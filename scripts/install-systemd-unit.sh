@@ -127,21 +127,16 @@ function rollback_pair {
 
 function validate_staged_pair {
     validation_root=$(mktemp -d) || die 'could not create staged validation root'
-    install -d -o root -g root -m 0755 -- \
-        "${validation_root}/etc/systemd/system" \
-        "${validation_root}/usr/local/libexec/omi-collector" \
-        "${validation_root}/etc/omi-collector" || die 'could not prepare staged validation root'
-    install -o root -g root -m 0644 -- "$staged_unit" "${validation_root}${unit_target}" \
-        || die 'could not stage the unit for validation'
-    install -o root -g root -m 0755 -- "$staged_exec" "${validation_root}${exec_target}" \
-        || die 'could not stage the wrapper for validation'
-    install -o root -g root -m 0640 -- "$environment_file" "${validation_root}${environment_file}" \
-        || die 'could not stage the environment for validation'
-    systemd-analyze verify --root="$validation_root" "$unit_target" \
+    validation_unit="${validation_root}/${service_name}"
+    sed "s|^ExecStart=.*|ExecStart=${staged_exec} --check|" "$staged_unit" > "$validation_unit" \
+        || die 'could not prepare staged unit for validation'
+    chown root:root -- "$validation_unit" || die 'could not set staged validation unit ownership'
+    chmod 0644 -- "$validation_unit" || die 'could not set staged validation unit mode'
+    systemd-analyze verify "$validation_unit" \
         || die "systemd unit validation failed: ${source_unit}"
 }
 
-declare script_dir repo_root source_unit source_exec staged_file staged_unit staged_exec validation_root
+declare script_dir repo_root source_unit source_exec staged_file staged_unit staged_exec validation_root validation_unit
 declare unit_backup exec_backup account_user account_group state_dir environment_file unit_target exec_target service_name
 declare -A environment_values
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve installer directory'

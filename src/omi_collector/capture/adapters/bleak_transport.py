@@ -132,7 +132,7 @@ class BleakClientLike(Protocol):
     async def start_notify(
         self,
         characteristic: object,
-        callback: Callable[[object, bytearray], None | Awaitable[None]],
+        callback: Callable[[object, bytearray], Awaitable[None] | None],
     ) -> object:
         """Subscribe to a characteristic."""
 

@@ -2079,7 +2079,8 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(tmp_pa
 async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path) -> None:
     started = threading.Event()
     release = threading.Event()
-    scheduler_overhead_seconds = 0.5
+    finished = threading.Event()
+    config = CollectorConfig(retry=RetryConfig(presence_preflight_budget_seconds=1.0))
 
     class BlockingTrustSession(ScriptedRingSession):
         async def read_optional_characteristic(self, uuid: str) -> bytes | None:
@@ -2100,7 +2101,8 @@ async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path)
 
     def blocking_trust_probe() -> bool:
         started.set()
-        release.wait(10.0)
+        release.wait()
+        finished.set()
         return False
 
     collection = asyncio.create_task(
@@ -2113,19 +2115,20 @@ async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path)
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
                 operational=lambda _event: None,
                 host_clock_synchronized=blocking_trust_probe,
+                config=config,
             ),
         )
     )
     try:
-        assert await asyncio.wait_for(
-            asyncio.to_thread(started.wait), timeout=DEFAULT_CONFIG.retry.presence_preflight_budget_seconds
-        )
-        result = await asyncio.wait_for(
-            collection,
-            timeout=DEFAULT_CONFIG.retry.presence_preflight_budget_seconds + scheduler_overhead_seconds,
-        )
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=5.0)
+        # Collection must finish after the configured preflight bound expires,
+        # even though this trust probe remains blocked until the test releases it.
+        result = await asyncio.wait_for(collection, timeout=5.0)
+        assert not release.is_set()
+        assert not finished.is_set()
     finally:
         release.set()
+        assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=5.0)
 
     assert isinstance(result, CollectionResult)
     assert session.writes == [

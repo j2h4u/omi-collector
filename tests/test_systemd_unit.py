@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from omi_collector.cli import app
@@ -166,7 +167,7 @@ def test_cli_requires_an_explicit_layout_for_storage_commands() -> None:
     result = CliRunner().invoke(app, ["device", "metrics", "--device-slug", "omi"])
 
     assert result.exit_code == 2
-    assert "Missing option '--layout'" in result.output
+    assert "Missing option '--layout'" in unstyle(result.output)
 
 
 def _write_commands(fake_bin: Path, log: Path, scenario: _DeploymentScenario, layout_path: Path) -> None:

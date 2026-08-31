@@ -71,12 +71,18 @@ function validate_environment {
 }
 
 function prepare_service_environment {
+    [[ "$uv_cache_dir" == "${state_dir}"/* && ! -L "$uv_cache_dir" ]] \
+        || die "UV cache directory must be below ${state_dir}"
     [[ "$project_environment" == "${state_dir}"/* && ! -L "$project_environment" ]] \
         || die "OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT must be below ${state_dir}"
     install -d -o "$account_user" -g "$account_group" -m 0750 -- "$uv_cache_dir" "$project_environment" \
         || die 'could not prepare service UV state directories'
+    chown -R "$account_user:$account_group" -- "$uv_cache_dir" \
+        || die "could not make UV cache writable by ${account_user}"
     chown -R "$account_user:$account_group" -- "$project_environment" \
         || die "could not make project environment writable by ${account_user}"
+    [[ $(stat -c '%U:%G:%a' -- "$uv_cache_dir") == "${account_user}:${account_group}:750" ]] \
+        || die "UV cache directory must be ${account_user}:${account_group} 0750: ${uv_cache_dir}"
     [[ $(stat -c '%U:%G:%a' -- "$project_environment") == "${account_user}:${account_group}:750" ]] \
         || die "project environment must be ${account_user}:${account_group} 0750: ${project_environment}"
 }

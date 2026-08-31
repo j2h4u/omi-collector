@@ -201,6 +201,11 @@ def _write_commands(fake_bin: Path, log: Path, scenario: _DeploymentScenario, la
         encoding="utf-8",
     )
     (fake_bin / "runuser").chmod(0o755)
+    (fake_bin / "chown").write_text(
+        f'#!/usr/bin/env bash\nprintf "chown args=%s\\n" "$*" >> {quoted_log}\nexec /usr/bin/chown "$@"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "chown").chmod(0o755)
     (fake_bin / "systemctl").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "systemctl args=%s\\n" "$*" >> {quoted_log}\n'
@@ -344,6 +349,8 @@ def test_deployer_harness_requires_readiness_and_stability(tmp_path: Path) -> No
     assert f"layout={layout_path}" in result.stdout
     commands = log.read_text(encoding="utf-8")
     assert "runuser args=--user root -- env" in commands
+    assert f"chown args=-R root:root -- {tmp_path / 'state' / 'uv-cache'}" in commands
+    assert f"chown args=-R root:root -- {tmp_path / 'state' / 'venv'}" in commands
     assert "systemctl args=restart omi-collector.service" in commands
     assert "sleep args=6" in commands
 

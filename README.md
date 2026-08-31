@@ -39,6 +39,18 @@ Omi Collector provides the narrow first stage:
 It deliberately does **not** transcode, run VAD, transcribe, call the Omi cloud,
 or delete published bundles. Those are downstream responsibilities.
 
+## What comes next
+
+In my downstream pipeline, each raw bundle passes through voice activity
+detection (VAD). The pipeline keeps only speech audio for long-term storage and
+publishes a compact passport alongside it that maps the retained speech back to
+the original timeline. This preserves when speech and removed gaps occurred
+without retaining the much larger stream of silence and non-speech audio.
+
+That processing intentionally lives outside Omi Collector. This repository
+ends at durable publication of the original pendant data, so other users can
+attach a different VAD, transcription, or archival pipeline.
+
 ## Requirements
 
 - Omi CV1 pendant running stock firmware

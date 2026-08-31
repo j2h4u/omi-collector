@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+function die {
+    printf 'ERROR: %s\n' "${1:-operation failed}" >&2
+    exit 2
+}
+
+function require_nonempty {
+    local -r name="$1"
+    local -r value="${!name:-}"
+
+    [[ -n "$value" ]] || die "${name} is required"
+}
+
+function require_absolute_directory {
+    local -r name="$1"
+    local -r path="${!name}"
+
+    [[ "$path" == /* && -d "$path" && ! -L "$path" ]] || die "${name} must name a regular absolute directory"
+}
+
+function require_absolute_regular_file {
+    local -r name="$1"
+    local -r path="${!name}"
+
+    [[ "$path" == /* && -f "$path" && ! -L "$path" ]] || die "${name} must name a regular absolute file"
+}
+
+function validate_environment {
+    local -r check_only="$1"
+
+    require_nonempty OMI_COLLECTOR_DEVICE_ADDRESS
+    require_nonempty OMI_COLLECTOR_DEVICE_SLUG
+    require_nonempty OMI_COLLECTOR_LAYOUT_PATH
+    require_nonempty OMI_COLLECTOR_PROJECT_DIR
+    require_nonempty OMI_COLLECTOR_UV_BIN
+    require_nonempty OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT
+
+    [[ "$OMI_COLLECTOR_DEVICE_ADDRESS" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] \
+        || die 'OMI_COLLECTOR_DEVICE_ADDRESS must be a Bluetooth address'
+    [[ "$OMI_COLLECTOR_DEVICE_SLUG" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+        || die 'OMI_COLLECTOR_DEVICE_SLUG must contain lowercase letters, digits, and hyphens'
+    require_absolute_regular_file OMI_COLLECTOR_LAYOUT_PATH
+    require_absolute_directory OMI_COLLECTOR_PROJECT_DIR
+    [[ "$OMI_COLLECTOR_UV_BIN" == /* && -x "$OMI_COLLECTOR_UV_BIN" && ! -L "$OMI_COLLECTOR_UV_BIN" ]] \
+        || die 'OMI_COLLECTOR_UV_BIN must name an executable absolute file'
+    [[ "$OMI_COLLECTOR_LAYOUT_PATH" == /var/lib/omi-collector/* ]] \
+        || die 'OMI_COLLECTOR_LAYOUT_PATH must be below /var/lib/omi-collector'
+    if (( ! check_only )); then
+        require_absolute_directory OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT
+    else
+        [[ "$OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT" == /* && ! -L "$OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT" ]] \
+            || die 'OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT must be an absolute non-symlink path'
+    fi
+}
+
+if [[ "${1:-}" == '--check' ]]; then
+    (( $# == 1 )) || die '--check does not accept additional arguments'
+    validate_environment 1
+    exit 0
+fi
+(( $# == 0 )) || die 'this wrapper does not accept arguments'
+validate_environment 0
+
+cd -- "$OMI_COLLECTOR_PROJECT_DIR" || die 'could not enter OMI_COLLECTOR_PROJECT_DIR'
+export UV_PROJECT_ENVIRONMENT="$OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT"
+exec "$OMI_COLLECTOR_UV_BIN" run \
+    --project "$OMI_COLLECTOR_PROJECT_DIR" \
+    --frozen \
+    --no-dev \
+    --no-sync \
+    --no-python-downloads \
+    --offline \
+    omi-collector device sync \
+    --address "$OMI_COLLECTOR_DEVICE_ADDRESS" \
+    --device-slug "$OMI_COLLECTOR_DEVICE_SLUG" \
+    --layout "$OMI_COLLECTOR_LAYOUT_PATH" \
+    --confirm-sync \
+    --announce-readiness

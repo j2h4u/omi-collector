@@ -1,0 +1,11 @@
+services:
+  # QA-only image; production is supervised by systemd on the host.
+  omi-collector-qa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: omi-collector:local
+    init: true
+    mem_limit: 1g
+    environment:
+      PYTHONUNBUFFERED: "1"

@@ -1,0 +1,1 @@
+"""Pendant capture bounded context."""

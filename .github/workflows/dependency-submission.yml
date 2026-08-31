@@ -1,0 +1,22 @@
+name: Dependency Submission
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "uv.lock"
+      - ".github/workflows/dependency-submission.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  uv-lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - name: Submit uv.lock dependency graph
+        uses: rmuir/uv-dependency-submission@v1.1.1

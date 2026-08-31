@@ -1,0 +1,13 @@
+version = 1
+
+[collector]
+root = "collector"
+attempts = "attempts"
+quarantine = "quarantine"
+lock = "collector.lock"
+device_state = "device.json"
+debug_log = "debug.jsonl"
+
+[publication]
+root = "pipeline"
+raw = "raw"

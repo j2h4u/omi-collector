@@ -1,0 +1,34 @@
+[Unit]
+Description=Omi CV1 pendant collector
+Wants=bluetooth.service
+After=bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=omi-collector
+Group=omi-collector
+EnvironmentFile=/etc/omi-collector/omi-collector.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 UV_LINK_MODE=hardlink UV_CACHE_DIR=/var/lib/omi-collector/uv-cache XDG_STATE_HOME=/var/lib/omi-collector
+ExecStart=/usr/local/libexec/omi-collector/omi-collector-exec
+Restart=always
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=5min
+TimeoutStopSec=180s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=omi-collector
+UMask=0027
+AmbientCapabilities=CAP_NET_RAW
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/omi-collector
+StateDirectory=omi-collector
+StateDirectoryMode=0750
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

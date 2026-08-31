@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RECORD_SIZE
-from .staging_filesystem import StagingPaths
+from .staging_filesystem import _SHARED_BUNDLE_DIRECTORY_MODE, StagingPaths
 from .staging_store import StagingStore
 
 _ATTEMPT_NAME: Final = "attempt.json"
@@ -415,7 +415,7 @@ def _publish_atomic(
     temporary = Path(f"/proc/self/fd/{device_fd}") / temporary_name
     completed = False
     try:
-        os.mkdir(temporary_name, 0o700, dir_fd=device_fd)
+        os.mkdir(temporary_name, _SHARED_BUNDLE_DIRECTORY_MODE, dir_fd=device_fd)
         _write_file(
             temporary / _RAW_NAME,
             raw,

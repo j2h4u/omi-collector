@@ -9,6 +9,7 @@ from json import dumps, loads
 from os import PathLike, fsync
 from pathlib import Path
 from shutil import rmtree
+from stat import S_IMODE
 from typing import cast
 
 import pytest
@@ -430,6 +431,32 @@ def test_seal_writes_bundle_manifest_and_receipt(tmp_path: Path) -> None:
     assert (result.bundle_path / "manifest.json").is_file()
     assert (result.bundle_path / "receipt.json").is_file()
     assert not attempt.path.exists()
+
+
+def test_full_publication_uses_shared_bundle_directory_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    requested_modes: list[int] = []
+    real_mkdir = publication.os.mkdir
+
+    def observed_mkdir(
+        path: str | bytes | PathLike[str] | PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if dir_fd is not None:
+            requested_modes.append(mode)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(publication.os, "mkdir", observed_mkdir)
+    attempt = _started_attempt(tmp_path, count=1)
+    attempt.append_record(0, 100, _record(1))
+
+    bundle = attempt.seal(DoneNotification(0, 101)).bundle_path
+
+    assert requested_modes == [0o770]
+    mode = S_IMODE(bundle.stat().st_mode)
+    assert mode & 0o700 == 0o700
+    assert mode & 0o007 == 0
 
 
 def test_seal_requires_success_complete_count_and_next_sequence(tmp_path: Path) -> None:

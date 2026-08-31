@@ -14,7 +14,7 @@ from json import JSONDecodeError, dumps, loads
 from os import O_DIRECTORY, O_RDONLY, close, fsync, statvfs
 from os import open as os_open
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, DurabilityConfig
@@ -35,6 +35,11 @@ from .staging_contract import (
 
 Fsync = Callable[[int], None]
 Statvfs = Callable[[str | Path], object]
+
+# Published raw bundles are a shared collector/downstream boundary.  Keep the
+# group class rwx so a parent default ACL can retain its named downstream-user
+# entry and mask; world access remains disabled.
+_SHARED_BUNDLE_DIRECTORY_MODE: Final = 0o770
 
 
 def _never_defer() -> bool:

@@ -31,6 +31,7 @@ from .staging_contract import (
     _validate_terminalized_at,
 )
 from .staging_filesystem import (
+    _SHARED_BUNDLE_DIRECTORY_MODE,
     StagingFilesystem,
     _copy_synced,
     _file_hash,
@@ -230,7 +231,7 @@ def _prepare_capture_temporary(
     device_fd = filesystem.validate_capture_destination(destination, device_slug)
     temporary_name = f".{destination.name}.{uuid4().hex}.tmp"
     try:
-        os.mkdir(temporary_name, 0o700, dir_fd=device_fd)
+        os.mkdir(temporary_name, _SHARED_BUNDLE_DIRECTORY_MODE, dir_fd=device_fd)
         filesystem._fsync(device_fd)
     except BaseException:
         os.close(device_fd)

@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from hashlib import sha256
 from json import dumps, loads
+from os import PathLike
 from pathlib import Path
 from shutil import rmtree
+from stat import S_IMODE
 from typing import cast
 
 import pytest
@@ -81,6 +83,32 @@ def test_publishes_only_authenticated_prefix_and_leaves_source_unchanged(tmp_pat
     assert not tuple((_capture_root(tmp_path) / "omi_cv1").glob(".*.tmp"))
     duplicate = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
     assert duplicate.deduplicated
+
+
+def test_quarantine_publication_uses_shared_bundle_directory_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _, _ = _quarantined_attempt(tmp_path)
+    requested_modes: list[int] = []
+    real_mkdir = quarantine_publish.os.mkdir
+
+    def observed_mkdir(
+        path: str | bytes | PathLike[str] | PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if dir_fd is not None:
+            requested_modes.append(mode)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(quarantine_publish.os, "mkdir", observed_mkdir)
+    result = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+
+    assert requested_modes == [0o770]
+    mode = S_IMODE(result.bundle_path.stat().st_mode)
+    assert mode & 0o700 == 0o700
+    assert mode & 0o007 == 0
 
 
 @pytest.mark.parametrize("name", ["attempt.json", "checkpoint.json", "records.bin"])

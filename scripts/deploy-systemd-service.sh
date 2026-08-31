@@ -60,8 +60,8 @@ function validate_environment {
         || die 'OMI_COLLECTOR_DEVICE_ADDRESS must be a Bluetooth address'
     [[ -n "${device_slug:-}" && "$device_slug" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
         || die 'OMI_COLLECTOR_DEVICE_SLUG must contain lowercase letters, digits, and hyphens'
-    [[ "${layout_path:-}" == /var/lib/omi-collector/* && -f "$layout_path" && ! -L "$layout_path" ]] \
-        || die 'OMI_COLLECTOR_LAYOUT_PATH must be a regular file below /var/lib/omi-collector'
+    [[ "${layout_path:-}" == /* && -f "$layout_path" && ! -L "$layout_path" ]] \
+        || die 'OMI_COLLECTOR_LAYOUT_PATH must name a regular absolute file'
     [[ "${project_dir:-}" == /* && -d "$project_dir" && ! -L "$project_dir" ]] \
         || die 'OMI_COLLECTOR_PROJECT_DIR must be a regular absolute directory'
     [[ "${uv_bin:-}" == /* && -x "$uv_bin" && ! -L "$uv_bin" ]] \

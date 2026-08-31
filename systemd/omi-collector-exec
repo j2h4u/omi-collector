@@ -46,8 +46,6 @@ function validate_environment {
     require_absolute_directory OMI_COLLECTOR_PROJECT_DIR
     [[ "$OMI_COLLECTOR_UV_BIN" == /* && -x "$OMI_COLLECTOR_UV_BIN" && ! -L "$OMI_COLLECTOR_UV_BIN" ]] \
         || die 'OMI_COLLECTOR_UV_BIN must name an executable absolute file'
-    [[ "$OMI_COLLECTOR_LAYOUT_PATH" == /var/lib/omi-collector/* ]] \
-        || die 'OMI_COLLECTOR_LAYOUT_PATH must be below /var/lib/omi-collector'
     if (( ! check_only )); then
         require_absolute_directory OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT
     else

@@ -57,6 +57,27 @@ against the environment, validates the staged unit, and rolls both files back
 if the composite install cannot be reloaded or enabled. It never starts the
 service without `--restart`.
 
+The public unit intentionally permits writes only beneath
+`/var/lib/omi-collector`; keep the example layout there unless the host has a
+specific storage requirement. `OMI_COLLECTOR_LAYOUT_PATH` may point to any
+absolute regular non-symlink file, including one outside `/var/lib`, but that
+does not expand the unit's write boundary. For external collector or
+publication roots, create a host-only drop-in such as
+`/etc/systemd/system/omi-collector.service.d/storage.conf`:
+
+```ini
+[Service]
+ReadWritePaths=/var/lib/omi-collector /srv/omi-collector/collector /srv/omi-collector/pipeline
+```
+
+Use the paths resolved by the layout (the layout parent plus its relative
+`collector.root` and `publication.root`), and keep host-specific paths out of
+the checked-in unit. The layout file's parent directories must permit
+`omi-collector` traversal and reading; its collector and publication roots
+must permit that account to write. Set ownership or narrowly scoped filesystem
+ACLs deliberately, then validate the drop-in and reload systemd. The installer
+still enforces `root:omi-collector` mode `0640` on every accepted layout file.
+
 Prepare the dedicated noneditable UV environment as the service account:
 
 ```bash

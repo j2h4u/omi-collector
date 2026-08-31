@@ -64,8 +64,8 @@ function ensure_service_account {
 function validate_layout_file {
     local -r layout_file="${environment_values[OMI_COLLECTOR_LAYOUT_PATH]}"
 
-    [[ "$layout_file" == "${state_dir}"/* && -f "$layout_file" && ! -L "$layout_file" ]] \
-        || die "OMI_COLLECTOR_LAYOUT_PATH must be a regular file below ${state_dir}"
+    [[ "$layout_file" == /* && -f "$layout_file" && ! -L "$layout_file" ]] \
+        || die 'OMI_COLLECTOR_LAYOUT_PATH must name a regular absolute file'
     chown root:"$account_group" -- "$layout_file" || die "could not set layout file group: ${layout_file}"
     chmod 0640 -- "$layout_file" || die "could not set layout file mode: ${layout_file}"
     [[ $(stat -c '%U:%G:%a' -- "$layout_file") == "root:${account_group}:640" ]] \

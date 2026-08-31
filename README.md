@@ -75,6 +75,30 @@ the `omi-collector` system user/group and corrects the state directory to
 and wrapper before replacing either one. It does not start the service unless
 `--restart` is explicit.
 
+The default layout authority and all mutable data stay under
+`/var/lib/omi-collector`. The checked-in unit grants the service write access
+only there. An operator may instead set `OMI_COLLECTOR_LAYOUT_PATH` to any
+absolute regular, non-symlink file, but collector and publication roots outside
+that default require a host-specific systemd drop-in. Add the resolved roots to
+`ReadWritePaths=` in `/etc/systemd/system/omi-collector.service.d/storage.conf`
+(retain `/var/lib/omi-collector`), then reload systemd. Ensure the layout file's
+parent directories grant `omi-collector` traversal/read access and its
+collector/publication roots grant that account write access, using filesystem
+ownership or narrowly scoped ACLs as appropriate. Do not add host paths to the
+checked-in base unit.
+
+For example, if a host keeps its layout and data below `/srv/omi-collector`,
+the drop-in might contain:
+
+```ini
+[Service]
+ReadWritePaths=/var/lib/omi-collector /srv/omi-collector/collector /srv/omi-collector/pipeline
+```
+
+After installing the external layout and editing the environment file, run the
+installer so it enforces `root:omi-collector` mode `0640` on the layout file,
+then verify the drop-in with `systemd-analyze verify` and restart deliberately.
+
 BlueZ must be running and the account must be able to use the host adapter:
 
 ```bash

@@ -83,12 +83,16 @@ def test_installer_and_deployer_keep_production_targets_non_overridable() -> Non
     assert 'stage_file "$source_unit" "$unit_target" 0644' in installer
     assert "validate_staged_pair" in installer
     assert "rollback_pair" in installer
+    assert '[[ "$layout_file" == /* && -f "$layout_file" && ! -L "$layout_file" ]]' in installer
+    assert "must name a regular absolute file" in installer
     assert "environment_file='/etc/omi-collector/omi-collector.env'" in deployer
     assert "installed_unit='/etc/systemd/system/omi-collector.service'" in deployer
     assert "installed_exec='/usr/local/libexec/omi-collector/omi-collector-exec'" in deployer
     assert "(( EUID == 0 ))" in deployer
     assert '"$runuser_bin" --user "$account_user" -- env' in deployer
     assert "sudo --non-interactive" not in deployer
+    assert '[[ "${layout_path:-}" == /* && -f "$layout_path" && ! -L "$layout_path" ]]' in deployer
+    assert "must name a regular absolute file" in deployer
 
 
 def test_wrapper_and_example_require_explicit_operator_values() -> None:
@@ -104,21 +108,18 @@ def test_wrapper_and_example_require_explicit_operator_values() -> None:
     assert "OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT=/var/lib/omi-collector/venv" in example
 
 
-def test_wrapper_check_allows_a_fresh_environment_but_exec_does_not(tmp_path: Path) -> None:
+def test_wrapper_check_allows_an_external_layout_but_exec_requires_environment(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     state_root.mkdir()
-    layout = state_root / "collector.toml"
+    external_root = tmp_path / "external"
+    external_root.mkdir()
+    layout = external_root / "collector.toml"
     layout.write_text("[collector]\nroot = 'collector'\n", encoding="utf-8")
     project = tmp_path / "project"
     project.mkdir()
     uv = tmp_path / "uv"
     uv.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     uv.chmod(0o755)
-    wrapper = tmp_path / "omi-collector-exec"
-    wrapper.write_text(
-        _EXEC.read_text(encoding="utf-8").replace("/var/lib/omi-collector", str(state_root)), encoding="utf-8"
-    )
-    wrapper.chmod(0o755)
     environment = {
         **os.environ,
         "OMI_COLLECTOR_DEVICE_ADDRESS": "12:34:56:78:9A:BC",
@@ -129,8 +130,8 @@ def test_wrapper_check_allows_a_fresh_environment_but_exec_does_not(tmp_path: Pa
         "OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT": str(state_root / "venv"),
     }
 
-    check = subprocess.run([str(wrapper), "--check"], check=False, capture_output=True, text=True, env=environment)
-    execute = subprocess.run([str(wrapper)], check=False, capture_output=True, text=True, env=environment)
+    check = subprocess.run([str(_EXEC), "--check"], check=False, capture_output=True, text=True, env=environment)
+    execute = subprocess.run([str(_EXEC)], check=False, capture_output=True, text=True, env=environment)
 
     assert check.returncode == 0, check.stderr
     assert execute.returncode != 0
@@ -143,7 +144,7 @@ def test_wrapper_check_allows_a_fresh_environment_but_exec_does_not(tmp_path: Pa
         f'#!/usr/bin/env bash\nprintf "%s\\n" "$UV_PROJECT_ENVIRONMENT" > {shlex.quote(str(uv_environment))}\n',
         encoding="utf-8",
     )
-    prepared_execute = subprocess.run([str(wrapper)], check=False, capture_output=True, text=True, env=environment)
+    prepared_execute = subprocess.run([str(_EXEC)], check=False, capture_output=True, text=True, env=environment)
 
     assert prepared_execute.returncode == 0, prepared_execute.stderr
     assert uv_environment.read_text(encoding="utf-8") == f"{prepared_environment}\n"
@@ -235,7 +236,9 @@ def _deployment_harness(
     fake_bin.mkdir()
     state_root = tmp_path / "state"
     state_root.mkdir()
-    layout_path = state_root / "collector.toml"
+    external_root = tmp_path / "external"
+    external_root.mkdir()
+    layout_path = external_root / "collector.toml"
     layout_path.write_text('[collector]\nroot = "collector"\n', encoding="utf-8")
     environment = state_root / "venv"
     venv.EnvBuilder(with_pip=False).create(environment)

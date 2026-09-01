@@ -86,6 +86,7 @@ def test_installer_and_deployer_keep_production_targets_non_overridable() -> Non
     assert "ExecStart=${staged_exec} --check" in installer
     assert 'systemd-analyze verify "$validation_unit"' in installer
     assert "--root=" not in installer
+    assert "--offline" not in deployer
     assert "rollback_pair" in installer
     assert '[[ "$layout_file" == /* && -f "$layout_file" && ! -L "$layout_file" ]]' in installer
     assert "must name a regular absolute file" in installer

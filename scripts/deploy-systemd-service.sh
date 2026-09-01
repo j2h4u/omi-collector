@@ -128,7 +128,7 @@ if ! "$runuser_bin" --user "$account_user" -- env \
     UV_PROJECT_ENVIRONMENT="$project_environment" \
     UV_LINK_MODE=hardlink \
     UV_CACHE_DIR="$uv_cache_dir" \
-    "$uv_bin" sync --locked --no-dev --no-editable --reinstall-package omi-collector --no-python-downloads --offline; then
+    "$uv_bin" sync --locked --no-dev --no-editable --reinstall-package omi-collector --no-python-downloads; then
     die 'uv sync failed; systemd was not touched'
 fi
 

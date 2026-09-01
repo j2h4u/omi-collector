@@ -158,10 +158,11 @@ def publish_prefix_directory(  # noqa: PLR0913
 
 
 def publish_full_directory(filesystem: StagingFilesystem, source: Path, destination: Path, device_slug: str) -> None:
-    """Copy a complete source attempt and atomically publish it in capture."""
+    """Publish only the completed bundle contract, never attempt-local state."""
     device_fd, temporary_name, temporary = _prepare_capture_temporary(filesystem, destination, device_slug)
     try:
-        for entry in sorted(source.iterdir(), key=lambda path: path.name):
+        for name in (_MANIFEST_NAME, _RECEIPT_NAME, _RAW_NAME):
+            entry = source / name
             if entry.is_symlink() or not entry.is_file():
                 raise StagingError(f"full publication source entry is not a regular file: {entry.name}")
             _copy_synced(entry, temporary / entry.name, filesystem._fsync)

@@ -198,6 +198,11 @@ def test_split_roots_publish_only_completed_bundles_to_capture_root(tmp_path: Pa
 
     assert result.bundle_path.is_relative_to(capture_root)
     assert not result.bundle_path.is_relative_to(spool)
+    assert {path.name for path in result.bundle_path.iterdir()} == {
+        "manifest.json",
+        "receipt.json",
+        "records.bin",
+    }
     assert not (spool / "omi_cv1").exists()
     assert not tuple((capture_root / "omi_cv1").glob(".*.tmp"))
 

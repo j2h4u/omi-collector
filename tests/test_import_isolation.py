@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-_LAYOUT_V1 = """version = 1
+_LAYOUT_V2 = """version = 2
 
 [collector]
 root = "collector"
@@ -17,8 +17,7 @@ device_state = "device.json"
 debug_log = "debug.jsonl"
 
 [publication]
-root = "pipeline"
-raw = "raw"
+root = "source"
 """
 
 
@@ -49,7 +48,7 @@ def test_root_cli_does_not_import_unselected_capture() -> None:
 
 def test_device_sync_executes_without_importing_downstream_code(tmp_path: Path) -> None:
     layout = tmp_path / "layout.toml"
-    layout.write_text(_LAYOUT_V1, encoding="utf-8")
+    layout.write_text(_LAYOUT_V2, encoding="utf-8")
     fake_sync_source = """
 async def fake_sync(*args: object, **kwargs: object) -> object:
     del args, kwargs

@@ -16,7 +16,7 @@ from omi_collector.storage_layout import StorageLayoutError, load_storage_layout
 
 def _layout(path: Path) -> Path:
     path.write_text(
-        """version = 1
+        """version = 2
 
 [collector]
 root = "collector"
@@ -27,8 +27,7 @@ device_state = "device.json"
 debug_log = "debug.jsonl"
 
 [publication]
-root = "pipeline"
-raw = "raw"
+root = "source"
 """,
         encoding="utf-8",
     )
@@ -39,8 +38,7 @@ def test_layout_parent_is_the_only_root_and_loading_creates_nothing(tmp_path: Pa
     layout = load_storage_layout(_layout(tmp_path / "layout.toml"))
 
     assert layout.collector.root == tmp_path / "collector"
-    assert layout.publication.root == tmp_path / "pipeline"
-    assert layout.publication.raw == tmp_path / "pipeline" / "raw"
+    assert layout.publication.root == tmp_path / "source"
     assert not layout.collector.root.exists()
     assert not layout.publication.root.exists()
 
@@ -55,14 +53,25 @@ def test_layout_rejects_a_symlinked_declared_target(tmp_path: Path) -> None:
         load_storage_layout(tmp_path / "layout.toml")
 
 
-def test_layout_rejects_the_removed_combined_pipeline_schema(tmp_path: Path) -> None:
+def test_layout_rejects_unsupported_version(tmp_path: Path) -> None:
     path = tmp_path / "layout.toml"
     path.write_text(
-        _layout(path).read_text(encoding="utf-8").replace("[publication]", "[pipeline]"),
+        _layout(path).read_text(encoding="utf-8").replace("version = 2", "version = 999"),
         encoding="utf-8",
     )
 
-    with pytest.raises(StorageLayoutError, match="collector, and publication"):
+    with pytest.raises(StorageLayoutError, match="version is unsupported"):
+        load_storage_layout(path)
+
+
+def test_layout_rejects_unknown_publication_key(tmp_path: Path) -> None:
+    path = tmp_path / "layout.toml"
+    path.write_text(
+        _layout(path).read_text(encoding="utf-8").replace('root = "source"', 'root = "source"\nextra = "x"'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(StorageLayoutError, match="publication"):
         load_storage_layout(path)
 
 
@@ -70,7 +79,7 @@ def test_quarantine_lifecycle_publishes_authenticated_prefix_and_retains_bad_sou
     collector = tmp_path / "collector"
     paths = StagingPaths(
         collector,
-        tmp_path / "pipeline" / "raw",
+        tmp_path / "source",
         collector / "attempts",
         collector / "quarantine",
         collector / "collector.lock",

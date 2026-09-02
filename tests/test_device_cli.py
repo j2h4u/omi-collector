@@ -84,7 +84,7 @@ def _store(tmp_path: Path) -> StagingStore:
 def _layout(tmp_path: Path) -> Path:
     path = tmp_path / "layout.toml"
     path.write_text(
-        """version = 1
+        """version = 2
 
 [collector]
 root = "collector"
@@ -95,8 +95,7 @@ device_state = "device.json"
 debug_log = "debug.jsonl"
 
 [publication]
-root = "pipeline"
-raw = "raw"
+root = "source"
 """,
         encoding="utf-8",
     )

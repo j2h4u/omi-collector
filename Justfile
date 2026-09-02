@@ -142,3 +142,7 @@ release-check title="" body="":
         printf 'The PR body needs a BEGIN_COMMIT_OVERRIDE block; re-run with body=<file> to check it.\n' >&2
         exit 1
     fi
+
+# Exercise the exact upstream TOML updater used by the pinned release action.
+release-please-updater-check:
+    uv run pytest -q -m integration tests/test_release_please_updater.py

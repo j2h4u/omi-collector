@@ -108,6 +108,15 @@ function write_deployment_environment {
         || die 'could not publish deployment provenance environment'
 }
 
+function require_clean_source_tree {
+    local source_tree_status
+
+    source_tree_status=$(git -C "$resolved_project_dir" status --porcelain=v1 --untracked-files=all) \
+        || die 'could not inspect the checked-out source tree'
+    [[ -z "$source_tree_status" ]] \
+        || die 'refusing deployment from a dirty source tree; commit, stash, or remove every tracked and untracked change first'
+}
+
 declare script_dir repo_root source_package source_unit source_exec environment_file deployment_environment_file installed_unit installed_exec
 declare service_name uv_cache_dir state_dir account_user account_group runuser_bin resolved_project_dir resolved_environment resolved_purelib package_dir compare_status resolver_output source_revision
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
@@ -143,6 +152,7 @@ resolved_project_dir=$(builtin cd -- "$project_dir" && pwd -P) || die "cannot re
     || die 'OMI_COLLECTOR_PROJECT_DIR must match this checked-out repository for deployment'
 source_revision=$(git -C "$resolved_project_dir" rev-parse --verify 'HEAD^{commit}') \
     || die 'could not resolve the checked-out source revision'
+require_clean_source_tree
 source_package="${resolved_project_dir}/src/omi_collector"
 [[ -d "$source_package" ]] || die "source package not found: ${source_package}"
 prepare_service_environment

@@ -25,6 +25,7 @@ _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 class _DeploymentScenario:
     readiness_layout: str | None = None
     crash_loop: bool = False
+    git_status: str = ""
 
 
 _DEFAULT_DEPLOYMENT_SCENARIO = _DeploymentScenario()
@@ -190,8 +191,12 @@ def _write_commands(fake_bin: Path, log: Path, scenario: _DeploymentScenario, la
     (fake_bin / "uv").chmod(0o755)
     (fake_bin / "git").write_text(
         "#!/usr/bin/env bash\n"
-        '[[ "${1:-}" == -C && "${3:-}" == rev-parse && "${4:-}" == --verify ]] || exit 2\n'
-        "printf '%040d\\n' 0\n",
+        '[[ "${1:-}" == -C ]] || exit 2\n'
+        'case "${3:-}" in\n'
+        "rev-parse) printf '%040d\\n' 0 ;;\n"
+        f"status) printf '%s' {shlex.quote(scenario.git_status)} ;;\n"
+        "*) exit 2 ;;\n"
+        "esac\n",
         encoding="utf-8",
     )
     (fake_bin / "git").chmod(0o755)
@@ -392,3 +397,16 @@ def test_deployer_harness_rejects_restart_during_stability(tmp_path: Path) -> No
 
     assert result.returncode != 0
     assert "restarted during the stability interval" in result.stderr
+
+
+@pytest.mark.parametrize("git_status", (" M src/omi_collector/cli.py\n", "?? capture.tmp\n"))
+def test_deployer_harness_refuses_dirty_source_before_building(tmp_path: Path, git_status: str) -> None:
+    deployer, _, _, environment, log = _deployment_harness(tmp_path, _DeploymentScenario(git_status=git_status))
+
+    result = subprocess.run(
+        [*_root_prefix(), str(deployer)], check=False, capture_output=True, text=True, env=environment
+    )
+
+    assert result.returncode != 0
+    assert "refusing deployment from a dirty source tree" in result.stderr
+    assert not log.exists()

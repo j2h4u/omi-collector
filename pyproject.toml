@@ -129,6 +129,9 @@ skip_covered = true
 root_package = "omi_collector"
 include_external_packages = true
 
+[tool.deptry]
+known_first_party = ["omi_collector", "scripts"]
+
 [[tool.importlinter.contracts]]
 id = "core-independent-from-cli"
 name = "Core stays independent from CLI"

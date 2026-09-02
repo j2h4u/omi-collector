@@ -1,0 +1,7 @@
+# Transfer-quality evidence
+
+`quality.jsonl` is a long-lived append-only journal directly beneath the collector root. Each complete line is fsynced before the collector continues; inability to write it is logged to the separate debug ring and never prevents audio staging.
+
+`transfer_session` appears once when a physical session that issued `READ` terminates. Its `active_read_elapsed_ms` covers READ work only, so per-session mean/median and pooled throughput should use `written_raw_bytes / active_read_elapsed_ms` (or the analogous received counter) from these terminal records. `written_raw_bytes` is writer-thread output, not a claim that the bytes were fsynced; sealed staging artifacts remain the durability authority. Do not average precomputed speeds: none are stored. `advertisement_rssi_dbm` is the latest scanner advertisement sample that woke the session, not connected-link or HCI RSSI, and may be null. `source_revision` is the first 12 characters of validated `OMI_COLLECTOR_SOURCE_REVISION`, or null when deployment did not supply it.
+
+`sequence_loss` appears only after a confirmed cursor-ahead gap. Sum `missing_record_count` and `missing_raw_bytes` to aggregate confirmed loss. It deliberately omits sequence ranges, record identities, and loss seconds: ring record size and Opus packing cannot establish audio duration. Both event types carry release and firmware context when known.

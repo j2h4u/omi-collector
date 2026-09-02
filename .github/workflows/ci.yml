@@ -3,9 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - ".planning/**"
-      - "**/*.md"
   pull_request:
     branches: [main]
   schedule:
@@ -23,6 +20,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pr-release-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Skip outside pull requests
+        if: github.event_name != 'pull_request'
+        run: echo "release contract is a pull-request check"
+
+      - uses: actions/checkout@v7.0.1
+        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7.0.0
+        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+        with:
+          enable-cache: true
+
+      - name: Validate release-please PR contract
+        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          uv run python scripts/validate_release_config.py
+          uv run python scripts/validate_pr_title.py --title "${PR_TITLE}"
+          uv run python -m scripts.validate_pr_commits --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}"
+          if [[ "${HEAD_REF}" == release-please--* ]]; then
+            exit 0
+          fi
+          count="$(git rev-list --no-merges --count "${BASE_SHA}..${HEAD_SHA}")"
+          printf '%s' "${PR_BODY}" \
+            | uv run python -m scripts.validate_release_notes --body-file - --commit-count "${count}"
+
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -125,7 +166,7 @@ jobs:
   ci:
     if: always()
     runs-on: ubuntu-latest
-    needs: [quality, test, crap, docker-build, runtime-smoke]
+    needs: [pr-release-contract, quality, test, crap, docker-build, runtime-smoke]
     steps:
       - name: Check required jobs
         run: |

@@ -23,7 +23,7 @@ packages = ["src/omi_collector"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 tmp_path_retention_policy = "failed"
 tmp_path_retention_count = 1
 addopts = [
@@ -128,6 +128,9 @@ skip_covered = true
 [tool.importlinter]
 root_package = "omi_collector"
 include_external_packages = true
+
+[tool.deptry]
+known_first_party = ["omi_collector", "scripts"]
 
 [[tool.importlinter.contracts]]
 id = "core-independent-from-cli"

@@ -30,7 +30,7 @@ from ..application.operational_telemetry import (
     TIME_SERVICE_UUID,
     TIME_WRITE_UUID,
 )
-from ..application.presence import PresenceCallback
+from ..application.presence import PresenceAdvertisement, PresenceCallback
 from ..application.ring_transport import (
     CONTROL_CHARACTERISTIC_UUID,
     RING_SERVICE_UUID,
@@ -86,12 +86,12 @@ class BleakPresenceObserver:
         if self._scanner is not None:
             return
 
-        def detected(device: BLEDevice, _advertisement: object) -> None:
+        def detected(device: BLEDevice, advertisement: object) -> None:
             if _normalize_address(device.address) == self._address:
                 # Keep the exact ephemeral BLEDevice, including its BlueZ
                 # object path.  A later BleakClient can then connect directly
                 # without a second address lookup after the scanner stops.
-                callback(device)
+                callback(PresenceAdvertisement(device, _advertisement_rssi(advertisement)))
 
         scanner = self._scanner_factory(
             detection_callback=detected,
@@ -118,6 +118,14 @@ class BleakPresenceObserver:
 
 def _normalize_address(address: str) -> str:
     return address.strip().lower()
+
+
+def _advertisement_rssi(advertisement: object) -> int | None:
+    """Keep the scanner-provided RSSI sample; never query RSSI after connect."""
+    value = getattr(advertisement, "rssi", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 class BleakClientLike(Protocol):

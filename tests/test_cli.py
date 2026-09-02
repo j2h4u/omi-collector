@@ -21,6 +21,7 @@ from omi_collector.capture.application.session_lifecycle import ActivityEvent
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
 from omi_collector.config import DebugLogConfig
+from omi_collector.core import package_version
 from omi_collector.spool_metrics import (
     FirmwareLifetimeMetrics,
     SpoolMetrics,
@@ -65,7 +66,7 @@ def test_version_flag_reports_package_version() -> None:
     result = CliRunner().invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert result.output.strip() == "0.1.0"
+    assert result.output.strip() == package_version()
 
 
 def test_health_command_reports_ok() -> None:

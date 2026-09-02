@@ -13,6 +13,7 @@ from omi_collector.config import (
     ObservabilityConfig,
     PhyConfig,
     PresenceConfig,
+    QualityMetricsConfig,
     RetryConfig,
     ServiceConfig,
     StagingRetentionConfig,
@@ -53,6 +54,9 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.observability.max_error_entry_chars == 1024
     assert isinstance(DEFAULT_CONFIG.observability.debug_log, DebugLogConfig)
     assert DEFAULT_CONFIG.observability.debug_log.file_name == "debug.jsonl"
+    assert isinstance(DEFAULT_CONFIG.observability.quality_metrics, QualityMetricsConfig)
+    assert DEFAULT_CONFIG.observability.quality_metrics.file_name == "quality.jsonl"
+    assert DEFAULT_CONFIG.observability.quality_metrics.source_revision_env == "OMI_COLLECTOR_SOURCE_REVISION"
     assert DEFAULT_CONFIG.phy.reap_timeout_seconds == 5.0
     assert DEFAULT_CONFIG.service.max_records == 256
     with pytest.raises(FrozenInstanceError):
@@ -145,3 +149,5 @@ def test_debug_log_config_rejects_unsafe_names_and_unknown_encoding() -> None:
         DebugLogConfig(backup_count=0)
     with pytest.raises(ValueError, match="exceed"):
         DebugLogConfig(max_bytes=512, max_record_bytes=1024)
+    with pytest.raises(ValueError, match="relative"):
+        QualityMetricsConfig(file_name="../quality.jsonl")

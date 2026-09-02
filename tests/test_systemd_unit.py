@@ -25,6 +25,7 @@ _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 class _DeploymentScenario:
     readiness_layout: str | None = None
     crash_loop: bool = False
+    git_status: str = ""
 
 
 _DEFAULT_DEPLOYMENT_SCENARIO = _DeploymentScenario()
@@ -44,7 +45,7 @@ def _unit_sections() -> dict[str, dict[str, str]]:
         assert section is not None, f"directive outside a section: {line}"
         key, separator, value = line.partition("=")
         assert separator, f"invalid unit directive: {line}"
-        section[key] = value
+        section[key] = f"{section[key]}\n{value}" if key in section else value
     return sections
 
 
@@ -53,7 +54,10 @@ def test_production_unit_uses_the_dedicated_account_and_static_pair() -> None:
 
     assert service["User"] == "omi-collector"
     assert service["Group"] == "omi-collector"
-    assert service["EnvironmentFile"] == "/etc/omi-collector/omi-collector.env"
+    assert service["EnvironmentFile"].splitlines() == [
+        "/etc/omi-collector/omi-collector.env",
+        "-/var/lib/omi-collector/deployment.env",
+    ]
     assert service["ExecStart"] == "/usr/local/libexec/omi-collector/omi-collector-exec"
     assert service["ReadWritePaths"] == "/var/lib/omi-collector"
     assert service["StateDirectory"] == "omi-collector"
@@ -185,6 +189,17 @@ def _write_commands(fake_bin: Path, log: Path, scenario: _DeploymentScenario, la
         encoding="utf-8",
     )
     (fake_bin / "uv").chmod(0o755)
+    (fake_bin / "git").write_text(
+        "#!/usr/bin/env bash\n"
+        '[[ "${1:-}" == -C ]] || exit 2\n'
+        'case "${3:-}" in\n'
+        "rev-parse) printf '%040d\\n' 0 ;;\n"
+        f"status) printf '%s' {shlex.quote(scenario.git_status)} ;;\n"
+        "*) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "git").chmod(0o755)
     initial_invocation = "a" * 32
     restarted_invocation = "b" * 32
     readiness_layout = scenario.readiness_layout or str(layout_path)
@@ -354,6 +369,9 @@ def test_deployer_harness_requires_readiness_and_stability(tmp_path: Path) -> No
     assert f"chown args=-R root:root -- {tmp_path / 'state' / 'venv'}" in commands
     assert "systemctl args=restart omi-collector.service" in commands
     assert "sleep args=6" in commands
+    assert (tmp_path / "state" / "deployment.env").read_text(encoding="utf-8") == (
+        "OMI_COLLECTOR_SOURCE_REVISION=0000000000000000000000000000000000000000\n"
+    )
 
 
 def test_deployer_harness_rejects_wrong_readiness(tmp_path: Path) -> None:
@@ -379,3 +397,16 @@ def test_deployer_harness_rejects_restart_during_stability(tmp_path: Path) -> No
 
     assert result.returncode != 0
     assert "restarted during the stability interval" in result.stderr
+
+
+@pytest.mark.parametrize("git_status", (" M src/omi_collector/cli.py\n", "?? capture.tmp\n"))
+def test_deployer_harness_refuses_dirty_source_before_building(tmp_path: Path, git_status: str) -> None:
+    deployer, _, _, environment, log = _deployment_harness(tmp_path, _DeploymentScenario(git_status=git_status))
+
+    result = subprocess.run(
+        [*_root_prefix(), str(deployer)], check=False, capture_output=True, text=True, env=environment
+    )
+
+    assert result.returncode != 0
+    assert "refusing deployment from a dirty source tree" in result.stderr
+    assert not log.exists()

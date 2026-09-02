@@ -87,8 +87,38 @@ function prepare_service_environment {
         || die "project environment must be ${account_user}:${account_group} 0750: ${project_environment}"
 }
 
-declare script_dir repo_root source_package source_unit source_exec environment_file installed_unit installed_exec
-declare service_name uv_cache_dir state_dir account_user account_group runuser_bin resolved_project_dir resolved_environment resolved_purelib package_dir compare_status resolver_output
+function write_deployment_environment {
+    local staged_deployment_environment metadata
+
+    [[ "$source_revision" =~ ^[[:xdigit:]]{40,64}$ ]] \
+        || die "source revision is not a full Git object ID: ${source_revision}"
+    staged_deployment_environment=$(mktemp --tmpdir="$state_dir" .deployment.env.tmp.XXXXXX) \
+        || die 'could not stage deployment provenance environment'
+    printf 'OMI_COLLECTOR_SOURCE_REVISION=%s\n' "$source_revision" > "$staged_deployment_environment" \
+        || die 'could not write deployment provenance environment'
+    chown root:"$account_group" -- "$staged_deployment_environment" \
+        || die 'could not set deployment provenance environment group'
+    chmod 0640 -- "$staged_deployment_environment" \
+        || die 'could not set deployment provenance environment mode'
+    metadata=$(stat -c '%U:%G:%a' -- "$staged_deployment_environment") \
+        || die 'could not inspect deployment provenance environment'
+    [[ "$metadata" == "root:${account_group}:640" && -f "$staged_deployment_environment" && ! -L "$staged_deployment_environment" ]] \
+        || die 'deployment provenance environment must be a regular root-owned 0640 file'
+    mv -f -- "$staged_deployment_environment" "$deployment_environment_file" \
+        || die 'could not publish deployment provenance environment'
+}
+
+function require_clean_source_tree {
+    local source_tree_status
+
+    source_tree_status=$(git -C "$resolved_project_dir" status --porcelain=v1 --untracked-files=all) \
+        || die 'could not inspect the checked-out source tree'
+    [[ -z "$source_tree_status" ]] \
+        || die 'refusing deployment from a dirty source tree; commit, stash, or remove every tracked and untracked change first'
+}
+
+declare script_dir repo_root source_package source_unit source_exec environment_file deployment_environment_file installed_unit installed_exec
+declare service_name uv_cache_dir state_dir account_user account_group runuser_bin resolved_project_dir resolved_environment resolved_purelib package_dir compare_status resolver_output source_revision
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
 declare device_address device_slug layout_path project_dir uv_bin project_environment
 declare -i attempt readiness_seen=0
@@ -100,6 +130,7 @@ repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve r
 source_unit="${repo_root}/systemd/omi-collector.service"
 source_exec="${repo_root}/systemd/omi-collector-exec"
 environment_file='/etc/omi-collector/omi-collector.env'
+deployment_environment_file='/var/lib/omi-collector/deployment.env'
 installed_unit='/etc/systemd/system/omi-collector.service'
 installed_exec='/usr/local/libexec/omi-collector/omi-collector-exec'
 service_name='omi-collector.service'
@@ -119,6 +150,9 @@ validate_environment
 resolved_project_dir=$(builtin cd -- "$project_dir" && pwd -P) || die "cannot resolve OMI_COLLECTOR_PROJECT_DIR: ${project_dir}"
 [[ "$resolved_project_dir" == "$repo_root" ]] \
     || die 'OMI_COLLECTOR_PROJECT_DIR must match this checked-out repository for deployment'
+source_revision=$(git -C "$resolved_project_dir" rev-parse --verify 'HEAD^{commit}') \
+    || die 'could not resolve the checked-out source revision'
+require_clean_source_tree
 source_package="${resolved_project_dir}/src/omi_collector"
 [[ -d "$source_package" ]] || die "source package not found: ${source_package}"
 prepare_service_environment
@@ -168,6 +202,7 @@ cmp --silent -- "$source_unit" "$installed_unit" || die 'installed systemd unit 
 [[ -r "$installed_exec" ]] || die 'installed systemd wrapper is missing or unreadable; run sudo scripts/install-systemd-unit.sh once'
 cmp --silent -- "$source_exec" "$installed_exec" || die 'installed systemd wrapper differs; run sudo scripts/install-systemd-unit.sh once'
 
+write_deployment_environment
 systemctl restart "$service_name" || die "could not restart ${service_name}"
 initial_snapshot=$(read_service_snapshot "$service_name") || die "${service_name} did not provide a valid active-process snapshot after deployment"
 IFS='|' read -r _ _ initial_invocation <<< "$initial_snapshot"

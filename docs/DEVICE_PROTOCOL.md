@@ -54,7 +54,14 @@ byte stream before validating record framing.
 Stock firmware performs a TX-confirmed, throttled auto-checkpoint while sending
 `READ` data. A `READ` can therefore consume pendant data without an explicit
 `ADVANCE`. Local restart guarantees end at the last fsynced checkpoint; never
-treat a `READ` as nondestructive.
+treat a `READ` as nondestructive. If the radio link disappears after this
+firmware checkpoint but before the corresponding bytes reach durable local
+staging, the missing tail cannot be requested again. In ordinary use, reduce
+this risk by leaving the pendant near the collector until the backlog drains.
+No ready-made firmware alternative provides stronger delivery semantics.
+Removing the risk at its source requires forking the stock firmware,
+implementing checkpoint changes or a bounded replay window, building it, and
+flashing the pendant.
 
 ## Weak-RF PHY guard
 

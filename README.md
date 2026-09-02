@@ -173,6 +173,21 @@ The collector treats missing audio as worse than duplicate audio:
 - Publication uses an atomic rename, so downstream consumers see either a
   complete bundle or nothing.
 
+### Stock firmware can lose a short tail
+
+The stock pendant firmware advances its persisted read checkpoint while data
+is being transmitted. If the pendant leaves radio range during a transfer, a
+small amount of audio can therefore become unavailable before the collector
+has received it. The collector detects and measures these gaps, but cannot
+recover bytes that the stock firmware has already discarded.
+
+The practical mitigation is to avoid repeatedly carrying the pendant through
+the edge of Bluetooth range: place it near the server and leave it there until
+the current download has drained. There is no ready-made firmware alternative
+that eliminates this failure mode. Doing so means forking the stock firmware,
+implementing less aggressive checkpointing or a replay window, building it,
+and flashing the pendant yourself.
+
 The optional `--force-1m` weak-RF workaround changes controller-wide PHY state.
 It is disabled by default and restores the prior selection after completion,
 failure, cancellation, or recovery. See the

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import KW_ONLY, dataclass
 from typing import Literal
@@ -27,6 +27,7 @@ from .operational_telemetry import (
 )
 from .ports import CaptureRuntimePort
 from .presence import PresenceScheduler, PresenceWake
+from .quality_metrics import QualityMetricsPort, SessionQuality, TransferSessionMetric, utc_timestamp
 from .ring_transport import (
     CandidateUnavailableError,
     NotificationOverflowError,
@@ -88,6 +89,8 @@ class OpportunisticOptions:
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], object] = asyncio.sleep
     presence: PresenceScheduler | None = None
+    quality_metrics: QualityMetricsPort | None = None
+    phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
 
 
@@ -130,6 +133,7 @@ class SessionLifecycleRun:
 @dataclass(slots=True)
 class SessionPhaseState:
     value: SessionPhase
+    quality: SessionQuality | None = None
 
 
 class SessionLifecycle:
@@ -178,7 +182,7 @@ class SessionLifecycle:
                 completed_before = self.run.callbacks.completed_batch_query()
                 context, outcome = await self._open_context(wake.candidate)
                 if context is not None:
-                    outcome = await self.run_session(context)
+                    outcome = await self.run_session(context, wake.advertisement_rssi_dbm)
                 candidate_failed = outcome == "candidate_unavailable"
                 if outcome == "drained":
                     await presence.attempt_finished("clean")
@@ -229,46 +233,91 @@ class SessionLifecycle:
                 raise
             return None, "retry"
 
-    async def run_session(self, context: AbstractAsyncContextManager[RingSession]) -> str:
+    async def run_session(
+        self, context: AbstractAsyncContextManager[RingSession], advertisement_rssi_dbm: int | None = None
+    ) -> str:
+        """Run and terminally account for one connected physical session."""
         session: RingSession | None = None
         primary: BaseException | None = None
+        terminal_error: BaseException | None = None
         current: RingInfo | None = None
         outcome: str | None = None
         teardown_error = False
-        phase = SessionPhaseState("connect")
+        quality = SessionQuality(self.run.device_slug, advertisement_rssi_dbm, self.run.options.phy_policy)
+        phase = SessionPhaseState("connect", quality)
         self._storage_not_ready_responses = 0
         try:
-            session = await bounded(context.__aenter__(), self.run.options.timeouts.info)
-            phase.value = "info"
-            current = await self._info(session)
-            await self._collect_telemetry(session, current, phase)
-            while True:
-                phase.value = "read/reconcile"
-                outcome, current = await self.run.callbacks.connected_step(session, current, self._info, phase)
-                if outcome in ("drained", "collected"):
-                    break
-        except asyncio.CancelledError as error:
-            primary = error
-            raise
-        except Exception as error:  # noqa: BLE001 - backend errors reach retry policy
-            primary = error
-            outcome = await recoverable_session_outcome(session, phase.value, error, self.run.options, self.run.runtime)
-        finally:
-            if session is not None:
-                teardown_error = await teardown_was_interrupted(
-                    context, primary, self.run.options.timeouts.info, self.run.options.activity, self.run.runtime
-                )
-        try:
-            await self.run.callbacks.post_session_checkpoint()
-        except BaseException as error:
-            if self.run.runtime.is_writer_failed(error):
+            try:
+                session = await bounded(context.__aenter__(), self.run.options.timeouts.info)
+                phase.value = "info"
+                current = await self._info(session)
+                await self._collect_telemetry(session, current, phase)
+                while True:
+                    phase.value = "read/reconcile"
+                    outcome, current = await self.run.callbacks.connected_step(session, current, self._info, phase)
+                    if outcome in ("drained", "collected"):
+                        break
+            except asyncio.CancelledError as error:
+                primary = error
                 raise
+            except Exception as error:  # noqa: BLE001 - backend errors reach retry policy
+                primary = error
+                outcome = await recoverable_session_outcome(
+                    session, phase.value, error, self.run.options, self.run.runtime
+                )
+            finally:
+                if session is not None:
+                    teardown_error = await teardown_was_interrupted(
+                        context, primary, self.run.options.timeouts.info, self.run.options.activity, self.run.runtime
+                    )
+            await self.run.callbacks.post_session_checkpoint()
+            if teardown_error:
+                return "connected_interrupted"
+            if outcome is not None:
+                return outcome
+            raise RuntimeError("opportunistic session ended without an outcome")
+        except BaseException as error:
+            terminal_error = error
             raise
-        if teardown_error:
-            return "connected_interrupted"
-        if outcome is not None:
-            return outcome
-        raise RuntimeError("opportunistic session ended without an outcome")
+        finally:
+            self._record_session_quality(quality, outcome, teardown_error, terminal_error)
+
+    def _record_session_quality(
+        self,
+        quality: SessionQuality,
+        outcome: str | None,
+        teardown_error: bool,
+        error: BaseException | None,
+    ) -> None:
+        """Metrics are auxiliary evidence and must never alter capture control flow."""
+        metrics = self.run.options.quality_metrics
+        if metrics is None or not quality.attempted_read:
+            return
+        termination_class, terminal_outcome = _quality_terminal(outcome, teardown_error, error)
+        try:
+            metrics.record_transfer_session(
+                TransferSessionMetric(
+                    utc_timestamp(self.run.options.host_time()),
+                    quality.session_id,
+                    quality.device_slug,
+                    terminal_outcome,
+                    termination_class,
+                    quality.active_read_elapsed_ms,
+                    quality.requested_record_count,
+                    quality.received_raw_bytes,
+                    quality.submitted_raw_bytes,
+                    quality.written_raw_bytes,
+                    metrics.release_version,  # type: ignore[attr-defined]
+                    metrics.source_revision,  # type: ignore[attr-defined]
+                    quality.firmware_version,
+                    quality.phy_policy,
+                    quality.advertisement_rssi_dbm,
+                )
+            )
+        except Exception as metrics_error:  # noqa: BLE001 - metrics cannot stop audio capture
+            self.run.runtime.debug_exception(
+                "quality_metrics_write_error", metrics_error, event_type="transfer_session"
+            )
 
     async def _info(self, session: RingSession) -> RingInfo:
         while True:
@@ -323,7 +372,7 @@ class SessionLifecycle:
                     session,
                     status if isinstance(status, RingStatus) else None,
                     info,
-                    options.operational,
+                    _quality_aware_operational_emitter(options.operational, phase.quality),
                     clock=TelemetryClock(
                         options.host_time,
                         options.host_clock_synchronized or system_host_clock_synchronized,
@@ -336,6 +385,32 @@ class SessionLifecycle:
             raise
         except Exception as error:  # noqa: BLE001 - optional telemetry
             await report_session_error(options.activity, "telemetry", error, self.run.runtime)
+
+
+def _quality_aware_operational_emitter(
+    emitter: OperationalEmitter, quality: SessionQuality | None
+) -> OperationalEmitter:
+    """Copy only the already-collected firmware dimension into session evidence."""
+
+    def emit(event: Mapping[str, object]) -> object:
+        if quality is not None and event.get("event") == "pendant_observation":
+            firmware = event.get("firmware")
+            quality.firmware_version = firmware if isinstance(firmware, str) else None
+        return emitter(event)
+
+    return emit
+
+
+def _quality_terminal(outcome: str | None, teardown_error: bool, error: BaseException | None) -> tuple[str, str]:
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled", "cancelled"
+    if error is not None:
+        return ("retryable_error" if retryable(error) else "fatal_error"), "failed"
+    if teardown_error:
+        return "teardown_interrupted", "connected_interrupted"
+    if outcome in {"drained", "collected"}:
+        return "completed", outcome
+    return "retryable_error", outcome or "interrupted"
 
 
 async def recoverable_session_outcome(

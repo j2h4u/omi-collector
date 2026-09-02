@@ -291,12 +291,27 @@ class DebugLogConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class QualityMetricsConfig:
+    """Long-lived, append-only transfer evidence beneath the collector root."""
+
+    file_name: str = "quality.jsonl"
+    encoding: str = "utf-8"
+    source_revision_env: str = "OMI_COLLECTOR_SOURCE_REVISION"
+
+    def __post_init__(self) -> None:
+        _require_path_component(self.file_name, "file_name")
+        _require_encoding(self.encoding, "encoding")
+        _require_logger_name(self.source_revision_env.lower(), "source_revision_env")
+
+
+@dataclass(frozen=True, slots=True)
 class ObservabilityConfig:
     """Bounded diagnostics retained separately from the operational journal."""
 
     max_error_chain_entries: int = 8
     max_error_entry_chars: int = 1024
     debug_log: DebugLogConfig = DebugLogConfig()
+    quality_metrics: QualityMetricsConfig = QualityMetricsConfig()
 
     def __post_init__(self) -> None:
         _require_positive_int(self.max_error_chain_entries, "max_error_chain_entries")

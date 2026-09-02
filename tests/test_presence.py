@@ -6,6 +6,7 @@ from bleak.backends.device import BLEDevice
 
 from omi_collector.capture.adapters.bleak_transport import BleakPresenceObserver
 from omi_collector.capture.application.presence import (
+    PresenceAdvertisement,
     PresencePolicy,
     PresenceScanStopError,
     PresenceScanTransitionError,
@@ -83,12 +84,17 @@ def test_bleak_observer_requests_duplicate_data_and_filters_exact_address() -> N
         await observer.start(seen.append)
         callback = kwargs["detection_callback"]
         assert callable(callback)
-        callback(Device("AA:CC"), object())  # type: ignore[call-arg]
+
+        class Advertisement:
+            def __init__(self, rssi: int) -> None:
+                self.rssi = rssi
+
+        callback(Device("AA:CC"), Advertisement(-42))  # type: ignore[call-arg]
         matching = Device("aa:bb")
-        callback(matching, object())  # type: ignore[call-arg]
+        callback(matching, Advertisement(-73))  # type: ignore[call-arg]
         await observer.stop()
 
-        assert seen == [matching]
+        assert seen == [PresenceAdvertisement(matching, -73)]
         assert kwargs["bluez"] == {"adapter": "hci0", "filters": {"DuplicateData": True}}
         assert events == ["start", "stop"]
 
@@ -199,7 +205,7 @@ def test_expired_candidate_snapshot_returns_no_candidate_or_timestamp() -> None:
         await first
         await scheduler.attempt_finished("clean")
         now[0] = 61.0
-        assert scheduler._fresh_candidate_snapshot() == (None, None)
+        assert scheduler._fresh_candidate_snapshot() == (None, None, None)
         await scheduler.close()
 
     _run(scenario())

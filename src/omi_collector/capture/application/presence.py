@@ -18,6 +18,15 @@ from typing import Protocol, cast
 
 from ...config import DEFAULT_CONFIG
 
+
+@dataclass(frozen=True, slots=True)
+class PresenceAdvertisement:
+    """One advisory scanner observation retaining only candidate and RSSI."""
+
+    candidate: object
+    rssi_dbm: int | None = None
+
+
 PresenceCallback = Callable[[object], object]
 
 
@@ -68,6 +77,7 @@ class PresenceWake:
     reason: str
     candidate: object | None = None
     observed_at: float | None = None
+    advertisement_rssi_dbm: int | None = None
 
 
 class PresenceScanTransitionError(RuntimeError):
@@ -107,6 +117,7 @@ class PresenceScheduler:
         self._last_matching: float | None = None
         self._latest_candidate: object | None = None
         self._latest_candidate_at: float | None = None
+        self._latest_candidate_rssi_dbm: int | None = None
         self._confirmed_absent = True
         self._suppress_continuous_ad_wake = False
         self._drained_mode = False
@@ -137,6 +148,7 @@ class PresenceScheduler:
         """Discard a stale BlueZ candidate and require a fresh observation."""
         self._latest_candidate = None
         self._latest_candidate_at = None
+        self._latest_candidate_rssi_dbm = None
         self._last_matching = None
         self._confirmed_absent = True
         self._retry_deadline = None
@@ -155,8 +167,8 @@ class PresenceScheduler:
             if wake_reason is not None:
                 await self._stop_scan()
                 self._wake.clear()
-                candidate, observed_at = self._fresh_candidate_snapshot()
-                return PresenceWake(wake_reason, candidate, observed_at)
+                candidate, observed_at, rssi_dbm = self._fresh_candidate_snapshot()
+                return PresenceWake(wake_reason, candidate, observed_at, rssi_dbm)
 
             event_task = asyncio.create_task(self._wake.wait())
             timer_task = asyncio.create_task(self._wait_until(self._next_deadline(now)))
@@ -180,8 +192,8 @@ class PresenceScheduler:
                 self._wake.clear()
                 if self._ad_wake_allowed():
                     await self._stop_scan()
-                    candidate, observed_at = self._fresh_candidate_snapshot()
-                    return PresenceWake("advertisement", candidate, observed_at)
+                    candidate, observed_at, rssi_dbm = self._fresh_candidate_snapshot()
+                    return PresenceWake("advertisement", candidate, observed_at, rssi_dbm)
                 continue
             self._confirm_absence_if_due(self._clock())
 
@@ -237,12 +249,16 @@ class PresenceScheduler:
         except Exception:  # noqa: BLE001 - do not mask the operation being cleaned up
             return
 
-    def _on_matching_advertisement(self, candidate: object) -> None:
+    def _on_matching_advertisement(self, observation: object) -> None:
+        advertisement = (
+            observation if isinstance(observation, PresenceAdvertisement) else PresenceAdvertisement(observation)
+        )
         now = self._clock()
         previous = self._last_matching
         self._last_matching = now
-        self._latest_candidate = candidate
+        self._latest_candidate = advertisement.candidate
         self._latest_candidate_at = now
+        self._latest_candidate_rssi_dbm = advertisement.rssi_dbm
         gap = float("inf") if previous is None else max(0.0, now - previous)
         was_absent = self._confirmed_absent or gap >= self._policy.absence_seconds
         self._confirmed_absent = False
@@ -255,15 +271,15 @@ class PresenceScheduler:
         if not self._suppress_continuous_ad_wake and self._retry_deadline is None:
             self._wake.set()
 
-    def _fresh_candidate_snapshot(self) -> tuple[object | None, float | None]:
-        """Return a coherent fresh candidate/timestamp pair, or two Nones."""
+    def _fresh_candidate_snapshot(self) -> tuple[object | None, float | None, int | None]:
+        """Return a coherent fresh candidate/timestamp/RSSI tuple, or nulls."""
         candidate = self._latest_candidate
         observed_at = self._latest_candidate_at
         if candidate is None or observed_at is None:
-            return None, None
+            return None, None, None
         if self._clock() - observed_at > self._policy.absence_seconds:
-            return None, None
-        return candidate, observed_at
+            return None, None, None
+        return candidate, observed_at, self._latest_candidate_rssi_dbm
 
     async def _start_scan(self) -> None:
         if self._closed or self._scan_active:

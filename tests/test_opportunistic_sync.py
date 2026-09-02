@@ -22,6 +22,7 @@ from fakes import DelayedNotification, ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError, WriterProgress
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
+from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError, DurablePrefix
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
@@ -1278,6 +1279,7 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     _seed_streaming_partial(tmp_path, count=4, persisted=0)
     activity: list[ActivityEvent] = []
     operational_events: list[dict[str, object]] = []
+    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="abcdef1")
 
     def fail_operational(event: Mapping[str, object]) -> None:
         operational_events.append(dict(event))
@@ -1302,13 +1304,110 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
         Provider([session]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
         "omi",
-        replace(_options(activity=activity, batch_records=4), operational=fail_operational),
+        replace(
+            _options(activity=activity, batch_records=4),
+            operational=fail_operational,
+            quality_metrics=journal,
+            host_time=lambda: 1000.0,
+        ),
     )
 
     assert isinstance(result, CollectionResult)
     assert encode_read_command(101, 3) in session.writes
     assert ActivityEvent("prefix_retired") in activity
     assert any(event.get("event") == "loss_detected" for event in operational_events)
+    metrics = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
+    loss = next(item for item in metrics if item["event"] == "sequence_loss")
+    assert loss == {
+        "schema_version": 1,
+        "event": "sequence_loss",
+        "occurred_at": "1970-01-01T00:16:40.000+00:00",
+        "session_id": loss["session_id"],
+        "device_slug": "omi",
+        "missing_record_count": 1,
+        "missing_raw_bytes": RECORD_SIZE,
+        "reason": "device_cursor_advanced_before_host_durable_prefix",
+        "release_version": "test-version",
+        "source_revision": "abcdef1",
+        "firmware_version": None,
+    }
+
+
+@_async_test
+async def test_quality_metrics_failure_does_not_change_completed_audio_collection(tmp_path: Path) -> None:
+    class FailingMetrics:
+        release_version = "test-version"
+        source_revision = None
+
+        def record_transfer_session(self, _metric: object) -> None:
+            raise OSError("quality filesystem unavailable")
+
+        def record_sequence_loss(self, _metric: object) -> None:
+            raise OSError("quality filesystem unavailable")
+
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+        ),
+    )
+    clock = Clock()
+    options = OpportunisticOptions(
+        TransferTimeouts(1, 1),
+        RetryPolicy(backoff=(0.001,), batch_records=1, advance_enabled=False, stop_after_drained=True),
+        clock=clock,
+        sleep=clock.sleep,
+        host_time=lambda: 1000.0,
+        quality_metrics=FailingMetrics(),  # type: ignore[arg-type]
+    )
+
+    result = await run_opportunistic_collector(
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", options
+    )
+
+    assert isinstance(result, CollectionResult)
+    assert result.packet_count == 1
+
+
+@_async_test
+async def test_completed_read_emits_one_terminal_transfer_session_with_raw_counters(tmp_path: Path) -> None:
+    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="abcdef1")
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+        ),
+    )
+    clock = Clock()
+    options = OpportunisticOptions(
+        TransferTimeouts(1, 1),
+        RetryPolicy(backoff=(0.001,), batch_records=1, advance_enabled=False, stop_after_drained=True),
+        clock=clock,
+        sleep=clock.sleep,
+        host_time=lambda: 1000.0,
+        quality_metrics=journal,
+        phy_policy="force_1m",
+    )
+
+    result = await run_opportunistic_collector(
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", options
+    )
+
+    assert isinstance(result, CollectionResult)
+    [metric] = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
+    assert metric["event"] == "transfer_session"
+    assert metric["completed_at"] == "1970-01-01T00:16:40.000+00:00"
+    assert metric["outcome"] == "collected"
+    assert metric["termination_class"] == "completed"
+    assert metric["requested_record_count"] == 1
+    assert metric["record_size_bytes"] == RECORD_SIZE
+    assert metric["received_raw_bytes"] == RECORD_SIZE
+    assert metric["submitted_raw_bytes"] == RECORD_SIZE
+    assert metric["written_raw_bytes"] == RECORD_SIZE
+    assert metric["phy_policy"] == "force_1m"
+    assert metric["advertisement_rssi_dbm"] is None
 
 
 @_async_test

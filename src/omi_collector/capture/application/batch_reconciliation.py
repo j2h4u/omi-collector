@@ -27,6 +27,7 @@ from .ports import (
     SealResultShape,
     StagingPort,
 )
+from .quality_metrics import SequenceLossMetric, SessionQuality, utc_timestamp
 from .ring_transport import RingSession
 from .session_lifecycle import (
     InfoReader,
@@ -226,7 +227,7 @@ async def _run_connected_step(
         batch.info = current
 
     if batch.seal is None:
-        already_confirmed = await _read_and_seal(session, run, state, current, batch)
+        already_confirmed = await _read_and_seal(context, session, current, batch, phase)
         if already_confirmed is None:
             phase.value = "info"
             fresh = await info(session)
@@ -366,18 +367,19 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
 
 
 async def _read_and_seal(
+    context: _CoordinatorContext,
     session: RingSession,
-    run: _Run,
-    state: _State,
     current: RingInfo,
     batch: _Batch,
+    phase: SessionPhaseState,
 ) -> bool | None:
-    reconciliation = await _read_or_reconcile(session, current, batch, run)
+    run = context.run
+    reconciliation = await _read_or_reconcile(session, current, batch, run, phase)
     if isinstance(reconciliation, _PrefixPublished):
-        await _continue_after_prefix(state, batch, reconciliation, run.staging, run.options)
+        await _continue_after_prefix(context.state, batch, reconciliation, run.staging, run.options)
         return None
     if isinstance(reconciliation, _ReconcileRestart):
-        _continue_after_reconcile_restart(state)
+        _continue_after_reconcile_restart(context.state)
         return None
     prefix = batch.durable
     if prefix is None:
@@ -448,6 +450,7 @@ async def _read_or_reconcile(
     current: RingInfo,
     batch: _Batch,
     run: _Run,
+    phase: SessionPhaseState,
 ) -> _PrefixPublished | _ReconcileRestart | None:
     options = run.options
     prefix = batch.durable
@@ -465,7 +468,7 @@ async def _read_or_reconcile(
         await _quarantine_discontinuous_attempt(run, batch)
         return _ReconcileRestart()
     if cursor > prefix.next_sequence:
-        return await _publish_cursor_ahead(current, batch, options, cursor, prefix.next_sequence)
+        return await _publish_cursor_ahead(current, batch, run, prefix.next_sequence, phase.quality)
     if cursor == batch.end:
         # A restarted, fully checkpointed attempt has a persisted original
         # READ_BEGIN but no live writer command yet.  Rebind it through the
@@ -484,7 +487,7 @@ async def _read_or_reconcile(
         batch.writer.prepare_leg(read_start, batch.end - read_start),
         options.timeouts.transfer,
     )
-    await _read_leg_with_progress(session, batch, read_start, options)
+    await _read_leg_with_progress(session, batch, read_start, options, phase.quality)
     prefix = await _checkpoint_batch(batch, options)
     if current.read_sequence > prefix.next_sequence:
         raise CursorConsistencyError("device cursor passed the writer checkpoint")
@@ -496,6 +499,7 @@ async def _read_leg_with_progress(
     batch: _Batch,
     read_start: int,
     options: OpportunisticOptions,
+    quality: SessionQuality | None,
 ) -> collector.ReadLegResult:
     """Run one READ beside a coalescing, best-effort progress pump."""
     mailbox = collector.ProgressMailbox()
@@ -504,29 +508,41 @@ async def _read_leg_with_progress(
         cleanup_timeout=options.timeouts.info,
         progress_mailbox=mailbox,
     )
-    if options.progress is None:
-        return await collector.read_leg(
-            session,
-            batch.arena,
-            batch.writer,
-            read_start,
-            batch.end - read_start,
-            read_options,
-        )
-    read = asyncio.create_task(
-        collector.read_leg(session, batch.arena, batch.writer, read_start, batch.end - read_start, read_options)
-    )
-    pump = asyncio.create_task(
-        _pump_progress(mailbox, options.progress, options.config.transfer.progress_interval_seconds)
-    )
+    requested_records = batch.end - read_start
+    started_at = options.clock()
     try:
-        result = await read
-    except BaseException:
-        pump.cancel()
-        await asyncio.gather(pump, return_exceptions=True)
+        if options.progress is None:
+            result = await collector.read_leg(
+                session,
+                batch.arena,
+                batch.writer,
+                read_start,
+                requested_records,
+                read_options,
+            )
+        else:
+            read = asyncio.create_task(
+                collector.read_leg(session, batch.arena, batch.writer, read_start, requested_records, read_options)
+            )
+            pump = asyncio.create_task(
+                _pump_progress(mailbox, options.progress, options.config.transfer.progress_interval_seconds)
+            )
+            try:
+                result = await read
+            except BaseException:
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+                raise
+            await pump
+    except collector.TransferInterruptedError as error:
+        _note_quality_counters(quality, error.counters)
         raise
-    await pump
-    return result
+    else:
+        _note_quality_counters(quality, result.counters)
+        return result
+    finally:
+        if quality is not None:
+            quality.note_read(options.clock() - started_at, requested_records)
 
 
 async def _pump_progress(
@@ -579,10 +595,12 @@ async def _rebind_durable_batch(batch: _Batch, options: OpportunisticOptions) ->
 async def _publish_cursor_ahead(
     current: RingInfo,
     batch: _Batch,
-    options: OpportunisticOptions,
-    cursor: int,
+    run: _Run,
     durable_next: int,
+    quality: SessionQuality | None,
 ) -> _PrefixPublished:
+    options = run.options
+    cursor = current.read_sequence
     if not durable_next < cursor <= current.write_sequence or batch.end > current.write_sequence:
         raise CursorConsistencyError(f"device cursor {cursor} passed durable prefix {durable_next}")
     # No READ is legal after the device cursor passed the durable prefix.
@@ -601,7 +619,29 @@ async def _publish_cursor_ahead(
             "reason": "device cursor advanced before host durable prefix",
         },
     )
+    if quality is not None and options.quality_metrics is not None:
+        try:
+            options.quality_metrics.record_sequence_loss(
+                SequenceLossMetric(
+                    utc_timestamp(options.host_time()),
+                    quality.session_id,
+                    batch.device_slug,
+                    cursor - durable_next,
+                    (cursor - durable_next) * RECORD_SIZE,
+                    "device_cursor_advanced_before_host_durable_prefix",
+                    options.quality_metrics.release_version,
+                    options.quality_metrics.source_revision,
+                    quality.firmware_version,
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - metrics cannot stop audio capture
+            run.runtime.debug_exception("quality_metrics_write_error", error, event_type="sequence_loss")
     return _PrefixPublished(cast(SealResultShape, published) if published is not None else None)
+
+
+def _note_quality_counters(quality: SessionQuality | None, counters: collector.TransferCounters) -> None:
+    if quality is not None:
+        quality.note_counters(counters.received_bytes, counters.submitted_bytes, counters.written_bytes)
 
 
 async def _report_loss_detected(options: OpportunisticOptions, event: dict[str, object]) -> None:

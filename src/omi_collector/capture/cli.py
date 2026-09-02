@@ -21,10 +21,12 @@ from typing import cast
 from bleak.backends.device import BLEDevice
 
 from ..config import DEFAULT_CONFIG, CollectorConfig
+from ..core import package_version
 from .adapters.bleak_transport import BleakPresenceObserver, BleakRingTransport, Device
 from .adapters.opportunistic_runtime import OpportunisticRuntime
 from .adapters.phy_guard import ScopedPhyGuard
 from .adapters.publication import SealResult
+from .adapters.quality_metrics import JsonlQualityMetrics, source_revision_from_environment
 from .adapters.staging_store import StagingStore
 from .application import collector
 from .application.opportunistic_sync import (
@@ -234,6 +236,8 @@ async def collect(
             advance_enabled=False,
             stop_after_drained=True,
         ),
+        quality_metrics=_quality_metrics(staging, DEFAULT_CONFIG),
+        phy_policy="force_1m",
     )
     return await run_opportunistic_collector(provider, staging, device_slug, options, runtime=OpportunisticRuntime())
 
@@ -314,9 +318,29 @@ async def sync(  # noqa: PLR0913
         activity=_activity_callback(progress),
         operational=_operational_callback(progress),
         presence=presence,
+        quality_metrics=_quality_metrics(staging, config, debug_logger),
+        phy_policy="force_1m" if force_1m else "auto",
         config=config,
     )
     return await run_opportunistic_collector(provider, staging, device_slug, options, runtime=OpportunisticRuntime())
+
+
+def _quality_metrics(
+    staging: StagingStore, config: CollectorConfig, debug_logger: logging.Logger | None = None
+) -> JsonlQualityMetrics | None:
+    """Build auxiliary evidence storage without making capture depend on it."""
+    from .adapters.debug_logging import debug_exception
+
+    try:
+        return JsonlQualityMetrics(
+            staging.paths.root,
+            release_version=package_version(),
+            source_revision=source_revision_from_environment(config=config.observability.quality_metrics),
+            config=config.observability.quality_metrics,
+        )
+    except Exception as error:  # noqa: BLE001 - provenance/journal setup is auxiliary
+        debug_exception("quality_metrics_configuration_error", error, logger=debug_logger)
+        return None
 
 
 def _progress_callback(progress: ProgressReporter | None) -> collector.ProgressCallback | None:

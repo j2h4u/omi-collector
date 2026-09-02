@@ -9,6 +9,7 @@ Type=exec
 User=omi-collector
 Group=omi-collector
 EnvironmentFile=/etc/omi-collector/omi-collector.env
+EnvironmentFile=-/var/lib/omi-collector/deployment.env
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 UV_LINK_MODE=hardlink UV_CACHE_DIR=/var/lib/omi-collector/uv-cache XDG_STATE_HOME=/var/lib/omi-collector
 ExecStart=/usr/local/libexec/omi-collector/omi-collector-exec
 Restart=always

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import tomllib
 import zipfile
 from pathlib import Path
 from venv import EnvBuilder
@@ -14,6 +15,11 @@ def _run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
+    package_metadata = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = package_metadata.get("project")
+    if not isinstance(project, dict) or not isinstance(project.get("version"), str):
+        raise RuntimeError("pyproject.toml must declare [project].version")
+    expected_version = project["version"]
 
     with tempfile.TemporaryDirectory(prefix="omi-collector-packaging-") as tmp:
         workdir = Path(tmp)
@@ -47,9 +53,14 @@ def main() -> int:
             ]
         )
         _run([str(executable), "--help"])
+        version_result = subprocess.run([str(executable), "--version"], capture_output=True, check=True, text=True)
+        if version_result.stdout.strip() != expected_version:
+            raise RuntimeError(
+                f"installed CLI version {version_result.stdout.strip()!r} does not match {expected_version!r}"
+            )
         _run([str(executable), "health"])
 
-    print("packaging smoke passed: wheel built, installed, CLI help and health ran")
+    print("packaging smoke passed: wheel built, installed, CLI version, help, and health ran")
     return 0
 
 

@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  wait-for-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for CI to conclude on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deadline="$(( $(date +%s) + 2400 ))"
+          while :; do
+            state="$(gh api \
+              "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${HEAD_SHA}&per_page=100" \
+              --jq 'if (.workflow_runs | length) == 0 then "pending" else
+                      (.workflow_runs | sort_by(.run_number) | last
+                       | if .status != "completed" then "pending"
+                         elif .conclusion == "success" then "success"
+                         else "failed with " + (.conclusion // "null") + " at " + .html_url
+                         end)
+                    end')"
+            case "${state}" in
+              success)
+                echo "CI succeeded for ${HEAD_SHA}"
+                exit 0
+                ;;
+              pending)
+                ;;
+              *)
+                echo "::error::CI ${state}"
+                exit 1
+                ;;
+            esac
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::timed out waiting for CI on ${HEAD_SHA}"
+              exit 1
+            fi
+            sleep 20
+          done
+
+  release-please:
+    needs: wait-for-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      tag-name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Verify release-please emitted expected outputs
+        env:
+          RELEASES_CREATED: ${{ steps.release.outputs.releases_created }}
+          PATHS_RELEASED: ${{ steps.release.outputs.paths_released }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::${1}"
+            echo "::error::releases_created='${RELEASES_CREATED}' paths_released='${PATHS_RELEASED}'" \
+                 "release_created='${RELEASE_CREATED}' tag_name='${TAG_NAME}'"
+            exit 1
+          }
+
+          if [ -z "${RELEASES_CREATED}" ]; then
+            fail "release-please emitted no releases_created output; its output names may have changed"
+          fi
+
+          case "${RELEASES_CREATED}" in
+            true)
+              case "${PATHS_RELEASED}" in
+                *'"."'*) ;;
+                *) fail "the root package '.' is missing from paths_released" ;;
+              esac
+              [ "${RELEASE_CREATED}" = "true" ] || fail "release_created is not true for root release"
+              [ -n "${TAG_NAME}" ] || fail "tag_name is empty for root release"
+              echo "release ${TAG_NAME} created"
+              ;;
+            false)
+              [ -z "${RELEASE_CREATED}" ] || fail "no release was created yet release_created is set"
+              echo "no release on this commit"
+              ;;
+            *)
+              fail "unexpected releases_created value"
+              ;;
+          esac

@@ -189,6 +189,15 @@ just verify
 It runs static and architecture checks, the behavioral test suite, the CRAP
 complexity gate, packaging validation, a Docker build, and a runtime smoke.
 
+## Releases
+
+Release-please opens a release PR from merged Conventional Commits. Use `feat:`
+for a minor release, `fix:` for a patch, and `!` for a breaking release. Run
+`just release-check` before opening a releasable PR; multi-commit squash PRs
+need a `BEGIN_COMMIT_OVERRIDE` / `END_COMMIT_OVERRIDE` block in their body.
+Release-please owns `CHANGELOG.md`, `pyproject.toml`, and `uv.lock` version
+updates; review and merge its release PR to create the tag and GitHub release.
+
 ## Documentation
 
 - [Device protocol](docs/DEVICE_PROTOCOL.md) — GATT services, ring framing,

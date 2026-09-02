@@ -43,13 +43,13 @@ exact selected set on every exit path, including cancellation and recovery.
 ## Runtime operations
 
 systemd is the production supervisor. The public unit runs as the dedicated
-`omi-collector` system user and writes only beneath `/var/lib/omi-collector`.
-Keep the checkout root-owned/readable at the configured absolute project path;
-keep the environment file root-owned, group-readable by `omi-collector`, mode
-`0640`; and keep the state directory `omi-collector:omi-collector` mode `0750`.
+`omi-collector` system user. Keep the checkout root-owned/readable at the
+configured absolute project path; keep the environment file root-owned,
+group-readable by `omi-collector`, mode `0640`; and keep the service-local
+state directory `omi-collector:omi-collector` mode `0750`.
 
-Initial setup is deliberately small: copy `config/layout.toml` to
-`/var/lib/omi-collector/collector.toml`, copy and edit
+Initial setup is deliberately small. For this production host, copy
+`config/layout.toml` to `/srv/pipelines/omi/collector.toml`, copy and edit
 `config/omi-collector.env.example` at `/etc/omi-collector/omi-collector.env`,
 then run `sudo scripts/install-systemd-unit.sh`. The installer creates or
 validates the system account and state ownership, validates the staged wrapper
@@ -57,26 +57,25 @@ against the environment, validates the staged unit, and rolls both files back
 if the composite install cannot be reloaded or enabled. It never starts the
 service without `--restart`.
 
-The public unit intentionally permits writes only beneath
-`/var/lib/omi-collector`; keep the example layout there unless the host has a
-specific storage requirement. `OMI_COLLECTOR_LAYOUT_PATH` may point to any
-absolute regular non-symlink file, including one outside `/var/lib`, but that
-does not expand the unit's write boundary. For external collector or
-publication roots, create a host-only drop-in such as
+The layout schema is strict version two: `collector` is the private collector
+root and `source` is the direct publication root. `OMI_COLLECTOR_LAYOUT_PATH`
+may name any regular non-symlink absolute layout file; roots resolve relative to
+its parent. This host uses `/srv/pipelines/omi/collector.toml`. Create the two
+roots with ownership and permissions appropriate to the service account, then
+add this host-only drop-in at
 `/etc/systemd/system/omi-collector.service.d/storage.conf`:
 
 ```ini
 [Service]
-ReadWritePaths=/var/lib/omi-collector /srv/omi-collector/collector /srv/omi-collector/pipeline
+ReadWritePaths=/var/lib/omi-collector /srv/pipelines/omi/collector /srv/pipelines/omi/source
 ```
 
-Use the paths resolved by the layout (the layout parent plus its relative
-`collector.root` and `publication.root`), and keep host-specific paths out of
-the checked-in unit. The layout file's parent directories must permit
-`omi-collector` traversal and reading; its collector and publication roots
-must permit that account to write. Set ownership or narrowly scoped filesystem
-ACLs deliberately, then validate the drop-in and reload systemd. The installer
-still enforces `root:omi-collector` mode `0640` on every accepted layout file.
+Keep host-specific paths out of the checked-in unit. The layout file's parent
+directories must permit `omi-collector` traversal and reading; both declared
+roots must permit that account to write. Set ownership or narrowly scoped
+filesystem ACLs deliberately, then validate the drop-in and reload systemd. The
+installer still enforces `root:omi-collector` mode `0640` on every accepted
+layout file.
 
 Prepare the dedicated noneditable UV environment as the service account:
 

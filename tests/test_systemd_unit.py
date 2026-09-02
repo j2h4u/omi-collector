@@ -113,7 +113,7 @@ def test_wrapper_and_example_require_explicit_operator_values() -> None:
     assert _DEPLOYER.stat().st_mode & 0o111
     assert "eval" not in wrapper
     assert "OMI_COLLECTOR_DEVICE_ADDRESS=AA:BB:CC:DD:EE:FF" in example
-    assert "OMI_COLLECTOR_LAYOUT_PATH=/var/lib/omi-collector/collector.toml" in example
+    assert "OMI_COLLECTOR_LAYOUT_PATH=/srv/pipelines/omi/collector.toml" in example
     assert "OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT=/var/lib/omi-collector/venv" in example
 
 

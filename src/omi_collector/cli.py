@@ -91,7 +91,7 @@ def _staging(layout: StorageLayout) -> StagingStore:
     return StagingStore.from_paths(
         StagingPaths(
             layout.collector.root,
-            layout.publication.raw,
+            layout.publication.root,
             layout.collector.attempts,
             layout.collector.quarantine,
             layout.collector.lock,
@@ -457,7 +457,7 @@ def device_metrics(
         str, typer.Option("--device-slug", help="Stable local directory component for this pendant.")
     ],
 ) -> None:
-    """Report metrics for the raw bundles currently visible to the collector."""
+    """Report metrics for the source bundles currently visible to the collector."""
     from omi_collector.spool_metrics import SpoolMetricsError
 
     try:
@@ -466,7 +466,7 @@ def device_metrics(
         if metrics is None:
             from omi_collector.spool_metrics import collect_spool_metrics as metrics
         result = cast(Callable[..., object], metrics)(
-            layout.publication.raw,
+            layout.publication.root,
             device_slug,
             observation_root=layout.collector.device_state,
         )

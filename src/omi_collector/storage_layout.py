@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Final, cast
 
-_VERSION: Final = 1
+_VERSION: Final = 2
 _COLLECTOR_KEYS: Final = frozenset({"root", "attempts", "quarantine", "lock", "device_state", "debug_log"})
-_PUBLICATION_KEYS: Final = frozenset({"root", "raw"})
+_PUBLICATION_KEYS: Final = frozenset({"root"})
 
 
 class StorageLayoutError(ValueError):
@@ -32,15 +32,14 @@ class CollectorLayout:
 
 @dataclass(frozen=True, slots=True)
 class PublicationLayout:
-    """Resolved paths owned by the downstream publication boundary."""
+    """The single source root owned by the downstream publication boundary."""
 
     root: Path
-    raw: Path
 
 
 @dataclass(frozen=True, slots=True)
 class StorageLayout:
-    """The complete resolved version-one collector/publication contract."""
+    """The complete resolved version-two collector/publication contract."""
 
     path: Path
     collector: CollectorLayout
@@ -78,7 +77,6 @@ def load_storage_layout(path: Path) -> StorageLayout:
     )
     publication = PublicationLayout(
         root=publication_root,
-        raw=_component(publication_root, publication_values["raw"], "publication.raw"),
     )
     _validate_unique_paths(
         (
@@ -89,7 +87,6 @@ def load_storage_layout(path: Path) -> StorageLayout:
             collector.device_state,
             collector.debug_log,
             publication.root,
-            publication.raw,
         )
     )
     for candidate in (
@@ -100,7 +97,6 @@ def load_storage_layout(path: Path) -> StorageLayout:
         collector.device_state,
         collector.debug_log,
         publication.root,
-        publication.raw,
     ):
         if os.path.lexists(candidate) and candidate.is_symlink():
             raise StorageLayoutError(f"layout target must not be a symlink: {candidate.name}")

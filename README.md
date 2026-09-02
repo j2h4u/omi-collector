@@ -82,8 +82,9 @@ sends an explicit `ADVANCE` command.
 ## Production installation
 
 The supported production shape is a root-owned checkout, a dedicated
-`omi-collector` service account, and mutable state under
-`/var/lib/omi-collector`.
+`omi-collector` service account, private mutable state under
+`/srv/pipelines/omi/collector`, and published source bundles under
+`/srv/pipelines/omi/source`.
 
 ```bash
 sudo git clone https://github.com/j2h4u/omi-collector.git /opt/omi-collector
@@ -91,11 +92,13 @@ cd /opt/omi-collector
 UV_BIN=$(command -v uv)
 [[ "$UV_BIN" == /usr/local/bin/uv ]] || \
   sudo install -o root -g root -m 0755 "$UV_BIN" /usr/local/bin/uv
-sudo install -d -o root -g root -m 0755 /etc/omi-collector /var/lib/omi-collector
-sudo install -o root -g root -m 0640 config/layout.toml /var/lib/omi-collector/collector.toml
+sudo install -d -o root -g root -m 0755 /etc/omi-collector /var/lib/omi-collector /srv/pipelines/omi
+sudo install -o root -g root -m 0640 config/layout.toml /srv/pipelines/omi/collector.toml
 sudo install -o root -g root -m 0600 config/omi-collector.env.example /etc/omi-collector/omi-collector.env
 sudoedit /etc/omi-collector/omi-collector.env
 sudo scripts/install-systemd-unit.sh
+sudo install -d -o omi-collector -g omi-collector -m 0750 \
+  /srv/pipelines/omi/collector /srv/pipelines/omi/source
 sudo -u omi-collector env HOME=/var/lib/omi-collector \
   UV_CACHE_DIR=/var/lib/omi-collector/uv-cache \
   UV_PROJECT_ENVIRONMENT=/var/lib/omi-collector/venv UV_LINK_MODE=hardlink \
@@ -128,34 +131,37 @@ service, and requires both application readiness and a stable process.
 
 ## Storage
 
-The default layout keeps private collector state and published bundles below
-`/var/lib/omi-collector`. Paths are configured in a TOML layout file rather
-than hard-coded in the application.
+The recommended production layout file is `/srv/pipelines/omi/collector.toml`.
+Its parent is the Omi root, with `collector` and `source` as direct sibling
+roots. The collector keeps private state under the former; each device slug
+creates its own bundle directory directly below the latter, such as
+`/srv/pipelines/omi/source/omi-cv1`. The application accepts any absolute,
+regular, non-symlink layout file; all declared roots resolve relative to its
+parent.
 
-An external layout may use any absolute regular, non-symlink file. External
-data roots also need a host-specific systemd drop-in, for example:
+This host's data roots need a host-specific systemd drop-in, for example:
 
 ```ini
 # /etc/systemd/system/omi-collector.service.d/storage.conf
 [Service]
-ReadWritePaths=/var/lib/omi-collector /srv/omi/collector /srv/omi/pipeline/raw
+ReadWritePaths=/var/lib/omi-collector /srv/pipelines/omi/collector /srv/pipelines/omi/source
 ```
 
 Do not add host-specific paths to the checked-in base unit. Grant the service
 account only the traversal and write permissions it needs.
 
 Published bundles are a shared boundary. If another local account consumes
-them, configure either a shared Unix group or a default ACL on the raw root.
+them, configure either a shared Unix group or a default ACL on the source root.
 For a named downstream account, the ACL shape is:
 
 ```bash
-sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /path/to/raw
-sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /path/to/raw
+sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /srv/pipelines/omi/source
+sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /srv/pipelines/omi/source
 ```
 
-Replace `DOWNSTREAM` and the path, and ensure every parent directory is
-traversable by both accounts. Verify access as the downstream account after the
-first bundle is published.
+Replace `DOWNSTREAM`, and ensure every parent directory is traversable by both
+accounts. Verify access as the downstream account after the first bundle is
+published.
 
 ## Safety model
 

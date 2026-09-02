@@ -28,6 +28,7 @@ from omi_collector.spool_metrics import (
     SpoolMetricsError,
     SpoolWindowMetrics,
 )
+from omi_collector.storage_layout import load_storage_layout
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -43,7 +44,7 @@ def _capture_root(tmp_path: Path) -> Path:
 def _layout(tmp_path: Path) -> Path:
     path = tmp_path / "layout.toml"
     path.write_text(
-        """version = 1
+        """version = 2
 
 [collector]
 root = "collector"
@@ -54,8 +55,7 @@ device_state = "device.json"
 debug_log = "debug.jsonl"
 
 [publication]
-root = "pipeline"
-raw = "raw"
+root = "source"
 """,
         encoding="utf-8",
     )
@@ -74,6 +74,12 @@ def test_health_command_reports_ok() -> None:
 
     assert result.exit_code == 0
     assert result.output.strip() == "ok"
+
+
+def test_staging_uses_the_publication_source_root_directly(tmp_path: Path) -> None:
+    store = cli._staging(load_storage_layout(_layout(tmp_path)))
+
+    assert store.paths.capture_root == tmp_path / "source"
 
 
 def test_sync_announces_loaded_layout_before_absent_pendant_wait(
@@ -199,7 +205,7 @@ def test_device_metrics_reports_one_stable_json_object(monkeypatch: pytest.Monke
 
     assert result.exit_code == 0
     assert result.output == json.dumps(expected.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
-    assert captured == [(tmp_path / "pipeline" / "raw", "omi", tmp_path / "collector" / "device.json")]
+    assert captured == [(tmp_path / "source", "omi", tmp_path / "collector" / "device.json")]
 
 
 def test_device_metrics_reports_malformed_authority_as_nonzero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

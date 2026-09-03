@@ -62,6 +62,11 @@ class QuarantineMaintenance:
         except OpportunisticSyncError as error:
             await self._quarantine_pending(str(error), original_error=error)
             pending = None
+        except Exception as error:
+            if not self._runtime.is_staging_error(error):
+                raise
+            await self._quarantine_pending(str(error), original_error=error)
+            pending = None
         if pending is None:
             state = PendingStartupState(None, None)
         elif getattr(pending, "mode", None) != "streaming":

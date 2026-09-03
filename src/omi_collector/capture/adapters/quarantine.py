@@ -64,9 +64,9 @@ def quarantine_pending(filesystem: StagingFilesystem, device_slug: str, reason: 
     """Move blocking partial evidence aside without inspecting its contents further.
 
     The device lease makes this operation mutually exclusive with a live
-    collector.  Only valid, unpublished attempts for ``device_slug`` are
-    moved; malformed, unattributed, published, and other-device evidence
-    remains in place.
+    collector.  Only valid, unpublished attempts and safely attributable
+    malformed attempts for ``device_slug`` are moved; unattributed, unsafe,
+    published, and other-device evidence remains in place.
     """
     _validate_slug(device_slug)
     if not isinstance(reason, str) or not reason.strip():
@@ -525,16 +525,51 @@ def _quarantine_candidates(filesystem: StagingFilesystem, device_slug: str) -> t
 
     candidates: list[Path] = []
     for entry in entries:
-        try:
-            mode = entry.lstat().st_mode
-            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                continue
-            descriptor = filesystem._read_descriptor(entry)
-        except OSError, StagingError:
-            continue
-        if descriptor.device_slug == device_slug and not is_nonblocking_attempt(filesystem, entry, descriptor):
+        descriptor, malformed = _inspect_pending_entry(filesystem, entry, device_slug)
+        if malformed or (
+            descriptor is not None
+            and descriptor.device_slug == device_slug
+            and not is_nonblocking_attempt(filesystem, entry, descriptor)
+        ):
             candidates.append(entry)
     return tuple(candidates)
+
+
+def _inspect_pending_entry(
+    filesystem: StagingFilesystem, entry: Path, device_slug: str
+) -> tuple[AttemptDescriptor | None, bool]:
+    """Inspect one entry, reporting an attributable malformed descriptor."""
+    try:
+        mode = entry.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise PendingAttemptError("partial staging evidence is not a regular directory")
+        return filesystem._read_descriptor(entry), False
+    except PendingAttemptError:
+        raise
+    except (OSError, StagingError) as error:
+        attributed_slug = _descriptor_device_slug(entry)
+        if attributed_slug == device_slug:
+            return None, True
+        if attributed_slug is not None:
+            return None, False
+        raise PendingAttemptError("partial attempt evidence cannot be attributed safely") from error
+
+
+def _descriptor_device_slug(entry: Path) -> str | None:
+    """Read only enough malformed metadata to establish safe ownership."""
+    try:
+        _require_regular_file(entry / "attempt.json", "attempt descriptor")
+        raw = _read_json(entry / "attempt.json")
+    except OSError, StagingError:
+        return None
+    value = raw.get("device_slug")
+    if not isinstance(value, str):
+        return None
+    try:
+        _validate_slug(value)
+    except AttemptStateError:
+        return None
+    return value
 
 
 def _quarantine_attempts_root(filesystem: StagingFilesystem, device_slug: str, reason: str) -> Path | None:
@@ -631,13 +666,14 @@ def pending_attempts(filesystem: StagingFilesystem, device_slug: str) -> tuple[A
         raise PendingAttemptError("partial staging cannot be inspected") from error
     result: list[AttemptDescriptor] = []
     for entry in entries:
-        try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-            descriptor = filesystem._read_descriptor(entry)
-        except OSError, StagingError:
-            continue
-        if descriptor.device_slug == device_slug and not is_nonblocking_attempt(filesystem, entry, descriptor):
+        descriptor, malformed = _inspect_pending_entry(filesystem, entry, device_slug)
+        if malformed:
+            raise PendingAttemptError("malformed partial attempt evidence blocks resume")
+        if (
+            descriptor is not None
+            and descriptor.device_slug == device_slug
+            and not is_nonblocking_attempt(filesystem, entry, descriptor)
+        ):
             result.append(descriptor)
     return tuple(result)
 

@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable
+from json import dumps
 from pathlib import Path
 from struct import pack
 from typing import cast
@@ -62,6 +63,26 @@ def test_pending_startup_result_including_no_pending_is_memoized(tmp_path: Path,
     assert first.pending is None
     assert first.durable_next is None
     assert calls == 1
+
+
+def test_attributable_malformed_startup_evidence_is_quarantined_before_collection(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    malformed = tmp_path / "attempts" / ("f" * 32)
+    malformed.mkdir(parents=True)
+    (malformed / "attempt.json").write_text(
+        dumps({"attempt_id": malformed.name, "device_slug": "omi"}), encoding="utf-8"
+    )
+    (malformed / "records.bin").write_bytes(b"preserve")
+
+    maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+    state = _run(maintenance.prepare_pending_startup())
+
+    assert state == PendingStartupState(None, None)
+    assert not malformed.exists()
+    quarantined = tuple((tmp_path / "quarantine" / "omi").iterdir())
+    assert len(quarantined) == 2
+    source = next(path for path in quarantined if path.is_dir())
+    assert (source / "records.bin").read_bytes() == b"preserve"
 
 
 def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: Path) -> None:

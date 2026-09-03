@@ -17,9 +17,10 @@ Feature: Opportunistic raw collection from an Omi pendant
 
     Scenario: Missing advertisements do not prevent collection
       Given the pendant remains nearby without a fresh advertisement
-      When the periodic authoritative fallback becomes due
+      When 300 seconds pass without a fresh advertisement
       Then the collector attempts to reach the pendant
       And GATT INFO determines whether records are available
+      And active scanning remains the primary presence detector between fallbacks
 
     Scenario: A completed drain respects the pendant battery
       Given all currently available records were collected

@@ -67,7 +67,7 @@ class PresenceConfig:
     """Presence hysteresis and fallback timings, in seconds."""
 
     absence_seconds: float = 60.0
-    fallback_seconds: float = 30.0
+    fallback_seconds: float = 300.0
     drained_fallback_seconds: float = 900.0
     scan_transition_seconds: float = 2.0
     max_fallback_seconds: float = 300.0

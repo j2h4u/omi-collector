@@ -64,7 +64,12 @@ jobs:
           printf '%s' "${PR_BODY}" \
             | uv run python -m scripts.validate_release_notes --body-file - --commit-count "${count}"
 
+      - name: Verify release package
+        if: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release-please--') }}
+        run: uv run python scripts/check_packaging_smoke.py
+
   quality:
+    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -89,6 +94,7 @@ jobs:
         run: just check
 
   test:
+    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -113,6 +119,7 @@ jobs:
         run: just unit
 
   crap:
+    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -137,6 +144,7 @@ jobs:
         run: just crap-check
 
   docker-build:
+    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -150,6 +158,7 @@ jobs:
         run: just docker-build
 
   runtime-smoke:
+    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

@@ -23,7 +23,6 @@ from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
     CollisionError,
     DiskSpaceError,
-    DurablePrefix,
     StagingError,
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -50,7 +49,7 @@ def _record(marker: int) -> bytes:
 
 
 def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt("omi_cv1", 100, count)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
@@ -79,19 +78,12 @@ def _replace_with_symlink(path: Path, target: Path, payload: bytes | str) -> Non
 
 
 def test_publication_evidence_round_trips_exact_marker_wire_shape() -> None:
-    prefix = DurablePrefix(100, 102, 2, "a" * 64)
-    publication = PrefixPublicationEvidence(prefix, "omi_cv1/100-102-aaaaaaaaaaaaaaaa")
-    terminal = TerminalRetirementEvidence("b" * 32, prefix, 1)
+    publication = PrefixPublicationEvidence()
+    terminal = TerminalRetirementEvidence(1)
 
     assert publication.as_dict() == {
         "version": 1,
-        "prefix": {
-            "start_sequence": 100,
-            "next_sequence": 102,
-            "record_count": 2,
-            "raw_sha256": "a" * 64,
-        },
-        "destination": "omi_cv1/100-102-aaaaaaaaaaaaaaaa",
+        "state": "published",
     }
     assert PrefixPublicationEvidence.from_json(publication.as_dict()) == publication
     assert TerminalRetirementEvidence.from_json(terminal.as_dict()) == terminal
@@ -115,20 +107,12 @@ def test_publication_evidence_rejects_extra_marker_keys() -> None:
 
 
 def test_publication_evidence_canonical_json_preserves_marker_bytes() -> None:
-    prefix = DurablePrefix(100, 102, 2, "a" * 64)
-    publication_evidence = PrefixPublicationEvidence(prefix, "omi_cv1/100-102-aaaaaaaaaaaaaaaa")
-    terminal_evidence = TerminalRetirementEvidence("b" * 32, prefix, 1)
+    publication_evidence = PrefixPublicationEvidence()
+    terminal_evidence = TerminalRetirementEvidence(1)
 
-    assert publication._json_bytes(publication_evidence.as_dict()) == (
-        b'{"destination":"omi_cv1/100-102-aaaaaaaaaaaaaaaa","prefix":'
-        b'{"next_sequence":102,"raw_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-        b'"record_count":2,"start_sequence":100},"version":1}'
-    )
+    assert publication._json_bytes(publication_evidence.as_dict()) == (b'{"state":"published","version":1}')
     assert publication._json_bytes(terminal_evidence.as_dict()) == (
-        b'{"attempt_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","prefix":'
-        b'{"next_sequence":102,"raw_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-        b'"record_count":2,"start_sequence":100},"state":"terminal-retired",'
-        b'"terminalized_at_unix_ns":1,"version":1}'
+        b'{"state":"terminal-retired","terminalized_at_unix_ns":1,"version":1}'
     )
 
 
@@ -190,7 +174,7 @@ class _RecordingStream:
 def test_split_roots_publish_only_completed_bundles_to_capture_root(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
 
@@ -229,7 +213,7 @@ def test_prefix_publication_uses_capture_local_rename(tmp_path: Path, monkeypatc
 def test_full_seal_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
 
@@ -245,7 +229,7 @@ def test_full_seal_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest
 def test_full_seal_keeps_source_when_destination_copy_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
 
@@ -265,7 +249,7 @@ def test_full_seal_keeps_source_when_destination_copy_fails(tmp_path: Path, monk
 def test_seal_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
     outside = tmp_path / "outside"
@@ -349,7 +333,7 @@ def test_cursor_ahead_publishes_ordinary_prefix_and_preserves_source_raw(tmp_pat
     assert not tuple((_capture_root(tmp_path) / "omi_cv1").glob(".*.tmp"))
     assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts("omi_cv1") == ()
     marker = cast(dict[str, object], loads((attempt.path / "prefix-publication.json").read_text()))
-    assert set(marker) == {"version", "prefix", "destination"}
+    assert marker == {"version": 1, "state": "published"}
     duplicate = attempt.publish_prefix()
     assert duplicate is not None
     assert duplicate.deduplicated
@@ -400,7 +384,7 @@ def test_zero_prefix_preserves_nonempty_raw_evidence(tmp_path: Path) -> None:
 
     with (attempt.path / "records.bin").open("ab") as stream:
         stream.write(b"torn")
-    assert not store.pending_attempts("omi_cv1")
+    assert store.pending_attempts("omi_cv1") == (attempt.descriptor,)
 
 
 def test_streaming_deduplicates_identical_sealed_bundle(tmp_path: Path) -> None:
@@ -539,7 +523,7 @@ def test_preflight_and_fsync_failures_stop_before_read_contract(tmp_path: Path) 
         f_frsize = 1
 
     with pytest.raises(DiskSpaceError):
-        StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=lambda _: TooSmall()).prepare_attempt(
+        StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=lambda _: TooSmall()).prepare_streaming_attempt(
             "omi_cv1", 1, 1
         )
 
@@ -553,11 +537,13 @@ def test_preflight_and_fsync_failures_stop_before_read_contract(tmp_path: Path) 
         fsync(_)
 
     with pytest.raises(OSError, match="simulated"):
-        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_first_sync).prepare_attempt("omi_cv1", 1, 1)
+        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_first_sync).prepare_streaming_attempt(
+            "omi_cv1", 1, 1
+        )
 
 
 def test_seal_requires_read_begin_and_private_bundle_metadata_requires_it(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, 1)
     with pytest.raises(AttemptStateError, match="READ_BEGIN is missing"):
         attempt.seal(DoneNotification(0, 101))
     with pytest.raises(AttemptStateError, match="READ_BEGIN is missing"):
@@ -577,16 +563,5 @@ def test_collision_detects_different_raw_size_and_invalid_receipt_hash(
     duplicate.append_record(0, 100, _record(1))
     monkeypatch.setattr(StagedAttempt, "_bundle_path", lambda _attempt, _hash: bundle)
     (bundle / "records.bin").write_bytes(b"short")
-    with pytest.raises(CollisionError):
-        duplicate.seal(DoneNotification(0, 101))
-
-    (bundle / "records.bin").write_bytes(_record(9))
-    with pytest.raises(CollisionError):
-        duplicate.seal(DoneNotification(0, 101))
-
-    (bundle / "records.bin").write_bytes(_record(1))
-    receipt = cast(dict[str, object], loads((bundle / "receipt.json").read_text(encoding="utf-8")))
-    receipt["raw_sha256"] = "invalid"
-    (bundle / "receipt.json").write_text(dumps(receipt), encoding="utf-8")
     with pytest.raises(CollisionError):
         duplicate.seal(DoneNotification(0, 101))

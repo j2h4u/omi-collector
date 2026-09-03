@@ -54,9 +54,6 @@ class NotificationProtocolError(RingTransportError):
     """A control-notification callback delivered an invalid payload."""
 
 
-RingTransportDisconnected = RingTransportDisconnectedError
-
-
 class ControlNotificationStream(AsyncIterator[bytes]):
     """A bounded transport/control cushion fed by a BLE callback."""
 

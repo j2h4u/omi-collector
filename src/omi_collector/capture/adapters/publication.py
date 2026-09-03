@@ -7,7 +7,7 @@ import stat
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG
@@ -57,46 +57,38 @@ class SealResult:
 
 @dataclass(frozen=True, slots=True)
 class PrefixPublicationEvidence:
-    """Authenticated recoverable-prefix marker evidence."""
+    """State-only marker; prefix identity is canonical checkpoint state."""
 
-    prefix: DurablePrefix
-    destination: str | None
+    state: str = "published"
 
     @classmethod
     def from_json(cls, value: object) -> PrefixPublicationEvidence:
         if not isinstance(value, Mapping):
             raise AttemptStateError("prefix publication marker must be a JSON object")
-        if set(value) != {"version", "prefix", "destination"}:
+        if set(value) != {"version", "state"}:
             raise AttemptStateError("prefix publication marker schema is invalid")
         version = value.get("version")
         if isinstance(version, bool) or not isinstance(version, int) or version != 1:
             raise AttemptStateError("prefix publication marker version is invalid")
-        raw_prefix = value.get("prefix")
-        if not isinstance(raw_prefix, Mapping):
-            raise AttemptStateError("prefix publication marker prefix is invalid")
-        prefix = _prefix_from_json(raw_prefix)
-        destination = value.get("destination")
-        if destination is not None and not isinstance(destination, str):
-            raise AttemptStateError("prefix publication marker destination is invalid")
-        return cls(prefix, destination)
+        if value.get("state") != "published":
+            raise AttemptStateError("prefix publication marker state is invalid")
+        return cls("published")
 
     def as_dict(self) -> dict[str, object]:
-        return {"version": 1, "prefix": _prefix_dict(self.prefix), "destination": self.destination}
+        return {"version": 1, "state": self.state}
 
 
 @dataclass(frozen=True, slots=True)
 class TerminalRetirementEvidence:
-    """Authenticated terminal-retirement marker evidence."""
+    """State-only terminal marker; timestamp is needed for retention."""
 
-    attempt_id: str
-    prefix: DurablePrefix
     terminalized_at_unix_ns: int
 
     @classmethod
     def from_json(cls, value: object) -> TerminalRetirementEvidence:
         if not isinstance(value, Mapping):
             raise AttemptStateError("terminal-retired marker must be a JSON object")
-        expected = {"version", "state", "attempt_id", "prefix", "terminalized_at_unix_ns"}
+        expected = {"version", "state", "terminalized_at_unix_ns"}
         if set(value) != expected:
             raise AttemptStateError("terminal-retired marker schema is invalid")
         version = value.get("version")
@@ -108,26 +100,16 @@ class TerminalRetirementEvidence:
             or state != _TERMINAL_RETIRED_STATE
         ):
             raise AttemptStateError("terminal-retired marker identity is invalid")
-        attempt_id = value.get("attempt_id")
-        if not isinstance(attempt_id, str):
-            raise AttemptStateError("terminal-retired marker attempt_id is invalid")
-        _validate_attempt_id(attempt_id)
-        raw_prefix = value.get("prefix")
-        if not isinstance(raw_prefix, Mapping):
-            raise AttemptStateError("terminal-retired marker prefix is invalid")
-        prefix = _prefix_from_json(raw_prefix)
         terminalized_at = value.get("terminalized_at_unix_ns")
         if isinstance(terminalized_at, bool) or not isinstance(terminalized_at, int):
             raise AttemptStateError("terminal-retired marker timestamp is invalid")
         _validate_terminalized_at(terminalized_at)
-        return cls(attempt_id, prefix, terminalized_at)
+        return cls(terminalized_at)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "version": _TERMINAL_RETIREMENT_VERSION,
             "state": _TERMINAL_RETIRED_STATE,
-            "attempt_id": self.attempt_id,
-            "prefix": _prefix_dict(self.prefix),
             "terminalized_at_unix_ns": self.terminalized_at_unix_ns,
         }
 
@@ -412,86 +394,31 @@ def _prefix_publication_matches(
     """Check a source marker against its checkpoint and ordinary destination."""
     try:
         prefix = _published_prefix(source, descriptor, filesystem, io_chunk_bytes=io_chunk_bytes)
-        if marker.prefix != prefix:
+        if marker.state != "published":
             return False
-        destination_name = marker.destination
-        if destination_name is None:
-            return prefix.record_count == 0
-        if not isinstance(destination_name, str) or not _safe_destination_name(destination_name):
-            return False
-        destination = filesystem.capture_root / destination_name
-        expected_destination = _prefix_destination_for(filesystem.capture_root, descriptor.device_slug, prefix)
-        return (
-            destination == expected_destination
-            and not destination.is_symlink()
-            and _prefix_destination_matches(
-                destination,
-                _read_prefix(source / _RAW_NAME, prefix.record_count * RECORD_SIZE),
-                _manifest_for_descriptor_prefix(descriptor, prefix),
-                io_chunk_bytes=io_chunk_bytes,
-            )
+        if prefix.record_count == 0:
+            return True
+        destination = _prefix_destination_for(filesystem.capture_root, descriptor.device_slug, prefix)
+        return not destination.is_symlink() and _prefix_destination_matches(
+            destination,
+            _read_prefix(source / _RAW_NAME, prefix.record_count * RECORD_SIZE),
+            _manifest_for_descriptor_prefix(descriptor, prefix),
+            io_chunk_bytes=io_chunk_bytes,
         )
     except AttemptStateError, OSError, TypeError:
         return False
 
 
-def _safe_destination_name(destination: str) -> bool:
-    parts = PurePosixPath(destination).parts
-    return not (not destination or Path(destination).is_absolute() or any(part in {"", ".", ".."} for part in parts))
-
-
-def _prefix_dict(prefix: DurablePrefix) -> dict[str, object]:
-    return {
-        "start_sequence": prefix.start_sequence,
-        "next_sequence": prefix.next_sequence,
-        "record_count": prefix.record_count,
-        "raw_sha256": prefix.raw_sha256,
-    }
-
-
-def _prefix_from_json(value: Mapping[str, object]) -> DurablePrefix:
-    expected = {"start_sequence", "next_sequence", "record_count", "raw_sha256"}
-    if set(value) != expected:
-        raise AttemptStateError("publication marker prefix schema is invalid")
-    start = value.get("start_sequence")
-    next_sequence = value.get("next_sequence")
-    count = value.get("record_count")
-    raw_sha256 = value.get("raw_sha256")
-    if any(isinstance(item, bool) or not isinstance(item, int) for item in (start, next_sequence, count)):
-        raise AttemptStateError("publication marker prefix coordinates are invalid")
-    if not isinstance(raw_sha256, str) or not _is_sha256(raw_sha256):
-        raise AttemptStateError("publication marker prefix hash is invalid")
-    assert isinstance(start, int)
-    assert isinstance(next_sequence, int)
-    assert isinstance(count, int)
-    if start < 0 or count < 0 or next_sequence != start + count:
-        raise AttemptStateError("publication marker prefix range is invalid")
-    return DurablePrefix(start, next_sequence, count, raw_sha256)
-
-
-def _terminal_retired_marker_matches(
-    marker: TerminalRetirementEvidence, descriptor: AttemptDescriptor, prefix: DurablePrefix
-) -> int | None:
+def _terminal_retired_marker_matches(marker: TerminalRetirementEvidence) -> int | None:
     """Return terminalization time for this exact terminal-only marker schema."""
-    if descriptor.mode != "streaming":
-        return None
-    if marker.attempt_id != descriptor.attempt_id or marker.prefix != prefix:
-        return None
     return marker.terminalized_at_unix_ns
 
 
 def _recoverable_prefix_marker_matches(
-    marker: PrefixPublicationEvidence, descriptor: AttemptDescriptor, prefix: DurablePrefix, root: Path
+    marker: PrefixPublicationEvidence,
 ) -> bool:
     """Validate the local recoverable marker without requiring its destination."""
-    if marker.prefix != prefix:
-        return False
-    destination_name = marker.destination
-    if prefix.record_count == 0:
-        return destination_name is None
-    if not isinstance(destination_name, str) or not _safe_destination_name(destination_name):
-        return False
-    return root / destination_name == _prefix_destination_for(root, descriptor.device_slug, prefix)
+    return marker.state == "published"
 
 
 def _prefix_destination_matches(
@@ -534,7 +461,7 @@ def _manifest_for_descriptor_prefix(descriptor: AttemptDescriptor, prefix: Durab
 
 def _receipt_matches(receipt: dict[str, object], manifest: dict[str, object]) -> bool:
     """Check a sealed receipt without tying an exact duplicate to this attempt ID."""
-    if not set(receipt).issubset({"attempt_id", "raw_sha256", "status", "recovery_leg"}):
+    if not set(receipt).issubset({"attempt_id", "raw_sha256", "status"}):
         return False
     try:
         attempt_id = _required_str(receipt, "attempt_id")

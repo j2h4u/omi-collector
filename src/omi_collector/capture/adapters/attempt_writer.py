@@ -33,7 +33,7 @@ class WriterTarget(Protocol):
         """Prepare the target attempt before any leg is accepted."""
 
     def prepare_leg(self, start_sequence: int, record_count: int) -> object:
-        """Prepare one target leg before READ_BEGIN or DATA is accepted."""
+        """Prepare one target range before READ_BEGIN or DATA is accepted."""
 
     def read_begin(self, notice: object) -> object:
         """Persist the beginning of the read represented by ``notice``."""
@@ -422,7 +422,7 @@ class AttemptWriter:
         If the caller is cancelled, the close command remains owned by the
         writer thread and is given the same bounded opportunity to finish;
         cancellation is then re-raised.  A target that remains blocked yields
-        :class:`WriterShutdownTimeout` rather than being silently abandoned.
+        :class:`WriterShutdownTimeoutError` rather than being silently abandoned.
         """
         if timeout is None:
             timeout = self._config.close_timeout_seconds
@@ -716,13 +716,8 @@ __all__ = [
     "WriterProgress",
     "WriterQueueFullError",
     "WriterResult",
-    "WriterShutdownTimeout",
     "WriterShutdownTimeoutError",
     "WriterSnapshot",
     "WriterState",
     "WriterTarget",
 ]
-
-# Compatibility spelling kept short for callers that use the public error
-# name from the initial boundary draft; the class itself follows N818.
-WriterShutdownTimeout = WriterShutdownTimeoutError

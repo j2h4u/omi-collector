@@ -27,7 +27,6 @@ from .staging_contract import (
     _PUBLISHED_QUARANTINE_STATE,
     _RAW_NAME,
     _RECEIPT_NAME,
-    _SALVAGE_PENDING_NAME,
     _TERMINAL_RETIRED_NAME,
     _TERMINAL_RETIREMENT_VERSION,
     _UNPROCESSABLE_QUARANTINE_NAME,
@@ -136,7 +135,7 @@ def terminalize_prefix_attempt(filesystem: StagingFilesystem, device_slug: str, 
             io_chunk_bytes=filesystem._durability.io_chunk_bytes,
         ):
             raise AttemptStateError("recoverable prefix publication marker is invalid")
-        prefix = _published_prefix(path, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
+        _published_prefix(path, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
         terminalized_at_unix_ns = _wall_clock_ns()
         _validate_terminalized_at(terminalized_at_unix_ns)
         terminal_marker = path / _TERMINAL_RETIRED_NAME
@@ -144,11 +143,7 @@ def terminalize_prefix_attempt(filesystem: StagingFilesystem, device_slug: str, 
             _sync_directory(path, filesystem._fsync)
             filesystem._write_json_atomic(
                 terminal_marker,
-                TerminalRetirementEvidence(
-                    descriptor.attempt_id,
-                    prefix,
-                    terminalized_at_unix_ns,
-                ).as_dict(),
+                TerminalRetirementEvidence(terminalized_at_unix_ns).as_dict(),
             )
             _sync_directory(path, filesystem._fsync)
         except BaseException:
@@ -309,24 +304,6 @@ def mark_quarantine_unprocessable(filesystem: StagingFilesystem, device_slug: st
     )
 
 
-def mark_quarantine_salvage_pending(filesystem: StagingFilesystem, device_slug: str, source: Path, reason: str) -> None:
-    """Classify valid evidence whose publication may succeed on a later pass."""
-    if not reason:
-        raise AttemptStateError("salvage reason must be non-empty")
-    _mark_quarantine(
-        filesystem,
-        source,
-        device_slug,
-        _SALVAGE_PENDING_NAME,
-        {
-            "version": _TERMINAL_RETIREMENT_VERSION,
-            "state": "salvage-pending",
-            "last_failure_at_unix_ns": _wall_clock_ns(),
-            "reason": reason,
-        },
-    )
-
-
 def _mark_quarantine(
     filesystem: StagingFilesystem, source: Path, device_slug: str, marker_name: str, payload: dict[str, object]
 ) -> None:
@@ -480,7 +457,7 @@ def _terminal_retired_at(
         return None
     try:
         _require_regular_file(marker_path, "terminal-retired marker")
-        prefix = _published_prefix(
+        _published_prefix(
             path,
             descriptor,
             filesystem=filesystem,
@@ -492,14 +469,9 @@ def _terminal_retired_at(
         recoverable_marker = PrefixPublicationEvidence.from_json(_read_json(recoverable_marker_path))
         if not _recoverable_prefix_marker_matches(
             recoverable_marker,
-            descriptor,
-            prefix,
-            filesystem.capture_root,
         ):
             return None
-        return _terminal_retired_marker_matches(
-            TerminalRetirementEvidence.from_json(_read_json(marker_path)), descriptor, prefix
-        )
+        return _terminal_retired_marker_matches(TerminalRetirementEvidence.from_json(_read_json(marker_path)))
     except OSError, StagingError, AttemptStateError:
         return None
 

@@ -146,16 +146,16 @@ def test_noncanonical_existing_bundle_is_retryable_not_a_conflict(tmp_path: Path
         publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
 
 
-def test_rejects_non_null_recovery_leg(tmp_path: Path) -> None:
+def test_rejects_unknown_attempt_field(tmp_path: Path) -> None:
     source, _, _ = _quarantined_attempt(tmp_path)
     attempt = cast(dict[str, object], loads(source.joinpath("attempt.json").read_text(encoding="utf-8")))
-    attempt["recovery_leg"] = {"start_sequence": 100, "packet_count": 1}
+    attempt["unexpected"] = True
     source.joinpath("attempt.json").write_text(
         dumps(attempt),
         encoding="utf-8",
     )
 
-    with pytest.raises(QuarantinePublishError, match="recovery leg must be null"):
+    with pytest.raises(QuarantinePublishError, match="schema is not exact"):
         publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
 
 

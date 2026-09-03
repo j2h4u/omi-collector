@@ -15,7 +15,6 @@ from . import publication, quarantine
 from .attempts import StagedAttempt
 from .recovery import Recovery
 from .staging_contract import (
-    _COMMITS_NAME,
     _DESCRIPTOR_NAME,
     _RAW_NAME,
     AttemptDescriptor,
@@ -60,12 +59,14 @@ class StagingStore:
             statvfs_fn=statvfs_fn,
             config=config,
         )
+        self._validated_attempts: dict[str, StagedAttempt] = {}
 
     @classmethod
     def from_paths(cls, paths: StagingPaths, *, config: CollectorConfig = DEFAULT_CONFIG) -> StagingStore:
         """Build a store from the external layout authority."""
         store = cls.__new__(cls)
         store._filesystem = StagingFilesystem.from_paths(paths, config=config)
+        store._validated_attempts = {}
         return store
 
     @property
@@ -90,13 +91,21 @@ class StagingStore:
         self._filesystem.preflight_storage()
 
     def quarantine_pending(self, device_slug: str, reason: str) -> tuple[Path, ...]:
-        return quarantine.quarantine_pending(
+        moved = quarantine.quarantine_pending(
             self._filesystem,
             device_slug,
             reason,
         )
+        for attempt_id, attempt in tuple(self._validated_attempts.items()):
+            if not attempt.path.exists():
+                self._validated_attempts.pop(attempt_id, None)
+                attempt.close()
+        return moved
 
     def quarantine_attempt_source(self, device_slug: str, attempt_id: str) -> Path:
+        cached = self._validated_attempts.pop(attempt_id, None)
+        if cached is not None:
+            cached.close()
         return quarantine.quarantine_attempt_source(
             self._filesystem,
             device_slug,
@@ -143,14 +152,6 @@ class StagingStore:
             reason,
         )
 
-    def mark_quarantine_salvage_pending(self, device_slug: str, source: Path, reason: str) -> None:
-        quarantine.mark_quarantine_salvage_pending(
-            self._filesystem,
-            device_slug,
-            source,
-            reason,
-        )
-
     def sweep_terminal_quarantine(
         self, device_slug: str, *, should_defer: Callable[[], bool] | None = None
     ) -> tuple[Path, ...]:
@@ -166,19 +167,6 @@ class StagingStore:
             device_slug,
         )
 
-    def prepare_attempt(self, device_slug: str, start_sequence: int, packet_count: int) -> StagedAttempt:
-        """Persist an empty attempt and return only after its descriptor is durable."""
-        _validate_int(start_sequence, "start_sequence")
-        _validate_count(packet_count)
-        _validate_slug(device_slug)
-        self._filesystem._preflight(packet_count, device_slug)
-        self._filesystem._ensure_directory(self.attempts_root)
-        descriptor = AttemptDescriptor(uuid4().hex, device_slug, start_sequence, packet_count)
-        attempt_path = self.attempts_root / descriptor.attempt_id
-        self._filesystem._ensure_directory(attempt_path)
-        self._filesystem._write_json_atomic(attempt_path / _DESCRIPTOR_NAME, asdict(descriptor))
-        return StagedAttempt(self._filesystem, attempt_path, descriptor)
-
     def prepare_streaming_attempt(self, device_slug: str, start_sequence: int, packet_count: int) -> StagedAttempt:
         """Prepare a restart-safe streaming attempt and its empty checkpoint."""
         # Mirrors the app's buffered/full-read transfer model:
@@ -193,7 +181,6 @@ class StagingStore:
             device_slug,
             start_sequence,
             packet_count,
-            mode="streaming",
         )
         attempt_path = self.attempts_root / descriptor.attempt_id
         self._filesystem._ensure_directory(attempt_path)
@@ -214,6 +201,25 @@ class StagingStore:
         _require_regular_directory(attempt_path)
         return StagedAttempt(self._filesystem, attempt_path, descriptor, live=False)
 
+    def open_attempt_for_resume(self, attempt_id: str) -> StagedAttempt:
+        """Hydrate a pending attempt once for startup validation and reuse."""
+        _validate_attempt_id(attempt_id)
+        attempt_path = self.attempts_root / attempt_id
+        descriptor = self._filesystem._read_descriptor(attempt_path)
+        _require_regular_directory(attempt_path)
+        # This is still inspection.  Promotion is performed only by
+        # ``activate_for_resume`` after the device lease is held.
+        return StagedAttempt(self._filesystem, attempt_path, descriptor, live=False)
+
+    def retain_validated_attempt(self, attempt_id: str, attempt: object) -> None:
+        """Transfer ownership of a startup-hydrated attempt to the next lease."""
+        if not isinstance(attempt, StagedAttempt):
+            raise TypeError("validated attempt must be a StagedAttempt")
+        previous = self._validated_attempts.pop(attempt_id, None)
+        if previous is not None and previous is not attempt:
+            previous.close()
+        self._validated_attempts[attempt_id] = attempt
+
     def resume_streaming_attempt(self, device_slug: str, lease: DeviceLock) -> StagedAttempt | None:
         """Validate and reopen the unique streaming partial under an active lease.
 
@@ -230,12 +236,12 @@ class StagingStore:
         if not candidates:
             return None
         descriptor = candidates[0]
-        if descriptor.mode != "streaming":
-            raise PendingAttemptError("non-streaming partial evidence cannot be resumed")
         path = self.attempts_root / descriptor.attempt_id
         _require_regular_directory(path)
-        attempt = StagedAttempt(self._filesystem, path, descriptor, live=True, resume=True)
-        attempt._resume_lease = lease
+        attempt = self._validated_attempts.pop(descriptor.attempt_id, None)
+        if attempt is None:
+            attempt = StagedAttempt(self._filesystem, path, descriptor, live=False)
+        attempt.activate_for_resume(lease)
         return attempt
 
     def recover_attempt(self, attempt_id: str) -> Recovery:
@@ -245,14 +251,7 @@ class StagingStore:
         try:
             return self.open_attempt(attempt_id).recover()
         except StagingError as error:
-            return Recovery(
-                attempt_id,
-                0,
-                _file_size(attempt_path / _RAW_NAME),
-                _file_size(attempt_path / _COMMITS_NAME),
-                False,
-                str(error),
-            )
+            return Recovery(attempt_id, 0, _file_size(attempt_path / _RAW_NAME), False, str(error))
 
     def pending_attempts(self, device_slug: str) -> tuple[AttemptDescriptor, ...]:
         return quarantine.pending_attempts(self._filesystem, device_slug)

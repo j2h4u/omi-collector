@@ -7,8 +7,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from typing import cast
 
+from ...config import DEFAULT_CONFIG, CollectorConfig
 from .ports import (
     AttemptDescriptorShape,
     CaptureRuntimePort,
@@ -45,12 +47,18 @@ class QuarantineMaintenance:
         device_slug: str,
         activity: ActivityCallback | None,
         runtime: CaptureRuntimePort,
+        *,
+        config: CollectorConfig = DEFAULT_CONFIG,
     ) -> None:
         self._staging = staging
         self._device_slug = device_slug
         self._activity = activity
         self._runtime = runtime
+        self._config = config
         self._startup_state: PendingStartupState | None = None
+        self._maintenance_not_before = 0.0
+        self._quarantine_retry_not_before = 0.0
+        self._quarantine_retry_number = 0
 
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
@@ -69,9 +77,6 @@ class QuarantineMaintenance:
             pending = None
         if pending is None:
             state = PendingStartupState(None, None)
-        elif getattr(pending, "mode", None) != "streaming":
-            await self._quarantine_pending("non-streaming partial evidence")
-            state = PendingStartupState(None, None)
         else:
             try:
                 durable_next = await self._validate_pending_evidence(pending)
@@ -88,11 +93,33 @@ class QuarantineMaintenance:
 
     async def run_once(self, should_defer: Callable[[], bool]) -> None:
         """Run one cooperative terminal sweep and quarantine salvage pass."""
-        if should_defer():
+        if not self._maintenance_due(should_defer):
             return
         await self._sweep_terminal_retired(should_defer)
         if should_defer():
             return
+        await self._sweep_terminal_quarantine(should_defer)
+        if should_defer():
+            return
+        if not self._salvage_due(should_defer):
+            return
+        await self._salvage_quarantine(should_defer)
+
+    def _maintenance_due(self, should_defer: Callable[[], bool]) -> bool:
+        if should_defer():
+            return False
+        now = monotonic()
+        if now < self._maintenance_not_before:
+            return False
+        self._maintenance_not_before = now + self._config.retry.maintenance_interval_seconds
+        return True
+
+    def _salvage_due(self, should_defer: Callable[[], bool]) -> bool:
+        if should_defer():
+            return False
+        return monotonic() >= self._quarantine_retry_not_before
+
+    async def _sweep_terminal_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
             removed = await asyncio.to_thread(
                 self._staging.sweep_terminal_quarantine,
@@ -106,8 +133,8 @@ class QuarantineMaintenance:
                 self._runtime.debug_event(
                     "terminal_quarantine_deleted", device_slug=self._device_slug, source=path.name
                 )
-        if should_defer():
-            return
+
+    async def _salvage_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
             sources = await asyncio.to_thread(
                 self._staging.quarantined_attempts,
@@ -192,12 +219,14 @@ class QuarantineMaintenance:
     async def _validate_pending_evidence(self, descriptor: AttemptDescriptorShape) -> int:
         attempt = cast(
             StagedAttemptShape,
-            await asyncio.to_thread(self._staging.open_attempt, descriptor.attempt_id),
+            await asyncio.to_thread(self._staging.open_attempt_for_resume, descriptor.attempt_id),
         )
         try:
             recovery = await asyncio.to_thread(attempt.recover)
-        finally:
+        except BaseException:
             await asyncio.to_thread(attempt.close)
+            raise
+        await asyncio.to_thread(self._staging.retain_validated_attempt, descriptor.attempt_id, attempt)
         return descriptor.start_sequence + recovery.valid_records
 
     async def _sweep_terminal_retired(self, should_defer: Callable[[], bool]) -> None:
@@ -238,13 +267,15 @@ class QuarantineMaintenance:
                     str(error),
                 )
                 return True
-            await self._mark_quarantine(
-                source,
-                self._staging.mark_quarantine_salvage_pending,
-                "quarantine_salvage_pending",
-                str(error),
+            self._runtime.debug_exception(
+                "quarantine_prefix_publish_retryable", error, device_slug=self._device_slug, source=source.name
             )
-            return True
+            backoff = self._config.retry.quarantine_publish_backoff_seconds
+            self._quarantine_retry_not_before = (
+                monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
+            )
+            self._quarantine_retry_number += 1
+            return False
         try:
             await asyncio.to_thread(self._staging.mark_quarantine_published, self._device_slug, source)
         except Exception as error:  # noqa: BLE001 - retain source until a later lifecycle pass
@@ -253,6 +284,8 @@ class QuarantineMaintenance:
             )
             return True
         publication = cast(QuarantinePublicationShape, result)
+        self._quarantine_retry_number = 0
+        self._quarantine_retry_not_before = 0.0
         self._runtime.debug_event(
             "quarantine_prefix_published",
             device_slug=self._device_slug,

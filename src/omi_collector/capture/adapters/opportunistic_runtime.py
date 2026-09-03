@@ -189,10 +189,8 @@ class OpportunisticRuntime(CaptureRuntimePort):
             return "unprocessable"
         if isinstance(error, QuarantineSalvageDeferredError):
             return "deferred"
-        if isinstance(error, (OSError,)):
-            return "salvage_pending"
-        if isinstance(error, StagingError):
-            return "salvage_pending"
+        if isinstance(error, (OSError, StagingError)):
+            return "deferred"
         return None
 
     def is_writer_error(self, error: BaseException) -> bool:

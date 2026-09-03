@@ -1,3 +1,6 @@
+# Acceptance specification (Gherkin). The scenarios state observable behavior
+# and are reviewed alongside the executable pytest suite; this file is not
+# itself an executable test.
 Feature: Opportunistic raw collection from an Omi pendant
   The collector uses every period of Bluetooth availability to preserve as much
   original audio as possible and publishes only complete local raw bundles.
@@ -114,7 +117,8 @@ Feature: Opportunistic raw collection from an Omi pendant
 
     Scenario: A collection attempt ends
       When its terminal transfer metric can be written
-      Then one durable metric records volume, duration, outcome, loss, and version
+      Then one durable transfer_session record records volume, duration, outcome, and version
+      And confirmed sequence-loss evidence is written as a separate durable sequence_loss record
 
     Scenario: Observability fails
       Given a log or metric cannot be written

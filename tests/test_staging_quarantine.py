@@ -47,7 +47,7 @@ def _record(marker: int) -> bytes:
 
 
 def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt("omi_cv1", 100, count)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
@@ -136,7 +136,7 @@ def test_device_lock_quarantines_hard_crash_publication_leftover(tmp_path: Path)
 def test_device_lock_finalizes_complete_capture_local_publication_temporary(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
     result = attempt.seal(DoneNotification(0, 101))
@@ -212,13 +212,6 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
     assert marker == {
         "version": 1,
         "state": "terminal-retired",
-        "attempt_id": attempt.attempt_id,
-        "prefix": {
-            "start_sequence": 100,
-            "next_sequence": 101,
-            "record_count": 1,
-            "raw_sha256": sha256(_record(1)).hexdigest(),
-        },
         "terminalized_at_unix_ns": now,
     }
     rmtree(result.bundle_path)
@@ -315,7 +308,7 @@ def test_streaming_partial_close_is_preserved_and_blocks_pending(tmp_path: Path)
 
 def test_pending_attempts_fail_closed_on_unattributed_malformed_evidence(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_attempt("omi_cv1", 100, 2)
+    matching = store.prepare_streaming_attempt("omi_cv1", 100, 2)
 
     assert store.pending_attempts("omi_cv1") == (matching.descriptor,)
     with pytest.raises(PendingAttemptError, match="blocks another READ"):
@@ -368,8 +361,8 @@ def test_attributable_malformed_evidence_is_quarantined_without_read_authorizati
 
 def test_quarantine_pending_moves_blockers_and_preserves_unrelated_and_retired(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_attempt("omi_cv1", 100, 2)
-    unrelated = store.prepare_attempt("other", 200, 2)
+    matching = store.prepare_streaming_attempt("omi_cv1", 100, 2)
+    unrelated = store.prepare_streaming_attempt("other", 200, 2)
     published = store.prepare_streaming_attempt("omi_cv1", 300, 1)
     assert published.publish_prefix() is None
     published.close(durable=True)
@@ -392,7 +385,7 @@ def test_quarantine_pending_moves_blockers_and_preserves_unrelated_and_retired(t
 
 def test_direct_quarantine_function_uses_concrete_filesystem(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_attempt("omi_cv1", 100, 1)
+    matching = store.prepare_streaming_attempt("omi_cv1", 100, 1)
 
     moved = quarantine_module.quarantine_pending(store._filesystem, "omi_cv1", "direct call")
 
@@ -403,7 +396,7 @@ def test_direct_quarantine_function_uses_concrete_filesystem(tmp_path: Path) -> 
 
 def test_quarantine_a_does_not_move_unattributed_entry_during_b_lease(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_attempt("omi_cv1", 100, 2)
+    matching = store.prepare_streaming_attempt("omi_cv1", 100, 2)
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir()
     before = malformed / "evidence"

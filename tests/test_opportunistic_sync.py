@@ -616,7 +616,7 @@ async def test_cancellation_during_observation_close_propagates(
 async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path: Path, kind: str) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     if kind == "legacy":
-        store.prepare_attempt("omi", 100, 2)
+        store.prepare_streaming_attempt("omi", 100, 2)
     else:
         store.prepare_streaming_attempt("omi", 100, 2)
         store.prepare_streaming_attempt("omi", 102, 2)
@@ -905,19 +905,25 @@ async def test_legacy_attempt_cadence_sweeps_terminal_retired_partials_after_sta
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
+    maintenance_now = 0.0
 
     def wall_clock_ns() -> int:
         return now
 
     async def advance_wall_clock(_delay: float) -> None:
-        nonlocal now
+        nonlocal now, maintenance_now
         now += 1_000_000_000
+        maintenance_now += 1.0
 
     monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", wall_clock_ns)
+    monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: maintenance_now)
     store = StagingStore(
         tmp_path,
         _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+        config=CollectorConfig(
+            retry=RetryConfig(maintenance_interval_seconds=1.0),
+            staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+        ),
     )
     attempt = store.prepare_streaming_attempt("omi", 100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
@@ -943,7 +949,14 @@ async def test_legacy_attempt_cadence_sweeps_terminal_retired_partials_after_sta
         provider,
         store,
         "omi",
-        replace(_options(), sleep=advance_wall_clock),
+        replace(
+            _options(),
+            sleep=advance_wall_clock,
+            config=CollectorConfig(
+                retry=RetryConfig(maintenance_interval_seconds=1.0),
+                staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+            ),
+        ),
     )
 
     assert isinstance(result, NoDataResult)

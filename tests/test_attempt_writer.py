@@ -14,7 +14,7 @@ from omi_collector.capture.adapters.attempt_writer import (
     AttemptWriter,
     WriterFailedError,
     WriterQueueFullError,
-    WriterShutdownTimeout,
+    WriterShutdownTimeoutError,
     WriterState,
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
@@ -176,7 +176,7 @@ def test_writer_config_controls_default_close_timeout() -> None:
         await writer.start()
         await writer.read_begin("begin")
 
-        with pytest.raises(WriterShutdownTimeout):
+        with pytest.raises(WriterShutdownTimeoutError):
             await writer.close()
         assert target.close_calls == 1
         target.release_close.set()
@@ -452,7 +452,7 @@ async def _test_close_timeout_is_reported_until_blocking_target_is_released() ->
     target = FakeTarget(block_close=True)
     writer = await _started(target, bytearray())
 
-    with pytest.raises(WriterShutdownTimeout):
+    with pytest.raises(WriterShutdownTimeoutError):
         await writer.close(timeout=0.01)
     assert target.close_calls == 1
     assert writer.state is WriterState.CLOSING

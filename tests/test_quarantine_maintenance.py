@@ -14,13 +14,14 @@ import pytest
 from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.application.ports import StagingPort
 from omi_collector.capture.application.presence import PresencePolicy, PresenceScheduler, PresenceWake
 from omi_collector.capture.application.quarantine_maintenance import (
     PendingStartupState,
     QuarantineMaintenance,
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
-from omi_collector.config import CollectorConfig, StagingRetentionConfig
+from omi_collector.config import CollectorConfig, RetryConfig, StagingRetentionConfig
 
 
 def _run(coro: object) -> object:
@@ -79,7 +80,7 @@ def test_attributable_malformed_startup_evidence_is_quarantined_before_collectio
     (malformed / "records.bin").write_bytes(b"preserve")
 
     maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
-    state = _run(maintenance.prepare_pending_startup())
+    state = cast(PendingStartupState, _run(maintenance.prepare_pending_startup()))
 
     assert state == PendingStartupState(None, None)
     assert not malformed.exists()
@@ -126,6 +127,128 @@ def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) 
         assert (bundles[0] / "records.bin").read_bytes() == expected
 
     _run(scenario())
+
+
+def test_pending_startup_hydration_is_reused_by_lease_bound_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    _seed_streaming_partial(store, count=2)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: (_ for _ in ()).throw(AssertionError("resume hydration must stream raw evidence")),
+    )
+    maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+    state = cast(PendingStartupState, _run(maintenance.prepare_pending_startup()))
+    assert state.pending is not None
+    with store.device_lock("omi") as lease:
+        resumed = store.resume_streaming_attempt("omi", lease)
+        assert resumed is not None
+        resumed.close()
+
+
+def test_pending_startup_inspection_does_not_promote_tail_without_lease(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = store.prepare_streaming_attempt("omi", 100, 3)
+    attempt.record_read_begin(ReadBeginNotification(100, 3))
+    first, second = _record(1), _record(2)
+    attempt.append_record(0, 100, first)
+    attempt.checkpoint()
+    attempt.append_record(1, 101, second)
+    attempt.close(durable=True)
+    checkpoint = (attempt.path / "checkpoint.json").read_text(encoding="utf-8")
+    raw = (attempt.path / "records.bin").read_bytes()
+
+    state = cast(
+        PendingStartupState,
+        _run(QuarantineMaintenance(store, "omi", None, OpportunisticRuntime()).prepare_pending_startup()),
+    )
+
+    assert state.durable_next == 101
+    assert (attempt.path / "checkpoint.json").read_text(encoding="utf-8") == checkpoint
+    assert (attempt.path / "records.bin").read_bytes() == raw
+
+
+def test_retryable_quarantine_publication_observes_configured_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    expected = _seed_streaming_partial(store, count=2)
+    attempt_id = next((tmp_path / "attempts").iterdir()).name
+    source = store.quarantine_attempt_source("omi", attempt_id)
+    now = 100.0
+    monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
+    config = CollectorConfig(
+        retry=RetryConfig(maintenance_interval_seconds=1.0, quarantine_publish_backoff_seconds=(5.0,))
+    )
+    runtime = OpportunisticRuntime()
+    original_publish = runtime.publish_quarantined_prefix
+    failures = 0
+
+    def fail_once(
+        source_path: Path,
+        staging_port: StagingPort,
+        slug: str,
+        *,
+        should_defer: Callable[[], bool],
+    ) -> object:
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise OSError("transient publication failure")
+        return original_publish(source_path, staging_port, slug, should_defer=should_defer)
+
+    monkeypatch.setattr(runtime, "publish_quarantined_prefix", fail_once)
+    maintenance = QuarantineMaintenance(store, "omi", None, runtime, config=config)
+    _run(maintenance.run_once(lambda: False))
+    _run(maintenance.run_once(lambda: False))
+    assert failures == 1
+    assert not (source / "published.json").exists()
+    now += 5.0
+    _run(maintenance.run_once(lambda: False))
+    assert failures == 2
+    assert (source / "published.json").is_file()
+    bundles = tuple((store.capture_root / "omi").iterdir())
+    assert (bundles[0] / "records.bin").read_bytes() == expected
+
+
+def test_quarantine_retry_cooldown_does_not_block_terminal_sweeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    _seed_streaming_partial(store, count=2)
+    now = 100.0
+    monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
+    config = CollectorConfig(retry=RetryConfig(maintenance_interval_seconds=1.0))
+    runtime = OpportunisticRuntime()
+    terminal_sweeps = 0
+    salvage_scans = 0
+    original_terminal_sweep = store.sweep_terminal_retired
+
+    def record_terminal_sweep(device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+        nonlocal terminal_sweeps
+        terminal_sweeps += 1
+        return original_terminal_sweep(device_slug, should_defer=should_defer)
+
+    def forbidden_salvage_scan(device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+        del device_slug, should_defer
+        nonlocal salvage_scans
+        salvage_scans += 1
+        raise AssertionError("salvage scan reached during retry cooldown")
+
+    maintenance = QuarantineMaintenance(store, "omi", None, runtime, config=config)
+    maintenance._quarantine_retry_not_before = 105.0
+    monkeypatch.setattr(store, "sweep_terminal_retired", record_terminal_sweep)
+    monkeypatch.setattr(store, "quarantined_attempts", forbidden_salvage_scan)
+
+    _run(maintenance.run_once(lambda: False))
+    assert terminal_sweeps == 1
+    assert salvage_scans == 0
+    now += 1.0
+    _run(maintenance.run_once(lambda: False))
+    assert terminal_sweeps == 2
+    assert salvage_scans == 0
 
 
 def test_quarantine_pending_keeps_valid_partial_salvageable_and_expires_opaque(

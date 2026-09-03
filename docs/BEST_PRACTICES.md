@@ -107,6 +107,10 @@ addresses, or detailed live device observations in documentation or logs.
 
 Keep the root README short and link only to maintained documents. Protocol
 details belong in [DEVICE_PROTOCOL.md](DEVICE_PROTOCOL.md), security claims in
-[SECURITY.md](SECURITY.md), and executable acceptance behavior in
-`features/opportunistic_collection.feature`. Remove obsolete documents and
-host-specific observations rather than expanding this documentation set.
+[SECURITY.md](SECURITY.md), transfer-quality interpretation in
+[QUALITY_METRICS.md](QUALITY_METRICS.md), and acceptance behavior in the
+Gherkin acceptance specification at
+`features/opportunistic_collection.feature`. The feature file is a reviewed
+specification, not an executable test; executable checks remain in pytest.
+Remove obsolete documents and host-specific observations rather than expanding
+this documentation set.

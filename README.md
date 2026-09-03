@@ -227,8 +227,12 @@ updates; review and merge its release PR to create the tag and GitHub release.
   expectations.
 - [Best practices](docs/BEST_PRACTICES.md) — concise operational and QA
   guidance.
-- [Acceptance scenarios](features/opportunistic_collection.feature) — presence,
-  transfer, interruption, recovery, and publication behavior.
+- [Transfer-quality evidence](docs/QUALITY_METRICS.md) — the durable metric
+  journal and how operators interpret its records.
+- [Acceptance specification (Gherkin)](features/opportunistic_collection.feature)
+  — presence, transfer, interruption, recovery, and publication behavior.
+  The specification is reviewed alongside the executable pytest suite; the
+  feature file itself is not an executable test.
 
 The protocol reference is pinned to revision
 [`6f7c57a`](https://github.com/BasedHardware/omi/tree/6f7c57ac1545c1931c806a01605646405d398198)

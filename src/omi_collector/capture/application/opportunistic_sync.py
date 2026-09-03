@@ -88,7 +88,7 @@ async def run_opportunistic_collector(
         staging, options.config.firmware_observations, report_observation_error
     )
 
-    maintenance = QuarantineMaintenance(staging, device_slug, options.activity, runtime)
+    maintenance = QuarantineMaintenance(staging, device_slug, options.activity, runtime, config=options.config)
     run = _Run(provider, staging, device_slug, options, observation_writer, runtime, maintenance)
     reconciler = BatchReconciler(staging, device_slug, options, runtime, maintenance.quarantine_attempt_source)
     lifecycle = _make_session_lifecycle(run, reconciler)

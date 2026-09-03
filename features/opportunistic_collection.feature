@@ -1,159 +1,126 @@
-Feature: Opportunistic raw collection from a pendant
-  The collector wakes for nearby BLE presence, validates unread state through
-  GATT INFO, and drains bounded raw batches without overlapping sessions.
+Feature: Opportunistic raw collection from an Omi pendant
+  The collector uses every period of Bluetooth availability to preserve as much
+  original audio as possible and publishes only complete local raw bundles.
 
   Background:
-    Given scanner observations are fresh and advisory rather than cache state
-    And GATT INFO is authoritative for unread packets
-    And the collector allows no more than one connection attempt at a time
+    Given the pendant may enter or leave Bluetooth range at any time
+    And missing audio is worse than duplicate audio
+    And GATT INFO is authoritative for currently available records
 
-  Rule: Presence is opportunistic but has an authoritative fallback
+  Rule: Every visit is an opportunity to collect audio
 
-    Scenario: A fresh advertisement starts a bounded attempt
-      Given the pendant is absent and no GATT session is active
-      When a fresh matching advertisement is observed
-      Then this collector stops its scanner before provider, PHY, or GATT work
-      And it starts one bounded sync attempt promptly
-      And GATT INFO confirms unread state before any READ
+    Scenario: A nearby pendant is detected promptly
+      Given no collection session is active
+      When the pendant is observed nearby
+      Then one bounded collection attempt starts promptly
+      And no overlapping attempt is allowed
 
-    Scenario: A missed advertisement cannot suppress fallback
-      Given the pendant remains in range but its advertisement is missed
-      When no fresh advertisement is observed
-      Then an authoritative fallback attempt is due within 30 seconds at startup
-      And GATT INFO determines whether packets are unread
+    Scenario: Missing advertisements do not prevent collection
+      Given the pendant remains nearby without a fresh advertisement
+      When the periodic authoritative fallback becomes due
+      Then the collector attempts to reach the pendant
+      And GATT INFO determines whether records are available
 
-    Scenario: A clean drain has a cooldown
-      Given a session drains all packets and confirms the final INFO cursor
-      When the collector disconnects cleanly
-      Then it waits 900 seconds before the next GATT attempt
-      And continuous advertisements cannot bypass that cooldown
+    Scenario: A completed drain respects the pendant battery
+      Given all currently available records were collected
+      When the final GATT INFO confirms a clean drain
+      Then the collector disconnects
+      And it waits 900 seconds before checking again
+      And advertisements cannot bypass that cooldown
 
-    Scenario: An interrupted attempt uses bounded retry
-      Given a fresh advertisement released a sync attempt
-      When connection or transfer is interrupted
-      Then the collector records the failed attempt without advancing state
-      And retries at 1, 2, 4, 8, 16, and 30 second intervals
-      And it never starts an overlapping attempt
+    Scenario: An interrupted visit is retried
+      Given a collection attempt is interrupted
+      When the pendant remains nearby or later returns
+      Then the collector retries with bounded backoff
+      And preserves every durable record already received
+      And continues collecting later available audio
 
-  Rule: Presence and GATT work are serialized
+  Rule: Device operations cannot silently discard available audio
 
-    Scenario: Scanner and GATT do not overlap
-      Given this collector's scanner is active
-      When a sync attempt is released
-      Then this collector stops its scanner before GATT work
-      And scanner shutdown has its own bounded transition timeout
-      And address discovery, connection, and INFO retain separate timeouts
+    Scenario: Every read is explicitly bounded
+      Given GATT INFO reports available records
+      When the collector requests audio
+      Then READ has an explicit positive record count
+      And the collector never sends CLEAR
 
-    Scenario: A phone occupying the link does not create a second session
-      Given another client is occupying the pendant's BLE link
-      When this collector cannot connect
-      Then it records a bounded failure
-      And the next attempt waits for the retry schedule or fallback
-      And a second collector is rejected before READ
+    Scenario: Device storage is temporarily unavailable
+      Given GATT INFO reports that storage is not ready
+      When the collector waits for storage
+      Then it retries for a bounded period without READ or ADVANCE
+      And reconnects later if storage remains unavailable
 
-    Scenario: No unread packets does not hold a connection
-      Given the pendant is reachable
-      And authoritative GATT INFO reports no unread packets
-      When the INFO check completes
-      Then the collector disconnects cleanly
-      And it does not hold the connection waiting for data
+    Scenario: Explicit advance follows durable publication
+      Given a complete bounded batch was received and validated
+      When its original bytes are durably published as one raw bundle
+      Then the collector may explicitly ADVANCE only through that batch
+      And fresh GATT INFO confirms the resulting device state
 
-  Rule: One connection drains sequentially sealed batches
-    Scenario: A connection drains sequentially sealed batches
-      Given the pendant has unread packets
-      And no other collector is consuming from it
-      When the collector begins a sync session
-      Then it uses one connection for sequential bounded batches
-      And it subscribes to data notifications before issuing READ
-      And it locally seals each batch before starting the next
-      And it confirms the current cursor with fresh INFO between batches
+    Scenario: An interruption can expose stock firmware loss
+      Given stock firmware may move its persisted cursor while serving READ
+      When the link fails before all requested records arrive
+      Then the collector preserves the durable prefix it received
+      And sends no explicit ADVANCE based on unavailable records
+      And records only aggregate loss telemetry for irretrievable audio
+      And continues collecting later available audio
 
-    Scenario: Data after a batch boundary belongs to a later batch
-      Given one bounded batch has been durably sealed
-      When additional packets are created before the pendant leaves range
-      Then the new packets are collected only by a later batch
-      And the collector does not reconnect solely because of the boundary
+  Rule: Restart recovery trusts only durable evidence
 
-    Scenario: A short visit can leave a recoverable remainder
-      Given the pendant is in range for only a short visit
-      When RF conditions interrupt a bounded batch
-      Then the verified prefix remains durable
-      And the next presence or fallback can collect the remaining available data
+    Scenario: A unique valid partial survives restart
+      Given one unfinished attempt has a valid durable prefix
+      When a new process reconciles it with fresh GATT INFO
+      Then the collector resumes from the latest position supported by both
+      And never invents or silently skips available audio
 
-  Rule: Recovery preserves proof and never invents missing audio
+    Scenario: Damaged or ambiguous unfinished evidence fails closed
+      Given unfinished attempt evidence is damaged or ambiguous
+      When a new process inspects it before READ
+      Then all attributable bytes are preserved separately
+      And no explicit ADVANCE is based on that evidence
+      And collection continues only from fresh authoritative device state
 
-    Scenario: A unique partial resumes after restart
-      Given one valid partial has durable attempt and checkpoint metadata
-      And a new process obtains fresh INFO
-      When the partial overlaps the current device cursor
-      Then it replays the overlap
-      And every replayed record matches the durable prefix byte-for-byte
-      And it continues from the exact next unverified record
-
-    Scenario: Ambiguous partial evidence is quarantined
-      Given partial evidence is malformed, legacy, or present in multiple attempts
-      When a new process inspects staging before READ
-      Then it preserves and quarantines the evidence
-      And it sends no blind ADVANCE for the unverified history
-      And it continues from the pendant's fresh current cursor
-
-    Scenario: Unavailable history has no persisted identity
-      Given historical records are no longer retrievable before the current cursor
-      And a verified prefix is durably recorded
-      When the collector reconciles with fresh INFO
-      Then it records only aggregate diagnostic loss telemetry
-      And it sends no ADVANCE for unavailable history
-      And it creates no artifact or range identity for the missing records
-      And it continues with later available audio
-
-    Scenario: Suspicious cursor evidence does not authorize an advance
+    Scenario: Suspicious device state does not authorize an advance
       Given fresh cursor evidence is reset, regressed, corrupt, or beyond the batch
-      When the collector reconciles collection state
-      Then it preserves diagnostic evidence
-      And it sends no blind ADVANCE
-      And it starts a later READ at the fresh current cursor when available
+      When collection state is reconciled
+      Then diagnostic evidence is preserved
+      And no explicit ADVANCE is sent
+      And later available audio remains collectible
 
-    Scenario: Firmware drop counters remain observations
-      Given INFO reports a firmware dropped-packets counter
-      When a later INFO resets or regresses that counter
-      Then the latest observation is persisted separately
-      And no cursor-gap identity is created
-      And raw collection continues without waiting for observation persistence
+  Rule: Publication is a local durable boundary
 
-  Rule: Raw publication is durable and atomic
+    Scenario: A complete batch becomes one raw bundle
+      Given every record in a bounded batch was validated
+      When the batch is published
+      Then downstream consumers see either the complete bundle or nothing
+      And the bundle contains the original record bytes without processing
 
-    Scenario: A complete batch becomes one sealed bundle
-      Given every record in a bounded batch has been validated
-      When record bytes and checkpoint metadata are fsynced
-      Then the collector seals one raw bundle
-      And publishes it with an atomic rename
-      And the bundle contains original record bytes without downstream processing
-
-    Scenario: Publication failure leaves recoverable evidence
-      Given a valid local prefix is sealed
+    Scenario: Publication is interrupted
+      Given a valid local prefix exists
       When publication cannot complete
-      Then the source remains visible as salvage-pending evidence
-      And no later cursor advance is based only on an incomplete publication
-      And a later maintenance pass can retry the publication
+      Then its bytes remain recoverable after restart
+      And no explicit ADVANCE depends only on incomplete publication
+      And a later attempt can finish publication
 
-    Scenario: Atomic publication survives interruption
-      Given publication has renamed a sealed bundle into place
-      When the process stops before terminal bookkeeping
-      Then recovery verifies the published bundle
-      And completes terminal bookkeeping without duplicating its bytes
+    Scenario: Collector scope remains narrow and private
+      Given the collector processes pendant audio
+      When it records state, logs, metrics, or published bundles
+      Then it makes no cloud or downstream processing call
+      And it never deletes a published bundle
+      And raw audio and credentials never appear in logs or metrics
 
-    Scenario: Quarantine maintenance yields to a new presence
-      Given eligible evidence is being hashed or copied for salvage
-      When a fresh matching advertisement arrives
-      Then maintenance yields at the next bounded I/O boundary
-      And it releases the device lock before GATT work
-      And unrenamed quarantine evidence remains byte-identical
+  Rule: Observability never competes with audio preservation
 
-  Rule: The weak-RF PHY workaround is reversible
+    Scenario: A collection attempt ends
+      When its terminal transfer metric can be written
+      Then one durable metric records volume, duration, outcome, loss, and version
 
-    Scenario: A temporary LE 1M guard restores controller state
-      Given the collector snapshots the controller's selected PHY set
-      When a weak-RF session temporarily removes LE 2M selections
-      Then the session can use LE 1M
-      And normal completion restores the exact prior set
-      And errors, cancellation, and recovery also restore that set
+    Scenario: Observability fails
+      Given a log or metric cannot be written
+      When audio collection can otherwise continue
+      Then the observability failure does not change the collection outcome
+
+  Rule: Optional radio workarounds are reversible
+
+    Scenario: A temporary PHY workaround ends
+      Given the collector temporarily changes controller-wide PHY selection
+      When collection completes, fails, or is cancelled
+      Then the exact prior controller selection is restored

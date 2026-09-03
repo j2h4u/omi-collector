@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/j2h4u/omi-collector/compare/v0.2.1...v0.2.2) (2026-09-03)
+
+
+### Fixes
+
+* reduce absent pendant connection attempts ([#14](https://github.com/j2h4u/omi-collector/issues/14)) ([95d593a](https://github.com/j2h4u/omi-collector/commit/95d593a1832ce48b4b8be3fe7efffa0c44e5895c))
+
 ## [0.2.1](https://github.com/j2h4u/omi-collector/compare/v0.2.0...v0.2.1) (2026-09-03)
 
 

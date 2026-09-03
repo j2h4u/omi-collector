@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import time
@@ -44,19 +43,21 @@ def _with_field(info: RingInfo, field: str, value: int) -> RingInfo:
     return RingInfo(**values)
 
 
-def test_store_publishes_chain_and_deduplicates_newest_counter(tmp_path: Path) -> None:
+def test_store_keeps_latest_snapshot_and_aggregates_counter_changes(tmp_path: Path) -> None:
     store = FirmwareObservationStore(tmp_path / "device.json")
 
     assert store.record("omi", _info(4))
+    assert store.record("omi", RingInfo(11, 21, 100, 4, 444))
     assert not store.record("omi", RingInfo(11, 21, 100, 4, 444))
     assert store.record("omi", _info(7))
     assert store.record("omi", _info(2))
 
     observations = read_firmware_observations(tmp_path / "device.json", "omi")
-    assert [item.dropped_packets for item in observations] == [4, 7, 2]
-    assert observations[0].previous_sha256 is None
-    assert observations[1].previous_sha256 == observations[0].sha256
-    assert observations[2].previous_sha256 == observations[1].sha256
+    assert [item.dropped_packets for item in observations] == [2]
+    assert observations[0].observation_count == 3
+    assert observations[0].observed_increase == 3
+    assert observations[0].regression_count == 1
+    assert observations[0].read_sequence == 10
 
 
 @pytest.mark.parametrize(("field", "maximum"), _BOUNDS.items())
@@ -94,12 +95,8 @@ def test_reader_rejects_hash_valid_out_of_bounds_firmware_field(tmp_path: Path, 
     store.record("omi", _info(1))
     path = tmp_path / "device.json"
     document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-    observation = cast(list[dict[str, object]], document["observations"])[0]
+    observation = cast(dict[str, object], document["latest"])
     observation[field] = maximum + 1
-    unsigned = {key: value for key, value in observation.items() if key != "sha256"}
-    observation["sha256"] = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     with pytest.raises(FirmwareObservationError):
         read_firmware_observations(path, "omi")
@@ -118,12 +115,7 @@ def test_reader_rejects_corruption_fork_and_symlink(tmp_path: Path) -> None:
     path.write_bytes(original)
 
     document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-    observations = cast(list[dict[str, object]], document["observations"])
-    observations[1]["previous_sha256"] = "0" * 64
-    unsigned = {key: value for key, value in observations[1].items() if key != "sha256"}
-    observations[1]["sha256"] = hashlib.sha256(
-        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    cast(dict[str, object], document["metrics"])["observation_count"] = 0
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     with pytest.raises(FirmwareObservationError):
         read_firmware_observations(path, "omi")

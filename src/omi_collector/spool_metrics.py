@@ -7,7 +7,6 @@ import re
 import stat
 from dataclasses import dataclass
 from hashlib import sha256
-from itertools import pairwise
 from pathlib import Path
 from typing import cast
 
@@ -228,15 +227,15 @@ def _firmware_metrics(
 ) -> tuple[int, int | None, int | None, int, int, int]:
     if not observations:
         return 0, None, None, 0, 0, 0
-    counters = tuple(observation.dropped_packets for observation in observations)
-    increase = 0
-    regressions = 0
-    for previous, current in pairwise(counters):
-        if current > previous:
-            increase += current - previous
-        elif current < previous:
-            regressions += 1
-    return len(counters), counters[0], counters[-1], increase, regressions, regressions + 1
+    state = observations[0]
+    return (
+        state.observation_count,
+        state.initial,
+        state.dropped_packets,
+        state.observed_increase,
+        state.regression_count,
+        state.epoch_count,
+    )
 
 
 def _reject_overlapping_ranges(values: tuple[_BundleMeasurement, ...]) -> None:
@@ -265,7 +264,7 @@ def _unproven_hole_records(values: tuple[_BundleMeasurement, ...]) -> int:
 
 def _validate_receipt(path: Path, raw_hash: str) -> None:
     receipt = _read_json(path / "receipt.json", "receipt.json")
-    allowed = {"attempt_id", "raw_sha256", "status", "recovery_leg", "completion"}
+    allowed = {"attempt_id", "raw_sha256", "status", "completion"}
     if set(receipt) - allowed:
         raise SpoolMetricsError(f"sealed receipt fields are invalid: {path}")
     if receipt.get("status") != "sealed" or receipt.get("raw_sha256") != raw_hash:

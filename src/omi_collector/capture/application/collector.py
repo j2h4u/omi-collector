@@ -227,6 +227,14 @@ class ReadLegResult:
 class IngestWriter(Protocol):
     """Minimum nonblocking/control surface consumed by the BLE half."""
 
+    @property
+    def submitted_high_water(self) -> int: ...
+
+    @property
+    def written_high_water(self) -> int: ...
+
+    async def start(self) -> None: ...
+
     async def prepare_leg(self, start_sequence: int, record_count: int) -> object: ...
 
     def submit_read_begin(self, notice: ReadBeginNotification) -> Awaitable[object] | object: ...
@@ -296,9 +304,7 @@ async def read_leg(
 
     # Preparation is deliberately before issuing READ.  Once READ is issued,
     # only BLE notification/control awaits are permitted until terminal DONE.
-    start_writer = getattr(writer, "start", None)
-    if start_writer is not None:
-        await start_writer()
+    await writer.start()
     await writer.prepare_leg(start, count)
     stream = session.notifications()
     state = _IngestState(start, count, time.monotonic(), options.progress_mailbox or ProgressMailbox())
@@ -366,10 +372,6 @@ def _parse_leg_args(leg_args: tuple[object, ...], options: ReadLegOptions | None
     if options is None:
         raise TypeError("read_leg requires ReadLegOptions")
     return start, count, options
-
-
-ingest_read = read_leg
-read_snapshot = read_leg
 
 
 async def report_progress(result: ReadLegResult, callback: ProgressCallback) -> None:
@@ -518,13 +520,7 @@ async def _finish_read(
 
 
 async def _await_writer_barrier(writer: IngestWriter) -> object:
-    barrier = getattr(writer, "barrier", None)
-    if callable(barrier):
-        return await cast(Awaitable[object], barrier())
-    checkpoint = getattr(writer, "checkpoint", None)
-    if not callable(checkpoint):
-        raise CollectorError("writer exposes neither barrier nor checkpoint")
-    return await cast(Awaitable[object], checkpoint())
+    return await writer.barrier()
 
 
 async def _stop_best_effort(session: RingSession, timeout: float | None) -> None:
@@ -571,20 +567,12 @@ def _publish_progress(state: _IngestState, arena: TransferArena, *, terminal: bo
 
 
 def writer_high_water(writer: IngestWriter) -> int:
-    for name in ("published_high_water", "submitted_high_water", "submitted_bytes"):
-        value = getattr(writer, name, None)
-        if isinstance(value, int):
-            return value
-    return 0
+    return writer.submitted_high_water
 
 
 def _writer_written(writer: IngestWriter, barrier_result: object | None) -> int:
     del barrier_result
-    for name in ("written_high_water", "written_bytes"):
-        value = getattr(writer, name, None)
-        if isinstance(value, int):
-            return value
-    return 0
+    return writer.written_high_water
 
 
 def _opcode(payload: bytes) -> int:
@@ -637,10 +625,8 @@ __all__ = [
     "TransferInterruptedError",
     "TransferTimeouts",
     "advance_leg",
-    "ingest_read",
     "probe",
     "read_leg",
-    "read_snapshot",
     "report_progress",
     "ring_info",
     "writer_high_water",

@@ -15,7 +15,6 @@ class AttemptDescriptorShape(Protocol):
     attempt_id: str
     start_sequence: int
     packet_count: int
-    mode: str
 
 
 class DurablePrefixShape(Protocol):
@@ -64,6 +63,12 @@ class BatchWriterPort(Protocol):
 
     @property
     def failure(self) -> BaseException | None: ...
+
+    @property
+    def submitted_high_water(self) -> int: ...
+
+    @property
+    def written_high_water(self) -> int: ...
 
     async def start(self) -> None: ...
 
@@ -114,6 +119,10 @@ class StagingPort(Protocol):
 
     def open_attempt(self, attempt_id: str) -> object: ...
 
+    def open_attempt_for_resume(self, attempt_id: str) -> object: ...
+
+    def retain_validated_attempt(self, attempt_id: str, attempt: StagedAttemptShape) -> None: ...
+
     def terminalize_prefix_attempt(self, device_slug: str, attempt_id: str) -> None: ...
 
     def sweep_terminal_retired(self, device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]: ...
@@ -124,12 +133,10 @@ class StagingPort(Protocol):
 
     def mark_quarantine_unprocessable(self, device_slug: str, source: Path, reason: str) -> None: ...
 
-    def mark_quarantine_salvage_pending(self, device_slug: str, source: Path, reason: str) -> None: ...
-
     def mark_quarantine_published(self, device_slug: str, source: Path) -> None: ...
 
 
-QuarantineErrorKind = Literal["unprocessable", "salvage_pending", "deferred"]
+QuarantineErrorKind = Literal["unprocessable", "deferred"]
 
 
 class CaptureRuntimePort(Protocol):

@@ -73,7 +73,7 @@ def test_append_chunk_rejects_unaligned_or_out_of_range_data(tmp_path: Path) -> 
     writer.close()
 
 
-def test_prepare_resumes_partial_and_reconciles_recovery_leg(tmp_path: Path) -> None:
+def test_prepare_resumes_partial_and_replays_from_checkpoint(tmp_path: Path) -> None:
     first = _record(1)
     second = _record(2)
     initial = StagingWriter(tmp_path, "omi_cv1", 100, 2, capture_root=_capture_root(tmp_path))

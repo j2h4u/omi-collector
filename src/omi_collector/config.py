@@ -105,12 +105,16 @@ class RetryConfig:
     storage_not_ready_backoff: tuple[float, ...] = (1.0, 2.0, 5.0)
     max_storage_not_ready_responses: int = 3
     presence_preflight_budget_seconds: float = 1.0
+    maintenance_interval_seconds: float = 30.0
+    quarantine_publish_backoff_seconds: tuple[float, ...] = (5.0, 30.0, 300.0)
 
     def __post_init__(self) -> None:
         _require_non_empty_positive(self.rapid_backoff, "rapid_backoff")
         _require_non_empty_positive(self.storage_not_ready_backoff, "storage_not_ready_backoff")
         _require_positive_int(self.max_storage_not_ready_responses, "max_storage_not_ready_responses")
         _require_positive_float(self.presence_preflight_budget_seconds, "presence_preflight_budget_seconds")
+        _require_positive_float(self.maintenance_interval_seconds, "maintenance_interval_seconds")
+        _require_non_empty_positive(self.quarantine_publish_backoff_seconds, "quarantine_publish_backoff_seconds")
 
 
 @dataclass(frozen=True, slots=True)

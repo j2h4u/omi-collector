@@ -109,5 +109,5 @@ def test_firmware_observations_stay_in_one_declared_device_file(tmp_path: Path) 
     assert store.record("omi", RingInfo(10, 20, 100, 1, RECORD_SIZE))
     assert store.record("omi", RingInfo(10, 21, 100, 2, RECORD_SIZE))
 
-    assert [item.dropped_packets for item in read_firmware_observations(state, "omi")] == [1, 2]
+    assert [item.dropped_packets for item in read_firmware_observations(state, "omi")] == [2]
     assert {path.name for path in state.parent.iterdir()} == {"device.json"}

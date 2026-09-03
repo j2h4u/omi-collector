@@ -8,7 +8,7 @@ from dataclasses import asdict
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, Protocol, cast
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .publication import (
@@ -20,10 +20,9 @@ from .publication import (
     publish_full_directory,
     publish_prefix_directory,
 )
-from .recovery import Recovery, _recover_prefix, _unbound_recovery
+from .recovery import Recovery
 from .staging_contract import (
     _CHECKPOINT_NAME,
-    _COMMITS_NAME,
     _DESCRIPTOR_NAME,
     _MANIFEST_NAME,
     _PREFIX_PUBLICATION_NAME,
@@ -33,7 +32,6 @@ from .staging_contract import (
     AttemptStateError,
     CollisionError,
     DurablePrefix,
-    RecoveryLeg,
     StreamingCheckpoint,
     _read_checkpoint,
     _validate_count,
@@ -42,12 +40,8 @@ from .staging_contract import (
 from .staging_filesystem import (
     DeviceLock,
     StagingFilesystem,
-    _append_synced,
-    _file_hash,
     _file_size,
     _fsync_path,
-    _hash_prefix,
-    _json_bytes,
     _read_prefix,
     _require_regular_file,
     _sync_directory,
@@ -67,7 +61,7 @@ class RecordGapError(RecordAcceptanceError):
 
 
 class RecordRegressionError(RecordAcceptanceError):
-    """A recovery record precedes the original snapshot or recovery leg."""
+    """A recovery record precedes the original snapshot or requested range."""
 
 
 class RecordDisposition(Enum):
@@ -75,6 +69,12 @@ class RecordDisposition(Enum):
 
     REPLAYED = "replayed"
     APPENDED = "appended"
+
+
+class _HashDigest(Protocol):
+    def update(self, data: bytes, /) -> None: ...
+
+    def hexdigest(self) -> str: ...
 
 
 class StagedAttempt:
@@ -87,13 +87,12 @@ class StagedAttempt:
         descriptor: AttemptDescriptor,
         *,
         live: bool = True,
-        resume: bool = False,
     ) -> None:
         self._filesystem = filesystem
         self.path = path
         self.descriptor = descriptor
         self._stream_raw: BinaryIO | None = None
-        self._stream_hash = sha256()
+        self._stream_hash: _HashDigest = sha256()
         self._stream_durable_hash = self._stream_hash.hexdigest()
         self._stream_next_index = 0
         self._stream_durable_next_index = 0
@@ -102,9 +101,10 @@ class StagedAttempt:
         self._live_recovery = live
         self._resume_lease: DeviceLock | None = None
         self._stream_requires_recovery = False
-        if descriptor.mode == "streaming":
-            self._hydrate_streaming_prefix(promote_extra=resume)
-            self._stream_raw = cast(BinaryIO, (path / _RAW_NAME).open("ab", buffering=0)) if live else None
+        self._recovery_start: int | None = None
+        self._recovery_count: int | None = None
+        self._hydrate_streaming_prefix()
+        self._stream_raw = cast(BinaryIO, (path / _RAW_NAME).open("ab", buffering=0)) if live else None
 
     @property
     def attempt_id(self) -> str:
@@ -119,10 +119,9 @@ class StagedAttempt:
                 self.descriptor.read_begin_count,
             ):
                 return
-            leg = self.descriptor.recovery_leg
-            if leg is not None and (notice.transfer_start_sequence, notice.packet_count) == (
-                leg.start_sequence,
-                leg.packet_count,
+            if (notice.transfer_start_sequence, notice.packet_count) == (
+                self._recovery_start,
+                self._recovery_count,
             ):
                 return
             raise AttemptStateError("READ_BEGIN is already persisted")
@@ -135,7 +134,6 @@ class StagedAttempt:
             self.descriptor.packet_count,
             read_begin_start=notice.transfer_start_sequence,
             read_begin_count=notice.packet_count,
-            mode=self.descriptor.mode,
         )
         self._filesystem._write_json_atomic(self.path / _DESCRIPTOR_NAME, asdict(descriptor))
         self.descriptor = descriptor
@@ -149,32 +147,13 @@ class StagedAttempt:
         return self.begin_recovery(start, count)
 
     def append_record(self, index: int, sequence: int, record: bytes) -> None:
-        """Append and fsync one 444-byte record, then its fsynced commit proof."""
+        """Append and fsync one 444-byte record through the streaming writer."""
         self._require_resume_lease()
-        if self.descriptor.mode == "streaming":
-            self._append_streaming_record(index, sequence, record)
-            return
-        self._require_appendable(index, sequence, record)
-        _append_synced(self.path / _RAW_NAME, record, self._filesystem._fsync)
-        commit = {"index": index, "sequence": sequence, "sha256": sha256(record).hexdigest()}
-        _append_synced(self.path / _COMMITS_NAME, _json_bytes(commit, newline=True), self._filesystem._fsync)
+        self._append_streaming_record(index, sequence, record)
 
     @property
     def durable_prefix(self) -> DurablePrefix:
         """Return the verified streaming prefix without changing on-disk bytes."""
-        if self.descriptor.mode != "streaming":
-            recovery = self.recover()
-            raw_hash = (
-                _file_hash(self.path / _RAW_NAME, chunk_size=self._filesystem._durability.io_chunk_bytes)
-                if recovery.valid_records
-                else sha256(b"").hexdigest()
-            )
-            return DurablePrefix(
-                self.descriptor.start_sequence,
-                self.descriptor.start_sequence + recovery.valid_records,
-                recovery.valid_records,
-                raw_hash,
-            )
         if not self._live_recovery:
             raise AttemptStateError("reopened streaming attempts have no trusted live durable prefix")
         return DurablePrefix(
@@ -187,8 +166,6 @@ class StagedAttempt:
     def begin_recovery(self, start_sequence: int, packet_count: int) -> DurablePrefix:
         """Durably record a continuation range before accepting any DATA bytes."""
         self._require_resume_lease()
-        if self.descriptor.mode != "streaming":
-            raise AttemptStateError("recovery continuation requires a streaming attempt")
         if not self._live_recovery:
             raise AttemptStateError("reopened partial attempts are not recoverable")
         _validate_int(start_sequence, "recovery start_sequence")
@@ -201,21 +178,10 @@ class StagedAttempt:
         prefix = self.durable_prefix
         if start_sequence > prefix.next_sequence:
             raise RecordGapError("recovery leg starts after the next durable sequence")
-        leg = RecoveryLeg(start_sequence, packet_count)
-        descriptor = AttemptDescriptor(
-            self.descriptor.attempt_id,
-            self.descriptor.device_slug,
-            self.descriptor.start_sequence,
-            self.descriptor.packet_count,
-            read_begin_start=self.descriptor.read_begin_start,
-            read_begin_count=self.descriptor.read_begin_count,
-            mode=self.descriptor.mode,
-            recovery_leg=leg,
-        )
-        # The atomic descriptor replacement is the recovery metadata durability
-        # boundary.  DATA is accepted only after this succeeds.
-        self._filesystem._write_json_atomic(self.path / _DESCRIPTOR_NAME, asdict(descriptor))
-        self.descriptor = descriptor
+        # Recovery intent is ephemeral. The checkpoint is the sole durable
+        # recovery frontier; after a restart the next READ begins at it again.
+        self._recovery_start = start_sequence
+        self._recovery_count = packet_count
         return prefix
 
     def accept_record(self, sequence: int, record: bytes) -> RecordDisposition:
@@ -241,46 +207,31 @@ class StagedAttempt:
         if not payload or len(payload) % RECORD_SIZE:
             raise AttemptStateError(f"ring chunk must be a positive multiple of {RECORD_SIZE} bytes")
         record_count = len(payload) // RECORD_SIZE
-        if self.descriptor.mode != "streaming":
-            return self._accept_durable_chunk(start_sequence, payload, record_count)
-
         return self._accept_streaming_chunk(start_sequence, payload, record_count)
-
-    def _accept_durable_chunk(
-        self, start_sequence: int, payload: bytes, record_count: int
-    ) -> tuple[RecordDisposition, ...]:
-        dispositions: list[RecordDisposition] = []
-        for index in range(record_count):
-            offset = index * RECORD_SIZE
-            self.append_record(
-                start_sequence - self.descriptor.start_sequence + index,
-                start_sequence + index,
-                payload[offset : offset + RECORD_SIZE],
-            )
-            dispositions.append(RecordDisposition.APPENDED)
-        return tuple(dispositions)
 
     def _accept_streaming_chunk(
         self, start_sequence: int, payload: bytes, record_count: int
     ) -> tuple[RecordDisposition, ...]:
 
-        leg = self.descriptor.recovery_leg
-        if leg is None:
+        if self._recovery_start is None or self._recovery_count is None:
             expected = self.descriptor.start_sequence + self._stream_next_index
             if start_sequence != expected:
                 raise AttemptStateError("initial record is not the next expected sequence")
             self._append_streaming_chunk(self._stream_next_index, payload)
             return (RecordDisposition.APPENDED,) * record_count
-        return self._accept_recovery_chunk(start_sequence, payload, record_count, leg)
+        return self._accept_recovery_chunk(start_sequence, payload, record_count)
 
     def _accept_recovery_chunk(
-        self, start_sequence: int, payload: bytes, record_count: int, leg: RecoveryLeg
+        self, start_sequence: int, payload: bytes, record_count: int
     ) -> tuple[RecordDisposition, ...]:
         end_sequence = start_sequence + record_count
-        if start_sequence < leg.start_sequence:
+        recovery_start = self._recovery_start
+        recovery_count = self._recovery_count
+        assert recovery_start is not None and recovery_count is not None
+        if start_sequence < recovery_start:
             raise RecordRegressionError("recovery sequence regresses before the recovery leg")
-        if end_sequence > leg.next_sequence:
-            raise RecordGapError("recovery sequence exceeds the persisted recovery leg")
+        if end_sequence > recovery_start + recovery_count:
+            raise RecordGapError("recovery sequence exceeds the requested range")
 
         next_sequence = self.descriptor.start_sequence + self._stream_next_index
         if start_sequence > next_sequence:
@@ -300,33 +251,23 @@ class StagedAttempt:
         return (RecordDisposition.REPLAYED,) * replay_count + (RecordDisposition.APPENDED,) * appended_count
 
     def recover(self) -> Recovery:
-        """Return only the longest contiguous prefix whose raw bytes hash-match commits."""
-        if self.descriptor.mode == "streaming":
-            return self._recover_streaming()
-        raw_path = self.path / _RAW_NAME
-        commit_path = self.path / _COMMITS_NAME
-        raw_size = _file_size(raw_path)
-        commit_size = _file_size(commit_path)
-        if self.descriptor.read_begin_start is None:
-            return _unbound_recovery(self.attempt_id, raw_size, commit_size)
-        return _recover_prefix(self.path, self.descriptor, self._filesystem)
+        """Return the checkpoint-authenticated prefix and raw evidence status."""
+        return self._recover_streaming()
 
     def seal(self, done: DoneNotification) -> SealResult:
         """Publish a fully validated attempt using an fsync-and-rename boundary."""
         self._require_resume_lease()
         raw_path = self.path / _RAW_NAME
-        if self.descriptor.mode == "streaming":
-            self._require_streaming_sealable(done)
-            self._flush_stream_raw(durable=True)
-            if _file_size(raw_path) != self._stream_written_bytes:
-                raise AttemptStateError("streaming raw file changed during transfer")
-            raw_hash = _file_hash(raw_path, chunk_size=self._filesystem._durability.io_chunk_bytes)
-            if raw_hash != self._stream_hash.hexdigest():
-                raise AttemptStateError("streaming raw bytes do not match appended records")
-            self.close()
-        else:
-            self._require_sealable(done)
-            raw_hash = _file_hash(raw_path, chunk_size=self._filesystem._durability.io_chunk_bytes)
+        self._require_streaming_sealable(done)
+        self._flush_stream_raw(durable=True)
+        if _file_size(raw_path) != self._stream_written_bytes:
+            raise AttemptStateError("streaming raw file changed during transfer")
+        # ``_stream_hash`` is updated from every byte accepted by the single
+        # writer thread.  The lease and the size check above establish that no
+        # other writer can have changed the file, so reuse this digest instead
+        # of reading the completed raw stream a second time just to hash it.
+        raw_hash = self._stream_hash.hexdigest()
+        self.close()
         bundle_path = self._bundle_path(raw_hash)
         manifest = self._manifest(raw_hash)
         if bundle_path.exists():
@@ -336,9 +277,8 @@ class StagedAttempt:
                 manifest,
                 io_chunk_bytes=self._filesystem._durability.io_chunk_bytes,
             ):
-                if self.descriptor.mode == "streaming":
-                    self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
-                    self._filesystem._write_json_atomic(self.path / _RECEIPT_NAME, self._receipt(raw_hash))
+                self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
+                self._filesystem._write_json_atomic(self.path / _RECEIPT_NAME, self._receipt(raw_hash))
                 return SealResult(bundle_path, True)
             raise CollisionError(f"bundle collision preserved at {self.path}; destination is {bundle_path}")
         self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
@@ -357,8 +297,6 @@ class StagedAttempt:
         successful close.
         """
         self._require_resume_lease()
-        if self.descriptor.mode != "streaming":
-            raise AttemptStateError("prefix publication requires a streaming attempt")
         prefix = self.durable_prefix
         if self._stream_raw is not None:
             self._flush_stream_raw(durable=True)
@@ -368,7 +306,7 @@ class StagedAttempt:
         if not prefix.record_count:
             self._filesystem._write_json_atomic(
                 self.path / _PREFIX_PUBLICATION_NAME,
-                PrefixPublicationEvidence(prefix, None).as_dict(),
+                PrefixPublicationEvidence().as_dict(),
             )
             return None
 
@@ -383,10 +321,7 @@ class StagedAttempt:
             ):
                 self._filesystem._write_json_atomic(
                     self.path / _PREFIX_PUBLICATION_NAME,
-                    PrefixPublicationEvidence(
-                        prefix,
-                        destination.relative_to(self._filesystem.capture_root).as_posix(),
-                    ).as_dict(),
+                    PrefixPublicationEvidence().as_dict(),
                 )
                 return SealResult(destination, True)
             raise CollisionError(f"prefix collision preserved at {self.path}; destination is {destination}")
@@ -400,10 +335,7 @@ class StagedAttempt:
         )
         self._filesystem._write_json_atomic(
             self.path / _PREFIX_PUBLICATION_NAME,
-            PrefixPublicationEvidence(
-                prefix,
-                destination.relative_to(self._filesystem.capture_root).as_posix(),
-            ).as_dict(),
+            PrefixPublicationEvidence().as_dict(),
         )
         return SealResult(destination, False)
 
@@ -427,27 +359,43 @@ class StagedAttempt:
         finally:
             stream.close()
 
+    def activate_for_resume(self, lease: DeviceLock) -> None:
+        """Bind a startup-hydrated inspection to its consuming device lease."""
+        lease.require_active()
+        if self._live_recovery or self._stream_raw is not None:
+            raise AttemptStateError("streaming attempt is already active")
+        self._resume_lease = lease
+        try:
+            raw_count = self._stream_written_bytes // RECORD_SIZE
+            if raw_count > self._stream_durable_next_index:
+                # Hydration already authenticated the checkpoint prefix and
+                # computed the complete raw digest in one streaming pass.
+                # Only this lease-bound consuming seam may advance the
+                # durable frontier over the complete aligned tail.
+                raw_path = self.path / _RAW_NAME
+                _fsync_path(raw_path, self._filesystem._fsync)
+                self._stream_durable_next_index = raw_count
+                self._stream_durable_hash = self._stream_hash.hexdigest()
+                self._filesystem._write_checkpoint(
+                    self.path,
+                    StreamingCheckpoint(1, self.attempt_id, raw_count, self._stream_durable_hash),
+                )
+            self._stream_next_index = raw_count
+            self._live_recovery = True
+            self._stream_requires_recovery = False
+            self._stream_raw = cast(BinaryIO, (self.path / _RAW_NAME).open("ab", buffering=0))
+        except BaseException:
+            self._resume_lease = None
+            raise
+
     def checkpoint(self) -> DurablePrefix:
         """Fsync raw bytes, then atomically publish their checkpoint proof."""
         self._require_resume_lease()
         # The upstream DATA path flushes full chunks during transfer:
         # https://github.com/BasedHardware/omi/blob/6f7c57ac1545c1931c806a01605646405d398198/app/lib/services/wals/ring_storage_sync.dart#L504-L523
-        if self.descriptor.mode == "streaming":
-            _require_regular_file(self.path / _RAW_NAME, "streaming raw file")
-            self._checkpoint_stream_prefix(self._stream_next_index, self._stream_hash.hexdigest())
-            return self.durable_prefix
-        recovery = self.recover()
-        raw_hash = (
-            _file_hash(self.path / _RAW_NAME, chunk_size=self._filesystem._durability.io_chunk_bytes)
-            if recovery.valid_records
-            else sha256(b"").hexdigest()
-        )
-        return DurablePrefix(
-            self.descriptor.start_sequence,
-            self.descriptor.start_sequence + recovery.valid_records,
-            recovery.valid_records,
-            raw_hash,
-        )
+        _require_regular_file(self.path / _RAW_NAME, "streaming raw file")
+        self._checkpoint_stream_prefix(self._stream_next_index, self._stream_hash.hexdigest())
+        return self.durable_prefix
 
     def __del__(self) -> None:
         with suppress(Exception):
@@ -460,8 +408,8 @@ class StagedAttempt:
     def _requested_range(self) -> tuple[int, int]:
         return self.descriptor.start_sequence, self.descriptor.packet_count
 
-    def _hydrate_streaming_prefix(self, *, promote_extra: bool = False) -> None:
-        """Load and validate the checkpoint-backed raw prefix without guessing."""
+    def _hydrate_streaming_prefix(self) -> None:
+        """Authenticate the checkpoint prefix while hashing raw evidence once."""
         raw_path = self.path / _RAW_NAME
         checkpoint_path = self.path / _CHECKPOINT_NAME
         _require_regular_file(raw_path, "streaming raw file")
@@ -480,50 +428,59 @@ class StagedAttempt:
             raise AttemptStateError("streaming checkpoint exceeds the prepared range")
         if raw_count < checkpoint.record_count:
             raise AttemptStateError("streaming raw file is shorter than its checkpoint")
-        prefix_hash = _hash_prefix(
-            raw_path,
-            checkpoint.record_count * RECORD_SIZE,
-            chunk_size=self._filesystem._durability.io_chunk_bytes,
-        )
+        checkpoint_bytes = checkpoint.record_count * RECORD_SIZE
+        bytes_seen, digest, prefix_hash = self._hash_raw_stream(raw_path, checkpoint_bytes)
+        if bytes_seen != raw_size:
+            raise AttemptStateError("streaming raw file changed during hydration")
         if prefix_hash != checkpoint.raw_sha256:
             raise AttemptStateError("streaming checkpoint hash does not match raw bytes")
-        if raw_count > checkpoint.record_count:
-            if promote_extra:
-                _fsync_path(raw_path, self._filesystem._fsync)
-                raw_hash = _file_hash(raw_path, chunk_size=self._filesystem._durability.io_chunk_bytes)
-                checkpoint = StreamingCheckpoint(1, self.attempt_id, raw_count, raw_hash)
-                self._filesystem._write_checkpoint(self.path, checkpoint)
-            else:
-                # Inspection can observe a complete tail, but it must not make
-                # that tail consumable until the lease-bound resume path promotes it.
-                raw_count = checkpoint.record_count
-        with raw_path.open("rb") as raw:
-            durable_bytes = raw.read(checkpoint.record_count * RECORD_SIZE)
-        self._stream_hash = sha256(durable_bytes)
+        # Keep the complete digest state from the streaming pass.  Hashlib's
+        # state cannot be reconstructed from a digest, so replaying the chunks
+        # would violate the one-pass hydration contract.
+        self._stream_hash = digest
         self._stream_durable_hash = checkpoint.raw_sha256
         self._stream_durable_next_index = checkpoint.record_count
         self._stream_written_bytes = raw_size
-        self._stream_next_index = checkpoint.record_count if not promote_extra else raw_count
-        if promote_extra and raw_count > checkpoint.record_count:
-            self._stream_hash = sha256(durable_bytes + raw_path.read_bytes()[checkpoint.record_count * RECORD_SIZE :])
-            self._stream_durable_hash = self._stream_hash.hexdigest()
-            self._stream_durable_next_index = raw_count
+        # Keep the uncheckpointed tail in memory only as a digest state. It is
+        # not consumable until activate_for_resume binds an active device lease.
+        self._stream_next_index = checkpoint.record_count
         self._stream_requires_recovery = not self._live_recovery
 
-    def _require_appendable(self, index: int, sequence: int, record: bytes) -> None:
-        _validate_int(index, "index")
-        _validate_int(sequence, "sequence")
-        if len(record) != RECORD_SIZE:
-            raise AttemptStateError(f"ring record must be exactly {RECORD_SIZE} bytes")
-        recovery = self.recover()
-        if not recovery.clean:
-            raise AttemptStateError(f"attempt has preserved uncommitted evidence: {recovery.issue}")
-        if self.descriptor.read_begin_start is None or self.descriptor.read_begin_count is None:
-            raise AttemptStateError("READ_BEGIN must be persisted before records")
-        if index != recovery.valid_records or sequence != self.descriptor.read_begin_start + index:
-            raise AttemptStateError("record index or sequence is not the next expected value")
-        if index >= self.descriptor.read_begin_count:
-            raise AttemptStateError("record count exceeds READ_BEGIN")
+    def _hash_raw_stream(self, path: Path, checkpoint_bytes: int) -> tuple[int, _HashDigest, str | None]:
+        """Hash raw evidence once and return byte count, full hash, and prefix hash."""
+        digest = sha256()
+        prefix_remaining = checkpoint_bytes
+        prefix_hash = sha256(b"").hexdigest() if not prefix_remaining else None
+        bytes_seen = 0
+        with path.open("rb") as raw:
+            while chunk := raw.read(self._filesystem._durability.io_chunk_bytes):
+                prefix_remaining, prefix_hash = self._hash_raw_chunk(
+                    digest,
+                    chunk,
+                    prefix_remaining,
+                    prefix_hash,
+                )
+                bytes_seen += len(chunk)
+        return bytes_seen, digest, prefix_hash
+
+    @staticmethod
+    def _hash_raw_chunk(
+        digest: _HashDigest,
+        chunk: bytes,
+        prefix_remaining: int,
+        prefix_hash: str | None,
+    ) -> tuple[int, str | None]:
+        """Update one raw chunk while capturing the checkpoint boundary digest."""
+        if prefix_remaining:
+            prefix_bytes = min(len(chunk), prefix_remaining)
+            digest.update(chunk[:prefix_bytes])
+            prefix_remaining -= prefix_bytes
+            if not prefix_remaining:
+                prefix_hash = digest.hexdigest()
+            digest.update(chunk[prefix_bytes:])
+        else:
+            digest.update(chunk)
+        return prefix_remaining, prefix_hash
 
     def _append_streaming_record(self, index: int, sequence: int, record: bytes) -> None:
         _validate_int(index, "index")
@@ -619,29 +576,40 @@ class StagedAttempt:
             raise
 
     def _recover_streaming(self) -> Recovery:
-        raw_size = max(_file_size(self.path / _RAW_NAME), self._stream_written_bytes)
-        expected_count = self.descriptor.read_begin_count
-        if self.descriptor.read_begin_start is None or expected_count is None:
-            return _unbound_recovery(self.attempt_id, raw_size, 0)
         if self._stream_failed:
             return Recovery(
                 self.attempt_id,
-                raw_size // RECORD_SIZE,
-                raw_size,
                 0,
+                max(_file_size(self.path / _RAW_NAME), self._stream_written_bytes),
                 False,
                 "streaming attempt has preserved partial evidence",
             )
-        count, remainder = divmod(raw_size, RECORD_SIZE)
+        # Construction already authenticated the checkpoint-backed prefix.
+        # Reuse that in-memory result here instead of hashing the same prefix
+        # a second time during startup validation.
+        raw_size = self._stream_written_bytes
+        if self.descriptor.read_begin_start is None or self.descriptor.read_begin_count is None:
+            return Recovery(
+                self.attempt_id,
+                self._stream_durable_next_index,
+                raw_size,
+                raw_size == 0,
+                None if raw_size == 0 else "READ_BEGIN is not persisted",
+            )
+        raw_count, remainder = divmod(raw_size, RECORD_SIZE)
+        limit = min(self.descriptor.packet_count, self.descriptor.read_begin_count)
         issue: str | None = None
         if remainder:
             issue = "streaming raw file is not record aligned"
-        elif count > expected_count:
-            issue = "streaming record count exceeds READ_BEGIN"
-        elif count != expected_count:
+        elif raw_count > limit:
+            issue = "streaming raw file exceeds the prepared range"
+        elif self._stream_durable_next_index > limit:
+            issue = "streaming checkpoint exceeds the prepared range"
+        elif raw_count < self._stream_durable_next_index:
+            issue = "streaming raw file is shorter than its checkpoint"
+        elif raw_count != self.descriptor.read_begin_count:
             issue = "streaming attempt is incomplete"
-        clean = issue is None
-        return Recovery(self.attempt_id, count, raw_size, 0, clean, issue)
+        return Recovery(self.attempt_id, self._stream_durable_next_index, raw_size, issue is None, issue)
 
     def _require_streaming_sealable(self, done: DoneNotification) -> None:
         if not done.is_ok:
@@ -663,17 +631,6 @@ class StagedAttempt:
         self._stream_raw.flush()
         if durable:
             self._filesystem._fsync(self._stream_raw.fileno())
-
-    def _require_sealable(self, done: DoneNotification) -> None:
-        if not done.is_ok:
-            raise AttemptStateError("DONE did not report success")
-        if self.descriptor.read_begin_start is None or self.descriptor.read_begin_count is None:
-            raise AttemptStateError("READ_BEGIN is missing")
-        if done.next_sequence != self.descriptor.read_begin_start + self.descriptor.read_begin_count:
-            raise AttemptStateError("DONE next sequence does not match READ_BEGIN")
-        recovery = self.recover()
-        if not recovery.clean or recovery.valid_records != self.descriptor.read_begin_count:
-            raise AttemptStateError("attempt does not contain a complete validated record prefix")
 
     def _bundle_path(self, raw_hash: str) -> Path:
         start = self.descriptor.read_begin_start
@@ -708,8 +665,4 @@ class StagedAttempt:
 
     def _receipt(self, raw_hash: str) -> dict[str, object]:
         receipt: dict[str, object] = {"attempt_id": self.attempt_id, "raw_sha256": raw_hash, "status": "sealed"}
-        if self.descriptor.recovery_leg is not None:
-            receipt["recovery_leg"] = asdict(self.descriptor.recovery_leg) | {
-                "next_sequence": self.descriptor.recovery_leg.next_sequence
-            }
         return receipt

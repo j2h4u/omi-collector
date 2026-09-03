@@ -107,7 +107,7 @@ class BlockingReadSession(BurstSession):
 @dataclass
 class FakeWriter:
     calls: list[str] = field(default_factory=list)
-    published_high_water: int = 0
+    submitted_high_water: int = 0
     written_high_water: int = 0
     fail_barrier: bool = False
     target_threads: list[int] = field(default_factory=list)
@@ -130,7 +130,7 @@ class FakeWriter:
 
     def publish(self, high_water: int) -> None:
         self.calls.append(f"publish:{high_water}")
-        self.published_high_water = high_water
+        self.submitted_high_water = high_water
 
     async def barrier(self) -> str:
         self.calls.append("barrier")
@@ -141,7 +141,7 @@ class FakeWriter:
 
     def _target_write(self) -> None:
         self.target_threads.append(threading.get_ident())
-        self.written_high_water = self.published_high_water
+        self.written_high_water = self.submitted_high_water
 
 
 class PendingReadBeginWriter(FakeWriter):
@@ -440,7 +440,7 @@ def test_real_attempt_writer_stall_does_not_stop_ble_ingest() -> None:
                 await asyncio.sleep(0)
             assert session.consumed == len(notifications)
             assert arena.received_bytes == 2 * RECORD_SIZE
-            assert writer.published_high_water == 2 * RECORD_SIZE
+            assert writer.submitted_high_water == 2 * RECORD_SIZE
             assert heartbeat > 0
             assert not ingest.done()
             target.release_append.set()

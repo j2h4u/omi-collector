@@ -14,7 +14,7 @@ from typing import BinaryIO, cast
 
 import pytest
 
-from omi_collector.capture.adapters import attempts, quarantine, staging_filesystem
+from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
     RecordDisposition,
     RecordGapError,
@@ -47,7 +47,7 @@ def _record(marker: int) -> bytes:
 
 
 def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt("omi_cv1", 100, count)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
@@ -111,8 +111,30 @@ class _RecordingStream:
         self.wrapped.close()  # type: ignore[attr-defined]
 
 
+class _ReadCountingStream:
+    def __init__(self, wrapped: BinaryIO, reads: list[int]) -> None:
+        self._wrapped = wrapped
+        self._reads = reads
+
+    def read(self, size: int = -1) -> bytes:
+        self._reads[0] += 1
+        return self._wrapped.read(size)
+
+    def fileno(self) -> int:
+        return self._wrapped.fileno()
+
+    def close(self) -> None:
+        self._wrapped.close()
+
+    def __enter__(self) -> _ReadCountingStream:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 def test_prepare_persists_descriptor_before_returning(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt("omi_cv1", 100, 2)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, 2)
 
     assert attempt.path.parent == tmp_path / "attempts"
     assert attempt.path.name == attempt.attempt_id
@@ -124,7 +146,7 @@ def test_prepare_persists_descriptor_before_returning(tmp_path: Path) -> None:
 
 
 def test_append_requires_read_begin_and_exact_order_and_size(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt("omi_cv1", 100, 2)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, 2)
     with pytest.raises(AttemptStateError, match="READ_BEGIN"):
         attempt.append_record(0, 100, _record(1))
 
@@ -137,7 +159,6 @@ def test_append_requires_read_begin_and_exact_order_and_size(tmp_path: Path) -> 
     attempt.append_record(1, 101, _record(2))
 
     assert (attempt.path / "records.bin").read_bytes() == _record(1) + _record(2)
-    assert len((attempt.path / "commits.jsonl").read_text().splitlines()) == 2
 
 
 def test_streaming_accept_chunk_replays_overlap_and_appends_one_suffix(tmp_path: Path) -> None:
@@ -238,22 +259,16 @@ def test_streaming_checkpoints_never_rehash_the_growing_raw_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1024)
-    hash_calls = 0
-    original_hash = attempts._file_hash
-
-    def count_hash(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
-        nonlocal hash_calls
-        hash_calls += 1
-        return original_hash(path, chunk_size=chunk_size)
-
-    monkeypatch.setattr(attempts, "_file_hash", count_hash)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: (_ for _ in ()).throw(AssertionError("streaming staging must not use read_bytes")),
+    )
     for index in range(1024):
         attempt.append_record(index, 100 + index, _record(index % 256))
     attempt.checkpoint()
 
-    assert hash_calls == 0
     attempt.seal(DoneNotification(0, 1124))
-    assert hash_calls == 1
 
 
 def test_durability_config_projects_headroom_overhead_and_checkpoint_batching(tmp_path: Path) -> None:
@@ -398,6 +413,38 @@ def test_streaming_resume_promotes_only_an_aligned_post_checkpoint_tail(tmp_path
     assert attempt.path.exists()
 
 
+def test_large_resume_hashes_raw_evidence_in_one_streaming_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 4097)
+    attempt.record_read_begin(ReadBeginNotification(100, 4097))
+    for index in range(4097):
+        attempt.append_record(index, 100 + index, _record(index % 256))
+    attempt.close(durable=True)
+
+    reads = [0]
+    original_open = Path.open
+
+    def count_raw_reads(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        stream = cast(Callable[..., object], original_open)(path, mode, *args, **kwargs)
+        if path.name == "records.bin" and mode == "rb":
+            return _ReadCountingStream(cast(BinaryIO, stream), reads)
+        return stream
+
+    monkeypatch.setattr(Path, "open", count_raw_reads)
+    with store.device_lock("omi_cv1") as lease:
+        resumed = store.resume_streaming_attempt("omi_cv1", lease)
+        assert resumed is not None
+        assert resumed.durable_prefix.record_count == 4097
+        resumed.close()
+
+    # The 4097-record stream is 2 chunks at the configured 1 MiB size plus
+    # one EOF read. Promotion performs only a metadata fsync open, never a
+    # second payload read or read_bytes allocation.
+    assert reads[0] == 3
+
+
 @pytest.mark.parametrize(
     "damage",
     [
@@ -458,23 +505,6 @@ def test_reopen_rejects_unaligned_or_out_of_bounds_streaming_bytes(tmp_path: Pat
     raw.write_bytes(_record(1) + _record(2) + _record(3))
     with pytest.raises(AttemptStateError, match="exceeds"):
         StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-
-def test_append_fsync_failure_preserves_uncommitted_raw_evidence(tmp_path: Path) -> None:
-    attempt = _started_attempt(tmp_path, count=1)
-
-    def failing_sync(_: int) -> None:
-        raise OSError("simulated fsync failure")
-
-    with pytest.raises(OSError, match="simulated"):
-        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=failing_sync).open_attempt(
-            attempt.attempt_id
-        ).append_record(0, 100, _record(1))
-
-    recovery = StagingStore(tmp_path, _capture_root(tmp_path)).recover_attempt(attempt.attempt_id)
-    assert recovery.raw_bytes == RECORD_SIZE
-    assert recovery.commit_bytes == 0
-    assert not recovery.clean
 
 
 @pytest.mark.parametrize(
@@ -556,7 +586,7 @@ def test_open_rejects_invalid_persisted_read_begin(
 
 
 def test_read_begin_is_idempotent_and_rejects_mismatch(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, 1)
     with pytest.raises(AttemptStateError, match="does not match"):
         attempt.record_read_begin(ReadBeginNotification(101, 1))
     attempt.record_read_begin(ReadBeginNotification(100, 1))
@@ -573,7 +603,9 @@ def test_prepare_validates_slug_sequences_and_counts(
     tmp_path: Path, device_slug: str, start_sequence: int, packet_count: int
 ) -> None:
     with pytest.raises(AttemptStateError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).prepare_attempt(device_slug, start_sequence, packet_count)
+        StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(
+            device_slug, start_sequence, packet_count
+        )
 
 
 def test_append_validates_integer_arguments_and_count_overflow(tmp_path: Path) -> None:

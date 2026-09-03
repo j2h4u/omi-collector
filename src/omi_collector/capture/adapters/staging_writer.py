@@ -155,7 +155,7 @@ class StagingWriter:
         return self._attempt.attempt_id
 
     def prepare_leg(self, start_sequence: int, packet_count: int) -> DurablePrefix:
-        """Prepare an initial leg or persist a recovery leg before READ."""
+        """Prepare an initial or in-process recovery range before READ."""
         self._enter("prepare_leg")
         if not self._prepared:
             self.prepare()
@@ -333,8 +333,3 @@ class StagingWriter:
             raise ValueError("start_sequence must be a non-negative integer")
         if isinstance(packet_count, bool) or not isinstance(packet_count, int) or packet_count <= 0:
             raise ValueError("packet_count must be a positive integer")
-
-
-# A descriptive alias helps callers that name the boundary after its role.
-StagingWriterAdapter = StagingWriter
-StreamingStagingWriter = StagingWriter

@@ -12,7 +12,6 @@ from ..domain.ring_protocol import RECORD_SIZE
 
 _DESCRIPTOR_NAME = "attempt.json"
 _RAW_NAME = "records.bin"
-_COMMITS_NAME = "commits.jsonl"
 _MANIFEST_NAME = "manifest.json"
 _RECEIPT_NAME = "receipt.json"
 _CHECKPOINT_NAME = "checkpoint.json"
@@ -22,7 +21,6 @@ _TERMINAL_RETIRED_STATE = "terminal-retired"
 _TERMINAL_RETIREMENT_VERSION = 1
 _PUBLISHED_QUARANTINE_NAME = "published.json"
 _UNPROCESSABLE_QUARANTINE_NAME = "unprocessable.json"
-_SALVAGE_PENDING_NAME = "salvage-pending.json"
 _PUBLISHED_QUARANTINE_STATE = "published"
 _UNPROCESSABLE_QUARANTINE_STATE = "unprocessable"
 _ATTEMPT_ID_LENGTH = 32
@@ -56,18 +54,6 @@ class DeviceAlreadyRunningError(StagingError):
 
 class MaintenanceDeferredError(Exception):
     """Cooperative stop between bounded maintenance I/O quanta."""
-
-
-@dataclass(frozen=True, slots=True)
-class RecoveryLeg:
-    """One device range requested to reconcile a preserved partial attempt."""
-
-    start_sequence: int
-    packet_count: int
-
-    @property
-    def next_sequence(self) -> int:
-        return self.start_sequence + self.packet_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,8 +95,6 @@ class AttemptDescriptor:
     record_size: int = RECORD_SIZE
     read_begin_start: int | None = None
     read_begin_count: int | None = None
-    mode: str = "durable"
-    recovery_leg: RecoveryLeg | None = None
 
 
 def _validate_attempt_id(attempt_id: str) -> None:
@@ -151,8 +135,6 @@ def _validate_descriptor(descriptor: AttemptDescriptor, path_id: str) -> None:
     _validate_count(descriptor.packet_count)
     if descriptor.attempt_id != path_id or descriptor.record_size != RECORD_SIZE:
         raise AttemptStateError("attempt descriptor identity or record size is invalid")
-    if descriptor.mode not in {"durable", "streaming"}:
-        raise AttemptStateError("attempt descriptor mode is invalid")
     if (descriptor.read_begin_start is None) != (descriptor.read_begin_count is None):
         raise AttemptStateError("attempt descriptor has incomplete READ_BEGIN")
     if descriptor.read_begin_start is not None and descriptor.read_begin_count is not None:
@@ -163,14 +145,6 @@ def _validate_descriptor(descriptor: AttemptDescriptor, path_id: str) -> None:
             descriptor.packet_count,
         ):
             raise AttemptStateError("attempt descriptor READ_BEGIN does not match requested range")
-    leg = descriptor.recovery_leg
-    if leg is not None:
-        _validate_int(leg.start_sequence, "recovery start_sequence")
-        _validate_count(leg.packet_count)
-        if descriptor.read_begin_start is None or leg.start_sequence < descriptor.start_sequence:
-            raise AttemptStateError("attempt descriptor recovery leg is outside requested range")
-        if leg.next_sequence > descriptor.start_sequence + descriptor.packet_count:
-            raise AttemptStateError("attempt descriptor recovery leg exceeds requested range")
 
 
 def _required_str(raw: dict[str, object], key: str) -> str:
@@ -196,29 +170,17 @@ def _optional_int(raw: dict[str, object], key: str) -> int | None:
     return value
 
 
-def _mode_from_json(raw: dict[str, object]) -> str:
-    value = raw.get("mode", "durable")
-    if not isinstance(value, str):
-        raise ValueError("mode")
-    return value
-
-
-def _recovery_leg_from_json(raw: dict[str, object]) -> RecoveryLeg | None:
-    value = raw.get("recovery_leg")
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("recovery_leg")
-    start = value.get("start_sequence")
-    count = value.get("packet_count")
-    if isinstance(start, bool) or not isinstance(start, int):
-        raise ValueError("recovery_leg")
-    if isinstance(count, bool) or not isinstance(count, int):
-        raise ValueError("recovery_leg")
-    return RecoveryLeg(start, count)
-
-
 def _descriptor_from_json(raw: dict[str, object]) -> AttemptDescriptor:
+    if set(raw) != {
+        "attempt_id",
+        "device_slug",
+        "start_sequence",
+        "packet_count",
+        "record_size",
+        "read_begin_start",
+        "read_begin_count",
+    }:
+        raise ValueError("attempt descriptor schema")
     return AttemptDescriptor(
         attempt_id=_required_str(raw, "attempt_id"),
         device_slug=_required_str(raw, "device_slug"),
@@ -227,8 +189,6 @@ def _descriptor_from_json(raw: dict[str, object]) -> AttemptDescriptor:
         record_size=_required_int(raw, "record_size"),
         read_begin_start=_optional_int(raw, "read_begin_start"),
         read_begin_count=_optional_int(raw, "read_begin_count"),
-        mode=_mode_from_json(raw),
-        recovery_leg=_recovery_leg_from_json(raw),
     )
 
 

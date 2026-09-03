@@ -31,8 +31,6 @@ _ATTEMPT_KEYS: Final = frozenset(
         "record_size",
         "read_begin_start",
         "read_begin_count",
-        "mode",
-        "recovery_leg",
     }
 )
 _CHECKPOINT_KEYS: Final = frozenset({"version", "attempt_id", "record_count", "raw_sha256"})
@@ -290,8 +288,6 @@ def _read_attempt(path: Path, source_name: str) -> dict[str, object]:
     _validate_attempt_identity(raw, source_name)
     _validate_attempt_range(raw)
     _validate_read_begin(raw)
-    if raw["recovery_leg"] is not None:
-        raise QuarantinePublishError("attempt recovery leg must be null")
     return raw
 
 
@@ -301,8 +297,6 @@ def _validate_attempt_identity(raw: dict[str, object], source_name: str) -> None
         raise QuarantinePublishError("attempt_id is invalid")
     if source_name != attempt_id and not source_name.startswith(f"{attempt_id}-"):
         raise QuarantinePublishError("quarantined directory does not identify attempt_id")
-    if _string(raw, "mode") != "streaming":
-        raise QuarantinePublishError("attempt is not a streaming attempt")
     _validate_slug(_string(raw, "device_slug"))
 
 

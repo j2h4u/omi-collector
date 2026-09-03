@@ -39,9 +39,10 @@ only when the implementation, focused tests, and relevant documentation agree.
 
 ## Final verification
 
-- [x] Run focused tests after each completed slice.
-- [ ] Reset the disposable schema-1 firmware metrics file during deployment;
+- [x] Cover every completed slice with focused tests.
+- [x] Confirm the disposable schema-1 firmware metrics file is absent after the
+  deployment cutover;
   do not add a compatibility reader or migration for it.
 - [x] Pass the complete repository gates on the release candidate.
-- [ ] Give this checklist and the resulting diff to a fresh, context-free
+- [x] Give this checklist and the resulting diff to a fresh, context-free
   auditor; correct every unsupported checkbox and remaining confirmed issue.

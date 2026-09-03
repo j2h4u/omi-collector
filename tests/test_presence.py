@@ -211,7 +211,7 @@ def test_expired_candidate_snapshot_returns_no_candidate_or_timestamp() -> None:
     _run(scenario())
 
 
-def test_startup_scans_before_the_first_thirty_second_fallback() -> None:
+def test_startup_scans_before_the_first_five_minute_fallback() -> None:
     async def scenario() -> None:
         now = [0.0]
 
@@ -222,7 +222,7 @@ def test_startup_scans_before_the_first_thirty_second_fallback() -> None:
         scheduler = PresenceScheduler(observer, clock=lambda: now[0], sleep=sleep_clock)
         wake = await scheduler.wait_for_attempt()
         assert wake.reason == "fallback"
-        assert now[0] == 30.0
+        assert now[0] == 300.0
         assert observer.starts == 1
         assert observer.stops == 1
         await scheduler.close()

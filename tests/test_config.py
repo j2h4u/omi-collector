@@ -27,7 +27,7 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert isinstance(DEFAULT_CONFIG.presence, PresenceConfig)
     assert isinstance(DEFAULT_CONFIG.retry, RetryConfig)
     assert DEFAULT_CONFIG.presence.absence_seconds == 60.0
-    assert DEFAULT_CONFIG.presence.fallback_seconds == 30.0
+    assert DEFAULT_CONFIG.presence.fallback_seconds == 300.0
     assert DEFAULT_CONFIG.presence.drained_fallback_seconds == 900.0
     assert DEFAULT_CONFIG.presence.scan_transition_seconds == 2.0
     assert DEFAULT_CONFIG.retry.rapid_backoff == (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)

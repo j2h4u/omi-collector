@@ -435,8 +435,8 @@ def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: in
     return records
 
 
-def test_retry_policy_preserves_legacy_positional_and_keyword_callers() -> None:
-    assert RetryPolicy().drain_cooldown_seconds == 30
+def test_retry_policy_preserves_positional_and_keyword_overrides() -> None:
+    assert RetryPolicy().drain_cooldown_seconds == 300
     positional = RetryPolicy((1,), 30, 4096, True)
     legacy_keyword = RetryPolicy(idle_poll_seconds=30)
     explicit = RetryPolicy(drain_cooldown_seconds=300)
@@ -996,7 +996,11 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
 
     class BlockingPresence:
         closed = False
-        policy = PresencePolicy(rapid_backoff=(0.001,), drained_fallback_seconds=30.0)
+        policy = PresencePolicy(
+            fallback_seconds=30.0,
+            rapid_backoff=(0.001,),
+            drained_fallback_seconds=DEFAULT_CONFIG.presence.fallback_seconds,
+        )
 
         async def wait_for_attempt(self) -> PresenceWake:
             scan_started.set()
@@ -1054,7 +1058,11 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
 
     class BlockingPresence:
         closed = False
-        policy = PresencePolicy(rapid_backoff=(0.001,), drained_fallback_seconds=30.0)
+        policy = PresencePolicy(
+            fallback_seconds=30.0,
+            rapid_backoff=(0.001,),
+            drained_fallback_seconds=DEFAULT_CONFIG.presence.fallback_seconds,
+        )
 
         async def wait_for_attempt(self) -> PresenceWake:
             await asyncio.Event().wait()

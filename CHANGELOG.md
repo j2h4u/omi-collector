@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.3](https://github.com/j2h4u/omi-collector/compare/v0.2.2...v0.2.3) (2026-09-03)
+
+
+### Documentation
+
+* complete final collector audit ([#18](https://github.com/j2h4u/omi-collector/issues/18)) ([103c526](https://github.com/j2h4u/omi-collector/commit/103c52655d7d37f1e75168efad8f37f95bc4dad8))
+
+
+### Refactoring
+
+* simplify collector state and maintenance ([#16](https://github.com/j2h4u/omi-collector/issues/16)) ([c43c1b3](https://github.com/j2h4u/omi-collector/commit/c43c1b310d3d625c9ab9fbae3e9566dc7c9a92b9))
+
 ## [0.2.2](https://github.com/j2h4u/omi-collector/compare/v0.2.1...v0.2.2) (2026-09-03)
 
 

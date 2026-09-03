@@ -19,10 +19,16 @@ jobs:
       security-events: write
 
     steps:
+      - name: Release metadata needs no code analysis
+        if: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release-please--') }}
+        run: echo "release PR changes package metadata only"
+
       - name: Checkout
+        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
         uses: actions/checkout@v7.0.1
 
       - name: Detect code scanning availability
+        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
         id: code-scanning
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,12 +40,14 @@ jobs:
           fi
 
       - name: Initialize CodeQL
+        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
         uses: github/codeql-action/init@v4.37.9
         with:
           languages: python
           queries: security-extended
 
       - name: Perform CodeQL Analysis
+        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
         uses: github/codeql-action/analyze@v4.37.9
         with:
           category: "/language:python"

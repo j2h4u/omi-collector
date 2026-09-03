@@ -12,10 +12,16 @@ jobs:
   dependency-review:
     runs-on: ubuntu-latest
     steps:
+      - name: Release metadata changes no dependencies
+        if: ${{ startsWith(github.event.pull_request.head.ref, 'release-please--') }}
+        run: echo "release PR only synchronizes the existing package version"
+
       - name: Checkout
+        if: ${{ !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
         uses: actions/checkout@v7.0.1
 
       - name: Dependency review
+        if: ${{ !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
         uses: actions/dependency-review-action@v5.0.0
         with:
           fail-on-severity: moderate

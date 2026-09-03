@@ -9,6 +9,9 @@ from pathlib import Path
 from struct import pack
 from typing import cast
 
+import pytest
+
+from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.presence import PresencePolicy, PresenceScheduler, PresenceWake
@@ -17,6 +20,7 @@ from omi_collector.capture.application.quarantine_maintenance import (
     QuarantineMaintenance,
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from omi_collector.config import CollectorConfig, StagingRetentionConfig
 
 
 def _run(coro: object) -> object:
@@ -122,6 +126,40 @@ def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) 
         assert (bundles[0] / "records.bin").read_bytes() == expected
 
     _run(scenario())
+
+
+def test_quarantine_pending_keeps_valid_partial_salvageable_and_expires_opaque(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
+    store = StagingStore(
+        tmp_path,
+        tmp_path.parent / f"{tmp_path.name}-captures",
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
+    )
+    expected = _seed_streaming_partial(store, count=2)
+    attempt_id = next((tmp_path / "attempts").iterdir()).name
+    malformed = tmp_path / "attempts" / ("f" * 32)
+    malformed.mkdir()
+    moved = store.quarantine_pending("omi", "ambiguous recovery evidence")
+
+    source = next(path for path in moved if path.name.startswith(attempt_id))
+    opaque = next(path for path in moved if path != source)
+    assert not (source.with_name(f"{source.name}.json")).exists()
+    assert (opaque.with_name(f"{opaque.name}.json")).is_file()
+    assert store.quarantined_attempts("omi") == (source,)
+
+    _run(QuarantineMaintenance(store, "omi", None, OpportunisticRuntime()).run_once(lambda: False))
+    assert (source / "published.json").is_file()
+    bundles = tuple((store.capture_root / "omi").iterdir())
+    assert len(bundles) == 1
+    assert (bundles[0] / "records.bin").read_bytes() == expected
+
+    now += 72_000_000_000
+    assert set(store.sweep_terminal_quarantine("omi")) == {source, opaque}
+    assert not source.exists()
+    assert not opaque.exists()
 
 
 def test_presence_scan_starts_before_startup_and_wake_waits_for_binding(tmp_path: Path) -> None:

@@ -151,7 +151,7 @@ def test_device_lock_finalizes_complete_capture_local_publication_temporary(tmp_
     assert (result.bundle_path / "records.bin").read_bytes() == _record(1)
 
 
-def test_sweep_quarantine_deletes_only_strict_published_evidence(
+def test_sweep_quarantine_deletes_terminal_evidence_after_shared_retention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -168,10 +168,9 @@ def test_sweep_quarantine_deletes_only_strict_published_evidence(
 
     now += 72_000_000_000
 
-    assert store.sweep_terminal_quarantine("omi_cv1") == (published,)
+    assert set(store.sweep_terminal_quarantine("omi_cv1")) == {published, unprocessable}
     assert not published.exists()
-    assert unprocessable.is_dir()
-    assert (unprocessable / "unprocessable.json").is_file()
+    assert not unprocessable.exists()
 
 
 def test_device_lock_rejects_symlink_publishing_root(tmp_path: Path) -> None:
@@ -325,9 +324,11 @@ def test_pending_attempts_fail_closed_on_unattributed_malformed_evidence(tmp_pat
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir()
     (malformed / "attempt.json").write_text("{", encoding="utf-8")
-    with pytest.raises(PendingAttemptError, match="cannot be attributed safely"):
+    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
         store.pending_attempts("other")
-    assert malformed.exists()
+    moved = store.quarantine_pending("other", "unattributed malformed evidence")
+    assert len(moved) == 1
+    assert not malformed.exists()
 
 
 def test_pending_attempts_fail_closed_on_invalid_malformed_attribution(tmp_path: Path) -> None:
@@ -338,11 +339,12 @@ def test_pending_attempts_fail_closed_on_invalid_malformed_attribution(tmp_path:
         dumps({"attempt_id": malformed.name, "device_slug": "../bad"}), encoding="utf-8"
     )
 
-    with pytest.raises(PendingAttemptError, match="cannot be attributed safely"):
+    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
         store.pending_attempts("omi_cv1")
-    with pytest.raises(PendingAttemptError, match="cannot be attributed safely"):
-        store.quarantine_pending("omi_cv1", "invalid descriptor attribution")
-    assert malformed.exists()
+    moved = store.quarantine_pending("omi_cv1", "invalid descriptor attribution")
+    assert len(moved) == 1
+    assert not malformed.exists()
+    assert (moved[0].with_name(f"{moved[0].name}.json")).is_file()
 
 
 def test_attributable_malformed_evidence_is_quarantined_without_read_authorization(tmp_path: Path) -> None:
@@ -376,18 +378,16 @@ def test_quarantine_pending_moves_blockers_and_preserves_unrelated_and_retired(t
     malformed.mkdir()
     (malformed / "attempt.json").write_text("{", encoding="utf-8")
 
-    with pytest.raises(PendingAttemptError, match="cannot be attributed safely"):
-        store.quarantine_pending("omi_cv1", "manual recovery")
+    moved = store.quarantine_pending("omi_cv1", "manual recovery")
 
-    assert matching.path.exists()
-    assert malformed.exists()
+    assert len(moved) == 2
+    assert not matching.path.exists()
+    assert not malformed.exists()
     assert unrelated.path.exists()
     assert published.path.exists()
     assert (published.path / "terminal-retired.json").is_file()
-    with pytest.raises(PendingAttemptError, match="cannot be attributed safely"):
-        store.pending_attempts("omi_cv1")
-    with pytest.raises(PendingAttemptError, match="cannot be attributed safely"):
-        store.pending_attempts("other")
+    assert store.pending_attempts("omi_cv1") == ()
+    assert store.pending_attempts("other") == (unrelated.descriptor,)
 
 
 def test_direct_quarantine_function_uses_concrete_filesystem(tmp_path: Path) -> None:
@@ -417,7 +417,7 @@ def test_quarantine_a_does_not_move_unattributed_entry_during_b_lease(tmp_path: 
     assert before.read_bytes() == b"unattributed"
 
 
-def test_quarantine_pending_preserves_symlink_without_following_it(tmp_path: Path) -> None:
+def test_quarantine_pending_moves_symlink_without_following_it(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     (tmp_path / "attempts").mkdir()
     outside = tmp_path / "outside"
@@ -427,12 +427,39 @@ def test_quarantine_pending_preserves_symlink_without_following_it(tmp_path: Pat
     link = tmp_path / "attempts" / "link"
     link.symlink_to(target)
 
-    with pytest.raises(PendingAttemptError, match="not a regular directory"):
-        store.quarantine_pending("omi_cv1", "symlink recovery")
+    moved = store.quarantine_pending("omi_cv1", "symlink recovery")
 
-    assert link.is_symlink()
-    assert link.readlink() == target
+    assert len(moved) == 1
+    assert moved[0].is_symlink()
+    assert moved[0].readlink() == target
+    assert not link.is_symlink()
     assert target.read_bytes() == b"evidence"
+
+
+def test_opaque_quarantine_entries_expire_after_terminal_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
+    store = StagingStore(
+        tmp_path,
+        _capture_root(tmp_path),
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
+    )
+    opaque_dir = tmp_path / "attempts" / "opaque-dir"
+    opaque_dir.mkdir(parents=True)
+    target = tmp_path / "outside"
+    target.write_bytes(b"preserve")
+    opaque_link = tmp_path / "attempts" / "opaque-link"
+    opaque_link.symlink_to(target)
+
+    moved = store.quarantine_pending("omi_cv1", "opaque evidence")
+    now += 72_000_000_000
+
+    assert set(store.sweep_terminal_quarantine("omi_cv1")) == set(moved)
+    assert not opaque_dir.exists()
+    assert not opaque_link.is_symlink()
+    assert target.read_bytes() == b"preserve"
 
 
 def test_quarantine_pending_rejects_active_lease(tmp_path: Path) -> None:
@@ -553,15 +580,20 @@ def test_pending_ignores_non_directory_entries_and_reports_iterdir_errors(
     partial = tmp_path / "attempts"
     partial.mkdir()
     (partial / "evidence.txt").write_text("preserve", encoding="utf-8")
-    with pytest.raises(PendingAttemptError, match="not a regular directory"):
+    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
         store.pending_attempts("omi_cv1")
 
     entry = partial / "linked-evidence"
     entry_target = tmp_path / "entry-target"
     entry_target.mkdir()
     entry.symlink_to(entry_target, target_is_directory=True)
-    with pytest.raises(PendingAttemptError, match="not a regular directory"):
+    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
         store.pending_attempts("omi_cv1")
+    moved = store.quarantine_pending("omi_cv1", "opaque local evidence")
+    assert len(moved) == 2
+    assert all(path.parent == tmp_path / "quarantine" / "omi_cv1" for path in moved)
+    assert all(not path.is_symlink() for path in partial.iterdir())
+    assert entry_target.is_dir()
 
     original_iterdir = Path.iterdir
 

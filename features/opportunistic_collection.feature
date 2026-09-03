@@ -74,7 +74,9 @@ Feature: Opportunistic raw collection from an Omi pendant
     Scenario: Damaged or ambiguous unfinished evidence fails closed
       Given unfinished attempt evidence is damaged or ambiguous
       When a new process inspects it before READ
-      Then all attributable bytes are preserved separately
+      Then each unusable local entry is moved opaquely into this device's quarantine
+      And valid evidence belonging to another device remains untouched
+      And quarantine evidence expires after the configured terminal retention
       And no explicit ADVANCE is based on that evidence
       And collection continues only from fresh authoritative device state
 

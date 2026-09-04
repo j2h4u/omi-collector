@@ -213,6 +213,7 @@ for a minor release, `fix:` for a patch, and `!` for a breaking release. Run
 need a `BEGIN_COMMIT_OVERRIDE` / `END_COMMIT_OVERRIDE` block in their body.
 Release-please owns `CHANGELOG.md`, `pyproject.toml`, and `uv.lock` version
 updates; review and merge its release PR to create the tag and GitHub release.
+Published changes are summarized in the [changelog](CHANGELOG.md).
 
 ## Documentation
 

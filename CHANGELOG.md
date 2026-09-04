@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.11](https://github.com/j2h4u/omi-collector/compare/v0.2.10...v0.2.11) (2026-09-04)
+
+
+### Fixes
+
+* harden bundle validation and shutdown ([#35](https://github.com/j2h4u/omi-collector/issues/35)) ([e02be8e](https://github.com/j2h4u/omi-collector/commit/e02be8e10e1f05e137a76424ffd57e281c7a36e2))
+
 ## [0.2.10](https://github.com/j2h4u/omi-collector/compare/v0.2.9...v0.2.10) (2026-09-04)
 
 

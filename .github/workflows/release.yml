@@ -73,11 +73,12 @@ jobs:
   release-please:
     needs: wait-for-ci
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       actions: write
       contents: write
       pull-requests: write
+      statuses: write
     outputs:
       release-created: ${{ steps.release.outputs.release_created }}
       tag-name: ${{ steps.release.outputs.tag_name }}
@@ -140,11 +141,12 @@ jobs:
               ;;
           esac
 
-      - name: Dispatch full checks and enable release auto-merge
+      - name: Attest release PR checks and enable release auto-merge
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_BRANCH: release-please--branches--main--components--omi-collector
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
 
@@ -163,15 +165,120 @@ jobs:
           fi
 
           IFS=$'\t' read -r pr_number head_ref head_sha base_sha <<< "${release_prs[0]}"
-          echo "Dispatching checks for PR #${pr_number} at ${head_sha} (${head_ref})"
-          gh api --method POST "repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches" \
-            -f ref="${head_ref}"
-          gh api --method POST "repos/${REPOSITORY}/actions/workflows/codeql.yml/dispatches" \
-            -f ref="${head_ref}"
-          gh api --method POST "repos/${REPOSITORY}/actions/workflows/dependency-review.yml/dispatches" \
-            -f ref="${head_ref}" \
-            -f "inputs[base-ref]=${base_sha}" \
-            -f "inputs[head-ref]=${head_sha}"
+          release_pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
+          pr_title="$(jq -r '.title' <<< "${release_pr}")"
+          pr_body="$(jq -r '.body' <<< "${release_pr}")"
+          head_repo="$(jq -r '.head.repo.full_name' <<< "${release_pr}")"
+          pr_author="$(jq -r '.user.login' <<< "${release_pr}")"
+          contexts=(ci "Analyze Python" dependency-review)
+          declare -A dispatch_started_at existing_run_ids
+
+          publish_status() {
+            local context="$1" state="$2" description="$3"
+            gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
+              -f state="${state}" \
+              -f context="${context}" \
+              -f description="${description}" \
+              -f target_url="${RUN_URL}" >/dev/null
+          }
+
+          dispatch_workflow() {
+            local workflow_id="$1"
+            dispatch_started_at["${workflow_id}"]="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            existing_run_ids["${workflow_id}"]="$(gh api \
+              "repos/${REPOSITORY}/actions/workflows/${workflow_id}/runs?event=workflow_dispatch&branch=${head_ref}&per_page=100" \
+              --jq '[.workflow_runs[].id]')"
+            case "${workflow_id}" in
+              ci.yml)
+                gh api --method POST "repos/${REPOSITORY}/actions/workflows/${workflow_id}/dispatches" \
+                  -f ref="${head_ref}" \
+                  -f "inputs[release_attestation]=true" \
+                  -f "inputs[pr_title]=${pr_title}" \
+                  -f "inputs[pr_body]=${pr_body}" \
+                  -f "inputs[base_sha]=${base_sha}" \
+                  -f "inputs[head_sha]=${head_sha}" \
+                  -f "inputs[head_ref]=${head_ref}" \
+                  -f "inputs[head_repo]=${head_repo}" \
+                  -f "inputs[pr_author]=${pr_author}"
+                ;;
+              dependency-review.yml)
+                gh api --method POST "repos/${REPOSITORY}/actions/workflows/${workflow_id}/dispatches" \
+                  -f ref="${head_ref}" \
+                  -f "inputs[base-ref]=${base_sha}" \
+                  -f "inputs[head-ref]=${head_sha}"
+                ;;
+              *)
+                gh api --method POST "repos/${REPOSITORY}/actions/workflows/${workflow_id}/dispatches" \
+                  -f ref="${head_ref}"
+                ;;
+            esac
+          }
+
+          wait_for_workflow() {
+            local workflow_id="$1" workflow_name="$2" run_id="" status conclusion
+            while [ -z "${run_id}" ]; do
+              run_id="$(gh api \
+                "repos/${REPOSITORY}/actions/workflows/${workflow_id}/runs?event=workflow_dispatch&branch=${head_ref}&per_page=100" \
+                | jq -r --arg workflow_name "${workflow_name}" --arg head_ref "${head_ref}" --arg head_sha "${head_sha}" \
+                  --arg started_at "${dispatch_started_at[${workflow_id}]}" --argjson existing "${existing_run_ids[${workflow_id}]}" '
+                  [.workflow_runs[]
+                   | select(.name == $workflow_name and .event == "workflow_dispatch" and .head_branch == $head_ref and .head_sha == $head_sha and .created_at >= $started_at)
+                   | .id as $id
+                   | select($existing | index($id) | not)
+                   | $id]
+                  | sort | last // empty')"
+              if [ -n "${run_id}" ]; then
+                break
+              fi
+              [ "$(date +%s)" -lt "${deadline}" ] || return 1
+              sleep 10
+            done
+            while :; do
+              IFS=$'\t' read -r status conclusion < <(gh api \
+                "repos/${REPOSITORY}/actions/runs/${run_id}" --jq '[.status, (.conclusion // "")] | @tsv')
+              if [ "${status}" = completed ]; then
+                [ "${conclusion}" = success ]
+                return
+              fi
+              [ "$(date +%s)" -lt "${deadline}" ] || return 1
+              sleep 10
+            done
+          }
+
+          deadline="$(( $(date +%s) + 1800 ))"
+          for context in "${contexts[@]}"; do
+            publish_status "${context}" pending "release PR check attestation is running"
+          done
+
+          if ! dispatch_workflow ci.yml; then
+            publish_status ci failure "release PR CI dispatch failed"
+            exit 1
+          fi
+          if ! dispatch_workflow codeql.yml; then
+            publish_status "Analyze Python" failure "release PR CodeQL dispatch failed"
+            exit 1
+          fi
+          if ! dispatch_workflow dependency-review.yml; then
+            publish_status dependency-review failure "release PR dependency review dispatch failed"
+            exit 1
+          fi
+
+          if ! wait_for_workflow ci.yml CI; then
+            publish_status ci failure "release PR CI attestation failed"
+            exit 1
+          fi
+          if ! wait_for_workflow codeql.yml CodeQL; then
+            publish_status "Analyze Python" failure "release PR CodeQL attestation failed"
+            exit 1
+          fi
+          if ! wait_for_workflow dependency-review.yml "Dependency review"; then
+            publish_status dependency-review failure "release PR dependency review attestation failed"
+            exit 1
+          fi
+
+          for context in "${contexts[@]}"; do
+            publish_status "${context}" success "release PR check attestation succeeded"
+          done
 
           gh pr merge "${pr_number}" --auto --squash \
             --repo "${REPOSITORY}" \

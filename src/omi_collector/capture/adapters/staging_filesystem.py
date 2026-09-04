@@ -392,21 +392,47 @@ def _files_equal(
     return True
 
 
-def _files_equal_bytes(
-    path: Path,
-    expected: bytes,
+def _files_equal_prefix(
+    first: Path,
+    second: Path,
+    size: int,
     *,
     chunk_size: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
 ) -> bool:
-    if _file_size(path) != len(expected):
+    """Compare one bounded prefix without materializing it in memory."""
+    if size < 0 or _file_size(first) != size or _file_size(second) < size:
         return False
-    with path.open("rb") as file:
-        offset = 0
-        while chunk := file.read(chunk_size):
-            if chunk != expected[offset : offset + len(chunk)]:
+    with first.open("rb") as left, second.open("rb") as right:
+        remaining = size
+        while remaining:
+            chunk = left.read(min(chunk_size, remaining))
+            if not chunk or chunk != right.read(len(chunk)):
                 return False
-            offset += len(chunk)
+            remaining -= len(chunk)
     return True
+
+
+def _copy_prefix_synced(
+    source: Path,
+    destination: Path,
+    size: int,
+    sync: Fsync,
+    *,
+    chunk_size: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
+) -> None:
+    """Copy one bounded prefix using fixed-size buffers and fsync the result."""
+    if size < 0:
+        raise AttemptStateError("prefix size must be non-negative")
+    with source.open("rb") as input_file, destination.open("xb") as output_file:
+        remaining = size
+        while remaining:
+            chunk = input_file.read(min(chunk_size, remaining))
+            if not chunk:
+                raise AttemptStateError("streaming raw file ended before prefix")
+            output_file.write(chunk)
+            remaining -= len(chunk)
+        output_file.flush()
+        sync(output_file.fileno())
 
 
 def _hash_prefix(
@@ -428,16 +454,6 @@ def _hash_prefix(
             digest.update(chunk)
             remaining -= len(chunk)
     return digest.hexdigest()
-
-
-def _read_prefix(path: Path, size: int) -> bytes:
-    if size < 0:
-        raise AttemptStateError("prefix size must be non-negative")
-    with path.open("rb") as file:
-        value = file.read(size)
-    if len(value) != size:
-        raise AttemptStateError("streaming raw file ended before prefix")
-    return value
 
 
 def _absolute_root(path: Path, label: str) -> Path:

@@ -208,6 +208,15 @@ def test_device_metrics_reports_one_stable_json_object(monkeypatch: pytest.Monke
     assert captured == [(tmp_path / "source", "omi", tmp_path / "collector" / "device.json")]
 
 
+def test_ble_link_journal_record_omits_device_address() -> None:
+    lines: list[str] = []
+    reporter = cli.SyncProgressReporter(emit=lines.append)
+
+    reporter.report_ble_link({"event": "ble_link_session", "address": "AA:BB", "handle": 7})
+
+    assert json.loads(lines[0]) == {"event": "ble_link_session", "handle": 7}
+
+
 def test_device_metrics_reports_malformed_authority_as_nonzero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def fail_metrics(*_args: object, **_kwargs: object) -> SpoolMetrics:
         raise SpoolMetricsError("bad artifact")

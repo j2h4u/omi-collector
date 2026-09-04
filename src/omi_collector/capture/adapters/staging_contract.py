@@ -65,14 +65,6 @@ class DurablePrefix:
     record_count: int
     raw_sha256: str
 
-    @property
-    def end_sequence(self) -> int:
-        return self.next_sequence
-
-    @property
-    def sha256(self) -> str:
-        return self.raw_sha256
-
 
 @dataclass(frozen=True, slots=True)
 class StreamingCheckpoint:

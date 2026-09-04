@@ -19,36 +19,23 @@ jobs:
       security-events: write
 
     steps:
-      - name: Release metadata needs no code analysis
-        if: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release-please--') }}
-        run: echo "release PR changes package metadata only"
-
       - name: Checkout
-        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
-        uses: actions/checkout@v7.0.1
-
-      - name: Detect code scanning availability
-        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
-        id: code-scanning
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh api "repos/${{ github.repository }}/code-scanning/alerts" >/dev/null 2>&1; then
-            echo "upload=always" >> "$GITHUB_OUTPUT"
-          else
-            echo "upload=never" >> "$GITHUB_OUTPUT"
-          fi
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
-        uses: github/codeql-action/init@v4.37.9
+        uses: github/codeql-action/init@a35ac6e6798d72df5475948b28efb89edc2e19ca # v4.37.9
         with:
           languages: python
           queries: security-extended
 
       - name: Perform CodeQL Analysis
-        if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
-        uses: github/codeql-action/analyze@v4.37.9
+        id: analyze
+        uses: github/codeql-action/analyze@a35ac6e6798d72df5475948b28efb89edc2e19ca # v4.37.9
         with:
           category: "/language:python"
-          upload: ${{ steps.code-scanning.outputs.upload }}
+          upload: always
+
+      - name: Require uploaded CodeQL analysis
+        env:
+          SARIF_ID: ${{ steps.analyze.outputs['sarif-id'] }}
+        run: test -n "${SARIF_ID}" || (echo "::error::CodeQL analysis was not uploaded" && exit 1)

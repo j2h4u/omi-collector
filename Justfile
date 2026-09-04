@@ -71,7 +71,7 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 
 # Unit tests.
 unit:
-    uv run pytest -q -n auto -m "not integration and not slow"
+    uv run pytest -q -n auto -m "not slow"
 
 # Test coverage report.
 coverage:
@@ -142,7 +142,3 @@ release-check title="" body="":
         printf 'The PR body needs a BEGIN_COMMIT_OVERRIDE block; re-run with body=<file> to check it.\n' >&2
         exit 1
     fi
-
-# Exercise the exact upstream TOML updater used by the pinned release action.
-release-please-updater-check:
-    uv run pytest -q -m integration tests/test_release_please_updater.py

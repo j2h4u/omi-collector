@@ -119,7 +119,10 @@ async def run_opportunistic_collector(
             unwinding = True
             raise
         finally:
-            await _close_observation_writer(run, unwinding=unwinding)
+            try:
+                await _close_observation_writer(run, unwinding=unwinding)
+            finally:
+                _close_quality_metrics(run)
 
 
 def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLifecycle:
@@ -213,3 +216,14 @@ async def _close_observation_writer(run: _Run, *, unwinding: bool) -> None:
     except Exception as error:  # noqa: BLE001 - observation teardown is best effort
         run.runtime.debug_exception("firmware_observation_writer_error", error, operation="close")
         return
+
+
+def _close_quality_metrics(run: _Run) -> None:
+    """Stop auxiliary metric storage with its own bounded daemon join."""
+    close = getattr(run.options.quality_metrics, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception as error:  # noqa: BLE001 - metrics teardown is best effort
+        run.runtime.debug_exception("quality_metrics_writer_error", error, operation="close")

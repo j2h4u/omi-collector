@@ -122,7 +122,7 @@ def _publish_quarantined_prefix(
     )
     capture_root = paths.capture_root.absolute()
     _defer_if_requested(should_defer)
-    prefix, raw_bytes, attempt_id = _read_authenticated_prefix(
+    prefix, raw_path, attempt_id = _read_authenticated_prefix(
         source,
         device_slug,
         should_defer=should_defer,
@@ -160,7 +160,8 @@ def _publish_quarantined_prefix(
                 destination,
                 manifest,
                 receipt,
-                raw_bytes,
+                raw_path,
+                prefix.record_count * RECORD_SIZE,
                 should_defer=should_defer,
             ):
                 return _result(destination, device_slug, prefix, True)
@@ -169,7 +170,8 @@ def _publish_quarantined_prefix(
             destination,
             manifest,
             receipt,
-            raw_bytes,
+            raw_path,
+            prefix.record_count * RECORD_SIZE,
             should_defer=should_defer,
         )
     except QuarantineOutputCollisionError:
@@ -184,7 +186,7 @@ def _read_authenticated_prefix(
     device_slug: str,
     *,
     should_defer: Callable[[], bool],
-) -> tuple[_Prefix, bytes, str]:
+) -> tuple[_Prefix, Path, str]:
     """Read and authenticate the checkpoint-bound prefix from one attempt."""
     attempt = _read_attempt(source / _ATTEMPT_NAME, source.name)
     if attempt["device_slug"] != device_slug:
@@ -196,7 +198,7 @@ def _read_authenticated_prefix(
 
     raw_path = source / _RAW_NAME
     _require_regular_file(raw_path, _RAW_NAME)
-    raw_bytes, actual_hash = _read_hashed_prefix(
+    actual_hash = _hash_prefix(
         raw_path,
         record_count * RECORD_SIZE,
         should_defer=should_defer,
@@ -205,7 +207,7 @@ def _read_authenticated_prefix(
     if actual_hash != expected_hash:
         raise QuarantinePublishError("records.bin prefix SHA-256 does not match checkpoint")
     prefix = _Prefix(cast(int, attempt["start_sequence"]), record_count, expected_hash)
-    return prefix, raw_bytes, cast(str, attempt["attempt_id"])
+    return prefix, raw_path, cast(str, attempt["attempt_id"])
 
 
 def _result(
@@ -335,14 +337,13 @@ def _read_checkpoint(path: Path, attempt_id: str) -> dict[str, object]:
     return raw
 
 
-def _read_hashed_prefix(
+def _hash_prefix(
     path: Path,
     size: int,
     *,
     should_defer: Callable[[], bool],
-) -> tuple[bytes, str]:
+) -> str:
     digest = sha256()
-    chunks: list[bytes] = []
     remaining = size
     descriptor = _open_regular_file(path, _RAW_NAME)
     try:
@@ -351,21 +352,20 @@ def _read_hashed_prefix(
             chunk = os.read(descriptor, min(DEFAULT_CONFIG.durability.io_chunk_bytes, remaining))
             if not chunk:
                 raise QuarantinePublishError("records.bin ends before checkpoint prefix")
-            chunks.append(chunk)
             digest.update(chunk)
             remaining -= len(chunk)
     finally:
         os.close(descriptor)
-    payload = b"".join(chunks)
     _defer_if_requested(should_defer)
-    return payload, digest.hexdigest()
+    return digest.hexdigest()
 
 
-def _destination_matches(
+def _destination_matches(  # noqa: PLR0913
     destination: Path,
     manifest: dict[str, object],
     receipt: dict[str, object],
-    raw: bytes,
+    raw_source: Path,
+    prefix_size: int,
     *,
     should_defer: Callable[[], bool],
 ) -> bool:
@@ -378,22 +378,26 @@ def _destination_matches(
         raise OSError("ordinary bundle destination is not yet canonical")
     existing_manifest = _read_object(destination / _MANIFEST_NAME, _MANIFEST_NAME)
     existing_receipt = _read_object(destination / _RECEIPT_NAME, _RECEIPT_NAME)
-    existing_raw = _read_regular_bytes(
-        destination / _RAW_NAME,
-        _RAW_NAME,
-        should_defer=should_defer,
-        chunk_size=DEFAULT_CONFIG.durability.io_chunk_bytes,
-    )
-    if existing_manifest != manifest or existing_receipt != receipt or existing_raw != raw:
+    if (
+        existing_manifest != manifest
+        or existing_receipt != receipt
+        or not _files_equal_prefix(
+            destination / _RAW_NAME,
+            raw_source,
+            prefix_size,
+            should_defer=should_defer,
+        )
+    ):
         raise QuarantineOutputCollisionError(f"ordinary bundle collision at {destination}")
     return True
 
 
-def _publish_atomic(
+def _publish_atomic(  # noqa: PLR0913
     destination: Path,
     manifest: dict[str, object],
     receipt: dict[str, object],
-    raw: bytes,
+    raw_source: Path,
+    prefix_size: int,
     *,
     should_defer: Callable[[], bool],
 ) -> None:
@@ -410,9 +414,10 @@ def _publish_atomic(
     completed = False
     try:
         os.mkdir(temporary_name, _SHARED_BUNDLE_DIRECTORY_MODE, dir_fd=device_fd)
-        _write_file(
+        _write_prefix_file(
             temporary / _RAW_NAME,
-            raw,
+            raw_source,
+            prefix_size,
             should_defer=should_defer,
         )
         _write_file(
@@ -437,7 +442,8 @@ def _publish_atomic(
                 destination,
                 manifest,
                 receipt,
-                raw,
+                raw_source,
+                prefix_size,
                 should_defer=_never_defer,
             ):
                 completed = True
@@ -591,6 +597,65 @@ def _write_file(
             offset += stream.write(payload[offset : offset + DEFAULT_CONFIG.durability.io_chunk_bytes])
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _write_prefix_file(
+    path: Path,
+    source: Path,
+    size: int,
+    *,
+    should_defer: Callable[[], bool],
+) -> None:
+    """Copy a source prefix with bounded buffers and durable completion."""
+    source_fd = _open_regular_file(source, _RAW_NAME)
+    try:
+        with path.open("xb") as stream:
+            remaining = size
+            while remaining:
+                _defer_if_requested(should_defer)
+                chunk = os.read(source_fd, min(DEFAULT_CONFIG.durability.io_chunk_bytes, remaining))
+                if not chunk:
+                    raise QuarantinePublishError("records.bin ends before checkpoint prefix")
+                offset = 0
+                while offset < len(chunk):
+                    offset += stream.write(chunk[offset:])
+                remaining -= len(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(source_fd)
+
+
+def _files_equal_prefix(
+    first: Path,
+    second: Path,
+    size: int,
+    *,
+    should_defer: Callable[[], bool],
+) -> bool:
+    """Compare one bounded prefix without materializing it in memory."""
+    try:
+        first_fd = _open_regular_file(first, _RAW_NAME)
+        second_fd = _open_regular_file(second, _RAW_NAME)
+    except QuarantinePublishError:
+        return False
+    try:
+        if os.fstat(first_fd).st_size != size or os.fstat(second_fd).st_size < size:
+            return False
+        remaining = size
+        while remaining:
+            _defer_if_requested(should_defer)
+            left = os.read(first_fd, min(DEFAULT_CONFIG.durability.io_chunk_bytes, remaining))
+            right = os.read(second_fd, len(left))
+            if not left or left != right:
+                return False
+            remaining -= len(left)
+        return True
+    except OSError as error:
+        raise QuarantinePublishError("prefix comparison failed") from error
+    finally:
+        os.close(first_fd)
+        os.close(second_fd)
 
 
 def _defer_if_requested(should_defer: Callable[[], bool]) -> None:

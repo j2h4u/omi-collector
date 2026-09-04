@@ -16,6 +16,7 @@ from omi_collector.capture.adapters.firmware_observations import (
     read_firmware_observations,
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
+from omi_collector.config import DEFAULT_CONFIG
 
 _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
 _SLUG = re.compile(r"[A-Za-z0-9_-]+")
@@ -189,13 +190,23 @@ def _read_manifest_and_raw(path: Path, device_slug: str) -> _ValidatedManifest:
         raise SpoolMetricsError(f"manifest sequence range is invalid: {path}")
     raw_path = path / "records.bin"
     _require_regular_file(raw_path, "records.bin")
-    try:
-        raw = raw_path.read_bytes()
-    except OSError as error:
-        raise SpoolMetricsError(f"records.bin is unreadable: {path}") from error
-    if len(raw) != count * RECORD_SIZE or sha256(raw).hexdigest() != raw_hash:
+    raw_size, calculated_hash = _stream_size_and_hash(raw_path)
+    if raw_size != count * RECORD_SIZE or calculated_hash != raw_hash:
         raise SpoolMetricsError(f"records.bin does not match manifest: {path}")
     return _ValidatedManifest(device_slug, start, next_sequence, count, cast(int, manifest["record_size"]), raw_hash)
+
+
+def _stream_size_and_hash(path: Path) -> tuple[int, str]:
+    digest = sha256()
+    size = 0
+    try:
+        with path.open("rb") as raw:
+            while chunk := raw.read(DEFAULT_CONFIG.durability.io_chunk_bytes):
+                size += len(chunk)
+                digest.update(chunk)
+    except OSError as error:
+        raise SpoolMetricsError(f"records.bin is unreadable: {path.parent}") from error
+    return size, digest.hexdigest()
 
 
 def _aggregate_window(measurements: tuple[_BundleMeasurement, ...]) -> SpoolWindowMetrics:

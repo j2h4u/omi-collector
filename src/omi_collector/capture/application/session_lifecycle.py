@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
@@ -53,23 +54,20 @@ type ConnectedStep = Callable[
     [RingSession, RingInfo | None, InfoReader, "SessionPhaseState"], Awaitable[tuple[str | None, RingInfo | None]]
 ]
 
+_BLE_ADDRESS = re.compile(r"(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:_-]){5}[0-9a-f]{2}(?![0-9a-f])")
+
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
     """Bounded per-operation timings, never a global presence deadline."""
 
     backoff: tuple[float, ...] = DEFAULT_CONFIG.retry.rapid_backoff
-    idle_poll_seconds: float | None = None
     batch_records: int = DEFAULT_CONFIG.memory.arena_max_bytes // RECORD_SIZE
     stop_after_drained: bool = False
     _: KW_ONLY
     drain_cooldown_seconds: float = DEFAULT_CONFIG.presence.fallback_seconds
     arena_max_bytes: int = DEFAULT_CONFIG.memory.arena_max_bytes
     advance_enabled: bool = True
-
-    def __post_init__(self) -> None:
-        if self.idle_poll_seconds is not None:
-            object.__setattr__(self, "drain_cooldown_seconds", self.idle_poll_seconds)
 
     def delay_for(self, retry_number: int) -> float:
         if not self.backoff:
@@ -280,9 +278,9 @@ class SessionLifecycle:
             terminal_error = error
             raise
         finally:
-            self._record_session_quality(quality, outcome, teardown_error, terminal_error)
+            await self._record_session_quality(quality, outcome, teardown_error, terminal_error)
 
-    def _record_session_quality(
+    async def _record_session_quality(
         self,
         quality: SessionQuality,
         outcome: str | None,
@@ -295,25 +293,24 @@ class SessionLifecycle:
             return
         termination_class, terminal_outcome = _quality_terminal(outcome, teardown_error, error)
         try:
-            metrics.record_transfer_session(
-                TransferSessionMetric(
-                    utc_timestamp(self.run.options.host_time()),
-                    quality.session_id,
-                    quality.device_slug,
-                    terminal_outcome,
-                    termination_class,
-                    quality.active_read_elapsed_ms,
-                    quality.requested_record_count,
-                    quality.received_raw_bytes,
-                    quality.submitted_raw_bytes,
-                    quality.written_raw_bytes,
-                    metrics.release_version,  # type: ignore[attr-defined]
-                    metrics.source_revision,  # type: ignore[attr-defined]
-                    quality.firmware_version,
-                    quality.phy_policy,
-                    quality.advertisement_rssi_dbm,
-                )
+            metric = TransferSessionMetric(
+                utc_timestamp(self.run.options.host_time()),
+                quality.session_id,
+                quality.device_slug,
+                terminal_outcome,
+                termination_class,
+                quality.active_read_elapsed_ms,
+                quality.requested_record_count,
+                quality.received_raw_bytes,
+                quality.submitted_raw_bytes,
+                quality.written_raw_bytes,
+                metrics.release_version,  # type: ignore[attr-defined]
+                metrics.source_revision,  # type: ignore[attr-defined]
+                quality.firmware_version,
+                quality.phy_policy,
+                quality.advertisement_rssi_dbm,
             )
+            metrics.record_transfer_session(metric)
         except Exception as metrics_error:  # noqa: BLE001 - metrics cannot stop audio capture
             self.run.runtime.debug_exception(
                 "quality_metrics_write_error", metrics_error, event_type="transfer_session"
@@ -481,6 +478,7 @@ def retryable(error: BaseException) -> bool:
             NotificationOverflowError,
             RingTransportDisconnectedError,
             RingTransportUnavailableError,
+            TimeoutError,
         ),
     )
 
@@ -646,7 +644,8 @@ def bounded_error_summary(error: BaseException) -> str:
     max_chars = DEFAULT_CONFIG.observability.max_error_entry_chars
     type_name = type(error).__name__[: max_chars - 2]
     message_limit = max_chars - len(type_name) - 2
-    return f"{type_name}: {str(error)[:message_limit]}"
+    message = _BLE_ADDRESS.sub("[BLE address]", str(error))
+    return f"{type_name}: {message[:message_limit]}"
 
 
 def remaining_budget(deadline: float) -> float:

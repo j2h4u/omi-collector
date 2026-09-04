@@ -169,7 +169,9 @@ class SyncProgressReporter:
 
     def report_ble_link(self, record: dict[str, object]) -> None:
         """Emit the observer's single terminal record at the selected sink."""
-        self._emit_json(record)
+        public_record = dict(record)
+        public_record.pop("address", None)
+        self._emit_json(public_record)
 
     def _report_session_error(self, progress: DownloadProgress) -> None:
         error_type = progress.error_type or "unknown"

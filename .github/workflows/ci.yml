@@ -28,62 +28,62 @@ jobs:
         if: github.event_name != 'pull_request'
         run: echo "release contract is a pull-request check"
 
-      - uses: actions/checkout@v7.0.1
-        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.event_name == 'pull_request' }}
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v7.0.0
-        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: ${{ github.event_name == 'pull_request' }}
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@v10.0.1
-        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        if: ${{ github.event_name == 'pull_request' }}
         with:
           enable-cache: true
 
       - name: Validate release-please PR contract
-        if: ${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'dependabot/') }}
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          RELEASE_BRANCH: release-please--branches--main--components--omi-collector
         run: |
           set -euo pipefail
           uv run python scripts/validate_release_config.py
           uv run python scripts/validate_pr_title.py --title "${PR_TITLE}"
           uv run python -m scripts.validate_pr_commits --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}"
-          if [[ "${HEAD_REF}" == release-please--* ]]; then
+          if [[ "${HEAD_REF}" == "${RELEASE_BRANCH}" &&
+                "${HEAD_REPO}" == "${GITHUB_REPOSITORY}" &&
+                "${PR_AUTHOR}" == "github-actions[bot]" ]]; then
             exit 0
           fi
           count="$(git rev-list --no-merges --count "${BASE_SHA}..${HEAD_SHA}")"
           printf '%s' "${PR_BODY}" \
             | uv run python -m scripts.validate_release_notes --body-file - --commit-count "${count}"
 
-      - name: Verify release package
-        if: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.head.ref, 'release-please--') }}
-        run: uv run python scripts/check_packaging_smoke.py
-
   quality:
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: just
 
@@ -94,21 +94,20 @@ jobs:
         run: just check
 
   test:
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: just
 
@@ -119,21 +118,20 @@ jobs:
         run: just unit
 
   crap:
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: just
 
@@ -144,13 +142,12 @@ jobs:
         run: just crap-check
 
   docker-build:
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: just
 
@@ -158,13 +155,12 @@ jobs:
         run: just docker-build
 
   runtime-smoke:
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.head.ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: just
 

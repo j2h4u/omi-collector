@@ -231,7 +231,7 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
     assert preserved.read_text(encoding="utf-8") == "evidence"
 
 
-def test_terminal_retired_sweep_defers_during_prefix_hash_before_delete(
+def test_terminal_retired_sweep_does_not_rehash_records_before_delete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -252,22 +252,11 @@ def test_terminal_retired_sweep_defers_during_prefix_hash_before_delete(
     attempt.close(durable=True)
     store.terminalize_prefix_attempt("omi_cv1", attempt.attempt_id)
     now += 1_000_000_000
-    checks = 0
-    real_rmtree = quarantine_module.shutil.rmtree
-
-    def defer_during_second_hash_chunk() -> bool:
-        nonlocal checks
-        checks += 1
-        return checks >= 3
-
-    def forbidden_delete(_path: object) -> None:
-        raise AssertionError("deferred maintenance reached recursive deletion")
-
-    monkeypatch.setattr(quarantine_module.shutil, "rmtree", forbidden_delete)
-    assert store.sweep_terminal_retired("omi_cv1", should_defer=defer_during_second_hash_chunk) == ()
-    assert attempt.path.exists()
-
-    monkeypatch.setattr(quarantine_module.shutil, "rmtree", real_rmtree)
+    monkeypatch.setattr(
+        quarantine_module,
+        "_published_prefix",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("retired records were rehashed")),
+    )
     assert store.sweep_terminal_retired("omi_cv1") == (attempt.path,)
     assert not attempt.path.exists()
 

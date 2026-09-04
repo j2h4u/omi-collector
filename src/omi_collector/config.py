@@ -296,14 +296,26 @@ class DebugLogConfig:
 
 @dataclass(frozen=True, slots=True)
 class QualityMetricsConfig:
-    """Long-lived, append-only transfer evidence beneath the collector root."""
+    """Bounded transfer evidence retained as complete JSONL records."""
 
     file_name: str = "quality.jsonl"
+    max_bytes: int = 8 * 1024 * 1024
+    backup_count: int = 3
+    max_record_bytes: int = 1 * 1024 * 1024
+    queue_max_records: int = 64
+    shutdown_join_seconds: float = 1.0
     encoding: str = "utf-8"
     source_revision_env: str = "OMI_COLLECTOR_SOURCE_REVISION"
 
     def __post_init__(self) -> None:
         _require_path_component(self.file_name, "file_name")
+        _require_positive_int(self.max_bytes, "max_bytes")
+        _require_positive_int(self.backup_count, "backup_count")
+        _require_positive_int(self.max_record_bytes, "max_record_bytes")
+        if self.max_record_bytes > self.max_bytes:
+            raise ValueError("max_record_bytes must not exceed max_bytes")
+        _require_positive_int(self.queue_max_records, "queue_max_records")
+        _require_positive_float(self.shutdown_join_seconds, "shutdown_join_seconds")
         _require_encoding(self.encoding, "encoding")
         _require_logger_name(self.source_revision_env.lower(), "source_revision_env")
 

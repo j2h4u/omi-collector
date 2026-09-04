@@ -172,6 +172,27 @@ def test_conflicting_overlapping_ranges_fail_closed(tmp_path: Path) -> None:
         collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
 
 
+def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    device = tmp_path / "omi"
+    device.mkdir()
+    _bundle(device, "first", (_record(1), _record(2)))
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path.name == "records.bin":
+            raise AssertionError("records.bin must be hashed as a bounded stream")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    result = collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+
+    assert result.current_window.downloaded_records == 2
+
+
 def test_partial_and_symlink_artifacts_are_not_counted(tmp_path: Path) -> None:
     device = tmp_path / "omi"
     device.mkdir()

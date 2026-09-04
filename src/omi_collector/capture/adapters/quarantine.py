@@ -120,7 +120,7 @@ def terminalize_prefix_attempt(filesystem: StagingFilesystem, device_slug: str, 
         descriptor = filesystem._read_descriptor(path)
         if descriptor.device_slug != device_slug:
             raise AttemptStateError("attempt source belongs to another device")
-        if _is_terminal_retired_attempt(filesystem, path, descriptor):
+        if _is_terminal_retired_attempt(path):
             return
         if _has_terminal_retirement_marker(path):
             raise AttemptStateError("terminal-retired marker is invalid")
@@ -185,7 +185,6 @@ def sweep_terminal_retired(
                     device_slug,
                     now_unix_ns,
                     retention_ns,
-                    should_defer=should_defer,
                 )
             except MaintenanceDeferredError:
                 break
@@ -201,25 +200,18 @@ def sweep_terminal_retired(
     return tuple(removed)
 
 
-def _terminal_retired_expired(  # noqa: PLR0913
+def _terminal_retired_expired(
     filesystem: StagingFilesystem,
     entry: Path,
     device_slug: str,
     now_unix_ns: int,
     retention_ns: int,
-    *,
-    should_defer: Callable[[], bool],
 ) -> bool:
     mode = entry.lstat().st_mode
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         return False
     descriptor = filesystem._read_descriptor(entry)
-    terminalized_at = _terminal_retired_at(
-        filesystem,
-        entry,
-        descriptor,
-        should_defer=should_defer,
-    )
+    terminalized_at = _terminal_retired_at(entry)
     return (
         descriptor.device_slug == device_slug
         and terminalized_at is not None
@@ -445,25 +437,12 @@ def _terminal_marker_at(path: Path) -> int | None:
     return None
 
 
-def _terminal_retired_at(
-    filesystem: StagingFilesystem,
-    path: Path,
-    descriptor: AttemptDescriptor,
-    *,
-    should_defer: Callable[[], bool] = _never_defer,
-) -> int | None:
+def _terminal_retired_at(path: Path) -> int | None:
     marker_path = path / _TERMINAL_RETIRED_NAME
     if not marker_path.exists():
         return None
     try:
         _require_regular_file(marker_path, "terminal-retired marker")
-        _published_prefix(
-            path,
-            descriptor,
-            filesystem=filesystem,
-            io_chunk_bytes=filesystem._durability.io_chunk_bytes,
-            should_defer=should_defer,
-        )
         recoverable_marker_path = path / _PREFIX_PUBLICATION_NAME
         _require_regular_file(recoverable_marker_path, "recoverable prefix publication marker")
         recoverable_marker = PrefixPublicationEvidence.from_json(_read_json(recoverable_marker_path))
@@ -480,13 +459,13 @@ def _has_terminal_retirement_marker(path: Path) -> bool:
     return os.path.lexists(path / _TERMINAL_RETIRED_NAME)
 
 
-def _is_terminal_retired_attempt(filesystem: StagingFilesystem, path: Path, descriptor: AttemptDescriptor) -> bool:
-    return _terminal_retired_at(filesystem, path, descriptor) is not None
+def _is_terminal_retired_attempt(path: Path) -> bool:
+    return _terminal_retired_at(path) is not None
 
 
 def is_nonblocking_attempt(filesystem: StagingFilesystem, path: Path, descriptor: AttemptDescriptor) -> bool:
     if _has_terminal_retirement_marker(path):
-        return _is_terminal_retired_attempt(filesystem, path, descriptor)
+        return _is_terminal_retired_attempt(path)
     return _is_published_attempt(filesystem, path, descriptor)
 
 

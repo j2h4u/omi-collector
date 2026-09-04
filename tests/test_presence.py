@@ -144,6 +144,98 @@ def test_bleak_start_failure_falls_back_and_retries_with_fresh_scanner() -> None
     _run(scenario())
 
 
+def test_drained_absent_scheduler_retries_soft_scan_failure() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        timer_released = asyncio.Event()
+
+        async def sleep_until_released(_delay: float) -> None:
+            await timer_released.wait()
+
+        class FlakyObserver:
+            def __init__(self) -> None:
+                self.starts = 0
+                self.callback: Callable[[object], object] | None = None
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                self.starts += 1
+                self.callback = callback
+                if self.starts < 3:
+                    raise RuntimeError("Bluetooth temporarily unavailable")
+                callback(BLEDevice("AA:BB", "omi", object()))
+
+            async def stop(self) -> None:
+                if self.starts < 3:
+                    raise TimeoutError("Bluetooth stop temporarily unavailable")
+
+        observer = FlakyObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=PresencePolicy(
+                absence_seconds=60.0,
+                fallback_seconds=300.0,
+                drained_fallback_seconds=900.0,
+            ),
+            clock=lambda: now[0],
+            sleep=sleep_until_released,
+        )
+        scheduler._fallback_deadline = 0.0
+        assert (await scheduler.wait_for_attempt()).reason == "fallback"
+        await scheduler.attempt_finished("clean")
+
+        now[0] = 1_000.0
+        wait = asyncio.create_task(scheduler.wait_for_attempt())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert observer.starts == 2
+        assert not wait.done()
+
+        timer_released.set()
+        assert (await asyncio.wait_for(wait, timeout=0.2)).reason == "fallback"
+        assert observer.starts == 3
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_due_rapid_retry_is_not_consumed_by_scan_guard() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+
+        class FlakyObserver:
+            def __init__(self) -> None:
+                self.starts = 0
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                del callback
+                self.starts += 1
+                if self.starts == 1:
+                    raise RuntimeError("Bluetooth temporarily unavailable")
+
+            async def stop(self) -> None:
+                return
+
+        observer = FlakyObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=PresencePolicy(rapid_backoff=(2.0,)),
+            clock=lambda: now[0],
+        )
+        scheduler._last_matching = 0.0
+
+        await scheduler.attempt_finished("retry")
+        assert observer.starts == 1
+        now[0] = 2.0
+
+        wake = await asyncio.wait_for(scheduler.wait_for_attempt(), timeout=0.2)
+
+        assert wake.reason == "rapid_retry"
+        assert observer.starts == 1
+        await scheduler.close()
+
+    _run(scenario())
+
+
 def test_ad_wake_retains_exact_scanner_candidate_and_stops_own_scan() -> None:
     async def scenario() -> None:
         observer = FakeObserver()

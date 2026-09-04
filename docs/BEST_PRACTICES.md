@@ -48,8 +48,9 @@ configured absolute project path; keep the environment file root-owned,
 group-readable by `omi-collector`, mode `0640`; and keep the service-local
 state directory `omi-collector:omi-collector` mode `0750`.
 
-Initial setup is deliberately small. For this production host, copy
-`config/layout.toml` to `/srv/pipelines/omi/collector.toml`, copy and edit
+Initial setup is deliberately small. Keep the checkout root-owned under
+`/opt`, copy `config/layout.toml` to
+`/var/lib/omi-collector/collector.toml`, copy and edit
 `config/omi-collector.env.example` at `/etc/omi-collector/omi-collector.env`,
 then run `sudo scripts/install-systemd-unit.sh`. The installer creates or
 validates the system account and state ownership, validates the staged wrapper
@@ -59,30 +60,18 @@ service without `--restart`.
 
 The layout schema is strict version two: `collector` is the private collector
 root and `source` is the direct publication root. `OMI_COLLECTOR_LAYOUT_PATH`
-may name any regular non-symlink absolute layout file; roots resolve relative to
-its parent. This host uses `/srv/pipelines/omi/collector.toml`. Create the two
-roots with ownership and permissions appropriate to the service account, then
-add this host-only drop-in at
-`/etc/systemd/system/omi-collector.service.d/storage.conf`:
+may name any regular non-symlink absolute layout file; roots resolve relative
+to its parent. The checked-in default stays under `/var/lib/omi-collector`,
+which the hardened unit can write. A custom external root requires a narrowly
+scoped host-only `ReadWritePaths` drop-in and deliberate ownership or ACLs. The
+installer enforces `root:omi-collector` mode `0640` on every accepted layout
+file.
 
-```ini
-[Service]
-ReadWritePaths=/var/lib/omi-collector /srv/pipelines/omi/collector /srv/pipelines/omi/source
-```
-
-Keep host-specific paths out of the checked-in unit. The layout file's parent
-directories must permit `omi-collector` traversal and reading; both declared
-roots must permit that account to write. Set ownership or narrowly scoped
-filesystem ACLs deliberately, then validate the drop-in and reload systemd. The
-installer still enforces `root:omi-collector` mode `0640` on every accepted
-layout file.
-
-Prepare the dedicated noneditable UV environment as the service account:
-
-```bash
-sudo -u omi-collector env UV_PROJECT_ENVIRONMENT=/var/lib/omi-collector/venv \
-  UV_LINK_MODE=hardlink /usr/local/bin/uv sync --locked --no-dev --no-editable
-```
+After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
+builds the environment as the service account, copies dependencies into it,
+then seals the selected release as root-owned under
+`/var/lib/omi-collector-deployments`. The base environment value is an
+intentionally unusable placeholder until this first deployment succeeds.
 
 Enable BlueZ and verify its normal user-level access with
 `sudo -u omi-collector bluetoothctl show`. The default long-running sync keeps
@@ -94,9 +83,9 @@ The base allowlist is the no-argument query plus `LE1MTX LE1MRX` and
 Do not grant general `bluetoothctl`, shell, or unrestricted sudo access.
 
 Run `sudo scripts/deploy-systemd-service.sh` only from the configured checkout.
-It synchronizes the UV environment as `omi-collector`, checks the installed unit
-and wrapper as the exact checked-in pair, then accepts the root-controlled
-restart only after readiness plus a bounded stable-process interval.
+It builds a staged environment as `omi-collector`, checks the installed unit
+and wrapper as the exact checked-in pair, then atomically selects the release.
+Readiness or stability failure restores the previous verified environment.
 
 Docker is for packaging and runtime QA only; it is not a production Bluetooth
 supervisor. Keep production state and publication roots configured explicitly,

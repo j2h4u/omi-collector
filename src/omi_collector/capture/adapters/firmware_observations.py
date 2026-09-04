@@ -32,7 +32,7 @@ class FirmwareObservationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class FirmwareObservation(Mapping[str, object]):
+class FirmwareObservation:
     """The latest firmware snapshot plus bounded lifetime counter aggregates."""
 
     device_slug: str
@@ -69,30 +69,6 @@ class FirmwareObservation(Mapping[str, object]):
     @property
     def epoch_count(self) -> int:
         return self.regression_count + 1
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "device_slug": self.device_slug,
-            "read_sequence": self.read_sequence,
-            "write_sequence": self.write_sequence,
-            "capacity_packets": self.capacity_packets,
-            "dropped_packets": self.dropped_packets,
-            "packet_size": self.packet_size,
-            "observation_count": self.observation_count,
-            "initial": self.initial,
-            "observed_increase": self.observed_increase,
-            "regression_count": self.regression_count,
-            "epoch_count": self.epoch_count,
-        }
-
-    def __getitem__(self, key: str) -> object:
-        return self.as_dict()[key]
-
-    def __iter__(self):  # type: ignore[no-untyped-def]
-        return iter(self.as_dict())
-
-    def __len__(self) -> int:
-        return len(self.as_dict())
 
 
 def _canonical_json(value: object) -> bytes:

@@ -150,9 +150,24 @@ def test_terminal_retired_recognition_requires_checkpoint(tmp_path: Path, monkey
     (attempt.path / "checkpoint.json").unlink()
 
     now += 1_000_000_000
+    assert store.pending_attempts("omi_cv1") == ()
+    assert store.sweep_terminal_retired("omi_cv1") == (attempt.path,)
+    assert not attempt.path.exists()
+
+
+def test_malformed_terminal_retired_marker_blocks_admission(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.append_record(0, 100, _record(1))
+    attempt.checkpoint()
+    assert attempt.publish_prefix() is not None
+    attempt.close(durable=True)
+    store.terminalize_prefix_attempt("omi_cv1", attempt.attempt_id)
+
+    (attempt.path / "terminal-retired.json").write_text("{}", encoding="utf-8")
+
     assert store.pending_attempts("omi_cv1") == (attempt.descriptor,)
-    assert store.sweep_terminal_retired("omi_cv1") == ()
-    assert attempt.path.exists()
 
 
 def test_recovery_accepts_overlap_replay_then_exact_append(tmp_path: Path) -> None:

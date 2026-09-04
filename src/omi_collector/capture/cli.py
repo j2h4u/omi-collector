@@ -337,6 +337,7 @@ def _quality_metrics(
             release_version=package_version(),
             source_revision=source_revision_from_environment(config=config.observability.quality_metrics),
             config=config.observability.quality_metrics,
+            diagnostic_logger=debug_logger,
         )
     except Exception as error:  # noqa: BLE001 - provenance/journal setup is auxiliary
         debug_exception("quality_metrics_configuration_error", error, logger=debug_logger)

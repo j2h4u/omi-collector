@@ -42,7 +42,7 @@ from .staging_filesystem import (
     StagingFilesystem,
     _file_size,
     _fsync_path,
-    _read_prefix,
+    _hash_prefix,
     _require_regular_file,
     _sync_directory,
 )
@@ -300,8 +300,15 @@ class StagedAttempt:
         prefix = self.durable_prefix
         if self._stream_raw is not None:
             self._flush_stream_raw(durable=True)
-        prefix_bytes = _read_prefix(self.path / _RAW_NAME, prefix.record_count * RECORD_SIZE)
-        if sha256(prefix_bytes).hexdigest() != prefix.raw_sha256:
+        prefix_size = prefix.record_count * RECORD_SIZE
+        if (
+            _hash_prefix(
+                self.path / _RAW_NAME,
+                prefix_size,
+                chunk_size=self._filesystem._durability.io_chunk_bytes,
+            )
+            != prefix.raw_sha256
+        ):
             raise AttemptStateError("streaming prefix hash does not match raw bytes")
         if not prefix.record_count:
             self._filesystem._write_json_atomic(
@@ -315,7 +322,8 @@ class StagedAttempt:
         if destination.exists():
             if _prefix_destination_matches(
                 destination,
-                prefix_bytes,
+                self.path / _RAW_NAME,
+                prefix_size,
                 manifest,
                 io_chunk_bytes=self._filesystem._durability.io_chunk_bytes,
             ):
@@ -329,7 +337,8 @@ class StagedAttempt:
             self._filesystem,
             destination=destination,
             device_slug=self.descriptor.device_slug,
-            prefix_bytes=prefix_bytes,
+            raw_source=self.path / _RAW_NAME,
+            prefix_size=prefix_size,
             manifest=manifest,
             receipt=self._receipt(prefix.raw_sha256),
         )
@@ -339,20 +348,18 @@ class StagedAttempt:
         )
         return SealResult(destination, False)
 
-    def close(self, *, durable: bool = False, _durable: bool | None = None) -> None:
+    def close(self, *, durable: bool = False) -> None:
         """Close a streaming handle while retaining partial evidence.
 
-        ``durable`` is opt-in for callers that are about to lose the process;
-        ``_durable`` remains accepted for the collector's protocol spelling.
+        ``durable`` is opt-in for callers that are about to lose the process.
         """
         stream = self._stream_raw
         if stream is None:
             return
         self._stream_raw = None
-        should_durable = durable if _durable is None else _durable
         try:
             stream.flush()
-            if should_durable:
+            if durable:
                 self._filesystem._fsync(stream.fileno())
                 self._stream_durable_next_index = self._stream_next_index
                 self._stream_durable_hash = self._stream_hash.hexdigest()
@@ -565,15 +572,6 @@ class StagedAttempt:
             self.path,
             StreamingCheckpoint(1, self.attempt_id, record_count, raw_hash),
         )
-
-    def _checkpoint_if_due(self) -> None:
-        if self._stream_next_index % self._filesystem._durability.checkpoint_records != 0:
-            return
-        try:
-            self.checkpoint()
-        except OSError:
-            self._stream_failed = True
-            raise
 
     def _recover_streaming(self) -> Recovery:
         if self._stream_failed:

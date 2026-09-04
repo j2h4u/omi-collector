@@ -84,11 +84,9 @@ function prepare_service_environment {
         || die 'deployment root must be a dedicated absolute state path'
     [[ "$deployments_dir" == "${deployment_root}"/* && ! -L "$deployments_dir" ]] \
         || die "deployment directory must be below ${deployment_root}"
-    [[ "$staging_dir" == "${deployment_root}"/* && ! -L "$staging_dir" ]] \
-        || die "staging directory must be below ${deployment_root}"
     install -d -o "$account_user" -g "$account_group" -m 0750 -- "$uv_cache_dir" \
         || die 'could not prepare service UV cache'
-    install -d -o root -g root -m 0755 -- "$deployment_root" "$deployments_dir" "$staging_dir" \
+    install -d -o root -g root -m 0755 -- "$deployment_root" "$deployments_dir" \
         || die 'could not prepare root-owned deployment directories'
     chown -R "$account_user:$account_group" -- "$uv_cache_dir" \
         || die "could not make UV cache writable by ${account_user}"
@@ -98,8 +96,6 @@ function prepare_service_environment {
         || die "deployment root must be root:root 0755: ${deployment_root}"
     [[ $(stat -c '%U:%G:%a' -- "$deployments_dir") == 'root:root:755' ]] \
         || die "deployment directory must be root:root 0755: ${deployments_dir}"
-    [[ $(stat -c '%U:%G:%a' -- "$staging_dir") == 'root:root:755' ]] \
-        || die "staging directory must be root:root 0755: ${staging_dir}"
 }
 
 function seal_deployment_environment {
@@ -187,15 +183,10 @@ function rollback_deployment {
 function cleanup_staged_environment {
     local -ri preserve_recovery="${1:-0}"
 
-    if (( !preserve_recovery && !deployment_committed && !selection_published && release_moved )); then
+    if (( !preserve_recovery && !deployment_committed && !selection_published && release_created )); then
         if [[ "$release_path" == "$deployments_dir"/release-* && -d "$release_path" && ! -L "$release_path" ]]; then
             rm -rf -- "$release_path" || printf 'ERROR: could not remove unpublished deployment: %s\n' "$release_path" >&2
         fi
-    fi
-    if (( !preserve_recovery )) && [[ -n "$staged_environment" && -d "$staged_environment" && ! -L "$staged_environment" ]]; then
-        case "$staged_environment" in
-            "$staging_dir"/.staging.*) rm -rf -- "$staged_environment" ;;
-        esac
     fi
     if (( !preserve_recovery )); then
         [[ -n "$staged_deployment_file" && -f "$staged_deployment_file" ]] && rm -f -- "$staged_deployment_file"
@@ -327,10 +318,10 @@ function require_clean_source_tree {
 }
 
 declare script_dir repo_root source_package source_unit source_exec environment_file deployment_environment_file installed_unit installed_exec
-declare service_name uv_cache_dir state_dir staging_dir deployment_root deployments_dir deployment_lock_file staged_environment staged_deployment_file previous_deployment_file release_path account_user account_group runuser_bin resolved_project_dir resolved_environment resolved_purelib package_dir compare_status resolver_output source_revision legacy_state_path legacy_state_backup legacy_state_device legacy_state_inode
+declare service_name uv_cache_dir state_dir deployment_root deployments_dir deployment_lock_file staged_environment staged_deployment_file previous_deployment_file release_path account_user account_group runuser_bin resolved_project_dir resolved_environment resolved_purelib package_dir compare_status resolver_output source_revision legacy_state_path legacy_state_backup legacy_state_device legacy_state_inode
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
 declare device_address device_slug layout_path project_dir uv_bin project_environment
-declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0 legacy_restore_required=0 service_quiesced=0 candidate_started=0 release_moved=0 deployment_lock_fd=-1
+declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0 legacy_restore_required=0 service_quiesced=0 candidate_started=0 release_created=0 deployment_lock_fd=-1
 declare -a resolver_paths
 declare -ri readiness_poll_attempts=5 readiness_poll_interval_seconds=1 stability_interval_seconds=6
 
@@ -347,7 +338,6 @@ uv_cache_dir='/var/lib/omi-collector/uv-cache'
 state_dir='/var/lib/omi-collector'
 deployment_root='/var/lib/omi-collector-deployments'
 deployments_dir='/var/lib/omi-collector-deployments/releases'
-staging_dir='/var/lib/omi-collector-deployments/staging'
 deployment_lock_file='/var/lib/omi-collector-deployments/.deployment.lock'
 account_user='omi-collector'
 account_group='omi-collector'
@@ -385,8 +375,11 @@ flock -n "$deployment_lock_fd" \
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before preparing deployment"
 
-staged_environment=$(mktemp -d --tmpdir="$staging_dir" .staging.XXXXXX) \
-    || die 'could not create staged deployment environment'
+release_path="${deployments_dir}/release-${source_revision}-$(date +%s)-$$"
+# Arm cleanup before creation so interruption cannot strand an unselected release.
+release_created=1
+mkdir --mode=0750 -- "$release_path" || die 'could not create deployment environment'
+staged_environment="$release_path"
 chown "$account_user:$account_group" -- "$staged_environment" \
     || die 'could not set staged deployment ownership'
 chmod 0750 -- "$staged_environment" || die 'could not set staged deployment mode'
@@ -438,11 +431,6 @@ cmp --silent -- "$source_unit" "$installed_unit" || die 'installed systemd unit 
 cmp --silent -- "$source_exec" "$installed_exec" || die 'installed systemd wrapper differs; run sudo scripts/install-systemd-unit.sh once'
 
 retire_legacy_device_state
-release_path="${deployments_dir}/release-${source_revision}-$(date +%s)-$$"
-# Arm cleanup before the rename so a signal cannot strand an unselected target.
-release_moved=1
-mv -- "$staged_environment" "$release_path" || die 'could not publish staged deployment environment'
-staged_environment="$release_path"
 stage_deployment_environment
 backup_deployment_environment
 # Arm rollback before the rename so a signal cannot strand a newly selected target.

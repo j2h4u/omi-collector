@@ -145,7 +145,7 @@ class JsonlQualityMetrics(QualityMetricsPort):
                 self._path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
                 self._rotate_if_needed(len(line))
                 current_created = not self._path.exists()
-                descriptor = os.open(self._path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o640)
+                descriptor = os.open(self._path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
                 try:
                     _write_all(descriptor, line)
                     os.fsync(descriptor)

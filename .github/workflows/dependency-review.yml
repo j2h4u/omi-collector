@@ -14,20 +14,54 @@ on:
         required: false
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout base revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-ref || github.event.pull_request.base.sha || github.event.repository.default_branch }}
+
+      - name: Checkout uv dependency submitter
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rmuir/uv-dependency-submission
+          ref: 8c650a3e5e519b93e604e644f7a4a3953144babe # v1.1.1
+          path: .dependency-submission
+          persist-credentials: false
+
+      - name: Set up Python for dependency submission
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Submit base uv.lock dependency graph
+        env:
+          BASE_REF: refs/heads/${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: GITHUB_SHA="$(git rev-parse HEAD)" GITHUB_REF="${BASE_REF}" python .dependency-submission/action.py
+
+      - name: Checkout head revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          clean: false
+          ref: ${{ inputs.head-ref || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Submit head uv.lock dependency graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
+        run: GITHUB_SHA="$(git rev-parse HEAD)" GITHUB_REF="${HEAD_REF}" python .dependency-submission/action.py
 
       - name: Dependency review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
           comment-summary-in-pr: ${{ github.event_name == 'pull_request' && 'always' || 'never' }}
+          retry-on-snapshot-warnings: true
           base-ref: ${{ inputs.base-ref || github.event.pull_request.base.sha || github.event.repository.default_branch }}
           head-ref: ${{ inputs.head-ref || github.event.pull_request.head.sha || github.sha }}

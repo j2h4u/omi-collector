@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.4](https://github.com/j2h4u/omi-collector/compare/v0.2.3...v0.2.4) (2026-09-04)
+
+
+### Fixes
+
+* harden collector for unattended operation ([#19](https://github.com/j2h4u/omi-collector/issues/19)) ([3ec4b06](https://github.com/j2h4u/omi-collector/commit/3ec4b06db0f1ec7932a4570fa0988be5ad2c141c))
+* keep quality metrics private ([#21](https://github.com/j2h4u/omi-collector/issues/21)) ([829d2f3](https://github.com/j2h4u/omi-collector/commit/829d2f38124549d9a04317d72e40be7e63ee22b1))
+
 ## [0.2.3](https://github.com/j2h4u/omi-collector/compare/v0.2.2...v0.2.3) (2026-09-03)
 
 

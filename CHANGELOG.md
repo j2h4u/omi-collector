@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.8](https://github.com/j2h4u/omi-collector/compare/v0.2.7...v0.2.8) (2026-09-04)
+
+
+### Refactoring
+
+* make writer lifecycle explicit ([#29](https://github.com/j2h4u/omi-collector/issues/29)) ([50f8b42](https://github.com/j2h4u/omi-collector/commit/50f8b42e9575ebb92b7e43431261e3c1fafd9b32))
+
 ## [0.2.7](https://github.com/j2h4u/omi-collector/compare/v0.2.6...v0.2.7) (2026-09-04)
 
 

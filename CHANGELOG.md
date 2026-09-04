@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/j2h4u/omi-collector/compare/v0.2.4...v0.2.5) (2026-09-04)
+
+
+### Fixes
+
+* build deployments at their final path ([#22](https://github.com/j2h4u/omi-collector/issues/22)) ([7772fe6](https://github.com/j2h4u/omi-collector/commit/7772fe630aa6184e2d101b606f9a58e8087ffcfb))
+
 ## [0.2.4](https://github.com/j2h4u/omi-collector/compare/v0.2.3...v0.2.4) (2026-09-04)
 
 

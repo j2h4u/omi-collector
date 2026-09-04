@@ -8,6 +8,40 @@ on:
   schedule:
     - cron: "37 21 * * *"
   workflow_dispatch:
+    inputs:
+      release_attestation:
+        description: Run the release-PR contract against supplied immutable metadata.
+        required: false
+        type: boolean
+        default: false
+      pr_title:
+        description: Exact release PR title.
+        required: false
+        type: string
+      pr_body:
+        description: Exact release PR body.
+        required: false
+        type: string
+      base_sha:
+        description: Exact release PR base commit.
+        required: false
+        type: string
+      head_sha:
+        description: Exact release PR head commit.
+        required: false
+        type: string
+      head_ref:
+        description: Exact release PR head branch.
+        required: false
+        type: string
+      head_repo:
+        description: Exact release PR head repository.
+        required: false
+        type: string
+      pr_author:
+        description: Exact release PR author.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,35 +59,66 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Skip outside pull requests
-        if: github.event_name != 'pull_request'
+        if: ${{ github.event_name != 'pull_request' && !inputs.release_attestation }}
         run: echo "release contract is a pull-request check"
 
+      - name: Verify release-attestation metadata
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_attestation }}
+        env:
+          PR_TITLE: ${{ inputs.pr_title }}
+          PR_BODY: ${{ inputs.pr_body }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          HEAD_REPO: ${{ inputs.head_repo }}
+          PR_AUTHOR: ${{ inputs.pr_author }}
+        run: |
+          set -euo pipefail
+          for name in PR_TITLE PR_BODY BASE_SHA HEAD_SHA HEAD_REF HEAD_REPO PR_AUTHOR; do
+            [ -n "${!name}" ] || (echo "::error::missing release-attestation input ${name}" && exit 1)
+          done
+          [ "${HEAD_SHA}" = "${GITHUB_SHA}" ] || (echo "::error::attested head SHA does not match the dispatch SHA" && exit 1)
+          [ "${HEAD_REF}" = "${GITHUB_REF_NAME}" ] || (echo "::error::attested head ref does not match the dispatch ref" && exit 1)
+          [ "${HEAD_REPO}" = "${GITHUB_REPOSITORY}" ] || (echo "::error::attested head repository is not this repository" && exit 1)
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ github.event_name == 'pull_request' || inputs.release_attestation }}
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ github.event_name == 'pull_request' || inputs.release_attestation }}
         with:
           python-version: "3.14"
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ github.event_name == 'pull_request' || inputs.release_attestation }}
         with:
           enable-cache: true
 
-      - name: Validate release-please PR contract
-        if: ${{ github.event_name == 'pull_request' }}
+      - name: Bind checkout to attested PR commits
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_attestation }}
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "${HEAD_SHA}" ] || (echo "::error::checkout did not resolve the attested head SHA" && exit 1)
+          git merge-base --is-ancestor "${BASE_SHA}" "${HEAD_SHA}" \
+            || (echo "::error::attested base SHA is not an ancestor of the head SHA" && exit 1)
+
+      - name: Validate release-please PR contract
+        if: ${{ github.event_name == 'pull_request' || inputs.release_attestation }}
+        env:
+          PR_TITLE: ${{ github.event_name == 'pull_request' && github.event.pull_request.title || inputs.pr_title }}
+          PR_BODY: ${{ github.event_name == 'pull_request' && github.event.pull_request.body || inputs.pr_body }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
+          HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || inputs.head_ref }}
+          HEAD_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || inputs.head_repo }}
+          PR_AUTHOR: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login || inputs.pr_author }}
           RELEASE_BRANCH: release-please--branches--main--components--omi-collector
         run: |
           set -euo pipefail

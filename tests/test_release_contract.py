@@ -86,8 +86,8 @@ def test_column_zero_bullet_in_a_commit_body_is_rejected() -> None:
 
 def test_release_pr_contract_requires_the_real_release_please_identity() -> None:
     assert "RELEASE_BRANCH: release-please--branches--main--components--omi-collector" in _CI_WORKFLOW
-    assert "HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}" in _CI_WORKFLOW
-    assert "PR_AUTHOR: ${{ github.event.pull_request.user.login }}" in _CI_WORKFLOW
+    assert "github.event.pull_request.head.repo.full_name || inputs.head_repo" in _CI_WORKFLOW
+    assert "github.event.pull_request.user.login || inputs.pr_author" in _CI_WORKFLOW
     assert '"${HEAD_REPO}" == "${GITHUB_REPOSITORY}"' in _CI_WORKFLOW
     assert '"${PR_AUTHOR}" == "github-actions[bot]"' in _CI_WORKFLOW
     assert '| jq -r --arg repository "${REPOSITORY}" --arg release_branch "${RELEASE_BRANCH}"' in _RELEASE_WORKFLOW
@@ -101,6 +101,58 @@ def test_release_merge_is_bound_to_repository_and_observed_head() -> None:
     assert 'gh pr merge "${pr_number}" --auto --squash \\' in _RELEASE_WORKFLOW
     assert '--repo "${REPOSITORY}"' in _RELEASE_WORKFLOW
     assert '--match-head-commit "${head_sha}"' in _RELEASE_WORKFLOW
+
+
+def test_release_attestation_requires_exact_release_pr_workflow_runs() -> None:
+    assert "statuses: write" in _RELEASE_WORKFLOW
+    assert 'contexts=(ci "Analyze Python" dependency-review)' in _RELEASE_WORKFLOW
+    assert '"repos/${REPOSITORY}/statuses/${head_sha}"' in _RELEASE_WORKFLOW
+    assert "event=workflow_dispatch&branch=${head_ref}" in _RELEASE_WORKFLOW
+    assert "--jq --arg" not in _RELEASE_WORKFLOW
+    assert "| jq -r --arg workflow_name" in _RELEASE_WORKFLOW
+    assert '.event == "workflow_dispatch"' in _RELEASE_WORKFLOW
+    assert ".head_branch == $head_ref" in _RELEASE_WORKFLOW
+    assert ".head_sha == $head_sha" in _RELEASE_WORKFLOW
+    assert ".created_at >= $started_at" in _RELEASE_WORKFLOW
+    assert "| select($existing | index($id) | not)\n                   | $id]" in _RELEASE_WORKFLOW
+    assert "wait_for_workflow ci.yml CI" in _RELEASE_WORKFLOW
+    assert "wait_for_workflow codeql.yml CodeQL" in _RELEASE_WORKFLOW
+    assert 'wait_for_workflow dependency-review.yml "Dependency review"' in _RELEASE_WORKFLOW
+
+
+def test_release_attestation_fails_before_auto_merge_and_only_then_succeeds() -> None:
+    merge_at = _RELEASE_WORKFLOW.index('gh pr merge "${pr_number}" --auto --squash')
+    assert _RELEASE_WORKFLOW.index('publish_status ci failure "release PR CI attestation failed"') < merge_at
+    assert (
+        _RELEASE_WORKFLOW.index('publish_status "Analyze Python" failure "release PR CodeQL attestation failed"')
+        < merge_at
+    )
+    assert (
+        _RELEASE_WORKFLOW.index(
+            'publish_status dependency-review failure "release PR dependency review attestation failed"'
+        )
+        < merge_at
+    )
+    assert (
+        _RELEASE_WORKFLOW.index('publish_status "${context}" success "release PR check attestation succeeded"')
+        < merge_at
+    )
+
+
+def test_attested_ci_dispatch_replays_the_release_pr_contract_on_exact_head() -> None:
+    assert "release_attestation:" in _CI_WORKFLOW
+    for input_name in ("pr_title:", "pr_body:", "base_sha:", "head_sha:", "head_ref:", "head_repo:", "pr_author:"):
+        assert input_name in _CI_WORKFLOW
+    assert "Verify release-attestation metadata" in _CI_WORKFLOW
+    assert '"${HEAD_SHA}" = "${GITHUB_SHA}"' in _CI_WORKFLOW
+    assert '"${HEAD_REF}" = "${GITHUB_REF_NAME}"' in _CI_WORKFLOW
+    assert (
+        "ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}"
+        in _CI_WORKFLOW
+    )
+    assert "Bind checkout to attested PR commits" in _CI_WORKFLOW
+    assert 'git merge-base --is-ancestor "${BASE_SHA}" "${HEAD_SHA}"' in _CI_WORKFLOW
+    assert "github.event_name == 'pull_request' || inputs.release_attestation" in _CI_WORKFLOW
 
 
 def test_token_merge_dispatches_checks_and_release_for_exact_main_commit() -> None:

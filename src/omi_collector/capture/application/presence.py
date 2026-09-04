@@ -1,9 +1,8 @@
-"""Fresh BLE presence observation and bounded opportunistic wake scheduling.
+"""Async interpreter for the pure presence scheduling policy.
 
-The scheduler deliberately has no GATT knowledge.  It only decides when a
-single caller may begin an attempt, and guarantees that the observer has been
-stopped before returning that decision.  Advertisement observations are
-advisory: the connected session must still obtain authoritative INFO.
+Bluetooth lifecycle belongs here; product scheduling belongs exclusively to
+``presence_machine``. Scanner generations are transport facts, never timer
+epochs or product state.
 """
 
 from __future__ import annotations
@@ -13,17 +12,18 @@ import inspect
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 from ...config import DEFAULT_CONFIG
+from . import presence_machine as machine
 
 
 @dataclass(frozen=True, slots=True)
 class PresenceAdvertisement:
     """One advisory scanner observation retaining only candidate and RSSI."""
 
-    candidate: object
+    candidate: object = field(repr=False)
     rssi_dbm: int | None = None
 
 
@@ -42,40 +42,53 @@ class PresenceObserver(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class PresencePolicy:
-    """Hysteresis and independent fallback bounds, expressed in seconds."""
+    """Validated interpreter timings, expressed in seconds."""
 
     absence_seconds: float = DEFAULT_CONFIG.presence.absence_seconds
     fallback_seconds: float = DEFAULT_CONFIG.presence.fallback_seconds
     drained_fallback_seconds: float = DEFAULT_CONFIG.presence.drained_fallback_seconds
     rapid_backoff: tuple[float, ...] = DEFAULT_CONFIG.retry.rapid_backoff
     scan_transition_seconds: float = DEFAULT_CONFIG.presence.scan_transition_seconds
+    scan_cancel_grace_min_seconds: float = DEFAULT_CONFIG.presence.scan_cancel_grace_min_seconds
+    scan_cancel_grace_max_seconds: float = DEFAULT_CONFIG.presence.scan_cancel_grace_max_seconds
+    scan_cancel_grace_fraction: float = DEFAULT_CONFIG.presence.scan_cancel_grace_fraction
 
     def __post_init__(self) -> None:
-        if (
-            self.absence_seconds <= 0
-            or self.fallback_seconds <= 0
-            or self.drained_fallback_seconds <= 0
-            or self.scan_transition_seconds <= 0
+        if any(
+            value <= 0
+            for value in (
+                self.absence_seconds,
+                self.fallback_seconds,
+                self.drained_fallback_seconds,
+                self.scan_transition_seconds,
+                self.scan_cancel_grace_min_seconds,
+                self.scan_cancel_grace_max_seconds,
+            )
         ):
             raise ValueError("presence policy bounds must be positive")
-        if self.fallback_seconds > DEFAULT_CONFIG.presence.max_fallback_seconds:
-            raise ValueError(
-                f"ordinary fallback must be at most {DEFAULT_CONFIG.presence.max_fallback_seconds:g} seconds"
-            )
-        if self.drained_fallback_seconds > DEFAULT_CONFIG.presence.max_drained_fallback_seconds:
-            raise ValueError(
-                f"drained fallback must be at most {DEFAULT_CONFIG.presence.max_drained_fallback_seconds:g} seconds"
-            )
+        if self.scan_cancel_grace_min_seconds > self.scan_cancel_grace_max_seconds:
+            raise ValueError("scan cancellation minimum must not exceed its maximum")
+        if not 0 <= self.scan_cancel_grace_fraction <= 1:
+            raise ValueError("scan cancellation fraction must be between zero and one")
         if not self.rapid_backoff or any(delay <= 0 for delay in self.rapid_backoff):
             raise ValueError("rapid retry delays must be positive")
+
+    def machine_policy(self) -> machine.PresenceMachinePolicy:
+        """Project validated runtime configuration into the pure policy."""
+        return machine.PresenceMachinePolicy(
+            absence_seconds=self.absence_seconds,
+            fallback_seconds=self.fallback_seconds,
+            drained_fallback_seconds=self.drained_fallback_seconds,
+            rapid_backoff=self.rapid_backoff,
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class PresenceWake:
-    """Why an attempt was released from the presence scheduler."""
+    """A redeemed attempt permit for the session lifecycle."""
 
     reason: str
-    candidate: object | None = None
+    candidate: object | None = field(default=None, repr=False)
     observed_at: float | None = None
     advertisement_rssi_dbm: int | None = None
 
@@ -89,12 +102,7 @@ class PresenceScanStopError(PresenceScanTransitionError):
 
 
 class PresenceScheduler:
-    """Serialize fresh observation, cooldown, fallback, and rapid retry.
-
-    ``wait_for_attempt`` is the only method that releases the GATT caller.  It
-    stops the active observer first, so observer callbacks cannot overlap
-    provider construction or a live GATT session.
-    """
+    """Interpret immutable presence decisions without scanner/GATT overlap."""
 
     def __init__(
         self,
@@ -106,31 +114,18 @@ class PresenceScheduler:
     ) -> None:
         self._observer = observer
         self._policy = policy or PresencePolicy()
+        self._machine_policy = self._policy.machine_policy()
         self._clock = clock
         self._sleep = sleep
-        now = clock()
-        # The first attempt is intentionally released by the bounded fallback;
-        # active scanning starts immediately and may release it sooner.
-        self._fallback_deadline = now + self._policy.fallback_seconds
-        self._retry_deadline: float | None = None
-        self._retry_number = 0
-        self._last_matching: float | None = None
-        self._latest_candidate: object | None = None
-        self._latest_candidate_at: float | None = None
-        self._latest_candidate_rssi_dbm: int | None = None
-        self._confirmed_absent = True
-        self._suppress_continuous_ad_wake = False
-        self._drained_mode = False
-        self._wake = asyncio.Event()
-        self._scan_active = False
-        self._closed = False
-
-    @property
-    def last_matching_age(self) -> float | None:
-        """Return current observation age without exposing the BLE address."""
-        if self._last_matching is None:
-            return None
-        return max(0.0, self._clock() - self._last_matching)
+        self._state: machine.PresenceState = machine.initial_state(clock(), self._machine_policy)
+        self._advertisements: asyncio.Queue[tuple[int, machine.Advertisement]] = asyncio.Queue()
+        self._changed = asyncio.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._next_scanner_generation = 0
+        self._active_scanner_generation: int | None = None
+        self._scanner_transition_lock = asyncio.Lock()
+        self._waiter_active = False
+        self._force_stop_required = False
 
     @property
     def policy(self) -> PresencePolicy:
@@ -139,298 +134,313 @@ class PresenceScheduler:
 
     @property
     def drained_cooldown_remaining_seconds(self) -> float:
-        """Return the monotonic delay until the current clean-drain wake."""
-        if not self._drained_mode:
-            return 0.0
-        return max(0.0, self._fallback_deadline - self._clock())
-
-    def invalidate_candidate(self) -> None:
-        """Discard a stale BlueZ candidate and require a fresh observation."""
-        self._latest_candidate = None
-        self._latest_candidate_at = None
-        self._latest_candidate_rssi_dbm = None
-        self._last_matching = None
-        self._confirmed_absent = True
-        self._retry_deadline = None
-        self._retry_number = 0
-        self._wake.clear()
+        """Return operator telemetry without exposing product state."""
+        return machine.drained_cooldown_remaining_seconds(self._state, at=self._clock())
 
     async def wait_for_attempt(self) -> PresenceWake:
-        """Wait for an advisory wake or fallback, stopping scan before return."""
-        if self._closed:
+        """Return one permit only after the matching scanner has stopped."""
+        if isinstance(self._state, machine.Closed):
             raise RuntimeError("presence scheduler is closed")
-        while True:
-            # A soft scanner failure must not strand a drained collector. The
-            # timer below bounds retries while absence is confirmed.
+        if isinstance(self._state, machine.Attempting):
+            raise RuntimeError("an attempt permit is already outstanding")
+        if self._waiter_active:
+            raise RuntimeError("only one presence waiter may be active")
+        self._waiter_active = True
+        self._loop = asyncio.get_running_loop()
+        try:
+            return await self._wait_for_attempt()
+        except asyncio.CancelledError:
+            await self._cancel_wait()
+            raise
+        finally:
+            self._waiter_active = False
+
+    async def attempt_finished(self, outcome: machine.AttemptOutcome) -> None:
+        """Submit the single typed outcome for an outstanding permit."""
+        try:
+            result = self._apply(machine.AttemptFinished(at=self._clock(), outcome=outcome))
+        except machine.UnexpectedAttemptOutcomeError as error:
+            self._state = error.closed_state
+            self._changed.set()
+            await self._best_effort_stop(force=True)
+            raise
+        if isinstance(result.directive, machine.Observe):
             await self._start_scan()
-            now = self._clock()
-            self._confirm_absence_if_due(now)
-            wake_reason = self._due_reason(now)
-            if wake_reason is not None:
-                await self._stop_scan()
-                self._wake.clear()
-                candidate, observed_at, rssi_dbm = self._fresh_candidate_snapshot()
-                return PresenceWake(wake_reason, candidate, observed_at, rssi_dbm)
-
-            event_task = asyncio.create_task(self._wake.wait())
-            timer_task = asyncio.create_task(self._wait_until(self._next_deadline(now)))
-            try:
-                done, _ = await asyncio.wait({event_task, timer_task}, return_when=asyncio.FIRST_COMPLETED)
-            except asyncio.CancelledError:
-                await _cancel(event_task)
-                await _cancel(timer_task)
-                with suppress(BaseException):
-                    await self._stop_scan()
-                raise
-            finally:
-                pending = tuple(
-                    cast(asyncio.Task[object], task) for task in (event_task, timer_task) if not task.done()
-                )
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
-            if event_task in done:
-                self._wake.clear()
-                if self._ad_wake_allowed():
-                    await self._stop_scan()
-                    candidate, observed_at, rssi_dbm = self._fresh_candidate_snapshot()
-                    return PresenceWake("advertisement", candidate, observed_at, rssi_dbm)
-                continue
-            self._confirm_absence_if_due(self._clock())
-
-    async def attempt_finished(self, outcome: str) -> None:
-        """Schedule the next independent fallback after a completed attempt."""
-        valid_outcomes = {
-            "clean",
-            "retry",
-            "retry_after_progress",
-            "connected_interrupted",
-            "connected_interrupted_after_progress",
-        }
-        if outcome not in valid_outcomes:
-            raise ValueError(f"unknown presence attempt outcome: {outcome}")
-        if self._closed:
-            return
-        now = self._clock()
-        self._fallback_deadline = now + self._policy.fallback_seconds
-        if outcome == "clean":
-            self._retry_deadline = None
-            self._retry_number = 0
-            # A completed GATT session is proof of presence even when startup
-            # was released by the immediate fallback and no advertisement was
-            # observed.  Anchor hysteresis at this completion instead of
-            # treating the first nearby advertisement as a new arrival.
-            self._last_matching = now
-            self._confirmed_absent = False
-            self._suppress_continuous_ad_wake = True
-            self._fallback_deadline = now + self._policy.drained_fallback_seconds
-            self._drained_mode = True
-        else:
-            self._drained_mode = False
-            if outcome in {"retry_after_progress", "connected_interrupted_after_progress"}:
-                self._retry_number = 0
-            if outcome.startswith("connected_interrupted"):
-                self._last_matching = now
-                self._confirmed_absent = False
-                self._suppress_continuous_ad_wake = False
-            if self.last_matching_age is not None and self.last_matching_age <= self._policy.absence_seconds:
-                delay = self._policy.rapid_backoff[min(self._retry_number, len(self._policy.rapid_backoff) - 1)]
-                self._retry_deadline = now + delay
-                self._retry_number += 1
-            else:
-                self._retry_deadline = None
-        await self._start_scan()
 
     async def close(self) -> None:
-        """Stop the active scan; safe on success, failure, and cancellation."""
-        self._closed = True
-        self._wake.set()
+        """Idempotently close product state and make one bounded stop attempt."""
+        self._close_state()
+        await self._best_effort_stop(force=self._force_stop_required)
+
+    async def _wait_for_attempt(self) -> PresenceWake:
+        while True:
+            if isinstance(self._state, machine.Closed):
+                raise RuntimeError("presence scheduler is closed")
+            await self._start_scan()
+            if isinstance(self._state, machine.Closed):
+                raise RuntimeError("presence scheduler is closed")
+            advertisement = self._next_advertisement()
+            if advertisement is not None:
+                wake = await self._handle_advertisement(advertisement)
+                if wake is not None:
+                    return wake
+                continue
+            deadline = machine.armed_deadline(_waiting_state(self._state))
+            if self._clock() >= deadline:
+                wake = await self._handle_timer(deadline)
+                if wake is not None:
+                    return wake
+                continue
+            wake = await self._wait_until_event(deadline)
+            if wake is not None:
+                return wake
+
+    async def _wait_until_event(self, deadline: float) -> PresenceWake | None:
+        self._changed.clear()
+        advertisement_task = asyncio.create_task(self._advertisements.get())
+        timer_task = asyncio.create_task(self._sleep_until(deadline))
+        changed_task = asyncio.create_task(self._changed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {advertisement_task, timer_task, changed_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if changed_task in done:
+                return None
+            if advertisement_task in done:
+                _, advertisement = advertisement_task.result()
+                return await self._handle_advertisement(advertisement)
+            await _cancel_task(advertisement_task)
+            advertisement = self._next_advertisement()
+            if advertisement is not None:
+                return await self._handle_advertisement(advertisement)
+            return await self._handle_timer(deadline)
+        finally:
+            await _cancel_task(advertisement_task)
+            await _cancel_task(timer_task)
+            await _cancel_task(changed_task)
+
+    async def _handle_advertisement(self, advertisement: machine.Advertisement) -> PresenceWake | None:
+        result = self._apply(machine.AdvertisementObserved(advertisement))
+        return await self._redeem(result.directive)
+
+    async def _handle_timer(self, deadline: float) -> PresenceWake | None:
+        state = _waiting_state(self._state)
+        result = self._apply(machine.TimerFired(at=self._clock(), deadline=deadline, timer_epoch=state.timer_epoch))
+        return await self._redeem(result.directive)
+
+    async def _redeem(self, directive: machine.PresenceDirective) -> PresenceWake | None:
+        if not isinstance(directive, machine.StopAndBeginAttempt):
+            return None
         try:
             await self._stop_scan()
-        except Exception:  # noqa: BLE001 - do not mask the operation being cleaned up
-            return
+        except asyncio.CancelledError:
+            await self._close_after_stop_failure()
+            raise
+        except Exception:
+            await self._close_after_stop_failure()
+            raise
+        if isinstance(self._state, machine.Closed):
+            raise RuntimeError("presence scheduler is closed")
+        if not isinstance(self._state, machine.Attempting):
+            raise RuntimeError("presence scheduler lost its outstanding attempt permit")
+        return _wake(directive.trigger)
 
-    def _on_matching_advertisement(self, observation: object) -> None:
+    def _apply(self, event: machine.PresenceEvent) -> machine.TransitionResult:
+        result = machine.transition(self._state, event, self._machine_policy)
+        self._state = result.state
+        self._changed.set()
+        return result
+
+    async def _start_scan(self) -> bool:
+        async with self._scanner_transition_lock:
+            return await self._start_scan_locked()
+
+    async def _start_scan_locked(self) -> bool:
+        if self._active_scanner_generation is not None:
+            return True
+        if isinstance(self._state, machine.Closed):
+            return False
+        generation = self._next_scanner_generation
+        self._next_scanner_generation += 1
+        self._active_scanner_generation = generation
+        try:
+            await _transition(
+                self._observer.start(lambda observation: self._receive_advertisement(generation, observation)),
+                policy=self._policy,
+                operation="start",
+            )
+        except asyncio.CancelledError:
+            self._active_scanner_generation = None
+            self._discard_advertisements()
+            await self._best_effort_stop_locked(force=True)
+            raise
+        except PresenceScanTransitionError:
+            self._active_scanner_generation = None
+            self._force_stop_required = True
+            self._discard_advertisements()
+            self._close_state()
+            await self._best_effort_stop_locked(force=True)
+            raise
+        except Exception:  # noqa: BLE001 - a normal scanner-start refusal is soft
+            self._active_scanner_generation = None
+            self._discard_advertisements()
+            await self._best_effort_stop_locked(force=True)
+            return False
+        if isinstance(self._state, machine.Closed):
+            await self._best_effort_stop_locked(force=True)
+            return False
+        return True
+
+    async def _stop_scan(self, *, force: bool = False) -> None:
+        async with self._scanner_transition_lock:
+            await self._stop_scan_locked(force=force)
+
+    async def _stop_scan_locked(self, *, force: bool) -> None:
+        if self._active_scanner_generation is None and not force:
+            return
+        self._active_scanner_generation = None
+        self._discard_advertisements()
+        try:
+            await _transition(self._observer.stop(), policy=self._policy, operation="stop")
+        except asyncio.CancelledError:
+            self._force_stop_required = True
+            self._close_state()
+            raise
+        except (TimeoutError, PresenceScanTransitionError) as error:
+            self._force_stop_required = True
+            raise PresenceScanStopError(str(error)) from error
+        except Exception as error:
+            self._force_stop_required = True
+            raise PresenceScanStopError("presence scanner stop failed") from error
+        self._force_stop_required = False
+
+    def _receive_advertisement(self, generation: int, observation: object) -> None:
         advertisement = (
             observation if isinstance(observation, PresenceAdvertisement) else PresenceAdvertisement(observation)
         )
-        now = self._clock()
-        previous = self._last_matching
-        self._last_matching = now
-        self._latest_candidate = advertisement.candidate
-        self._latest_candidate_at = now
-        self._latest_candidate_rssi_dbm = advertisement.rssi_dbm
-        gap = float("inf") if previous is None else max(0.0, now - previous)
-        was_absent = self._confirmed_absent or gap >= self._policy.absence_seconds
-        self._confirmed_absent = False
-        if self._drained_mode and now >= self._fallback_deadline:
-            self._suppress_continuous_ad_wake = False
-        if was_absent:
-            self._suppress_continuous_ad_wake = False
-            self._retry_deadline = None
-            self._retry_number = 0
-        if not self._suppress_continuous_ad_wake and self._retry_deadline is None:
-            self._wake.set()
+        event = machine.Advertisement(
+            candidate=advertisement.candidate,
+            observed_at=self._clock(),
+            rssi_dbm=advertisement.rssi_dbm,
+        )
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._buffer_advertisement, generation, event)
 
-    def _fresh_candidate_snapshot(self) -> tuple[object | None, float | None, int | None]:
-        """Return a coherent fresh candidate/timestamp/RSSI tuple, or nulls."""
-        candidate = self._latest_candidate
-        observed_at = self._latest_candidate_at
-        if candidate is None or observed_at is None:
-            return None, None, None
-        if self._clock() - observed_at > self._policy.absence_seconds:
-            return None, None, None
-        return candidate, observed_at, self._latest_candidate_rssi_dbm
-
-    async def _start_scan(self) -> None:
-        if self._closed or self._scan_active:
+    def _buffer_advertisement(self, generation: int, advertisement: machine.Advertisement) -> None:
+        if generation != self._active_scanner_generation or isinstance(self._state, machine.Closed):
             return
-        if self._wake_is_due(self._clock()):
-            return
-        self._scan_active = True
-        try:
-            await _transition(
-                self._observer.start(self._on_matching_advertisement),
-                self._policy.scan_transition_seconds,
-                "start",
-            )
-        except asyncio.CancelledError:
-            with suppress(Exception):
-                await self._stop_scan()
-            raise
-        except PresenceScanTransitionError:
-            with suppress(Exception):
-                await self._stop_scan()
-            raise
-        except Exception:  # noqa: BLE001 - the wait loop retries after the bounded timer
-            with suppress(Exception):
-                await self._stop_scan()
-            self._scan_active = False
-            return
+        self._advertisements.put_nowait((generation, advertisement))
 
-    async def _stop_scan(self) -> None:
-        if not self._scan_active:
-            return
-        try:
-            await _transition(
-                self._observer.stop(),
-                self._policy.scan_transition_seconds,
-                "stop",
-            )
-        except (TimeoutError, PresenceScanTransitionError) as error:
-            raise PresenceScanStopError(str(error)) from error
-        self._scan_active = False
-
-    def _confirm_absence_if_due(self, now: float) -> None:
-        if self._last_matching is not None and now - self._last_matching >= self._policy.absence_seconds:
-            self._confirmed_absent = True
-            self._suppress_continuous_ad_wake = False
-            self._retry_deadline = None
-
-    def _ad_wake_allowed(self) -> bool:
-        if self._drained_mode and self._clock() < self._fallback_deadline:
-            return False
-        return (not self._suppress_continuous_ad_wake or self._confirmed_absent) and self._retry_deadline is None
-
-    def _due_reason(self, now: float) -> str | None:
-        if self._retry_deadline is not None and now >= self._retry_deadline:
-            if self.last_matching_age is not None and self.last_matching_age <= self._policy.absence_seconds:
-                self._retry_deadline = None
-                return "rapid_retry"
-            self._retry_deadline = None
-        if now >= self._fallback_deadline and (
-            not self._drained_mode
-            or (self.last_matching_age is not None and self.last_matching_age <= self._policy.absence_seconds)
-        ):
-            return "fallback"
+    def _next_advertisement(self) -> machine.Advertisement | None:
+        while not self._advertisements.empty():
+            generation, advertisement = self._advertisements.get_nowait()
+            if generation == self._active_scanner_generation:
+                return advertisement
         return None
 
-    def _wake_is_due(self, now: float) -> bool:
-        rapid_retry_due = (
-            self._retry_deadline is not None
-            and now >= self._retry_deadline
-            and self.last_matching_age is not None
-            and self.last_matching_age <= self._policy.absence_seconds
-        )
-        fallback_due = now >= self._fallback_deadline and (
-            not self._drained_mode
-            or (self.last_matching_age is not None and self.last_matching_age <= self._policy.absence_seconds)
-        )
-        return rapid_retry_due or fallback_due
+    def _discard_advertisements(self) -> None:
+        while not self._advertisements.empty():
+            self._advertisements.get_nowait()
 
-    def _next_deadline(self, now: float) -> float:
-        cooldown_expired_while_absent = (
-            self._drained_mode
-            and now >= self._fallback_deadline
-            and (
-                self._last_matching is None
-                or self.last_matching_age is None
-                or self.last_matching_age > self._policy.absence_seconds
-            )
-        )
-        deadlines = [] if cooldown_expired_while_absent else [self._fallback_deadline]
-        if self._retry_deadline is not None:
-            deadlines.append(self._retry_deadline)
-        if self._last_matching is not None and self._retry_deadline is not None:
-            deadlines.append(self._last_matching + self._policy.absence_seconds)
-        if cooldown_expired_while_absent:
-            deadlines.append(now + self._policy.absence_seconds)
-        return min(deadlines, default=now)
+    async def _cancel_wait(self) -> None:
+        try:
+            await self._stop_scan()
+        except asyncio.CancelledError:
+            await self._close_after_stop_failure()
+        except Exception:  # noqa: BLE001 - cancelled waiting must leave no live scanner
+            await self._close_after_stop_failure()
 
-    def _next_attempt_deadline(self) -> float:
-        if self._retry_deadline is None:
-            return self._fallback_deadline
-        return min(self._fallback_deadline, self._retry_deadline)
+    async def _close_after_stop_failure(self) -> None:
+        self._close_state()
+        await self._best_effort_stop(force=True)
 
-    async def _wait_until(self, deadline: float) -> None:
-        delay = max(0.0, deadline - self._clock())
-        result = self._sleep(delay)
+    def _close_state(self) -> None:
+        result = machine.transition(self._state, machine.Shutdown(at=self._clock()), self._machine_policy)
+        self._state = result.state
+        self._changed.set()
+
+    async def _best_effort_stop(self, *, force: bool) -> None:
+        async with self._scanner_transition_lock:
+            await self._best_effort_stop_locked(force=force)
+
+    async def _best_effort_stop_locked(self, *, force: bool) -> None:
+        try:
+            await self._stop_scan_locked(force=force)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - close is intentionally best effort
+            return
+
+    async def _sleep_until(self, deadline: float) -> None:
+        result = self._sleep(max(0.0, deadline - self._clock()))
         if inspect.isawaitable(result):
             await result
 
 
-async def _cancel(task: asyncio.Task[object]) -> None:
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+def _waiting_state(state: machine.PresenceState) -> machine.WaitingState:
+    if isinstance(state, machine.Attempting | machine.Closed):
+        raise RuntimeError("presence scheduler has no waiting deadline")
+    return state
 
 
-async def _transition(awaitable: object, timeout: float, operation: str) -> None:
-    """Bound a scanner transition; uncertain cancellation fails closed."""
+def _wake(trigger: machine.AttemptTrigger) -> PresenceWake:
+    if isinstance(trigger, machine.AdvertisementTrigger):
+        reason = "advertisement"
+    elif isinstance(trigger, machine.RapidRetryTrigger):
+        reason = "rapid_retry"
+    else:
+        reason = "fallback"
+    advertisement = trigger.advertisement
+    if advertisement is None:
+        return PresenceWake(reason=reason)
+    return PresenceWake(
+        reason=reason,
+        candidate=advertisement.candidate,
+        observed_at=advertisement.observed_at,
+        advertisement_rssi_dbm=advertisement.rssi_dbm,
+    )
+
+
+async def _transition(awaitable: object, *, policy: PresencePolicy, operation: str) -> None:
+    """Bound scanner transitions and detach only cancellation-uncertain work."""
     if not inspect.isawaitable(awaitable):
         return
     task = asyncio.ensure_future(awaitable)
     try:
-        done, _ = await asyncio.wait({task}, timeout=timeout)
+        done, _ = await asyncio.wait({task}, timeout=policy.scan_transition_seconds)
     except asyncio.CancelledError:
-        if not await _cancel_bounded(cast(asyncio.Task[object], task), timeout):
+        if not await _cancel_bounded(cast(asyncio.Task[object], task), policy):
             task.add_done_callback(_consume_task)
+            raise PresenceScanTransitionError(f"presence scanner {operation} cancellation is uncertain") from None
         raise
     if not done:
-        if not await _cancel_bounded(cast(asyncio.Task[object], task), timeout):
+        if not await _cancel_bounded(cast(asyncio.Task[object], task), policy):
             task.add_done_callback(_consume_task)
             raise PresenceScanTransitionError(f"presence scanner {operation} cancellation is uncertain")
-        raise TimeoutError(f"presence scanner {operation} timed out after {timeout:g}s")
+        raise TimeoutError(f"presence scanner {operation} timed out after {policy.scan_transition_seconds:g}s")
     task.result()
 
 
-async def _cancel_bounded(task: asyncio.Task[object], timeout: float) -> bool:
-    """Cancel a backend transition without waiting forever for bad teardown."""
+async def _cancel_bounded(task: asyncio.Task[object], policy: PresencePolicy) -> bool:
     task.cancel()
-    presence_config = DEFAULT_CONFIG.presence
     grace = min(
-        presence_config.scan_cancel_grace_max_seconds,
-        max(presence_config.scan_cancel_grace_min_seconds, timeout * presence_config.scan_cancel_grace_fraction),
+        policy.scan_cancel_grace_max_seconds,
+        max(
+            policy.scan_cancel_grace_min_seconds,
+            policy.scan_transition_seconds * policy.scan_cancel_grace_fraction,
+        ),
     )
     done, _ = await asyncio.wait({task}, timeout=grace)
     return bool(done)
 
 
+async def _cancel_task(task: asyncio.Task[object]) -> None:
+    if task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 def _consume_task(task: asyncio.Task[object]) -> None:
-    """Consume a detached backend transition result after cancellation."""
-    try:
+    with suppress(asyncio.CancelledError, Exception):
         task.result()
-    except asyncio.CancelledError:
-        return
-    except Exception:  # noqa: BLE001 - detached backend task result is intentionally consumed
-        return

@@ -15,7 +15,7 @@ from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.ports import StagingPort
-from omi_collector.capture.application.presence import PresencePolicy, PresenceScheduler, PresenceWake
+from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
 from omi_collector.capture.application.quarantine_maintenance import (
     PendingStartupState,
     QuarantineMaintenance,
@@ -293,12 +293,16 @@ def test_presence_scan_starts_before_startup_and_wake_waits_for_binding(tmp_path
 
         class Presence:
             policy = PresencePolicy(rapid_backoff=(0.001,))
+            closed = False
 
             async def wait_for_attempt(self) -> PresenceWake:
                 events.append("scan")
                 await release_wake.wait()
                 events.append("wake")
                 return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                self.closed = True
 
         store = _store(tmp_path)
         original = store.pending_attempts
@@ -315,7 +319,7 @@ def test_presence_scan_starts_before_startup_and_wake_waits_for_binding(tmp_path
             events.append("bind")
             startup_bound.set()
 
-        task = asyncio.create_task(maintenance.wait_for_presence_attempt(cast(PresenceScheduler, Presence()), bind))
+        task = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), bind))
         await startup_bound.wait()
         release_wake.set()
         wake = await task
@@ -333,10 +337,14 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
 
         class Presence:
             policy = PresencePolicy(rapid_backoff=(0.001,))
+            closed = False
 
             async def wait_for_attempt(self) -> PresenceWake:
                 await asyncio.Event().wait()
                 raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                self.closed = True
 
         store = _store(tmp_path)
 
@@ -349,9 +357,7 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
 
         store.sweep_terminal_retired = sweep  # type: ignore[method-assign]
         maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
-        task = asyncio.create_task(
-            maintenance.wait_for_presence_attempt(cast(PresenceScheduler, Presence()), lambda _: None)
-        )
+        task = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
         assert await asyncio.to_thread(worker_started.wait, 1)
         task.cancel()
         try:
@@ -361,5 +367,73 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
         else:
             raise AssertionError("cancellation was swallowed")
         assert worker_stopped.is_set()
+
+    _run(scenario())
+
+
+def test_maintenance_failure_after_internal_permit_closes_presence(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        class Presence:
+            closed = False
+
+            async def wait_for_attempt(self) -> PresenceWake:
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        async def fail_after_startup(*_args: object) -> None:
+            raise RuntimeError("maintenance failed")
+
+        maintenance = QuarantineMaintenance(_store(tmp_path), "omi", None, OpportunisticRuntime())
+        maintenance._prepare_and_run = fail_after_startup  # type: ignore[method-assign]
+        presence = Presence()
+
+        with pytest.raises(RuntimeError, match="maintenance failed"):
+            await maintenance.wait_for_presence_attempt(presence, lambda _: None)
+
+        assert presence.closed
+
+    _run(scenario())
+
+
+def test_cancellation_after_internal_permit_closes_presence(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release_permit = asyncio.Event()
+        deferral_started = asyncio.Event()
+        finish_maintenance = asyncio.Event()
+
+        class Presence:
+            closed = False
+
+            async def wait_for_attempt(self) -> PresenceWake:
+                await release_permit.wait()
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        async def wait_for_deferral(
+            defer_requested: threading.Event, _bind: Callable[[PendingStartupState], None]
+        ) -> None:
+            started.set()
+            await asyncio.to_thread(defer_requested.wait)
+            deferral_started.set()
+            await finish_maintenance.wait()
+
+        maintenance = QuarantineMaintenance(_store(tmp_path), "omi", None, OpportunisticRuntime())
+        maintenance._prepare_and_run = wait_for_deferral  # type: ignore[method-assign]
+        presence = Presence()
+        task = asyncio.create_task(maintenance.wait_for_presence_attempt(presence, lambda _: None))
+        await started.wait()
+        release_permit.set()
+        await deferral_started.wait()
+        task.cancel()
+        finish_maintenance.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert presence.closed
 
     _run(scenario())

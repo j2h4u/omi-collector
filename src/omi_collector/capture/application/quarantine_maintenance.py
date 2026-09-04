@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 from time import monotonic
-from typing import cast
+from typing import Protocol, cast
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
 from .ports import (
@@ -18,12 +18,20 @@ from .ports import (
     StagedAttemptShape,
     StagingPort,
 )
-from .presence import PresenceScheduler, PresenceWake
+from .presence import PresenceWake
 from .session_lifecycle import (
     ActivityCallback,
     OpportunisticSyncError,
     report_activity,
 )
+
+
+class PresenceWaiterPort(Protocol):
+    """The maintenance race owns only permit acquisition and fail-closed close."""
+
+    async def wait_for_attempt(self) -> PresenceWake: ...
+
+    async def close(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +163,7 @@ class QuarantineMaintenance:
 
     async def wait_for_presence_attempt(
         self,
-        presence: PresenceScheduler,
+        presence: PresenceWaiterPort,
         bind_startup_state: Callable[[PendingStartupState], None],
     ) -> PresenceWake:
         """Race scanning with maintenance while joining both scoped tasks.
@@ -167,6 +175,7 @@ class QuarantineMaintenance:
         presence_task = asyncio.create_task(presence.wait_for_attempt())
         maintenance_task: asyncio.Task[None] | None = None
         primary: BaseException | None = None
+        permit_returned = False
         try:
             # Give the scheduler its first turn so scanner startup begins before
             # any filesystem maintenance is scheduled.
@@ -175,6 +184,7 @@ class QuarantineMaintenance:
             done, _ = await asyncio.wait({presence_task, maintenance_task}, return_when=asyncio.FIRST_COMPLETED)
             if presence_task in done:
                 wake = presence_task.result()
+                permit_returned = True
                 defer_requested.set()
                 await asyncio.shield(maintenance_task)
                 return wake
@@ -183,6 +193,8 @@ class QuarantineMaintenance:
         except BaseException as error:
             primary = error
             defer_requested.set()
+            if permit_returned:
+                await presence.close()
             if not presence_task.done():
                 presence_task.cancel()
             await asyncio.gather(presence_task, return_exceptions=True)

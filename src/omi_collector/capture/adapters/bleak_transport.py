@@ -84,7 +84,7 @@ class BleakPresenceObserver:
     async def start(self, callback: PresenceCallback) -> None:
         """Start a fresh scan and forward only matching detection callbacks."""
         if self._scanner is not None:
-            return
+            raise RuntimeError("presence scanner is already active")
 
         def detected(device: BLEDevice, advertisement: object) -> None:
             if _normalize_address(device.address) == self._address:
@@ -101,11 +101,14 @@ class BleakPresenceObserver:
         try:
             await scanner.start()
         except BaseException:
-            # A failed BlueZ start must not pin the observer to a dead scanner.
-            # Teardown is best effort and must never replace the start error.
-            self._scanner = None
+            # A failed BlueZ start must be cleaned up, while retaining the
+            # scanner if cleanup itself fails so a later stop can retry it.
+            cleanup_succeeded = False
             with suppress(BaseException):
                 await scanner.stop()
+                cleanup_succeeded = True
+            if cleanup_succeeded:
+                self._scanner = None
             raise
 
     async def stop(self) -> None:

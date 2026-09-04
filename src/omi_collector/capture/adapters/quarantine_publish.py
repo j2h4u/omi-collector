@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RECORD_SIZE
+from .bundle_contract import BundleManifest, SealedReceipt
 from .staging_filesystem import _SHARED_BUNDLE_DIRECTORY_MODE, StagingPaths
 from .staging_store import StagingStore
 
@@ -142,19 +143,15 @@ def _publish_quarantined_prefix(
             / device_slug
             / f"{prefix.start_sequence}-{prefix.next_sequence}-{prefix.raw_sha256[:16]}"
         )
-        manifest = {
-            "device_slug": device_slug,
-            "start_sequence": prefix.start_sequence,
-            "next_sequence": prefix.next_sequence,
-            "record_count": prefix.record_count,
-            "record_size": RECORD_SIZE,
-            "raw_sha256": prefix.raw_sha256,
-        }
-        receipt: dict[str, object] = {
-            "attempt_id": attempt_id,
-            "raw_sha256": prefix.raw_sha256,
-            "status": "sealed",
-        }
+        manifest = BundleManifest(
+            device_slug,
+            prefix.start_sequence,
+            prefix.next_sequence,
+            prefix.record_count,
+            RECORD_SIZE,
+            prefix.raw_sha256,
+        ).as_dict()
+        receipt = SealedReceipt(attempt_id, prefix.raw_sha256).as_dict()
         if os.path.lexists(destination):
             if _destination_matches(
                 destination,
@@ -378,8 +375,12 @@ def _destination_matches(  # noqa: PLR0913
         raise OSError("ordinary bundle destination is not yet canonical")
     existing_manifest = _read_object(destination / _MANIFEST_NAME, _MANIFEST_NAME)
     existing_receipt = _read_object(destination / _RECEIPT_NAME, _RECEIPT_NAME)
+    try:
+        canonical_manifest = BundleManifest.from_json(existing_manifest).as_dict()
+    except ValueError as error:
+        raise QuarantineOutputCollisionError(f"ordinary bundle collision at {destination}") from error
     if (
-        existing_manifest != manifest
+        canonical_manifest != manifest
         or existing_receipt != receipt
         or not _files_equal_prefix(
             destination / _RAW_NAME,

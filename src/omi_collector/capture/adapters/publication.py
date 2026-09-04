@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RECORD_SIZE
+from .bundle_contract import BundleManifest, SealedReceipt
 from .recovery import _published_prefix
 from .staging_contract import (
     _MANIFEST_NAME,
@@ -24,10 +25,6 @@ from .staging_contract import (
     AttemptStateError,
     DurablePrefix,
     StagingError,
-    _is_sha256,
-    _required_int,
-    _required_str,
-    _validate_attempt_id,
     _validate_terminalized_at,
 )
 from .staging_filesystem import (
@@ -272,25 +269,18 @@ def _authenticated_capture_temporary(
 def _validate_capture_temporary_manifest(
     filesystem: StagingFilesystem, manifest: dict[str, object], device_slug: str, raw_path: Path
 ) -> tuple[int, int, str]:
-    expected_keys = {"device_slug", "start_sequence", "next_sequence", "record_count", "record_size", "raw_sha256"}
-    if set(manifest) != expected_keys:
-        raise AttemptStateError("capture temporary manifest is not canonical")
-    manifest_device = _required_str(manifest, "device_slug")
-    start = _required_int(manifest, "start_sequence")
-    next_sequence = _required_int(manifest, "next_sequence")
-    count = _required_int(manifest, "record_count")
-    record_size = _required_int(manifest, "record_size")
-    raw_hash = _required_str(manifest, "raw_sha256")
-    if manifest_device != device_slug or start < 0 or count <= 0 or next_sequence != start + count:
-        raise AttemptStateError("capture temporary manifest or raw bytes are inconsistent")
-    if record_size != RECORD_SIZE or not _is_sha256(raw_hash):
+    try:
+        parsed = BundleManifest.from_json(manifest)
+    except ValueError as error:
+        raise AttemptStateError("capture temporary manifest is not canonical") from error
+    if parsed.device_slug != device_slug:
         raise AttemptStateError("capture temporary manifest or raw bytes are inconsistent")
     if (
-        raw_path.stat().st_size != count * RECORD_SIZE
-        or _file_hash(raw_path, chunk_size=filesystem._durability.io_chunk_bytes) != raw_hash
+        raw_path.stat().st_size != parsed.record_count * RECORD_SIZE
+        or _file_hash(raw_path, chunk_size=filesystem._durability.io_chunk_bytes) != parsed.raw_sha256
     ):
         raise AttemptStateError("capture temporary manifest or raw bytes are inconsistent")
-    return start, next_sequence, raw_hash
+    return parsed.start_sequence, parsed.next_sequence, parsed.raw_sha256
 
 
 def _finalize_capture_temporary(  # noqa: PLR0913
@@ -333,12 +323,13 @@ def _capture_temporary_matches(
         _require_regular_directory(destination)
         for name in (_RAW_NAME, _MANIFEST_NAME, _RECEIPT_NAME):
             _require_regular_file(destination / name, f"published {name}")
-        if _read_json(destination / _MANIFEST_NAME) != manifest or _read_json(destination / _RECEIPT_NAME) != receipt:
+        existing_manifest = BundleManifest.from_json(_read_json(destination / _MANIFEST_NAME)).as_dict()
+        if existing_manifest != manifest or _read_json(destination / _RECEIPT_NAME) != receipt:
             return False
         return _files_equal(
             destination / _RAW_NAME, temporary / _RAW_NAME, chunk_size=filesystem._durability.io_chunk_bytes
         )
-    except (OSError, AttemptStateError) as error:
+    except (OSError, AttemptStateError, ValueError) as error:
         raise StagingError("capture destination cannot be compared strictly") from error
 
 
@@ -350,9 +341,9 @@ def _bundle_matches(
     io_chunk_bytes: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
 ) -> bool:
     try:
-        existing = _read_json(bundle_path / _MANIFEST_NAME)
+        existing = BundleManifest.from_json(_read_json(bundle_path / _MANIFEST_NAME)).as_dict()
         receipt = _read_json(bundle_path / _RECEIPT_NAME)
-    except AttemptStateError:
+    except AttemptStateError, ValueError:
         return False
     return (
         existing == manifest
@@ -374,14 +365,7 @@ def is_published_attempt(source: Path, descriptor: AttemptDescriptor, filesystem
         return False
     try:
         raw_hash = _file_hash(raw_path, chunk_size=filesystem._durability.io_chunk_bytes)
-        manifest = {
-            "device_slug": descriptor.device_slug,
-            "start_sequence": start,
-            "next_sequence": start + count,
-            "record_count": count,
-            "record_size": RECORD_SIZE,
-            "raw_sha256": raw_hash,
-        }
+        manifest = BundleManifest(descriptor.device_slug, start, start + count, count, RECORD_SIZE, raw_hash).as_dict()
         destination = filesystem.capture_root / descriptor.device_slug / f"{start}-{start + count}-{raw_hash[:16]}"
         return destination.exists() and _bundle_matches(
             destination, raw_path, manifest, io_chunk_bytes=filesystem._durability.io_chunk_bytes
@@ -440,10 +424,10 @@ def _prefix_destination_matches(
     if destination.is_symlink():
         return False
     try:
-        existing_manifest = _read_json(destination / _MANIFEST_NAME)
+        existing_manifest = BundleManifest.from_json(_read_json(destination / _MANIFEST_NAME)).as_dict()
         receipt = _read_json(destination / _RECEIPT_NAME)
         _require_regular_file(destination / _RAW_NAME, "published raw")
-    except AttemptStateError, OSError:
+    except AttemptStateError, OSError, ValueError:
         return False
     return (
         existing_manifest == manifest
@@ -458,26 +442,20 @@ def _prefix_destination_for(root: Path, device_slug: str, prefix: DurablePrefix)
 
 
 def _manifest_for_descriptor_prefix(descriptor: AttemptDescriptor, prefix: DurablePrefix) -> dict[str, object]:
-    return {
-        "device_slug": descriptor.device_slug,
-        "start_sequence": prefix.start_sequence,
-        "next_sequence": prefix.next_sequence,
-        "record_count": prefix.record_count,
-        "record_size": RECORD_SIZE,
-        "raw_sha256": prefix.raw_sha256,
-    }
+    return BundleManifest(
+        descriptor.device_slug,
+        prefix.start_sequence,
+        prefix.next_sequence,
+        prefix.record_count,
+        RECORD_SIZE,
+        prefix.raw_sha256,
+    ).as_dict()
 
 
 def _receipt_matches(receipt: dict[str, object], manifest: dict[str, object]) -> bool:
     """Check a sealed receipt without tying an exact duplicate to this attempt ID."""
-    if not set(receipt).issubset({"attempt_id", "raw_sha256", "status"}):
-        return False
     try:
-        attempt_id = _required_str(receipt, "attempt_id")
-        raw_hash = _required_str(receipt, "raw_sha256")
-        status = _required_str(receipt, "status")
-        _validate_attempt_id(attempt_id)
-    except AttemptStateError, ValueError:
+        parsed = SealedReceipt.from_json(receipt)
+    except ValueError:
         return False
-    expected_hash = manifest.get("raw_sha256")
-    return status == "sealed" and _is_sha256(raw_hash) and raw_hash == expected_hash
+    return parsed.raw_sha256 == manifest.get("raw_sha256")

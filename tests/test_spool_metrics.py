@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 from shutil import rmtree
+from typing import cast
 
 import pytest
 
@@ -87,6 +88,23 @@ def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
             "epoch_count": 0,
         },
     }
+
+
+@pytest.mark.parametrize("kind", ["completion", "boolean_record_count"])
+def test_metrics_rejects_noncanonical_bundle_evidence(tmp_path: Path, kind: str) -> None:
+    device_root = tmp_path / "omi"
+    bundle = _bundle(device_root, "100-101", (_record(1),))
+    if kind == "completion":
+        receipt = cast(dict[str, object], json.loads((bundle / "receipt.json").read_text(encoding="utf-8")))
+        receipt["completion"] = "done"
+        (bundle / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+    else:
+        manifest = cast(dict[str, object], json.loads((bundle / "manifest.json").read_text(encoding="utf-8")))
+        manifest["record_count"] = True
+        (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SpoolMetricsError):
+        collect_spool_metrics(tmp_path, "omi")
 
 
 def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path: Path) -> None:

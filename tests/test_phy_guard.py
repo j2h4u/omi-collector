@@ -246,6 +246,28 @@ async def test_restore_failure_retains_marker_for_recovery(tmp_path: Path) -> No
 
 
 @_async_test
+async def test_failed_enter_releases_lock_when_restore_also_fails(tmp_path: Path) -> None:
+    runner = FakeRunner(failures=(2, 3))
+    paths = _paths(tmp_path)
+    guard = ScopedPhyGuard("hci0", paths=paths, runner=runner)
+
+    with pytest.raises(PhyCommandError):
+        await guard.__aenter__()
+
+    assert guard._lock_fd is None
+    assert paths.marker_path.exists()
+    marker_before = paths.marker_path.read_bytes()
+
+    fresh_guard = ScopedPhyGuard("hci0", paths=paths, runner=FakeRunner())
+    fresh_guard._acquire_lock()
+    try:
+        assert fresh_guard._lock_fd is not None
+        assert paths.marker_path.read_bytes() == marker_before
+    finally:
+        fresh_guard._release_lock()
+
+
+@_async_test
 async def test_cancellation_restores_snapshot(tmp_path: Path) -> None:
     runner = FakeRunner()
 

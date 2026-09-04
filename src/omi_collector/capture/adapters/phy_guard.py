@@ -167,8 +167,10 @@ class ScopedPhyGuard(AbstractAsyncContextManager["ScopedPhyGuard"]):
             self._write_marker(snapshot, self._owner)
             await self._set_selected_phys(temporary)
         except BaseException:
-            await self._restore_after_failed_enter()
-            self._release_lock()
+            try:
+                await self._restore_after_failed_enter()
+            finally:
+                self._release_lock()
             raise
         return self
 

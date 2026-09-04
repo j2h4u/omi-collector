@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import BinaryIO, Protocol, cast
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
+from .bundle_contract import BundleManifest, SealedReceipt
 from .publication import (
     PrefixPublicationEvidence,
     SealResult,
@@ -642,25 +643,17 @@ class StagedAttempt:
         count = self.descriptor.read_begin_count
         if start is None or count is None:
             raise AttemptStateError("READ_BEGIN is missing")
-        return {
-            "device_slug": self.descriptor.device_slug,
-            "start_sequence": start,
-            "next_sequence": start + count,
-            "record_count": count,
-            "record_size": RECORD_SIZE,
-            "raw_sha256": raw_hash,
-        }
+        return BundleManifest(self.descriptor.device_slug, start, start + count, count, RECORD_SIZE, raw_hash).as_dict()
 
     def _manifest_for_prefix(self, prefix: DurablePrefix) -> dict[str, object]:
-        return {
-            "device_slug": self.descriptor.device_slug,
-            "start_sequence": prefix.start_sequence,
-            "next_sequence": prefix.next_sequence,
-            "record_count": prefix.record_count,
-            "record_size": RECORD_SIZE,
-            "raw_sha256": prefix.raw_sha256,
-        }
+        return BundleManifest(
+            self.descriptor.device_slug,
+            prefix.start_sequence,
+            prefix.next_sequence,
+            prefix.record_count,
+            RECORD_SIZE,
+            prefix.raw_sha256,
+        ).as_dict()
 
     def _receipt(self, raw_hash: str) -> dict[str, object]:
-        receipt: dict[str, object] = {"attempt_id": self.attempt_id, "raw_sha256": raw_hash, "status": "sealed"}
-        return receipt
+        return SealedReceipt(self.attempt_id, raw_hash).as_dict()

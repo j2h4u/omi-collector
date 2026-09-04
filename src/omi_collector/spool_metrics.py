@@ -10,6 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
+from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.firmware_observations import (
     FirmwareObservation,
     FirmwareObservationError,
@@ -18,7 +19,6 @@ from omi_collector.capture.adapters.firmware_observations import (
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
 
-_ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
 _SLUG = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -94,16 +94,6 @@ class _BundleMeasurement:
     ranges: tuple[tuple[int, int], ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _ValidatedManifest:
-    device_slug: str
-    start_sequence: int
-    next_sequence: int
-    record_count: int
-    record_size: int
-    raw_sha256: str
-
-
 def collect_spool_metrics(
     capture_root: Path,
     device_slug: str,
@@ -172,28 +162,20 @@ def _read_bundle_artifact(path: Path, device_slug: str) -> _BundleMeasurement:
     )
 
 
-def _read_manifest_and_raw(path: Path, device_slug: str) -> _ValidatedManifest:
+def _read_manifest_and_raw(path: Path, device_slug: str) -> BundleManifest:
     manifest = _read_json(path / "manifest.json", "manifest.json")
-    expected = {"device_slug", "start_sequence", "next_sequence", "record_count", "record_size", "raw_sha256"}
-    if set(manifest) != expected or manifest.get("device_slug") != device_slug:
+    try:
+        parsed = BundleManifest.from_json(manifest)
+    except ValueError as error:
+        raise SpoolMetricsError(f"manifest is invalid or has the wrong device_slug: {path}") from error
+    if parsed.device_slug != device_slug:
         raise SpoolMetricsError(f"manifest is invalid or has the wrong device_slug: {path}")
-    integer_names = ("start_sequence", "next_sequence", "record_count", "record_size")
-    if any(isinstance(manifest[name], bool) or not isinstance(manifest[name], int) for name in integer_names):
-        raise SpoolMetricsError(f"manifest integer fields are invalid: {path}")
-    raw_hash = manifest["raw_sha256"]
-    if not isinstance(raw_hash, str) or re.fullmatch(r"[0-9a-f]{64}", raw_hash) is None:
-        raise SpoolMetricsError(f"manifest raw_sha256 is invalid: {path}")
-    start = cast(int, manifest["start_sequence"])
-    next_sequence = cast(int, manifest["next_sequence"])
-    count = cast(int, manifest["record_count"])
-    if start < 0 or next_sequence != start + count or count <= 0 or manifest["record_size"] != RECORD_SIZE:
-        raise SpoolMetricsError(f"manifest sequence range is invalid: {path}")
     raw_path = path / "records.bin"
     _require_regular_file(raw_path, "records.bin")
     raw_size, calculated_hash = _stream_size_and_hash(raw_path)
-    if raw_size != count * RECORD_SIZE or calculated_hash != raw_hash:
+    if raw_size != parsed.record_count * RECORD_SIZE or calculated_hash != parsed.raw_sha256:
         raise SpoolMetricsError(f"records.bin does not match manifest: {path}")
-    return _ValidatedManifest(device_slug, start, next_sequence, count, cast(int, manifest["record_size"]), raw_hash)
+    return parsed
 
 
 def _stream_size_and_hash(path: Path) -> tuple[int, str]:
@@ -275,14 +257,12 @@ def _unproven_hole_records(values: tuple[_BundleMeasurement, ...]) -> int:
 
 def _validate_receipt(path: Path, raw_hash: str) -> None:
     receipt = _read_json(path / "receipt.json", "receipt.json")
-    allowed = {"attempt_id", "raw_sha256", "status", "completion"}
-    if set(receipt) - allowed:
-        raise SpoolMetricsError(f"sealed receipt fields are invalid: {path}")
-    if receipt.get("status") != "sealed" or receipt.get("raw_sha256") != raw_hash:
+    try:
+        parsed = SealedReceipt.from_json(receipt)
+    except ValueError as error:
+        raise SpoolMetricsError(f"sealed receipt fields are invalid: {path}") from error
+    if parsed.raw_sha256 != raw_hash:
         raise SpoolMetricsError(f"sealed receipt does not authenticate artifact: {path}")
-    attempt_id = receipt.get("attempt_id")
-    if not isinstance(attempt_id, str) or _ATTEMPT_ID.fullmatch(attempt_id) is None:
-        raise SpoolMetricsError(f"sealed receipt attempt_id is invalid: {path}")
 
 
 def _read_json(path: Path, label: str) -> dict[str, object]:

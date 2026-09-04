@@ -191,6 +191,42 @@ def test_split_roots_publish_only_completed_bundles_to_capture_root(tmp_path: Pa
     assert not tuple((capture_root / "omi_cv1").glob(".*.tmp"))
 
 
+def test_recovery_quarantines_capture_temporary_with_malformed_manifest_scalar(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    device_root = capture_root / "omi_cv1"
+    device_root.mkdir(parents=True)
+    raw = _record(1)
+    raw_hash = sha256(raw).hexdigest()
+    temporary = device_root / f".100-101-{raw_hash[:16]}.{'a' * 32}.tmp"
+    temporary.mkdir()
+    (temporary / "records.bin").write_bytes(raw)
+    (temporary / "manifest.json").write_text(
+        dumps(
+            {
+                "device_slug": "omi_cv1",
+                "start_sequence": True,
+                "next_sequence": 101,
+                "record_count": 1,
+                "record_size": RECORD_SIZE,
+                "raw_sha256": raw_hash,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (temporary / "receipt.json").write_text(
+        dumps({"attempt_id": "b" * 32, "raw_sha256": raw_hash, "status": "sealed"}),
+        encoding="utf-8",
+    )
+
+    with StagingStore(tmp_path / "spool", capture_root).device_lock("omi_cv1"):
+        pass
+
+    assert not temporary.exists()
+    quarantined = tuple((tmp_path / "spool" / "quarantine" / "omi_cv1").iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "unprocessable.json").is_file()
+
+
 def test_prefix_publication_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     capture_root = _capture_root(tmp_path)
     attempt = _started_streaming_attempt(tmp_path, count=2)
@@ -487,7 +523,9 @@ def test_exact_bundle_collision_deduplicates_but_other_content_is_preserved(
     assert conflict.path.exists()
 
 
-@pytest.mark.parametrize("damage", ["missing", "malformed", "wrong_hash", "wrong_status", "wrong_attempt_id"])
+@pytest.mark.parametrize(
+    "damage", ["missing", "malformed", "wrong_hash", "wrong_status", "wrong_attempt_id", "completion"]
+)
 def test_invalid_bundle_receipt_prevents_deduplication(tmp_path: Path, damage: str) -> None:
     first = _started_attempt(tmp_path)
     first.append_record(0, 100, _record(1))
@@ -504,6 +542,8 @@ def test_invalid_bundle_receipt_prevents_deduplication(tmp_path: Path, damage: s
             value["raw_sha256"] = "0" * 64
         elif damage == "wrong_status":
             value["status"] = "open"
+        elif damage == "completion":
+            value["completion"] = "done"
         else:
             value["attempt_id"] = "not-an-attempt-id"
         receipt.write_text(dumps(value), encoding="utf-8")
@@ -515,6 +555,21 @@ def test_invalid_bundle_receipt_prevents_deduplication(tmp_path: Path, damage: s
     with pytest.raises(CollisionError):
         duplicate.seal(DoneNotification(0, 102))
     assert duplicate.path.exists()
+
+
+def test_invalid_bundle_manifest_boolean_prevents_deduplication(tmp_path: Path) -> None:
+    first = _started_attempt(tmp_path, count=1)
+    first.append_record(0, 100, _record(1))
+    bundle = first.seal(DoneNotification(0, 101)).bundle_path
+    manifest = cast(dict[str, object], loads((bundle / "manifest.json").read_text(encoding="utf-8")))
+    manifest["record_count"] = True
+    (bundle / "manifest.json").write_text(dumps(manifest), encoding="utf-8")
+
+    duplicate = _started_attempt(tmp_path, count=1)
+    duplicate.append_record(0, 100, _record(1))
+
+    with pytest.raises(CollisionError):
+        duplicate.seal(DoneNotification(0, 101))
 
 
 def test_preflight_and_fsync_failures_stop_before_read_contract(tmp_path: Path) -> None:

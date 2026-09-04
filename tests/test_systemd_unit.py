@@ -39,8 +39,6 @@ class _DeploymentScenario:
     build_failure: bool = False
     staging_failure: bool = False
     staging_mktemp_failure: bool = False
-    release_move_signal: bool = False
-    release_move_failure: bool = False
     rollback_stop_failure: bool = False
     readiness_signal: str = "TERM"
 
@@ -118,7 +116,6 @@ def test_installer_and_deployer_keep_production_targets_non_overridable() -> Non
     assert "deployment_environment_file='/var/lib/omi-collector-deployments/deployment.env'" in deployer
     assert "deployment_root='/var/lib/omi-collector-deployments'" in deployer
     assert "deployments_dir='/var/lib/omi-collector-deployments/releases'" in deployer
-    assert "staging_dir='/var/lib/omi-collector-deployments/staging'" in deployer
     assert "installed_unit='/etc/systemd/system/omi-collector.service'" in deployer
     assert "installed_exec='/usr/local/libexec/omi-collector/omi-collector-exec'" in deployer
     assert "(( EUID == 0 ))" in deployer
@@ -127,14 +124,15 @@ def test_installer_and_deployer_keep_production_targets_non_overridable() -> Non
     assert '[[ "${layout_path:-}" == /* && -f "$layout_path" && ! -L "$layout_path" ]]' in deployer
     assert "must name a regular absolute file" in deployer
     assert 'chown -R root:root -- "$environment"' in deployer
-    assert 'install -d -o root -g root -m 0755 -- "$deployment_root" "$deployments_dir" "$staging_dir"' in deployer
+    assert 'install -d -o root -g root -m 0755 -- "$deployment_root" "$deployments_dir"' in deployer
     assert "deployment_committed=1" in deployer
     assert "legacy_restore_required=0" in deployer
     assert 'chown root:root -- "$legacy_state_backup"' in deployer
     assert 'chmod 0600 -- "$legacy_state_backup"' in deployer
-    assert "release_moved=0" in deployer
+    assert "release_created=0" in deployer
     assert 'staged_deployment_file=$(mktemp --tmpdir="$deployment_root"' in deployer
-    assert 'release_moved=1\nmv -- "$staged_environment" "$release_path"' in deployer
+    assert 'release_created=1\nmkdir --mode=0750 -- "$release_path"' in deployer
+    assert 'mv -- "$staged_environment" "$release_path"' not in deployer
     assert 'flock -n "$deployment_lock_fd"' in deployer
 
 
@@ -285,7 +283,9 @@ def _write_commands(
         '[[ "${DEPLOY_BUILD_FAIL:-}" != 1 ]] || exit 1\n'
         f'python3 -m venv --clear "$UV_PROJECT_ENVIRONMENT"\n'
         f'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c \'import sysconfig; print(sysconfig.get_path("purelib"))\')\n'
-        f'cp -a {shlex.quote(str(source_package))} "$purelib/omi_collector"\n',
+        f'cp -a {shlex.quote(str(source_package))} "$purelib/omi_collector"\n'
+        'printf \'#!%s\\nprint("entrypoint-ready")\\n\' "$UV_PROJECT_ENVIRONMENT/bin/python" > "$UV_PROJECT_ENVIRONMENT/bin/omi-collector"\n'
+        'chmod 0755 "$UV_PROJECT_ENVIRONMENT/bin/omi-collector"\n',
         encoding="utf-8",
     )
     (fake_bin / "uv").chmod(0o755)
@@ -366,19 +366,6 @@ def _write_commands(
         encoding="utf-8",
     )
     (fake_bin / "systemctl").chmod(0o755)
-    if scenario.release_move_signal or scenario.release_move_failure:
-        (fake_bin / "mv").write_text(
-            "#!/usr/bin/env bash\n"
-            'if [[ "${3:-}" == */release-* && "${DEPLOY_RELEASE_MOVE_FAIL:-}" == 1 ]]; then exit 1; fi\n'
-            'if [[ "${3:-}" == */release-* && "${DEPLOY_RELEASE_MOVE_SIGNAL:-}" == 1 ]]; then\n'
-            '    /usr/bin/mv "$@" || exit $?\n'
-            '    kill -TERM "$PPID"\n'
-            "    exit 0\n"
-            "fi\n"
-            'exec /usr/bin/mv "$@"\n',
-            encoding="utf-8",
-        )
-        (fake_bin / "mv").chmod(0o755)
     (fake_bin / "journalctl").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "journalctl args=%s\\n" "$*" >> {quoted_log}\n'
@@ -521,8 +508,6 @@ def _deployment_harness(
             **({"DEPLOY_BUILD_FAIL": "1"} if scenario.build_failure else {}),
             **({"DEPLOY_STAGING_FAIL": "1"} if scenario.staging_failure else {}),
             **({"DEPLOY_STAGING_MKTEMP_FAIL": "1"} if scenario.staging_mktemp_failure else {}),
-            **({"DEPLOY_RELEASE_MOVE_SIGNAL": "1"} if scenario.release_move_signal else {}),
-            **({"DEPLOY_RELEASE_MOVE_FAIL": "1"} if scenario.release_move_failure else {}),
             **({"DEPLOY_ROLLBACK_STOP_FAIL": "1"} if scenario.rollback_stop_failure else {}),
             **({"DEPLOY_SIGNAL": scenario.readiness_signal} if scenario.signal_during_readiness else {}),
         },
@@ -576,6 +561,10 @@ def test_deployer_harness_requires_readiness_and_stability(tmp_path: Path) -> No
         "OMI_COLLECTOR_SOURCE_REVISION=0000000000000000000000000000000000000000\n"
         f"OMI_COLLECTOR_UV_PROJECT_ENVIRONMENT={next((tmp_path / 'deployments' / 'releases').glob('release-*'))}\n"
     )
+    release = next((tmp_path / "deployments" / "releases").glob("release-*"))
+    entrypoint = subprocess.run([release / "bin" / "omi-collector"], check=False, capture_output=True, text=True)
+    assert entrypoint.returncode == 0, entrypoint.stderr
+    assert entrypoint.stdout == "entrypoint-ready\n"
 
 
 def test_deployer_restores_service_after_build_failure(tmp_path: Path) -> None:
@@ -593,7 +582,7 @@ def test_deployer_restores_service_after_build_failure(tmp_path: Path) -> None:
     assert not tuple((tmp_path / "deployments" / "releases").glob("release-*"))
 
 
-def test_deployer_removes_release_moved_before_selector_publication(tmp_path: Path) -> None:
+def test_deployer_removes_candidate_before_selector_publication(tmp_path: Path) -> None:
     deployer, _, _, environment, log = _deployment_harness(tmp_path, _DeploymentScenario(staging_failure=True))
 
     result = subprocess.run(
@@ -604,35 +593,6 @@ def test_deployer_removes_release_moved_before_selector_publication(tmp_path: Pa
     assert "could not set deployment provenance environment group" in result.stderr
     assert not tuple((tmp_path / "deployments" / "releases").glob("release-*"))
     assert not tuple((tmp_path / "state" / "staging").glob(".staging.*"))
-    assert "systemctl args=start omi-collector.service" in log.read_text(encoding="utf-8")
-
-
-def test_deployer_removes_release_when_signal_interrupts_move_bookkeeping(tmp_path: Path) -> None:
-    deployer, _, _, environment, log = _deployment_harness(tmp_path, _DeploymentScenario(release_move_signal=True))
-
-    result = subprocess.run(
-        [*_root_prefix(), str(deployer)], check=False, capture_output=True, text=True, env=environment
-    )
-
-    assert result.returncode == 143
-    assert "interrupted by SIGTERM" in result.stderr
-    assert not tuple((tmp_path / "state" / "staging").glob(".staging.*"))
-    assert not tuple((tmp_path / "deployments" / "releases").glob("release-*"))
-    assert not tuple((tmp_path / "deployments").glob(".deployment.env.tmp.*"))
-    assert "systemctl args=start omi-collector.service" in log.read_text(encoding="utf-8")
-
-
-def test_deployer_removes_staging_when_release_move_fails(tmp_path: Path) -> None:
-    deployer, _, _, environment, log = _deployment_harness(tmp_path, _DeploymentScenario(release_move_failure=True))
-
-    result = subprocess.run(
-        [*_root_prefix(), str(deployer)], check=False, capture_output=True, text=True, env=environment
-    )
-
-    assert result.returncode != 0
-    assert "could not publish staged deployment environment" in result.stderr
-    assert not tuple((tmp_path / "state" / "staging").glob(".staging.*"))
-    assert not tuple((tmp_path / "deployments" / "releases").glob("release-*"))
     assert "systemctl args=start omi-collector.service" in log.read_text(encoding="utf-8")
 
 
@@ -696,7 +656,6 @@ def test_deployer_seals_published_release_against_service_writes(tmp_path: Path)
     release = next((deployment_root / "releases").glob("release-*"))
     assert deployment_root.stat().st_mode & 0o22 == 0
     assert (deployment_root / "releases").stat().st_mode & 0o22 == 0
-    assert (deployment_root / "staging").stat().st_mode & 0o22 == 0
     for path in release.rglob("*"):
         assert path.lstat().st_uid == os.getuid(), path
         if not path.is_symlink():

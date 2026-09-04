@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from threading import Event, Lock, Thread
@@ -23,6 +24,39 @@ from typing import Protocol, cast
 
 from ...config import DEFAULT_CONFIG, WriterConfig
 from ..domain.ring_protocol import RECORD_SIZE
+from .attempt_writer_machine import (
+    Admit,
+    AttemptWriterMachineEvent,
+    AttemptWriterMachineState,
+    CheckpointRequested,
+    CheckpointSucceeded,
+    Closed,
+    CloseFailed,
+    CloseRequested,
+    CloseSucceeded,
+    Closing,
+    CommandFailed,
+    Constructed,
+    Failed,
+    Finalized,
+    FinalizeRequested,
+    FinalizeSucceeded,
+    Finalizing,
+    Ignore,
+    LegRequested,
+    LegSucceeded,
+    PrepareSucceeded,
+    PublishRequested,
+    ReadBeginRequested,
+    ReadBeginSucceeded,
+    Reading,
+    Reject,
+    RejectionKind,
+    ReuseClose,
+    StartRequested,
+    failure_of,
+    transition,
+)
 from .debug_logging import debug_exception
 
 
@@ -216,14 +250,7 @@ class AttemptWriter:
         self._written = 0
         self._durable_next_sequence: int | None = None
         self._durable_record_count: int | None = None
-        self._failure: BaseException | None = None
-        self._started = False
-        self._prepared = False
-        self._read_started = False
-        self._sealing = False
-        self._sealed = False
-        self._closing = False
-        self._closed = False
+        self._state: AttemptWriterMachineState = Constructed()
         self._close_pending: asyncio.Future[object] | None = None
         self._thread = Thread(target=self._run, name="omi-attempt-writer", daemon=False)
         self._thread.start()
@@ -237,21 +264,7 @@ class AttemptWriter:
     def state(self) -> WriterState:
         """Return a point-in-time lifecycle state."""
         with self._lock:
-            if self._closed:
-                state = WriterState.CLOSED
-            elif self._failure is not None:
-                state = WriterState.FAILED
-            elif self._closing:
-                state = WriterState.CLOSING
-            elif self._sealed:
-                state = WriterState.SEALED
-            elif self._sealing:
-                state = WriterState.SEALING
-            elif self._started:
-                state = WriterState.STARTED
-            else:
-                state = WriterState.CREATED
-        return state
+            return self._writer_state_locked()
 
     @property
     def published_high_water(self) -> int:
@@ -306,7 +319,7 @@ class AttemptWriter:
     def failure(self) -> BaseException | None:
         """Return the latched target exception, if any."""
         with self._lock:
-            return self._failure
+            return failure_of(self._state)
 
     def publish(self, high_water: int) -> bool:
         """Publish a monotonic source byte offset without waiting for disk I/O.
@@ -319,7 +332,8 @@ class AttemptWriter:
         if high_water % RECORD_SIZE:
             raise ValueError(f"high_water must be record-aligned ({RECORD_SIZE} bytes)")
         with self._lock:
-            self._require_accepting_data_locked()
+            result = transition(self._state, PublishRequested())
+            self._raise_rejection_locked(result.directive, publish=True)
             if high_water <= self._published:
                 return False
             self._published = high_water
@@ -328,28 +342,18 @@ class AttemptWriter:
 
     async def start(self) -> None:
         """Prepare the target attempt on the dedicated thread."""
-        with self._lock:
-            if self._started:
-                failure = self._failure
-                if failure is not None:
-                    raise WriterFailedError("writer target failed") from failure
-                return
-            self._require_open_locked()
-            self._started = True
-        try:
-            await self._submit(PrepareCommand())
-        except BaseException:
-            with self._lock:
-                self._started = False
-            raise
+        future = self._admit(StartRequested(), lambda _high_water: PrepareCommand())
+        if future is not None:
+            await future
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> object:
         """Prepare one target leg on the dedicated thread."""
         if start_sequence < 0 or record_count < 0:
             raise ValueError("leg sequence and record count must be non-negative")
-        with self._lock:
-            self._require_prepared_locked()
-        return await self._submit(PrepareLegCommand(start_sequence, record_count))
+        future = self._admit(LegRequested(), lambda _high_water: PrepareLegCommand(start_sequence, record_count))
+        if future is None:
+            return None
+        return await future
 
     async def read_begin(self, notice: object) -> object:
         """Record READ_BEGIN through the target thread."""
@@ -357,17 +361,25 @@ class AttemptWriter:
 
     def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
         """Queue READ_BEGIN without waiting for target or disk progress."""
-        with self._lock:
-            self._require_prepared_locked()
-        return self._enqueue(ReadBeginCommand(notice))
+        try:
+            future = self._admit(ReadBeginRequested(), lambda _high_water: ReadBeginCommand(notice))
+        except WriterFailedError as error:
+            with self._lock:
+                future = self._new_future_locked()
+            future.set_exception(error)
+            return future
+        if future is None:
+            with self._lock:
+                future = self._new_future_locked()
+            future.set_result(None)
+        return future
 
     async def checkpoint(self) -> object:
         """Wait for published bytes, then invoke target checkpoint."""
-        with self._lock:
-            self._require_ready_locked()
-            self._raise_failure_locked()
-            high_water = self._published
-        return await self._submit(CheckpointCommand(high_water))
+        future = self._admit(CheckpointRequested(), CheckpointCommand)
+        if future is None:
+            return None
+        return await future
 
     async def barrier(self) -> object:
         """Alias for :meth:`checkpoint`, emphasizing ordering semantics."""
@@ -375,46 +387,25 @@ class AttemptWriter:
 
     async def seal(self, done_notice: object = None) -> object:
         """Flush published bytes and seal, unless the target has failed."""
-        with self._lock:
-            self._require_ready_locked()
-            self._raise_failure_locked()
-            if self._sealed:
-                raise WriterClosedError("writer is already sealed")
-            if self._sealing:
-                raise WriterClosedError("writer seal is already pending")
-            self._sealing = True
-            high_water = self._published
-        try:
-            result = await self._submit(SealCommand(high_water, done_notice))
-        except BaseException:
-            with self._lock:
-                self._sealing = False
-            raise
-        with self._lock:
-            self._sealed = True
-        return result
+        future = self._admit(
+            FinalizeRequested(),
+            lambda high_water: SealCommand(high_water, done_notice),
+            finalization_message="writer seal is already pending",
+        )
+        if future is None:
+            return None
+        return await future
 
     async def publish_prefix(self) -> object:
         """Flush published bytes and publish the durable prefix on the writer thread."""
-        with self._lock:
-            self._require_ready_locked()
-            self._raise_failure_locked()
-            if self._sealed:
-                raise WriterClosedError("writer is already sealed")
-            if self._sealing:
-                raise WriterClosedError("writer publication is already pending")
-            self._sealing = True
-            high_water = self._published
-        try:
-            result = await self._submit(PublishPrefixCommand(high_water))
-        except BaseException:
-            with self._lock:
-                self._sealing = False
-            raise
-        with self._lock:
-            self._sealing = False
-            self._sealed = True
-        return result
+        future = self._admit(
+            FinalizeRequested(),
+            PublishPrefixCommand,
+            finalization_message="writer publication is already pending",
+        )
+        if future is None:
+            return None
+        return await future
 
     async def close(self, *, timeout: float | None = None) -> object:
         """Orderly-close the target, with idempotent bounded waiting.
@@ -430,15 +421,8 @@ class AttemptWriter:
             raise ValueError("timeout must be positive")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        with self._lock:
-            if self._close_pending is None:
-                self._require_open_locked()
-                self._closing = True
-                high_water = self._published
-                self._close_pending = self._new_future_locked()
-                self._commands.append(_Pending(CloseCommand(high_water), self._close_pending))
-                self._wake.set()
-            future = self._close_pending
+        future = self._admit(CloseRequested(), CloseCommand)
+        assert future is not None
         try:
             await asyncio.wait_for(asyncio.shield(future), timeout)
         except asyncio.CancelledError:
@@ -487,49 +471,82 @@ class AttemptWriter:
     def _new_future_locked(self) -> asyncio.Future[object]:
         return self._loop_for_completion().create_future()
 
-    def _enqueue(self, command: WriterCommand) -> asyncio.Future[object]:
+    def _admit(
+        self,
+        event: AttemptWriterMachineEvent,
+        command_factory: Callable[[int], WriterCommand],
+        *,
+        finalization_message: str | None = None,
+    ) -> asyncio.Future[object] | None:
+        """Atomically decide, capacity-check, and enqueue one control operation."""
         with self._lock:
-            if command.__class__ is not CloseCommand:
-                self._require_open_locked()
-            if len(self._commands) >= self._max_controls:
+            result = transition(self._state, event)
+            self._raise_rejection_locked(result.directive, finalization_message=finalization_message)
+            if isinstance(result.directive, Ignore):
+                return None
+            if isinstance(result.directive, ReuseClose):
+                assert self._close_pending is not None
+                return self._close_pending
+            assert isinstance(result.directive, Admit)
+            if not isinstance(event, CloseRequested) and len(self._commands) >= self._max_controls:
                 raise WriterQueueFullError("writer control queue is full")
+            command = command_factory(self._published)
             future = self._new_future_locked()
             self._commands.append(_Pending(command, future))
+            self._state = result.state
+            if isinstance(command, CloseCommand):
+                self._close_pending = future
             self._wake.set()
-        return future
+            return future
 
-    async def _submit(self, command: WriterCommand) -> object:
-        return await self._enqueue(command)
-
-    def _require_open_locked(self) -> None:
-        if self._closed or self._closing:
-            raise WriterClosedError("writer is closed")
-
-    def _require_accepting_data_locked(self) -> None:
-        self._require_open_locked()
-        if self._sealed or self._sealing:
-            raise WriterClosedError("writer is sealing or sealed")
-        self._raise_failure_locked()
-
-    def _require_started_locked(self) -> None:
-        self._require_open_locked()
-        if not self._started:
+    def _raise_rejection_locked(
+        self,
+        directive: object,
+        *,
+        publish: bool = False,
+        finalization_message: str | None = None,
+    ) -> None:
+        if not isinstance(directive, Reject):
+            return
+        if directive.kind is RejectionKind.NOT_STARTED:
             raise WriterError("writer has not been started")
-
-    def _require_prepared_locked(self) -> None:
-        self._require_started_locked()
-        if not self._prepared:
+        if directive.kind is RejectionKind.PREPARE_PENDING:
             raise WriterError("writer preparation has not completed")
-
-    def _require_ready_locked(self) -> None:
-        self._require_prepared_locked()
-        self._raise_failure_locked()
-        if not self._read_started:
+        if directive.kind is RejectionKind.READ_PENDING:
             raise WriterError("READ_BEGIN has not completed")
+        if directive.kind is RejectionKind.FINALIZE_PENDING:
+            assert finalization_message is not None
+            raise WriterClosedError(finalization_message)
+        if directive.kind is RejectionKind.FINALIZED:
+            if publish:
+                raise WriterClosedError("writer is sealing or sealed")
+            raise WriterClosedError("writer is already sealed")
+        if directive.kind is RejectionKind.FINALIZING:
+            raise WriterClosedError("writer is sealing or sealed")
+        if directive.kind is RejectionKind.CLOSED:
+            raise WriterClosedError("writer is closed")
+        assert directive.kind is RejectionKind.FAILED
+        failure = failure_of(self._state)
+        assert failure is not None
+        raise WriterFailedError("writer target failed") from failure
 
-    def _raise_failure_locked(self) -> None:
-        if self._failure is not None:
-            raise WriterFailedError("writer target failed") from self._failure
+    def _writer_state_locked(self) -> WriterState:
+        state = self._state
+        if isinstance(state, Closed):
+            writer_state = WriterState.CLOSED
+        elif failure_of(state) is not None:
+            writer_state = WriterState.FAILED
+        elif isinstance(state, Closing):
+            writer_state = WriterState.CLOSING
+        elif isinstance(state, Finalized):
+            writer_state = WriterState.SEALED
+        elif isinstance(state, Finalizing):
+            writer_state = WriterState.SEALING
+        elif isinstance(state, Constructed):
+            writer_state = WriterState.CREATED
+        else:
+            writer_state = WriterState.STARTED
+        return writer_state
 
     def _run(self) -> None:
         while True:
@@ -543,8 +560,8 @@ class AttemptWriter:
 
     def _run_idle(self) -> bool:
         with self._lock:
-            failed = self._failure is not None
-            ready = self._prepared and self._read_started
+            failed = failure_of(self._state) is not None
+            ready = isinstance(self._state, Reading)
         if failed or not ready:
             self._wake.wait()
             self._wake.clear()
@@ -562,34 +579,26 @@ class AttemptWriter:
     def _run_command(self, pending: _Pending) -> bool:
         command = pending.command
         with self._lock:
-            failure = self._failure
+            failure = failure_of(self._state)
         if failure is not None and not isinstance(command, CloseCommand):
             self._complete(pending.future, None, WriterFailedError("writer target failed", failure))
             return False
         try:
             result = self._execute(command)
         except Exception as exc:  # noqa: BLE001 - adapter failures must latch at this boundary
-            self._record_failure(exc)
-            self._complete(pending.future, None, WriterFailedError("writer target failed", exc))
-            if isinstance(command, CloseCommand):
-                with self._lock:
-                    self._closing = False
-                    self._closed = True
+            failure = self._record_failure(exc, close_failed=isinstance(command, CloseCommand))
+            self._complete(pending.future, None, WriterFailedError("writer target failed", failure))
             return isinstance(command, CloseCommand)
         with self._lock:
-            failure = self._failure
+            self._state = transition(self._state, self._success_event(command)).state
+            failure = failure_of(self._state)
         if failure is None and isinstance(command, CheckpointCommand):
             self._remember_durable_result(result)
         if failure is not None:
             self._complete(pending.future, None, WriterFailedError("writer target failed", failure))
         else:
             self._complete(pending.future, result, None)
-        if isinstance(command, CloseCommand):
-            with self._lock:
-                self._closing = False
-                self._closed = True
-            return True
-        return False
+        return isinstance(command, CloseCommand)
 
     def _remember_durable_result(self, result: object) -> None:
         next_sequence = getattr(result, "next_sequence", None)
@@ -611,14 +620,10 @@ class AttemptWriter:
     def _execute(self, command: WriterCommand) -> object:
         if isinstance(command, PrepareCommand):
             result = self._target.prepare()
-            with self._lock:
-                self._prepared = True
         elif isinstance(command, PrepareLegCommand):
             result = self._target.prepare_leg(command.start_sequence, command.record_count)
         elif isinstance(command, ReadBeginCommand):
             result = self._target.read_begin(command.notice)
-            with self._lock:
-                self._read_started = True
         elif isinstance(command, CheckpointCommand):
             self._drain_data(command.high_water, exact=True)
             result = self._target.checkpoint()
@@ -630,9 +635,8 @@ class AttemptWriter:
             result = self._target.publish_prefix()
         else:
             with self._lock:
-                failed = self._failure is not None
-                ready = self._prepared and self._read_started
-            if not failed and ready:
+                state = self._state
+            if isinstance(state, Closing) and state.failure is None and state.drain:
                 self._drain_data(command.high_water, exact=True)
             result = self._target.close()
         return result
@@ -655,12 +659,30 @@ class AttemptWriter:
                 break
         return wrote
 
-    def _record_failure(self, error: BaseException) -> None:
+    def _success_event(self, command: WriterCommand) -> AttemptWriterMachineEvent:
+        if isinstance(command, PrepareCommand):
+            return PrepareSucceeded()
+        if isinstance(command, PrepareLegCommand):
+            return LegSucceeded()
+        if isinstance(command, ReadBeginCommand):
+            return ReadBeginSucceeded()
+        if isinstance(command, CheckpointCommand):
+            return CheckpointSucceeded()
+        if isinstance(command, SealCommand | PublishPrefixCommand):
+            return FinalizeSucceeded()
+        if isinstance(command, CloseCommand):
+            return CloseSucceeded()
+        raise TypeError(f"unknown writer command: {type(command).__name__}")
+
+    def _record_failure(self, error: BaseException, *, close_failed: bool = False) -> BaseException:
         with self._lock:
-            newly_latched = self._failure is None
-            if self._failure is None:
-                self._failure = error
-            latched = self._failure
+            newly_latched = failure_of(self._state) is None
+            event = CloseFailed(error) if close_failed else CommandFailed(error)
+            self._state = transition(self._state, event).state
+            latched = failure_of(self._state)
+            if latched is None:
+                self._state = Failed(error)
+                latched = error
             submitted_high_water = self._published
             written_high_water = self._written
             pending = list(self._commands)
@@ -679,6 +701,7 @@ class AttemptWriter:
                     self._commands.appendleft(item)
                 break
             self._complete(item.future, None, WriterFailedError("writer target failed", cast(BaseException, latched)))
+        return latched
 
     def _complete(self, future: asyncio.Future[object], result: object | None, error: BaseException | None) -> None:
         try:

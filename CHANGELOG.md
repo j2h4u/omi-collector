@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.10](https://github.com/j2h4u/omi-collector/compare/v0.2.9...v0.2.10) (2026-09-04)
+
+
+### Documentation
+
+* remove completed architecture plans ([#33](https://github.com/j2h4u/omi-collector/issues/33)) ([6707b82](https://github.com/j2h4u/omi-collector/commit/6707b828a5373e5327e34f52d351e86afaef2879))
+
 ## [0.2.9](https://github.com/j2h4u/omi-collector/compare/v0.2.8...v0.2.9) (2026-09-04)
 
 

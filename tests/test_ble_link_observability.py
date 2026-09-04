@@ -3,6 +3,8 @@ import ctypes
 import errno
 import json
 import logging
+import threading
+import time
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -507,6 +509,128 @@ def test_observer_shutdown_drains_queued_disconnect_before_finalizing() -> None:
     observer._queue.put(_packet(0x05, b"\x00\x42\x00\x13"))
     asyncio.run(observer.close())
     assert records and records[0]["disconnect_reason_hex"] == "0x13"
+
+
+def test_observer_shutdown_deadline_does_not_block_loop_on_full_queue_and_stalled_callback() -> None:
+    fake = _FakeSocket()
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    close_returned = threading.Event()
+    records: list[dict[str, object]] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_queue_max_packets=1,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+
+    def terminal_callback(record: dict[str, object]) -> None:
+        records.append(record)
+        callback_entered.set()
+        callback_release.wait()
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=terminal_callback,
+        clock=lambda: 0.0,
+    )
+    watchdog = threading.Thread(target=lambda: _release_after_timeout(close_returned, callback_release), daemon=True)
+    watchdog.start()
+
+    async def scenario() -> tuple[threading.Thread, float]:
+        await observer.start()
+        observer.handle_packet(_connect())
+        observer._queue.put(_packet(0x05, b"\x00\x42\x00\x13"))
+        assert callback_entered.wait(timeout=1)
+        observer._queue.put(b"queued behind blocked callback")
+        processor = observer._processor
+        assert processor is not None
+        loop_progressed = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.001, loop_progressed.set)
+        close_task = asyncio.create_task(observer.close())
+        await asyncio.wait_for(loop_progressed.wait(), timeout=0.05)
+        assert not close_task.done()
+        started = time.monotonic()
+        await close_task
+        await observer.start()
+        assert observer._processor is processor
+        return processor, time.monotonic() - started
+
+    try:
+        processor, elapsed = asyncio.run(scenario())
+        close_returned.set()
+        assert elapsed < 0.15
+    finally:
+        callback_release.set()
+        close_returned.set()
+        watchdog.join(timeout=1)
+
+    processor.join(timeout=1)
+    assert not watchdog.is_alive()
+    assert not processor.is_alive()
+    assert len(records) == 1
+
+
+def test_observer_shutdown_finalizer_is_bounded_off_loop_without_processor() -> None:
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    close_returned = threading.Event()
+    records: list[dict[str, object]] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+
+    def terminal_callback(record: dict[str, object]) -> None:
+        records.append(record)
+        callback_entered.set()
+        callback_release.wait()
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        config=config,
+        terminal_callback=terminal_callback,
+        clock=lambda: 0.0,
+    )
+    observer.handle_packet(_connect())
+    watchdog = threading.Thread(target=lambda: _release_after_timeout(close_returned, callback_release), daemon=True)
+    watchdog.start()
+
+    async def scenario() -> tuple[threading.Thread, float]:
+        loop_progressed = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.001, loop_progressed.set)
+        close_task = asyncio.create_task(observer.close())
+        await asyncio.wait_for(loop_progressed.wait(), timeout=0.05)
+        assert not close_task.done()
+        started = time.monotonic()
+        await close_task
+        finalizer = observer._shutdown_finalizer
+        assert finalizer is not None
+        return finalizer, time.monotonic() - started
+
+    try:
+        finalizer, elapsed = asyncio.run(scenario())
+        close_returned.set()
+        assert callback_entered.is_set()
+        assert elapsed < 0.15
+    finally:
+        callback_release.set()
+        close_returned.set()
+        watchdog.join(timeout=1)
+
+    finalizer.join(timeout=1)
+    assert not watchdog.is_alive()
+    assert not finalizer.is_alive()
+    assert len(records) == 1
+
+
+def _release_after_timeout(close_returned: threading.Event, callback_release: threading.Event) -> None:
+    if not close_returned.wait(timeout=0.2):
+        callback_release.set()
 
 
 def test_observer_native_bind_failure_closes_socket() -> None:

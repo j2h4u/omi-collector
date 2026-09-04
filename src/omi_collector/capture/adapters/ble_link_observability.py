@@ -644,6 +644,7 @@ class BleLinkObserver:
         self._socket: HciSocket | None = None
         self._reader: threading.Thread | None = None
         self._processor: threading.Thread | None = None
+        self._shutdown_finalizer: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._active: _ActiveSession | None = None
@@ -662,7 +663,7 @@ class BleLinkObserver:
             self._diagnostic_failure("ble_link_observer_start_failed", error)
 
     def _start_sync(self) -> None:
-        if self._reader is not None:
+        if self._workers_are_still_running():
             return
         adapter_index = _hci_adapter_index(self.adapter)
         sock = cast(HciSocket, self._socket_factory(_AF_BLUETOOTH, socket.SOCK_RAW, _BTPROTO_HCI))
@@ -685,13 +686,15 @@ class BleLinkObserver:
     async def close(self) -> None:
         """Stop workers, finalize an active record, and swallow all observer errors."""
         try:
-            self._close_sync()
+            await self._close_workers()
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - observer is diagnostic-only
             self._diagnostic_failure("ble_link_observer_shutdown_failed", error)
 
-    def _close_sync(self) -> None:
+    async def _close_workers(self) -> None:
+        """Stop workers within one bounded deadline without blocking the event loop."""
+        deadline = time.monotonic() + self.config.observer_join_timeout_seconds
         self._stop.set()
         sock, self._socket = self._socket, None
         if sock is not None:
@@ -701,26 +704,84 @@ class BleLinkObserver:
                 self._diagnostic_failure("ble_link_observer_socket_close_failed", error)
         reader = self._reader
         if reader is not None:
-            reader.join(self.config.observer_join_timeout_seconds)
-            if reader.is_alive():
-                self._diagnostic("ble_link_observer_reader_timeout")
+            await self._wait_for_worker(reader, deadline, "ble_link_observer_reader_timeout")
         processor = self._processor
         if processor is not None:
-            while True:
-                try:
-                    self._queue.put_nowait(None)
-                    break
-                except queue.Full:
-                    if not processor.is_alive():
-                        self._diagnostic("ble_link_observer_processor_stopped")
-                        break
-                    self._stop.wait(self.config.observer_poll_seconds)
-            processor.join(self.config.observer_join_timeout_seconds)
-            if processor.is_alive():
-                self._diagnostic("ble_link_observer_processor_timeout")
+            await self._enqueue_shutdown_sentinel(processor, deadline)
+            await self._wait_for_worker(processor, deadline, "ble_link_observer_processor_timeout")
+        if reader is not None and not reader.is_alive():
+            self._reader = None
+        if processor is not None and not processor.is_alive():
+            self._processor = None
+        if processor is None:
+            await self._finish_without_processor(deadline)
+
+    def _workers_are_still_running(self) -> bool:
+        workers = (self._reader, self._processor, self._shutdown_finalizer)
+        if any(worker is not None and worker.is_alive() for worker in workers):
+            return True
+        self._discard_queued_packets()
         self._reader = None
         self._processor = None
-        self._finish(None)
+        self._shutdown_finalizer = None
+        return False
+
+    def _discard_queued_packets(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _start_shutdown_finalizer(self) -> None:
+        with self._lock:
+            finalizer = self._shutdown_finalizer
+            if finalizer is not None and finalizer.is_alive():
+                return
+            self._shutdown_finalizer = threading.Thread(
+                target=self._finish,
+                args=(None,),
+                name="omi-ble-link-finalizer",
+                daemon=True,
+            )
+            finalizer = self._shutdown_finalizer
+        finalizer.start()
+
+    async def _finish_without_processor(self, deadline: float) -> None:
+        with self._lock:
+            active = self._active is not None
+        if not active:
+            return
+        self._start_shutdown_finalizer()
+        finalizer = self._shutdown_finalizer
+        if finalizer is not None:
+            await self._wait_for_worker(finalizer, deadline, "ble_link_observer_finalizer_timeout")
+
+    async def _wait_for_worker(self, worker: threading.Thread, deadline: float, timeout_event: str) -> None:
+        while worker.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._diagnostic(timeout_event)
+                return
+            await asyncio.sleep(min(self.config.observer_poll_seconds, remaining))
+
+    async def _enqueue_shutdown_sentinel(self, processor: threading.Thread, deadline: float) -> None:
+        while True:
+            if not processor.is_alive():
+                self._diagnostic("ble_link_observer_processor_stopped")
+                return
+            try:
+                self._queue.put_nowait(None)
+                return
+            except queue.Full:
+                if not processor.is_alive():
+                    self._diagnostic("ble_link_observer_processor_stopped")
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._diagnostic("ble_link_observer_processor_timeout")
+                    return
+                await asyncio.sleep(min(self.config.observer_poll_seconds, remaining))
 
     def _reader_loop(self) -> None:
         while not self._stop.is_set():
@@ -746,17 +807,23 @@ class BleLinkObserver:
                 self._warn_once()
 
     def _processor_loop(self) -> None:
-        while True:
-            try:
-                packet = self._queue.get(timeout=self.config.observer_poll_seconds)
-            except queue.Empty:
-                continue
-            if packet is None:
-                return
-            try:
-                self.handle_packet(packet)
-            except BaseException as error:  # noqa: BLE001 - malformed vendor packets are nonfatal
-                self._diagnostic_failure("ble_link_observer_parser_failed", error)
+        try:
+            while True:
+                try:
+                    packet = self._queue.get(timeout=self.config.observer_poll_seconds)
+                except queue.Empty:
+                    reader = self._reader
+                    if self._stop.is_set() and (reader is None or not reader.is_alive()):
+                        return
+                    continue
+                if packet is None:
+                    return
+                try:
+                    self.handle_packet(packet)
+                except BaseException as error:  # noqa: BLE001 - malformed vendor packets are nonfatal
+                    self._diagnostic_failure("ble_link_observer_parser_failed", error)
+        finally:
+            self._finish(None)
 
     def handle_packet(self, packet: bytes | bytearray) -> None:
         """Parse one packet synchronously; useful for deterministic tests."""

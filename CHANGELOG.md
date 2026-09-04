@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.6](https://github.com/j2h4u/omi-collector/compare/v0.2.5...v0.2.6) (2026-09-04)
+
+
+### Fixes
+
+* attest automated release checks ([#26](https://github.com/j2h4u/omi-collector/issues/26)) ([3b6d85b](https://github.com/j2h4u/omi-collector/commit/3b6d85b548428e04fbb605e4a5565ce425a38515))
+* make presence scheduling race-safe ([33b6755](https://github.com/j2h4u/omi-collector/commit/33b67551a6bb52baa4c4d008078a5ec1e4e9d143))
+
+
+### Documentation
+
+* design explicit presence state machine ([33b6755](https://github.com/j2h4u/omi-collector/commit/33b67551a6bb52baa4c4d008078a5ec1e4e9d143))
+
 ## [0.2.5](https://github.com/j2h4u/omi-collector/compare/v0.2.4...v0.2.5) (2026-09-04)
 
 

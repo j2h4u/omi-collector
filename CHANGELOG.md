@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/j2h4u/omi-collector/compare/v0.2.6...v0.2.7) (2026-09-04)
+
+
+### Fixes
+
+* review submitted PR dependencies ([#27](https://github.com/j2h4u/omi-collector/issues/27)) ([167f234](https://github.com/j2h4u/omi-collector/commit/167f2347a7f533eccf67d2869ffcd6ade3f3a7bf))
+
 ## [0.2.6](https://github.com/j2h4u/omi-collector/compare/v0.2.5...v0.2.6) (2026-09-04)
 
 

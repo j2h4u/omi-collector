@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -96,6 +97,7 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
         "firmware_version": "1.0.0",
     }
     assert "loss_seconds" not in journal.path.read_text(encoding="utf-8")
+    assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("value", ["ABCDEF1", "abcdef", "abcdef1-", "abcdef1 "])

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.9](https://github.com/j2h4u/omi-collector/compare/v0.2.8...v0.2.9) (2026-09-04)
+
+
+### Fixes
+
+* release writer lifecycle hardening ([#31](https://github.com/j2h4u/omi-collector/issues/31)) ([77110fd](https://github.com/j2h4u/omi-collector/commit/77110fd6312567924feee3763939345838168075))
+
 ## [0.2.8](https://github.com/j2h4u/omi-collector/compare/v0.2.7...v0.2.8) (2026-09-04)
 
 

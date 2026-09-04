@@ -34,7 +34,6 @@ addopts = [
 ]
 xfail_strict = true
 markers = [
-    "integration: tests that cross process, service, container, or network boundaries",
     "slow: tests that are too slow for the default unit gate",
 ]
 

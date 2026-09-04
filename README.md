@@ -41,11 +41,10 @@ or delete published bundles. Those are downstream responsibilities.
 
 ## What comes next
 
-In my downstream pipeline, each raw bundle passes through voice activity
-detection (VAD). The pipeline keeps only speech audio for long-term storage and
-publishes a compact passport alongside it that maps the retained speech back to
-the original timeline. This preserves when speech and removed gaps occurred
-without retaining the much larger stream of silence and non-speech audio.
+A useful downstream pipeline can pass each raw bundle through voice activity
+detection (VAD), keep only speech for long-term storage, and publish a compact
+passport that maps retained speech back to the original timeline. This keeps
+the result small without losing when speech and removed gaps occurred.
 
 That processing intentionally lives outside Omi Collector. This repository
 ends at durable publication of the original pendant data, so other users can
@@ -81,10 +80,10 @@ sends an explicit `ADVANCE` command.
 
 ## Production installation
 
-The supported production shape is a root-owned checkout, a dedicated
-`omi-collector` service account, private mutable state under
-`/srv/pipelines/omi/collector`, and published source bundles under
-`/srv/pipelines/omi/source`.
+The supported generic production shape is a root-owned checkout and a
+dedicated `omi-collector` service account with all mutable state under
+`/var/lib/omi-collector`. This is the checked-in default and works with the
+hardened service unit without a host-specific drop-in.
 
 ```bash
 sudo git clone https://github.com/j2h4u/omi-collector.git /opt/omi-collector
@@ -92,26 +91,22 @@ cd /opt/omi-collector
 UV_BIN=$(command -v uv)
 [[ "$UV_BIN" == /usr/local/bin/uv ]] || \
   sudo install -o root -g root -m 0755 "$UV_BIN" /usr/local/bin/uv
-sudo install -d -o root -g root -m 0755 /etc/omi-collector /var/lib/omi-collector /srv/pipelines/omi
-sudo install -o root -g root -m 0640 config/layout.toml /srv/pipelines/omi/collector.toml
+sudo install -d -o root -g root -m 0755 /etc/omi-collector /var/lib/omi-collector
+sudo install -o root -g root -m 0640 config/layout.toml /var/lib/omi-collector/collector.toml
 sudo install -o root -g root -m 0600 config/omi-collector.env.example /etc/omi-collector/omi-collector.env
 sudoedit /etc/omi-collector/omi-collector.env
 sudo scripts/install-systemd-unit.sh
-sudo install -d -o omi-collector -g omi-collector -m 0750 \
-  /srv/pipelines/omi/collector /srv/pipelines/omi/source
-sudo -u omi-collector env HOME=/var/lib/omi-collector \
-  UV_CACHE_DIR=/var/lib/omi-collector/uv-cache \
-  UV_PROJECT_ENVIRONMENT=/var/lib/omi-collector/venv UV_LINK_MODE=hardlink \
-  /usr/local/bin/uv sync --locked --no-dev --no-editable
 sudo systemctl enable --now bluetooth.service
 sudo -u omi-collector bluetoothctl show
-sudo systemctl restart omi-collector.service
+sudo scripts/deploy-systemd-service.sh
 ```
 
 Replace every placeholder in the environment file. At minimum, configure the
 pendant Bluetooth address, a lowercase device slug, the layout file, checkout,
 `uv`, and virtual-environment paths. The installer enables the service but does
-not start it unless `--restart` is explicit.
+not start it unless `--restart` is explicit. Complete the first successful
+deployment before rebooting or leaving the host unattended: until then the
+environment deliberately points at an unusable placeholder.
 
 Follow the service with:
 
@@ -126,37 +121,37 @@ For subsequent updates, pull a reviewed revision and run:
 sudo scripts/deploy-systemd-service.sh
 ```
 
-The deployment command refreshes the dedicated environment, restarts the
-service, and requires both application readiness and a stable process.
+The deployment command builds a versioned, root-owned environment under
+`/var/lib/omi-collector-deployments`, atomically selects it with its
+source-revision provenance, starts the service, and
+requires both application readiness and a stable process. If either check
+fails, it restores the previous environment, provenance, and service. Known
+obsolete release directories are pruned only after a successful deployment.
+During deployment, the exact canonical schema-1 `device.json` format from
+older releases is treated as disposable and removed. Malformed, unknown,
+symlinked, or non-regular device state stops deployment without deletion.
 
 ## Storage
 
-The recommended production layout file is `/srv/pipelines/omi/collector.toml`.
+The recommended generic layout file is `/var/lib/omi-collector/collector.toml`.
 Its parent is the Omi root, with `collector` and `source` as direct sibling
 roots. The collector keeps private state under the former; each device slug
 creates its own bundle directory directly below the latter, such as
-`/srv/pipelines/omi/source/omi-cv1`. The application accepts any absolute,
+`/var/lib/omi-collector/source/omi-cv1`. The application accepts any absolute,
 regular, non-symlink layout file; all declared roots resolve relative to its
 parent.
 
-This host's data roots need a host-specific systemd drop-in, for example:
-
-```ini
-# /etc/systemd/system/omi-collector.service.d/storage.conf
-[Service]
-ReadWritePaths=/var/lib/omi-collector /srv/pipelines/omi/collector /srv/pipelines/omi/source
-```
-
-Do not add host-specific paths to the checked-in base unit. Grant the service
-account only the traversal and write permissions it needs.
+Custom storage roots require a host-specific `ReadWritePaths` systemd drop-in.
+Do not add those paths to the checked-in base unit. Grant the service account
+only the traversal and write permissions it needs.
 
 Published bundles are a shared boundary. If another local account consumes
 them, configure either a shared Unix group or a default ACL on the source root.
 For a named downstream account, the ACL shape is:
 
 ```bash
-sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /srv/pipelines/omi/source
-sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /srv/pipelines/omi/source
+sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /var/lib/omi-collector/source
+sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /var/lib/omi-collector/source
 ```
 
 Replace `DOWNSTREAM`, and ensure every parent directory is traversable by both

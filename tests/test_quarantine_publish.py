@@ -186,18 +186,19 @@ def test_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path, monkeyp
     outside.mkdir()
     real_publish = quarantine_publish._publish_atomic
 
-    def swap_before_atomic(
+    def swap_before_atomic(  # noqa: PLR0913
         destination: Path,
         manifest: dict[str, object],
         receipt: dict[str, object],
-        raw: bytes,
+        raw_source: Path,
+        prefix_size: int,
         *,
         should_defer: Callable[[], bool],
     ) -> None:
         backup = tmp_path / "capture-backup"
         capture_root.rename(backup)
         capture_root.symlink_to(outside, target_is_directory=True)
-        real_publish(destination, manifest, receipt, raw, should_defer=should_defer)
+        real_publish(destination, manifest, receipt, raw_source, prefix_size, should_defer=should_defer)
 
     monkeypatch.setattr(quarantine_publish, "_publish_atomic", swap_before_atomic)
     with pytest.raises(OSError, match="temporarily unavailable"):

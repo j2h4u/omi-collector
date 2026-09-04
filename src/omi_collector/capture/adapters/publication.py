@@ -33,13 +33,13 @@ from .staging_contract import (
 from .staging_filesystem import (
     _SHARED_BUNDLE_DIRECTORY_MODE,
     StagingFilesystem,
+    _copy_prefix_synced,
     _copy_synced,
     _file_hash,
     _files_equal,
-    _files_equal_bytes,
+    _files_equal_prefix,
     _json_bytes,
     _read_json,
-    _read_prefix,
     _require_regular_directory,
     _require_regular_file,
     _sync_directory,
@@ -119,7 +119,8 @@ def publish_prefix_directory(  # noqa: PLR0913
     *,
     destination: Path,
     device_slug: str,
-    prefix_bytes: bytes,
+    raw_source: Path,
+    prefix_size: int,
     manifest: dict[str, object],
     receipt: dict[str, object],
 ) -> None:
@@ -128,7 +129,13 @@ def publish_prefix_directory(  # noqa: PLR0913
     try:
         _write_synced(temporary / _MANIFEST_NAME, _json_bytes(manifest), filesystem._fsync)
         _write_synced(temporary / _RECEIPT_NAME, _json_bytes(receipt), filesystem._fsync)
-        _write_synced(temporary / _RAW_NAME, prefix_bytes, filesystem._fsync)
+        _copy_prefix_synced(
+            raw_source,
+            temporary / _RAW_NAME,
+            prefix_size,
+            filesystem._fsync,
+            chunk_size=filesystem._durability.io_chunk_bytes,
+        )
         _sync_directory(temporary, filesystem._fsync)
         os.rename(temporary_name, destination.name, src_dir_fd=device_fd, dst_dir_fd=device_fd)
         filesystem._fsync(device_fd)
@@ -401,7 +408,8 @@ def _prefix_publication_matches(
         destination = _prefix_destination_for(filesystem.capture_root, descriptor.device_slug, prefix)
         return not destination.is_symlink() and _prefix_destination_matches(
             destination,
-            _read_prefix(source / _RAW_NAME, prefix.record_count * RECORD_SIZE),
+            source / _RAW_NAME,
+            prefix.record_count * RECORD_SIZE,
             _manifest_for_descriptor_prefix(descriptor, prefix),
             io_chunk_bytes=io_chunk_bytes,
         )
@@ -423,7 +431,8 @@ def _recoverable_prefix_marker_matches(
 
 def _prefix_destination_matches(
     destination: Path,
-    prefix_bytes: bytes,
+    raw_source: Path,
+    prefix_size: int,
     manifest: dict[str, object],
     *,
     io_chunk_bytes: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
@@ -439,7 +448,7 @@ def _prefix_destination_matches(
     return (
         existing_manifest == manifest
         and _receipt_matches(receipt, manifest)
-        and _files_equal_bytes(destination / _RAW_NAME, prefix_bytes, chunk_size=io_chunk_bytes)
+        and _files_equal_prefix(destination / _RAW_NAME, raw_source, prefix_size, chunk_size=io_chunk_bytes)
     )
 
 

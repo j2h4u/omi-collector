@@ -787,7 +787,7 @@ class BleLinkObserver:
 
     def _handle_connect(self, event: _ConnectEvent) -> None:
         if event.address != self.address:
-            self._diagnostic("ble_link_address_mismatch", observed_address=event.address)
+            self._diagnostic("ble_link_address_mismatch")
             return
         with self._lock:
             if self._active is not None:

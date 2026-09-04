@@ -39,6 +39,8 @@ from omi_collector.capture.application.collector import (
     ProgressMailbox,
     ProgressSnapshot,
     RingAcknowledgementError,
+    TransferCounters,
+    TransferInterruptedError,
     TransferTimeouts,
 )
 from omi_collector.capture.application.operational_telemetry import TIME_READ_UUID
@@ -179,6 +181,23 @@ async def test_session_error_includes_explicit_bleak_bluez_cause_chain() -> None
         " <- BleakError: backend lost connection"
         " <- BleakDBusError: [org.bluez.Error.Failed] Connection attempt failed"
     )
+
+
+@_async_test
+async def test_session_error_redacts_ble_address_without_hiding_transport_cause() -> None:
+    bleak = BleakError("Device with address AA:BB:CC:DD:EE:FF at /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF was not found")
+    transport = RingTransportUnavailableError("connection failed")
+    transport.__cause__ = bleak
+    activity: list[ActivityEvent] = []
+
+    await report_session_error(activity.append, "connect", transport, _runtime())
+
+    message = activity[0].error_message
+    assert message is not None
+    assert "AA:BB:CC:DD:EE:FF" not in message
+    assert "dev_AA_BB_CC_DD_EE_FF" not in message
+    assert message.count("[BLE address]") == 2
+    assert "BleakError" in message
 
 
 @_async_test
@@ -435,17 +454,15 @@ def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: in
     return records
 
 
-def test_retry_policy_preserves_positional_and_keyword_overrides() -> None:
+def test_retry_policy_requires_explicit_drain_cooldown() -> None:
     assert RetryPolicy().drain_cooldown_seconds == 300
-    positional = RetryPolicy((1,), 30, 4096, True)
-    legacy_keyword = RetryPolicy(idle_poll_seconds=30)
     explicit = RetryPolicy(drain_cooldown_seconds=300)
+    explicit_values = RetryPolicy(backoff=(1,), batch_records=4096, stop_after_drained=True, drain_cooldown_seconds=30)
 
-    assert positional.backoff == (1,)
-    assert positional.drain_cooldown_seconds == 30
-    assert positional.batch_records == 4096
-    assert positional.stop_after_drained
-    assert legacy_keyword.drain_cooldown_seconds == 30
+    assert explicit_values.backoff == (1,)
+    assert explicit_values.drain_cooldown_seconds == 30
+    assert explicit_values.batch_records == 4096
+    assert explicit_values.stop_after_drained
     assert explicit.drain_cooldown_seconds == 300
 
 
@@ -1392,8 +1409,18 @@ async def test_quality_metrics_failure_does_not_change_completed_audio_collectio
 
 
 @_async_test
-async def test_completed_read_emits_one_terminal_transfer_session_with_raw_counters(tmp_path: Path) -> None:
+async def test_completed_read_emits_one_terminal_transfer_session_with_raw_counters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="abcdef1")
+    metric_threads: list[threading.Thread] = []
+    original_append = journal._append
+
+    def observe_append(value: bytes) -> None:
+        metric_threads.append(threading.current_thread())
+        original_append(value)
+
+    monkeypatch.setattr(journal, "_append", observe_append)
     session = ScriptedRingSession(
         _status(),
         (
@@ -1429,6 +1456,8 @@ async def test_completed_read_emits_one_terminal_transfer_session_with_raw_count
     assert metric["written_raw_bytes"] == RECORD_SIZE
     assert metric["phy_policy"] == "force_1m"
     assert metric["advertisement_rssi_dbm"] is None
+    assert metric_threads
+    assert metric_threads[0] is not threading.main_thread()
 
 
 @_async_test
@@ -2446,6 +2475,12 @@ def test_only_storage_not_ready_ack_is_retryable() -> None:
     assert not retryable(RingAcknowledgementError(1))
 
 
+def test_interrupted_read_timeout_is_retryable() -> None:
+    error = TransferInterruptedError("timed out", TransferCounters(0, 0, 0), cause=TimeoutError())
+
+    assert retryable(error)
+
+
 @_async_test
 @pytest.mark.parametrize(
     ("case", "read", "write"),
@@ -2943,7 +2978,7 @@ async def test_no_data_async_activity_timeout_retry_and_policy_validation(tmp_pa
     assert result.info.read_sequence == 10
     assert events == ["connecting", "drained"]
 
-    for policy in (RetryPolicy(backoff=()), RetryPolicy(backoff=(0,)), RetryPolicy(idle_poll_seconds=0)):
+    for policy in (RetryPolicy(backoff=()), RetryPolicy(backoff=(0,)), RetryPolicy(drain_cooldown_seconds=0)):
         with pytest.raises(ValueError, match="policy"):
             await run_opportunistic_collector(
                 Provider([]),

@@ -3,9 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FLOATING_ACTION_REFS = {"main", "master", "trunk", "HEAD"}
-FLOATING_IMAGE_TAGS = {"latest", "stable", "edge", "main", "master"}
-WORKFLOW_USES_PATTERN = re.compile(r"^\s*uses:\s*([^@\s]+)@([^\s#]+)", re.MULTILINE)
+WORKFLOW_USES_PATTERN = re.compile(r"^\s*(?:-\s*)?uses:\s*([^@\s]+)@([^\s#]+)", re.MULTILINE)
 FROM_PATTERN = re.compile(r"^\s*FROM\s+(?P<image>[^\s]+)", re.MULTILINE)
 STAGE_NAME_PATTERN = re.compile(r"^\s*FROM\s+[^\s]+\s+AS\s+(?P<stage>[^\s]+)", re.IGNORECASE | re.MULTILINE)
 COPY_FROM_PATTERN = re.compile(r"^\s*COPY\s+--from=(?P<image>[^\s]+)", re.MULTILINE)
@@ -25,8 +23,8 @@ def _check_action_refs(root: Path) -> list[str]:
         text = path.read_text(encoding="utf-8")
         for match in WORKFLOW_USES_PATTERN.finditer(text):
             action, ref = match.groups()
-            if ref in FLOATING_ACTION_REFS or re.fullmatch(r"v?\d+", ref) or re.fullmatch(r"v?\d+\.\d+", ref):
-                errors.append(f"{path.relative_to(root)} uses {action}@{ref}; pin actions to a full version or SHA")
+            if not re.fullmatch(r"[0-9a-f]{40}", ref):
+                errors.append(f"{path.relative_to(root)} uses {action}@{ref}; pin actions to a full 40-character SHA")
     return errors
 
 
@@ -34,23 +32,11 @@ def _is_local_image(image: str) -> bool:
     return "/" not in image and image.endswith(":local")
 
 
-def _split_image_ref(image: str) -> tuple[str, str | None]:
-    if "@sha256:" in image:
-        return image, "sha256"
-    last_part = image.rsplit("/", maxsplit=1)[-1]
-    if ":" not in last_part:
-        return image, None
-    return image, last_part.rsplit(":", maxsplit=1)[1]
-
-
 def _check_image_ref(image: str, source: str) -> list[str]:
     if _is_local_image(image):
         return []
-    _, tag = _split_image_ref(image)
-    if tag is None:
-        return [f"{source} uses {image}; pin container images to an explicit tag or digest"]
-    if tag in FLOATING_IMAGE_TAGS:
-        return [f"{source} uses {image}; floating image tags are not allowed"]
+    if not re.search(r"@sha256:[0-9a-f]{64}$", image):
+        return [f"{source} uses {image}; pin container images to a sha256 digest"]
     return []
 
 

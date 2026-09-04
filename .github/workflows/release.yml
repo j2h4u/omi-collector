@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      commit-sha:
+        description: Main commit to release after a token-created merge
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -24,9 +29,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
-          HEAD_SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ inputs.commit-sha || github.sha }}
+          DISPATCHED_SHA: ${{ inputs.commit-sha || '' }}
         run: |
           set -euo pipefail
+          if [ -n "${DISPATCHED_SHA}" ]; then
+            main_sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+            if [ "${main_sha}" != "${DISPATCHED_SHA}" ]; then
+              echo "::error::requested release commit ${DISPATCHED_SHA} is no longer the main branch tip (${main_sha})"
+              exit 1
+            fi
+          fi
           deadline="$(( $(date +%s) + 2400 ))"
           while :; do
             state="$(gh api \
@@ -60,14 +73,29 @@ jobs:
   release-please:
     needs: wait-for-ci
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     outputs:
       release-created: ${{ steps.release.outputs.release_created }}
       tag-name: ${{ steps.release.outputs.tag_name }}
     steps:
+      - name: Verify requested release commit is still main tip
+        if: ${{ inputs.commit-sha != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ inputs.commit-sha }}
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [ "${main_sha}" != "${RELEASE_SHA}" ]; then
+            echo "::error::requested release commit ${RELEASE_SHA} is no longer the main branch tip (${main_sha})"
+            exit 1
+          fi
+
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
@@ -111,3 +139,72 @@ jobs:
               fail "unexpected releases_created value"
               ;;
           esac
+
+      - name: Dispatch full checks and enable release auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_BRANCH: release-please--branches--main--components--omi-collector
+        run: |
+          set -euo pipefail
+
+          mapfile -t release_prs < <(gh api \
+            "repos/${REPOSITORY}/pulls?state=open&base=main&per_page=100" \
+            | jq -r --arg repository "${REPOSITORY}" --arg release_branch "${RELEASE_BRANCH}" \
+              '.[] | select(.head.repo.full_name == $repository and .head.ref == $release_branch and .user.login == "github-actions[bot]") | [.number, .head.ref, .head.sha, .base.sha] | @tsv')
+
+          if [ "${#release_prs[@]}" -eq 0 ]; then
+            echo "No open release-please PR; nothing to dispatch"
+            exit 0
+          fi
+          if [ "${#release_prs[@]}" -ne 1 ]; then
+            echo "::error::expected one open release-please PR, found ${#release_prs[@]}"
+            exit 1
+          fi
+
+          IFS=$'\t' read -r pr_number head_ref head_sha base_sha <<< "${release_prs[0]}"
+          echo "Dispatching checks for PR #${pr_number} at ${head_sha} (${head_ref})"
+          gh api --method POST "repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches" \
+            -f ref="${head_ref}"
+          gh api --method POST "repos/${REPOSITORY}/actions/workflows/codeql.yml/dispatches" \
+            -f ref="${head_ref}"
+          gh api --method POST "repos/${REPOSITORY}/actions/workflows/dependency-review.yml/dispatches" \
+            -f ref="${head_ref}" \
+            -f "inputs[base-ref]=${base_sha}" \
+            -f "inputs[head-ref]=${head_sha}"
+
+          gh pr merge "${pr_number}" --auto --squash \
+            --repo "${REPOSITORY}" \
+            --match-head-commit "${head_sha}"
+
+          deadline="$(( $(date +%s) + 1800 ))"
+          while :; do
+            pr_state="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.state')"
+            if [ "${pr_state}" = "closed" ]; then
+              read -r merged merge_sha < <(gh api "repos/${REPOSITORY}/pulls/${pr_number}" \
+                --jq '[.merged, (.merge_commit_sha // "")] | @tsv')
+              if [ "${merged}" != "true" ] || [ -z "${merge_sha}" ]; then
+                echo "::error::release PR #${pr_number} closed without a merge"
+                exit 1
+              fi
+              break
+            fi
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::timed out waiting for release PR #${pr_number} to merge"
+              exit 1
+            fi
+            sleep 20
+          done
+
+          main_sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [ "${main_sha}" != "${merge_sha}" ]; then
+            echo "::error::main advanced from merge commit ${merge_sha} to ${main_sha}; refusing a racy release dispatch"
+            exit 1
+          fi
+
+          echo "Dispatching CI and release for merged main commit ${merge_sha}"
+          gh api --method POST "repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches" \
+            -f ref=main
+          gh api --method POST "repos/${REPOSITORY}/actions/workflows/release.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[commit-sha]=${merge_sha}"

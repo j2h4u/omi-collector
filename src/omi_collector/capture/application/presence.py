@@ -159,8 +159,10 @@ class PresenceScheduler:
         """Wait for an advisory wake or fallback, stopping scan before return."""
         if self._closed:
             raise RuntimeError("presence scheduler is closed")
-        await self._start_scan()
         while True:
+            # A soft scanner failure must not strand a drained collector. The
+            # timer below bounds retries while absence is confirmed.
+            await self._start_scan()
             now = self._clock()
             self._confirm_absence_if_due(now)
             wake_reason = self._due_reason(now)
@@ -284,7 +286,7 @@ class PresenceScheduler:
     async def _start_scan(self) -> None:
         if self._closed or self._scan_active:
             return
-        if self._due_reason(self._clock()) is not None:
+        if self._wake_is_due(self._clock()):
             return
         self._scan_active = True
         try:
@@ -301,8 +303,10 @@ class PresenceScheduler:
             with suppress(Exception):
                 await self._stop_scan()
             raise
-        except Exception:  # noqa: BLE001 - fallback remains authoritative if scanning is unavailable
-            await self._stop_scan()
+        except Exception:  # noqa: BLE001 - the wait loop retries after the bounded timer
+            with suppress(Exception):
+                await self._stop_scan()
+            self._scan_active = False
             return
 
     async def _stop_scan(self) -> None:
@@ -341,6 +345,19 @@ class PresenceScheduler:
         ):
             return "fallback"
         return None
+
+    def _wake_is_due(self, now: float) -> bool:
+        rapid_retry_due = (
+            self._retry_deadline is not None
+            and now >= self._retry_deadline
+            and self.last_matching_age is not None
+            and self.last_matching_age <= self._policy.absence_seconds
+        )
+        fallback_due = now >= self._fallback_deadline and (
+            not self._drained_mode
+            or (self.last_matching_age is not None and self.last_matching_age <= self._policy.absence_seconds)
+        )
+        return rapid_retry_due or fallback_due
 
     def _next_deadline(self, now: float) -> float:
         cooldown_expired_while_absent = (

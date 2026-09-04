@@ -388,7 +388,10 @@ async def _read_and_seal(
         raise CursorConsistencyError("READ did not produce the bounded batch prefix")
     await _report_activity(run.options.activity, "sealing")
     try:
-        sealed = await _bounded(batch.writer.seal(DoneNotification(0, batch.end)), run.options.timeouts.transfer)
+        sealed = await _bounded(
+            batch.writer.seal(DoneNotification(0, batch.end)),
+            run.options.timeouts.transfer,
+        )
     except BaseException as error:
         if run.runtime.is_writer_failed(error):
             _raise_writer_cause(batch.writer, error)

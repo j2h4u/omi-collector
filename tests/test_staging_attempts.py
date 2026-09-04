@@ -307,8 +307,8 @@ def test_writer_close_failure_preserves_recoverable_prefix_without_terminal_mark
     assert attempt is not None
     original_close = attempt.close
 
-    def fail_close(*, durable: bool = False, _durable: bool | None = None) -> None:
-        del durable, _durable
+    def fail_close(*, durable: bool = False) -> None:
+        del durable
         raise OSError("simulated writer close failure")
 
     monkeypatch.setattr(attempt, "close", fail_close)

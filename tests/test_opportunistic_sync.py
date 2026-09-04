@@ -55,6 +55,7 @@ from omi_collector.capture.application.presence import (
     PresenceScheduler,
     PresenceWake,
 )
+from omi_collector.capture.application.presence_machine import AttemptOutcome
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.application.ring_transport import (
     CandidateUnavailableError,
@@ -1037,7 +1038,7 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
             await release_wake.wait()
             return PresenceWake("advertisement")
 
-        async def attempt_finished(self, _outcome: str) -> None:
+        async def attempt_finished(self, _outcome: AttemptOutcome) -> None:
             return None
 
         async def close(self) -> None:

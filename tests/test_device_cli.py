@@ -600,7 +600,15 @@ def test_sync_uses_injected_presence_scheduler_without_reconstruction(
 
 def test_presence_and_retry_policies_share_one_config_instance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = CollectorConfig(
-        presence=PresenceConfig(fallback_seconds=7.0, drained_fallback_seconds=8.0),
+        presence=PresenceConfig(
+            fallback_seconds=301.0,
+            max_fallback_seconds=301.0,
+            drained_fallback_seconds=901.0,
+            max_drained_fallback_seconds=901.0,
+            scan_cancel_grace_min_seconds=0.02,
+            scan_cancel_grace_max_seconds=0.03,
+            scan_cancel_grace_fraction=0.5,
+        ),
         retry=RetryConfig(rapid_backoff=(0.25, 0.5)),
         transfer=TransferConfig(info_timeout_seconds=3.0, sync_timeout_seconds=4.0),
     )
@@ -626,6 +634,9 @@ def test_presence_and_retry_policies_share_one_config_instance(monkeypatch: pyte
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert presence.policy.rapid_backoff == config.retry.rapid_backoff
     assert presence.policy.fallback_seconds == config.presence.fallback_seconds
+    assert presence.policy.scan_cancel_grace_min_seconds == config.presence.scan_cancel_grace_min_seconds
+    assert presence.policy.scan_cancel_grace_max_seconds == config.presence.scan_cancel_grace_max_seconds
+    assert presence.policy.scan_cancel_grace_fraction == config.presence.scan_cancel_grace_fraction
     assert captured[0].policy.backoff == config.retry.rapid_backoff
     assert captured[0].policy.drain_cooldown_seconds == config.presence.drained_fallback_seconds
     assert captured[0].config is config

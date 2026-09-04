@@ -208,15 +208,15 @@ sufficient.
 
 ## Delivery slices
 
-- [ ] Add the closed state/event/outcome/directive types and pure transition
+- [x] Add the closed state/event/outcome/directive types and pure transition
   function, including the normative transition table as focused tests.
-- [ ] Convert the asynchronous scheduler into a thin interpreter while keeping
+- [x] Convert the asynchronous scheduler into a thin interpreter while keeping
   its bounded scanner lifecycle.
-- [ ] Replace candidate invalidation plus retry with one typed outcome from the
+- [x] Replace candidate invalidation plus retry with one typed outcome from the
   session lifecycle.
-- [ ] Verify the existing Gherkin scenarios and driver effect ordering without
+- [x] Verify the existing Gherkin scenarios and driver effect ordering without
   changing BLE collection behaviour.
-- [ ] Run the full release gates and an independent adversarial review before
+- [x] Run the full release gates and an independent adversarial review before
   merge.
 
 ## Verification

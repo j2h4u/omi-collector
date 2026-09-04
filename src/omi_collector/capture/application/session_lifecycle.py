@@ -15,7 +15,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import KW_ONLY, dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, RetryConfig
 from ..domain.ring_protocol import RECORD_SIZE, STATUS_STORAGE_NOT_READY, RingInfo, RingStatus, encode_stop_command
@@ -27,7 +27,8 @@ from .operational_telemetry import (
     system_host_clock_synchronized,
 )
 from .ports import CaptureRuntimePort
-from .presence import PresenceScheduler, PresenceWake
+from .presence import PresencePolicy, PresenceWake
+from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import QualityMetricsPort, SessionQuality, TransferSessionMetric, utc_timestamp
 from .ring_transport import (
     CandidateUnavailableError,
@@ -53,6 +54,23 @@ type InfoReader = Callable[[RingSession], Awaitable[RingInfo]]
 type ConnectedStep = Callable[
     [RingSession, RingInfo | None, InfoReader, "SessionPhaseState"], Awaitable[tuple[str | None, RingInfo | None]]
 ]
+
+
+class PresenceSchedulerPort(Protocol):
+    """The lifecycle's narrow ownership boundary for one issued permit."""
+
+    @property
+    def policy(self) -> PresencePolicy: ...
+
+    @property
+    def drained_cooldown_remaining_seconds(self) -> float: ...
+
+    async def wait_for_attempt(self) -> PresenceWake: ...
+
+    async def attempt_finished(self, outcome: AttemptOutcome) -> None: ...
+
+    async def close(self) -> None: ...
+
 
 _BLE_ADDRESS = re.compile(r"(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:_-]){5}[0-9a-f]{2}(?![0-9a-f])")
 
@@ -86,7 +104,7 @@ class OpportunisticOptions:
     host_clock_synchronized: Callable[[], bool] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], object] = asyncio.sleep
-    presence: PresenceScheduler | None = None
+    presence: PresenceSchedulerPort | None = None
     quality_metrics: QualityMetricsPort | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
@@ -177,40 +195,32 @@ class SessionLifecycle:
         try:
             while True:
                 wake = await self.run.callbacks.wait_presence_attempt()
-                completed_before = self.run.callbacks.completed_batch_query()
-                context, outcome = await self._open_context(wake.candidate)
-                if context is not None:
-                    outcome = await self.run_session(context, wake.advertisement_rssi_dbm)
-                candidate_failed = outcome == "candidate_unavailable"
-                if outcome == "drained":
-                    await presence.attempt_finished("clean")
-                    await report_activity(self.run.options.activity, "drained")
-                    if self.run.options.policy.stop_after_drained:
-                        return self.run.callbacks.drained_result()
-                    await report_cooldown_started(
-                        self.run.options.activity,
-                        presence.policy.drained_fallback_seconds,
-                        presence.drained_cooldown_remaining_seconds,
-                    )
-                    continue
-                if outcome == "collected":
-                    await presence.attempt_finished("clean")
+                outcome_submitted = False
+                try:
+                    completed_before = self.run.callbacks.completed_batch_query()
+                    context, outcome = await self._open_context(wake.candidate)
+                    if context is not None:
+                        outcome = await self.run_session(context, wake.advertisement_rssi_dbm)
+                    durable_progress = self.run.callbacks.completed_batch_query() > completed_before
+                    attempt_outcome = presence_attempt_outcome(outcome, durable_progress)
+                    await presence.attempt_finished(attempt_outcome)
+                    outcome_submitted = True
+                except BaseException:
+                    if not outcome_submitted:
+                        await presence.close()
+                    raise
+                if isinstance(attempt_outcome, CleanDrain):
+                    if outcome == "drained":
+                        await report_activity(self.run.options.activity, "drained")
+                        if self.run.options.policy.stop_after_drained:
+                            return self.run.callbacks.drained_result()
+                        await report_cooldown_started(
+                            self.run.options.activity,
+                            presence.policy.drained_fallback_seconds,
+                            presence.drained_cooldown_remaining_seconds,
+                        )
+                        continue
                     return self.run.callbacks.drained_result()
-                if outcome == "connected_interrupted":
-                    retry_outcome = (
-                        "connected_interrupted_after_progress"
-                        if self.run.callbacks.completed_batch_query() > completed_before
-                        else "connected_interrupted"
-                    )
-                else:
-                    retry_outcome = (
-                        "retry_after_progress"
-                        if self.run.callbacks.completed_batch_query() > completed_before
-                        else "retry"
-                    )
-                if candidate_failed:
-                    presence.invalidate_candidate()
-                await presence.attempt_finished(retry_outcome)
                 if self.run.callbacks.completed_batch_query() > completed_before:
                     await report_activity(self.run.options.activity, "batch_complete")
                 await report_activity(self.run.options.activity, "away")
@@ -462,6 +472,19 @@ def session_retry_outcome(error: BaseException, connected: bool) -> str | None:
     if isinstance(error, CandidateUnavailableError):
         return "candidate_unavailable"
     return "connected_interrupted" if connected else "retry"
+
+
+def presence_attempt_outcome(outcome: str, durable_progress: bool) -> AttemptOutcome:
+    """Translate completed lifecycle work into the scheduler's closed outcome union."""
+    if outcome in {"drained", "collected"}:
+        return CleanDrain()
+    if outcome == "candidate_unavailable":
+        return CandidateUnavailable()
+    if outcome == "connected_interrupted":
+        return ConnectedInterruption(durable_progress)
+    if outcome == "retry":
+        return NotConnected(durable_progress)
+    raise RuntimeError(f"unknown lifecycle attempt outcome: {outcome}")
 
 
 def retryable(error: BaseException) -> bool:

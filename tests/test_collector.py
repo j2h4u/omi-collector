@@ -9,6 +9,7 @@ from struct import pack
 import pytest
 
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter
+from omi_collector.capture.application import collector as collector_module
 from omi_collector.capture.application.collector import (
     ProgressEvent,
     ProgressMailbox,
@@ -400,6 +401,23 @@ def test_read_leg_done_validates_current_continuation_leg() -> None:
         assert result.progress.eta is None or result.progress.eta >= 0
 
     asyncio.run(scenario())
+
+
+def test_reconnect_progress_rate_excludes_records_from_previous_leg(monkeypatch: pytest.MonkeyPatch) -> None:
+    arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+    arena.begin_leg(10, 1)
+    arena.append(_record(10))
+    arena.begin_leg(11, 1)
+    state = collector_module._IngestState(11, 1, 10.0, ProgressMailbox(), arena.received_records)
+    arena.append(_record(11))
+    monkeypatch.setattr(collector_module.time, "monotonic", lambda: 11.0)
+
+    collector_module._publish_progress(state, arena, terminal=True)
+
+    assert state.latest_progress is not None
+    assert state.latest_progress.records_completed == 2
+    assert state.latest_progress.records_per_second == 1.0
+    assert state.latest_progress.bytes_per_second == RECORD_SIZE
 
 
 def test_read_begin_is_queued_before_any_data_publication() -> None:

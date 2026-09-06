@@ -11,7 +11,12 @@ from pathlib import Path
 from threading import Lock, Thread
 
 from ...config import DEFAULT_CONFIG, QualityMetricsConfig
-from ..application.quality_metrics import QualityMetricsPort, SequenceLossMetric, TransferSessionMetric
+from ..application.quality_metrics import (
+    AdvertisementMetric,
+    QualityMetricsPort,
+    SequenceLossMetric,
+    TransferSessionMetric,
+)
 
 _REVISION = re.compile(r"[0-9a-f]{7,40}")
 
@@ -55,6 +60,9 @@ class JsonlQualityMetrics(QualityMetricsPort):
         return self._path
 
     def record_transfer_session(self, metric: TransferSessionMetric) -> None:
+        self._enqueue(metric.as_dict())
+
+    def record_advertisement(self, metric: AdvertisementMetric) -> None:
         self._enqueue(metric.as_dict())
 
     def record_sequence_loss(self, metric: SequenceLossMetric) -> None:

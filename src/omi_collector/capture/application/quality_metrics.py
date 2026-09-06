@@ -47,6 +47,32 @@ class SessionQuality:
 
 
 @dataclass(frozen=True, slots=True)
+class AdvertisementMetric:
+    """One scanner RSSI sample recorded before its connection attempt."""
+
+    recorded_at: str
+    session_id: str
+    device_slug: str
+    advertisement_rssi_dbm: int
+    release_version: str
+    source_revision: str | None
+    phy_policy: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "event": "advertisement_observation",
+            "recorded_at": self.recorded_at,
+            "session_id": self.session_id,
+            "device_slug": self.device_slug,
+            "advertisement_rssi_dbm": self.advertisement_rssi_dbm,
+            "release_version": self.release_version,
+            "source_revision": self.source_revision,
+            "phy_policy": self.phy_policy,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class TransferSessionMetric:
     """One terminal quality event for a physical session that attempted READ."""
 
@@ -124,6 +150,8 @@ class QualityMetricsPort(Protocol):
 
     release_version: str
     source_revision: str | None
+
+    def record_advertisement(self, metric: AdvertisementMetric) -> None: ...
 
     def record_transfer_session(self, metric: TransferSessionMetric) -> None: ...
 

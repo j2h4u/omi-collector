@@ -1036,7 +1036,7 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
         async def wait_for_attempt(self) -> PresenceWake:
             scan_started.set()
             await release_wake.wait()
-            return PresenceWake("advertisement")
+            return PresenceWake("advertisement", advertisement_rssi_dbm=-72)
 
         async def attempt_finished(self, _outcome: AttemptOutcome) -> None:
             return None
@@ -1064,12 +1064,18 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
 
     monkeypatch.setattr(QuarantineMaintenance, "run_once", slow_maintenance)
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
+    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="abcdef1")
     task = asyncio.create_task(
         run_opportunistic_collector(
             OrderedProvider([session]),
             store,
             "omi",
-            replace(_options(), presence=cast(PresenceScheduler, presence)),
+            replace(
+                _options(),
+                presence=cast(PresenceScheduler, presence),
+                quality_metrics=journal,
+                host_time=lambda: 1000.0,
+            ),
         )
     )
     await maintenance_started.wait()
@@ -1078,6 +1084,12 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
     assert isinstance(await task, NoDataResult)
     assert maintenance_stopped.is_set()
     assert presence.closed
+    [advertisement] = [
+        cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert advertisement["event"] == "advertisement_observation"
+    assert advertisement["recorded_at"] == "1970-01-01T00:16:40.000+00:00"
+    assert advertisement["advertisement_rssi_dbm"] == -72
 
 
 @_async_test
@@ -1377,6 +1389,9 @@ async def test_quality_metrics_failure_does_not_change_completed_audio_collectio
     class FailingMetrics:
         release_version = "test-version"
         source_revision = None
+
+        def record_advertisement(self, _metric: object) -> None:
+            raise OSError("quality filesystem unavailable")
 
         def record_transfer_session(self, _metric: object) -> None:
             raise OSError("quality filesystem unavailable")

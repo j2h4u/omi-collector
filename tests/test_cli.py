@@ -474,8 +474,10 @@ def test_sync_reporter_info_emits_clean_drain_cooldown_event() -> None:
         "records_completed": 0,
         "records_per_second": 0,
         "records_total": 0,
+        "remaining_bytes": 0,
         "remaining_packets": 0,
         "status": "cooldown_started",
+        "total_bytes": 0,
     }
 
 

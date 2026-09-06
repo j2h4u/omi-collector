@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/j2h4u/omi-collector/compare/v0.3.1...v0.3.2) (2026-09-06)
+
+
+### Fixes
+
+* avoid readonly deploy variable collision ([#43](https://github.com/j2h4u/omi-collector/issues/43)) ([fbcdc48](https://github.com/j2h4u/omi-collector/commit/fbcdc48c691dbbd3560c5181cdee0129d6ae7e64))
+
 ## [0.3.1](https://github.com/j2h4u/omi-collector/compare/v0.3.0...v0.3.1) (2026-09-06)
 
 

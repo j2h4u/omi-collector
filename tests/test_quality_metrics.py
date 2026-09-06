@@ -17,7 +17,11 @@ from omi_collector.capture.adapters.quality_metrics import (
     normalize_source_revision,
     source_revision_from_environment,
 )
-from omi_collector.capture.application.quality_metrics import SequenceLossMetric, TransferSessionMetric
+from omi_collector.capture.application.quality_metrics import (
+    AdvertisementMetric,
+    SequenceLossMetric,
+    TransferSessionMetric,
+)
 from omi_collector.config import QualityMetricsConfig
 
 
@@ -27,6 +31,17 @@ def _journal(tmp_path: Path) -> JsonlQualityMetrics:
 
 def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Path) -> None:
     journal = _journal(tmp_path)
+    journal.record_advertisement(
+        AdvertisementMetric(
+            "2026-09-02T01:02:02.456+00:00",
+            "session-1",
+            "omi",
+            -73,
+            journal.release_version,
+            journal.source_revision,
+            "force_1m",
+        )
+    )
     journal.record_transfer_session(
         TransferSessionMetric(
             "2026-09-02T01:02:03.456+00:00",
@@ -62,7 +77,18 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
     assert journal.close()
 
     lines = journal.path.read_text(encoding="utf-8").splitlines()
-    transfer, loss = (cast(dict[str, object], json.loads(line)) for line in lines)
+    advertisement, transfer, loss = (cast(dict[str, object], json.loads(line)) for line in lines)
+    assert advertisement == {
+        "schema_version": 1,
+        "event": "advertisement_observation",
+        "recorded_at": "2026-09-02T01:02:02.456+00:00",
+        "session_id": "session-1",
+        "device_slug": "omi",
+        "advertisement_rssi_dbm": -73,
+        "release_version": "1.2.3",
+        "source_revision": "abcdef123456",
+        "phy_policy": "force_1m",
+    }
     assert transfer == {
         "schema_version": 1,
         "event": "transfer_session",

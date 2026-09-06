@@ -29,7 +29,13 @@ from .operational_telemetry import (
 from .ports import CaptureRuntimePort
 from .presence import PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
-from .quality_metrics import QualityMetricsPort, SessionQuality, TransferSessionMetric, utc_timestamp
+from .quality_metrics import (
+    AdvertisementMetric,
+    QualityMetricsPort,
+    SessionQuality,
+    TransferSessionMetric,
+    utc_timestamp,
+)
 from .ring_transport import (
     CandidateUnavailableError,
     NotificationOverflowError,
@@ -254,6 +260,7 @@ class SessionLifecycle:
         quality = SessionQuality(self.run.device_slug, advertisement_rssi_dbm, self.run.options.phy_policy)
         phase = SessionPhaseState("connect", quality)
         self._storage_not_ready_responses = 0
+        self._record_advertisement_quality(quality)
         try:
             try:
                 session = await bounded(context.__aenter__(), self.run.options.timeouts.info)
@@ -289,6 +296,28 @@ class SessionLifecycle:
             raise
         finally:
             await self._record_session_quality(quality, outcome, teardown_error, terminal_error)
+
+    def _record_advertisement_quality(self, quality: SessionQuality) -> None:
+        """Persist scanner evidence immediately without delaying connection setup."""
+        metrics = self.run.options.quality_metrics
+        if metrics is None or quality.advertisement_rssi_dbm is None:
+            return
+        try:
+            metrics.record_advertisement(
+                AdvertisementMetric(
+                    utc_timestamp(self.run.options.host_time()),
+                    quality.session_id,
+                    quality.device_slug,
+                    quality.advertisement_rssi_dbm,
+                    metrics.release_version,
+                    metrics.source_revision,
+                    quality.phy_policy,
+                )
+            )
+        except Exception as metrics_error:  # noqa: BLE001 - metrics cannot stop audio capture
+            self.run.runtime.debug_exception(
+                "quality_metrics_write_error", metrics_error, event_type="advertisement_observation"
+            )
 
     async def _record_session_quality(
         self,

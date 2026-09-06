@@ -250,6 +250,7 @@ class _IngestState:
     count: int
     began_at: float
     progress_mailbox: ProgressMailbox
+    initial_received_records: int
     read_begin_future: asyncio.Future[object] | None = None
     started: bool = False
     latest_progress: ProgressEvent | None = None
@@ -307,7 +308,13 @@ async def read_leg(
     await writer.start()
     await writer.prepare_leg(start, count)
     stream = session.notifications()
-    state = _IngestState(start, count, time.monotonic(), options.progress_mailbox or ProgressMailbox())
+    state = _IngestState(
+        start,
+        count,
+        time.monotonic(),
+        options.progress_mailbox or ProgressMailbox(),
+        arena.received_records,
+    )
     terminal = False
     try:
         await _await_with_timeout(session.write_control(encode_read_command(start, count)), options.timeout)
@@ -551,7 +558,8 @@ def _publish_progress(state: _IngestState, arena: TransferArena, *, terminal: bo
     records = arena.received_records
     total = arena.total_records
     elapsed = max(0.0, now - state.began_at)
-    rate = records / elapsed if elapsed else 0.0
+    leg_records = max(0, records - state.initial_received_records)
+    rate = leg_records / elapsed if elapsed else 0.0
     event = ProgressEvent(
         records,
         total,

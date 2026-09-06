@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.12](https://github.com/j2h4u/omi-collector/compare/v0.2.11...v0.2.12) (2026-09-06)
+
+
+### Fixes
+
+* defer maintenance while device lock is busy ([#37](https://github.com/j2h4u/omi-collector/issues/37)) ([a8bc6bf](https://github.com/j2h4u/omi-collector/commit/a8bc6bf0d3167d531d3bc1def0fee27de1ef23e0))
+
 ## [0.2.11](https://github.com/j2h4u/omi-collector/compare/v0.2.10...v0.2.11) (2026-09-04)
 
 

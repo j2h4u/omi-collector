@@ -18,11 +18,11 @@ function usage {
 
 function is_expected_origin {
     # args
-    local -r origin_url="$1"
+    local -r candidate_origin="$1"
 
     # result: true for either canonical GitHub transport
-    [[ "$origin_url" == 'git@github.com:j2h4u/omi-collector.git' \
-        || "$origin_url" == 'https://github.com/j2h4u/omi-collector.git' ]]
+    [[ "$candidate_origin" == 'git@github.com:j2h4u/omi-collector.git' \
+        || "$candidate_origin" == 'https://github.com/j2h4u/omi-collector.git' ]]
 }
 
 declare -r PROJECT_DIR='/opt/omi-collector'

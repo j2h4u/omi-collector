@@ -115,7 +115,8 @@ systemctl status omi-collector.service
 journalctl -u omi-collector.service -f
 ```
 
-For subsequent updates, pull a reviewed revision and run:
+For subsequent updates, select the reviewed revision in the production
+checkout and run:
 
 ```bash
 sudo scripts/deploy-systemd-service.sh
@@ -130,6 +131,26 @@ obsolete release directories are pruned only after a successful deployment.
 During deployment, the exact canonical schema-1 `device.json` format from
 older releases is treated as disposable and removed. Malformed, unknown,
 symlinked, or non-regular device state stops deployment without deletion.
+
+### Maintainer Dev Script
+
+`scripts/dev-deploy-release.sh` is a host-specific convenience tool for the
+project maintainer. It is intended only for deployments whose live checkout is
+fixed under an operator-owned `/opt` tree, following the same convention as
+Docker services under `/opt/docker/<service>`. This systemd deployment uses
+`/opt/omi-collector` instead. The script fetches and validates a published
+release tag in that exact checkout, refuses local changes or an unexpected
+origin, and then invokes the transactional deployer above.
+
+It is not part of the portable installation contract. Other operators should
+select their own reviewed revision in the checkout configured by
+`OMI_COLLECTOR_PROJECT_DIR` and run `deploy-systemd-service.sh` directly.
+
+On the maintainer host, run it from the source checkout with an explicit tag:
+
+```bash
+sudo scripts/dev-deploy-release.sh v0.3.0
+```
 
 ## Storage
 

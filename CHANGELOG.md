@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/j2h4u/omi-collector/compare/v0.3.0...v0.3.1) (2026-09-06)
+
+
+### Maintenance
+
+* add maintainer release deployer ([#41](https://github.com/j2h4u/omi-collector/issues/41)) ([fb898b6](https://github.com/j2h4u/omi-collector/commit/fb898b6a1d2304e08ed11964305b7369dd2835bd))
+
 ## [0.3.0](https://github.com/j2h4u/omi-collector/compare/v0.2.12...v0.3.0) (2026-09-06)
 
 

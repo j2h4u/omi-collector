@@ -135,6 +135,8 @@ class QuarantineMaintenance:
                 should_defer=should_defer,
             )
         except Exception as error:  # noqa: BLE001 - expiry failures preserve evidence
+            if self._runtime.is_device_busy_error(error):
+                return
             self._runtime.debug_exception("terminal_quarantine_sweep_failed", error, device_slug=self._device_slug)
         else:
             for path in removed:
@@ -249,6 +251,8 @@ class QuarantineMaintenance:
                 should_defer=should_defer,
             )
         except Exception as error:  # noqa: BLE001 - sweep failure preserves collection and evidence
+            if self._runtime.is_device_busy_error(error):
+                return
             self._runtime.debug_exception("terminal_retired_sweep_failed", error, device_slug=self._device_slug)
             return
         for path in removed:

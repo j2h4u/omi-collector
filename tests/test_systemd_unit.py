@@ -19,6 +19,7 @@ _UNIT = _ROOT / "systemd" / "omi-collector.service"
 _EXEC = _ROOT / "systemd" / "omi-collector-exec"
 _INSTALLER = _ROOT / "scripts" / "install-systemd-unit.sh"
 _DEPLOYER = _ROOT / "scripts" / "deploy-systemd-service.sh"
+_DEV_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
 _LEGACY_INSPECTOR = _ROOT / "scripts" / "inspect-legacy-device-state.py"
 _FEATURE = _ROOT / "features" / "opportunistic_collection.feature"
 _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
@@ -44,6 +45,19 @@ class _DeploymentScenario:
 
 
 _DEFAULT_DEPLOYMENT_SCENARIO = _DeploymentScenario()
+
+
+def test_dev_release_deployer_accepts_https_with_readonly_caller_variable() -> None:
+    function_prelude = _DEV_DEPLOYER.read_text(encoding="utf-8").split("declare -r PROJECT_DIR", maxsplit=1)[0]
+    command = "\n".join(
+        (
+            function_prelude,
+            "declare -r origin_url='https://github.com/j2h4u/omi-collector.git'",
+            'is_expected_origin "$origin_url"',
+        )
+    )
+
+    subprocess.run(("bash", "-c", command), check=True)
 
 
 def _unit_sections() -> dict[str, dict[str, str]]:

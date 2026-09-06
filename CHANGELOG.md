@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/j2h4u/omi-collector/compare/v0.2.12...v0.3.0) (2026-09-06)
+
+
+### Features
+
+* expose total and remaining transfer bytes ([ccaa994](https://github.com/j2h4u/omi-collector/commit/ccaa994063c321ddf0284bdd996632ef4a09dc88))
+
+
+### Fixes
+
+* record RSSI before BLE sessions finish ([ccaa994](https://github.com/j2h4u/omi-collector/commit/ccaa994063c321ddf0284bdd996632ef4a09dc88))
+
 ## [0.2.12](https://github.com/j2h4u/omi-collector/compare/v0.2.11...v0.2.12) (2026-09-06)
 
 

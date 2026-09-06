@@ -27,7 +27,7 @@ from .quarantine_publish import (
     QuarantineSalvageDeferredError,
     publish_quarantined_prefix,
 )
-from .staging_contract import AttemptDescriptor, DurablePrefix, StagingError
+from .staging_contract import AttemptDescriptor, DeviceAlreadyRunningError, DurablePrefix, StagingError
 from .staging_store import StagingStore
 from .staging_writer import StagingWriter
 
@@ -201,6 +201,9 @@ class OpportunisticRuntime(CaptureRuntimePort):
 
     def is_staging_error(self, error: BaseException) -> bool:
         return isinstance(error, StagingError)
+
+    def is_device_busy_error(self, error: BaseException) -> bool:
+        return isinstance(error, DeviceAlreadyRunningError)
 
     def debug_event(self, event: str, **fields: object) -> None:
         cast(Callable[..., None], debug_event)(event, **fields)

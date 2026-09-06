@@ -108,6 +108,21 @@ def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: P
     assert calls == 1
 
 
+def test_writer_lock_defers_terminal_sweeps_without_reporting_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    runtime = OpportunisticRuntime()
+    failures: list[str] = []
+    monkeypatch.setattr(runtime, "debug_exception", lambda event, _error, **_fields: failures.append(event))
+    maintenance = QuarantineMaintenance(store, "omi", None, runtime)
+
+    with store.device_lock("omi"):
+        _run(maintenance.run_once(lambda: False))
+
+    assert failures == []
+
+
 def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = _store(tmp_path)

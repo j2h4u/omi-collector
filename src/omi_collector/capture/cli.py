@@ -59,13 +59,16 @@ class DownloadMetrics:
 
     def as_dict(self) -> dict[str, object]:
         """Return stable JSON field names, including finite zero values."""
+        remaining_bytes = self.remaining_packets * collector.RECORD_SIZE
         return {
             "bytes_per_second": round(self.bytes_per_second, 2),
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "eta_seconds": round(self.eta_seconds, 2) if self.eta_seconds is not None else None,
             "payload_bytes": self.payload_bytes,
             "records_per_second": round(self.records_per_second, 2),
+            "remaining_bytes": remaining_bytes,
             "remaining_packets": self.remaining_packets,
+            "total_bytes": self.payload_bytes + remaining_bytes,
         }
 
 
@@ -93,6 +96,7 @@ class DownloadProgress:
 
     def as_dict(self) -> dict[str, object]:
         """Return progress fields suitable for one JSON line on stderr."""
+        total_bytes = self.records_total * collector.RECORD_SIZE
         result: dict[str, object] = {
             "bytes_per_second": round(self.bytes_per_second, 2),
             "elapsed_seconds": round(self.elapsed_seconds, 2),
@@ -101,8 +105,10 @@ class DownloadProgress:
             "records_completed": self.records_completed,
             "records_per_second": round(self.records_per_second, 2),
             "records_total": self.records_total,
+            "remaining_bytes": max(0, total_bytes - self.payload_bytes),
             "remaining_packets": self.remaining_packets,
             "status": self.state,
+            "total_bytes": total_bytes,
         }
         if self.retry_seconds is not None:
             result["retry_seconds"] = round(self.retry_seconds, 2)

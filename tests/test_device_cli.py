@@ -761,7 +761,9 @@ def test_download_metrics_are_finite_for_no_data_and_zero_duration() -> None:
         "eta_seconds": 0.0,
         "payload_bytes": 0,
         "records_per_second": 0.0,
+        "remaining_bytes": 0,
         "remaining_packets": 0,
+        "total_bytes": 0,
     }
 
 
@@ -775,7 +777,9 @@ def test_download_metric_serialization_rounds_float_fields_only() -> None:
         "eta_seconds": 0.13,
         "payload_bytes": 444,
         "records_per_second": 7.89,
+        "remaining_bytes": 888,
         "remaining_packets": 2,
+        "total_bytes": 1332,
     }
     assert progress.as_dict() == {
         "bytes_per_second": 98.77,
@@ -785,8 +789,10 @@ def test_download_metric_serialization_rounds_float_fields_only() -> None:
         "records_completed": 1,
         "records_per_second": 4.32,
         "records_total": 4,
+        "remaining_bytes": 1554,
         "remaining_packets": 3,
         "status": "progress",
+        "total_bytes": 1776,
     }
 
 
@@ -845,8 +851,10 @@ def test_collect_no_data_result_is_safe_json(monkeypatch: pytest.MonkeyPatch, tm
         "payload_bytes": 0,
         "read_sequence": 10,
         "records_per_second": 0.0,
+        "remaining_bytes": 0,
         "remaining_packets": 0,
         "status": "no_data",
+        "total_bytes": 0,
         "unread_packets": 0,
         "write_sequence": 10,
     }

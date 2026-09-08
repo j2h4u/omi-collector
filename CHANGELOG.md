@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/j2h4u/omi-collector/compare/v0.3.2...v0.4.0) (2026-09-08)
+
+
+### Features
+
+* add operator status summary ([#47](https://github.com/j2h4u/omi-collector/issues/47)) ([9780fe5](https://github.com/j2h4u/omi-collector/commit/9780fe58acf25f17f6b69a1c648d7baf203bbe3d))
+
 ## [0.3.2](https://github.com/j2h4u/omi-collector/compare/v0.3.1...v0.3.2) (2026-09-06)
 
 

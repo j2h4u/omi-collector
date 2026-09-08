@@ -90,7 +90,36 @@ Readiness or stability failure restores the previous verified environment.
 Docker is for packaging and runtime QA only; it is not a production Bluetooth
 supervisor. Keep production state and publication roots configured explicitly,
 and restrict their permissions. Do not put raw audio, credentials, BLE
-addresses, or detailed live device observations in documentation or logs.
+addresses, or detailed live device observations in documentation or public
+logs. Keep the private diagnostic ring access-restricted.
+
+## Observability
+
+Use the system journal for the small operational stream. The default `INFO`
+level shows readiness, transfer outcomes, failures, and recovery; it suppresses
+repeated `storage_wait` polling and detailed `ble_link_session` records. Use
+`--log-level DEBUG` for a diagnostic foreground sync when link negotiation or
+polling detail is required. The bounded `debug.jsonl` ring receives sync
+callbacks and link diagnostics separately from the journal; keep its private
+permissions and inspect it only for an active investigation.
+
+The read-only `device status` command joins the latest firmware observation,
+published-bundle metrics, and the selected recent window from `quality.jsonl`:
+
+```bash
+uv run omi-collector device status \
+  --layout /var/lib/omi-collector/collector.toml \
+  --device-slug omi-cv1 --hours 24
+```
+
+Interpret `ok` as a completed transfer with no confirmed loss or terminal
+failure in the window. `attention` is the degraded state for confirmed loss or
+a latest fatal, cancelled, or teardown-interrupted transfer; `unknown` means no
+completed transfer in the window. The quality window includes both outcome and
+termination-class counts. A missing `device` object means no firmware
+observation has been recorded yet. Treat the status as an operational summary:
+inspect the journal, debug ring, and sealed bundles before diagnosing a
+specific transfer.
 
 ## Documentation hygiene
 

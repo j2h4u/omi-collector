@@ -64,6 +64,7 @@ app.add_typer(device, name="device")
 # Test seams remain unloaded until their command is selected.  A production
 # import of this module therefore does not pull in Bluetooth code.
 collect_spool_metrics: object | None = None
+collect_operator_status: object | None = None
 
 
 def _capture_cli() -> _CaptureCli:
@@ -117,7 +118,7 @@ class SyncProgressReporter:
     only the first such callback; DEBUG can still inspect later legs.
     """
 
-    _DEBUG_STATES: ClassVar[frozenset[str]] = frozenset({"away", "connecting", "drained"})
+    _DEBUG_STATES: ClassVar[frozenset[str]] = frozenset({"away", "connecting", "drained", "storage_wait"})
     _HEALTHY_CLOCK_OUTCOMES: ClassVar[frozenset[str]] = frozenset({"within_threshold", "verified"})
     _OBSERVATION_SIGNATURE_FIELDS: ClassVar[tuple[str, ...]] = (
         "battery_percent",
@@ -168,9 +169,14 @@ class SyncProgressReporter:
         self._emit_json(progress.as_dict())
 
     def report_ble_link(self, record: dict[str, object]) -> None:
-        """Emit the observer's single terminal record at the selected sink."""
+        """Persist a private terminal link record and emit it only at DEBUG."""
+        from omi_collector.capture.adapters.debug_logging import debug_event
+
         public_record = dict(record)
         public_record.pop("address", None)
+        debug_event("ble_link_session", logger=self._debug_logger, record=public_record)
+        if self.level is not SyncLogLevel.DEBUG:
+            return
         self._emit_json(public_record)
 
     def _report_session_error(self, progress: DownloadProgress) -> None:
@@ -476,6 +482,30 @@ def device_metrics(
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(json.dumps(cast(_JsonResult, result).as_dict(), sort_keys=True, separators=(",", ":")))
+
+
+@device.command("status")
+def device_status(
+    *,
+    layout_path: Annotated[Path, typer.Option("--layout", help="Storage-layout TOML authority.")],
+    device_slug: Annotated[
+        str, typer.Option("--device-slug", help="Stable local directory component for this pendant.")
+    ],
+    hours: Annotated[int, typer.Option("--hours", min=1, max=8760, help="Recent quality window in hours.")] = 24,
+) -> None:
+    """Summarize current backlog, publication, transfers, and confirmed loss."""
+    from omi_collector.operator_status import OperatorStatusError
+
+    try:
+        layout = _load_layout(layout_path)
+        status = collect_operator_status
+        if status is None:
+            from omi_collector.operator_status import collect_operator_status as status
+        result = cast(Callable[..., dict[str, object]], status)(layout, device_slug, hours=hours)
+    except OperatorStatusError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
 def _require_confirmation(confirmed: bool, flag: str) -> None:

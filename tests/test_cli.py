@@ -22,13 +22,14 @@ from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
 from omi_collector.config import DebugLogConfig
 from omi_collector.core import package_version
+from omi_collector.operator_status import OperatorStatusError
 from omi_collector.spool_metrics import (
     FirmwareLifetimeMetrics,
     SpoolMetrics,
     SpoolMetricsError,
     SpoolWindowMetrics,
 )
-from omi_collector.storage_layout import load_storage_layout
+from omi_collector.storage_layout import StorageLayout, load_storage_layout
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -208,13 +209,27 @@ def test_device_metrics_reports_one_stable_json_object(monkeypatch: pytest.Monke
     assert captured == [(tmp_path / "source", "omi", tmp_path / "collector" / "device.json")]
 
 
-def test_ble_link_journal_record_omits_device_address() -> None:
-    lines: list[str] = []
-    reporter = cli.SyncProgressReporter(emit=lines.append)
+def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(tmp_path: Path) -> None:
+    info_lines: list[str] = []
+    debug_lines: list[str] = []
+    debug_reporter = cli.SyncProgressReporter(cli.SyncLogLevel.DEBUG, emit=debug_lines.append)
 
-    reporter.report_ble_link({"event": "ble_link_session", "address": "AA:BB", "handle": 7})
+    record = {"event": "ble_link_session", "address": "AA:BB", "handle": 7}
+    logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.debug.ble_link_report"))
+    try:
+        info_reporter = cli.SyncProgressReporter(emit=info_lines.append, debug_logger=logger)
+        info_reporter.report_ble_link(record)
+    finally:
+        close_debug_logging(logger)
 
-    assert json.loads(lines[0]) == {"event": "ble_link_session", "handle": 7}
+    assert info_lines == []
+    debug_entry = cast(dict[str, object], json.loads((tmp_path / "debug.jsonl").read_text(encoding="utf-8")))
+    debug_fields = cast(dict[str, object], debug_entry["fields"])
+    assert debug_entry["event"] == "ble_link_session"
+    assert debug_fields["record"] == {"event": "ble_link_session", "handle": 7}
+
+    debug_reporter.report_ble_link(record)
+    assert [json.loads(line) for line in debug_lines] == [{"event": "ble_link_session", "handle": 7}]
 
 
 def test_device_metrics_reports_malformed_authority_as_nonzero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -237,6 +252,40 @@ def test_device_metrics_reports_malformed_authority_as_nonzero(monkeypatch: pyte
 
     assert result.exit_code == 1
     assert result.output.strip() == "bad artifact"
+
+
+def test_device_status_reports_one_stable_json_object(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    expected = {"schema_version": 1, "status": "ok"}
+    captured: list[tuple[Path, str, int]] = []
+
+    def fake_status(layout: StorageLayout, device_slug: str, *, hours: int) -> dict[str, object]:
+        captured.append((layout.path, device_slug, hours))
+        return expected
+
+    monkeypatch.setattr(cli, "collect_operator_status", fake_status)
+    layout_path = _layout(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        ["device", "status", "--layout", str(layout_path), "--device-slug", "omi", "--hours", "12"],
+    )
+
+    assert result.exit_code == 0
+    assert result.output == '{"schema_version":1,"status":"ok"}\n'
+    assert captured == [(layout_path, "omi", 12)]
+
+
+def test_device_status_reports_malformed_evidence_as_nonzero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fail_status(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise OperatorStatusError("quality journal contains malformed JSON")
+
+    monkeypatch.setattr(cli, "collect_operator_status", fail_status)
+    result = CliRunner().invoke(
+        app,
+        ["device", "status", "--layout", str(_layout(tmp_path)), "--device-slug", "omi"],
+    )
+
+    assert result.exit_code == 1
+    assert result.output.strip() == "quality journal contains malformed JSON"
 
 
 def test_serve_passes_interval_to_sleep_until_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -405,6 +454,7 @@ def test_sync_reporter_info_suppresses_routine_polling() -> None:
     reporter(_sync_progress(state="away"))
     reporter(_sync_progress(state="drained"))
     reporter(_sync_progress(state="connecting"))
+    reporter(_sync_progress(state="storage_wait"))
     reporter(
         _sync_progress(
             state="operational",
@@ -486,6 +536,7 @@ def test_sync_reporter_debug_exposes_routine_polling() -> None:
     reporter = cli.SyncProgressReporter(cli.SyncLogLevel.DEBUG, emit=lines.append)
 
     reporter(_sync_progress(state="away"))
+    reporter(_sync_progress(state="storage_wait"))
     reporter(
         _sync_progress(
             state="operational",
@@ -493,7 +544,11 @@ def test_sync_reporter_debug_exposes_routine_polling() -> None:
         )
     )
 
-    assert [cast(dict[str, object], json.loads(line))["status"] for line in lines] == ["away", "operational"]
+    assert [cast(dict[str, object], json.loads(line))["status"] for line in lines] == [
+        "away",
+        "storage_wait",
+        "operational",
+    ]
 
 
 def test_sync_reporter_debug_keeps_repeated_session_errors() -> None:

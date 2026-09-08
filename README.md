@@ -115,6 +115,36 @@ systemctl status omi-collector.service
 journalctl -u omi-collector.service -f
 ```
 
+### Observability
+
+The service uses `INFO` journal output for durable operator signals: readiness,
+transfer progress and completion, failures, and recovery. Routine
+`storage_wait` polling and detailed `ble_link_session` records stay out of the
+INFO journal. A diagnostic sync can use `--log-level DEBUG` when those records
+are needed. Every sync callback and BLE link session is also retained in the
+bounded `debug.jsonl` ring under the collector root, so protect that state as
+you would the rest of the private collector data.
+
+For a read-only summary of the current device and recent transfer evidence,
+run:
+
+```bash
+uv run omi-collector device status \
+  --layout /var/lib/omi-collector/collector.toml \
+  --device-slug omi-cv1 --hours 24
+```
+
+Interpret `status=ok` as at least one completed transfer in the window with no
+confirmed loss or terminal failure. `status=attention` is the degraded state:
+confirmed loss or a latest fatal, cancelled, or teardown-interrupted transfer
+was recorded;
+`status=unknown` means the window has no completed transfer to assess. The
+`publication` object describes currently visible bundles, while
+`quality_window` contains bounded advertisements, transfer throughput,
+outcome and termination-class breakdowns, and loss totals. Use `device metrics`
+for the publication inventory alone and `journalctl -u omi-collector.service`
+or `debug.jsonl` when the summary needs more context.
+
 For subsequent updates, select the reviewed revision in the production
 checkout and run:
 

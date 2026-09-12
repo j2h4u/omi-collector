@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/j2h4u/omi-collector/compare/v0.4.1...v0.5.0) (2026-09-12)
+
+
+### Features
+
+* unify production status reporting ([#53](https://github.com/j2h4u/omi-collector/issues/53)) ([9e3e12a](https://github.com/j2h4u/omi-collector/commit/9e3e12a738a7613f4e510e672a9ddef72da6f520))
+
 ## [0.4.1](https://github.com/j2h4u/omi-collector/compare/v0.4.0...v0.4.1) (2026-09-12)
 
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/j2h4u/omi-collector/compare/v0.4.0...v0.4.1) (2026-09-12)
+
+
+### Maintenance
+
+* pin local Python version ([#50](https://github.com/j2h4u/omi-collector/issues/50)) ([48f1f00](https://github.com/j2h4u/omi-collector/commit/48f1f00cf2205f06f77bb34e5c6d093022284921))
+
 ## [0.4.0](https://github.com/j2h4u/omi-collector/compare/v0.3.2...v0.4.0) (2026-09-08)
 
 

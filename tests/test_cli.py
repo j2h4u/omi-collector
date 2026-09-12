@@ -255,7 +255,8 @@ def test_device_metrics_reports_malformed_authority_as_nonzero(monkeypatch: pyte
 
 
 def test_device_status_reports_one_stable_json_object(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    expected = {"schema_version": 1, "status": "ok"}
+    expected = {"schema_version": 2, "status": "ok"}
+    service = {"active_state": "active", "available": True}
     captured: list[tuple[Path, str, int]] = []
 
     def fake_status(layout: StorageLayout, device_slug: str, *, hours: int) -> dict[str, object]:
@@ -263,6 +264,7 @@ def test_device_status_reports_one_stable_json_object(monkeypatch: pytest.Monkey
         return expected
 
     monkeypatch.setattr(cli, "collect_operator_status", fake_status)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: service)
     layout_path = _layout(tmp_path)
     result = CliRunner().invoke(
         app,
@@ -270,7 +272,9 @@ def test_device_status_reports_one_stable_json_object(monkeypatch: pytest.Monkey
     )
 
     assert result.exit_code == 0
-    assert result.output == '{"schema_version":1,"status":"ok"}\n'
+    assert result.output == (
+        '{"schema_version":2,"service":{"active_state":"active","available":true},"status":"ok"}\n'
+    )
     assert captured == [(layout_path, "omi", 12)]
 
 
@@ -286,6 +290,55 @@ def test_device_status_reports_malformed_evidence_as_nonzero(monkeypatch: pytest
 
     assert result.exit_code == 1
     assert result.output.strip() == "quality journal contains malformed JSON"
+
+
+def test_systemd_service_status_reports_supervisor_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = """ActiveState=active
+SubState=running
+MainPID=42
+NRestarts=0
+ExecMainStatus=0
+ActiveEnterTimestamp=Sat 2026-09-12 10:00:00 +05"""
+    completed = cli.subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    assert cli._systemd_service_status() == {
+        "active_enter_timestamp": "Sat 2026-09-12 10:00:00 +05",
+        "active_state": "active",
+        "available": True,
+        "exec_main_status": 0,
+        "main_pid": 42,
+        "restart_count": 0,
+        "sub_state": "running",
+        "unit": "omi-collector.service",
+    }
+
+
+def test_systemd_service_status_reports_command_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    completed = cli.subprocess.CompletedProcess([], 1, stdout="", stderr="unit unavailable\n")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    assert cli._systemd_service_status() == {
+        "available": False,
+        "error": "unit unavailable",
+        "unit": "omi-collector.service",
+    }
+
+
+@pytest.mark.parametrize("error", [OSError(), cli.subprocess.TimeoutExpired(["systemctl"], 3)])
+def test_systemd_service_status_reports_execution_failure(
+    monkeypatch: pytest.MonkeyPatch, error: OSError | cli.subprocess.TimeoutExpired
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(cli.subprocess, "run", fail)
+
+    assert cli._systemd_service_status() == {
+        "available": False,
+        "error": type(error).__name__,
+        "unit": "omi-collector.service",
+    }
 
 
 def test_serve_passes_interval_to_sleep_until_stopped(monkeypatch: pytest.MonkeyPatch) -> None:

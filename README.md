@@ -92,7 +92,7 @@ UV_BIN=$(command -v uv)
 [[ "$UV_BIN" == /usr/local/bin/uv ]] || \
   sudo install -o root -g root -m 0755 "$UV_BIN" /usr/local/bin/uv
 sudo install -d -o root -g root -m 0755 /etc/omi-collector /var/lib/omi-collector
-sudo install -o root -g root -m 0640 config/layout.toml /var/lib/omi-collector/collector.toml
+sudo install -o root -g root -m 0644 config/layout.toml /var/lib/omi-collector/collector.toml
 sudo install -o root -g root -m 0600 config/omi-collector.env.example /etc/omi-collector/omi-collector.env
 sudoedit /etc/omi-collector/omi-collector.env
 sudo scripts/install-systemd-unit.sh
@@ -125,7 +125,9 @@ are needed. Every sync callback and BLE link session is also retained in the
 bounded `debug.jsonl` ring under the collector root, so protect that state as
 you would the rest of the private collector data.
 
-For a read-only summary of the current device and recent transfer evidence,
+For one machine-readable operational snapshot of systemd health, current
+transfer progress, last observed battery and firmware, device backlog,
+publication, and recent transfer/loss evidence,
 run:
 
 ```bash

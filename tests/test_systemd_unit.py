@@ -114,7 +114,7 @@ def test_installer_and_deployer_keep_production_targets_non_overridable() -> Non
     assert 'install -d -o "$account_user" -g "$account_group" -m 0750' in installer
     assert "validate_layout_file" in installer
     assert 'chown root:"$account_group" -- "$layout_file"' in installer
-    assert 'chmod 0640 -- "$layout_file"' in installer
+    assert 'chmod 0644 -- "$layout_file"' in installer
     assert 'stage_file "$source_exec" "$exec_target" 0755' in installer
     assert 'stage_file "$source_unit" "$unit_target" 0644' in installer
     assert "validate_staged_pair" in installer

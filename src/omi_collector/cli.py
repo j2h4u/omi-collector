@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from enum import StrEnum
@@ -65,6 +66,40 @@ app.add_typer(device, name="device")
 # import of this module therefore does not pull in Bluetooth code.
 collect_spool_metrics: object | None = None
 collect_operator_status: object | None = None
+
+
+def _systemd_service_status(unit: str = "omi-collector.service") -> dict[str, object]:
+    """Read the local supervisor state without requiring journal access."""
+    command = [
+        "systemctl",
+        "show",
+        unit,
+        "--property=ActiveState,SubState,MainPID,NRestarts,ExecMainStatus,ActiveEnterTimestamp",
+    ]
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"available": False, "error": type(error).__name__, "unit": unit}
+    if completed.returncode != 0:
+        return {"available": False, "error": completed.stderr.strip() or "systemctl failed", "unit": unit}
+    values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+    return {
+        "active_enter_timestamp": values.get("ActiveEnterTimestamp") or None,
+        "active_state": values.get("ActiveState") or None,
+        "available": True,
+        "exec_main_status": _decimal(values.get("ExecMainStatus")),
+        "main_pid": _decimal(values.get("MainPID")),
+        "restart_count": _decimal(values.get("NRestarts")),
+        "sub_state": values.get("SubState") or None,
+        "unit": unit,
+    }
+
+
+def _decimal(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
 
 
 def _capture_cli() -> _CaptureCli:
@@ -505,6 +540,10 @@ def device_status(
     except OperatorStatusError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
+    service_status = _systemd_service_status()
+    result["service"] = service_status
+    if service_status.get("available") is True and service_status.get("active_state") != "active":
+        result["status"] = "attention"
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 

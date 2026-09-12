@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/j2h4u/omi-collector/compare/v0.5.0...v0.5.1) (2026-09-12)
+
+
+### Maintenance
+
+* **deps-dev:** bump the python-minor-patch group across 1 directory with 3 updates ([#52](https://github.com/j2h4u/omi-collector/issues/52)) ([e3be09d](https://github.com/j2h4u/omi-collector/commit/e3be09da86a21aad4616afba40101acad134e41a))
+* **deps:** bump the github-actions group with 3 updates ([#46](https://github.com/j2h4u/omi-collector/issues/46)) ([d9ba0b4](https://github.com/j2h4u/omi-collector/commit/d9ba0b45b420c2630f43aa15a80676d1dc55209f))
+
 ## [0.5.0](https://github.com/j2h4u/omi-collector/compare/v0.4.1...v0.5.0) (2026-09-12)
 
 

@@ -198,6 +198,7 @@ def collect_operator_status(
             observation_root=layout.collector.device_state,
         )
         quality = _quality_window(layout.collector.root, device_slug, start, end.astimezone(UTC))
+        runtime = _runtime_status(layout.collector.debug_log, end.astimezone(UTC))
     except ValueError as error:
         raise OperatorStatusError(str(error)) from error
     device = _device_status(observations[0]) if observations else None
@@ -207,10 +208,107 @@ def collect_operator_status(
         "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
         "publication": spool.current_window.as_dict(),
         "quality_window": quality.as_dict(),
-        "schema_version": 1,
+        "runtime": runtime,
+        "schema_version": 2,
         "status": window_status,
         "window_hours": hours,
     }
+
+
+def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
+    latest: tuple[datetime, dict[str, object]] | None = None
+    observation: tuple[datetime, dict[str, object]] | None = None
+    error: tuple[datetime, dict[str, object]] | None = None
+    if _path_exists(path, "debug journal"):
+        for row in _debug_rows(path):
+            decoded = _decode_sync_progress(row)
+            if decoded is None:
+                continue
+            timestamp, progress = decoded
+            if latest is None or timestamp > latest[0]:
+                latest = decoded
+            if progress.get("event") == "pendant_observation" and (observation is None or timestamp > observation[0]):
+                observation = decoded
+            if progress.get("status") == "session_error" and (error is None or timestamp > error[0]):
+                error = decoded
+    current = latest[1] if latest else {}
+    observed = observation[1] if observation else {}
+    state = current.get("status", "unknown")
+    active = state == "progress"
+    return {
+        "battery_percent": observed.get("battery_percent"),
+        "battery_observed_at": _iso(observation[0]) if observation else None,
+        "firmware": observed.get("firmware"),
+        "last_error": _runtime_error(error),
+        "state": "transferring" if active else state,
+        "updated_at": _iso(latest[0]) if latest else None,
+        "updated_age_seconds": max(0, int((now - latest[0]).total_seconds())) if latest else None,
+        "transfer": _active_transfer(current) if active else None,
+    }
+
+
+def _runtime_error(error: tuple[datetime, dict[str, object]] | None) -> dict[str, object] | None:
+    if error is None:
+        return None
+    timestamp, progress = error
+    return {
+        "error_message": progress.get("error_message"),
+        "error_type": progress.get("error_type"),
+        "occurred_at": _iso(timestamp),
+        "phase": progress.get("phase"),
+    }
+
+
+def _debug_rows(path: Path) -> list[dict[str, object]]:
+    config = DEFAULT_CONFIG.observability.debug_log
+    _require_regular_file(path, max_bytes=config.max_bytes, label="debug journal")
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise OperatorStatusError(f"debug journal is unreadable: {path.name}") from error
+    rows: list[dict[str, object]] = []
+    for line in payload.splitlines():
+        if len(line) > config.max_record_bytes:
+            raise OperatorStatusError(f"debug journal record exceeds configured size: {path.name}")
+        try:
+            value = cast(object, json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise OperatorStatusError(f"debug journal contains malformed JSON: {path.name}") from error
+        if not isinstance(value, dict):
+            raise OperatorStatusError(f"debug journal record is not an object: {path.name}")
+        rows.append(cast(dict[str, object], value))
+    return rows
+
+
+def _decode_sync_progress(row: dict[str, object]) -> tuple[datetime, dict[str, object]] | None:
+    if row.get("event") != "sync_progress":
+        return None
+    timestamp = _timestamp(row, "timestamp")
+    fields = row.get("fields")
+    if not isinstance(fields, dict):
+        raise OperatorStatusError("debug sync progress has invalid fields")
+    progress = fields.get("progress")
+    if not isinstance(progress, dict):
+        raise OperatorStatusError("debug sync progress has invalid progress")
+    return timestamp, cast(dict[str, object], progress)
+
+
+def _active_transfer(progress: dict[str, object]) -> dict[str, object]:
+    completed = progress.get("records_completed")
+    total = progress.get("records_total")
+    fraction = completed / total if isinstance(completed, int) and isinstance(total, int) and total > 0 else None
+    keys = (
+        "bytes_per_second",
+        "eta_seconds",
+        "payload_bytes",
+        "records_completed",
+        "records_per_second",
+        "records_total",
+        "remaining_bytes",
+        "remaining_packets",
+        "total_bytes",
+    )
+    return {"fraction_complete": fraction, **{key: progress.get(key) for key in keys}}
 
 
 def _device_status(observation: FirmwareObservation) -> dict[str, object]:
@@ -220,6 +318,7 @@ def _device_status(observation: FirmwareObservation) -> dict[str, object]:
         "capacity_packets": observation.capacity_packets,
         "dropped_packets": observation.dropped_packets,
         "read_sequence": read_sequence,
+        "unread_bytes": (write_sequence - read_sequence) * observation.packet_size,
         "unread_packets": write_sequence - read_sequence,
         "write_sequence": write_sequence,
     }
@@ -358,15 +457,15 @@ def _require_regular_directory(path: Path) -> None:
         raise OperatorStatusError("collector root must be a regular directory")
 
 
-def _require_regular_file(path: Path, *, max_bytes: int) -> None:
+def _require_regular_file(path: Path, *, max_bytes: int, label: str = "quality journal") -> None:
     try:
         state = path.lstat()
     except OSError as error:
-        raise OperatorStatusError(f"quality journal is unavailable: {path.name}") from error
+        raise OperatorStatusError(f"{label} is unavailable: {path.name}") from error
     if not stat.S_ISREG(state.st_mode):
-        raise OperatorStatusError(f"quality journal must be a regular file: {path.name}")
+        raise OperatorStatusError(f"{label} must be a regular file: {path.name}")
     if state.st_size > max_bytes:
-        raise OperatorStatusError(f"quality journal exceeds configured size: {path.name}")
+        raise OperatorStatusError(f"{label} exceeds configured size: {path.name}")
 
 
 def _decode_quality_event(row: dict[str, object]) -> _QualityEvent:

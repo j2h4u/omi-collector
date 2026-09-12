@@ -115,9 +115,21 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "capacity_packets": 100,
         "dropped_packets": 2,
         "read_sequence": 10,
+        "unread_bytes": 6_660,
         "unread_packets": 15,
         "write_sequence": 25,
     }
+    assert result["runtime"] == {
+        "battery_observed_at": None,
+        "battery_percent": None,
+        "firmware": None,
+        "last_error": None,
+        "state": "unknown",
+        "transfer": None,
+        "updated_age_seconds": None,
+        "updated_at": None,
+    }
+    assert result["schema_version"] == 2
     assert result["publication"] == _spool().current_window.as_dict()
     assert result["quality_window"] == {
         "advertisements": 1,
@@ -147,6 +159,50 @@ def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(OperatorStatusError, match="malformed JSON"):
         collect_operator_status(layout, "omi", hours=24)
+
+
+def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    layout = load_storage_layout(_layout(tmp_path))
+    rows = (
+        {
+            "event": "sync_progress",
+            "fields": {"progress": {"event": "pendant_observation", "battery_percent": 96, "firmware": "3.0.21"}},
+            "timestamp": "2026-09-08T09:00:00+00:00",
+        },
+        {
+            "event": "sync_progress",
+            "fields": {
+                "progress": {
+                    "status": "progress",
+                    "bytes_per_second": 64_000.0,
+                    "eta_seconds": 10.0,
+                    "payload_bytes": 444,
+                    "records_completed": 1,
+                    "records_per_second": 144.0,
+                    "records_total": 4,
+                    "remaining_bytes": 1_332,
+                    "remaining_packets": 3,
+                    "total_bytes": 1_776,
+                }
+            },
+            "timestamp": "2026-09-08T09:00:05+00:00",
+        },
+    )
+    layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, "omi", hours=24, now=datetime(2026, 9, 8, 9, 0, 10, tzinfo=UTC))
+
+    runtime = cast(dict[str, object], result["runtime"])
+    assert runtime["battery_percent"] == 96
+    assert runtime["battery_observed_at"] == "2026-09-08T09:00:00.000+00:00"
+    assert runtime["firmware"] == "3.0.21"
+    assert runtime["last_error"] is None
+    assert runtime["state"] == "transferring"
+    assert runtime["updated_age_seconds"] == 5
+    transfer = cast(dict[str, object], runtime["transfer"])
+    assert transfer["fraction_complete"] == 0.25
+    assert transfer["remaining_bytes"] == 1_332
 
 
 def test_status_marks_latest_fatal_transfer_as_attention_and_excludes_future_rows(

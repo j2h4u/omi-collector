@@ -67,9 +67,9 @@ function validate_layout_file {
     [[ "$layout_file" == /* && -f "$layout_file" && ! -L "$layout_file" ]] \
         || die 'OMI_COLLECTOR_LAYOUT_PATH must name a regular absolute file'
     chown root:"$account_group" -- "$layout_file" || die "could not set layout file group: ${layout_file}"
-    chmod 0640 -- "$layout_file" || die "could not set layout file mode: ${layout_file}"
-    [[ $(stat -c '%U:%G:%a' -- "$layout_file") == "root:${account_group}:640" ]] \
-        || die "layout file must be root:${account_group} 0640: ${layout_file}"
+    chmod 0644 -- "$layout_file" || die "could not set layout file mode: ${layout_file}"
+    [[ $(stat -c '%U:%G:%a' -- "$layout_file") == "root:${account_group}:644" ]] \
+        || die "layout file must be root:${account_group} 0644: ${layout_file}"
 }
 
 function stage_file {

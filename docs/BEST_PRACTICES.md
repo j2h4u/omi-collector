@@ -64,8 +64,10 @@ may name any regular non-symlink absolute layout file; roots resolve relative
 to its parent. The checked-in default stays under `/var/lib/omi-collector`,
 which the hardened unit can write. A custom external root requires a narrowly
 scoped host-only `ReadWritePaths` drop-in and deliberate ownership or ACLs. The
-installer enforces `root:omi-collector` mode `0640` on every accepted layout
-file.
+installer enforces `root:omi-collector` mode `0644` on every accepted layout
+file. The layout contains path names only, so making that authority readable
+lets an unprivileged operator run the read-only status command; private state,
+audio, environment files, and credentials retain their restricted modes.
 
 After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
 builds the environment as the service account, copies dependencies into it,
@@ -103,8 +105,9 @@ polling detail is required. The bounded `debug.jsonl` ring receives sync
 callbacks and link diagnostics separately from the journal; keep its private
 permissions and inspect it only for an active investigation.
 
-The read-only `device status` command joins the latest firmware observation,
-published-bundle metrics, and the selected recent window from `quality.jsonl`:
+The read-only `device status` command joins systemd health, the latest runtime
+progress and battery observation, firmware state, published-bundle metrics,
+and the selected recent window from `quality.jsonl`:
 
 ```bash
 uv run omi-collector device status \

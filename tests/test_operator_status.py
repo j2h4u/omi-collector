@@ -171,6 +171,11 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
         },
         {
             "event": "sync_progress",
+            "fields": {"progress": {"event": "pendant_observation", "firmware": "3.0.22"}},
+            "timestamp": "2026-09-08T09:00:01+00:00",
+        },
+        {
+            "event": "sync_progress",
             "fields": {
                 "progress": {
                     "status": "progress",
@@ -196,7 +201,7 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
     runtime = cast(dict[str, object], result["runtime"])
     assert runtime["battery_percent"] == 96
     assert runtime["battery_observed_at"] == "2026-09-08T09:00:00.000+00:00"
-    assert runtime["firmware"] == "3.0.21"
+    assert runtime["firmware"] == "3.0.22"
     assert runtime["last_error"] is None
     assert runtime["state"] == "transferring"
     assert runtime["updated_age_seconds"] == 5

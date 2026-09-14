@@ -278,6 +278,40 @@ def test_device_status_reports_one_stable_json_object(monkeypatch: pytest.Monkey
     assert captured == [(layout_path, "omi", 12)]
 
 
+def test_device_status_uses_running_service_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    expected = {"schema_version": 2, "status": "ok"}
+    layout_path = _layout(tmp_path)
+    options = {"--layout": str(layout_path), "--device-slug": "omi"}
+    captured: list[tuple[Path, str, int]] = []
+
+    def fake_status(layout: StorageLayout, device_slug: str, *, hours: int) -> dict[str, object]:
+        captured.append((layout.path, device_slug, hours))
+        return expected
+
+    monkeypatch.setattr(cli, "collect_operator_status", fake_status)
+    monkeypatch.setattr(cli, "_running_service_option", options.get)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"active_state": "active", "available": True})
+
+    result = CliRunner().invoke(app, ["device", "status"])
+
+    assert result.exit_code == 0
+    assert captured == [(layout_path, "omi", 24)]
+
+
+def test_running_service_option_reads_expanded_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"main_pid": 42})
+    monkeypatch.setattr(Path, "read_bytes", lambda _path: b"omi-collector\0--device-slug\0omi\0")
+
+    assert cli._running_service_option("--device-slug") == "omi"
+    assert cli._running_service_option("--layout") is None
+
+
+def test_running_service_option_handles_unavailable_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"main_pid": 0})
+
+    assert cli._running_service_option("--layout") is None
+
+
 def test_device_status_reports_malformed_evidence_as_nonzero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def fail_status(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise OperatorStatusError("quality journal contains malformed JSON")

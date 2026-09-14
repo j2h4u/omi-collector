@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.2](https://github.com/j2h4u/omi-collector/compare/v0.5.1...v0.5.2) (2026-09-14)
+
+
+### Fixes
+
+* make operator status reliable and concise ([#58](https://github.com/j2h4u/omi-collector/issues/58)) ([bbe73a1](https://github.com/j2h4u/omi-collector/commit/bbe73a1f98eddc1956093214c60f06bb059df9e5))
+
+
+### Maintenance
+
+* **deps-dev:** bump the python-minor-patch group with 2 updates ([#56](https://github.com/j2h4u/omi-collector/issues/56)) ([427bd11](https://github.com/j2h4u/omi-collector/commit/427bd112669238dd58cd6a4fcaa607a0431e0810))
+* **deps:** bump the github-actions group with 4 updates ([#57](https://github.com/j2h4u/omi-collector/issues/57)) ([66d35c7](https://github.com/j2h4u/omi-collector/commit/66d35c7b794607fbba3495ce7c3675c9caca27a0))
+
 ## [0.5.1](https://github.com/j2h4u/omi-collector/compare/v0.5.0...v0.5.1) (2026-09-12)
 
 

@@ -218,6 +218,7 @@ def collect_operator_status(
 def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
     latest: tuple[datetime, dict[str, object]] | None = None
     observation: tuple[datetime, dict[str, object]] | None = None
+    battery_observation: tuple[datetime, dict[str, object]] | None = None
     error: tuple[datetime, dict[str, object]] | None = None
     if _path_exists(path, "debug journal"):
         for row in _debug_rows(path):
@@ -229,15 +230,22 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
                 latest = decoded
             if progress.get("event") == "pendant_observation" and (observation is None or timestamp > observation[0]):
                 observation = decoded
+            if (
+                progress.get("event") == "pendant_observation"
+                and isinstance(progress.get("battery_percent"), int)
+                and (battery_observation is None or timestamp > battery_observation[0])
+            ):
+                battery_observation = decoded
             if progress.get("status") == "session_error" and (error is None or timestamp > error[0]):
                 error = decoded
     current = latest[1] if latest else {}
     observed = observation[1] if observation else {}
+    battery = battery_observation[1] if battery_observation else {}
     state = current.get("status", "unknown")
     active = state == "progress"
     return {
-        "battery_percent": observed.get("battery_percent"),
-        "battery_observed_at": _iso(observation[0]) if observation else None,
+        "battery_percent": battery.get("battery_percent"),
+        "battery_observed_at": _iso(battery_observation[0]) if battery_observation else None,
         "firmware": observed.get("firmware"),
         "last_error": _runtime_error(error),
         "state": "transferring" if active else state,

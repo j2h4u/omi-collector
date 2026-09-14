@@ -110,9 +110,7 @@ progress and battery observation, firmware state, published-bundle metrics,
 and the selected recent window from `quality.jsonl`:
 
 ```bash
-uv run omi-collector device status \
-  --layout /var/lib/omi-collector/collector.toml \
-  --device-slug omi-cv1 --hours 24
+uv run omi-collector device status
 ```
 
 Interpret `ok` as a completed transfer with no confirmed loss or terminal

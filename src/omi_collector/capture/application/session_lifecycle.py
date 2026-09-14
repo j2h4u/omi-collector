@@ -23,6 +23,7 @@ from . import collector
 from .operational_telemetry import (
     OperationalEmitter,
     TelemetryClock,
+    collect_battery_observation,
     collect_operational_telemetry,
     system_host_clock_synchronized,
 )
@@ -390,6 +391,21 @@ class SessionLifecycle:
             return
         deadline = asyncio.get_running_loop().time() + options.config.retry.presence_preflight_budget_seconds
         phase.value = "telemetry"
+        emitter = _quality_aware_operational_emitter(options.operational, phase.quality)
+        try:
+            await collect_battery_observation(
+                session,
+                info,
+                emitter,
+                operation_timeout=min(
+                    options.config.telemetry.optional_operation_timeout_seconds,
+                    remaining_budget(deadline) / 2,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - optional telemetry
+            await report_session_error(options.activity, "telemetry", error, self.run.runtime)
         status: object | None = None
         timeout = remaining_budget(deadline)
         if timeout > 0:
@@ -408,7 +424,7 @@ class SessionLifecycle:
                     session,
                     status if isinstance(status, RingStatus) else None,
                     info,
-                    _quality_aware_operational_emitter(options.operational, phase.quality),
+                    emitter,
                     clock=TelemetryClock(
                         options.host_time,
                         options.host_clock_synchronized or system_host_clock_synchronized,

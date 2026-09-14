@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from collections.abc import Callable, Coroutine, Mapping
@@ -66,6 +67,39 @@ app.add_typer(device, name="device")
 # import of this module therefore does not pull in Bluetooth code.
 collect_spool_metrics: object | None = None
 collect_operator_status: object | None = None
+
+
+def _running_service_option(option: str) -> str | None:
+    """Read one already-expanded option from the running production command."""
+    service = _systemd_service_status()
+    pid = service.get("main_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    return _command_option(arguments, option)
+
+
+def _command_option(arguments: list[bytes], option: str) -> str | None:
+    """Extract an option value from a NUL-decoded process argument vector."""
+    encoded = option.encode()
+    for index, argument in enumerate(arguments[:-1]):
+        if argument == encoded:
+            return arguments[index + 1].decode(errors="strict")
+    return None
+
+
+def _status_option(explicit: object | None, environment: str, command_option: str) -> str:
+    value = (
+        str(explicit)
+        if explicit is not None
+        else os.environ.get(environment) or _running_service_option(command_option)
+    )
+    if not value:
+        raise typer.BadParameter(f"could not determine {command_option} from the running service")
+    return value
 
 
 def _systemd_service_status(unit: str = "omi-collector.service") -> dict[str, object]:
@@ -522,21 +556,23 @@ def device_metrics(
 @device.command("status")
 def device_status(
     *,
-    layout_path: Annotated[Path, typer.Option("--layout", help="Storage-layout TOML authority.")],
+    layout_path: Annotated[Path | None, typer.Option("--layout", help="Override the running service layout.")] = None,
     device_slug: Annotated[
-        str, typer.Option("--device-slug", help="Stable local directory component for this pendant.")
-    ],
+        str | None, typer.Option("--device-slug", help="Override the running service pendant.")
+    ] = None,
     hours: Annotated[int, typer.Option("--hours", min=1, max=8760, help="Recent quality window in hours.")] = 24,
 ) -> None:
     """Summarize current backlog, publication, transfers, and confirmed loss."""
     from omi_collector.operator_status import OperatorStatusError
 
     try:
-        layout = _load_layout(layout_path)
+        resolved_layout = Path(_status_option(layout_path, "OMI_COLLECTOR_LAYOUT_PATH", "--layout"))
+        resolved_slug = _status_option(device_slug, "OMI_COLLECTOR_DEVICE_SLUG", "--device-slug")
+        layout = _load_layout(resolved_layout)
         status = collect_operator_status
         if status is None:
             from omi_collector.operator_status import collect_operator_status as status
-        result = cast(Callable[..., dict[str, object]], status)(layout, device_slug, hours=hours)
+        result = cast(Callable[..., dict[str, object]], status)(layout, resolved_slug, hours=hours)
     except OperatorStatusError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error

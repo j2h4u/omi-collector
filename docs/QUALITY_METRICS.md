@@ -21,9 +21,7 @@ The read-only status command combines the current firmware observation, visible
 published bundles, and a bounded quality window:
 
 ```bash
-uv run omi-collector device status \
-  --layout /var/lib/omi-collector/collector.toml \
-  --device-slug omi-cv1 --hours 24
+uv run omi-collector device status
 ```
 
 Its top-level `status` is `ok` when the window contains a completed transfer

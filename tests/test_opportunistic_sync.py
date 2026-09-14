@@ -2235,7 +2235,7 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(tmp_pa
     elapsed = time.monotonic() - started_at
 
     assert isinstance(result, NoDataResult)
-    assert order[:2] == ["info", "status"]
+    assert order[:3] == ["info", "optional", "status"]
     assert "optional" in order
     assert elapsed < 0.2
 

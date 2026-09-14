@@ -93,7 +93,7 @@ jobs:
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         if: ${{ github.event_name == 'pull_request' || inputs.release_attestation }}
         with:
           enable-cache: true
@@ -144,11 +144,11 @@ jobs:
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: just
 
@@ -168,11 +168,11 @@ jobs:
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: just
 
@@ -192,11 +192,11 @@ jobs:
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: just
 
@@ -212,7 +212,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: just
 
@@ -225,7 +225,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: just
 

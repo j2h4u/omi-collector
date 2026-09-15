@@ -122,6 +122,27 @@ def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path
     assert result.firmware_lifetime.latest == 9
 
 
+def test_published_generation_link_is_a_valid_device_spool(tmp_path: Path) -> None:
+    generation = tmp_path / ".generations/omi/generation"
+    generation.mkdir(parents=True)
+    _bundle(generation, "10-12-a", (_record(1000), _record(1001)))
+    (tmp_path / "omi").symlink_to(Path(".generations/omi/generation"))
+
+    result = collect_spool_metrics(tmp_path, "omi")
+
+    assert result.current_window.bundle_count == 1
+
+
+def test_published_generation_link_cannot_escape_authority(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / ".generations/omi").mkdir(parents=True)
+    (tmp_path / "omi").symlink_to(Path("outside"))
+
+    with pytest.raises(SpoolMetricsError, match="authority"):
+        collect_spool_metrics(tmp_path, "omi")
+
+
 def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path) -> None:
     device = tmp_path / "omi"
     device.mkdir()

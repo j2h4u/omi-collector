@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.4](https://github.com/j2h4u/omi-collector/compare/v0.5.3...v0.5.4) (2026-09-15)
+
+
+### Fixes
+
+* expose clock corrections in status ([#62](https://github.com/j2h4u/omi-collector/issues/62)) ([7b5e1ef](https://github.com/j2h4u/omi-collector/commit/7b5e1ef56ebf195d3b95b41a4de554839fbbd377))
+
 ## [0.5.3](https://github.com/j2h4u/omi-collector/compare/v0.5.2...v0.5.3) (2026-09-15)
 
 

@@ -158,6 +158,8 @@ class CaptureRuntimePort(Protocol):
         self, staging: StagingPort, config: FirmwareObservationConfig, on_error: Callable[[Exception], None]
     ) -> ObservationWriterPort: ...
 
+    def make_clock_correction_sink(self, staging: StagingPort) -> object: ...
+
     def publish_quarantined_prefix(
         self,
         source: Path,

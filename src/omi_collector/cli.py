@@ -161,12 +161,13 @@ def _staging(layout: StorageLayout) -> StagingStore:
     return StagingStore.from_paths(
         StagingPaths(
             layout.collector.root,
-            layout.publication.root,
+            layout.path.parent / "captured",
             layout.collector.attempts,
             layout.collector.quarantine,
             layout.collector.lock,
             layout.collector.device_state,
-        )
+        ),
+        publication_root=layout.publication.root,
     )
 
 

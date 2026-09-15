@@ -77,10 +77,10 @@ def test_health_command_reports_ok() -> None:
     assert result.output.strip() == "ok"
 
 
-def test_staging_uses_the_publication_source_root_directly(tmp_path: Path) -> None:
+def test_staging_keeps_capture_inside_collector_state(tmp_path: Path) -> None:
     store = cli._staging(load_storage_layout(_layout(tmp_path)))
 
-    assert store.paths.capture_root == tmp_path / "source"
+    assert store.paths.capture_root == tmp_path / "captured"
 
 
 def test_sync_announces_loaded_layout_before_absent_pendant_wait(

@@ -21,6 +21,7 @@ from ...config import DEFAULT_CONFIG, CollectorConfig, RetryConfig
 from ..domain.ring_protocol import RECORD_SIZE, STATUS_STORAGE_NOT_READY, RingInfo, RingStatus, encode_stop_command
 from . import collector
 from .operational_telemetry import (
+    ClockCorrectionSink,
     OperationalEmitter,
     TelemetryClock,
     collect_battery_observation,
@@ -114,6 +115,7 @@ class OpportunisticOptions:
     sleep: Callable[[float], object] = asyncio.sleep
     presence: PresenceSchedulerPort | None = None
     quality_metrics: QualityMetricsPort | None = None
+    clock_correction_sink: ClockCorrectionSink | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
 
@@ -433,6 +435,8 @@ class SessionLifecycle:
                         options.host_clock_synchronized or system_host_clock_synchronized,
                         remaining_budget(deadline),
                         info_reader=lambda: self._info(session),
+                        correction_sink=options.clock_correction_sink,
+                        device_slug=self.run.device_slug,
                     ),
                 ),
                 timeout,

@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from ..domain.ring_protocol import RingInfo
 from . import collector
 from .batch_reconciliation import BatchReconciler
-from .operational_telemetry import OperationalEmitter
+from .operational_telemetry import ClockCorrectionSink, OperationalEmitter
 from .ports import CaptureRuntimePort, ObservationWriterPort, StagingPort
 from .presence import PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
@@ -84,6 +85,11 @@ async def run_opportunistic_collector(
         except RuntimeError:
             return
 
+    if options.clock_correction_sink is None:
+        options = replace(
+            options,
+            clock_correction_sink=cast(ClockCorrectionSink, runtime.make_clock_correction_sink(staging)),
+        )
     observation_writer = runtime.make_observation_writer(
         staging, options.config.firmware_observations, report_observation_error
     )

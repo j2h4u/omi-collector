@@ -61,6 +61,28 @@ class FakeOperationalSession:
         self.writes.append((uuid, value))
 
 
+class FakeClockCorrectionSink:
+    def __init__(self) -> None:
+        self.finished: list[dict[str, object]] = []
+
+    def prepare(
+        self,
+        device_slug: str,
+        observed_epoch: int,
+        target_epoch: int,
+        drift_seconds: float,
+        boundary_sequence_min: int,
+    ) -> object:
+        return device_slug, observed_epoch, target_epoch, drift_seconds, boundary_sequence_min
+
+    def finish(self, correction: object, **values: object) -> object:
+        self.finished.append({"correction": correction, **values})
+        return correction
+
+    def mark_unresolved(self, correction: object) -> object:
+        return correction
+
+
 def _event_emitter(events: list[dict[str, object]]) -> OperationalEmitter:
     def emit(event: Mapping[str, object]) -> None:
         events.append(dict(event))
@@ -84,14 +106,20 @@ def _run(
     synchronized: bool = True,
     operation_timeout: float = 0.5,
 ) -> None:
-    ticks = iter(times)
+    ticks = iter((*times, *(times[-1] for _ in range(5))))
     asyncio.run(
         collect_operational_telemetry(
             session,
             _status(),
             _info(),
             _event_emitter(events),
-            clock=TelemetryClock(lambda: next(ticks), lambda: synchronized, operation_timeout),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: synchronized,
+                operation_timeout,
+                correction_sink=FakeClockCorrectionSink(),
+                device_slug="omi",
+            ),
         )
     )
 
@@ -162,7 +190,7 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
         readback=target,
     )
     events: list[dict[str, object]] = []
-    ticks = iter((1000.0, 1000.0))
+    ticks = iter((1000.0,) * 8)
 
     async def info_after() -> RingInfo:
         return RingInfo(10, 14, 100, 2, RECORD_SIZE)
@@ -173,7 +201,14 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
             _status(),
             _info(),
             _event_emitter(events),
-            clock=TelemetryClock(lambda: next(ticks), lambda: True, 0.5, info_reader=info_after),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=info_after,
+                correction_sink=FakeClockCorrectionSink(),
+                device_slug="omi",
+            ),
         )
     )
 
@@ -211,7 +246,7 @@ def test_write_and_verification_failures_are_classified_without_retry() -> None:
     verify_events: list[dict[str, object]] = []
     verify_fail = FakeOperationalSession(
         {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)},
-        readback=pack("<I", 1001),
+        readback=pack("<I", 1005),
     )
     _run(verify_fail, verify_events)
     assert len(verify_fail.writes) == 1

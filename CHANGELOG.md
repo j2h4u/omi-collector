@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.6](https://github.com/j2h4u/omi-collector/compare/v0.5.5...v0.5.6) (2026-09-15)
+
+
+### Fixes
+
+* ignore timeline generation metadata in status ([#68](https://github.com/j2h4u/omi-collector/issues/68)) ([9616c7a](https://github.com/j2h4u/omi-collector/commit/9616c7aa3c3e1251d81fcbcc27bb3b2032b61f55))
+* inspect published timeline generations ([#66](https://github.com/j2h4u/omi-collector/issues/66)) ([4674133](https://github.com/j2h4u/omi-collector/commit/4674133de91c4878f639ac38f3e772f89049b759))
+
 ## [0.5.5](https://github.com/j2h4u/omi-collector/compare/v0.5.4...v0.5.5) (2026-09-15)
 
 

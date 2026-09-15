@@ -559,6 +559,25 @@ def test_sync_reporter_info_suppresses_routine_polling() -> None:
     assert json.loads(lines[0])["event"] == "pendant_observation"
 
 
+def test_sync_reporter_info_emits_verified_clock_correction_to_system_journal() -> None:
+    lines: list[str] = []
+    reporter = cli.SyncProgressReporter(emit=lines.append)
+    correction = {
+        "event": "pendant_clock_sync",
+        "outcome": "verified",
+        "drift_seconds": 2359.68,
+        "target_epoch": 1789128032,
+        "boundary_sequence_min": 5898589,
+        "boundary_sequence_max": 5898591,
+    }
+
+    reporter(_sync_progress(state="operational", operational_event=correction))
+
+    assert len(lines) == 1
+    journal_event = cast(dict[str, object], json.loads(lines[0]))
+    assert all(journal_event[key] == value for key, value in correction.items())
+
+
 def test_sync_reporter_persists_filtered_debug_callback(tmp_path: Path) -> None:
     lines: list[str] = []
     logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.debug.progress"))

@@ -11,6 +11,7 @@ import omi_collector.operator_status as status_module
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
 from omi_collector.capture.application.quality_metrics import (
     AdvertisementMetric,
+    ClockCorrectionMetric,
     SequenceLossMetric,
     TransferSessionMetric,
 )
@@ -87,6 +88,21 @@ def _loss(timestamp: str) -> dict[str, object]:
     ).as_dict()
 
 
+def _clock_correction(timestamp: str) -> dict[str, object]:
+    return ClockCorrectionMetric(
+        timestamp,
+        "session-clock",
+        "omi",
+        2359.68,
+        1789128032,
+        5898589,
+        5898591,
+        "1.2.3",
+        "abcdef123456",
+        "1.0.0",
+    ).as_dict()
+
+
 def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = load_storage_layout(_layout(tmp_path))
     FirmwareObservationStore(layout.collector.device_state).record("omi", RingInfo(10, 25, 100, 2, RECORD_SIZE))
@@ -102,6 +118,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
             written_raw_bytes=444,
         ),
         _loss("2026-09-08T09:15:00+00:00"),
+        _clock_correction("2026-09-08T09:20:00+00:00"),
     )
     (layout.collector.root / "quality.jsonl").write_text(
         "".join(f"{json.dumps(event)}\n" for event in events), encoding="utf-8"
@@ -111,6 +128,10 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
     result = collect_operator_status(layout, "omi", hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
     assert result["status"] == "attention"
+    quality = cast(dict[str, object], result["quality_window"])
+    assert quality["clock_corrections"] == 1
+    assert quality["last_clock_correction_at"] == "2026-09-08T09:20:00.000+00:00"
+    assert quality["last_clock_correction_drift_seconds"] == 2359.68
     assert result["device"] == {
         "capacity_packets": 100,
         "dropped_packets": 2,
@@ -137,8 +158,11 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "confirmed_loss_events": 1,
         "confirmed_lost_raw_bytes": 888,
         "confirmed_lost_records": 2,
+        "clock_corrections": 1,
         "last_advertisement_at": "2026-09-08T09:00:00.000+00:00",
         "last_advertisement_rssi_dbm": -91,
+        "last_clock_correction_at": "2026-09-08T09:20:00.000+00:00",
+        "last_clock_correction_drift_seconds": 2359.68,
         "last_successful_transfer_at": "2026-09-08T09:05:00.000+00:00",
         "last_transfer_at": "2026-09-08T09:10:00.000+00:00",
         "last_transfer_outcome": "connected_interrupted",

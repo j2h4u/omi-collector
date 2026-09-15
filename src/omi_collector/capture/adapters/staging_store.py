@@ -60,14 +60,30 @@ class StagingStore:
             config=config,
         )
         self._validated_attempts: dict[str, StagedAttempt] = {}
+        self._publication_root: Path | None = None
 
     @classmethod
-    def from_paths(cls, paths: StagingPaths, *, config: CollectorConfig = DEFAULT_CONFIG) -> StagingStore:
+    def from_paths(
+        cls,
+        paths: StagingPaths,
+        *,
+        config: CollectorConfig = DEFAULT_CONFIG,
+        publication_root: Path | None = None,
+    ) -> StagingStore:
         """Build a store from the external layout authority."""
         store = cls.__new__(cls)
         store._filesystem = StagingFilesystem.from_paths(paths, config=config)
         store._validated_attempts = {}
+        store._publication_root = publication_root
         return store
+
+    def publish_timeline(self, device_slug: str) -> object | None:
+        """Publish a complete normalized view when this store has an external boundary."""
+        if self._publication_root is None:
+            return None
+        from .timeline_generations import publish_from_ledger
+
+        return publish_from_ledger(self.capture_root, self._publication_root, self.paths.root, device_slug)
 
     @property
     def capture_root(self) -> Path:

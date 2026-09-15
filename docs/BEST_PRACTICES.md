@@ -1,8 +1,9 @@
 # Best practices
 
-Keep this project a small raw-capture boundary. The collector owns presence,
-BLE transfer, recovery/quarantine, and atomic raw publication. Consumer-specific
-processing and external service integration are outside its boundary.
+Keep this project a small capture boundary. The collector owns presence, BLE
+transfer, recovery/quarantine, clock normalization, and atomic audio
+publication. Consumer-specific processing and external service integration are
+outside its boundary.
 
 ## Quality gates
 
@@ -133,3 +134,6 @@ Gherkin acceptance specification at
 specification, not an executable test; executable checks remain in pytest.
 Remove obsolete documents and host-specific observations rather than expanding
 this documentation set.
+# Audio time ownership
+
+Persist a clock-correction intent before writing the pendant clock, then record whether the write was confirmed or remains uncertain. Never write the clock when that intent cannot be made durable or while an interrupted audio attempt is pending. Apply only confirmed corrections to record timestamps before bundle publication so consumers receive one ordinary audio timeline. Keep unrecoverable packet loss in operational quality evidence; consumers cannot act on missing audio.

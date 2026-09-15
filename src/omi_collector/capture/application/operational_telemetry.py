@@ -53,6 +53,25 @@ class OperationalSession(Protocol):
         ...
 
 
+class ClockCorrectionSink(Protocol):
+    """Durable boundary around a pendant clock write."""
+
+    def prepare(
+        self, device_slug: str, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
+    ) -> object: ...
+
+    def mark_unresolved(self, correction: object) -> object: ...
+
+    def finish(
+        self,
+        correction: object,
+        *,
+        state: str,
+        boundary_sequence_max: int | None,
+        verified_epoch: int | None,
+    ) -> object: ...
+
+
 @dataclass(frozen=True, slots=True)
 class TelemetryClock:
     """Injectable wall-clock and trust source used by drift correction."""
@@ -62,6 +81,8 @@ class TelemetryClock:
     operation_timeout: float = OPTIONAL_OPERATION_TIMEOUT_SECONDS
     host_clock_probe_timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SECONDS
     info_reader: InfoReader | None = None
+    correction_sink: ClockCorrectionSink | None = None
+    device_slug: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +146,9 @@ async def collect_operational_telemetry(
             telemetry_clock.operation_timeout,
             info,
             telemetry_clock.info_reader,
+            telemetry_clock.correction_sink,
+            telemetry_clock.device_slug,
+            telemetry_clock.now,
         )
     )
 
@@ -210,6 +234,9 @@ class _ClockSync:
     operation_timeout: float
     info_before: RingInfo
     info_reader: InfoReader | None
+    correction_sink: ClockCorrectionSink | None
+    device_slug: str | None
+    host_time: Callable[[], float]
 
 
 async def _sync_clock(sync: _ClockSync) -> None:
@@ -251,7 +278,7 @@ async def _sync_clock(sync: _ClockSync) -> None:
         event.update(action="none", outcome="host_unsynchronized")
         await _emit(emit, event)
         return
-    target = int(midpoint)
+    target = int(sync.host_time())
     if not 0 <= target <= MAX_U32:
         event.update(action="none", outcome="target_unrepresentable")
         await _emit(emit, event)
@@ -260,51 +287,121 @@ async def _sync_clock(sync: _ClockSync) -> None:
         event.update(action="none", outcome="time_write_missing")
         await _emit(emit, event)
         return
-    await _write_and_verify(reader, writer, target, event, operation_timeout)
-    if event.get("outcome") == "verified" and sync.info_reader is not None:
-        try:
-            info_after = await _bounded_optional(sync.info_reader(), operation_timeout)
-        except Exception:  # noqa: BLE001 - sequence evidence is best effort
-            info_after = None
-        if isinstance(info_after, RingInfo):
-            event["boundary_sequence_max"] = info_after.write_sequence
+    correction = _prepare_clock_intent(sync, event, target, drift)
+    if correction is None:
+        await _emit(emit, event)
+        return
+    verified_epoch = await _write_and_verify(
+        _ClockWrite(reader, writer, target, event, operation_timeout, sync.host_time)
+    )
+    info_after = await _read_boundary_after(sync, event)
+    _finish_clock_intent(sync, correction, event, info_after, verified_epoch)
     await _emit(emit, event)
 
 
-async def _write_and_verify(
-    reader: OptionalReader | None,
-    writer: OptionalWriter,
-    target: int,
+async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> RingInfo | None:
+    if event.get("action") != "written" or sync.info_reader is None:
+        return None
+    try:
+        info = await _bounded_optional(sync.info_reader(), sync.operation_timeout)
+    except Exception:  # noqa: BLE001 - sequence evidence is best effort
+        return None
+    if isinstance(info, RingInfo):
+        event["boundary_sequence_max"] = info.write_sequence
+        return info
+    return None
+
+
+def _prepare_clock_intent(sync: _ClockSync, event: dict[str, object], target: int, drift: float) -> object | None:
+    if sync.correction_sink is None or sync.device_slug is None:
+        event.update(action="none", outcome="intent_unavailable")
+        return None
+    assert sync.sample.epoch is not None
+    assert sync.correction_sink is not None
+    try:
+        correction = sync.correction_sink.prepare(
+            sync.device_slug, sync.sample.epoch, target, drift, sync.info_before.write_sequence
+        )
+        return sync.correction_sink.mark_unresolved(correction)
+    except Exception:  # noqa: BLE001 - writing without durable intent is unsafe
+        event.update(action="none", outcome="intent_persist_failed")
+        return None
+
+
+def _finish_clock_intent(
+    sync: _ClockSync,
+    correction: object,
     event: dict[str, object],
-    operation_timeout: float,
+    info_after: RingInfo | None,
+    verified_epoch: int | None,
 ) -> None:
+    assert sync.correction_sink is not None
+    outcome = event.get("outcome")
+    state = (
+        "applied"
+        if outcome == "verified"
+        else "not_applied"
+        if outcome in {"time_write_missing", "target_stale"}
+        else "unresolved"
+    )
+    try:
+        sync.correction_sink.finish(
+            correction,
+            state=state,
+            boundary_sequence_max=info_after.write_sequence if info_after is not None else None,
+            verified_epoch=verified_epoch,
+        )
+    except Exception:  # noqa: BLE001 - prepared state truthfully records uncertainty
+        event["outcome"] = "result_persist_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class _ClockWrite:
+    reader: OptionalReader | None
+    writer: OptionalWriter
+    target: int
+    event: dict[str, object]
+    operation_timeout: float
+    host_time: Callable[[], float]
+
+
+async def _write_and_verify(write: _ClockWrite) -> int | None:
+    reader, writer, target, event = write.reader, write.writer, write.target, write.event
+    write_started = write.host_time()
+    if not target <= write_started <= target + 2:
+        event.update(action="none", outcome="target_stale")
+        return None
     try:
         performed = await _bounded_optional(
-            writer(TIME_WRITE_UUID, target.to_bytes(U32_BYTES, "little")), operation_timeout
+            writer(TIME_WRITE_UUID, target.to_bytes(U32_BYTES, "little")), write.operation_timeout
         )
     except _OptionalOperationTimeoutError:
         event.update(action="none", outcome="time_write_timeout")
-        return
+        return None
     except Exception:  # noqa: BLE001 - classify optional backend failures
         event.update(action="none", outcome="time_write_failed")
-        return
+        return None
     if performed is False:
         event.update(action="none", outcome="time_write_missing")
-        return
+        return None
     event["target_epoch"] = target
     try:
         verified = (
-            _parse_u32(await _bounded_optional(reader(TIME_READ_UUID), operation_timeout))
+            _parse_u32(await _bounded_optional(reader(TIME_READ_UUID), write.operation_timeout))
             if reader is not None
             else None
         )
     except _OptionalOperationTimeoutError:
         verified = None
         event.update(action="written", outcome="verification_timeout")
-        return
+        return None
     except Exception:  # noqa: BLE001 - classify optional backend failures
         verified = None
-    event.update(action="written", outcome="verified" if verified == target else "verification_failed")
+    read_finished = write.host_time()
+    allowance = max(1, int(read_finished - write_started) + 1)
+    valid = verified is not None and target <= verified <= target + allowance
+    event.update(action="written", outcome="verified" if valid else "verification_failed")
+    return verified
 
 
 def _optional_accessors(session: object) -> tuple[OptionalReader | None, OptionalWriter | None]:

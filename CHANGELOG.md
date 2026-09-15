@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/j2h4u/omi-collector/compare/v0.5.2...v0.5.3) (2026-09-15)
+
+
+### Fixes
+
+* persist clock correction sequence evidence ([#60](https://github.com/j2h4u/omi-collector/issues/60)) ([32c60a0](https://github.com/j2h4u/omi-collector/commit/32c60a0a4f495ffa08a3d9ade8544ac1dee53c9b))
+
 ## [0.5.2](https://github.com/j2h4u/omi-collector/compare/v0.5.1...v0.5.2) (2026-09-14)
 
 

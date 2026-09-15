@@ -140,7 +140,7 @@ def _published_device_root(capture_root: Path, device_root: Path, device_slug: s
 def _read_artifacts(device_root: Path, device_slug: str) -> tuple[_BundleMeasurement, ...]:
     measurements: list[_BundleMeasurement] = []
     for entry in _entries(device_root, "device spool"):
-        if entry.name.startswith(".") or entry.name == "incidents":
+        if entry.name.startswith(".") or entry.name in {"generation.json", "incidents"}:
             # Retired gap-only incident directories are intentionally opaque.
             continue
         if entry.is_symlink():

@@ -126,6 +126,7 @@ def test_published_generation_link_is_a_valid_device_spool(tmp_path: Path) -> No
     generation = tmp_path / ".generations/omi/generation"
     generation.mkdir(parents=True)
     _bundle(generation, "10-12-a", (_record(1000), _record(1001)))
+    (generation / "generation.json").write_text("{}", encoding="utf-8")
     (tmp_path / "omi").symlink_to(Path(".generations/omi/generation"))
 
     result = collect_spool_metrics(tmp_path, "omi")

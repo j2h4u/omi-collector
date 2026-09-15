@@ -145,6 +145,38 @@ class SequenceLossMetric:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ClockCorrectionMetric:
+    """A verified RTC write bounded by device sequence observations."""
+
+    occurred_at: str
+    session_id: str
+    device_slug: str
+    drift_seconds: float
+    target_epoch: int
+    boundary_sequence_min: int
+    boundary_sequence_max: int
+    release_version: str
+    source_revision: str | None
+    firmware_version: str | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "event": "clock_correction",
+            "occurred_at": self.occurred_at,
+            "session_id": self.session_id,
+            "device_slug": self.device_slug,
+            "drift_seconds": self.drift_seconds,
+            "target_epoch": self.target_epoch,
+            "boundary_sequence_min": self.boundary_sequence_min,
+            "boundary_sequence_max": self.boundary_sequence_max,
+            "release_version": self.release_version,
+            "source_revision": self.source_revision,
+            "firmware_version": self.firmware_version,
+        }
+
+
 class QualityMetricsPort(Protocol):
     """Best-effort boundary; callers catch failures before collection can see them."""
 
@@ -156,3 +188,5 @@ class QualityMetricsPort(Protocol):
     def record_transfer_session(self, metric: TransferSessionMetric) -> None: ...
 
     def record_sequence_loss(self, metric: SequenceLossMetric) -> None: ...
+
+    def record_clock_correction(self, metric: ClockCorrectionMetric) -> None: ...

@@ -162,13 +162,28 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
         readback=target,
     )
     events: list[dict[str, object]] = []
-    _run(session, events)
+    ticks = iter((1000.0, 1000.0))
+
+    async def info_after() -> RingInfo:
+        return RingInfo(10, 14, 100, 2, RECORD_SIZE)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(lambda: next(ticks), lambda: True, 0.5, info_reader=info_after),
+        )
+    )
 
     assert session.writes == [(TIME_WRITE_UUID, target)]
     assert session.reads.index(TIME_READ_UUID) < len(session.reads)
     assert session.reads[-1] == TIME_READ_UUID
     assert events[-1]["outcome"] == "verified"
     assert events[-1]["target_epoch"] == 1000
+    assert events[-1]["boundary_sequence_min"] == 12
+    assert events[-1]["boundary_sequence_max"] == 14
 
 
 def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:

@@ -32,6 +32,7 @@ from .presence import PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
     AdvertisementMetric,
+    ClockCorrectionMetric,
     QualityMetricsPort,
     SessionQuality,
     TransferSessionMetric,
@@ -391,7 +392,9 @@ class SessionLifecycle:
             return
         deadline = asyncio.get_running_loop().time() + options.config.retry.presence_preflight_budget_seconds
         phase.value = "telemetry"
-        emitter = _quality_aware_operational_emitter(options.operational, phase.quality)
+        emitter = _quality_aware_operational_emitter(
+            options.operational, phase.quality, options.quality_metrics, options.host_time
+        )
         try:
             await collect_battery_observation(
                 session,
@@ -429,6 +432,7 @@ class SessionLifecycle:
                         options.host_time,
                         options.host_clock_synchronized or system_host_clock_synchronized,
                         remaining_budget(deadline),
+                        info_reader=lambda: self._info(session),
                     ),
                 ),
                 timeout,
@@ -440,7 +444,10 @@ class SessionLifecycle:
 
 
 def _quality_aware_operational_emitter(
-    emitter: OperationalEmitter, quality: SessionQuality | None
+    emitter: OperationalEmitter,
+    quality: SessionQuality | None,
+    metrics: QualityMetricsPort | None = None,
+    host_time: Callable[[], float] = time.time,
 ) -> OperationalEmitter:
     """Copy only the already-collected firmware dimension into session evidence."""
 
@@ -448,9 +455,49 @@ def _quality_aware_operational_emitter(
         if quality is not None and event.get("event") == "pendant_observation":
             firmware = event.get("firmware")
             quality.firmware_version = firmware if isinstance(firmware, str) else None
+        if quality is not None and metrics is not None:
+            _record_clock_correction(event, quality, metrics, host_time)
         return emitter(event)
 
     return emit
+
+
+def _record_clock_correction(
+    event: Mapping[str, object],
+    quality: SessionQuality,
+    metrics: QualityMetricsPort,
+    host_time: Callable[[], float],
+) -> None:
+    drift = event.get("drift_seconds")
+    target = event.get("target_epoch")
+    boundary_min = event.get("boundary_sequence_min")
+    boundary_max = event.get("boundary_sequence_max")
+    if not (
+        event.get("event") == "pendant_clock_sync"
+        and event.get("outcome") == "verified"
+        and isinstance(drift, float)
+        and isinstance(target, int)
+        and isinstance(boundary_min, int)
+        and isinstance(boundary_max, int)
+    ):
+        return
+    try:
+        metrics.record_clock_correction(
+            ClockCorrectionMetric(
+                utc_timestamp(host_time()),
+                quality.session_id,
+                quality.device_slug,
+                drift,
+                target,
+                boundary_min,
+                boundary_max,
+                metrics.release_version,
+                metrics.source_revision,
+                quality.firmware_version,
+            )
+        )
+    except Exception:  # noqa: BLE001 - metrics cannot stop audio capture
+        return
 
 
 def _quality_terminal(outcome: str | None, teardown_error: bool, error: BaseException | None) -> tuple[str, str]:

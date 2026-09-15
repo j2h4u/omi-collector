@@ -38,6 +38,7 @@ type OperationalEvent = Mapping[str, object]
 type OperationalEmitter = Callable[[OperationalEvent], object]
 type OptionalReader = Callable[[str], Awaitable[bytes | None]]
 type OptionalWriter = Callable[[str, bytes], Awaitable[object]]
+type InfoReader = Callable[[], Awaitable[RingInfo]]
 
 
 class OperationalSession(Protocol):
@@ -60,6 +61,7 @@ class TelemetryClock:
     synchronized: Callable[[], bool] | None = None
     operation_timeout: float = OPTIONAL_OPERATION_TIMEOUT_SECONDS
     host_clock_probe_timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SECONDS
+    info_reader: InfoReader | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +123,8 @@ async def collect_operational_telemetry(
             synchronized,
             emit,
             telemetry_clock.operation_timeout,
+            info,
+            telemetry_clock.info_reader,
         )
     )
 
@@ -204,6 +208,8 @@ class _ClockSync:
     host_clock_synchronized: Callable[[], bool]
     emit: OperationalEmitter
     operation_timeout: float
+    info_before: RingInfo
+    info_reader: InfoReader | None
 
 
 async def _sync_clock(sync: _ClockSync) -> None:
@@ -230,6 +236,7 @@ async def _sync_clock(sync: _ClockSync) -> None:
         "event": "pendant_clock_sync",
         "drift_seconds": round(drift, 3),
         "threshold_seconds": CLOCK_DRIFT_THRESHOLD_SECONDS,
+        "boundary_sequence_min": sync.info_before.write_sequence,
     }
     if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
         event.update(action="none", outcome="within_threshold")
@@ -254,6 +261,13 @@ async def _sync_clock(sync: _ClockSync) -> None:
         await _emit(emit, event)
         return
     await _write_and_verify(reader, writer, target, event, operation_timeout)
+    if event.get("outcome") == "verified" and sync.info_reader is not None:
+        try:
+            info_after = await _bounded_optional(sync.info_reader(), operation_timeout)
+        except Exception:  # noqa: BLE001 - sequence evidence is best effort
+            info_after = None
+        if isinstance(info_after, RingInfo):
+            event["boundary_sequence_max"] = info_after.write_sequence
     await _emit(emit, event)
 
 

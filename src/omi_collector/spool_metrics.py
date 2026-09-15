@@ -116,8 +116,25 @@ def _current_measurements(capture_root: Path, device_slug: str) -> tuple[_Bundle
     device_root = capture_root / device_slug
     if not device_root.exists() and not device_root.is_symlink():
         return ()
-    _require_directory(device_root, "device spool")
-    return _read_artifacts(device_root, device_slug)
+    return _read_artifacts(_published_device_root(capture_root, device_root, device_slug), device_slug)
+
+
+def _published_device_root(capture_root: Path, device_root: Path, device_slug: str) -> Path:
+    if not device_root.is_symlink():
+        _require_directory(device_root, "device spool")
+        return device_root
+    target = device_root.readlink()
+    if target.is_absolute():
+        raise SpoolMetricsError("device spool generation link must be relative")
+    authority = capture_root / ".generations" / device_slug
+    try:
+        resolved = device_root.resolve(strict=True)
+        resolved_authority = authority.resolve(strict=True)
+    except OSError as error:
+        raise SpoolMetricsError("device spool generation link cannot be resolved") from error
+    if not resolved.is_dir() or resolved.parent != resolved_authority:
+        raise SpoolMetricsError("device spool generation link escapes its authority")
+    return resolved
 
 
 def _read_artifacts(device_root: Path, device_slug: str) -> tuple[_BundleMeasurement, ...]:

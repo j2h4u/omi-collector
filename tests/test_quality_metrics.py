@@ -19,6 +19,7 @@ from omi_collector.capture.adapters.quality_metrics import (
 )
 from omi_collector.capture.application.quality_metrics import (
     AdvertisementMetric,
+    ClockCorrectionMetric,
     SequenceLossMetric,
     TransferSessionMetric,
 )
@@ -74,10 +75,24 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
             "1.0.0",
         )
     )
+    journal.record_clock_correction(
+        ClockCorrectionMetric(
+            "2026-09-02T01:02:05.456+00:00",
+            "session-1",
+            "omi",
+            2359.68,
+            1789128032,
+            5898589,
+            5898591,
+            journal.release_version,
+            journal.source_revision,
+            "1.0.0",
+        )
+    )
     assert journal.close()
 
     lines = journal.path.read_text(encoding="utf-8").splitlines()
-    advertisement, transfer, loss = (cast(dict[str, object], json.loads(line)) for line in lines)
+    advertisement, transfer, loss, correction = (cast(dict[str, object], json.loads(line)) for line in lines)
     assert advertisement == {
         "schema_version": 1,
         "event": "advertisement_observation",
@@ -118,6 +133,20 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
         "missing_record_count": 3,
         "missing_raw_bytes": 1332,
         "reason": "device_cursor_advanced_before_host_durable_prefix",
+        "release_version": "1.2.3",
+        "source_revision": "abcdef123456",
+        "firmware_version": "1.0.0",
+    }
+    assert correction == {
+        "schema_version": 1,
+        "event": "clock_correction",
+        "occurred_at": "2026-09-02T01:02:05.456+00:00",
+        "session_id": "session-1",
+        "device_slug": "omi",
+        "drift_seconds": 2359.68,
+        "target_epoch": 1789128032,
+        "boundary_sequence_min": 5898589,
+        "boundary_sequence_max": 5898591,
         "release_version": "1.2.3",
         "source_revision": "abcdef123456",
         "firmware_version": "1.0.0",

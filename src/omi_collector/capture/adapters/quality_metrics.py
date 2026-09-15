@@ -13,6 +13,7 @@ from threading import Lock, Thread
 from ...config import DEFAULT_CONFIG, QualityMetricsConfig
 from ..application.quality_metrics import (
     AdvertisementMetric,
+    ClockCorrectionMetric,
     QualityMetricsPort,
     SequenceLossMetric,
     TransferSessionMetric,
@@ -66,6 +67,9 @@ class JsonlQualityMetrics(QualityMetricsPort):
         self._enqueue(metric.as_dict())
 
     def record_sequence_loss(self, metric: SequenceLossMetric) -> None:
+        self._enqueue(metric.as_dict())
+
+    def record_clock_correction(self, metric: ClockCorrectionMetric) -> None:
         self._enqueue(metric.as_dict())
 
     def close(self, timeout_seconds: float | None = None) -> bool:

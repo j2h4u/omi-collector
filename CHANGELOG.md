@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.5](https://github.com/j2h4u/omi-collector/compare/v0.5.4...v0.5.5) (2026-09-15)
+
+
+### Fixes
+
+* publish normalized Omi audio timelines ([#64](https://github.com/j2h4u/omi-collector/issues/64)) ([dc29950](https://github.com/j2h4u/omi-collector/commit/dc29950c53100f14f25b543a795a2f7d9f261aed))
+
 ## [0.5.4](https://github.com/j2h4u/omi-collector/compare/v0.5.3...v0.5.4) (2026-09-15)
 
 

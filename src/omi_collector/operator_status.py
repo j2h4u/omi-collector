@@ -70,6 +70,22 @@ _LOSS_FIELDS = frozenset(
         "firmware_version",
     }
 )
+_CLOCK_CORRECTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "event",
+        "occurred_at",
+        "session_id",
+        "device_slug",
+        "drift_seconds",
+        "target_epoch",
+        "boundary_sequence_min",
+        "boundary_sequence_max",
+        "release_version",
+        "source_revision",
+        "firmware_version",
+    }
+)
 
 
 class OperatorStatusError(ValueError):
@@ -87,6 +103,9 @@ class _QualityWindow:
     loss_events: int = 0
     missing_records: int = 0
     missing_raw_bytes: int = 0
+    clock_corrections: int = 0
+    last_clock_correction_at: str | None = None
+    last_clock_correction_drift_seconds: float | None = None
     last_advertisement_at: str | None = None
     last_advertisement_rssi_dbm: int | None = None
     last_transfer_at: str | None = None
@@ -106,8 +125,11 @@ class _QualityWindow:
             "confirmed_loss_events": self.loss_events,
             "confirmed_lost_raw_bytes": self.missing_raw_bytes,
             "confirmed_lost_records": self.missing_records,
+            "clock_corrections": self.clock_corrections,
             "last_advertisement_at": self.last_advertisement_at,
             "last_advertisement_rssi_dbm": self.last_advertisement_rssi_dbm,
+            "last_clock_correction_at": self.last_clock_correction_at,
+            "last_clock_correction_drift_seconds": self.last_clock_correction_drift_seconds,
             "last_successful_transfer_at": self.last_successful_transfer_at,
             "last_transfer_at": self.last_transfer_at,
             "last_transfer_outcome": self.last_transfer_outcome,
@@ -132,6 +154,8 @@ class _QualityAccumulator:
     loss_events: int = 0
     missing_records: int = 0
     missing_raw_bytes: int = 0
+    clock_corrections: int = 0
+    last_clock_correction: tuple[datetime, float] | None = None
     last_advertisement: tuple[datetime, int] | None = None
     last_transfer: datetime | None = None
     last_success: datetime | None = None
@@ -151,6 +175,9 @@ class _QualityAccumulator:
             loss_events=self.loss_events,
             missing_records=self.missing_records,
             missing_raw_bytes=self.missing_raw_bytes,
+            clock_corrections=self.clock_corrections,
+            last_clock_correction_at=_iso(self.last_clock_correction[0]) if self.last_clock_correction else None,
+            last_clock_correction_drift_seconds=self.last_clock_correction[1] if self.last_clock_correction else None,
             last_advertisement_at=_iso(self.last_advertisement[0]) if self.last_advertisement else None,
             last_advertisement_rssi_dbm=self.last_advertisement[1] if self.last_advertisement else None,
             last_transfer_at=_iso(self.last_transfer),
@@ -174,6 +201,7 @@ class _QualityEvent:
     active_read_elapsed_ms: int = 0
     missing_record_count: int = 0
     missing_raw_bytes: int = 0
+    drift_seconds: float | None = None
 
 
 def collect_operator_status(
@@ -357,8 +385,10 @@ def _accumulate_quality_event(
         _accumulate_advertisement(accumulator, event)
     elif event.event == "transfer_session":
         _accumulate_transfer(accumulator, event)
-    else:
+    elif event.event == "sequence_loss":
         _accumulate_loss(accumulator, event)
+    else:
+        _accumulate_clock_correction(accumulator, event)
 
 
 def _accumulate_advertisement(accumulator: _QualityAccumulator, event: _QualityEvent) -> None:
@@ -399,6 +429,15 @@ def _accumulate_loss(accumulator: _QualityAccumulator, event: _QualityEvent) -> 
     accumulator.loss_events += 1
     accumulator.missing_records += event.missing_record_count
     accumulator.missing_raw_bytes += event.missing_raw_bytes
+
+
+def _accumulate_clock_correction(accumulator: _QualityAccumulator, event: _QualityEvent) -> None:
+    drift = event.drift_seconds
+    if drift is None:
+        raise OperatorStatusError("clock correction event is incomplete")
+    accumulator.clock_corrections += 1
+    if accumulator.last_clock_correction is None or event.timestamp > accumulator.last_clock_correction[0]:
+        accumulator.last_clock_correction = (event.timestamp, drift)
 
 
 def _quality_rows(root: Path) -> list[dict[str, object]]:
@@ -484,6 +523,8 @@ def _decode_quality_event(row: dict[str, object]) -> _QualityEvent:
         return _decode_transfer(row)
     if event == "sequence_loss":
         return _decode_loss(row)
+    if event == "clock_correction":
+        return _decode_clock_correction(row)
     raise OperatorStatusError("quality journal contains unsupported event")
 
 
@@ -541,6 +582,23 @@ def _decode_loss(row: dict[str, object]) -> _QualityEvent:
         missing_record_count=_integer(row, "missing_record_count", minimum=0),
         missing_raw_bytes=_integer(row, "missing_raw_bytes", minimum=0),
     )
+
+
+def _decode_clock_correction(row: dict[str, object]) -> _QualityEvent:
+    timestamp, device_slug = _event_header(row, _CLOCK_CORRECTION_FIELDS, "occurred_at")
+    _require_string(row, "session_id")
+    _require_string(row, "release_version")
+    _source_revision(row)
+    _nullable_string(row, "firmware_version")
+    _integer(row, "target_epoch", minimum=0)
+    boundary_min = _integer(row, "boundary_sequence_min", minimum=0)
+    boundary_max = _integer(row, "boundary_sequence_max", minimum=0)
+    if boundary_max < boundary_min:
+        raise OperatorStatusError("clock correction event has invalid sequence boundary")
+    drift = row.get("drift_seconds")
+    if isinstance(drift, bool) or not isinstance(drift, int | float):
+        raise OperatorStatusError("clock correction event has invalid drift_seconds")
+    return _QualityEvent("clock_correction", timestamp, device_slug, drift_seconds=float(drift))
 
 
 def _event_header(row: dict[str, object], fields: frozenset[str], timestamp_key: str) -> tuple[datetime, str]:

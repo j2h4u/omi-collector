@@ -223,6 +223,23 @@ The collector treats missing audio as worse than duplicate audio:
 These are observed limitations of the stock CV1 firmware that materially
 affect capture. They are not properties of the external audio format.
 
+#### Recommended operating routine
+
+Keep the pendant powered on whenever possible, including while charging.
+Powering it off and back on can leave its clock substantially wrong, which in
+turn complicates the recorded timeline. If a shutdown is unavoidable, switch
+the pendant on near the collector and leave it there while the collector
+automatically corrects the clock and downloads all buffered audio.
+
+Treat each visit to the collector as one complete synchronization session.
+Place the pendant close to the Bluetooth adapter, wait until the download has
+fully drained, and only then carry it away. Avoid several short approaches and
+departures: every interrupted transfer creates another opportunity for the
+stock firmware to discard a few records before the collector has stored them.
+No manual clock or download command is required; the collector performs both
+steps automatically. Its device status should report no unread packets and a
+cleanly completed transfer before the pendant is removed.
+
 #### A transmitted packet may already be gone
 
 The stock pendant firmware advances its persisted read checkpoint while data

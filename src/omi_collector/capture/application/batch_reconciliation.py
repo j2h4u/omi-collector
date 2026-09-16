@@ -61,7 +61,6 @@ class ConcurrentAdvanceError(OpportunisticSyncError):
 @dataclass(slots=True)
 class _Batch:
     info: RingInfo | None
-    device_slug: str
     start: int
     end: int
     arena: TransferArena
@@ -97,7 +96,6 @@ class _State:
 @dataclass(frozen=True, slots=True)
 class _Run:
     staging: StagingPort
-    device_slug: str
     options: OpportunisticOptions
     runtime: CaptureRuntimePort
     quarantine_attempt: Callable[[str], Awaitable[None]]
@@ -119,12 +117,11 @@ class BatchReconciler:
     def __init__(
         self,
         staging: StagingPort,
-        device_slug: str,
         options: OpportunisticOptions,
         runtime: CaptureRuntimePort,
         quarantine_attempt: Callable[[str], Awaitable[None]],
     ) -> None:
-        self._run = _Run(staging, device_slug, options, runtime, quarantine_attempt)
+        self._run = _Run(staging, options, runtime, quarantine_attempt)
         self._state = _State()
 
     @property
@@ -334,7 +331,6 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
     arena = TransferArena(arena_start, arena_count, max_bytes=run.options.policy.arena_max_bytes)
     writer = run.runtime.make_batch_writer(
         run.staging,
-        run.device_slug,
         start,
         end - start,
         source_start=arena_start,
@@ -363,7 +359,7 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
             if not (run.runtime.is_writer_error(close_error) or isinstance(close_error, asyncio.TimeoutError)):
                 raise
         raise
-    return _Batch(current, run.device_slug, start, end, arena, writer, prepared_prefix)
+    return _Batch(current, start, end, arena, writer, prepared_prefix)
 
 
 async def _read_and_seal(
@@ -628,7 +624,6 @@ async def _publish_cursor_ahead(
                 SequenceLossMetric(
                     utc_timestamp(options.host_time()),
                     quality.session_id,
-                    batch.device_slug,
                     cursor - durable_next,
                     (cursor - durable_next) * RECORD_SIZE,
                     "device_cursor_advanced_before_host_durable_prefix",
@@ -761,7 +756,7 @@ async def _continue_after_prefix(
         )
     attempt_id = batch.writer.attempt_id
     await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
-    await asyncio.to_thread(staging.terminalize_prefix_attempt, batch.device_slug, attempt_id)
+    await asyncio.to_thread(staging.terminalize_prefix_attempt, attempt_id)
     state.batch = None
     state.pending_descriptor = None
     state.pending_durable_next = None

@@ -351,7 +351,6 @@ def test_observer_sends_read_phy_tracks_transition_and_finishes_once() -> None:
         config=config,
         clock=lambda: clock_value[0],
         terminal_callback=records.append,
-        local_name="omi",
     )
     asyncio.run(observer.start())
     assert native_bind_calls == [(37, 31, 3, 0)]

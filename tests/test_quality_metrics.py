@@ -15,7 +15,7 @@ from omi_collector.capture.adapters.quality_metrics import (
     JsonlQualityMetrics,
     QualityMetricsError,
     normalize_source_revision,
-    source_revision_from_environment,
+    source_revision_from_release_metadata,
 )
 from omi_collector.capture.application.quality_metrics import (
     AdvertisementMetric,
@@ -27,7 +27,7 @@ from omi_collector.config import QualityMetricsConfig
 
 
 def _journal(tmp_path: Path) -> JsonlQualityMetrics:
-    return JsonlQualityMetrics(tmp_path, release_version="1.2.3", source_revision="abcdef1234567890")
+    return JsonlQualityMetrics(tmp_path, release_version="1.2.3", source_revision="a" * 40)
 
 
 def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Path) -> None:
@@ -36,7 +36,6 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
         AdvertisementMetric(
             "2026-09-02T01:02:02.456+00:00",
             "session-1",
-            "omi",
             -73,
             journal.release_version,
             journal.source_revision,
@@ -47,7 +46,6 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
         TransferSessionMetric(
             "2026-09-02T01:02:03.456+00:00",
             "session-1",
-            "omi",
             "collected",
             "completed",
             1234,
@@ -66,7 +64,6 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
         SequenceLossMetric(
             "2026-09-02T01:02:04.456+00:00",
             "session-1",
-            "omi",
             3,
             1332,
             "device_cursor_advanced_before_host_durable_prefix",
@@ -79,7 +76,6 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
         ClockCorrectionMetric(
             "2026-09-02T01:02:05.456+00:00",
             "session-1",
-            "omi",
             2359.68,
             1789128032,
             5898589,
@@ -94,22 +90,20 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
     lines = journal.path.read_text(encoding="utf-8").splitlines()
     advertisement, transfer, loss, correction = (cast(dict[str, object], json.loads(line)) for line in lines)
     assert advertisement == {
-        "schema_version": 1,
+        "schema_version": 2,
         "event": "advertisement_observation",
         "recorded_at": "2026-09-02T01:02:02.456+00:00",
         "session_id": "session-1",
-        "device_slug": "omi",
         "advertisement_rssi_dbm": -73,
         "release_version": "1.2.3",
-        "source_revision": "abcdef123456",
+        "source_revision": "aaaaaaaaaaaa",
         "phy_policy": "force_1m",
     }
     assert transfer == {
-        "schema_version": 1,
+        "schema_version": 2,
         "event": "transfer_session",
         "completed_at": "2026-09-02T01:02:03.456+00:00",
         "session_id": "session-1",
-        "device_slug": "omi",
         "outcome": "collected",
         "termination_class": "completed",
         "active_read_elapsed_ms": 1234,
@@ -119,51 +113,51 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
         "submitted_raw_bytes": 888,
         "written_raw_bytes": 888,
         "release_version": "1.2.3",
-        "source_revision": "abcdef123456",
+        "source_revision": "aaaaaaaaaaaa",
         "firmware_version": "1.0.0",
         "phy_policy": "force_1m",
         "advertisement_rssi_dbm": -73,
     }
     assert loss == {
-        "schema_version": 1,
+        "schema_version": 2,
         "event": "sequence_loss",
         "occurred_at": "2026-09-02T01:02:04.456+00:00",
         "session_id": "session-1",
-        "device_slug": "omi",
         "missing_record_count": 3,
         "missing_raw_bytes": 1332,
         "reason": "device_cursor_advanced_before_host_durable_prefix",
         "release_version": "1.2.3",
-        "source_revision": "abcdef123456",
+        "source_revision": "aaaaaaaaaaaa",
         "firmware_version": "1.0.0",
     }
     assert correction == {
-        "schema_version": 1,
+        "schema_version": 2,
         "event": "clock_correction",
         "occurred_at": "2026-09-02T01:02:05.456+00:00",
         "session_id": "session-1",
-        "device_slug": "omi",
         "drift_seconds": 2359.68,
         "target_epoch": 1789128032,
         "boundary_sequence_min": 5898589,
         "boundary_sequence_max": 5898591,
         "release_version": "1.2.3",
-        "source_revision": "abcdef123456",
+        "source_revision": "aaaaaaaaaaaa",
         "firmware_version": "1.0.0",
     }
     assert "loss_seconds" not in journal.path.read_text(encoding="utf-8")
     assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
 
 
-@pytest.mark.parametrize("value", ["ABCDEF1", "abcdef", "abcdef1-", "abcdef1 "])
+@pytest.mark.parametrize("value", ["A" * 40, "a" * 39, "a" * 65, "a" * 39 + "-"])
 def test_source_revision_requires_deployment_provided_lowercase_hex(value: str) -> None:
     with pytest.raises(ValueError, match="lowercase hexadecimal"):
         normalize_source_revision(value)
 
 
-def test_source_revision_is_read_only_from_deployment_environment() -> None:
-    assert source_revision_from_environment({"OMI_COLLECTOR_SOURCE_REVISION": "abcdef1234567890"}) == "abcdef123456"
-    assert source_revision_from_environment({}) is None
+def test_source_revision_is_read_from_release_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "release.json"
+    path.write_text(json.dumps({"source_revision": "a" * 40}), encoding="utf-8")
+    assert source_revision_from_release_metadata(path) == "a" * 12
+    assert source_revision_from_release_metadata(tmp_path / "missing.json") is None
 
 
 def test_journal_write_failure_is_reported_as_a_visible_diagnostic(
@@ -176,7 +170,7 @@ def test_journal_write_failure_is_reported_as_a_visible_diagnostic(
 
     monkeypatch.setattr(os, "open", fail_open)
     journal.record_sequence_loss(
-        SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", "omi", 1, 444, "reason", "1", None, None)
+        SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
     )
     assert journal.close()
     assert "quality metrics write_failed" in caplog.text
@@ -188,7 +182,7 @@ def test_journal_rotates_complete_records_with_bounded_retention(tmp_path: Path)
         release_version="1.2.3",
         config=QualityMetricsConfig(max_bytes=400, backup_count=2, max_record_bytes=399),
     )
-    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", "omi", 1, 444, "reason", "1", None, None)
+    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
 
     journal.record_sequence_loss(metric)
     journal.record_sequence_loss(metric)
@@ -211,7 +205,7 @@ def test_journal_rejects_oversized_record_before_opening_file(tmp_path: Path) ->
     )
     with pytest.raises(QualityMetricsError, match="exceeds configured limit"):
         journal.record_sequence_loss(
-            SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", "omi", 1, 444, "reason", "1", None, None)
+            SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
         )
     assert not journal.path.exists()
     assert journal.close()
@@ -230,7 +224,7 @@ def test_first_journal_creation_fsyncs_parent_after_file(tmp_path: Path, monkeyp
     monkeypatch.setattr(os, "fsync", observe_fsync)
     monkeypatch.setattr(quality_metrics_module, "_fsync_parent", observe_parent)
     journal.record_sequence_loss(
-        SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", "omi", 1, 444, "reason", "1", None, None)
+        SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
     )
     assert journal.close()
     assert events == ["file", "parent"]
@@ -248,7 +242,7 @@ def test_record_does_not_wait_for_a_blocked_filesystem_writer(tmp_path: Path, mo
         original_append(line)
 
     monkeypatch.setattr(journal, "_append", blocked_append)
-    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", "omi", 1, 444, "reason", "1", None, None)
+    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
     start = time.monotonic()
     journal.record_sequence_loss(metric)
     elapsed = time.monotonic() - start
@@ -273,7 +267,7 @@ def test_close_races_with_enqueue_without_losing_the_ordered_stop(
         original_put(item)
 
     monkeypatch.setattr(journal._queue, "put_nowait", paused_put)
-    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", "omi", 1, 444, "reason", "1", None, None)
+    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
     producer = threading.Thread(target=journal.record_sequence_loss, args=(metric,))
     producer.start()
     assert entered.wait(1)
@@ -301,7 +295,7 @@ def test_full_queue_drops_auxiliary_event_without_blocking(
         release.wait(5)
 
     monkeypatch.setattr(journal, "_append", blocked_append)
-    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", "omi", 1, 444, "reason", "1", None, None)
+    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
     journal.record_sequence_loss(metric)
     assert started.wait(1)
     journal.record_sequence_loss(metric)

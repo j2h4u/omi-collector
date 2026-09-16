@@ -47,15 +47,13 @@ def _record(marker: int) -> bytes:
 
 
 def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, count)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
 
 def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(
-        "omi_cv1", 100, count
-    )
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
@@ -114,20 +112,17 @@ class _RecordingStream:
 def test_device_lock_quarantines_hard_crash_publication_leftover(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    publishing = capture_root / "omi_cv1"
-    publishing.mkdir(parents=True)
-    leftover = publishing / ".100-101-deadbeef.tmp"
+    capture_root.mkdir(parents=True)
+    leftover = capture_root / ".100-101-deadbeef.tmp"
     leftover.mkdir()
     payload = _record(1)
     (leftover / "records.bin").write_bytes(payload)
 
-    with StagingStore(spool, capture_root).device_lock("omi_cv1"):
+    with StagingStore(spool, capture_root).device_lock():
         pass
 
     assert not leftover.exists()
-    quarantined = tuple(
-        path for path in (spool / "quarantine" / "omi_cv1").glob("capture-temporary-*") if path.is_dir()
-    )
+    quarantined = tuple(path for path in (spool / "quarantine").glob("capture-temporary-*") if path.is_dir())
     assert len(quarantined) == 1
     assert (quarantined[0] / "records.bin").read_bytes() == payload
     assert (quarantined[0] / "unprocessable.json").is_file()
@@ -136,14 +131,14 @@ def test_device_lock_quarantines_hard_crash_publication_leftover(tmp_path: Path)
 def test_device_lock_finalizes_complete_capture_local_publication_temporary(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
     result = attempt.seal(DoneNotification(0, 101))
     temporary = result.bundle_path.with_name(f".{result.bundle_path.name}.{'a' * 32}.tmp")
     result.bundle_path.replace(temporary)
 
-    with StagingStore(spool, capture_root).device_lock("omi_cv1"):
+    with StagingStore(spool, capture_root).device_lock():
         pass
 
     assert result.bundle_path.is_dir()
@@ -158,17 +153,17 @@ def test_sweep_quarantine_deletes_terminal_evidence_after_shared_retention(
     monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
     config = CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0))
     store = StagingStore(tmp_path, _capture_root(tmp_path), config=config)
-    root = tmp_path / "quarantine" / "omi_cv1"
+    root = tmp_path / "quarantine"
     published = root / "published-source"
     unprocessable = root / "unprocessable-source"
     published.mkdir(parents=True)
     unprocessable.mkdir()
-    store.mark_quarantine_published("omi_cv1", published)
-    store.mark_quarantine_unprocessable("omi_cv1", unprocessable, "strict proof failed")
+    store.mark_quarantine_published(published)
+    store.mark_quarantine_unprocessable(unprocessable, "strict proof failed")
 
     now += 72_000_000_000
 
-    assert set(store.sweep_terminal_quarantine("omi_cv1")) == {published, unprocessable}
+    assert set(store.sweep_terminal_quarantine()) == {published, unprocessable}
     assert not published.exists()
     assert not unprocessable.exists()
 
@@ -178,12 +173,11 @@ def test_device_lock_rejects_symlink_publishing_root(tmp_path: Path) -> None:
     capture_root = _capture_root(tmp_path)
     outside = tmp_path / "outside-publishing"
     outside.mkdir()
-    (capture_root / "omi_cv1").parent.mkdir(parents=True)
-    (capture_root / "omi_cv1").symlink_to(outside, target_is_directory=True)
+    capture_root.symlink_to(outside, target_is_directory=True)
 
     with (
-        pytest.raises(StagingError, match="capture device root"),
-        StagingStore(spool, capture_root).device_lock("omi_cv1"),
+        pytest.raises(StagingError, match="capture root"),
+        StagingStore(spool, capture_root).device_lock(),
     ):
         pass
 
@@ -199,14 +193,14 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
     config = CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0))
     monkeypatch.setattr(quarantine_module, "_wall_clock_ns", wall_clock_ns)
     store = StagingStore(tmp_path, _capture_root(tmp_path), config=config)
-    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 2)
+    attempt = store.prepare_streaming_attempt(100, 2)
     attempt.record_read_begin(ReadBeginNotification(100, 2))
     attempt.append_record(0, 100, _record(1))
     attempt.checkpoint()
     result = attempt.publish_prefix()
     assert result is not None
     attempt.close(durable=True)
-    store.terminalize_prefix_attempt("omi_cv1", attempt.attempt_id)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
 
     marker = cast(dict[str, object], loads((attempt.path / "terminal-retired.json").read_text(encoding="utf-8")))
     assert marker == {
@@ -215,17 +209,17 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
         "terminalized_at_unix_ns": now,
     }
     rmtree(result.bundle_path)
-    active = store.prepare_streaming_attempt("omi_cv1", 200, 1)
-    quarantine = tmp_path / "quarantine" / "omi_cv1"
+    active = store.prepare_streaming_attempt(200, 1)
+    quarantine = tmp_path / "quarantine"
     quarantine.mkdir(parents=True)
     preserved = quarantine / "preserved"
     preserved.write_text("evidence", encoding="utf-8")
 
-    assert store.pending_attempts("omi_cv1") == (active.descriptor,)
-    assert store.sweep_terminal_retired("omi_cv1") == ()
+    assert store.pending_attempts() == (active.descriptor,)
+    assert store.sweep_terminal_retired() == ()
     assert attempt.path.exists()
     now += 72_000_000_000
-    assert store.sweep_terminal_retired("omi_cv1") == (attempt.path,)
+    assert store.sweep_terminal_retired() == (attempt.path,)
     assert not attempt.path.exists()
     assert active.path.exists()
     assert preserved.read_text(encoding="utf-8") == "evidence"
@@ -244,20 +238,20 @@ def test_terminal_retired_sweep_does_not_rehash_records_before_delete(
             staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
         ),
     )
-    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 5)
+    attempt = store.prepare_streaming_attempt(100, 5)
     attempt.record_read_begin(ReadBeginNotification(100, 5))
     attempt.accept_chunk(100, memoryview(b"x" * (5 * RECORD_SIZE)))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
-    store.terminalize_prefix_attempt("omi_cv1", attempt.attempt_id)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
     now += 1_000_000_000
     monkeypatch.setattr(
         quarantine_module,
         "_published_prefix",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("retired records were rehashed")),
     )
-    assert store.sweep_terminal_retired("omi_cv1") == (attempt.path,)
+    assert store.sweep_terminal_retired() == (attempt.path,)
     assert not attempt.path.exists()
 
 
@@ -270,13 +264,13 @@ def test_quarantine_attempt_source_preserves_only_existing_attempt_files(tmp_pat
     expected_files = {path.name for path in attempt.path.iterdir()}
     attempt.close(durable=True)
 
-    destination = store.quarantine_attempt_source("omi_cv1", attempt_id)
+    destination = store.quarantine_attempt_source(attempt_id)
 
     assert not attempt.path.exists()
     assert destination.name.startswith(f"{attempt_id}-")
     assert {path.name for path in destination.iterdir()} == expected_files
     assert tuple(destination.parent.iterdir()) == (destination,)
-    assert not store.pending_attempts("omi_cv1")
+    assert not store.pending_attempts()
 
 
 def test_streaming_partial_close_is_preserved_and_blocks_pending(tmp_path: Path) -> None:
@@ -291,25 +285,26 @@ def test_streaming_partial_close_is_preserved_and_blocks_pending(tmp_path: Path)
     with pytest.raises(AttemptStateError, match="preserved partial evidence"):
         reopened.append_record(1, 101, _record(2))
     with pytest.raises(PendingAttemptError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending("omi_cv1")
+        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
     assert attempt.path.exists()
 
 
 def test_pending_attempts_fail_closed_on_unattributed_malformed_evidence(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt("omi_cv1", 100, 2)
+    matching = store.prepare_streaming_attempt(100, 2)
 
-    assert store.pending_attempts("omi_cv1") == (matching.descriptor,)
+    assert store.pending_attempts() == (matching.descriptor,)
     with pytest.raises(PendingAttemptError, match="blocks another READ"):
-        store.assert_no_pending("omi_cv1")
+        store.assert_no_pending()
 
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir()
     (malformed / "attempt.json").write_text("{", encoding="utf-8")
     with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts("other")
-    moved = store.quarantine_pending("other", "unattributed malformed evidence")
-    assert len(moved) == 1
+        store.pending_attempts()
+    moved = store.quarantine_pending("unattributed malformed evidence")
+    assert len(moved) == 2
+    assert not matching.path.exists()
     assert not malformed.exists()
 
 
@@ -318,12 +313,12 @@ def test_pending_attempts_fail_closed_on_invalid_malformed_attribution(tmp_path:
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir(parents=True)
     (malformed / "attempt.json").write_text(
-        dumps({"attempt_id": malformed.name, "device_slug": "../bad"}), encoding="utf-8"
+        dumps({"attempt_id": malformed.name, "schema_version": 2}), encoding="utf-8"
     )
 
     with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts("omi_cv1")
-    moved = store.quarantine_pending("omi_cv1", "invalid descriptor attribution")
+        store.pending_attempts()
+    moved = store.quarantine_pending("invalid descriptor attribution")
     assert len(moved) == 1
     assert not malformed.exists()
     assert (moved[0].with_name(f"{moved[0].name}.json")).is_file()
@@ -333,66 +328,65 @@ def test_attributable_malformed_evidence_is_quarantined_without_read_authorizati
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir(parents=True)
-    descriptor = dumps({"attempt_id": malformed.name, "device_slug": "omi_cv1"})
+    descriptor = dumps({"attempt_id": malformed.name, "schema_version": 2})
     (malformed / "attempt.json").write_text(descriptor, encoding="utf-8")
     (malformed / "records.bin").write_bytes(b"unverified bytes")
     before = {path.name: path.read_bytes() for path in malformed.iterdir()}
 
     with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts("omi_cv1")
-    moved = store.quarantine_pending("omi_cv1", "malformed descriptor")
+        store.pending_attempts()
+    moved = store.quarantine_pending("malformed descriptor")
 
     assert len(moved) == 1
     assert not malformed.exists()
     assert {path.name: path.read_bytes() for path in moved[0].iterdir() if path.name != "unprocessable.json"} == before
-    store.assert_no_pending("omi_cv1")
+    store.assert_no_pending()
 
 
-def test_quarantine_pending_moves_blockers_and_preserves_unrelated_and_retired(tmp_path: Path) -> None:
+def test_quarantine_pending_moves_all_blockers_and_preserves_retired(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt("omi_cv1", 100, 2)
-    unrelated = store.prepare_streaming_attempt("other", 200, 2)
-    published = store.prepare_streaming_attempt("omi_cv1", 300, 1)
+    matching = store.prepare_streaming_attempt(100, 2)
+    unrelated = store.prepare_streaming_attempt(200, 2)
+    published = store.prepare_streaming_attempt(300, 1)
     assert published.publish_prefix() is None
     published.close(durable=True)
-    store.terminalize_prefix_attempt("omi_cv1", published.attempt_id)
+    store.terminalize_prefix_attempt(published.attempt_id)
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir()
     (malformed / "attempt.json").write_text("{", encoding="utf-8")
 
-    moved = store.quarantine_pending("omi_cv1", "manual recovery")
+    moved = store.quarantine_pending("manual recovery")
 
-    assert len(moved) == 2
+    assert len(moved) == 3
     assert not matching.path.exists()
     assert not malformed.exists()
-    assert unrelated.path.exists()
+    assert not unrelated.path.exists()
     assert published.path.exists()
     assert (published.path / "terminal-retired.json").is_file()
-    assert store.pending_attempts("omi_cv1") == ()
-    assert store.pending_attempts("other") == (unrelated.descriptor,)
+    assert store.pending_attempts() == ()
 
 
 def test_direct_quarantine_function_uses_concrete_filesystem(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt("omi_cv1", 100, 1)
+    matching = store.prepare_streaming_attempt(100, 1)
 
-    moved = quarantine_module.quarantine_pending(store._filesystem, "omi_cv1", "direct call")
+    moved = quarantine_module.quarantine_pending(store._filesystem, "direct call")
 
     assert len(moved) == 1
-    assert moved[0].parent == tmp_path / "quarantine" / "omi_cv1"
+    assert moved[0].parent == tmp_path / "quarantine"
     assert not matching.path.exists()
 
 
 def test_quarantine_a_does_not_move_unattributed_entry_during_b_lease(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt("omi_cv1", 100, 2)
+    matching = store.prepare_streaming_attempt(100, 2)
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir()
     before = malformed / "evidence"
     before.write_bytes(b"unattributed")
 
-    with store.device_lock("other"), pytest.raises(DeviceAlreadyRunningError):
-        store.quarantine_pending("omi_cv1", "race recovery")
+    with store.device_lock(), pytest.raises(DeviceAlreadyRunningError):
+        store.quarantine_pending("race recovery")
 
     assert matching.path.exists()
     assert malformed.is_dir()
@@ -409,7 +403,7 @@ def test_quarantine_pending_moves_symlink_without_following_it(tmp_path: Path) -
     link = tmp_path / "attempts" / "link"
     link.symlink_to(target)
 
-    moved = store.quarantine_pending("omi_cv1", "symlink recovery")
+    moved = store.quarantine_pending("symlink recovery")
 
     assert len(moved) == 1
     assert moved[0].is_symlink()
@@ -435,10 +429,10 @@ def test_opaque_quarantine_entries_expire_after_terminal_retention(
     opaque_link = tmp_path / "attempts" / "opaque-link"
     opaque_link.symlink_to(target)
 
-    moved = store.quarantine_pending("omi_cv1", "opaque evidence")
+    moved = store.quarantine_pending("opaque evidence")
     now += 72_000_000_000
 
-    assert set(store.sweep_terminal_quarantine("omi_cv1")) == set(moved)
+    assert set(store.sweep_terminal_quarantine()) == set(moved)
     assert not opaque_dir.exists()
     assert not opaque_link.is_symlink()
     assert target.read_bytes() == b"preserve"
@@ -447,24 +441,24 @@ def test_opaque_quarantine_entries_expire_after_terminal_retention(
 def test_quarantine_pending_rejects_active_lease(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
 
-    with store.device_lock("omi_cv1"), pytest.raises(DeviceAlreadyRunningError):
-        store.quarantine_pending("omi_cv1", "manual recovery")
+    with store.device_lock(), pytest.raises(DeviceAlreadyRunningError):
+        store.quarantine_pending("manual recovery")
 
 
 def test_pending_checks_empty_and_rejects_malformed_roots(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    store.assert_no_pending("omi_cv1")
+    store.assert_no_pending()
 
     partial = tmp_path / "attempts"
     partial.write_text("not a directory", encoding="utf-8")
     with pytest.raises(PendingAttemptError, match="not a directory"):
-        store.pending_attempts("omi_cv1")
+        store.pending_attempts()
     partial.unlink()
     target = tmp_path / "partial-target"
     target.mkdir()
     partial.symlink_to(target, target_is_directory=True)
     with pytest.raises(PendingAttemptError, match="not a directory"):
-        store.pending_attempts("omi_cv1")
+        store.pending_attempts()
 
 
 @pytest.mark.parametrize("root_kind", ["file", "symlink"])
@@ -481,10 +475,10 @@ def test_quarantine_pending_moves_unsafe_partial_root_and_recreates_it(tmp_path:
 
     if root_kind == "symlink":
         with pytest.raises(StagingError, match="attempts root must not be a symlink"):
-            store.quarantine_pending("omi_cv1", "root recovery")
+            store.quarantine_pending("root recovery")
         return
 
-    moved = store.quarantine_pending("omi_cv1", "root recovery")
+    moved = store.quarantine_pending("root recovery")
 
     assert len(moved) == 1
     assert moved[0].name.startswith("attempts-")
@@ -497,7 +491,7 @@ def test_quarantine_pending_moves_unsafe_partial_root_and_recreates_it(tmp_path:
     assert partial.is_dir()
     assert not partial.is_symlink()
     assert tuple(partial.iterdir()) == ()
-    assert store.pending_attempts("omi_cv1") == ()
+    assert store.pending_attempts() == ()
 
 
 def test_pending_sealed_looking_partial_requires_the_real_destination_bundle(tmp_path: Path) -> None:
@@ -509,7 +503,7 @@ def test_pending_sealed_looking_partial_requires_the_real_destination_bundle(tmp
     (attempt.path / "receipt.json").write_text(dumps(attempt._receipt(raw_hash)), encoding="utf-8")
 
     with pytest.raises(PendingAttemptError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending("omi_cv1")
+        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
 
 
 def test_pending_partial_with_a_corrupt_destination_bundle_remains_blocking(tmp_path: Path) -> None:
@@ -526,26 +520,26 @@ def test_pending_partial_with_a_corrupt_destination_bundle_remains_blocking(tmp_
     (attempt.path / "receipt.json").write_text(dumps(attempt._receipt(raw_hash)), encoding="utf-8")
 
     with pytest.raises(PendingAttemptError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending("omi_cv1")
+        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
 
 
 def test_device_lock_is_exclusive_and_released_after_an_error(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    with store.device_lock("omi_cv1"), pytest.raises(DeviceAlreadyRunningError), store.device_lock("omi_cv1"):
+    with store.device_lock(), pytest.raises(DeviceAlreadyRunningError), store.device_lock():
         pass
-    with store.device_lock("omi_cv1"):
+    with store.device_lock():
         pass
 
 
 def test_device_lock_rejects_forged_cross_store_expired_and_reused_leases(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     other = StagingStore(tmp_path / "other", tmp_path / "other-captures")
-    forged = DeviceLock(store._filesystem, "omi_cv1")
-    cross_store = DeviceLock(other._filesystem, "omi_cv1")
+    forged = DeviceLock(store._filesystem)
+    cross_store = DeviceLock(other._filesystem)
 
     with pytest.raises(AttemptStateError, match="active spool lock"):
         forged.require_active()
-    with store.device_lock("omi_cv1") as active:
+    with store.device_lock() as active:
         active.require_active()
         with pytest.raises(AttemptStateError, match="active spool lock"):
             forged.require_active()
@@ -563,17 +557,17 @@ def test_pending_ignores_non_directory_entries_and_reports_iterdir_errors(
     partial.mkdir()
     (partial / "evidence.txt").write_text("preserve", encoding="utf-8")
     with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts("omi_cv1")
+        store.pending_attempts()
 
     entry = partial / "linked-evidence"
     entry_target = tmp_path / "entry-target"
     entry_target.mkdir()
     entry.symlink_to(entry_target, target_is_directory=True)
     with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts("omi_cv1")
-    moved = store.quarantine_pending("omi_cv1", "opaque local evidence")
+        store.pending_attempts()
+    moved = store.quarantine_pending("opaque local evidence")
     assert len(moved) == 2
-    assert all(path.parent == tmp_path / "quarantine" / "omi_cv1" for path in moved)
+    assert all(path.parent == tmp_path / "quarantine" for path in moved)
     assert all(not path.is_symlink() for path in partial.iterdir())
     assert entry_target.is_dir()
 
@@ -586,4 +580,4 @@ def test_pending_ignores_non_directory_entries_and_reports_iterdir_errors(
 
     monkeypatch.setattr(Path, "iterdir", fail_iterdir)
     with pytest.raises(PendingAttemptError, match="cannot be inspected"):
-        store.pending_attempts("omi_cv1")
+        store.pending_attempts()

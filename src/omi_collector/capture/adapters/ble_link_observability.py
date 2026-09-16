@@ -255,7 +255,6 @@ class BleLinkSessionRecord:
     disconnect_reason_hex: str | None
     disconnect_reason_name: str | None
     disconnect_class: str | None
-    local_name: str | None
     observer_status: str
     dropped_packets: int
 
@@ -286,7 +285,6 @@ class BleLinkSessionRecord:
             "disconnect_reason_hex": self.disconnect_reason_hex,
             "disconnect_reason_name": self.disconnect_reason_name,
             "disconnect_class": self.disconnect_class,
-            "local_name": self.local_name,
             "observer_status": self.observer_status,
             "dropped_packets": self.dropped_packets,
         }
@@ -618,7 +616,6 @@ class BleLinkObserver:
         *,
         adapter: str = DEFAULT_CONFIG.ble.adapter_name,
         phy_policy: str = "auto",
-        local_name: str | None = None,
         config: BleConfig = DEFAULT_CONFIG.ble,
         socket_factory: SocketFactory | None = None,
         native_bind: HciBinder | None = None,
@@ -632,7 +629,6 @@ class BleLinkObserver:
         self.address = normalize_address(address)
         self.adapter = adapter
         self.phy_policy = phy_policy
-        self.local_name = local_name[: config.observer_max_local_name_chars] if local_name else None
         self.config = config
         self._socket_factory = socket_factory or socket.socket
         self._native_bind = native_bind or _native_hci_bind
@@ -1040,7 +1036,6 @@ class BleLinkObserver:
             f"0x{reason:02x}" if reason is not None else None,
             _disconnect_reason_name(reason),
             _disconnect_class(reason),
-            self.local_name,
             self.observer_status,
             self.dropped_packets,
         )

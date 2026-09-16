@@ -59,7 +59,6 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.observability.quality_metrics.max_bytes == 8 * 1024 * 1024
     assert DEFAULT_CONFIG.observability.quality_metrics.backup_count == 3
     assert DEFAULT_CONFIG.observability.quality_metrics.max_record_bytes == 1 * 1024 * 1024
-    assert DEFAULT_CONFIG.observability.quality_metrics.source_revision_env == "OMI_COLLECTOR_SOURCE_REVISION"
     assert DEFAULT_CONFIG.phy.reap_timeout_seconds == 5.0
     assert DEFAULT_CONFIG.service.max_records == 256
     with pytest.raises(FrozenInstanceError):

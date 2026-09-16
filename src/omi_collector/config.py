@@ -199,7 +199,6 @@ class BleConfig:
     observer_max_data_length_transitions: int = 8
     observer_max_connection_parameter_requests: int = 8
     observer_max_connection_parameter_updates: int = 8
-    observer_max_local_name_chars: int = 64
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -219,7 +218,6 @@ class BleConfig:
             ("observer_max_data_length_transitions", self.observer_max_data_length_transitions),
             ("observer_max_connection_parameter_requests", self.observer_max_connection_parameter_requests),
             ("observer_max_connection_parameter_updates", self.observer_max_connection_parameter_updates),
-            ("observer_max_local_name_chars", self.observer_max_local_name_chars),
         ):
             _require_positive_int(value, name)
 
@@ -305,7 +303,6 @@ class QualityMetricsConfig:
     queue_max_records: int = 64
     shutdown_join_seconds: float = 1.0
     encoding: str = "utf-8"
-    source_revision_env: str = "OMI_COLLECTOR_SOURCE_REVISION"
 
     def __post_init__(self) -> None:
         _require_path_component(self.file_name, "file_name")
@@ -317,7 +314,6 @@ class QualityMetricsConfig:
         _require_positive_int(self.queue_max_records, "queue_max_records")
         _require_positive_float(self.shutdown_join_seconds, "shutdown_join_seconds")
         _require_encoding(self.encoding, "encoding")
-        _require_logger_name(self.source_revision_env.lower(), "source_revision_env")
 
 
 @dataclass(frozen=True, slots=True)

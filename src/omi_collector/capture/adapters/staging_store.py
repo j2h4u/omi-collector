@@ -25,7 +25,6 @@ from .staging_contract import (
     _validate_attempt_id,
     _validate_count,
     _validate_int,
-    _validate_slug,
 )
 from .staging_filesystem import (
     DeviceLock,
@@ -77,13 +76,13 @@ class StagingStore:
         store._publication_root = publication_root
         return store
 
-    def publish_timeline(self, device_slug: str) -> object | None:
+    def publish_timeline(self) -> object | None:
         """Publish a complete normalized view when this store has an external boundary."""
         if self._publication_root is None:
             return None
         from .timeline_generations import publish_from_ledger
 
-        return publish_from_ledger(self.capture_root, self._publication_root, self.paths.root, device_slug)
+        return publish_from_ledger(self.capture_root, self._publication_root, self.paths.root)
 
     @property
     def capture_root(self) -> Path:
@@ -106,95 +105,74 @@ class StagingStore:
         """Validate and durably probe storage before any device operation starts."""
         self._filesystem.preflight_storage()
 
-    def quarantine_pending(self, device_slug: str, reason: str) -> tuple[Path, ...]:
-        moved = quarantine.quarantine_pending(
-            self._filesystem,
-            device_slug,
-            reason,
-        )
+    def quarantine_pending(self, reason: str) -> tuple[Path, ...]:
+        moved = quarantine.quarantine_pending(self._filesystem, reason)
         for attempt_id, attempt in tuple(self._validated_attempts.items()):
             if not attempt.path.exists():
                 self._validated_attempts.pop(attempt_id, None)
                 attempt.close()
         return moved
 
-    def quarantine_attempt_source(self, device_slug: str, attempt_id: str) -> Path:
+    def quarantine_attempt_source(self, attempt_id: str) -> Path:
         cached = self._validated_attempts.pop(attempt_id, None)
         if cached is not None:
             cached.close()
         return quarantine.quarantine_attempt_source(
             self._filesystem,
-            device_slug,
             attempt_id,
         )
 
-    def terminalize_prefix_attempt(self, device_slug: str, attempt_id: str) -> None:
+    def terminalize_prefix_attempt(self, attempt_id: str) -> None:
         quarantine.terminalize_prefix_attempt(
             self._filesystem,
-            device_slug,
             attempt_id,
         )
 
-    def sweep_terminal_retired(
-        self, device_slug: str, *, should_defer: Callable[[], bool] | None = None
-    ) -> tuple[Path, ...]:
+    def sweep_terminal_retired(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.sweep_terminal_retired(
             self._filesystem,
-            device_slug,
             should_defer=should_defer or _never_defer,
         )
 
-    def quarantined_attempts(
-        self, device_slug: str, *, should_defer: Callable[[], bool] | None = None
-    ) -> tuple[Path, ...]:
+    def quarantined_attempts(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.quarantined_attempts(
             self._filesystem,
-            device_slug,
             should_defer=should_defer or _never_defer,
         )
 
-    def mark_quarantine_published(self, device_slug: str, source: Path) -> None:
+    def mark_quarantine_published(self, source: Path) -> None:
         quarantine.mark_quarantine_published(
             self._filesystem,
-            device_slug,
             source,
         )
 
-    def mark_quarantine_unprocessable(self, device_slug: str, source: Path, reason: str) -> None:
+    def mark_quarantine_unprocessable(self, source: Path, reason: str) -> None:
         quarantine.mark_quarantine_unprocessable(
             self._filesystem,
-            device_slug,
             source,
             reason,
         )
 
-    def sweep_terminal_quarantine(
-        self, device_slug: str, *, should_defer: Callable[[], bool] | None = None
-    ) -> tuple[Path, ...]:
+    def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.sweep_terminal_quarantine(
             self._filesystem,
-            device_slug,
             should_defer=should_defer or _never_defer,
         )
 
-    def assert_no_pending(self, device_slug: str) -> None:
-        quarantine.assert_no_pending(
-            self._filesystem,
-            device_slug,
-        )
+    def assert_no_pending(self) -> None:
+        quarantine.assert_no_pending(self._filesystem)
 
-    def prepare_streaming_attempt(self, device_slug: str, start_sequence: int, packet_count: int) -> StagedAttempt:
+    def prepare_streaming_attempt(self, start_sequence: int, packet_count: int) -> StagedAttempt:
         """Prepare a restart-safe streaming attempt and its empty checkpoint."""
         # Mirrors the app's buffered/full-read transfer model:
         # https://github.com/BasedHardware/omi/blob/6f7c57ac1545c1931c806a01605646405d398198/app/lib/services/wals/ring_storage_sync.dart#L545-L608
         _validate_int(start_sequence, "start_sequence")
         _validate_count(packet_count)
-        _validate_slug(device_slug)
-        self._filesystem._preflight(packet_count, device_slug)
+        self._filesystem._preflight(packet_count)
         self._filesystem._ensure_directory(self.attempts_root)
         descriptor = AttemptDescriptor(
             uuid4().hex,
-            device_slug,
+            2,
             start_sequence,
             packet_count,
         )
@@ -236,7 +214,7 @@ class StagingStore:
             previous.close()
         self._validated_attempts[attempt_id] = attempt
 
-    def resume_streaming_attempt(self, device_slug: str, lease: DeviceLock) -> StagedAttempt | None:
+    def resume_streaming_attempt(self, lease: DeviceLock) -> StagedAttempt | None:
         """Validate and reopen the unique streaming partial under an active lease.
 
         ``open_attempt`` is deliberately inspection-only.  This consuming seam
@@ -244,11 +222,11 @@ class StagingStore:
         promote complete raw tail records into the durable checkpoint.
         """
         lease.require_active()
-        if lease.filesystem is not self._filesystem or lease.device_slug != device_slug:
-            raise AttemptStateError("resume requires this device's active spool lock")
-        candidates = self.pending_attempts(device_slug)
+        if lease.filesystem is not self._filesystem:
+            raise AttemptStateError("resume requires the active spool lock")
+        candidates = self.pending_attempts()
         if len(candidates) > 1:
-            raise PendingAttemptError(f"multiple partial attempts block resume for {device_slug}")
+            raise PendingAttemptError("multiple partial attempts block resume")
         if not candidates:
             return None
         descriptor = candidates[0]
@@ -269,31 +247,28 @@ class StagingStore:
         except StagingError as error:
             return Recovery(attempt_id, 0, _file_size(attempt_path / _RAW_NAME), False, str(error))
 
-    def pending_attempts(self, device_slug: str) -> tuple[AttemptDescriptor, ...]:
-        return quarantine.pending_attempts(self._filesystem, device_slug)
+    def pending_attempts(self) -> tuple[AttemptDescriptor, ...]:
+        return quarantine.pending_attempts(self._filesystem)
 
     @contextmanager
     def device_lock(
         self,
-        device_slug: str,
         *,
         recover_capture_temporaries: bool = True,
     ) -> Iterator[DeviceLock]:
         """Acquire the filesystem lease, then sequence publication recovery and quarantine."""
-        _validate_slug(device_slug)
-        with self._filesystem.device_lock(device_slug) as lease:
+        with self._filesystem.device_lock() as lease:
             if recover_capture_temporaries:
-                unsafe = publication.recover_capture_temporaries(self._filesystem, device_slug)
-                for temporary, device_root, reason in unsafe:
+                unsafe = publication.recover_capture_temporaries(self._filesystem)
+                for temporary, capture_root, reason in unsafe:
                     quarantine.quarantine_capture_temporary(
                         self._filesystem,
                         temporary,
-                        device_root,
-                        device_slug,
+                        capture_root,
                         reason,
                     )
             yield lease
 
-    def require_device_lock(self, device_slug: str, lease: DeviceLock) -> None:
+    def require_device_lock(self, lease: DeviceLock) -> None:
         """Reject consuming operations that are not protected by this active lease."""
-        self._filesystem.require_device_lock(device_slug, lease)
+        self._filesystem.require_device_lock(lease)

@@ -37,7 +37,7 @@ def _record(value: int) -> bytes:
 
 
 def _seed_streaming_partial(store: StagingStore, count: int) -> bytes:
-    attempt = store.prepare_streaming_attempt("omi", 100, count)
+    attempt = store.prepare_streaming_attempt(100, count)
     records = b"".join(_record(sequence) for sequence in range(100, 100 + count))
     attempt.record_read_begin(ReadBeginNotification(100, count))
     for index in range(count):
@@ -52,13 +52,13 @@ def test_pending_startup_result_including_no_pending_is_memoized(tmp_path: Path,
     calls = 0
     original = store.pending_attempts
 
-    def pending(device_slug: str) -> tuple[object, ...]:
+    def pending() -> tuple[object, ...]:
         nonlocal calls
         calls += 1
-        return original(device_slug)
+        return original()
 
     monkeypatch.setattr(store, "pending_attempts", pending)  # type: ignore[attr-defined]
-    maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
 
     first = _run(maintenance.prepare_pending_startup())
     second = _run(maintenance.prepare_pending_startup())
@@ -75,16 +75,16 @@ def test_attributable_malformed_startup_evidence_is_quarantined_before_collectio
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir(parents=True)
     (malformed / "attempt.json").write_text(
-        dumps({"attempt_id": malformed.name, "device_slug": "omi"}), encoding="utf-8"
+        dumps({"attempt_id": malformed.name, "schema_version": 2}), encoding="utf-8"
     )
     (malformed / "records.bin").write_bytes(b"preserve")
 
-    maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
     state = cast(PendingStartupState, _run(maintenance.prepare_pending_startup()))
 
     assert state == PendingStartupState(None, None)
     assert not malformed.exists()
-    quarantined = tuple((tmp_path / "quarantine" / "omi").iterdir())
+    quarantined = tuple((tmp_path / "quarantine").iterdir())
     assert len(quarantined) == 2
     source = next(path for path in quarantined if path.is_dir())
     assert (source / "records.bin").read_bytes() == b"preserve"
@@ -92,14 +92,14 @@ def test_attributable_malformed_startup_evidence_is_quarantined_before_collectio
 
 def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
     calls = 0
     original = store.sweep_terminal_retired
 
-    def sweep(device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+    def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
         nonlocal calls
         calls += 1
-        return original(device_slug, should_defer=should_defer)
+        return original(should_defer=should_defer)
 
     store.sweep_terminal_retired = sweep  # type: ignore[method-assign]
     _run(maintenance.run_once(lambda: True))
@@ -115,9 +115,9 @@ def test_writer_lock_defers_terminal_sweeps_without_reporting_failures(
     runtime = OpportunisticRuntime()
     failures: list[str] = []
     monkeypatch.setattr(runtime, "debug_exception", lambda event, _error, **_fields: failures.append(event))
-    maintenance = QuarantineMaintenance(store, "omi", None, runtime)
+    maintenance = QuarantineMaintenance(store, None, runtime)
 
-    with store.device_lock("omi"):
+    with store.device_lock():
         _run(maintenance.run_once(lambda: False))
 
     assert failures == []
@@ -128,16 +128,16 @@ def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) 
         store = _store(tmp_path)
         expected = _seed_streaming_partial(store, count=2)
         attempt_id = next((tmp_path / "attempts").iterdir()).name
-        source = store.quarantine_attempt_source("omi", attempt_id)
+        source = store.quarantine_attempt_source(attempt_id)
         before = {path.name: path.read_bytes() for path in source.iterdir()}
 
-        maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         await maintenance.run_once(lambda: True)
 
         assert {path.name: path.read_bytes() for path in source.iterdir()} == before
         await maintenance.run_once(lambda: False)
         assert (source / "published.json").is_file()
-        bundles = tuple((store.capture_root / "omi").iterdir())
+        bundles = tuple((store.capture_root).iterdir())
         assert len(bundles) == 1
         assert (bundles[0] / "records.bin").read_bytes() == expected
 
@@ -154,18 +154,18 @@ def test_pending_startup_hydration_is_reused_by_lease_bound_resume(
         "read_bytes",
         lambda _path: (_ for _ in ()).throw(AssertionError("resume hydration must stream raw evidence")),
     )
-    maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
     state = cast(PendingStartupState, _run(maintenance.prepare_pending_startup()))
     assert state.pending is not None
-    with store.device_lock("omi") as lease:
-        resumed = store.resume_streaming_attempt("omi", lease)
+    with store.device_lock() as lease:
+        resumed = store.resume_streaming_attempt(lease)
         assert resumed is not None
         resumed.close()
 
 
 def test_pending_startup_inspection_does_not_promote_tail_without_lease(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    attempt = store.prepare_streaming_attempt("omi", 100, 3)
+    attempt = store.prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
     first, second = _record(1), _record(2)
     attempt.append_record(0, 100, first)
@@ -177,7 +177,7 @@ def test_pending_startup_inspection_does_not_promote_tail_without_lease(tmp_path
 
     state = cast(
         PendingStartupState,
-        _run(QuarantineMaintenance(store, "omi", None, OpportunisticRuntime()).prepare_pending_startup()),
+        _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup()),
     )
 
     assert state.durable_next == 101
@@ -191,7 +191,7 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
     store = _store(tmp_path)
     expected = _seed_streaming_partial(store, count=2)
     attempt_id = next((tmp_path / "attempts").iterdir()).name
-    source = store.quarantine_attempt_source("omi", attempt_id)
+    source = store.quarantine_attempt_source(attempt_id)
     now = 100.0
     monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
     config = CollectorConfig(
@@ -204,7 +204,6 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
     def fail_once(
         source_path: Path,
         staging_port: StagingPort,
-        slug: str,
         *,
         should_defer: Callable[[], bool],
     ) -> object:
@@ -212,10 +211,10 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
         failures += 1
         if failures == 1:
             raise OSError("transient publication failure")
-        return original_publish(source_path, staging_port, slug, should_defer=should_defer)
+        return original_publish(source_path, staging_port, should_defer=should_defer)
 
     monkeypatch.setattr(runtime, "publish_quarantined_prefix", fail_once)
-    maintenance = QuarantineMaintenance(store, "omi", None, runtime, config=config)
+    maintenance = QuarantineMaintenance(store, None, runtime, config=config)
     _run(maintenance.run_once(lambda: False))
     _run(maintenance.run_once(lambda: False))
     assert failures == 1
@@ -224,7 +223,7 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
     _run(maintenance.run_once(lambda: False))
     assert failures == 2
     assert (source / "published.json").is_file()
-    bundles = tuple((store.capture_root / "omi").iterdir())
+    bundles = tuple((store.capture_root).iterdir())
     assert (bundles[0] / "records.bin").read_bytes() == expected
 
 
@@ -241,18 +240,18 @@ def test_quarantine_retry_cooldown_does_not_block_terminal_sweeps(
     salvage_scans = 0
     original_terminal_sweep = store.sweep_terminal_retired
 
-    def record_terminal_sweep(device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+    def record_terminal_sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
         nonlocal terminal_sweeps
         terminal_sweeps += 1
-        return original_terminal_sweep(device_slug, should_defer=should_defer)
+        return original_terminal_sweep(should_defer=should_defer)
 
-    def forbidden_salvage_scan(device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
-        del device_slug, should_defer
+    def forbidden_salvage_scan(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+        del should_defer
         nonlocal salvage_scans
         salvage_scans += 1
         raise AssertionError("salvage scan reached during retry cooldown")
 
-    maintenance = QuarantineMaintenance(store, "omi", None, runtime, config=config)
+    maintenance = QuarantineMaintenance(store, None, runtime, config=config)
     maintenance._quarantine_retry_not_before = 105.0
     monkeypatch.setattr(store, "sweep_terminal_retired", record_terminal_sweep)
     monkeypatch.setattr(store, "quarantined_attempts", forbidden_salvage_scan)
@@ -280,22 +279,22 @@ def test_quarantine_pending_keeps_valid_partial_salvageable_and_expires_opaque(
     attempt_id = next((tmp_path / "attempts").iterdir()).name
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir()
-    moved = store.quarantine_pending("omi", "ambiguous recovery evidence")
+    moved = store.quarantine_pending("ambiguous recovery evidence")
 
     source = next(path for path in moved if path.name.startswith(attempt_id))
     opaque = next(path for path in moved if path != source)
     assert not (source.with_name(f"{source.name}.json")).exists()
     assert (opaque.with_name(f"{opaque.name}.json")).is_file()
-    assert store.quarantined_attempts("omi") == (source,)
+    assert store.quarantined_attempts() == (source,)
 
-    _run(QuarantineMaintenance(store, "omi", None, OpportunisticRuntime()).run_once(lambda: False))
+    _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).run_once(lambda: False))
     assert (source / "published.json").is_file()
-    bundles = tuple((store.capture_root / "omi").iterdir())
+    bundles = tuple((store.capture_root).iterdir())
     assert len(bundles) == 1
     assert (bundles[0] / "records.bin").read_bytes() == expected
 
     now += 72_000_000_000
-    assert set(store.sweep_terminal_quarantine("omi")) == {source, opaque}
+    assert set(store.sweep_terminal_quarantine()) == {source, opaque}
     assert not source.exists()
     assert not opaque.exists()
 
@@ -322,12 +321,12 @@ def test_presence_scan_starts_before_startup_and_wake_waits_for_binding(tmp_path
         store = _store(tmp_path)
         original = store.pending_attempts
 
-        def pending(device_slug: str) -> tuple[object, ...]:
+        def pending() -> tuple[object, ...]:
             events.append("startup")
-            return original(device_slug)
+            return original()
 
         store.pending_attempts = pending  # type: ignore[method-assign]
-        maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
 
         def bind(state: PendingStartupState) -> None:
             assert state.pending is None
@@ -363,7 +362,7 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
 
         store = _store(tmp_path)
 
-        def sweep(_device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+        def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
             worker_started.set()
             while not should_defer():
                 time.sleep(0.001)
@@ -371,7 +370,7 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
             return ()
 
         store.sweep_terminal_retired = sweep  # type: ignore[method-assign]
-        maintenance = QuarantineMaintenance(store, "omi", None, OpportunisticRuntime())
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         task = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
         assert await asyncio.to_thread(worker_started.wait, 1)
         task.cancel()
@@ -400,7 +399,7 @@ def test_maintenance_failure_after_internal_permit_closes_presence(tmp_path: Pat
         async def fail_after_startup(*_args: object) -> None:
             raise RuntimeError("maintenance failed")
 
-        maintenance = QuarantineMaintenance(_store(tmp_path), "omi", None, OpportunisticRuntime())
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
         maintenance._prepare_and_run = fail_after_startup  # type: ignore[method-assign]
         presence = Presence()
 
@@ -437,7 +436,7 @@ def test_cancellation_after_internal_permit_closes_presence(tmp_path: Path) -> N
             deferral_started.set()
             await finish_maintenance.wait()
 
-        maintenance = QuarantineMaintenance(_store(tmp_path), "omi", None, OpportunisticRuntime())
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
         maintenance._prepare_and_run = wait_for_deferral  # type: ignore[method-assign]
         presence = Presence()
         task = asyncio.create_task(maintenance.wait_for_presence_attempt(presence, lambda _: None))

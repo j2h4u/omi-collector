@@ -38,15 +38,13 @@ def _record(marker: int) -> bytes:
 
 
 def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, count)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
 
 def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(
-        "omi_cv1", 100, count
-    )
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
@@ -114,26 +112,25 @@ def test_split_roots_reject_aliases_and_nesting(tmp_path: Path, layout: str) -> 
 
     store = StagingStore(spool, capture_root)
     with pytest.raises(StagingError, match=r"real directory|distinct, non-nested"):
-        store.prepare_streaming_attempt("omi_cv1", 100, 1)
+        store.prepare_streaming_attempt(100, 1)
 
 
-def test_prepare_rejects_symlink_capture_device_root(tmp_path: Path) -> None:
+def test_prepare_rejects_symlink_capture_root(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    capture_root.mkdir()
     target = tmp_path / "target"
     target.mkdir()
-    (capture_root / "omi_cv1").symlink_to(target, target_is_directory=True)
+    capture_root.symlink_to(target, target_is_directory=True)
 
-    with pytest.raises(StagingError, match="capture device root must be a real directory"):
-        StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
+    with pytest.raises(StagingError, match="capture root must be a real directory"):
+        StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
 
 
 def test_prepare_rejects_existing_non_directory_root(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.write_text("root is unexpectedly a file", encoding="utf-8")
     with pytest.raises(StagingError, match="real directory"):
-        StagingStore(root, root / "captures").prepare_streaming_attempt("omi_cv1", 1, 1)
+        StagingStore(root, root / "captures").prepare_streaming_attempt(1, 1)
 
 
 def test_storage_preflight_creates_and_durably_probes_missing_roots(tmp_path: Path) -> None:
@@ -194,9 +191,7 @@ def test_statvfs_and_atomic_write_errors_leave_evidence(tmp_path: Path) -> None:
         raise OSError("simulated statvfs failure")
 
     with pytest.raises(OSError, match="statvfs"):
-        StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=fail_statvfs).prepare_streaming_attempt(
-            "omi_cv1", 1, 1
-        )
+        StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=fail_statvfs).prepare_streaming_attempt(1, 1)
 
     calls = 0
 
@@ -208,7 +203,5 @@ def test_statvfs_and_atomic_write_errors_leave_evidence(tmp_path: Path) -> None:
         fsync(_)
 
     with pytest.raises(OSError, match="atomic write"):
-        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_descriptor_sync).prepare_streaming_attempt(
-            "omi_cv1", 1, 1
-        )
+        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_descriptor_sync).prepare_streaming_attempt(1, 1)
     assert list((tmp_path / "attempts").glob("*/.attempt.json.*.tmp"))

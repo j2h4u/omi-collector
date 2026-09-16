@@ -29,12 +29,21 @@ def _capture_root(tmp_path: Path) -> Path:
 def _firmware_observations(root: Path, counters: tuple[int, ...]) -> None:
     store = FirmwareObservationStore(root / "device.json")
     for counter in counters:
-        assert store.record("omi", RingInfo(10, 20, 100, counter, RECORD_SIZE))
+        assert store.record(RingInfo(10, 20, 100, counter, RECORD_SIZE))
 
 
 def _record(timestamp: int) -> bytes:
     payload = bytearray(440)
     return timestamp.to_bytes(4, "big") + bytes(payload)
+
+
+def _generation(publication_root: Path) -> Path:
+    generation = publication_root / ".generations" / "generation"
+    generation.mkdir(parents=True)
+    current = publication_root / "current"
+    if not current.is_symlink():
+        current.symlink_to(Path(".generations/generation"))
+    return generation
 
 
 def _bundle(
@@ -52,7 +61,7 @@ def _bundle(
     (path / "manifest.json").write_text(
         json.dumps(
             {
-                "device_slug": "omi",
+                "schema_version": 2,
                 "start_sequence": start,
                 "next_sequence": start + len(records),
                 "record_count": len(records),
@@ -68,7 +77,7 @@ def _bundle(
 
 
 def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
-    result = collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
     assert result.as_dict() == {
         "current_window": {
@@ -92,7 +101,7 @@ def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("kind", ["completion", "boolean_record_count"])
 def test_metrics_rejects_noncanonical_bundle_evidence(tmp_path: Path, kind: str) -> None:
-    device_root = tmp_path / "omi"
+    device_root = _generation(tmp_path)
     bundle = _bundle(device_root, "100-101", (_record(1),))
     if kind == "completion":
         receipt = cast(dict[str, object], json.loads((bundle / "receipt.json").read_text(encoding="utf-8")))
@@ -104,7 +113,7 @@ def test_metrics_rejects_noncanonical_bundle_evidence(tmp_path: Path, kind: str)
         (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SpoolMetricsError):
-        collect_spool_metrics(tmp_path, "omi")
+        collect_spool_metrics(tmp_path)
 
 
 def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path: Path) -> None:
@@ -114,7 +123,7 @@ def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path
     capture_root.mkdir()
     _firmware_observations(spool, (4, 9))
 
-    result = collect_spool_metrics(capture_root, "omi", observation_root=spool / "device.json")
+    result = collect_spool_metrics(capture_root, observation_root=spool / "device.json")
 
     assert result.current_window.bundle_count == 0
     assert result.firmware_lifetime.observation_count == 2
@@ -123,13 +132,13 @@ def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path
 
 
 def test_published_generation_link_is_a_valid_device_spool(tmp_path: Path) -> None:
-    generation = tmp_path / ".generations/omi/generation"
+    generation = tmp_path / ".generations/generation"
     generation.mkdir(parents=True)
     _bundle(generation, "10-12-a", (_record(1000), _record(1001)))
     (generation / "generation.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "omi").symlink_to(Path(".generations/omi/generation"))
+    (tmp_path / "current").symlink_to(Path(".generations/generation"))
 
-    result = collect_spool_metrics(tmp_path, "omi")
+    result = collect_spool_metrics(tmp_path)
 
     assert result.current_window.bundle_count == 1
 
@@ -137,19 +146,18 @@ def test_published_generation_link_is_a_valid_device_spool(tmp_path: Path) -> No
 def test_published_generation_link_cannot_escape_authority(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
-    (tmp_path / ".generations/omi").mkdir(parents=True)
-    (tmp_path / "omi").symlink_to(Path("outside"))
+    (tmp_path / ".generations").mkdir(parents=True)
+    (tmp_path / "current").symlink_to(Path("outside"))
 
     with pytest.raises(SpoolMetricsError, match="authority"):
-        collect_spool_metrics(tmp_path, "omi")
+        collect_spool_metrics(tmp_path)
 
 
 def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path) -> None:
-    device = tmp_path / "omi"
-    device.mkdir()
+    _generation(tmp_path)
     _firmware_observations(tmp_path, (4, 9, 12))
 
-    result = collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
     assert result.firmware_lifetime.observation_count == 3
     assert result.firmware_lifetime.initial == 4
@@ -163,11 +171,10 @@ def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path)
 
 
 def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
-    device = tmp_path / "omi"
-    device.mkdir()
+    _generation(tmp_path)
     _firmware_observations(tmp_path, (4, 9, 3, 8, 2))
 
-    result = collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
     assert result.firmware_lifetime.observation_count == 5
     assert result.firmware_lifetime.initial == 4
@@ -179,23 +186,21 @@ def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
 
 
 def test_malformed_firmware_observation_chain_fails_closed(tmp_path: Path) -> None:
-    device = tmp_path / "omi"
-    device.mkdir()
+    _generation(tmp_path)
     _firmware_observations(tmp_path, (4, 9))
     state = tmp_path / "device.json"
     state.write_text(state.read_text(encoding="utf-8") + "\n", encoding="utf-8")
 
     with pytest.raises(SpoolMetricsError, match="firmware observations are invalid"):
-        collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+        collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
 
 def test_sequence_discontinuity_is_aggregated_between_real_bundles(tmp_path: Path) -> None:
-    device = tmp_path / "omi"
-    device.mkdir()
+    device = _generation(tmp_path)
     _bundle(device, "first", (_record(1), _record(2)))
     _bundle(device, "second", (_record(4), _record(5)), start=13)
 
-    result = collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
     assert result.current_window.lost_records == 1
     assert result.current_window.lost_raw_bytes == RECORD_SIZE
@@ -203,21 +208,19 @@ def test_sequence_discontinuity_is_aggregated_between_real_bundles(tmp_path: Pat
 
 
 def test_conflicting_overlapping_ranges_fail_closed(tmp_path: Path) -> None:
-    device = tmp_path / "omi"
-    device.mkdir()
+    device = _generation(tmp_path)
     _bundle(device, "first", (_record(1), _record(2)))
     _bundle(device, "overlap", (_record(3), _record(4)), start=11)
 
     with pytest.raises(SpoolMetricsError, match="sequence ranges overlap"):
-        collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+        collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
 
 def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    device = tmp_path / "omi"
-    device.mkdir()
+    device = _generation(tmp_path)
     _bundle(device, "first", (_record(1), _record(2)))
     original_read_bytes = Path.read_bytes
 
@@ -228,26 +231,25 @@ def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
 
     monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
 
-    result = collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
     assert result.current_window.downloaded_records == 2
 
 
 def test_partial_and_symlink_artifacts_are_not_counted(tmp_path: Path) -> None:
-    device = tmp_path / "omi"
-    device.mkdir()
+    device = _generation(tmp_path)
     (device / "attempts").mkdir()
     target = device / ".real"
     target.mkdir()
     (device / "symlink").symlink_to(target, target_is_directory=True)
 
-    result = collect_spool_metrics(tmp_path, "omi", observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
     assert result.current_window.bundle_count == 0
 
 
 def test_observation_path_is_optional_when_state_file_is_not_available(tmp_path: Path) -> None:
-    result = collect_spool_metrics(tmp_path, "omi")
+    result = collect_spool_metrics(tmp_path)
 
     assert result.firmware_lifetime.observation_count == 0
     assert result.firmware_lifetime.initial is None
@@ -258,11 +260,11 @@ def test_observation_path_rejects_directory_and_symlink(tmp_path: Path) -> None:
     observation_directory = tmp_path / "collector"
     observation_directory.mkdir()
     with pytest.raises(SpoolMetricsError, match="firmware observations are invalid"):
-        collect_spool_metrics(tmp_path, "omi", observation_root=observation_directory)
+        collect_spool_metrics(tmp_path, observation_root=observation_directory)
 
     target = tmp_path / "state-target.json"
     target.write_text("{}", encoding="utf-8")
     observation_symlink = tmp_path / "device.json"
     observation_symlink.symlink_to(target)
     with pytest.raises(SpoolMetricsError, match="firmware observations are invalid"):
-        collect_spool_metrics(tmp_path, "omi", observation_root=observation_symlink)
+        collect_spool_metrics(tmp_path, observation_root=observation_symlink)

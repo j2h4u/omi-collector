@@ -28,9 +28,12 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
+COPY --chown=1000:1000 config/config.toml.example /data/omi/config.toml
 
 RUN groupadd --gid 1000 app \
-    && useradd --uid 1000 --gid 1000 --create-home app
+    && useradd --uid 1000 --gid 1000 --create-home app \
+    && mkdir -p /data/omi/collector /data/omi/captured /data/omi/source \
+    && chown -R app:app /data/omi
 
 USER 1000:1000
 
@@ -38,4 +41,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["omi-collector", "health"]
 
 ENTRYPOINT ["omi-collector"]
-CMD ["serve"]
+CMD ["service", "--config", "/data/omi/config.toml"]

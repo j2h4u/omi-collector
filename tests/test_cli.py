@@ -14,22 +14,13 @@ from omi_collector import cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
 from omi_collector.capture.adapters.publication import SealResult
-from omi_collector.capture.adapters.staging_contract import StagingError
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
 from omi_collector.config import DebugLogConfig
 from omi_collector.core import package_version
-from omi_collector.operator_status import OperatorStatusError
-from omi_collector.spool_metrics import (
-    FirmwareLifetimeMetrics,
-    SpoolMetrics,
-    SpoolMetricsError,
-    SpoolWindowMetrics,
-)
-from omi_collector.storage_layout import StorageLayout, load_storage_layout
+from omi_collector.storage_layout import load_operator_config
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -43,23 +34,8 @@ def _capture_root(tmp_path: Path) -> Path:
 
 
 def _layout(tmp_path: Path) -> Path:
-    path = tmp_path / "layout.toml"
-    path.write_text(
-        """version = 2
-
-[collector]
-root = "collector"
-attempts = "attempts"
-quarantine = "quarantine"
-lock = "collector.lock"
-device_state = "device.json"
-debug_log = "debug.jsonl"
-
-[publication]
-root = "source"
-""",
-        encoding="utf-8",
-    )
+    path = tmp_path / "config.toml"
+    path.write_text('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n', encoding="utf-8")
     return path
 
 
@@ -78,135 +54,37 @@ def test_health_command_reports_ok() -> None:
 
 
 def test_staging_keeps_capture_inside_collector_state(tmp_path: Path) -> None:
-    store = cli._staging(load_storage_layout(_layout(tmp_path)))
+    store = cli._staging(load_operator_config(_layout(tmp_path)))
 
     assert store.paths.capture_root == tmp_path / "captured"
 
 
-def test_sync_announces_loaded_layout_before_absent_pendant_wait(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    async def fake_sync(*args: object, **kwargs: object) -> object:
-        del kwargs
-        progress = cast(cli.SyncProgressReporter, args[4])
-        progress(_sync_progress(state="away"))
-        return device_cli.collector.NoDataResult(device_cli.RingInfo(10, 10, 100, 0, RECORD_SIZE))
+def test_config_check_reports_canonical_path(tmp_path: Path) -> None:
+    path = _layout(tmp_path)
+    result = CliRunner().invoke(app, ["config", "check", "--config", str(path)])
 
-    layout_path = _layout(tmp_path)
-    monkeypatch.setattr(device_cli, "sync", fake_sync)
-    result = CliRunner().invoke(
-        app,
-        [
-            "device",
-            "sync",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
-            str(layout_path),
-            "--confirm-sync",
-            "--announce-readiness",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    readiness = cast(dict[str, object], json.loads(result.output.splitlines()[0]))
-    assert readiness == {
-        "layout": str(layout_path),
-        "status": "deployment_ready",
-    }
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"config": str(path), "status": "config_valid"}
 
 
-def test_sync_does_not_announce_readiness_for_bad_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    bad_layout = tmp_path / "layout.toml"
-    bad_layout.write_text("not = [valid", encoding="utf-8")
+def test_service_announces_readiness_after_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "_sync", lambda *_args, **_kwargs: None)
 
-    async def unexpected_sync(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("sync must not start")
+    result = CliRunner().invoke(app, ["service", "--config", str(path)])
 
-    monkeypatch.setattr(device_cli, "sync", unexpected_sync)
-    result = CliRunner().invoke(
-        app,
-        [
-            "device",
-            "sync",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
-            str(bad_layout),
-            "--confirm-sync",
-            "--announce-readiness",
-        ],
-    )
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"config": str(path), "status": "deployment_ready"}
+
+
+def test_service_does_not_announce_readiness_for_invalid_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("not = [valid", encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["service", "--config", str(path)])
 
     assert result.exit_code == 2
     assert "deployment_ready" not in result.output
-
-
-def test_sync_does_not_announce_readiness_when_storage_preflight_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    def fail_preflight(_store: StagingStore) -> None:
-        raise StagingError("simulated durable-write denial")
-
-    async def unexpected_sync(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("sync must not start")
-
-    monkeypatch.setattr(StagingStore, "preflight_storage", fail_preflight)
-    monkeypatch.setattr(device_cli, "sync", unexpected_sync)
-    result = CliRunner().invoke(
-        app,
-        [
-            "device",
-            "sync",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
-            str(_layout(tmp_path)),
-            "--confirm-sync",
-            "--announce-readiness",
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "deployment_ready" not in result.output
-    assert "simulated durable-write denial" in result.output
-
-
-def test_device_metrics_reports_one_stable_json_object(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    expected = SpoolMetrics(
-        SpoolWindowMetrics(1, 3, 1332, 4, 1776, 4 / 7),
-        FirmwareLifetimeMetrics(3, 1, 6, 5, 0, 1),
-    )
-    captured: list[tuple[Path, str, Path]] = []
-
-    def fake_metrics(capture_root: Path, device_slug: str, *, observation_root: Path) -> SpoolMetrics:
-        captured.append((capture_root, device_slug, observation_root))
-        return expected
-
-    monkeypatch.setattr(cli, "collect_spool_metrics", fake_metrics)
-    result = CliRunner().invoke(
-        app,
-        [
-            "device",
-            "metrics",
-            "--layout",
-            str(_layout(tmp_path)),
-            "--device-slug",
-            "omi",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert result.output == json.dumps(expected.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
-    assert captured == [(tmp_path / "source", "omi", tmp_path / "collector" / "device.json")]
 
 
 def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(tmp_path: Path) -> None:
@@ -230,100 +108,6 @@ def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(t
 
     debug_reporter.report_ble_link(record)
     assert [json.loads(line) for line in debug_lines] == [{"event": "ble_link_session", "handle": 7}]
-
-
-def test_device_metrics_reports_malformed_authority_as_nonzero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fail_metrics(*_args: object, **_kwargs: object) -> SpoolMetrics:
-        raise SpoolMetricsError("bad artifact")
-
-    monkeypatch.setattr(cli, "collect_spool_metrics", fail_metrics)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "device",
-            "metrics",
-            "--layout",
-            str(_layout(tmp_path)),
-            "--device-slug",
-            "omi",
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert result.output.strip() == "bad artifact"
-
-
-def test_device_status_reports_one_stable_json_object(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    expected = {"schema_version": 2, "status": "ok"}
-    service = {"active_state": "active", "available": True}
-    captured: list[tuple[Path, str, int]] = []
-
-    def fake_status(layout: StorageLayout, device_slug: str, *, hours: int) -> dict[str, object]:
-        captured.append((layout.path, device_slug, hours))
-        return expected
-
-    monkeypatch.setattr(cli, "collect_operator_status", fake_status)
-    monkeypatch.setattr(cli, "_systemd_service_status", lambda: service)
-    layout_path = _layout(tmp_path)
-    result = CliRunner().invoke(
-        app,
-        ["device", "status", "--layout", str(layout_path), "--device-slug", "omi", "--hours", "12"],
-    )
-
-    assert result.exit_code == 0
-    assert result.output == (
-        '{"schema_version":2,"service":{"active_state":"active","available":true},"status":"ok"}\n'
-    )
-    assert captured == [(layout_path, "omi", 12)]
-
-
-def test_device_status_uses_running_service_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    expected = {"schema_version": 2, "status": "ok"}
-    layout_path = _layout(tmp_path)
-    options = {"--layout": str(layout_path), "--device-slug": "omi"}
-    captured: list[tuple[Path, str, int]] = []
-
-    def fake_status(layout: StorageLayout, device_slug: str, *, hours: int) -> dict[str, object]:
-        captured.append((layout.path, device_slug, hours))
-        return expected
-
-    monkeypatch.setattr(cli, "collect_operator_status", fake_status)
-    monkeypatch.setattr(cli, "_running_service_option", options.get)
-    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"active_state": "active", "available": True})
-
-    result = CliRunner().invoke(app, ["device", "status"])
-
-    assert result.exit_code == 0
-    assert captured == [(layout_path, "omi", 24)]
-
-
-def test_running_service_option_reads_expanded_command(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"main_pid": 42})
-    monkeypatch.setattr(Path, "read_bytes", lambda _path: b"omi-collector\0--device-slug\0omi\0")
-
-    assert cli._running_service_option("--device-slug") == "omi"
-    assert cli._running_service_option("--layout") is None
-
-
-def test_running_service_option_handles_unavailable_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"main_pid": 0})
-
-    assert cli._running_service_option("--layout") is None
-
-
-def test_device_status_reports_malformed_evidence_as_nonzero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fail_status(*_args: object, **_kwargs: object) -> dict[str, object]:
-        raise OperatorStatusError("quality journal contains malformed JSON")
-
-    monkeypatch.setattr(cli, "collect_operator_status", fail_status)
-    result = CliRunner().invoke(
-        app,
-        ["device", "status", "--layout", str(_layout(tmp_path)), "--device-slug", "omi"],
-    )
-
-    assert result.exit_code == 1
-    assert result.output.strip() == "quality journal contains malformed JSON"
 
 
 def test_systemd_service_status_reports_supervisor_fields(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -375,24 +159,6 @@ def test_systemd_service_status_reports_execution_failure(
     }
 
 
-def test_serve_passes_interval_to_sleep_until_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
-    class StopServingError(RuntimeError):
-        pass
-
-    intervals: list[int] = []
-
-    def stop_after_sleep(interval: int) -> None:
-        intervals.append(interval)
-        raise StopServingError
-
-    monkeypatch.setattr(cli.time, "sleep", stop_after_sleep)
-
-    result = CliRunner().invoke(app, ["serve", "--interval-seconds", "7"])
-
-    assert isinstance(result.exception, StopServingError)
-    assert intervals == [7]
-
-
 def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, str]] = []
 
@@ -440,7 +206,7 @@ def test_sync_requires_explicit_read_advance_confirmation(monkeypatch: pytest.Mo
     monkeypatch.setattr(device_cli, "sync", fail_sync)
     result = CliRunner().invoke(
         app,
-        ["device", "sync", "--address", "AA:BB", "--device-slug", "omi", "--layout", str(_layout(tmp_path))],
+        ["device", "sync", "--config", str(_layout(tmp_path))],
     )
 
     assert result.exit_code == 2
@@ -462,7 +228,6 @@ def test_sync_reports_progress_on_stderr_and_metrics_on_stdout(monkeypatch: pyte
     async def fake_sync(
         _address: str,
         adapter: str,
-        _slug: str,
         _staging: object,
         *args: object,
         **kwargs: object,
@@ -487,11 +252,7 @@ def test_sync_reports_progress_on_stderr_and_metrics_on_stdout(monkeypatch: pyte
         [
             "device",
             "sync",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--confirm-sync",
         ],
@@ -853,7 +614,6 @@ def test_sync_accepts_debug_log_level(monkeypatch: pytest.MonkeyPatch, tmp_path:
     async def fake_sync(
         _address: str,
         _adapter: str,
-        _slug: str,
         _staging: object,
         *args: object,
         **kwargs: object,
@@ -873,11 +633,7 @@ def test_sync_accepts_debug_log_level(monkeypatch: pytest.MonkeyPatch, tmp_path:
         [
             "device",
             "sync",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--confirm-sync",
             "--log-level",
@@ -895,7 +651,6 @@ def test_sync_force_1m_flag_is_forwarded(monkeypatch: pytest.MonkeyPatch, tmp_pa
     async def fake_sync(
         _address: str,
         _adapter: str,
-        _slug: str,
         _staging: object,
         *_args: object,
         **kwargs: object,
@@ -915,11 +670,7 @@ def test_sync_force_1m_flag_is_forwarded(monkeypatch: pytest.MonkeyPatch, tmp_pa
         [
             "device",
             "sync",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--confirm-sync",
             "--force-1m",
@@ -942,7 +693,6 @@ def test_sync_constructs_production_presence_scheduler_once(monkeypatch: pytest.
     async def fake_sync(
         _address: str,
         _adapter: str,
-        _slug: str,
         _staging: object,
         *_args: object,
         **kwargs: object,
@@ -962,16 +712,12 @@ def test_sync_constructs_production_presence_scheduler_once(monkeypatch: pytest.
         [
             "device",
             "sync",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--confirm-sync",
         ],
     )
 
     assert result.exit_code == 0
-    assert factory_calls == [("AA:BB", "hci0")]
+    assert factory_calls == [("AA:BB:CC:DD:EE:FF", "hci0")]
     assert captured == [sentinel]

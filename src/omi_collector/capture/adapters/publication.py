@@ -115,14 +115,13 @@ def publish_prefix_directory(  # noqa: PLR0913
     filesystem: StagingFilesystem,
     *,
     destination: Path,
-    device_slug: str,
     raw_source: Path,
     prefix_size: int,
     manifest: dict[str, object],
     receipt: dict[str, object],
 ) -> None:
     """Write and atomically publish a checkpoint-authenticated prefix bundle."""
-    device_fd, temporary_name, temporary = _prepare_capture_temporary(filesystem, destination, device_slug)
+    capture_fd, temporary_name, temporary = _prepare_capture_temporary(filesystem, destination)
     try:
         _write_synced(temporary / _MANIFEST_NAME, _json_bytes(manifest), filesystem._fsync)
         _write_synced(temporary / _RECEIPT_NAME, _json_bytes(receipt), filesystem._fsync)
@@ -134,18 +133,18 @@ def publish_prefix_directory(  # noqa: PLR0913
             chunk_size=filesystem._durability.io_chunk_bytes,
         )
         _sync_directory(temporary, filesystem._fsync)
-        os.rename(temporary_name, destination.name, src_dir_fd=device_fd, dst_dir_fd=device_fd)
-        filesystem._fsync(device_fd)
+        os.rename(temporary_name, destination.name, src_dir_fd=capture_fd, dst_dir_fd=capture_fd)
+        filesystem._fsync(capture_fd)
     except BaseException:
-        _discard_capture_temporary(filesystem, device_fd, temporary)
+        _discard_capture_temporary(filesystem, capture_fd, temporary)
         raise
     finally:
-        os.close(device_fd)
+        os.close(capture_fd)
 
 
-def publish_full_directory(filesystem: StagingFilesystem, source: Path, destination: Path, device_slug: str) -> None:
+def publish_full_directory(filesystem: StagingFilesystem, source: Path, destination: Path) -> None:
     """Publish only the completed bundle contract, never attempt-local state."""
-    device_fd, temporary_name, temporary = _prepare_capture_temporary(filesystem, destination, device_slug)
+    capture_fd, temporary_name, temporary = _prepare_capture_temporary(filesystem, destination)
     try:
         for name in (_MANIFEST_NAME, _RECEIPT_NAME, _RAW_NAME):
             entry = source / name
@@ -153,31 +152,29 @@ def publish_full_directory(filesystem: StagingFilesystem, source: Path, destinat
                 raise StagingError(f"full publication source entry is not a regular file: {entry.name}")
             _copy_synced(entry, temporary / entry.name, filesystem._fsync)
         _sync_directory(temporary, filesystem._fsync)
-        os.rename(temporary_name, destination.name, src_dir_fd=device_fd, dst_dir_fd=device_fd)
-        filesystem._fsync(device_fd)
+        os.rename(temporary_name, destination.name, src_dir_fd=capture_fd, dst_dir_fd=capture_fd)
+        filesystem._fsync(capture_fd)
     except BaseException:
-        _discard_capture_temporary(filesystem, device_fd, temporary)
+        _discard_capture_temporary(filesystem, capture_fd, temporary)
         raise
     finally:
-        os.close(device_fd)
+        os.close(capture_fd)
 
 
-def recover_capture_temporaries(  # noqa: C901
-    filesystem: StagingFilesystem, device_slug: str
-) -> tuple[tuple[Path, Path, str], ...]:
+def recover_capture_temporaries(filesystem: StagingFilesystem) -> tuple[tuple[Path, Path, str], ...]:  # noqa: C901
     """Recover authenticated temporary bundles and return unsafe actions to quarantine."""
     filesystem._prepare_roots()
-    device_root = filesystem.capture_root / device_slug
+    capture_root = filesystem.capture_root
     try:
-        mode = device_root.lstat().st_mode
+        mode = capture_root.lstat().st_mode
     except FileNotFoundError:
         return ()
     except OSError as error:
         raise StagingError("capture publication leftovers cannot be inspected") from error
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        raise StagingError("capture device root must be a real directory")
+        raise StagingError("capture root must be a real directory")
     try:
-        leftovers = tuple(device_root.iterdir())
+        leftovers = tuple(capture_root.iterdir())
     except OSError as error:
         raise StagingError("capture publication leftovers cannot be inspected") from error
     unsafe: list[tuple[Path, Path, str]] = []
@@ -189,41 +186,38 @@ def recover_capture_temporaries(  # noqa: C901
         except OSError as error:
             raise StagingError("capture publication leftover cannot be inspected") from error
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-            unsafe.append((temporary, device_root, "capture temporary is unsafe"))
+            unsafe.append((temporary, capture_root, "capture temporary is unsafe"))
             continue
         try:
-            destination, manifest, receipt = _authenticated_capture_temporary(filesystem, temporary, device_slug)
+            destination, manifest, receipt = _authenticated_capture_temporary(filesystem, temporary)
         except (OSError, AttemptStateError) as error:
-            unsafe.append((temporary, device_root, str(error)))
+            unsafe.append((temporary, capture_root, str(error)))
             continue
         try:
             completed = _finalize_capture_temporary(
                 filesystem,
                 temporary=temporary,
                 destination=destination,
-                device_slug=device_slug,
                 manifest=manifest,
                 receipt=receipt,
             )
         except OSError, StagingError:
             continue
         if not completed:
-            unsafe.append((temporary, device_root, "capture temporary conflicts with canonical destination"))
+            unsafe.append((temporary, capture_root, "capture temporary conflicts with canonical destination"))
     return tuple(unsafe)
 
 
-def _prepare_capture_temporary(
-    filesystem: StagingFilesystem, destination: Path, device_slug: str
-) -> tuple[int, str, Path]:
-    device_fd = filesystem.validate_capture_destination(destination, device_slug)
+def _prepare_capture_temporary(filesystem: StagingFilesystem, destination: Path) -> tuple[int, str, Path]:
+    capture_fd = filesystem.validate_capture_destination(destination)
     temporary_name = f".{destination.name}.{uuid4().hex}.tmp"
     try:
-        os.mkdir(temporary_name, _SHARED_BUNDLE_DIRECTORY_MODE, dir_fd=device_fd)
-        filesystem._fsync(device_fd)
+        os.mkdir(temporary_name, _SHARED_BUNDLE_DIRECTORY_MODE, dir_fd=capture_fd)
+        filesystem._fsync(capture_fd)
     except BaseException:
-        os.close(device_fd)
+        os.close(capture_fd)
         raise
-    return device_fd, temporary_name, Path(f"/proc/self/fd/{device_fd}") / temporary_name
+    return capture_fd, temporary_name, Path(f"/proc/self/fd/{capture_fd}") / temporary_name
 
 
 def _discard_capture_temporary(filesystem: StagingFilesystem, device_fd: int, temporary: Path) -> None:
@@ -241,7 +235,7 @@ def _discard_capture_temporary(filesystem: StagingFilesystem, device_fd: int, te
 
 
 def _authenticated_capture_temporary(
-    filesystem: StagingFilesystem, temporary: Path, device_slug: str
+    filesystem: StagingFilesystem, temporary: Path
 ) -> tuple[Path, dict[str, object], dict[str, object]]:
     _require_regular_directory(temporary)
     for entry in temporary.iterdir():
@@ -251,11 +245,11 @@ def _authenticated_capture_temporary(
     _require_regular_file(temporary / _MANIFEST_NAME, _MANIFEST_NAME)
     _require_regular_file(temporary / _RECEIPT_NAME, _RECEIPT_NAME)
     manifest = _read_json(temporary / _MANIFEST_NAME)
-    start, next_sequence, raw_hash = _validate_capture_temporary_manifest(filesystem, manifest, device_slug, raw_path)
+    start, next_sequence, raw_hash = _validate_capture_temporary_manifest(filesystem, manifest, raw_path)
     receipt = _read_json(temporary / _RECEIPT_NAME)
     if not _receipt_matches(receipt, manifest):
         raise AttemptStateError("capture temporary receipt is not canonical")
-    destination = filesystem.capture_root / device_slug / f"{start}-{next_sequence}-{raw_hash[:16]}"
+    destination = filesystem.capture_root / f"{start}-{next_sequence}-{raw_hash[:16]}"
     nonce = temporary.name.removeprefix(f".{destination.name}.").removesuffix(".tmp")
     if (
         temporary.name != f".{destination.name}.{nonce}.tmp"
@@ -267,14 +261,12 @@ def _authenticated_capture_temporary(
 
 
 def _validate_capture_temporary_manifest(
-    filesystem: StagingFilesystem, manifest: dict[str, object], device_slug: str, raw_path: Path
+    filesystem: StagingFilesystem, manifest: dict[str, object], raw_path: Path
 ) -> tuple[int, int, str]:
     try:
         parsed = BundleManifest.from_json(manifest)
     except ValueError as error:
         raise AttemptStateError("capture temporary manifest is not canonical") from error
-    if parsed.device_slug != device_slug:
-        raise AttemptStateError("capture temporary manifest or raw bytes are inconsistent")
     if (
         raw_path.stat().st_size != parsed.record_count * RECORD_SIZE
         or _file_hash(raw_path, chunk_size=filesystem._durability.io_chunk_bytes) != parsed.raw_sha256
@@ -283,33 +275,32 @@ def _validate_capture_temporary_manifest(
     return parsed.start_sequence, parsed.next_sequence, parsed.raw_sha256
 
 
-def _finalize_capture_temporary(  # noqa: PLR0913
+def _finalize_capture_temporary(
     filesystem: StagingFilesystem,
     *,
     temporary: Path,
     destination: Path,
-    device_slug: str,
     manifest: dict[str, object],
     receipt: dict[str, object],
 ) -> bool:
-    device_fd = filesystem.validate_capture_destination(destination, device_slug)
+    capture_fd = filesystem.validate_capture_destination(destination)
     try:
         if os.path.lexists(destination):
             if _capture_temporary_matches(filesystem, destination, temporary, manifest, receipt):
-                _discard_capture_temporary(filesystem, device_fd, temporary)
+                _discard_capture_temporary(filesystem, capture_fd, temporary)
                 return True
             return False
         try:
-            os.rename(temporary.name, destination.name, src_dir_fd=device_fd, dst_dir_fd=device_fd)
+            os.rename(temporary.name, destination.name, src_dir_fd=capture_fd, dst_dir_fd=capture_fd)
         except FileExistsError:
             if _capture_temporary_matches(filesystem, destination, temporary, manifest, receipt):
-                _discard_capture_temporary(filesystem, device_fd, temporary)
+                _discard_capture_temporary(filesystem, capture_fd, temporary)
                 return True
             return False
-        filesystem._fsync(device_fd)
+        filesystem._fsync(capture_fd)
         return True
     finally:
-        os.close(device_fd)
+        os.close(capture_fd)
 
 
 def _capture_temporary_matches(
@@ -365,8 +356,8 @@ def is_published_attempt(source: Path, descriptor: AttemptDescriptor, filesystem
         return False
     try:
         raw_hash = _file_hash(raw_path, chunk_size=filesystem._durability.io_chunk_bytes)
-        manifest = BundleManifest(descriptor.device_slug, start, start + count, count, RECORD_SIZE, raw_hash).as_dict()
-        destination = filesystem.capture_root / descriptor.device_slug / f"{start}-{start + count}-{raw_hash[:16]}"
+        manifest = BundleManifest(2, start, start + count, count, RECORD_SIZE, raw_hash).as_dict()
+        destination = filesystem.capture_root / f"{start}-{start + count}-{raw_hash[:16]}"
         return destination.exists() and _bundle_matches(
             destination, raw_path, manifest, io_chunk_bytes=filesystem._durability.io_chunk_bytes
         )
@@ -389,12 +380,12 @@ def _prefix_publication_matches(
             return False
         if prefix.record_count == 0:
             return True
-        destination = _prefix_destination_for(filesystem.capture_root, descriptor.device_slug, prefix)
+        destination = _prefix_destination_for(filesystem.capture_root, prefix)
         return not destination.is_symlink() and _prefix_destination_matches(
             destination,
             source / _RAW_NAME,
             prefix.record_count * RECORD_SIZE,
-            _manifest_for_descriptor_prefix(descriptor, prefix),
+            _manifest_for_prefix(prefix),
             io_chunk_bytes=io_chunk_bytes,
         )
     except AttemptStateError, OSError, TypeError:
@@ -436,14 +427,13 @@ def _prefix_destination_matches(
     )
 
 
-def _prefix_destination_for(root: Path, device_slug: str, prefix: DurablePrefix) -> Path:
-    device_root = root / device_slug
-    return device_root / f"{prefix.start_sequence}-{prefix.next_sequence}-{prefix.raw_sha256[:16]}"
+def _prefix_destination_for(root: Path, prefix: DurablePrefix) -> Path:
+    return root / f"{prefix.start_sequence}-{prefix.next_sequence}-{prefix.raw_sha256[:16]}"
 
 
-def _manifest_for_descriptor_prefix(descriptor: AttemptDescriptor, prefix: DurablePrefix) -> dict[str, object]:
+def _manifest_for_prefix(prefix: DurablePrefix) -> dict[str, object]:
     return BundleManifest(
-        descriptor.device_slug,
+        2,
         prefix.start_sequence,
         prefix.next_sequence,
         prefix.record_count,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import threading
 from collections.abc import Callable, Mapping
@@ -17,11 +16,10 @@ from uuid import uuid4
 from ...config import DEFAULT_CONFIG, CollectorConfig, FirmwareObservationConfig
 from ..domain.ring_protocol import RingInfo
 
-_SCHEMA_VERSION: Final = 2
+_SCHEMA_VERSION: Final = 3
 _U16_MAX: Final = (1 << 16) - 1
 _U32_MAX: Final = (1 << 32) - 1
 _U64_MAX: Final = (1 << 64) - 1
-_SLUG = re.compile(r"[A-Za-z0-9_-]+\Z")
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 _ErrorCallback = Callable[[Exception], None]
@@ -35,7 +33,6 @@ class FirmwareObservationError(ValueError):
 class FirmwareObservation:
     """The latest firmware snapshot plus bounded lifetime counter aggregates."""
 
-    device_slug: str
     info: RingInfo
     observation_count: int
     initial: int
@@ -75,11 +72,6 @@ def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _validate_slug(device_slug: str) -> None:
-    if not isinstance(device_slug, str) or _SLUG.fullmatch(device_slug) is None:
-        raise FirmwareObservationError("device_slug must contain only ASCII letters, digits, '-' and '_'")
-
-
 def _validate_ring_info(info: RingInfo) -> None:
     if not isinstance(info, RingInfo):
         raise TypeError("info must be a RingInfo")
@@ -116,14 +108,9 @@ def _integer(data: Mapping[str, object], key: str, path: Path, maximum: int | No
     return value
 
 
-def _decode(document: Mapping[str, object], path: Path, device_slug: str) -> FirmwareObservation:
-    if (
-        set(document) != {"schema_version", "device_slug", "latest", "metrics"}
-        or document.get("schema_version") != _SCHEMA_VERSION
-    ):
+def _decode(document: Mapping[str, object], path: Path) -> FirmwareObservation:
+    if set(document) != {"schema_version", "latest", "metrics"} or document.get("schema_version") != _SCHEMA_VERSION:
         raise FirmwareObservationError(f"unexpected device state fields: {path.name}")
-    if document.get("device_slug") != device_slug:
-        raise FirmwareObservationError(f"device state identity is invalid: {path.name}")
     latest = document.get("latest")
     metrics = document.get("metrics")
     if not isinstance(latest, dict) or not isinstance(metrics, dict):
@@ -145,12 +132,11 @@ def _decode(document: Mapping[str, object], path: Path, device_slug: str) -> Fir
     regressions = _integer(metrics, "regression_count", path)
     if count <= 0:
         raise FirmwareObservationError(f"firmware metrics state is inconsistent: {path.name}")
-    return FirmwareObservation(device_slug, info, count, initial, increase, regressions)
+    return FirmwareObservation(info, count, initial, increase, regressions)
 
 
-def read_firmware_observations(device_state_path: Path, device_slug: str) -> tuple[FirmwareObservation, ...]:
+def read_firmware_observations(device_state_path: Path) -> tuple[FirmwareObservation, ...]:
     """Read the one bounded state record; absent state is an empty result."""
-    _validate_slug(device_slug)
     path = Path(device_state_path)
     if not path.exists() and not path.is_symlink():
         return ()
@@ -162,7 +148,7 @@ def read_firmware_observations(device_state_path: Path, device_slug: str) -> tup
     document = _parse_object(raw, path)
     if raw != _canonical_json(document):
         raise FirmwareObservationError(f"device state JSON is not canonical: {path.name}")
-    return (_decode(document, path, device_slug),)
+    return (_decode(document, path),)
 
 
 class FirmwareObservationStore:
@@ -171,20 +157,18 @@ class FirmwareObservationStore:
     def __init__(self, device_state_path: Path) -> None:
         self._path = Path(device_state_path)
 
-    def record(self, device_slug: str, info: RingInfo) -> bool:
-        _validate_slug(device_slug)
+    def record(self, info: RingInfo) -> bool:
         _validate_ring_info(info)
         with _lock_for(self._path):
             _ensure_regular_parent(self._path)
-            persisted = read_firmware_observations(self._path, device_slug)
+            persisted = read_firmware_observations(self._path)
             previous = persisted[0] if persisted else None
             if previous is not None and previous.info == info:
                 return False
             if previous is None:
-                state = FirmwareObservation(device_slug, info, 1, info.dropped_packets, 0, 0)
+                state = FirmwareObservation(info, 1, info.dropped_packets, 0, 0)
             elif previous.dropped_packets == info.dropped_packets:
                 state = FirmwareObservation(
-                    device_slug,
                     info,
                     previous.observation_count,
                     previous.initial,
@@ -195,7 +179,6 @@ class FirmwareObservationStore:
                 increase = previous.observed_increase + max(0, info.dropped_packets - previous.dropped_packets)
                 regressions = previous.regression_count + (info.dropped_packets < previous.dropped_packets)
                 state = FirmwareObservation(
-                    device_slug,
                     info,
                     previous.observation_count + 1,
                     previous.initial,
@@ -204,7 +187,6 @@ class FirmwareObservationStore:
                 )
             document = {
                 "schema_version": _SCHEMA_VERSION,
-                "device_slug": device_slug,
                 "latest": {
                     "read_sequence": state.read_sequence,
                     "write_sequence": state.write_sequence,
@@ -280,21 +262,20 @@ class FirmwareObservationWriter:
         self._config = config.firmware_observations if isinstance(config, CollectorConfig) else config
         self._on_error = on_error
         self._condition = threading.Condition()
-        self._pending: dict[str, RingInfo] = {}
-        self._latest_observations: dict[str, RingInfo] = {}
+        self._pending: RingInfo | None = None
+        self._latest_observation: RingInfo | None = None
         self._failure_active = False
         self._stopping = False
         self._thread = threading.Thread(target=self._run, name="firmware-observations", daemon=True)
         self._thread.start()
 
-    def observe(self, device_slug: str, info: RingInfo) -> None:
-        _validate_slug(device_slug)
+    def observe(self, info: RingInfo) -> None:
         _validate_ring_info(info)
         with self._condition:
-            if self._latest_observations.get(device_slug) == info:
+            if self._latest_observation == info:
                 return
-            self._latest_observations[device_slug] = info
-            self._pending[device_slug] = info
+            self._latest_observation = info
+            self._pending = info
             self._condition.notify()
 
     def close(self) -> None:
@@ -315,20 +296,21 @@ class FirmwareObservationWriter:
         retry_index = 0
         while True:
             with self._condition:
-                while not self._pending and not self._stopping:
+                while self._pending is None and not self._stopping:
                     self._condition.wait()
-                if not self._pending:
+                if self._pending is None:
                     return
-                device_slug = next(iter(self._pending))
-                item = (device_slug, self._pending.pop(device_slug))
+                item = self._pending
+                self._pending = None
             try:
-                self._store.record(*item)
+                self._store.record(item)
             except Exception as error:  # noqa: BLE001
                 if not self._failure_active:
                     self._failure_active = True
                     self._report_error(error)
                 with self._condition:
-                    self._pending.setdefault(item[0], item[1])
+                    if self._pending is None:
+                        self._pending = item
                     if self._stopping:
                         return
                     delay = self._config.retry_backoff_seconds[

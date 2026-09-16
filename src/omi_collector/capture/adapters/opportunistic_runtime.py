@@ -36,10 +36,9 @@ from .staging_writer import StagingWriter
 class _StagingWriterAdapter:
     """Checked ``AttemptWriter`` target over the public staging-writer API."""
 
-    def __init__(self, store: StagingStore, device_slug: str, start: int, count: int, source_start: int) -> None:
-        self._writer = StagingWriter(store, device_slug, start, count)
+    def __init__(self, store: StagingStore, start: int, count: int, source_start: int) -> None:
+        self._writer = StagingWriter(store, start, count)
         self._store = store
-        self._device_slug = device_slug
         self._leg_base = 0
         self._source_start = source_start
 
@@ -82,11 +81,11 @@ class _StagingWriterAdapter:
 
     def _publish_timeline(self) -> None:
         try:
-            result = self._store.publish_timeline(self._device_slug)
+            result = self._store.publish_timeline()
             if result is not None:
-                debug_event("timeline_generation_published", device_slug=self._device_slug)
+                debug_event("timeline_generation_published")
         except Exception as error:  # noqa: BLE001 - capture remains authoritative while publication waits
-            debug_exception("timeline_generation_blocked", error, device_slug=self._device_slug)
+            debug_exception("timeline_generation_blocked", error)
 
     def close(self) -> None:
         self._writer.close()
@@ -162,7 +161,6 @@ class OpportunisticRuntime(CaptureRuntimePort):
     def make_batch_writer(  # noqa: PLR0913 - transfer intent values stay explicit
         self,
         staging: StagingPort,
-        device_slug: str,
         start: int,
         count: int,
         *,
@@ -170,7 +168,7 @@ class OpportunisticRuntime(CaptureRuntimePort):
         source: memoryview,
         config: WriterConfig,
     ) -> BatchWriterPort:
-        target = _StagingWriterAdapter(cast(StagingStore, staging), device_slug, start, count, source_start)
+        target = _StagingWriterAdapter(cast(StagingStore, staging), start, count, source_start)
         return _BatchWriter(
             AttemptWriter(target, source, config=config),
             target,
@@ -194,13 +192,11 @@ class OpportunisticRuntime(CaptureRuntimePort):
         self,
         source: Path,
         staging: StagingPort,
-        device_slug: str,
         should_defer: Callable[[], bool],
     ) -> object:
         return publish_quarantined_prefix(
             source,
             cast(StagingStore, staging).paths,
-            device_slug,
             should_defer=should_defer,
         )
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -14,6 +13,8 @@ from uuid import uuid4
 
 from ..domain.ring_protocol import RECORD_SIZE
 from .bundle_contract import BundleManifest, SealedReceipt
+
+_REPAIR_LEDGER_VERSION = 2
 
 
 class TimelineGenerationError(RuntimeError):
@@ -42,28 +43,23 @@ class GenerationResult:
     generation_id: str
 
 
-def publish_from_ledger(
-    captured_root: Path, publication_root: Path, collector_root: Path, device_slug: str
-) -> GenerationResult:
+def publish_from_ledger(captured_root: Path, publication_root: Path, collector_root: Path) -> GenerationResult:
     """Publish from the durable repair ledger only when clock evidence is settled."""
-    _validate_device_slug(device_slug)
-    repairs = _read_repairs(collector_root / "timeline-repairs.json", device_slug)
-    _require_settled_clock_operations(collector_root / "clock-corrections" / device_slug)
-    return build_generation(captured_root, publication_root, device_slug, repairs)
+    repairs = _read_repairs(collector_root / "timeline-repairs.json")
+    _require_settled_clock_operations(collector_root / "clock-corrections")
+    return build_generation(captured_root, publication_root, repairs)
 
 
 def build_generation(
     captured_root: Path,
     publication_root: Path,
-    device_slug: str,
     repairs: tuple[TimeRepair, ...],
 ) -> GenerationResult:
     """Rebuild every bundle, validate the chain, and switch one symlink."""
-    _validate_device_slug(device_slug)
-    bundles = _bundles(captured_root / device_slug)
+    bundles = _bundles(captured_root)
     _validate_repairs(repairs)
     identity = _generation_identity(bundles, repairs)
-    generations = publication_root / ".generations" / device_slug
+    generations = publication_root / ".generations"
     generations.mkdir(mode=0o750, parents=True, exist_ok=True)
     destination = generations / identity
     if not destination.exists():
@@ -80,13 +76,8 @@ def build_generation(
             raise
     else:
         records = _append_generation(destination, identity, bundles, repairs)
-    _switch_current(publication_root, device_slug, destination)
+    _switch_current(publication_root, destination)
     return GenerationResult(destination, len(bundles), records, identity)
-
-
-def _validate_device_slug(device_slug: str) -> None:
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", device_slug) is None:
-        raise TimelineGenerationError("device slug is unsafe")
 
 
 def _require_settled_clock_operations(root: Path) -> None:
@@ -106,17 +97,18 @@ def _require_settled_clock_operations(root: Path) -> None:
             raise TimelineGenerationError("clock correction evidence is unresolved")
 
 
-def _read_repairs(path: Path, device_slug: str) -> tuple[TimeRepair, ...]:
+def _read_repairs(path: Path) -> tuple[TimeRepair, ...]:
     if not path.exists():
         return ()
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        if not isinstance(value, dict) or set(value) != {"version", "devices"} or value["version"] != 1:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"version", "repairs"}
+            or value["version"] != _REPAIR_LEDGER_VERSION
+        ):
             raise ValueError
-        devices = value["devices"]
-        if not isinstance(devices, dict):
-            raise ValueError
-        rows = devices.get(device_slug, [])
+        rows = value["repairs"]
         if not isinstance(rows, list):
             raise ValueError
         repairs = tuple(_repair(cast(dict[str, object], row)) for row in rows if isinstance(row, dict))
@@ -259,7 +251,7 @@ def _write_bundles(
         temporary = destination / f".{target.name}.{uuid4().hex}.tmp"
         temporary.mkdir(mode=0o750)
         output_manifest = BundleManifest(
-            manifest.device_slug,
+            2,
             manifest.start_sequence,
             manifest.next_sequence,
             manifest.record_count,
@@ -327,12 +319,12 @@ def _generation_manifest(
     }
 
 
-def _switch_current(publication_root: Path, device_slug: str, destination: Path) -> None:
+def _switch_current(publication_root: Path, destination: Path) -> None:
     publication_root.mkdir(mode=0o750, parents=True, exist_ok=True)
-    current = publication_root / device_slug
+    current = publication_root / "current"
     if current.exists() and not current.is_symlink():
-        raise TimelineGenerationError("legacy publication must be migrated before generation switch")
-    temporary = publication_root / f".{device_slug}.{uuid4().hex}.tmp"
+        raise TimelineGenerationError("current publication path must be a generation link")
+    temporary = publication_root / f".current.{uuid4().hex}.tmp"
     relative = destination.relative_to(publication_root)
     temporary.symlink_to(relative, target_is_directory=True)
     temporary.replace(current)

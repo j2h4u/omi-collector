@@ -45,15 +45,13 @@ def _record(marker: int) -> bytes:
 
 
 def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, count)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
 
 def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(
-        "omi_cv1", 100, count
-    )
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
@@ -139,35 +137,35 @@ def test_terminal_retired_recognition_requires_checkpoint(tmp_path: Path, monkey
         _capture_root(tmp_path),
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
-    store.terminalize_prefix_attempt("omi_cv1", attempt.attempt_id)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
 
     (attempt.path / "checkpoint.json").unlink()
 
     now += 1_000_000_000
-    assert store.pending_attempts("omi_cv1") == ()
-    assert store.sweep_terminal_retired("omi_cv1") == (attempt.path,)
+    assert store.pending_attempts() == ()
+    assert store.sweep_terminal_retired() == (attempt.path,)
     assert not attempt.path.exists()
 
 
 def test_malformed_terminal_retired_marker_blocks_admission(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
-    store.terminalize_prefix_attempt("omi_cv1", attempt.attempt_id)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
 
     (attempt.path / "terminal-retired.json").write_text("{}", encoding="utf-8")
 
-    assert store.pending_attempts("omi_cv1") == (attempt.descriptor,)
+    assert store.pending_attempts() == (attempt.descriptor,)
 
 
 def test_recovery_accepts_overlap_replay_then_exact_append(tmp_path: Path) -> None:

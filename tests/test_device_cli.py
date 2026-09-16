@@ -82,23 +82,8 @@ def _store(tmp_path: Path) -> StagingStore:
 
 
 def _layout(tmp_path: Path) -> Path:
-    path = tmp_path / "layout.toml"
-    path.write_text(
-        """version = 2
-
-[collector]
-root = "collector"
-attempts = "attempts"
-quarantine = "quarantine"
-lock = "collector.lock"
-device_state = "device.json"
-debug_log = "debug.jsonl"
-
-[publication]
-root = "source"
-""",
-        encoding="utf-8",
-    )
+    path = tmp_path / "config.toml"
+    path.write_text('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n', encoding="utf-8")
     return path
 
 
@@ -238,11 +223,11 @@ def test_confirmation_gates_do_not_construct_host_operations(monkeypatch: pytest
     runner = CliRunner()
 
     phy_result = runner.invoke(app, ["device", "phy-check"])
-    probe_result = runner.invoke(app, ["device", "probe", "--address", "AA:BB"])
-    info_result = runner.invoke(app, ["device", "info", "--address", "AA:BB"])
+    probe_result = runner.invoke(app, ["device", "probe", "--config", str(_layout(tmp_path))])
+    info_result = runner.invoke(app, ["device", "info", "--config", str(_layout(tmp_path))])
     collect_result = runner.invoke(
         app,
-        ["device", "collect", "--address", "AA:BB", "--device-slug", "omi", "--layout", str(_layout(tmp_path))],
+        ["device", "collect", "--config", str(_layout(tmp_path))],
     )
 
     assert phy_result.exit_code == 2
@@ -255,40 +240,25 @@ def test_confirmation_gates_do_not_construct_host_operations(monkeypatch: pytest
     assert "--confirm-read" in collect_result.output
 
 
-def test_non_hci0_adapter_fails_before_host_operation(monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_host_operation(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("host operation must not be constructed")
-
-    monkeypatch.setattr(device_cli, "make_guard", no_host_operation)
-
-    result = CliRunner().invoke(
-        app,
-        ["device", "probe", "--address", "AA:BB", "--adapter", "hci7", "--confirm-host-change"],
-    )
-
-    assert result.exit_code == 1
-    assert "ValueError" in result.output
-
-
-def test_unexpected_transport_error_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unexpected_transport_error_is_redacted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     async def failing_probe(_address: str, _adapter: str) -> RingStatus:
         raise Exception("raw transport detail must not reach the terminal")
 
     monkeypatch.setattr(device_cli, "probe", failing_probe)
 
-    result = CliRunner().invoke(app, ["device", "probe", "--address", "AA:BB", "--confirm-host-change"])
+    result = CliRunner().invoke(app, ["device", "probe", "--config", str(_layout(tmp_path)), "--confirm-host-change"])
 
     assert result.exit_code == 1
     assert result.output.strip() == "device operation failed: Exception"
 
 
-def test_probe_uses_injected_fakes_and_renders_safe_status(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_probe_uses_injected_fakes_and_renders_safe_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     events: list[str] = []
     _install_fakes(monkeypatch, FakeSession(_status()), events)
 
     result = CliRunner().invoke(
         app,
-        ["device", "probe", "--address", "AA:BB", "--adapter", "hci0", "--confirm-host-change"],
+        ["device", "probe", "--config", str(_layout(tmp_path)), "--confirm-host-change"],
     )
 
     assert result.exit_code == 0
@@ -299,15 +269,15 @@ def test_probe_uses_injected_fakes_and_renders_safe_status(monkeypatch: pytest.M
         "unread_packets": 2,
         "used_bytes": 100,
     }
-    assert events == ["guard-enter", "connect:AA:BB", "disconnect", "guard-exit"]
+    assert events == ["guard-enter", "connect:AA:BB:CC:DD:EE:FF", "disconnect", "guard-exit"]
 
 
-def test_info_renders_sequences_without_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_info_renders_sequences_without_audio(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     events: list[str] = []
     session = FakeSession(_status(), (b"\x01\x00", _info()))
     _install_fakes(monkeypatch, session, events)
 
-    result = CliRunner().invoke(app, ["device", "info", "--address", "AA:BB", "--confirm-host-change"])
+    result = CliRunner().invoke(app, ["device", "info", "--config", str(_layout(tmp_path)), "--confirm-host-change"])
 
     assert result.exit_code == 0
     assert json.loads(result.output) == {
@@ -330,11 +300,7 @@ def test_collect_rejects_values_above_conservative_bound(monkeypatch: pytest.Mon
         [
             "device",
             "collect",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--max-records",
             "257",
@@ -372,7 +338,6 @@ def test_sync_uses_one_guard_and_transport_and_forwards_end_to_end_progress(
     async def fake_run_opportunistic_collector(
         provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
         _staging: object,
-        _slug: str,
         options: OpportunisticOptions,
         *,
         runtime: object,
@@ -391,7 +356,7 @@ def test_sync_uses_one_guard_and_transport_and_forwards_end_to_end_progress(
         return expected
 
     monkeypatch.setattr(device_cli, "run_opportunistic_collector", fake_run_opportunistic_collector)
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), updates.append))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path), updates.append))
 
     assert result == expected
     assert events == ["connect:AA:BB", "disconnect"]
@@ -420,7 +385,6 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
     async def fake_run(
         provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
         _staging: object,
-        _slug: str,
         _options: OpportunisticOptions,
         *,
         runtime: object,
@@ -433,7 +397,7 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
     monkeypatch.setattr(device_cli, "run_opportunistic_collector", fake_run)
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), config=config))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path), config=config))
 
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert captured == [timeout_seconds, timeout_seconds]
@@ -443,7 +407,6 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
     async def fake_run_force(
         provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
         _staging: object,
-        _slug: str,
         _options: OpportunisticOptions,
         *,
         runtime: object,
@@ -454,7 +417,7 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
     monkeypatch.setattr(device_cli, "run_opportunistic_collector", fake_run_force)
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), force_1m=True, config=config))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path), force_1m=True, config=config))
 
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert captured == [timeout_seconds]
@@ -468,7 +431,6 @@ def test_sync_force_1m_enters_and_restores_phy_guard(monkeypatch: pytest.MonkeyP
     async def fake_run_opportunistic_collector(
         provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
         _staging: object,
-        _slug: str,
         options: OpportunisticOptions,
         *,
         runtime: object,
@@ -483,7 +445,7 @@ def test_sync_force_1m_enters_and_restores_phy_guard(monkeypatch: pytest.MonkeyP
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
     monkeypatch.setattr(device_cli, "run_opportunistic_collector", fake_run_opportunistic_collector)
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), force_1m=True))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path), force_1m=True))
 
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert events == ["guard-enter", "connect:AA:BB", "disconnect", "guard-exit"]
@@ -546,7 +508,7 @@ def test_sync_reconnects_with_overlap_and_enters_one_outer_guard(
     )
 
     updates: list[device_cli.DownloadProgress] = []
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), updates.append, force_1m=True))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path), updates.append, force_1m=True))
 
     assert isinstance(result, CollectionResult)
     assert result.next_sequence == 12
@@ -579,7 +541,6 @@ def test_sync_uses_injected_presence_scheduler_without_reconstruction(
     async def fake_run(
         _provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
         _staging: object,
-        _slug: str,
         options: OpportunisticOptions,
         *,
         runtime: object,
@@ -589,7 +550,7 @@ def test_sync_uses_injected_presence_scheduler_without_reconstruction(
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
     monkeypatch.setattr(device_cli, "run_opportunistic_collector", fake_run)
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), presence=injected))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path), presence=injected))
 
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert len(captured) == 1
@@ -619,7 +580,6 @@ def test_presence_and_retry_policies_share_one_config_instance(monkeypatch: pyte
     async def fake_run(
         _provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
         _staging: object,
-        _slug: str,
         options: OpportunisticOptions,
         *,
         runtime: object,
@@ -629,7 +589,7 @@ def test_presence_and_retry_policies_share_one_config_instance(monkeypatch: pyte
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
     monkeypatch.setattr(device_cli, "run_opportunistic_collector", fake_run)
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), presence=presence, config=config))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path), presence=presence, config=config))
 
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert presence.policy.rapid_backoff == config.retry.rapid_backoff
@@ -654,7 +614,7 @@ def test_sync_cancellation_exits_transport_and_restores_one_outer_guard(
     )
 
     async def cancel() -> None:
-        task = asyncio.create_task(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path), force_1m=True))
+        task = asyncio.create_task(device_cli.sync("AA:BB", "hci0", _store(tmp_path), force_1m=True))
         while len(events) < 2:
             await asyncio.sleep(0)
         task.cancel()
@@ -707,10 +667,10 @@ def test_collect_does_not_read_while_sync_writer_holds_the_device_lock(
     monkeypatch.setattr(device_cli, "make_guard", tracked_guard)
 
     async def contend() -> None:
-        syncing = asyncio.create_task(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path)))
+        syncing = asyncio.create_task(device_cli.sync("AA:BB", "hci0", _store(tmp_path)))
         await entered.wait()
         with pytest.raises(DeviceAlreadyRunningError):
-            await device_cli.collect("AA:BB", "hci0", "omi", _store(tmp_path), 1)
+            await device_cli.collect("AA:BB", "hci0", _store(tmp_path), 1)
         syncing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await syncing
@@ -745,7 +705,7 @@ def test_sync_retries_pendant_absence_with_a_fresh_transport(monkeypatch: pytest
         device_cli, "RetryPolicy", lambda **_kwargs: DefaultRetryPolicy(backoff=(0.001,), stop_after_drained=True)
     )
 
-    result = asyncio.run(device_cli.sync("AA:BB", "hci0", "omi", _store(tmp_path)))
+    result = asyncio.run(device_cli.sync("AA:BB", "hci0", _store(tmp_path)))
 
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert calls == ["AA:BB", "AA:BB"]
@@ -830,11 +790,7 @@ def test_collect_no_data_result_is_safe_json(monkeypatch: pytest.MonkeyPatch, tm
         [
             "device",
             "collect",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--max-records",
             "1",
@@ -872,7 +828,7 @@ def test_collect_seals_one_bounded_read_without_advance(monkeypatch: pytest.Monk
     )
     _install_fakes(monkeypatch, session, events)
 
-    result = asyncio.run(device_cli.collect("AA:BB", "hci0", "omi", _store(tmp_path), 1))
+    result = asyncio.run(device_cli.collect("AA:BB", "hci0", _store(tmp_path), 1))
 
     assert isinstance(result, CollectionResult)
     assert not result.advance_confirmed
@@ -896,7 +852,6 @@ def test_collect_sealed_command_reports_bundle_metadata_without_audio(
     async def fake_collect(
         _address: str,
         _adapter: str,
-        _device_slug: str,
         _staging: object,
         _max_records: int,
     ) -> CollectionResult:
@@ -909,11 +864,7 @@ def test_collect_sealed_command_reports_bundle_metadata_without_audio(
         [
             "device",
             "collect",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--confirm-read",
         ],
@@ -929,7 +880,6 @@ def test_collect_command_redacts_operational_errors(monkeypatch: pytest.MonkeyPa
     async def fail_collect(
         _address: str,
         _adapter: str,
-        _device_slug: str,
         _staging: object,
         _max_records: int,
     ) -> CollectionResult:
@@ -942,11 +892,7 @@ def test_collect_command_redacts_operational_errors(monkeypatch: pytest.MonkeyPa
         [
             "device",
             "collect",
-            "--address",
-            "AA:BB",
-            "--device-slug",
-            "omi",
-            "--layout",
+            "--config",
             str(_layout(tmp_path)),
             "--confirm-read",
         ],
@@ -995,7 +941,7 @@ def test_collect_rejects_max_records_outside_bound(
     _install_fakes(monkeypatch, FakeSession(_status()), [])
 
     with pytest.raises(ValueError, match="max_records must be between"):
-        asyncio.run(device_cli.collect("AA:BB", "hci0", "omi", _store(tmp_path), max_records))
+        asyncio.run(device_cli.collect("AA:BB", "hci0", _store(tmp_path), max_records))
 
 
 def test_run_uses_windows_asyncio_path(monkeypatch: pytest.MonkeyPatch) -> None:

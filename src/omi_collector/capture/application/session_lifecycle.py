@@ -2,7 +2,7 @@
 
 This module owns the connection boundary: context entry/exit, bounded INFO
 recovery, telemetry, retry classification, activity reporting, and the
-presence/legacy retry loops.  Batch admission and durability decisions stay in
+presence/direct retry loops. Batch admission and durability decisions stay in
 ``opportunistic_sync`` and are supplied as a small callback bundle.
 """
 
@@ -138,7 +138,7 @@ class ActivityEvent:
 class SessionLifecycleCallbacks:
     """Coordinator closures used by the physical-session lifecycle."""
 
-    before_legacy_attempt: Callable[[], Awaitable[None]]
+    before_direct_attempt: Callable[[], Awaitable[None]]
     wait_presence_attempt: Callable[[], Awaitable[PresenceWake]]
     connected_step: ConnectedStep
     post_session_checkpoint: Callable[[], Awaitable[None]]
@@ -150,7 +150,6 @@ class SessionLifecycleCallbacks:
 @dataclass(frozen=True, slots=True)
 class SessionLifecycleRun:
     provider: SessionProvider
-    device_slug: str
     options: OpportunisticOptions
     runtime: CaptureRuntimePort
     callbacks: SessionLifecycleCallbacks
@@ -169,10 +168,10 @@ class SessionLifecycle:
         self.run = run
         self._storage_not_ready_responses = 0
 
-    async def run_legacy(self) -> collector.CollectResult:
+    async def run_direct(self) -> collector.CollectResult:
         retry = 0
         while True:
-            await self.run.callbacks.before_legacy_attempt()
+            await self.run.callbacks.before_direct_attempt()
             await report_activity(self.run.options.activity, "connecting")
             completed_before = self.run.callbacks.completed_batch_query()
             context, outcome = await self._open_context(None)
@@ -261,7 +260,7 @@ class SessionLifecycle:
         current: RingInfo | None = None
         outcome: str | None = None
         teardown_error = False
-        quality = SessionQuality(self.run.device_slug, advertisement_rssi_dbm, self.run.options.phy_policy)
+        quality = SessionQuality(advertisement_rssi_dbm, self.run.options.phy_policy)
         phase = SessionPhaseState("connect", quality)
         self._storage_not_ready_responses = 0
         self._record_advertisement_quality(quality)
@@ -311,7 +310,6 @@ class SessionLifecycle:
                 AdvertisementMetric(
                     utc_timestamp(self.run.options.host_time()),
                     quality.session_id,
-                    quality.device_slug,
                     quality.advertisement_rssi_dbm,
                     metrics.release_version,
                     metrics.source_revision,
@@ -339,7 +337,6 @@ class SessionLifecycle:
             metric = TransferSessionMetric(
                 utc_timestamp(self.run.options.host_time()),
                 quality.session_id,
-                quality.device_slug,
                 terminal_outcome,
                 termination_class,
                 quality.active_read_elapsed_ms,
@@ -436,7 +433,6 @@ class SessionLifecycle:
                         remaining_budget(deadline),
                         info_reader=lambda: self._info(session),
                         correction_sink=options.clock_correction_sink,
-                        device_slug=self.run.device_slug,
                     ),
                 ),
                 timeout,
@@ -490,7 +486,6 @@ def _record_clock_correction(
             ClockCorrectionMetric(
                 utc_timestamp(host_time()),
                 quality.session_id,
-                quality.device_slug,
                 drift,
                 target,
                 boundary_min,

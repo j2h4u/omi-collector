@@ -6,19 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-_LAYOUT_V2 = """version = 2
-
-[collector]
-root = "collector"
-attempts = "attempts"
-quarantine = "quarantine"
-lock = "collector.lock"
-device_state = "device.json"
-debug_log = "debug.jsonl"
-
-[publication]
-root = "source"
-"""
+_CONFIG = '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n'
 
 
 def test_product_namespace_is_importable() -> None:
@@ -47,8 +35,8 @@ def test_root_cli_does_not_import_unselected_capture() -> None:
 
 
 def test_device_sync_executes_without_importing_downstream_code(tmp_path: Path) -> None:
-    layout = tmp_path / "layout.toml"
-    layout.write_text(_LAYOUT_V2, encoding="utf-8")
+    config = tmp_path / "config.toml"
+    config.write_text(_CONFIG, encoding="utf-8")
     fake_sync_source = """
 async def fake_sync(*args: object, **kwargs: object) -> object:
     del args, kwargs
@@ -63,7 +51,6 @@ async def fake_sync(*args: object, **kwargs: object) -> object:
         "from omi_collector.capture import cli as capture_cli; "
         f"exec({fake_sync_source!r}); "
         "capture_cli.sync = fake_sync; "
-        f"result = CliRunner().invoke(cli.app, ['device', 'sync', '--address', 'AA:BB', "
-        f"'--device-slug', 'omi', '--layout', {str(layout)!r}, '--confirm-sync']); "
+        f"result = CliRunner().invoke(cli.app, ['device', 'sync', '--config', {str(config)!r}, '--confirm-sync']); "
         "assert result.exit_code == 0, result.output"
     )

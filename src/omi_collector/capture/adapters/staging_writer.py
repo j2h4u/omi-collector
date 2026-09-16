@@ -85,10 +85,9 @@ class StagingWriter:
     exists, and otherwise creates a fresh streaming attempt.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         root: Path | str | StagingStore,
-        device_slug: str,
         start_sequence: int,
         packet_count: int,
         *,
@@ -103,7 +102,6 @@ class StagingWriter:
             if capture_root is None:
                 raise TypeError("capture_root is required when constructing StagingWriter from a path")
             self._store = StagingStore(Path(root), Path(capture_root))
-        self._device_slug = device_slug
         self._start_sequence = start_sequence
         self._packet_count = packet_count
         self._lease_context: AbstractContextManager[DeviceLock] | None = None
@@ -126,15 +124,13 @@ class StagingWriter:
             assert self._attempt is not None
             return self._attempt.descriptor
 
-        context = self._store.device_lock(self._device_slug)
+        context = self._store.device_lock()
         lease: DeviceLock | None = None
         try:
             lease = context.__enter__()
-            attempt = self._store.resume_streaming_attempt(self._device_slug, lease)
+            attempt = self._store.resume_streaming_attempt(lease)
             if attempt is None:
-                attempt = self._store.prepare_streaming_attempt(
-                    self._device_slug, self._start_sequence, self._packet_count
-                )
+                attempt = self._store.prepare_streaming_attempt(self._start_sequence, self._packet_count)
         except BaseException:
             if lease is not None:
                 context.__exit__(*sys.exc_info())

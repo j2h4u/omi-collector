@@ -67,13 +67,12 @@ class FakeClockCorrectionSink:
 
     def prepare(
         self,
-        device_slug: str,
         observed_epoch: int,
         target_epoch: int,
         drift_seconds: float,
         boundary_sequence_min: int,
     ) -> object:
-        return device_slug, observed_epoch, target_epoch, drift_seconds, boundary_sequence_min
+        return observed_epoch, target_epoch, drift_seconds, boundary_sequence_min
 
     def finish(self, correction: object, **values: object) -> object:
         self.finished.append({"correction": correction, **values})
@@ -118,7 +117,6 @@ def _run(
                 lambda: synchronized,
                 operation_timeout,
                 correction_sink=FakeClockCorrectionSink(),
-                device_slug="omi",
             ),
         )
     )
@@ -207,7 +205,6 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
                 0.5,
                 info_reader=info_after,
                 correction_sink=FakeClockCorrectionSink(),
-                device_slug="omi",
             ),
         )
     )
@@ -355,7 +352,6 @@ def test_presence_telemetry_reuses_first_info_without_duplicate_info_read(tmp_pa
         run_opportunistic_collector(
             lambda _candidate: provider(_candidate),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             OpportunisticOptions(
                 TransferTimeouts(1, 1),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),

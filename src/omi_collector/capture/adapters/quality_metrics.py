@@ -7,8 +7,10 @@ import logging
 import os
 import queue
 import re
+import sys
 from pathlib import Path
 from threading import Lock, Thread
+from typing import cast
 
 from ...config import DEFAULT_CONFIG, QualityMetricsConfig
 from ..application.quality_metrics import (
@@ -19,7 +21,8 @@ from ..application.quality_metrics import (
     TransferSessionMetric,
 )
 
-_REVISION = re.compile(r"[0-9a-f]{7,40}")
+_REVISION = re.compile(r"[0-9a-f]{40,64}")
+_RELEASE_METADATA = Path("share/omi-collector/release.json")
 
 
 class QualityMetricsError(RuntimeError):
@@ -185,20 +188,28 @@ class JsonlQualityMetrics(QualityMetricsPort):
         _fsync_parent(self._path)
 
 
-def source_revision_from_environment(
-    environ: dict[str, str] | None = None,
-    config: QualityMetricsConfig = DEFAULT_CONFIG.observability.quality_metrics,
-) -> str | None:
-    """Read deployment provenance only; never inspect a runtime working tree."""
-    values = os.environ if environ is None else environ
-    return normalize_source_revision(values.get(config.source_revision_env))
+def source_revision_from_release_metadata(path: Path | None = None) -> str | None:
+    """Read immutable deployment provenance from the installed release."""
+    metadata_path = path or Path(sys.prefix) / _RELEASE_METADATA
+    try:
+        value = cast(object, json.loads(metadata_path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("release metadata is unreadable or malformed") from error
+    if not isinstance(value, dict) or set(value) != {"source_revision"}:
+        raise ValueError("release metadata schema is invalid")
+    revision = value["source_revision"]
+    if not isinstance(revision, str):
+        raise ValueError("release source revision is invalid")
+    return normalize_source_revision(revision)
 
 
 def normalize_source_revision(value: str | None) -> str | None:
     if value is None or value == "":
         return None
     if _REVISION.fullmatch(value) is None:
-        raise ValueError("source revision must be 7 to 40 lowercase hexadecimal characters")
+        raise ValueError("source revision must be 40 to 64 lowercase hexadecimal characters")
     return value[:12]
 
 

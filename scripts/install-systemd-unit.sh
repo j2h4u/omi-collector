@@ -51,13 +51,13 @@ function validate_operator_config_file {
     # assert: the one operator configuration is a regular local file
     [[ -f "$config_file" && ! -L "$config_file" ]] \
         || die "operator configuration is missing or unsafe: ${config_file}"
-    chown root:"$account_group" -- "$config_file" \
-        || die "could not set operator configuration group: ${config_file}"
-    chmod 0640 -- "$config_file" \
+    chown root:root -- "$config_file" \
+        || die "could not set operator configuration ownership: ${config_file}"
+    chmod 0644 -- "$config_file" \
         || die "could not set operator configuration mode: ${config_file}"
-    # assert: only root and the service account can read configuration
-    [[ $(stat -c '%U:%G:%a' -- "$config_file") == "root:${account_group}:640" ]] \
-        || die "operator configuration must be root:${account_group} 0640: ${config_file}"
+    # assert: both the system collector and user-owned pipeline can read it
+    [[ $(stat -c '%U:%G:%a' -- "$config_file") == "root:root:644" ]] \
+        || die "operator configuration must be root:root 0644: ${config_file}"
 }
 
 function stage_file {

@@ -116,7 +116,7 @@ def test_installer_keeps_the_unit_and_config_targets_fixed() -> None:
     assert "ensure_service_account" in installer
     assert "groupadd --system" in installer
     assert "useradd --system" in installer
-    assert 'chmod 0640 -- "$config_file"' in installer
+    assert 'chmod 0644 -- "$config_file"' in installer
     assert 'stage_file "$source_unit" "$unit_target" 0644 staged_unit' in installer
     assert "ExecStart=/usr/bin/true" in installer
     assert "systemd-analyze verify" in installer

@@ -45,8 +45,8 @@ exact selected set on every exit path, including cancellation and recovery.
 
 systemd is the production supervisor. The public unit runs as the dedicated
 `omi-collector` system user. Keep the checkout root-owned and readable; keep
-`/srv/pipelines/omi/config.toml` root-owned, group-readable by `omi-collector`,
-mode `0640`; and keep the service-local state directory
+`/srv/pipelines/omi/config.toml` root-owned and readable by both the system
+collector and the user-owned pipeline, mode `0644`; and keep the service-local state directory
 `omi-collector:omi-collector` mode `0750`.
 
 Initial setup is deliberately small. Keep the checkout root-owned under

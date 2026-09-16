@@ -92,7 +92,7 @@ UV_BIN=$(command -v uv)
 [[ "$UV_BIN" == /usr/local/bin/uv ]] || \
   sudo install -o root -g root -m 0755 "$UV_BIN" /usr/local/bin/uv
 sudo install -d -o root -g root -m 0755 /srv/pipelines/omi
-sudo install -o root -g root -m 0600 config/config.toml.example /srv/pipelines/omi/config.toml
+sudo install -o root -g root -m 0644 config/config.toml.example /srv/pipelines/omi/config.toml
 sudoedit /srv/pipelines/omi/config.toml
 sudo scripts/install-systemd-unit.sh
 sudo install -d -o omi-collector -g omi-collector -m 0750 \

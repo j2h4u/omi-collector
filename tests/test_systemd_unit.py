@@ -255,7 +255,7 @@ def _write_filesystem_fakes(context: _FakeCommandContext) -> None:
     (fake_bin / "stat").write_text(
         "#!/usr/bin/env bash\n"
         'path="${@: -1}"\n'
-        f"if [[ \"$path\" == {quoted_config} ]]; then printf '%s\\n' 'root:{context.account_group}:640'; exit 0; fi\n"
+        f"if [[ \"$path\" == {quoted_config} ]]; then printf '%s\\n' 'root:root:644'; exit 0; fi\n"
         f"if [[ \"$path\" == {quoted_uv_cache} ]]; then printf '%s\\n' "
         f"'{context.account_user}:{context.account_group}:750'; exit 0; fi\n"
         f'if [[ "$path" == {quoted_deployment_root} || "$path" == {quoted_deployments_dir} '
@@ -349,7 +349,7 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
         '[pendant]\naddress = "12:34:56:78:9A:BC"\n',
         encoding="utf-8",
     )
-    config_file.chmod(0o640)
+    config_file.chmod(0o644)
     account_user = getpass.getuser()
     account_group = grp.getgrgid(pwd.getpwnam(account_user).pw_gid).gr_name
     return _FakeCommandContext(

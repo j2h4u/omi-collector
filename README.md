@@ -227,13 +227,23 @@ The collector treats missing audio as worse than duplicate audio:
 - Publication uses an atomic rename, so downstream consumers see either a
   complete bundle or nothing.
 
-### Stock firmware can lose a short tail
+### Stock pendant gotchas
+
+These are observed limitations of the stock CV1 firmware that materially
+affect capture. They are not properties of the external audio format.
+
+#### A transmitted packet may already be gone
 
 The stock pendant firmware advances its persisted read checkpoint while data
-is being transmitted. If the pendant leaves radio range during a transfer, a
-small amount of audio can therefore become unavailable before the collector
-has received it. The collector detects and measures these gaps, but cannot
-recover bytes that the stock firmware has already discarded.
+is being transmitted. Bluetooth transmission completion does not prove that
+the collector received a complete record and stored it durably. If the pendant
+leaves radio range between those events, reconnecting can start after a small
+amount of audio that the collector never received. This is a timing-dependent
+race, not a loss on every disconnect; a weak or intermittent link makes it more
+likely. The collector detects and measures the resulting cursor gap, but cannot
+recover bytes that the stock firmware has already discarded. The confirmed
+upstream report is
+[BasedHardware/omi#13100](https://github.com/BasedHardware/omi/issues/13100).
 
 The practical mitigation is to avoid repeatedly carrying the pendant through
 the edge of Bluetooth range: place it near the server and leave it there until
@@ -241,6 +251,29 @@ the current download has drained. There is no ready-made firmware alternative
 that eliminates this failure mode. Doing so means forking the stock firmware,
 implementing less aggressive checkpointing or a replay window, building it,
 and flashing the pendant yourself.
+
+#### The pendant clock can be substantially wrong
+
+Each stored record contains a pendant-generated Unix timestamp. The CV1 clock
+has been observed ahead of trusted host time by many minutes. The corrections
+are too large to assume ordinary crystal drift, but current evidence does not
+distinguish among RTC restoration, sleep-time accounting, reset behavior, or
+another firmware defect.
+
+Correcting the clock can make later raw records appear earlier than records
+captured immediately before the write. The collector therefore persists its
+intent before changing the clock, reads the value back afterward, and records
+the exact sequence interval in which a verified reset occurred. It applies
+only this evidence-backed correction when publishing the audio timeline and
+also records the event in the operational journal. A bundle boundary alone is
+not proof of a clock correction.
+
+This gives consumers one monotonic recording timeline while preserving the
+device evidence. It does not explain or fix the underlying RTC behavior. Treat
+`sequence_loss` as confirmed unrecoverable source loss, and treat a raw
+timestamp regression as authorized only when it falls within a verified clock
+correction boundary. Recheck both behaviors after every firmware upgrade; a
+new version number alone is not proof that either one was fixed.
 
 The optional `--force-1m` weak-RF workaround changes controller-wide PHY state.
 It is disabled by default and restores the prior selection after completion,

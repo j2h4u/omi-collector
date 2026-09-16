@@ -8,9 +8,10 @@
 **Continuously drain offline audio from an Omi CV1 pendant to your own Linux server.**
 
 Omi Collector discovers a nearby pendant over Bluetooth Low Energy, downloads
-its buffered records, survives interrupted transfers, and publishes durable raw
-bundles for whatever audio pipeline you want to build next. It works with the
-stock pendant firmware and runs unattended as a systemd service.
+its buffered records, survives interrupted transfers, corrects known clock
+shifts, and publishes validated source bundles for the audio pipeline that
+follows. It works with the stock pendant firmware and runs unattended as a
+systemd service.
 
 This is an independent community project. It is not an official Omi or Based
 Hardware product. The protocol implementation is grounded in the
@@ -33,7 +34,8 @@ Omi Collector provides the narrow first stage:
 - drains the on-device ring as quickly as the link permits;
 - resumes after ordinary disconnects and process restarts;
 - verifies replayed overlap instead of silently skipping records;
-- atomically publishes sealed bundles containing the original bytes;
+- corrects timestamps around recorded pendant clock changes;
+- atomically publishes sealed bundles with one consistent timeline;
 - records operational metrics and recent debug context in local state.
 
 It deliberately does **not** transcode, run VAD, transcribe, call the Omi cloud,
@@ -41,14 +43,36 @@ or delete published bundles. Those are downstream responsibilities.
 
 ## What comes next
 
-A useful downstream pipeline can pass each raw bundle through voice activity
-detection (VAD), keep only speech for long-term storage, and publish a compact
-passport that maps retained speech back to the original timeline. This keeps
-the result small without losing when speech and removed gaps occurred.
+Our production installation passes the published source bundles to a private
+Windmill flow. That downstream implementation is not published in this
+repository. Windmill prepares temporary audio for voice activity detection
+(VAD), keeps only speech for long-term storage, and publishes one ordinary Ogg
+Opus file with a compact JSON passport. The passport maps retained speech back
+to the real timeline and records removed or missing intervals.
 
 That processing intentionally lives outside Omi Collector. This repository
-ends at durable publication of the original pendant data, so other users can
-attach a different VAD, transcription, or archival pipeline.
+ends at durable publication of validated pendant records, so Windmill is not a
+runtime dependency and other users can attach a different processing pipeline.
+
+### Pipeline boundary
+
+```text
+Omi pendant -> Omi Collector -> source/current -> Windmill -> speech/*.ogg + speech/*.json
+```
+
+Omi Collector owns Bluetooth transfer, interruption recovery, source-loss
+reporting, clock correction, and publication of a consistent record timeline.
+Its public handoff is the generation exposed atomically at `source/current`.
+Each generation contains `generation.json` plus sequence-range directories;
+each range contains `records.bin`, `manifest.json`, and `receipt.json`.
+
+`records.bin` stores consecutive 444-byte pendant records: a normalized Unix
+timestamp followed by the packed Opus payload. The manifest binds the sequence
+range, record count, size, and content hash; the receipt marks the bundle as
+sealed. Windmill discovers only these complete published ranges. The
+`captured` and `collector` directories remain internal to Omi Collector,
+`work` is temporary Windmill state, and `speech` contains Windmill's completed
+audio and passport artifacts.
 
 ## Requirements
 

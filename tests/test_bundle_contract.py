@@ -6,7 +6,7 @@ from omi_collector.capture.adapters.bundle_contract import BundleManifest, Seale
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 
 MANIFEST = {
-    "device_slug": "omi-cv1",
+    "schema_version": 2,
     "start_sequence": 10,
     "next_sequence": 12,
     "record_count": 2,

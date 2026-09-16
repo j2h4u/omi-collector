@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 import time
 from collections.abc import Callable, Coroutine, Mapping
@@ -14,11 +13,12 @@ import typer
 
 from omi_collector.config import DEFAULT_CONFIG
 from omi_collector.core import package_version
+from omi_collector.storage_layout import DEFAULT_CONFIG_PATH
 
 if TYPE_CHECKING:
     from omi_collector.capture.adapters.staging_store import StagingStore
     from omi_collector.capture.cli import DownloadProgress
-    from omi_collector.storage_layout import StorageLayout
+    from omi_collector.storage_layout import OperatorConfig
 
 
 class _CaptureCli(Protocol):
@@ -61,45 +61,14 @@ class _JsonResult(Protocol):
 
 app = typer.Typer(help="Bounded pendant collection tools.")
 device = typer.Typer(help="Safely inspect and collect bounded Omi ring batches.")
+config = typer.Typer(help="Validate collector configuration.")
 app.add_typer(device, name="device")
+app.add_typer(config, name="config")
 
 # Test seams remain unloaded until their command is selected.  A production
 # import of this module therefore does not pull in Bluetooth code.
 collect_spool_metrics: object | None = None
 collect_operator_status: object | None = None
-
-
-def _running_service_option(option: str) -> str | None:
-    """Read one already-expanded option from the running production command."""
-    service = _systemd_service_status()
-    pid = service.get("main_pid")
-    if not isinstance(pid, int) or pid <= 0:
-        return None
-    try:
-        arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-    except OSError:
-        return None
-    return _command_option(arguments, option)
-
-
-def _command_option(arguments: list[bytes], option: str) -> str | None:
-    """Extract an option value from a NUL-decoded process argument vector."""
-    encoded = option.encode()
-    for index, argument in enumerate(arguments[:-1]):
-        if argument == encoded:
-            return arguments[index + 1].decode(errors="strict")
-    return None
-
-
-def _status_option(explicit: object | None, environment: str, command_option: str) -> str:
-    value = (
-        str(explicit)
-        if explicit is not None
-        else os.environ.get(environment) or _running_service_option(command_option)
-    )
-    if not value:
-        raise typer.BadParameter(f"could not determine {command_option} from the running service")
-    return value
 
 
 def _systemd_service_status(unit: str = "omi-collector.service") -> dict[str, object]:
@@ -143,25 +112,25 @@ def _capture_cli() -> _CaptureCli:
     return cast(_CaptureCli, cli)
 
 
-def _load_layout(path: Path) -> StorageLayout:
-    from omi_collector.storage_layout import StorageLayoutError, load_storage_layout
+def _load_config(path: Path) -> OperatorConfig:
+    from omi_collector.storage_layout import StorageLayoutError, load_operator_config
 
     try:
-        return load_storage_layout(path)
+        return load_operator_config(path)
     except StorageLayoutError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=2) from error
 
 
-def _staging(layout: StorageLayout) -> StagingStore:
+def _staging(operator_config: OperatorConfig) -> StagingStore:
     from omi_collector.capture.adapters.staging_filesystem import StagingPaths
     from omi_collector.capture.adapters.staging_store import StagingStore
 
-    # Layout is validated by ``_load_layout`` before this helper is called.
+    layout = operator_config.storage
     return StagingStore.from_paths(
         StagingPaths(
             layout.collector.root,
-            layout.path.parent / "captured",
+            layout.captured,
             layout.collector.attempts,
             layout.collector.quarantine,
             layout.collector.lock,
@@ -332,14 +301,33 @@ def health() -> None:
     typer.echo("ok")
 
 
-@app.command()
-def serve(
-    interval_seconds: Annotated[
-        int, typer.Option("--interval-seconds", min=1)
-    ] = DEFAULT_CONFIG.service.interval_seconds,
+@config.command("check")
+def config_check(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")],
 ) -> None:
-    while True:
-        time.sleep(interval_seconds)
+    loaded = _load_config(config_path)
+    typer.echo(
+        json.dumps({"config": str(loaded.path), "status": "config_valid"}, sort_keys=True, separators=(",", ":"))
+    )
+
+
+@app.command()
+def service(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Run the long-lived single-pendant collector."""
+    loaded = _load_config(config_path)
+    staging = _staging(loaded)
+    _preflight_storage(staging)
+    typer.echo(
+        json.dumps(
+            {"config": str(loaded.path), "status": "deployment_ready"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        err=True,
+    )
+    _sync(loaded, staging, force_1m=False, log_level=SyncLogLevel.INFO)
 
 
 @device.command("phy-check")
@@ -371,10 +359,7 @@ def device_recover_phy(
 
 @device.command("probe")
 def device_probe(
-    address: Annotated[str, typer.Option("--address", help="Omi BLE address to connect to.")],
-    adapter: Annotated[
-        str, typer.Option("--adapter", help="Bluetooth adapter to scope temporarily.")
-    ] = DEFAULT_CONFIG.ble.adapter_name,
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     confirm_host_change: Annotated[
         bool,
         typer.Option("--confirm-host-change", help="Acknowledge the temporary controller-wide PHY change."),
@@ -382,16 +367,14 @@ def device_probe(
 ) -> None:
     """Read cached ring status without issuing a ring control command."""
     _require_confirmation(confirm_host_change, "--confirm-host-change")
-    result = _run_device_operation(_capture_cli().probe(address, adapter))
+    loaded = _load_config(config_path)
+    result = _run_device_operation(_capture_cli().probe(loaded.pendant.address, DEFAULT_CONFIG.ble.adapter_name))
     typer.echo(_capture_cli().render_status(cast(object, result)))
 
 
 @device.command("info")
 def device_info(
-    address: Annotated[str, typer.Option("--address", help="Omi BLE address to connect to.")],
-    adapter: Annotated[
-        str, typer.Option("--adapter", help="Bluetooth adapter to scope temporarily.")
-    ] = DEFAULT_CONFIG.ble.adapter_name,
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     confirm_host_change: Annotated[
         bool,
         typer.Option("--confirm-host-change", help="Acknowledge the temporary controller-wide PHY change."),
@@ -399,18 +382,15 @@ def device_info(
 ) -> None:
     """Read safe ring sequence metadata without requesting audio records."""
     _require_confirmation(confirm_host_change, "--confirm-host-change")
-    result = _run_device_operation(_capture_cli().info(address, adapter))
+    loaded = _load_config(config_path)
+    result = _run_device_operation(_capture_cli().info(loaded.pendant.address, DEFAULT_CONFIG.ble.adapter_name))
     typer.echo(_capture_cli().render_info(cast(object, result)))
 
 
 @device.command("collect")
 def device_collect(
     *,
-    address: Annotated[str, typer.Option("--address", help="Omi BLE address to connect to.")],
-    device_slug: Annotated[
-        str, typer.Option("--device-slug", help="Stable local directory component for this pendant.")
-    ],
-    layout_path: Annotated[Path, typer.Option("--layout", help="Storage-layout TOML authority.")],
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     max_records: Annotated[
         int,
         typer.Option("--max-records", min=1, max=DEFAULT_CONFIG.service.max_records, help="Bounded READ size."),
@@ -425,15 +405,14 @@ def device_collect(
 ) -> None:
     """Durably stage a bounded READ; output contains bundle metadata only."""
     _require_confirmation(confirm_read, "--confirm-read")
-    layout = _load_layout(layout_path)
-    staging = _staging(layout)
+    loaded = _load_config(config_path)
+    staging = _staging(loaded)
     _preflight_storage(staging)
     started = time.monotonic()
     result = _run_device_operation(
         _capture_cli().collect(
-            address,
+            loaded.pendant.address,
             _capture_cli().SUPPORTED_ADAPTER,
-            device_slug,
             staging,
             max_records,
         )
@@ -443,13 +422,9 @@ def device_collect(
 
 
 @device.command("sync")
-def device_sync(  # noqa: PLR0913
+def device_sync(
     *,
-    address: Annotated[str, typer.Option("--address", help="Omi BLE address to connect to.")],
-    device_slug: Annotated[
-        str, typer.Option("--device-slug", help="Stable local directory component for this pendant.")
-    ],
-    layout_path: Annotated[Path, typer.Option("--layout", help="Storage-layout TOML authority.")],
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     confirm_sync: Annotated[
         bool,
         typer.Option(
@@ -472,28 +447,23 @@ def device_sync(  # noqa: PLR0913
             help="Progress verbosity for the long-lived sync: INFO or DEBUG.",
         ),
     ] = SyncLogLevel.INFO,
-    announce_readiness: Annotated[
-        bool,
-        typer.Option(
-            "--announce-readiness",
-            help="Emit one startup record after the storage layout is loaded.",
-        ),
-    ] = False,
 ) -> None:
     """Sync using normal PHY negotiation, or explicit temporary LE 1M fallback."""
     _require_confirmation(confirm_sync, "--confirm-sync")
-    layout = _load_layout(layout_path)
-    staging = _staging(layout)
+    loaded = _load_config(config_path)
+    staging = _staging(loaded)
     _preflight_storage(staging)
-    if announce_readiness:
-        typer.echo(
-            json.dumps(
-                {"layout": str(layout.path), "status": "deployment_ready"},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            err=True,
-        )
+    _sync(loaded, staging, force_1m=force_1m, log_level=log_level)
+
+
+def _sync(
+    loaded: OperatorConfig,
+    staging: StagingStore,
+    *,
+    force_1m: bool,
+    log_level: SyncLogLevel,
+) -> None:
+    """Run one foreground sync using validated configuration and storage."""
     started = time.monotonic()
     from omi_collector.capture.adapters.debug_logging import (
         close_debug_logging,
@@ -501,15 +471,16 @@ def device_sync(  # noqa: PLR0913
         debug_exception,
     )
 
-    debug_logger = configure_debug_logging(layout.collector.root, file_name=layout.collector.debug_log.name)
+    debug_logger = configure_debug_logging(
+        loaded.storage.collector.root, file_name=loaded.storage.collector.debug_log.name
+    )
     try:
         report_progress = SyncProgressReporter(log_level, debug_logger=debug_logger)
-        presence = _capture_cli().make_presence_scheduler(address, _capture_cli().SUPPORTED_ADAPTER)
+        presence = _capture_cli().make_presence_scheduler(loaded.pendant.address, _capture_cli().SUPPORTED_ADAPTER)
         result = _run_device_operation(
             _capture_cli().sync(
-                address,
+                loaded.pendant.address,
                 _capture_cli().SUPPORTED_ADAPTER,
-                device_slug,
                 staging,
                 report_progress,
                 force_1m=force_1m,
@@ -521,7 +492,7 @@ def device_sync(  # noqa: PLR0913
         metrics = _capture_cli().download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
         typer.echo(_capture_cli().render_sync(cast(object, result), metrics))
     except Exception as error:
-        debug_exception("sync_command_failed", error, logger=debug_logger, device_slug=device_slug)
+        debug_exception("sync_command_failed", error, logger=debug_logger)
         raise
     finally:
         close_debug_logging(debug_logger)
@@ -530,23 +501,19 @@ def device_sync(  # noqa: PLR0913
 @device.command("metrics")
 def device_metrics(
     *,
-    layout_path: Annotated[Path, typer.Option("--layout", help="Storage-layout TOML authority.")],
-    device_slug: Annotated[
-        str, typer.Option("--device-slug", help="Stable local directory component for this pendant.")
-    ],
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Report metrics for the source bundles currently visible to the collector."""
     from omi_collector.spool_metrics import SpoolMetricsError
 
     try:
-        layout = _load_layout(layout_path)
+        loaded = _load_config(config_path)
         metrics = collect_spool_metrics
         if metrics is None:
             from omi_collector.spool_metrics import collect_spool_metrics as metrics
         result = cast(Callable[..., object], metrics)(
-            layout.publication.root,
-            device_slug,
-            observation_root=layout.collector.device_state,
+            loaded.storage.publication.root,
+            observation_root=loaded.storage.collector.device_state,
         )
     except SpoolMetricsError as error:
         typer.echo(str(error), err=True)
@@ -557,23 +524,18 @@ def device_metrics(
 @device.command("status")
 def device_status(
     *,
-    layout_path: Annotated[Path | None, typer.Option("--layout", help="Override the running service layout.")] = None,
-    device_slug: Annotated[
-        str | None, typer.Option("--device-slug", help="Override the running service pendant.")
-    ] = None,
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     hours: Annotated[int, typer.Option("--hours", min=1, max=8760, help="Recent quality window in hours.")] = 24,
 ) -> None:
     """Summarize current backlog, publication, transfers, and confirmed loss."""
     from omi_collector.operator_status import OperatorStatusError
 
     try:
-        resolved_layout = Path(_status_option(layout_path, "OMI_COLLECTOR_LAYOUT_PATH", "--layout"))
-        resolved_slug = _status_option(device_slug, "OMI_COLLECTOR_DEVICE_SLUG", "--device-slug")
-        layout = _load_layout(resolved_layout)
+        loaded = _load_config(config_path)
         status = collect_operator_status
         if status is None:
             from omi_collector.operator_status import collect_operator_status as status
-        result = cast(Callable[..., dict[str, object]], status)(layout, resolved_slug, hours=hours)
+        result = cast(Callable[..., dict[str, object]], status)(loaded.storage, hours=hours)
     except OperatorStatusError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error

@@ -25,23 +25,23 @@ def _bundle(root: Path, start: int, timestamps: tuple[int, ...], attempt: str) -
     digest = sha256(raw).hexdigest()
     path = root / f"{start}-{start + len(timestamps)}-{digest[:16]}"
     path.mkdir(parents=True)
-    manifest = BundleManifest("omi", start, start + len(timestamps), len(timestamps), RECORD_SIZE, digest)
+    manifest = BundleManifest(2, start, start + len(timestamps), len(timestamps), RECORD_SIZE, digest)
     (path / "records.bin").write_bytes(raw)
     (path / "manifest.json").write_text(json.dumps(manifest.as_dict()))
     (path / "receipt.json").write_text(json.dumps(SealedReceipt(attempt, digest).as_dict()))
 
 
 def test_generation_repairs_epoch_and_atomically_exposes_ordinary_bundles(tmp_path: Path) -> None:
-    captured = tmp_path / "captured" / "omi"
+    captured = tmp_path / "captured"
     published = tmp_path / "source"
     _bundle(captured, 10, (1300, 1301), "a" * 32)
     _bundle(captured, 12, (1002, 1003), "b" * 32)
 
-    result = build_generation(captured.parent, published, "omi", (TimeRepair(10, 12, 300, "clock-op"),))
+    result = build_generation(captured, published, (TimeRepair(10, 12, 300, "clock-op"),))
 
-    assert (published / "omi").is_symlink()
-    assert (published / "omi").resolve() == result.path
-    bundles = sorted(path for path in (published / "omi").iterdir() if path.is_dir())
+    assert (published / "current").is_symlink()
+    assert (published / "current").resolve() == result.path
+    bundles = sorted(path for path in (published / "current").iterdir() if path.is_dir())
     timestamps = []
     for bundle in bundles:
         raw = (bundle / "records.bin").read_bytes()
@@ -50,18 +50,18 @@ def test_generation_repairs_epoch_and_atomically_exposes_ordinary_bundles(tmp_pa
 
 
 def test_generation_never_exposes_a_regressing_candidate(tmp_path: Path) -> None:
-    captured = tmp_path / "captured" / "omi"
+    captured = tmp_path / "captured"
     published = tmp_path / "source"
     _bundle(captured, 10, (1000, 999), "a" * 32)
 
     with pytest.raises(TimelineGenerationError, match="regresses"):
-        build_generation(captured.parent, published, "omi", ())
+        build_generation(captured, published, ())
 
-    assert not (published / "omi").exists()
+    assert not (published / "current").exists()
 
 
 def test_ledger_publishes_only_settled_clock_evidence(tmp_path: Path) -> None:
-    captured = tmp_path / "captured" / "omi"
+    captured = tmp_path / "captured"
     published = tmp_path / "source"
     collector = tmp_path / "collector"
     _bundle(captured, 10, (1300, 1301), "a" * 32)
@@ -70,49 +70,47 @@ def test_ledger_publishes_only_settled_clock_evidence(tmp_path: Path) -> None:
     (collector / "timeline-repairs.json").write_text(
         json.dumps(
             {
-                "version": 1,
-                "devices": {
-                    "omi": [
-                        {
-                            "start_sequence": 10,
-                            "next_sequence": 12,
-                            "offset_seconds": 300,
-                            "evidence": "clock-op",
-                        }
-                    ]
-                },
+                "version": 2,
+                "repairs": [
+                    {
+                        "start_sequence": 10,
+                        "next_sequence": 12,
+                        "offset_seconds": 300,
+                        "evidence": "clock-op",
+                    }
+                ],
             }
         )
     )
 
-    result = publish_from_ledger(captured.parent, published, collector, "omi")
+    result = publish_from_ledger(captured, published, collector)
     assert result.record_count == 4
 
-    evidence = collector / "clock-corrections/omi/op.json"
+    evidence = collector / "clock-corrections/op.json"
     evidence.parent.mkdir(parents=True)
     evidence.write_text(json.dumps({"state": "unresolved"}))
     with pytest.raises(TimelineGenerationError, match="unresolved"):
-        publish_from_ledger(captured.parent, published, collector, "omi")
+        publish_from_ledger(captured, published, collector)
 
 
 def test_existing_generation_is_authenticated_before_reuse(tmp_path: Path) -> None:
-    captured = tmp_path / "captured" / "omi"
+    captured = tmp_path / "captured"
     published = tmp_path / "source"
     _bundle(captured, 10, (1000, 1001), "a" * 32)
-    result = build_generation(captured.parent, published, "omi", ())
+    result = build_generation(captured, published, ())
     bundle = next(path for path in result.path.iterdir() if path.is_dir())
     (bundle / "records.bin").write_bytes(b"tampered")
 
     with pytest.raises(TimelineGenerationError, match="invalid"):
-        build_generation(captured.parent, published, "omi", ())
+        build_generation(captured, published, ())
 
 
 def test_applied_clock_operation_blocks_until_finite_repair_is_proven(tmp_path: Path) -> None:
-    captured = tmp_path / "captured" / "omi"
+    captured = tmp_path / "captured"
     collector = tmp_path / "collector"
     published = tmp_path / "source"
     _bundle(captured, 10, (1000, 1300, 1301, 1002, 1003), "a" * 32)
-    operation = collector / "clock-corrections/omi/op.json"
+    operation = collector / "clock-corrections/op.json"
     operation.parent.mkdir(parents=True)
     operation.write_text(
         json.dumps(
@@ -127,20 +125,20 @@ def test_applied_clock_operation_blocks_until_finite_repair_is_proven(tmp_path: 
     )
 
     with pytest.raises(TimelineGenerationError, match="unresolved"):
-        publish_from_ledger(captured.parent, published, collector, "omi")
+        publish_from_ledger(captured, published, collector)
     assert json.loads(operation.read_text())["state"] == "applied"
 
 
 def test_generation_appends_new_bundles_without_copying_history(tmp_path: Path) -> None:
-    captured = tmp_path / "captured" / "omi"
+    captured = tmp_path / "captured"
     published = tmp_path / "source"
     _bundle(captured, 10, (1000, 1001), "a" * 32)
-    first = build_generation(captured.parent, published, "omi", ())
+    first = build_generation(captured, published, ())
     original = next(path for path in first.path.iterdir() if path.is_dir()) / "records.bin"
     original_inode = original.stat().st_ino
     _bundle(captured, 12, (1002, 1003), "b" * 32)
 
-    second = build_generation(captured.parent, published, "omi", ())
+    second = build_generation(captured, published, ())
 
     assert second.generation_id == first.generation_id
     assert second.record_count == 4

@@ -52,7 +52,6 @@ class CollectionPreservedCancelledError(asyncio.CancelledError):
 class _Run:
     provider: SessionProvider
     staging: StagingPort
-    device_slug: str
     options: OpportunisticOptions
     observation_writer: ObservationWriterPort
     runtime: CaptureRuntimePort
@@ -62,7 +61,6 @@ class _Run:
 async def run_opportunistic_collector(
     provider: SessionProvider,
     staging: StagingPort,
-    device_slug: str,
     options: OpportunisticOptions,
     runtime: CaptureRuntimePort,
 ) -> collector.CollectResult:
@@ -94,9 +92,9 @@ async def run_opportunistic_collector(
         staging, options.config.firmware_observations, report_observation_error
     )
 
-    maintenance = QuarantineMaintenance(staging, device_slug, options.activity, runtime, config=options.config)
-    run = _Run(provider, staging, device_slug, options, observation_writer, runtime, maintenance)
-    reconciler = BatchReconciler(staging, device_slug, options, runtime, maintenance.quarantine_attempt_source)
+    maintenance = QuarantineMaintenance(staging, options.activity, runtime, config=options.config)
+    run = _Run(provider, staging, options, observation_writer, runtime, maintenance)
+    reconciler = BatchReconciler(staging, options, runtime, maintenance.quarantine_attempt_source)
     lifecycle = _make_session_lifecycle(run, reconciler)
     cancelled = False
     unwinding = False
@@ -105,7 +103,7 @@ async def run_opportunistic_collector(
             return await lifecycle.run_with_presence()
         state = await maintenance.prepare_pending_startup()
         _bind_startup_state(reconciler, state)
-        return await lifecycle.run_legacy()
+        return await lifecycle.run_direct()
     except BaseException as error:
         cancelled = isinstance(error, asyncio.CancelledError)
         unwinding = True
@@ -144,7 +142,7 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
 
     def observe_info(info: RingInfo) -> None:
         try:
-            run.observation_writer.observe(run.device_slug, info)
+            run.observation_writer.observe(info)
         except Exception as error:  # noqa: BLE001 - observations are best effort
             _schedule_observation_error(run.options, error, run.runtime)
 
@@ -152,7 +150,7 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         await reconciler.checkpoint_after_session()
 
     callbacks = SessionLifecycleCallbacks(
-        before_legacy_attempt=lambda: run.maintenance.run_once(lambda: False),
+        before_direct_attempt=lambda: run.maintenance.run_once(lambda: False),
         wait_presence_attempt=wait_presence_attempt,
         connected_step=reconciler.connected_step,
         post_session_checkpoint=post_session_checkpoint,
@@ -160,7 +158,7 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         drained_result=reconciler.drained_result,
         observe_info=observe_info,
     )
-    return SessionLifecycle(SessionLifecycleRun(run.provider, run.device_slug, run.options, run.runtime, callbacks))
+    return SessionLifecycle(SessionLifecycleRun(run.provider, run.options, run.runtime, callbacks))
 
 
 def _bind_startup_state(reconciler: BatchReconciler, state: PendingStartupState) -> None:

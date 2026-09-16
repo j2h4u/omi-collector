@@ -33,7 +33,7 @@ def _begin(writer: StagingWriter, start: int = 100, count: int = 2) -> None:
 def test_construction_does_not_touch_disk(tmp_path: Path) -> None:
     root = tmp_path / "staging"
 
-    writer = StagingWriter(root, "omi_cv1", 100, 2, capture_root=_capture_root(tmp_path))
+    writer = StagingWriter(root, 100, 2, capture_root=_capture_root(tmp_path))
 
     assert not root.exists()
     writer.close()
@@ -41,7 +41,7 @@ def test_construction_does_not_touch_disk(tmp_path: Path) -> None:
 
 
 def test_writer_maps_arena_offsets_and_owns_streaming_mutations(tmp_path: Path) -> None:
-    writer = StagingWriter(tmp_path, "omi_cv1", 100, 2, capture_root=_capture_root(tmp_path))
+    writer = StagingWriter(tmp_path, 100, 2, capture_root=_capture_root(tmp_path))
     first = _record(1)
     second = _record(2)
 
@@ -61,7 +61,7 @@ def test_writer_maps_arena_offsets_and_owns_streaming_mutations(tmp_path: Path) 
 
 
 def test_append_chunk_rejects_unaligned_or_out_of_range_data(tmp_path: Path) -> None:
-    writer = StagingWriter(tmp_path, "omi_cv1", 100, 2, capture_root=_capture_root(tmp_path))
+    writer = StagingWriter(tmp_path, 100, 2, capture_root=_capture_root(tmp_path))
     _begin(writer)
 
     with pytest.raises(ValueError, match="offset"):
@@ -76,13 +76,13 @@ def test_append_chunk_rejects_unaligned_or_out_of_range_data(tmp_path: Path) -> 
 def test_prepare_resumes_partial_and_replays_from_checkpoint(tmp_path: Path) -> None:
     first = _record(1)
     second = _record(2)
-    initial = StagingWriter(tmp_path, "omi_cv1", 100, 2, capture_root=_capture_root(tmp_path))
+    initial = StagingWriter(tmp_path, 100, 2, capture_root=_capture_root(tmp_path))
     _begin(initial)
     initial.append_chunk(0, memoryview(first))
     initial.checkpoint()
     initial.close()
 
-    resumed = StagingWriter(tmp_path, "omi_cv1", 100, 2, capture_root=_capture_root(tmp_path))
+    resumed = StagingWriter(tmp_path, 100, 2, capture_root=_capture_root(tmp_path))
     prefix = resumed.prepare_leg(100, 2)
     assert prefix.next_sequence == 101
     resumed.read_begin(ReadBeginNotification(100, 2))
@@ -98,7 +98,7 @@ def test_prepare_resumes_partial_and_replays_from_checkpoint(tmp_path: Path) -> 
 
 
 def test_read_begin_rebinds_original_range_after_recovery_read_started(tmp_path: Path) -> None:
-    writer = StagingWriter(tmp_path, "omi_cv1", 100, 3, capture_root=_capture_root(tmp_path))
+    writer = StagingWriter(tmp_path, 100, 3, capture_root=_capture_root(tmp_path))
     _begin(writer, 100, 3)
     writer.append_chunk(0, memoryview(_record(1) * 2))
     writer.checkpoint()
@@ -113,7 +113,7 @@ def test_read_begin_rebinds_original_range_after_recovery_read_started(tmp_path:
 
 
 def test_prefix_is_published_by_the_same_target(tmp_path: Path) -> None:
-    writer = StagingWriter(tmp_path, "omi_cv1", 100, 2, capture_root=_capture_root(tmp_path))
+    writer = StagingWriter(tmp_path, 100, 2, capture_root=_capture_root(tmp_path))
     _begin(writer)
     writer.append_chunk(0, memoryview(_record(1)))
     writer.checkpoint()
@@ -127,7 +127,7 @@ def test_prefix_is_published_by_the_same_target(tmp_path: Path) -> None:
 
 
 def test_target_rejects_direct_cross_thread_calls_after_first_call(tmp_path: Path) -> None:
-    writer = StagingWriter(tmp_path, "omi_cv1", 100, 1, capture_root=_capture_root(tmp_path))
+    writer = StagingWriter(tmp_path, 100, 1, capture_root=_capture_root(tmp_path))
     writer.prepare()
     failures: list[BaseException] = []
 

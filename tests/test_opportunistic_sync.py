@@ -98,11 +98,10 @@ def _runtime() -> OpportunisticRuntime:
 async def run_opportunistic_collector(
     provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
     staging: StagingStore,
-    device_slug: str,
     options: OpportunisticOptions,
 ) -> CollectionResult | NoDataResult:
     """Test helper that injects the concrete runtime at every call site."""
-    return await _run_opportunistic_collector(provider, staging, device_slug, options, runtime=_runtime())
+    return await _run_opportunistic_collector(provider, staging, options, runtime=_runtime())
 
 
 def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
@@ -398,7 +397,6 @@ async def test_delayed_read_reports_progress_before_done(tmp_path: Path) -> None
         run_opportunistic_collector(
             Provider([session]),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             replace(_options(), progress=report),
         )
     )
@@ -412,7 +410,7 @@ async def test_delayed_read_reports_progress_before_done(tmp_path: Path) -> None
 
 def _patch_observation_writer(
     monkeypatch: pytest.MonkeyPatch,
-    observed: list[tuple[str, RingInfo]],
+    observed: list[RingInfo],
     close_calls: list[None],
     *,
     observe_error: bool = False,
@@ -422,10 +420,10 @@ def _patch_observation_writer(
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
-        def observe(self, device_slug: str, info: RingInfo) -> None:
+        def observe(self, info: RingInfo) -> None:
             if observe_error:
                 raise RuntimeError("observation unavailable")
-            observed.append((device_slug, info))
+            observed.append(info)
 
         def close(self) -> None:
             close_calls.append(None)
@@ -445,7 +443,7 @@ def _patch_observation_writer(
 
 def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: int = 100) -> bytes:
     store = StagingStore(root, _capture_root(root))
-    attempt = store.prepare_streaming_attempt("omi", start, count)
+    attempt = store.prepare_streaming_attempt(start, count)
     attempt.record_read_begin(ReadBeginNotification(start, count))
     records = _records(start, count)
     if persisted:
@@ -495,17 +493,17 @@ def test_presence_validation_uses_clean_drain_cooldown() -> None:
 async def test_drained_info_reaches_observation_writer_and_writer_closes_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    observed: list[tuple[str, RingInfo]] = []
+    observed: list[RingInfo] = []
     close_calls: list[None] = []
     _patch_observation_writer(monkeypatch, observed, close_calls)
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, NoDataResult)
-    assert observed == [("omi", RingInfo(100, 100, 10000, 0, RECORD_SIZE))]
+    assert observed == [RingInfo(100, 100, 10000, 0, RECORD_SIZE)]
     assert close_calls == [None]
 
 
@@ -513,7 +511,7 @@ async def test_drained_info_reaches_observation_writer_and_writer_closes_once(
 async def test_successful_info_values_reach_observation_writer_across_batch_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    observed: list[tuple[str, RingInfo]] = []
+    observed: list[RingInfo] = []
     close_calls: list[None] = []
     _patch_observation_writer(monkeypatch, observed, close_calls)
     session = ScriptedRingSession(
@@ -528,14 +526,14 @@ async def test_successful_info_values_reach_observation_writer_across_batch_life
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
     assert observed == [
-        ("omi", RingInfo(10, 11, 10000, 5, RECORD_SIZE)),
-        ("omi", RingInfo(10, 11, 10000, 6, RECORD_SIZE)),
-        ("omi", RingInfo(11, 11, 10000, 0, RECORD_SIZE)),
+        RingInfo(10, 11, 10000, 5, RECORD_SIZE),
+        RingInfo(10, 11, 10000, 6, RECORD_SIZE),
+        RingInfo(11, 11, 10000, 0, RECORD_SIZE),
     ]
     assert close_calls == [None]
     assert session.writes == [b"\x10", encode_read_command(10, 1), b"\x10", encode_advance_command(11), b"\x10"]
@@ -546,7 +544,7 @@ async def test_successful_info_values_reach_observation_writer_across_batch_life
 async def test_observation_writer_failures_do_not_block_collection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    observed: list[tuple[str, RingInfo]] = []
+    observed: list[RingInfo] = []
     close_calls: list[None] = []
     debug_records: list[tuple[str, BaseException, dict[str, object]]] = []
 
@@ -574,7 +572,7 @@ async def test_observation_writer_failures_do_not_block_collection(
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -596,7 +594,7 @@ async def test_cancellation_during_observation_close_propagates(
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
-        def observe(self, _device_slug: str, _info: RingInfo) -> None:
+        def observe(self, _info: RingInfo) -> None:
             return None
 
         def close(self) -> None:
@@ -614,9 +612,7 @@ async def test_cancellation_during_observation_close_propagates(
     monkeypatch.setattr(OpportunisticRuntime, "make_observation_writer", make_blocking_observation_writer)
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
     task = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
-        )
+        run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options())
     )
 
     try:
@@ -630,20 +626,20 @@ async def test_cancellation_during_observation_close_propagates(
 
 
 @_async_test
-@pytest.mark.parametrize("kind", ["legacy", "multiple"])
+@pytest.mark.parametrize("kind", ["single", "multiple"])
 async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path: Path, kind: str) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    if kind == "legacy":
-        store.prepare_streaming_attempt("omi", 100, 2)
+    if kind == "single":
+        store.prepare_streaming_attempt(100, 2)
     else:
-        store.prepare_streaming_attempt("omi", 100, 2)
-        store.prepare_streaming_attempt("omi", 102, 2)
+        store.prepare_streaming_attempt(100, 2)
+        store.prepare_streaming_attempt(102, 2)
     provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))])
-    result = await run_opportunistic_collector(provider, store, "omi", _options())
+    result = await run_opportunistic_collector(provider, store, _options())
 
     assert isinstance(result, NoDataResult)
     assert provider.opened == 1
-    assert not store.pending_attempts("omi")
+    assert not store.pending_attempts()
 
 
 @_async_test
@@ -657,15 +653,13 @@ async def test_malformed_resume_evidence_is_quarantined_before_provider(tmp_path
     else:
         evidence.write_bytes(evidence.read_bytes() + b"torn")
     provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))])
-    result = await run_opportunistic_collector(
-        provider, StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
-    )
+    result = await run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
 
     assert isinstance(result, NoDataResult)
     assert provider.opened == 1
     assert not partial.exists()
     assert not evidence.exists()
-    assert list((tmp_path / "quarantine" / "omi").iterdir())
+    assert list((tmp_path / "quarantine").iterdir())
 
 
 @_async_test
@@ -674,7 +668,7 @@ async def test_resumed_complete_prefix_at_device_end_seals_without_read_or_advan
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(102, 102),)),))
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -697,7 +691,7 @@ async def test_collect_mode_seals_without_advance_or_second_info(tmp_path: Path)
     options = _options(batch_records=1)
     options = replace(options, policy=replace(options.policy, advance_enabled=False))
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", options
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
     )
 
     assert isinstance(result, CollectionResult)
@@ -724,7 +718,7 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -763,7 +757,7 @@ async def test_live_partial_ahead_of_fresh_cursor_resumes_at_durable_prefix(tmp_
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=end - start)
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=end - start)
     )
 
     assert isinstance(result, CollectionResult)
@@ -776,8 +770,8 @@ async def test_live_partial_ahead_of_fresh_cursor_resumes_at_durable_prefix(tmp_
 async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    with store.device_lock("omi") as lease:
-        sealed = store.resume_streaming_attempt("omi", lease)
+    with store.device_lock() as lease:
+        sealed = store.resume_streaming_attempt(lease)
         assert sealed is not None
         sealed_result = sealed.seal(DoneNotification(0, 102))
     assert sealed_result.bundle_path.exists()
@@ -793,7 +787,7 @@ async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -819,13 +813,13 @@ async def test_post_seal_cursor_ahead_keeps_old_bundle_and_starts_at_fresh_curso
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
     assert result.next_sequence == 104
     assert encode_advance_command(102) not in session.writes
-    bundles = tuple(path.name for path in (_capture_root(tmp_path) / "omi").iterdir() if path.is_dir())
+    bundles = tuple(path.name for path in (_capture_root(tmp_path)).iterdir() if path.is_dir())
     assert any(name.startswith("100-102-") for name in bundles)
     assert any(name.startswith("103-104-") for name in bundles)
 
@@ -846,7 +840,7 @@ async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=3)
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
     )
 
     assert isinstance(result, CollectionResult)
@@ -870,15 +864,13 @@ async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_curren
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
     assert encode_read_command(103, 1) in session.writes
     assert encode_advance_command(102) not in session.writes
-    prefix_bundles = tuple(
-        path for path in (_capture_root(tmp_path) / "omi").iterdir() if path.name.startswith("100-101-")
-    )
+    prefix_bundles = tuple(path for path in (_capture_root(tmp_path)).iterdir() if path.name.startswith("100-101-"))
     assert len(prefix_bundles) == 1
     assert not (prefix_bundles[0] / "gap.json").exists()
     assert "gap_sha256" not in loads((prefix_bundles[0] / "receipt.json").read_text(encoding="utf-8"))
@@ -902,24 +894,24 @@ async def test_startup_sweep_removes_only_aged_terminal_retired_partials(
         _capture_root(tmp_path),
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    attempt = store.prepare_streaming_attempt("omi", 100, 1)
+    attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(100))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
-    store.terminalize_prefix_attempt("omi", attempt.attempt_id)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
     now += 1_000_000_000
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
 
-    result = await run_opportunistic_collector(Provider([session]), store, "omi", _options())
+    result = await run_opportunistic_collector(Provider([session]), store, _options())
 
     assert isinstance(result, NoDataResult)
     assert not attempt.path.exists()
 
 
 @_async_test
-async def test_legacy_attempt_cadence_sweeps_terminal_retired_partials_after_startup(
+async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -943,13 +935,13 @@ async def test_legacy_attempt_cadence_sweeps_terminal_retired_partials_after_sta
             staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
         ),
     )
-    attempt = store.prepare_streaming_attempt("omi", 100, 1)
+    attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(100))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
-    store.terminalize_prefix_attempt("omi", attempt.attempt_id)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
     drained = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))])
 
     class RetryThenDrain:
@@ -966,7 +958,6 @@ async def test_legacy_attempt_cadence_sweeps_terminal_retired_partials_after_sta
     result = await run_opportunistic_collector(
         provider,
         store,
-        "omi",
         replace(
             _options(),
             sleep=advance_wall_clock,
@@ -989,7 +980,7 @@ async def test_terminal_retired_sweep_failure_is_structured_and_does_not_stop_co
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     events: list[tuple[str, BaseException, dict[str, object]]] = []
 
-    def fail_sweep(_device_slug: str, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+    def fail_sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
         del should_defer
         raise OSError("simulated sweep failure")
 
@@ -1006,14 +997,14 @@ async def test_terminal_retired_sweep_failure_is_structured_and_does_not_stop_co
     monkeypatch.setattr(OpportunisticRuntime, "debug_exception", runtime_debug_exception)
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
 
-    result = await run_opportunistic_collector(Provider([session]), store, "omi", _options())
+    result = await run_opportunistic_collector(Provider([session]), store, _options())
 
     assert isinstance(result, NoDataResult)
     assert len(events) == 1
     for event, error, fields in events:
         assert event == "terminal_retired_sweep_failed"
         assert isinstance(error, OSError)
-        assert fields == {"device_slug": "omi"}
+        assert fields == {}
 
 
 @_async_test
@@ -1064,12 +1055,11 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
 
     monkeypatch.setattr(QuarantineMaintenance, "run_once", slow_maintenance)
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
-    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="abcdef1")
+    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
     task = asyncio.create_task(
         run_opportunistic_collector(
             OrderedProvider([session]),
             store,
-            "omi",
             replace(
                 _options(),
                 presence=cast(PresenceScheduler, presence),
@@ -1132,7 +1122,6 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
         run_opportunistic_collector(
             Provider([]),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             replace(_options(), presence=cast(PresenceScheduler, presence)),
         )
     )
@@ -1157,15 +1146,13 @@ async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_an
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
     assert session.writes == [b"\x10", b"\x10"]
     assert encode_advance_command(102) not in session.writes
-    prefix_bundles = tuple(
-        path for path in (_capture_root(tmp_path) / "omi").iterdir() if path.name.startswith("100-101-")
-    )
+    prefix_bundles = tuple(path for path in (_capture_root(tmp_path)).iterdir() if path.name.startswith("100-101-"))
     assert len(prefix_bundles) == 1
     assert not (prefix_bundles[0] / "gap.json").exists()
 
@@ -1216,7 +1203,6 @@ async def test_three_storage_not_ready_infos_reconnect_before_read(tmp_path: Pat
     result = await run_opportunistic_collector(
         ClosingProvider([first, second]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=config.retry.rapid_backoff, batch_records=1, stop_after_drained=True),
@@ -1282,14 +1268,14 @@ async def test_resume_cursor_matrix(
     if error is not None:
         provider = Provider([session])
         result = await run_opportunistic_collector(
-            provider, StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+            provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options()
         )
         assert isinstance(result, NoDataResult)
         assert provider.opened == 1
         return
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -1316,13 +1302,13 @@ async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_curs
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
     assert encode_read_command(103, 1) in session.writes
-    assert not StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts("omi")
-    assert any(path.name.startswith("100-101-") for path in (_capture_root(tmp_path) / "omi").iterdir())
+    assert not StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts()
+    assert any(path.name.startswith("100-101-") for path in (_capture_root(tmp_path)).iterdir())
 
 
 @_async_test
@@ -1330,7 +1316,7 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     _seed_streaming_partial(tmp_path, count=4, persisted=0)
     activity: list[ActivityEvent] = []
     operational_events: list[dict[str, object]] = []
-    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="abcdef1")
+    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
 
     def fail_operational(event: Mapping[str, object]) -> None:
         operational_events.append(dict(event))
@@ -1354,7 +1340,6 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     result = await run_opportunistic_collector(
         Provider([session]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         replace(
             _options(activity=activity, batch_records=4),
             operational=fail_operational,
@@ -1370,16 +1355,15 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     metrics = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
     loss = next(item for item in metrics if item["event"] == "sequence_loss")
     assert loss == {
-        "schema_version": 1,
+        "schema_version": 2,
         "event": "sequence_loss",
         "occurred_at": "1970-01-01T00:16:40.000+00:00",
         "session_id": loss["session_id"],
-        "device_slug": "omi",
         "missing_record_count": 1,
         "missing_raw_bytes": RECORD_SIZE,
         "reason": "device_cursor_advanced_before_host_durable_prefix",
         "release_version": "test-version",
-        "source_revision": "abcdef1",
+        "source_revision": "a" * 12,
         "firmware_version": None,
     }
 
@@ -1417,7 +1401,7 @@ async def test_quality_metrics_failure_does_not_change_completed_audio_collectio
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", options
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
     )
 
     assert isinstance(result, CollectionResult)
@@ -1428,7 +1412,7 @@ async def test_quality_metrics_failure_does_not_change_completed_audio_collectio
 async def test_completed_read_emits_one_terminal_transfer_session_with_raw_counters(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="abcdef1")
+    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
     metric_threads: list[threading.Thread] = []
     original_append = journal._append
 
@@ -1456,7 +1440,7 @@ async def test_completed_read_emits_one_terminal_transfer_session_with_raw_count
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", options
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
     )
 
     assert isinstance(result, CollectionResult)
@@ -1490,14 +1474,13 @@ async def test_real_ring_cursor_ahead_publishes_hash_bound_prefix_and_continues(
     result = await run_opportunistic_collector(
         Provider([session]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         replace(_options(batch_records=4096), operational=emit_operational),
     )
     assert isinstance(result, CollectionResult)
 
     prefix_bytes = _records(start, prefix_end - start)
     prefix_hash = sha256(prefix_bytes).hexdigest()
-    prefix_bundle = _capture_root(tmp_path) / "omi" / f"{start}-{prefix_end}-{prefix_hash[:16]}"
+    prefix_bundle = _capture_root(tmp_path) / f"{start}-{prefix_end}-{prefix_hash[:16]}"
     receipt = cast(dict[str, object], loads(prefix_bundle.joinpath("receipt.json").read_text()))
     assert prefix_bundle.joinpath("records.bin").read_bytes() == prefix_bytes
     assert not prefix_bundle.joinpath("gap.json").exists()
@@ -1535,7 +1518,6 @@ async def test_durable_prefix_resume_never_replays_old_records(tmp_path: Path) -
     result = await run_opportunistic_collector(
         Provider([session]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         replace(_options(), operational=emit_operational),
     )
 
@@ -1568,7 +1550,6 @@ async def test_clean_drain_disconnects_before_exactly_300_second_cooldown(tmp_pa
         await run_opportunistic_collector(
             lambda _candidate: Context(),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             OpportunisticOptions(
                 TransferTimeouts(1, 1),
                 RetryPolicy(backoff=(1,), drain_cooldown_seconds=300),
@@ -1611,7 +1592,6 @@ async def test_clean_drain_reports_full_cooldown_after_callback_work(tmp_path: P
         await run_opportunistic_collector(
             lambda _candidate: Context(),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             OpportunisticOptions(
                 TransferTimeouts(1, 1),
                 RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
@@ -1672,7 +1652,6 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
         await run_opportunistic_collector(
             lambda _candidate: Context(),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             OpportunisticOptions(
                 TransferTimeouts(1, 1),
                 RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
@@ -1711,7 +1690,6 @@ async def test_absence_backoff_stops_at_30_and_never_uses_drain_cooldown(tmp_pat
     result = await run_opportunistic_collector(
         provider,
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1, 2, 4, 8, 16, 30), stop_after_drained=True),
@@ -1762,7 +1740,6 @@ async def test_connected_interruption_after_initial_fallback_uses_first_rapid_re
     result = await run_opportunistic_collector(
         provider,
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1,), drain_cooldown_seconds=30, stop_after_drained=True),
@@ -1815,7 +1792,7 @@ async def test_notification_overflow_checkpoints_and_reconnects_with_fresh_info(
             return context()
 
     result = await run_opportunistic_collector(
-        ClosingProvider([first, second]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        ClosingProvider([first, second]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -1859,7 +1836,6 @@ async def test_presence_coordinator_forwards_exact_wake_candidate(tmp_path: Path
     result = await run_opportunistic_collector(
         provider,
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
@@ -1907,7 +1883,6 @@ async def test_stale_candidate_restarts_scan_for_next_candidate_without_address_
     result = await run_opportunistic_collector(
         provider,
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
@@ -1954,7 +1929,6 @@ async def test_connect_failure_without_presence_keeps_fallback_not_rapid_retry(t
     result = await run_opportunistic_collector(
         provider,
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1,), drain_cooldown_seconds=30, stop_after_drained=True),
@@ -2017,7 +1991,6 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
     result = await run_opportunistic_collector(
         provider,
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1,), batch_records=1, drain_cooldown_seconds=30, stop_after_drained=True),
@@ -2064,9 +2037,7 @@ async def test_three_batches_share_one_presence_no_double_info_and_defer_tail(tm
     )
 
     provider = Provider([session])
-    result = await run_opportunistic_collector(
-        provider, StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
-    )
+    result = await run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
 
     assert isinstance(result, CollectionResult)
     assert result.next_sequence == 16
@@ -2135,7 +2106,7 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
         assert isinstance(checkpoint_value, dict)
         checkpoint = cast(dict[str, object], checkpoint_value)
         durable_after_visit.append(cast(int, checkpoint["record_count"]))
-        device_root = capture_root / "omi"
+        device_root = capture_root
         published_after_visit.append(
             sum(1 for path in device_root.iterdir() if path.is_dir()) if device_root.is_dir() else 0
         )
@@ -2144,7 +2115,6 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
     result = await run_opportunistic_collector(
         provider,
         StagingStore(tmp_path, capture_root),
-        "omi",
         replace(_options(batch_records=6), activity=observe),
     )
 
@@ -2181,7 +2151,7 @@ async def test_default_preflight_skips_cached_status_without_telemetry(tmp_path:
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", options
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
     )
 
     assert isinstance(result, CollectionResult)
@@ -2221,7 +2191,6 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(tmp_pa
         run_opportunistic_collector(
             Provider([session]),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             OpportunisticOptions(
                 TransferTimeouts(info=30.0, transfer=600.0),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
@@ -2274,7 +2243,6 @@ async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path)
         run_opportunistic_collector(
             Provider([session]),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             OpportunisticOptions(
                 TransferTimeouts(info=30.0, transfer=600.0),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
@@ -2343,7 +2311,6 @@ async def test_disconnect_next_day_replays_overlap_and_progress_counts_unique_by
     result = await run_opportunistic_collector(
         AwayProvider([first, *unavailable, complete]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1, 2, 4, 8, 16, 30), batch_records=2, stop_after_drained=True),
@@ -2397,7 +2364,6 @@ async def test_same_process_recovery_disconnect_rebinds_original_read_begin_for_
     result = await run_opportunistic_collector(
         Provider([first, recovery, gapped]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         _options(batch_records=3),
     )
 
@@ -2438,7 +2404,6 @@ async def test_storage_not_ready_info_after_disconnect_retries_on_same_session(t
     result = await run_opportunistic_collector(
         Provider([first, recovered]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         _options(clock=clock, activity=activity),
     )
 
@@ -2471,7 +2436,7 @@ async def test_storage_not_ready_read_ack_reconnects_and_continues_collection(tm
     )
 
     result = await run_opportunistic_collector(
-        Provider([first, recovered]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+        Provider([first, recovered]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -2513,9 +2478,9 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
         ordering.append("close")
         original_close(writer)
 
-    def quarantine_source(store: StagingStore, device_slug: str, attempt_id: str) -> Path:
+    def quarantine_source(store: StagingStore, attempt_id: str) -> Path:
         ordering.append("quarantine")
-        return original_quarantine(store, device_slug, attempt_id)
+        return original_quarantine(store, attempt_id)
 
     monkeypatch.setattr(StagingWriter, "close", close)
     monkeypatch.setattr(StagingStore, "quarantine_attempt_source", quarantine_source)
@@ -2550,12 +2515,12 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
     second = ScriptedRingSession(_status(), tuple(steps))
 
     result = await run_opportunistic_collector(
-        Provider([first, second]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=3)
+        Provider([first, second]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
     )
     assert isinstance(result, (CollectionResult, NoDataResult))
-    assert not StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts("omi")
+    assert not StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts()
     assert second.writes[0] == b"\x10"
-    quarantine = tmp_path / "quarantine" / "omi"
+    quarantine = tmp_path / "quarantine"
     if case == "gap":
         assert not quarantine.exists()
     else:
@@ -2595,11 +2560,11 @@ async def test_startup_discontinuity_defers_quarantine_salvage_until_next_mainte
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=3)
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
     )
 
     assert isinstance(result, CollectionResult)
-    quarantine = tmp_path / "quarantine" / "omi"
+    quarantine = tmp_path / "quarantine"
     destinations = tuple(quarantine.iterdir())
     assert len(destinations) == 1
     assert {path.name for path in destinations[0].iterdir()} == {
@@ -2628,10 +2593,10 @@ async def test_admission_prefix_mismatch_closes_writer_and_releases_lease(
 
     with pytest.raises(CursorConsistencyError, match="prepared durable prefix"):
         await run_opportunistic_collector(
-            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
+            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
         )
 
-    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts("omi")
+    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts()
     assert not ({thread for thread in threading.enumerate() if thread.name == "omi-attempt-writer"} - original_threads)
 
 
@@ -2649,7 +2614,7 @@ async def test_cursor_regression_after_advance_ack_keeps_bundle_and_continues(tm
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=3)
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
     )
 
     assert isinstance(result, CollectionResult)
@@ -2674,7 +2639,7 @@ async def test_seal_failure_never_advances(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr("omi_collector.capture.adapters.attempts.StagedAttempt.seal", fail_seal)
     with pytest.raises(OSError, match="disk fault"):
         await run_opportunistic_collector(
-            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=1)
+            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     assert encode_advance_command(11) not in session.writes
 
@@ -2696,14 +2661,12 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
 
     reconciler = BatchReconciler(
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         _options(),
         _runtime(),
         quarantine,
     )
     reconciler._state.batch = batch_reconciliation._Batch(
         RingInfo(10, 11, 10000, 0, RECORD_SIZE),
-        "omi",
         10,
         11,
         TransferArena(10, 1, max_bytes=RECORD_SIZE),
@@ -2747,14 +2710,12 @@ async def test_uncertain_advance_reconciles_cursor_safely(
             await run_opportunistic_collector(
                 Provider([first, second]),
                 StagingStore(tmp_path, _capture_root(tmp_path)),
-                "omi",
                 _options(activity=activity),
             )
     else:
         result = await run_opportunistic_collector(
             Provider([first, second]),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             _options(activity=activity),
         )
         assert isinstance(result, CollectionResult)
@@ -2801,13 +2762,13 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
     second = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 11),)),))
     task = asyncio.create_task(
         run_opportunistic_collector(
-            Provider([first]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=1)
+            Provider([first]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     )
     await entered.wait()
     with pytest.raises(DeviceAlreadyRunningError):
         await run_opportunistic_collector(
-            Provider([second]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options(batch_records=1)
+            Provider([second]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     task.cancel()
     with pytest.raises(CollectionPreservedCancelledError):
@@ -2860,9 +2821,7 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
         ),
     )
     task = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), "omi", _options()
-        )
+        run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options())
     )
     await entered.wait()
     for _ in range(3):
@@ -2876,7 +2835,7 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
     if phase == "read":
         assert raised.value.preserved_path == tmp_path / "attempts"
     else:
-        assert raised.value.preserved_path.parent == _capture_root(tmp_path) / "omi"
+        assert raised.value.preserved_path.parent == _capture_root(tmp_path)
 
 
 @_async_test
@@ -2945,7 +2904,6 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
         run_opportunistic_collector(
             Provider([session]),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            "omi",
             replace(_options(batch_records=1, activity=activity), timeouts=TransferTimeouts(0.03, 0.03)),
         )
     )
@@ -2970,7 +2928,7 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
     assert len(closed_writers) == 1
     assert await asyncio.to_thread(closed_writers[0].thread.join, 1) is None
     assert not closed_writers[0].thread.is_alive()
-    with StagingStore(tmp_path, _capture_root(tmp_path)).device_lock("omi"):
+    with StagingStore(tmp_path, _capture_root(tmp_path)).device_lock():
         pass
 
 
@@ -2986,7 +2944,6 @@ async def test_no_data_async_activity_timeout_retry_and_policy_validation(tmp_pa
     result = await run_opportunistic_collector(
         Provider([session]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(1, 1), RetryPolicy(backoff=(0.001,), stop_after_drained=True), activity=activity
         ),
@@ -2999,7 +2956,6 @@ async def test_no_data_async_activity_timeout_retry_and_policy_validation(tmp_pa
             await run_opportunistic_collector(
                 Provider([]),
                 StagingStore(tmp_path / str(policy), tmp_path / f"{policy}-captures"),
-                "omi",
                 OpportunisticOptions(TransferTimeouts(1, 1), policy),
             )
 
@@ -3008,7 +2964,6 @@ async def test_no_data_async_activity_timeout_retry_and_policy_validation(tmp_pa
     result = await run_opportunistic_collector(
         Provider([timed_out, drained]),
         StagingStore(tmp_path / "timeout", tmp_path / "timeout-captures"),
-        "omi",
         OpportunisticOptions(
             TransferTimeouts(0.01, 1), RetryPolicy(backoff=(0.001,), stop_after_drained=True), sleep=asyncio.sleep
         ),

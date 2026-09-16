@@ -80,10 +80,10 @@ sends an explicit `ADVANCE` command.
 
 ## Production installation
 
-The supported generic production shape is a root-owned checkout and a
-dedicated `omi-collector` service account with all mutable state under
-`/var/lib/omi-collector`. This is the checked-in default and works with the
-hardened service unit without a host-specific drop-in.
+The supported production shape is a root-owned checkout, a dedicated
+`omi-collector` service account, and one shared pipeline root at
+`/srv/pipelines/omi`. The operator configuration lives at
+`/srv/pipelines/omi/config.toml`; its parent is also the fixed storage root.
 
 ```bash
 sudo git clone https://github.com/j2h4u/omi-collector.git /opt/omi-collector
@@ -91,22 +91,24 @@ cd /opt/omi-collector
 UV_BIN=$(command -v uv)
 [[ "$UV_BIN" == /usr/local/bin/uv ]] || \
   sudo install -o root -g root -m 0755 "$UV_BIN" /usr/local/bin/uv
-sudo install -d -o root -g root -m 0755 /etc/omi-collector /var/lib/omi-collector
-sudo install -o root -g root -m 0644 config/layout.toml /var/lib/omi-collector/collector.toml
-sudo install -o root -g root -m 0600 config/omi-collector.env.example /etc/omi-collector/omi-collector.env
-sudoedit /etc/omi-collector/omi-collector.env
+sudo install -d -o root -g root -m 0755 /srv/pipelines/omi
+sudo install -o root -g root -m 0644 config/config.toml.example /srv/pipelines/omi/config.toml
+sudoedit /srv/pipelines/omi/config.toml
 sudo scripts/install-systemd-unit.sh
+sudo install -d -o omi-collector -g omi-collector -m 0750 \
+  /srv/pipelines/omi/collector /srv/pipelines/omi/captured /srv/pipelines/omi/source
 sudo systemctl enable --now bluetooth.service
 sudo -u omi-collector bluetoothctl show
 sudo scripts/deploy-systemd-service.sh
 ```
 
-Replace every placeholder in the environment file. At minimum, configure the
-pendant Bluetooth address, a lowercase device slug, the layout file, checkout,
-`uv`, and virtual-environment paths. The installer enables the service but does
-not start it unless `--restart` is explicit. Complete the first successful
-deployment before rebooting or leaving the host unattended: until then the
-environment deliberately points at an unusable placeholder.
+Replace the placeholder with the pendant Bluetooth address. The configuration
+contains only `[pendant]` and `address`; the fixed location determines storage.
+The installer creates the service account, protects the configuration as
+`root:omi-collector` mode `0640`, and enables the service. It does not start the
+service unless `--restart` is explicit. Complete the first successful
+deployment before rebooting or leaving the host unattended because the unit
+has no selected runtime before then.
 
 Follow the service with:
 
@@ -131,9 +133,7 @@ publication, and recent transfer/loss evidence,
 run:
 
 ```bash
-uv run omi-collector device status \
-  --layout /var/lib/omi-collector/collector.toml \
-  --device-slug omi-cv1 --hours 24
+/var/lib/omi-collector-deployments/current/bin/omi-collector device status --hours 24
 ```
 
 Interpret `status=ok` as at least one completed transfer in the window with no
@@ -154,15 +154,13 @@ checkout and run:
 sudo scripts/deploy-systemd-service.sh
 ```
 
-The deployment command builds a versioned, root-owned environment under
-`/var/lib/omi-collector-deployments`, atomically selects it with its
-source-revision provenance, starts the service, and
+The deployment command validates the operator configuration, builds a
+versioned root-owned environment under `/var/lib/omi-collector-deployments`,
+writes its source revision into the release, atomically selects it, and
+starts the service. It
 requires both application readiness and a stable process. If either check
-fails, it restores the previous environment, provenance, and service. Known
+fails, it restores the previous selected environment and service. Known
 obsolete release directories are pruned only after a successful deployment.
-During deployment, the exact canonical schema-1 `device.json` format from
-older releases is treated as disposable and removed. Malformed, unknown,
-symlinked, or non-regular device state stops deployment without deletion.
 
 ### Maintainer Dev Script
 
@@ -175,8 +173,8 @@ release tag in that exact checkout, refuses local changes or an unexpected
 origin, and then invokes the transactional deployer above.
 
 It is not part of the portable installation contract. Other operators should
-select their own reviewed revision in the checkout configured by
-`OMI_COLLECTOR_PROJECT_DIR` and run `deploy-systemd-service.sh` directly.
+select their reviewed revision in the production checkout and run
+`deploy-systemd-service.sh` directly.
 
 On the maintainer host, run it from the source checkout with an explicit tag:
 
@@ -186,25 +184,18 @@ sudo scripts/dev-deploy-release.sh v0.3.0
 
 ## Storage
 
-The recommended generic layout file is `/var/lib/omi-collector/collector.toml`.
-Its parent is the Omi root, with `collector` and `source` as direct sibling
-roots. The collector keeps private state under the former; each device slug
-creates its own bundle directory directly below the latter, such as
-`/var/lib/omi-collector/source/omi-cv1`. The application accepts any absolute,
-regular, non-symlink layout file; all declared roots resolve relative to its
-parent.
-
-Custom storage roots require a host-specific `ReadWritePaths` systemd drop-in.
-Do not add those paths to the checked-in base unit. Grant the service account
-only the traversal and write permissions it needs.
+`/srv/pipelines/omi/config.toml` is the single operator-facing configuration.
+Its parent is the storage root. The collector uses `collector` for private
+state, `captured` for captured inputs, and `source` for the current published
+history. The checked-in systemd unit grants write access to this one fixed root.
 
 Published bundles are a shared boundary. If another local account consumes
 them, configure either a shared Unix group or a default ACL on the source root.
 For a named downstream account, the ACL shape is:
 
 ```bash
-sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /var/lib/omi-collector/source
-sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /var/lib/omi-collector/source
+sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /srv/pipelines/omi/source
+sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /srv/pipelines/omi/source
 ```
 
 Replace `DOWNSTREAM`, and ensure every parent directory is traversable by both

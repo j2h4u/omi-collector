@@ -52,14 +52,12 @@ class QuarantineMaintenance:
     def __init__(
         self,
         staging: StagingPort,
-        device_slug: str,
         activity: ActivityCallback | None,
         runtime: CaptureRuntimePort,
         *,
         config: CollectorConfig = DEFAULT_CONFIG,
     ) -> None:
         self._staging = staging
-        self._device_slug = device_slug
         self._activity = activity
         self._runtime = runtime
         self._config = config
@@ -131,28 +129,24 @@ class QuarantineMaintenance:
         try:
             removed = await asyncio.to_thread(
                 self._staging.sweep_terminal_quarantine,
-                self._device_slug,
                 should_defer=should_defer,
             )
         except Exception as error:  # noqa: BLE001 - expiry failures preserve evidence
             if self._runtime.is_device_busy_error(error):
                 return
-            self._runtime.debug_exception("terminal_quarantine_sweep_failed", error, device_slug=self._device_slug)
+            self._runtime.debug_exception("terminal_quarantine_sweep_failed", error)
         else:
             for path in removed:
-                self._runtime.debug_event(
-                    "terminal_quarantine_deleted", device_slug=self._device_slug, source=path.name
-                )
+                self._runtime.debug_event("terminal_quarantine_deleted", source=path.name)
 
     async def _salvage_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
             sources = await asyncio.to_thread(
                 self._staging.quarantined_attempts,
-                self._device_slug,
                 should_defer=should_defer,
             )
         except Exception as error:  # noqa: BLE001 - no unsafe inference from unreadable quarantine
-            self._runtime.debug_exception("quarantine_scan_failed", error, device_slug=self._device_slug)
+            self._runtime.debug_exception("quarantine_scan_failed", error)
             return
         for source in sources:
             if should_defer() or not await self._salvage_quarantined_prefix(source, should_defer):
@@ -160,7 +154,7 @@ class QuarantineMaintenance:
 
     async def quarantine_attempt_source(self, attempt_id: str) -> None:
         """Move a discontinuous source aside without diagnostic metadata."""
-        await asyncio.to_thread(self._staging.quarantine_attempt_source, self._device_slug, attempt_id)
+        await asyncio.to_thread(self._staging.quarantine_attempt_source, attempt_id)
         await report_activity(self._activity, "evidence_quarantined")
 
     async def wait_for_presence_attempt(
@@ -224,10 +218,10 @@ class QuarantineMaintenance:
         await self.run_once(defer_requested.is_set)
 
     async def _pending_descriptor(self) -> AttemptDescriptorShape | None:
-        pending = await asyncio.to_thread(self._staging.pending_attempts, self._device_slug)
+        pending = await asyncio.to_thread(self._staging.pending_attempts)
         descriptors = cast(tuple[AttemptDescriptorShape, ...], pending)
         if len(descriptors) > 1:
-            raise OpportunisticSyncError(f"multiple partial attempts block resume for {self._device_slug}")
+            raise OpportunisticSyncError("multiple partial attempts block resume")
         return descriptors[0] if descriptors else None
 
     async def _validate_pending_evidence(self, descriptor: AttemptDescriptorShape) -> int:
@@ -247,18 +241,15 @@ class QuarantineMaintenance:
         try:
             removed = await asyncio.to_thread(
                 self._staging.sweep_terminal_retired,
-                self._device_slug,
                 should_defer=should_defer,
             )
         except Exception as error:  # noqa: BLE001 - sweep failure preserves collection and evidence
             if self._runtime.is_device_busy_error(error):
                 return
-            self._runtime.debug_exception("terminal_retired_sweep_failed", error, device_slug=self._device_slug)
+            self._runtime.debug_exception("terminal_retired_sweep_failed", error)
             return
         for path in removed:
-            self._runtime.debug_event(
-                "terminal_retired_partial_deleted", device_slug=self._device_slug, attempt_id=path.name
-            )
+            self._runtime.debug_event("terminal_retired_partial_deleted", attempt_id=path.name)
 
     async def _salvage_quarantined_prefix(self, source: Path, should_defer: Callable[[], bool]) -> bool:
         try:
@@ -266,7 +257,6 @@ class QuarantineMaintenance:
                 self._runtime.publish_quarantined_prefix,
                 source,
                 self._staging,
-                self._device_slug,
                 should_defer=should_defer,
             )
         except Exception as error:
@@ -283,9 +273,7 @@ class QuarantineMaintenance:
                     str(error),
                 )
                 return True
-            self._runtime.debug_exception(
-                "quarantine_prefix_publish_retryable", error, device_slug=self._device_slug, source=source.name
-            )
+            self._runtime.debug_exception("quarantine_prefix_publish_retryable", error, source=source.name)
             backoff = self._config.retry.quarantine_publish_backoff_seconds
             self._quarantine_retry_not_before = (
                 monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
@@ -293,18 +281,15 @@ class QuarantineMaintenance:
             self._quarantine_retry_number += 1
             return False
         try:
-            await asyncio.to_thread(self._staging.mark_quarantine_published, self._device_slug, source)
+            await asyncio.to_thread(self._staging.mark_quarantine_published, source)
         except Exception as error:  # noqa: BLE001 - retain source until a later lifecycle pass
-            self._runtime.debug_exception(
-                "quarantine_terminal_mark_failed", error, device_slug=self._device_slug, source=source.name
-            )
+            self._runtime.debug_exception("quarantine_terminal_mark_failed", error, source=source.name)
             return True
         publication = cast(QuarantinePublicationShape, result)
         self._quarantine_retry_number = 0
         self._quarantine_retry_not_before = 0.0
         self._runtime.debug_event(
             "quarantine_prefix_published",
-            device_slug=self._device_slug,
             source=source.name,
             bundle=publication.bundle_path.name,
             deduplicated=publication.deduplicated,
@@ -315,21 +300,20 @@ class QuarantineMaintenance:
     async def _mark_quarantine(
         self,
         source: Path,
-        marker: Callable[[str, Path, str], None],
+        marker: Callable[[Path, str], None],
         event: str,
         reason: str,
     ) -> None:
         try:
-            await asyncio.to_thread(marker, self._device_slug, source, reason)
+            await asyncio.to_thread(marker, source, reason)
         except Exception as marking_error:  # noqa: BLE001 - source remains safe
             self._runtime.debug_exception(
                 "quarantine_classification_failed",
                 marking_error,
-                device_slug=self._device_slug,
                 source=source.name,
             )
         else:
-            self._runtime.debug_event(event, device_slug=self._device_slug, source=source.name)
+            self._runtime.debug_event(event, source=source.name)
 
     async def _quarantine_pending(
         self,
@@ -337,9 +321,9 @@ class QuarantineMaintenance:
         *,
         original_error: BaseException | None = None,
     ) -> None:
-        moved = await asyncio.to_thread(self._staging.quarantine_pending, self._device_slug, reason)
+        moved = await asyncio.to_thread(self._staging.quarantine_pending, reason)
         if not moved:
             if original_error is not None:
                 raise original_error
-            raise OpportunisticSyncError(f"unable to quarantine blocking evidence for {self._device_slug}")
+            raise OpportunisticSyncError("unable to quarantine blocking evidence")
         await report_activity(self._activity, "evidence_quarantined")

@@ -18,29 +18,14 @@ from omi_collector.capture.application.quality_metrics import (
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.operator_status import OperatorStatusError, collect_operator_status
 from omi_collector.spool_metrics import FirmwareLifetimeMetrics, SpoolMetrics, SpoolWindowMetrics
-from omi_collector.storage_layout import load_storage_layout
+from omi_collector.storage_layout import load_operator_config
 
 
-def _layout(tmp_path: Path) -> Path:
-    path = tmp_path / "layout.toml"
-    path.write_text(
-        """version = 2
-
-[collector]
-root = "collector"
-attempts = "attempts"
-quarantine = "quarantine"
-lock = "collector.lock"
-device_state = "device.json"
-debug_log = "debug.jsonl"
-
-[publication]
-root = "source"
-""",
-        encoding="utf-8",
-    )
+def _layout(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n', encoding="utf-8")
     (tmp_path / "collector").mkdir()
-    return path
+    return load_operator_config(path).storage
 
 
 def _spool() -> SpoolMetrics:
@@ -51,14 +36,13 @@ def _spool() -> SpoolMetrics:
 
 
 def _advertisement(timestamp: str) -> dict[str, object]:
-    return AdvertisementMetric(timestamp, "session-1", "omi", -91, "1.2.3", "abcdef123456", "auto").as_dict()
+    return AdvertisementMetric(timestamp, "session-1", -91, "1.2.3", "abcdef123456", "auto").as_dict()
 
 
 def _transfer(timestamp: str, *, outcome: str, termination_class: str, written_raw_bytes: int) -> dict[str, object]:
     return TransferSessionMetric(
         timestamp,
         f"session-{timestamp[-2:]}",
-        "omi",
         outcome,
         termination_class,
         2_000 if termination_class == "completed" else 1_000,
@@ -78,7 +62,6 @@ def _loss(timestamp: str) -> dict[str, object]:
     return SequenceLossMetric(
         timestamp,
         "session-loss",
-        "omi",
         2,
         888,
         "device_cursor_advanced_before_host_durable_prefix",
@@ -92,7 +75,6 @@ def _clock_correction(timestamp: str) -> dict[str, object]:
     return ClockCorrectionMetric(
         timestamp,
         "session-clock",
-        "omi",
         2359.68,
         1789128032,
         5898589,
@@ -104,8 +86,8 @@ def _clock_correction(timestamp: str) -> dict[str, object]:
 
 
 def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    layout = load_storage_layout(_layout(tmp_path))
-    FirmwareObservationStore(layout.collector.device_state).record("omi", RingInfo(10, 25, 100, 2, RECORD_SIZE))
+    layout = _layout(tmp_path)
+    FirmwareObservationStore(layout.collector.device_state).record(RingInfo(10, 25, 100, 2, RECORD_SIZE))
     events = (
         _advertisement("2026-09-08T09:00:00+00:00"),
         _transfer(
@@ -125,7 +107,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
     )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    result = collect_operator_status(layout, "omi", hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
     assert result["status"] == "attention"
     quality = cast(dict[str, object], result["quality_window"])
@@ -177,16 +159,16 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
 
 
 def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    layout = load_storage_layout(_layout(tmp_path))
+    layout = _layout(tmp_path)
     (layout.collector.root / "quality.jsonl").write_text("not-json\n", encoding="utf-8")
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     with pytest.raises(OperatorStatusError, match="malformed JSON"):
-        collect_operator_status(layout, "omi", hours=24)
+        collect_operator_status(layout, hours=24)
 
 
 def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    layout = load_storage_layout(_layout(tmp_path))
+    layout = _layout(tmp_path)
     rows = (
         {
             "event": "sync_progress",
@@ -220,7 +202,7 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
     layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    result = collect_operator_status(layout, "omi", hours=24, now=datetime(2026, 9, 8, 9, 0, 10, tzinfo=UTC))
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 9, 0, 10, tzinfo=UTC))
 
     runtime = cast(dict[str, object], result["runtime"])
     assert runtime["battery_percent"] == 96
@@ -237,7 +219,7 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
 def test_status_marks_latest_fatal_transfer_as_attention_and_excludes_future_rows(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    layout = load_storage_layout(_layout(tmp_path))
+    layout = _layout(tmp_path)
     events = (
         _transfer(
             "2026-09-08T09:05:00+00:00", outcome="collected", termination_class="completed", written_raw_bytes=4_440
@@ -260,7 +242,7 @@ def test_status_marks_latest_fatal_transfer_as_attention_and_excludes_future_row
     )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    result = collect_operator_status(layout, "omi", hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
     assert result["status"] == "attention"
     quality = cast(dict[str, object], result["quality_window"])

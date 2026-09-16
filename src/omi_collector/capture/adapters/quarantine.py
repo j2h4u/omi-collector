@@ -38,7 +38,6 @@ from .staging_contract import (
     PendingAttemptError,
     StagingError,
     _validate_attempt_id,
-    _validate_slug,
     _validate_terminalized_at,
 )
 from .staging_filesystem import (
@@ -59,27 +58,24 @@ def _seconds_to_nanoseconds(seconds: float) -> int:
     return int(seconds * 1_000_000_000)
 
 
-def quarantine_pending(filesystem: StagingFilesystem, device_slug: str, reason: str) -> tuple[Path, ...]:
+def quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tuple[Path, ...]:
     """Move blocking partial evidence aside without inspecting its contents further.
 
-    The device lease makes this operation mutually exclusive with a live
-    collector.  Valid unpublished attempts for ``device_slug`` and opaque
-    entries that cannot be proven to belong to another device are moved;
-    published and valid other-device evidence remains in place.
+    The collector lease makes this operation mutually exclusive with a live
+    collector. Valid unpublished attempts and opaque entries are moved while
+    published evidence remains in place.
     """
-    _validate_slug(device_slug)
     if not isinstance(reason, str) or not reason.strip():
         raise AttemptStateError("quarantine reason must be a non-empty string")
 
-    with filesystem.device_lock(device_slug):
-        root_candidate = _quarantine_attempts_root(filesystem, device_slug, reason)
+    with filesystem.device_lock():
+        root_candidate = _quarantine_attempts_root(filesystem, reason)
         if root_candidate is not None:
             return (root_candidate,)
-        candidates = _quarantine_candidates(filesystem, device_slug)
+        candidates = _quarantine_candidates(filesystem)
         if not candidates:
             return ()
-        destination_root = filesystem.quarantine_root / device_slug
-        _ensure_quarantine_directory(filesystem, destination_root.parent)
+        destination_root = filesystem.quarantine_root
         _ensure_quarantine_directory(filesystem, destination_root)
         return tuple(
             _move_to_quarantine(filesystem, destination_root, entry, reason, opaque=opaque)
@@ -87,17 +83,15 @@ def quarantine_pending(filesystem: StagingFilesystem, device_slug: str, reason: 
         )
 
 
-def quarantine_attempt_source(filesystem: StagingFilesystem, device_slug: str, attempt_id: str) -> Path:
+def quarantine_attempt_source(filesystem: StagingFilesystem, attempt_id: str) -> Path:
     """Move one preserved attempt source without adding diagnostic metadata."""
-    _validate_slug(device_slug)
     _validate_attempt_id(attempt_id)
-    with filesystem.device_lock(device_slug):
+    with filesystem.device_lock():
         path = filesystem.attempts_root / attempt_id
         descriptor = filesystem._read_descriptor(path)
-        if descriptor.device_slug != device_slug or is_nonblocking_attempt(filesystem, path, descriptor):
+        if is_nonblocking_attempt(filesystem, path, descriptor):
             raise AttemptStateError("attempt source is not an active partial")
-        destination_root = filesystem.quarantine_root / device_slug
-        _ensure_quarantine_directory(filesystem, destination_root.parent)
+        destination_root = filesystem.quarantine_root
         _ensure_quarantine_directory(filesystem, destination_root)
         destination = _quarantine_source_path(destination_root, path.name)
         path.replace(destination)
@@ -106,20 +100,17 @@ def quarantine_attempt_source(filesystem: StagingFilesystem, device_slug: str, a
         return destination
 
 
-def terminalize_prefix_attempt(filesystem: StagingFilesystem, device_slug: str, attempt_id: str) -> None:
+def terminalize_prefix_attempt(filesystem: StagingFilesystem, attempt_id: str) -> None:
     """Atomically mark one closed prefix publication as permanently retired.
 
     The recoverable prefix marker remains in place. The new marker is a
     distinct state-machine stage that wins admission independently of the
     published capture directory.
     """
-    _validate_slug(device_slug)
     _validate_attempt_id(attempt_id)
-    with filesystem.device_lock(device_slug):
+    with filesystem.device_lock():
         path = filesystem.attempts_root / attempt_id
         descriptor = filesystem._read_descriptor(path)
-        if descriptor.device_slug != device_slug:
-            raise AttemptStateError("attempt source belongs to another device")
         if _is_terminal_retired_attempt(path):
             return
         if _has_terminal_retirement_marker(path):
@@ -156,17 +147,15 @@ def terminalize_prefix_attempt(filesystem: StagingFilesystem, device_slug: str, 
 
 def sweep_terminal_retired(
     filesystem: StagingFilesystem,
-    device_slug: str,
     *,
     should_defer: Callable[[], bool] = _never_defer,
 ) -> tuple[Path, ...]:
-    """Delete only aged terminal-retired partial directories for one device."""
-    _validate_slug(device_slug)
+    """Delete only aged terminal-retired partial directories."""
     retention_ns = _seconds_to_nanoseconds(filesystem._terminal_retention_seconds)
     now_unix_ns = _wall_clock_ns()
     _validate_terminalized_at(now_unix_ns)
     removed: list[Path] = []
-    with filesystem.device_lock(device_slug):
+    with filesystem.device_lock():
         try:
             if not os.path.lexists(filesystem.attempts_root):
                 return ()
@@ -182,7 +171,6 @@ def sweep_terminal_retired(
                 expired = _terminal_retired_expired(
                     filesystem,
                     entry,
-                    device_slug,
                     now_unix_ns,
                     retention_ns,
                 )
@@ -203,41 +191,34 @@ def sweep_terminal_retired(
 def _terminal_retired_expired(
     filesystem: StagingFilesystem,
     entry: Path,
-    device_slug: str,
     now_unix_ns: int,
     retention_ns: int,
 ) -> bool:
     mode = entry.lstat().st_mode
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         return False
-    descriptor = filesystem._read_descriptor(entry)
+    filesystem._read_descriptor(entry)
     terminalized_at = _terminal_retired_at(entry)
-    return (
-        descriptor.device_slug == device_slug
-        and terminalized_at is not None
-        and now_unix_ns - terminalized_at >= retention_ns
-    )
+    return terminalized_at is not None and now_unix_ns - terminalized_at >= retention_ns
 
 
 def quarantined_attempts(
     filesystem: StagingFilesystem,
-    device_slug: str,
     *,
     should_defer: Callable[[], bool] = _never_defer,
 ) -> tuple[Path, ...]:
     """Return regular quarantined attempt directories without creating roots."""
-    _validate_slug(device_slug)
-    device_root = filesystem.quarantine_root / device_slug
+    quarantine_root = filesystem.quarantine_root
     try:
-        mode = device_root.lstat().st_mode
+        mode = quarantine_root.lstat().st_mode
     except FileNotFoundError:
         return ()
     except OSError as error:
         raise StagingError("quarantine cannot be inspected") from error
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        raise StagingError("quarantine device root is not a regular directory")
+        raise StagingError("quarantine root is not a regular directory")
     try:
-        entries = tuple(device_root.iterdir())
+        entries = tuple(quarantine_root.iterdir())
     except OSError as error:
         raise StagingError("quarantine cannot be inspected") from error
     result: list[Path] = []
@@ -263,12 +244,11 @@ def quarantined_attempts(
     return tuple(result)
 
 
-def mark_quarantine_published(filesystem: StagingFilesystem, device_slug: str, source: Path) -> None:
+def mark_quarantine_published(filesystem: StagingFilesystem, source: Path) -> None:
     """Mark an automatically published quarantine source for delayed deletion."""
     _mark_quarantine(
         filesystem,
         source,
-        device_slug,
         _PUBLISHED_QUARANTINE_NAME,
         {
             "version": _TERMINAL_RETIREMENT_VERSION,
@@ -278,14 +258,13 @@ def mark_quarantine_published(filesystem: StagingFilesystem, device_slug: str, s
     )
 
 
-def mark_quarantine_unprocessable(filesystem: StagingFilesystem, device_slug: str, source: Path, reason: str) -> None:
+def mark_quarantine_unprocessable(filesystem: StagingFilesystem, source: Path, reason: str) -> None:
     """Terminally classify evidence that cannot authenticate a publishable prefix."""
     if not reason:
         raise AttemptStateError("unprocessable reason must be non-empty")
     _mark_quarantine(
         filesystem,
         source,
-        device_slug,
         _UNPROCESSABLE_QUARANTINE_NAME,
         {
             "version": _TERMINAL_RETIREMENT_VERSION,
@@ -296,37 +275,32 @@ def mark_quarantine_unprocessable(filesystem: StagingFilesystem, device_slug: st
     )
 
 
-def _mark_quarantine(
-    filesystem: StagingFilesystem, source: Path, device_slug: str, marker_name: str, payload: dict[str, object]
-) -> None:
-    _validate_slug(device_slug)
-    with filesystem.device_lock(device_slug):
-        root = filesystem.quarantine_root / device_slug
+def _mark_quarantine(filesystem: StagingFilesystem, source: Path, marker_name: str, payload: dict[str, object]) -> None:
+    with filesystem.device_lock():
+        root = filesystem.quarantine_root
         try:
             relative = Path(source).absolute().relative_to(root)
         except ValueError as error:
-            raise AttemptStateError("quarantine source escapes device root") from error
+            raise AttemptStateError("quarantine source escapes quarantine root") from error
         if len(relative.parts) != 1:
-            raise AttemptStateError("quarantine source is not an immediate device child")
+            raise AttemptStateError("quarantine source is not an immediate child")
         _require_regular_directory(source)
         filesystem._write_json_atomic(source / marker_name, payload)
 
 
 def sweep_terminal_quarantine(
     filesystem: StagingFilesystem,
-    device_slug: str,
     *,
     should_defer: Callable[[], bool] = _never_defer,
 ) -> tuple[Path, ...]:
     """Classify unsafe entries and delete aged terminal quarantine evidence."""
-    _validate_slug(device_slug)
     if should_defer():
         return ()
     retention_ns = _seconds_to_nanoseconds(filesystem._terminal_retention_seconds)
     now_unix_ns = _wall_clock_ns()
     removed: list[Path] = []
-    with filesystem.device_lock(device_slug):
-        root = filesystem.quarantine_root / device_slug
+    with filesystem.device_lock():
+        root = filesystem.quarantine_root
         try:
             mode = root.lstat().st_mode
         except FileNotFoundError:
@@ -491,13 +465,13 @@ def _is_published_attempt(filesystem: StagingFilesystem, path: Path, descriptor:
     return is_published_attempt(path, descriptor, filesystem)
 
 
-def assert_no_pending(filesystem: StagingFilesystem, device_slug: str) -> None:
-    """Fail closed when preserved partial evidence exists for ``device_slug``."""
-    if pending_attempts(filesystem, device_slug):
-        raise PendingAttemptError(f"partial staging evidence blocks another READ for {device_slug}")
+def assert_no_pending(filesystem: StagingFilesystem) -> None:
+    """Fail closed when preserved partial evidence exists."""
+    if pending_attempts(filesystem):
+        raise PendingAttemptError("partial staging evidence blocks another READ")
 
 
-def _quarantine_candidates(filesystem: StagingFilesystem, device_slug: str) -> tuple[tuple[Path, bool], ...]:
+def _quarantine_candidates(filesystem: StagingFilesystem) -> tuple[tuple[Path, bool], ...]:
     try:
         if not os.path.lexists(filesystem.attempts_root):
             return ()
@@ -510,9 +484,7 @@ def _quarantine_candidates(filesystem: StagingFilesystem, device_slug: str) -> t
     candidates: list[tuple[Path, bool]] = []
     for entry in entries:
         descriptor = _inspect_pending_entry(filesystem, entry)
-        if descriptor is None or (
-            descriptor.device_slug == device_slug and not is_nonblocking_attempt(filesystem, entry, descriptor)
-        ):
+        if descriptor is None or not is_nonblocking_attempt(filesystem, entry, descriptor):
             candidates.append((entry, descriptor is None))
     return tuple(candidates)
 
@@ -528,7 +500,7 @@ def _inspect_pending_entry(filesystem: StagingFilesystem, entry: Path) -> Attemp
         return None
 
 
-def _quarantine_attempts_root(filesystem: StagingFilesystem, device_slug: str, reason: str) -> Path | None:
+def _quarantine_attempts_root(filesystem: StagingFilesystem, reason: str) -> Path | None:
     """Move an unsafe attempts root itself, then recreate a directory."""
     try:
         mode = filesystem.attempts_root.lstat().st_mode
@@ -539,8 +511,7 @@ def _quarantine_attempts_root(filesystem: StagingFilesystem, device_slug: str, r
     if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
         return None
 
-    destination_root = filesystem.quarantine_root / device_slug
-    _ensure_quarantine_directory(filesystem, destination_root.parent)
+    destination_root = filesystem.quarantine_root
     _ensure_quarantine_directory(filesystem, destination_root)
     destination, sidecar = _quarantine_paths(destination_root, filesystem.attempts_root.name)
     filesystem.attempts_root.replace(destination)
@@ -620,9 +591,8 @@ def _ensure_quarantine_directory(filesystem: StagingFilesystem, path: Path) -> N
         raise StagingError(f"quarantine path is not a directory: {path}")
 
 
-def pending_attempts(filesystem: StagingFilesystem, device_slug: str) -> tuple[AttemptDescriptor, ...]:
-    """Return valid, non-published partial attempts attributed to one device."""
-    _validate_slug(device_slug)
+def pending_attempts(filesystem: StagingFilesystem) -> tuple[AttemptDescriptor, ...]:
+    """Return valid, non-published partial attempts."""
     try:
         if not os.path.lexists(filesystem.attempts_root):
             return ()
@@ -636,7 +606,7 @@ def pending_attempts(filesystem: StagingFilesystem, device_slug: str) -> tuple[A
         descriptor = _inspect_pending_entry(filesystem, entry)
         if descriptor is None:
             raise PendingAttemptError("malformed partial attempt evidence blocks resume")
-        if descriptor.device_slug == device_slug and not is_nonblocking_attempt(filesystem, entry, descriptor):
+        if not is_nonblocking_attempt(filesystem, entry, descriptor):
             result.append(descriptor)
     return tuple(result)
 
@@ -644,18 +614,16 @@ def pending_attempts(filesystem: StagingFilesystem, device_slug: str) -> tuple[A
 def quarantine_capture_temporary(
     filesystem: StagingFilesystem,
     temporary: Path,
-    device_root: Path,
-    device_slug: str,
+    capture_root: Path,
     reason: str,
 ) -> None:
     """Move one unsafe capture temporary into quarantine with retryable evidence."""
-    destination_root = filesystem.quarantine_root / device_slug
-    _ensure_quarantine_directory(filesystem, destination_root.parent)
+    destination_root = filesystem.quarantine_root
     _ensure_quarantine_directory(filesystem, destination_root)
     destination, sidecar = _quarantine_paths(destination_root, f"capture-temporary-{temporary.name}")
     temporary.replace(destination)
     _sync_directory(destination.parent, filesystem._fsync)
-    _sync_directory(device_root, filesystem._fsync)
+    _sync_directory(capture_root, filesystem._fsync)
     payload = {
         "version": _TERMINAL_RETIREMENT_VERSION,
         "state": _UNPROCESSABLE_QUARANTINE_STATE,

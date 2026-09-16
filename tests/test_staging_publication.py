@@ -49,15 +49,13 @@ def _record(marker: int) -> bytes:
 
 
 def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, count)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
 
 def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(
-        "omi_cv1", 100, count
-    )
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
 
@@ -174,7 +172,7 @@ class _RecordingStream:
 def test_split_roots_publish_only_completed_bundles_to_capture_root(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
 
@@ -187,23 +185,21 @@ def test_split_roots_publish_only_completed_bundles_to_capture_root(tmp_path: Pa
         "receipt.json",
         "records.bin",
     }
-    assert not (spool / "omi_cv1").exists()
-    assert not tuple((capture_root / "omi_cv1").glob(".*.tmp"))
+    assert not tuple(capture_root.glob(".*.tmp"))
 
 
 def test_recovery_quarantines_capture_temporary_with_malformed_manifest_scalar(tmp_path: Path) -> None:
     capture_root = _capture_root(tmp_path)
-    device_root = capture_root / "omi_cv1"
-    device_root.mkdir(parents=True)
+    capture_root.mkdir(parents=True)
     raw = _record(1)
     raw_hash = sha256(raw).hexdigest()
-    temporary = device_root / f".100-101-{raw_hash[:16]}.{'a' * 32}.tmp"
+    temporary = capture_root / f".100-101-{raw_hash[:16]}.{'a' * 32}.tmp"
     temporary.mkdir()
     (temporary / "records.bin").write_bytes(raw)
     (temporary / "manifest.json").write_text(
         dumps(
             {
-                "device_slug": "omi_cv1",
+                "schema_version": 2,
                 "start_sequence": True,
                 "next_sequence": 101,
                 "record_count": 1,
@@ -218,11 +214,11 @@ def test_recovery_quarantines_capture_temporary_with_malformed_manifest_scalar(t
         encoding="utf-8",
     )
 
-    with StagingStore(tmp_path / "spool", capture_root).device_lock("omi_cv1"):
+    with StagingStore(tmp_path / "spool", capture_root).device_lock():
         pass
 
     assert not temporary.exists()
-    quarantined = tuple((tmp_path / "spool" / "quarantine" / "omi_cv1").iterdir())
+    quarantined = tuple((tmp_path / "spool" / "quarantine").iterdir())
     assert len(quarantined) == 1
     assert (quarantined[0] / "unprocessable.json").is_file()
 
@@ -243,13 +239,13 @@ def test_prefix_publication_uses_capture_local_rename(tmp_path: Path, monkeypatc
     assert (attempt.path / "records.bin").read_bytes() == source_raw
     assert (attempt.path / "prefix-publication.json").exists()
     assert result.bundle_path.exists()
-    assert not tuple((capture_root / "omi_cv1").glob(".*.tmp"))
+    assert not tuple(capture_root.glob(".*.tmp"))
 
 
 def test_full_seal_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
 
@@ -259,13 +255,13 @@ def test_full_seal_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest
 
     assert result.bundle_path.exists()
     assert not attempt.path.exists()
-    assert not tuple((capture_root / "omi_cv1").glob(".*.tmp"))
+    assert not tuple(capture_root.glob(".*.tmp"))
 
 
 def test_full_seal_keeps_source_when_destination_copy_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
 
@@ -278,14 +274,14 @@ def test_full_seal_keeps_source_when_destination_copy_fails(tmp_path: Path, monk
         attempt.seal(DoneNotification(0, 101))
 
     assert attempt.path.exists()
-    assert not tuple((capture_root / "omi_cv1").glob("100-101-*"))
-    assert not tuple((capture_root / "omi_cv1").glob(".*.tmp"))
+    assert not tuple(capture_root.glob("100-101-*"))
+    assert not tuple(capture_root.glob(".*.tmp"))
 
 
 def test_seal_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
     outside = tmp_path / "outside"
@@ -297,14 +293,14 @@ def test_seal_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path) ->
     with pytest.raises(StagingError, match="capture root"):
         attempt.seal(DoneNotification(0, 101))
 
-    assert not (outside / "omi_cv1").exists()
+    assert not tuple(outside.iterdir())
     assert attempt.path.exists()
 
 
 def test_prefix_publication_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.append_record(0, 100, _record(1))
     attempt.checkpoint()
@@ -317,7 +313,7 @@ def test_prefix_publication_rejects_capture_root_symlink_swap_before_rename(tmp_
     with pytest.raises(StagingError, match="capture root"):
         attempt.publish_prefix()
 
-    assert not (outside / "omi_cv1").exists()
+    assert not tuple(outside.iterdir())
     assert attempt.path.exists()
 
 
@@ -356,7 +352,7 @@ def test_cursor_ahead_publishes_ordinary_prefix_and_preserves_source_raw(tmp_pat
     assert result is not None
     assert result.bundle_path.joinpath("records.bin").read_bytes() == first
     assert loads(result.bundle_path.joinpath("manifest.json").read_text()) == {
-        "device_slug": "omi_cv1",
+        "schema_version": 2,
         "start_sequence": 100,
         "next_sequence": 101,
         "record_count": 1,
@@ -366,8 +362,8 @@ def test_cursor_ahead_publishes_ordinary_prefix_and_preserves_source_raw(tmp_pat
     assert not result.bundle_path.joinpath("gap.json").exists()
     assert "gap_sha256" not in loads(result.bundle_path.joinpath("receipt.json").read_text())
     assert (attempt.path / "records.bin").read_bytes() == source_raw
-    assert not tuple((_capture_root(tmp_path) / "omi_cv1").glob(".*.tmp"))
-    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts("omi_cv1") == ()
+    assert not tuple(_capture_root(tmp_path).glob(".*.tmp"))
+    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts() == ()
     marker = cast(dict[str, object], loads((attempt.path / "prefix-publication.json").read_text()))
     assert marker == {"version": 1, "state": "published"}
     duplicate = attempt.publish_prefix()
@@ -385,7 +381,7 @@ def test_cursor_ahead_publication_uses_only_checkpoint_prefix(tmp_path: Path) ->
     assert result is not None
     assert result.bundle_path.joinpath("records.bin").read_bytes() == _record(1)
     assert not (result.bundle_path / "gap.json").exists()
-    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts("omi_cv1") == ()
+    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts() == ()
 
 
 def test_zero_prefix_publication_waits_for_terminalization_without_audio_artifact(
@@ -393,7 +389,7 @@ def test_zero_prefix_publication_waits_for_terminalization_without_audio_artifac
 ) -> None:
     monkeypatch.setattr(quarantine, "_wall_clock_ns", lambda: 1)
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 2)
+    attempt = store.prepare_streaming_attempt(100, 2)
     attempt.record_read_begin(ReadBeginNotification(100, 2))
 
     result = attempt.publish_prefix()
@@ -402,25 +398,25 @@ def test_zero_prefix_publication_waits_for_terminalization_without_audio_artifac
     assert attempt.path.exists()
     assert (attempt.path / "prefix-publication.json").is_file()
     attempt.close(durable=True)
-    store.terminalize_prefix_attempt("omi_cv1", attempt.attempt_id)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
     assert (attempt.path / "terminal-retired.json").is_file()
-    assert not tuple(StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts("omi_cv1"))
+    assert not tuple(StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts())
 
 
 def test_zero_prefix_preserves_nonempty_raw_evidence(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt("omi_cv1", 100, 2)
+    attempt = store.prepare_streaming_attempt(100, 2)
     attempt.record_read_begin(ReadBeginNotification(100, 2))
     attempt.append_record(0, 100, _record(1))
     raw = (attempt.path / "records.bin").read_bytes()
     assert attempt.publish_prefix() is None
     assert attempt.path.exists()
     assert (attempt.path / "records.bin").read_bytes() == raw
-    assert not store.pending_attempts("omi_cv1")
+    assert not store.pending_attempts()
 
     with (attempt.path / "records.bin").open("ab") as stream:
         stream.write(b"torn")
-    assert store.pending_attempts("omi_cv1") == (attempt.descriptor,)
+    assert store.pending_attempts() == (attempt.descriptor,)
 
 
 def test_streaming_deduplicates_identical_sealed_bundle(tmp_path: Path) -> None:
@@ -435,10 +431,10 @@ def test_streaming_deduplicates_identical_sealed_bundle(tmp_path: Path) -> None:
     assert result.bundle_path == bundle
     assert result.deduplicated
     assert duplicate.path.exists()
-    StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending("omi_cv1")
+    StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    store.assert_no_pending("omi_cv1")
-    future = store.prepare_streaming_attempt("omi_cv1", 100, 1)
+    store.assert_no_pending()
+    future = store.prepare_streaming_attempt(100, 1)
     assert future.path.exists()
     future.close()
 
@@ -451,7 +447,7 @@ def test_seal_writes_bundle_manifest_and_receipt(tmp_path: Path) -> None:
     result = attempt.seal(DoneNotification(0, 102))
 
     assert not result.deduplicated
-    assert result.bundle_path.parent == _capture_root(tmp_path) / "omi_cv1"
+    assert result.bundle_path.parent == _capture_root(tmp_path)
     assert (result.bundle_path / "records.bin").read_bytes() == _record(1) + _record(2)
     assert (result.bundle_path / "manifest.json").is_file()
     assert (result.bundle_path / "receipt.json").is_file()
@@ -578,9 +574,7 @@ def test_preflight_and_fsync_failures_stop_before_read_contract(tmp_path: Path) 
         f_frsize = 1
 
     with pytest.raises(DiskSpaceError):
-        StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=lambda _: TooSmall()).prepare_streaming_attempt(
-            "omi_cv1", 1, 1
-        )
+        StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=lambda _: TooSmall()).prepare_streaming_attempt(1, 1)
 
     calls = 0
 
@@ -592,13 +586,11 @@ def test_preflight_and_fsync_failures_stop_before_read_contract(tmp_path: Path) 
         fsync(_)
 
     with pytest.raises(OSError, match="simulated"):
-        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_first_sync).prepare_streaming_attempt(
-            "omi_cv1", 1, 1
-        )
+        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_first_sync).prepare_streaming_attempt(1, 1)
 
 
 def test_seal_requires_read_begin_and_private_bundle_metadata_requires_it(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt("omi_cv1", 100, 1)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 1)
     with pytest.raises(AttemptStateError, match="READ_BEGIN is missing"):
         attempt.seal(DoneNotification(0, 101))
     with pytest.raises(AttemptStateError, match="READ_BEGIN is missing"):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import stat
 from dataclasses import dataclass
 from hashlib import sha256
@@ -18,8 +17,6 @@ from omi_collector.capture.adapters.firmware_observations import (
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
-
-_SLUG = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class SpoolMetricsError(ValueError):
@@ -95,51 +92,48 @@ class _BundleMeasurement:
 
 
 def collect_spool_metrics(
-    capture_root: Path,
-    device_slug: str,
+    publication_root: Path,
     *,
     observation_root: Path | None = None,
 ) -> SpoolMetrics:
     """Report only authenticated raw bundles visible in the capture root."""
-    _validate_slug(device_slug)
-    _require_directory(capture_root, "capture root")
+    _require_directory(publication_root, "publication root")
     try:
-        observations = read_firmware_observations(observation_root, device_slug) if observation_root is not None else ()
+        observations = read_firmware_observations(observation_root) if observation_root is not None else ()
     except FirmwareObservationError as error:
         raise SpoolMetricsError(f"firmware observations are invalid: {error}") from error
-    measurements = _current_measurements(capture_root, device_slug)
+    measurements = _current_measurements(publication_root)
     current = _aggregate_window(measurements)
     return SpoolMetrics(current, FirmwareLifetimeMetrics(*_firmware_metrics(observations)))
 
 
-def _current_measurements(capture_root: Path, device_slug: str) -> tuple[_BundleMeasurement, ...]:
-    device_root = capture_root / device_slug
-    if not device_root.exists() and not device_root.is_symlink():
+def _current_measurements(publication_root: Path) -> tuple[_BundleMeasurement, ...]:
+    current = publication_root / "current"
+    if not current.exists() and not current.is_symlink():
         return ()
-    return _read_artifacts(_published_device_root(capture_root, device_root, device_slug), device_slug)
+    return _read_artifacts(_published_root(publication_root, current))
 
 
-def _published_device_root(capture_root: Path, device_root: Path, device_slug: str) -> Path:
-    if not device_root.is_symlink():
-        _require_directory(device_root, "device spool")
-        return device_root
-    target = device_root.readlink()
+def _published_root(publication_root: Path, current: Path) -> Path:
+    if not current.is_symlink():
+        raise SpoolMetricsError("current publication must be a generation link")
+    target = current.readlink()
     if target.is_absolute():
-        raise SpoolMetricsError("device spool generation link must be relative")
-    authority = capture_root / ".generations" / device_slug
+        raise SpoolMetricsError("current generation link must be relative")
+    authority = publication_root / ".generations"
     try:
-        resolved = device_root.resolve(strict=True)
+        resolved = current.resolve(strict=True)
         resolved_authority = authority.resolve(strict=True)
     except OSError as error:
-        raise SpoolMetricsError("device spool generation link cannot be resolved") from error
+        raise SpoolMetricsError("current generation link cannot be resolved") from error
     if not resolved.is_dir() or resolved.parent != resolved_authority:
-        raise SpoolMetricsError("device spool generation link escapes its authority")
+        raise SpoolMetricsError("current generation link escapes its authority")
     return resolved
 
 
-def _read_artifacts(device_root: Path, device_slug: str) -> tuple[_BundleMeasurement, ...]:
+def _read_artifacts(root: Path) -> tuple[_BundleMeasurement, ...]:
     measurements: list[_BundleMeasurement] = []
-    for entry in _entries(device_root, "device spool"):
+    for entry in _entries(root, "publication generation"):
         if entry.name.startswith(".") or entry.name in {"generation.json", "incidents"}:
             # Retired gap-only incident directories are intentionally opaque.
             continue
@@ -147,28 +141,27 @@ def _read_artifacts(device_root: Path, device_slug: str) -> tuple[_BundleMeasure
             continue
         if not entry.is_dir():
             raise SpoolMetricsError(f"visible spool entry is not an artifact directory: {entry}")
-        measurement = _read_artifact(entry, device_slug)
+        measurement = _read_artifact(entry)
         if measurement is not None:
             measurements.append(measurement)
     return tuple(measurements)
 
 
-def _read_artifact(path: Path, device_slug: str) -> _BundleMeasurement | None:
+def _read_artifact(path: Path) -> _BundleMeasurement | None:
     # A directory is a participant only when it has a real-bundle manifest;
     # gap-only directories therefore disappear without being inspected.
     manifest_path = path / "manifest.json"
     if not _regular_file(manifest_path):
         return None
-    return _read_bundle_artifact(path, device_slug)
+    return _read_bundle_artifact(path)
 
 
-def _read_bundle_artifact(path: Path, device_slug: str) -> _BundleMeasurement:
-    manifest = _read_manifest_and_raw(path, device_slug)
+def _read_bundle_artifact(path: Path) -> _BundleMeasurement:
+    manifest = _read_manifest_and_raw(path)
     _validate_receipt(path, manifest.raw_sha256)
     return _BundleMeasurement(
         (
             "bundle",
-            manifest.device_slug,
             manifest.start_sequence,
             manifest.next_sequence,
             manifest.raw_sha256,
@@ -179,14 +172,12 @@ def _read_bundle_artifact(path: Path, device_slug: str) -> _BundleMeasurement:
     )
 
 
-def _read_manifest_and_raw(path: Path, device_slug: str) -> BundleManifest:
+def _read_manifest_and_raw(path: Path) -> BundleManifest:
     manifest = _read_json(path / "manifest.json", "manifest.json")
     try:
         parsed = BundleManifest.from_json(manifest)
     except ValueError as error:
-        raise SpoolMetricsError(f"manifest is invalid or has the wrong device_slug: {path}") from error
-    if parsed.device_slug != device_slug:
-        raise SpoolMetricsError(f"manifest is invalid or has the wrong device_slug: {path}")
+        raise SpoolMetricsError(f"manifest is invalid: {path}") from error
     raw_path = path / "records.bin"
     _require_regular_file(raw_path, "records.bin")
     raw_size, calculated_hash = _stream_size_and_hash(raw_path)
@@ -324,8 +315,3 @@ def _regular_file(path: Path) -> bool:
     except OSError:
         return False
     return stat.S_ISREG(mode)
-
-
-def _validate_slug(value: str) -> None:
-    if _SLUG.fullmatch(value) is None:
-        raise SpoolMetricsError("device slug is invalid")

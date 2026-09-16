@@ -461,7 +461,6 @@ class BleakRingTransport:
         att_mtu_query_timeout_seconds: float = DEFAULT_CONFIG.ble.att_mtu_query_timeout_seconds,
         adapter: str = DEFAULT_CONFIG.ble.adapter_name,
         phy_policy: str = "auto",
-        local_name: str | None = None,
         link_observer_factory: LinkObserverFactory | None = None,
         link_terminal_callback: TerminalCallback | None = None,
         debug_logger: logging.Logger | None = None,
@@ -482,7 +481,6 @@ class BleakRingTransport:
         self._att_mtu_query_timeout_seconds = att_mtu_query_timeout_seconds
         self._adapter = adapter
         self._phy_policy = phy_policy
-        self._local_name = local_name
         self._link_observer_factory = link_observer_factory
         self._link_terminal_callback = link_terminal_callback
         self._debug_logger = debug_logger
@@ -561,7 +559,6 @@ class BleakRingTransport:
                     self._address,
                     adapter=self._adapter,
                     phy_policy=self._phy_policy,
-                    local_name=self._local_name,
                     terminal_callback=self._link_terminal_callback,
                     debug_logger=self._debug_logger,
                 )
@@ -570,7 +567,6 @@ class BleakRingTransport:
                     self._address,
                     adapter=self._adapter,
                     phy_policy=self._phy_policy,
-                    local_name=self._local_name,
                     terminal_callback=self._link_terminal_callback,
                     debug_logger=self._debug_logger,
                 )

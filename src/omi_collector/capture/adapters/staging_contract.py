@@ -26,6 +26,7 @@ _UNPROCESSABLE_QUARANTINE_STATE = "unprocessable"
 _ATTEMPT_ID_LENGTH = 32
 _UUID_HEX_LENGTH = 32
 _SHA256_LENGTH = 64
+_ATTEMPT_SCHEMA_VERSION = 2
 
 
 class StagingError(RuntimeError):
@@ -81,7 +82,7 @@ class AttemptDescriptor:
     """The fsynced transfer intent needed before a caller may issue READ."""
 
     attempt_id: str
-    device_slug: str
+    schema_version: int
     start_sequence: int
     packet_count: int
     record_size: int = RECORD_SIZE
@@ -92,12 +93,6 @@ class AttemptDescriptor:
 def _validate_attempt_id(attempt_id: str) -> None:
     if len(attempt_id) != _ATTEMPT_ID_LENGTH or any(char not in "0123456789abcdef" for char in attempt_id):
         raise AttemptStateError("attempt id is invalid")
-
-
-def _validate_slug(device_slug: str) -> None:
-    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-    if not device_slug or any(char not in allowed for char in device_slug):
-        raise AttemptStateError("device slug may contain only letters, digits, underscores, and hyphens")
 
 
 def _validate_int(value: int, label: str) -> None:
@@ -122,7 +117,8 @@ def _is_sha256(value: str) -> bool:
 
 def _validate_descriptor(descriptor: AttemptDescriptor, path_id: str) -> None:
     _validate_attempt_id(descriptor.attempt_id)
-    _validate_slug(descriptor.device_slug)
+    if descriptor.schema_version != _ATTEMPT_SCHEMA_VERSION:
+        raise AttemptStateError("attempt descriptor schema version is invalid")
     _validate_int(descriptor.start_sequence, "start_sequence")
     _validate_count(descriptor.packet_count)
     if descriptor.attempt_id != path_id or descriptor.record_size != RECORD_SIZE:
@@ -165,7 +161,7 @@ def _optional_int(raw: dict[str, object], key: str) -> int | None:
 def _descriptor_from_json(raw: dict[str, object]) -> AttemptDescriptor:
     if set(raw) != {
         "attempt_id",
-        "device_slug",
+        "schema_version",
         "start_sequence",
         "packet_count",
         "record_size",
@@ -175,7 +171,7 @@ def _descriptor_from_json(raw: dict[str, object]) -> AttemptDescriptor:
         raise ValueError("attempt descriptor schema")
     return AttemptDescriptor(
         attempt_id=_required_str(raw, "attempt_id"),
-        device_slug=_required_str(raw, "device_slug"),
+        schema_version=_required_int(raw, "schema_version"),
         start_sequence=_required_int(raw, "start_sequence"),
         packet_count=_required_int(raw, "packet_count"),
         record_size=_required_int(raw, "record_size"),
@@ -214,9 +210,9 @@ def _read_checkpoint(path: Path, attempt_id: str) -> StreamingCheckpoint:
         raise AttemptStateError("streaming checkpoint is malformed") from error
 
 
-def _manifest_prefix(descriptor: AttemptDescriptor, prefix: DurablePrefix) -> dict[str, object]:
+def _manifest_prefix(prefix: DurablePrefix) -> dict[str, object]:
     return {
-        "device_slug": descriptor.device_slug,
+        "schema_version": 2,
         "start_sequence": prefix.start_sequence,
         "next_sequence": prefix.next_sequence,
         "record_count": prefix.record_count,

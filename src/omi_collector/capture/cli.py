@@ -26,7 +26,7 @@ from .adapters.bleak_transport import BleakPresenceObserver, BleakRingTransport,
 from .adapters.opportunistic_runtime import OpportunisticRuntime
 from .adapters.phy_guard import ScopedPhyGuard
 from .adapters.publication import SealResult
-from .adapters.quality_metrics import JsonlQualityMetrics, source_revision_from_environment
+from .adapters.quality_metrics import JsonlQualityMetrics, source_revision_from_release_metadata
 from .adapters.staging_store import StagingStore
 from .application import collector
 from .application.opportunistic_sync import (
@@ -149,7 +149,6 @@ def make_transport(  # noqa: PLR0913
     att_mtu_query_timeout_seconds: float = DEFAULT_CONFIG.ble.att_mtu_query_timeout_seconds,
     adapter: str = DEFAULT_CONFIG.ble.adapter_name,
     phy_policy: str = "auto",
-    local_name: str | None = None,
     link_terminal_callback: Callable[[dict[str, object]], object] | None = None,
     debug_logger: logging.Logger | None = None,
 ) -> BleakRingTransport:
@@ -161,8 +160,6 @@ def make_transport(  # noqa: PLR0913
         transport_options["adapter"] = adapter
     if phy_policy != "auto":
         transport_options["phy_policy"] = phy_policy
-    if local_name is not None:
-        transport_options["local_name"] = local_name
     if link_terminal_callback is not None:
         transport_options["link_terminal_callback"] = link_terminal_callback
     if debug_logger is not None:
@@ -226,7 +223,6 @@ async def info(address: str, adapter: str) -> RingInfo:
 async def collect(
     address: str,
     adapter: str,
-    device_slug: str,
     staging: StagingStore,
     max_records: int,
 ) -> collector.CollectResult:
@@ -248,14 +244,13 @@ async def collect(
         quality_metrics=_quality_metrics(staging, DEFAULT_CONFIG),
         phy_policy="force_1m",
     )
-    return await run_opportunistic_collector(provider, staging, device_slug, options, runtime=OpportunisticRuntime())
+    return await run_opportunistic_collector(provider, staging, options, runtime=OpportunisticRuntime())
 
 
 # The public seam keeps address, adapter, and progress arguments compatible.
 async def sync(  # noqa: PLR0913
     address: str,
     adapter: str,
-    device_slug: str,
     staging: StagingStore,
     progress: ProgressReporter | None = None,
     *,
@@ -280,7 +275,6 @@ async def sync(  # noqa: PLR0913
                 address,
                 device_selector=cast(BLEDevice | None, candidate),
                 phy_policy="force_1m",
-                local_name=device_slug,
                 link_terminal_callback=link_terminal_callback,
                 debug_logger=debug_logger,
                 att_mtu_query_timeout_seconds=config.ble.att_mtu_query_timeout_seconds,
@@ -291,7 +285,6 @@ async def sync(  # noqa: PLR0913
                 device_selector=cast(BLEDevice | None, candidate),
                 adapter=adapter,
                 phy_policy="auto",
-                local_name=device_slug,
                 link_terminal_callback=link_terminal_callback,
                 debug_logger=debug_logger,
                 att_mtu_query_timeout_seconds=config.ble.att_mtu_query_timeout_seconds,
@@ -303,7 +296,6 @@ async def sync(  # noqa: PLR0913
             address,
             adapter=adapter,
             phy_policy="auto",
-            local_name=device_slug,
             link_terminal_callback=link_terminal_callback,
             debug_logger=debug_logger,
             att_mtu_query_timeout_seconds=config.ble.att_mtu_query_timeout_seconds,
@@ -331,7 +323,7 @@ async def sync(  # noqa: PLR0913
         phy_policy="force_1m" if force_1m else "auto",
         config=config,
     )
-    return await run_opportunistic_collector(provider, staging, device_slug, options, runtime=OpportunisticRuntime())
+    return await run_opportunistic_collector(provider, staging, options, runtime=OpportunisticRuntime())
 
 
 def _quality_metrics(
@@ -344,7 +336,7 @@ def _quality_metrics(
         return JsonlQualityMetrics(
             staging.paths.root,
             release_version=package_version(),
-            source_revision=source_revision_from_environment(config=config.observability.quality_metrics),
+            source_revision=source_revision_from_release_metadata(),
             config=config.observability.quality_metrics,
             diagnostic_logger=debug_logger,
         )
@@ -431,7 +423,6 @@ async def _guarded_transport(  # noqa: PLR0913
     device_selector: BLEDevice | None = None,
     att_mtu_query_timeout_seconds: float = DEFAULT_CONFIG.ble.att_mtu_query_timeout_seconds,
     phy_policy: str = "auto",
-    local_name: str | None = None,
     link_terminal_callback: Callable[[dict[str, object]], object] | None = None,
     debug_logger: logging.Logger | None = None,
 ) -> AsyncIterator[RingSession]:
@@ -442,7 +433,6 @@ async def _guarded_transport(  # noqa: PLR0913
             adapter=adapter,
             att_mtu_query_timeout_seconds=att_mtu_query_timeout_seconds,
             phy_policy=phy_policy,
-            local_name=local_name,
             link_terminal_callback=link_terminal_callback,
             debug_logger=debug_logger,
         )
@@ -453,7 +443,6 @@ async def _guarded_transport(  # noqa: PLR0913
             adapter=adapter,
             att_mtu_query_timeout_seconds=att_mtu_query_timeout_seconds,
             phy_policy=phy_policy,
-            local_name=local_name,
             link_terminal_callback=link_terminal_callback,
             debug_logger=debug_logger,
         )

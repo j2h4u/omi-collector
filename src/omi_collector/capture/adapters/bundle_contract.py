@@ -10,6 +10,7 @@ from ..domain.ring_protocol import RECORD_SIZE
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
+_SCHEMA_VERSION = 2
 
 
 def _int(value: object, name: str) -> int:
@@ -28,7 +29,7 @@ def _string(value: object, name: str) -> str:
 class BundleManifest:
     """The exact six-field manifest written beside records.bin."""
 
-    device_slug: str
+    schema_version: int
     start_sequence: int
     next_sequence: int
     record_count: int
@@ -40,7 +41,7 @@ class BundleManifest:
         if not isinstance(value, Mapping):
             raise ValueError("manifest must be a JSON object")
         expected = {
-            "device_slug",
+            "schema_version",
             "start_sequence",
             "next_sequence",
             "record_count",
@@ -50,13 +51,15 @@ class BundleManifest:
         if set(value) != expected:
             raise ValueError("manifest schema is not canonical")
         manifest = cls(
-            _string(value.get("device_slug"), "device_slug"),
+            _int(value.get("schema_version"), "schema_version"),
             _int(value.get("start_sequence"), "start_sequence"),
             _int(value.get("next_sequence"), "next_sequence"),
             _int(value.get("record_count"), "record_count"),
             _int(value.get("record_size"), "record_size"),
             _string(value.get("raw_sha256"), "raw_sha256"),
         )
+        if manifest.schema_version != _SCHEMA_VERSION:
+            raise ValueError("schema_version is invalid")
         if manifest.start_sequence < 0:
             raise ValueError("start_sequence must be non-negative")
         if manifest.record_count <= 0:
@@ -71,7 +74,7 @@ class BundleManifest:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "device_slug": self.device_slug,
+            "schema_version": self.schema_version,
             "start_sequence": self.start_sequence,
             "next_sequence": self.next_sequence,
             "record_count": self.record_count,

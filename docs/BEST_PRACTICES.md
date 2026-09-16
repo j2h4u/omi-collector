@@ -44,37 +44,30 @@ exact selected set on every exit path, including cancellation and recovery.
 ## Runtime operations
 
 systemd is the production supervisor. The public unit runs as the dedicated
-`omi-collector` system user. Keep the checkout root-owned/readable at the
-configured absolute project path; keep the environment file root-owned,
-group-readable by `omi-collector`, mode `0640`; and keep the service-local
-state directory `omi-collector:omi-collector` mode `0750`.
+`omi-collector` system user. Keep the checkout root-owned and readable; keep
+`/srv/pipelines/omi/config.toml` root-owned and readable by both the system
+collector and the user-owned pipeline, mode `0644`; and keep the service-local state directory
+`omi-collector:omi-collector` mode `0750`.
 
 Initial setup is deliberately small. Keep the checkout root-owned under
-`/opt`, copy `config/layout.toml` to
-`/var/lib/omi-collector/collector.toml`, copy and edit
-`config/omi-collector.env.example` at `/etc/omi-collector/omi-collector.env`,
-then run `sudo scripts/install-systemd-unit.sh`. The installer creates or
-validates the system account and state ownership, validates the staged wrapper
-against the environment, validates the staged unit, and rolls both files back
-if the composite install cannot be reloaded or enabled. It never starts the
-service without `--restart`.
+`/opt`, copy and edit `config/config.toml.example` at
+`/srv/pipelines/omi/config.toml`, then run
+`sudo scripts/install-systemd-unit.sh`. The installer creates or validates the
+system account and state ownership, protects the configuration, validates the
+staged unit, and restores the prior unit if installation cannot be reloaded or
+enabled. It never starts the service without `--restart`.
 
-The layout schema is strict version two: `collector` is the private collector
-root and `source` is the direct publication root. `OMI_COLLECTOR_LAYOUT_PATH`
-may name any regular non-symlink absolute layout file; roots resolve relative
-to its parent. The checked-in default stays under `/var/lib/omi-collector`,
-which the hardened unit can write. A custom external root requires a narrowly
-scoped host-only `ReadWritePaths` drop-in and deliberate ownership or ACLs. The
-installer enforces `root:omi-collector` mode `0644` on every accepted layout
-file. The layout contains path names only, so making that authority readable
-lets an unprivileged operator run the read-only status command; private state,
-audio, environment files, and credentials retain their restricted modes.
+The configuration is strict and contains only `[pendant] address`. Its fixed
+parent `/srv/pipelines/omi` is the storage root; `collector`, `captured`, and
+`source` are derived beneath it. The base unit grants the service write access
+to that root. Use filesystem ownership or ACLs on the derived directories when
+a downstream account also needs access.
 
 After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
 builds the environment as the service account, copies dependencies into it,
 then seals the selected release as root-owned under
-`/var/lib/omi-collector-deployments`. The base environment value is an
-intentionally unusable placeholder until this first deployment succeeds.
+`/var/lib/omi-collector-deployments`. The first successful deployment creates
+the `current` selector used by the fixed unit command.
 
 Enable BlueZ and verify its normal user-level access with
 `sudo -u omi-collector bluetoothctl show`. The default long-running sync keeps
@@ -85,10 +78,12 @@ The base allowlist is the no-argument query plus `LE1MTX LE1MRX` and
 `LE1MTX LE1MRX LE2MTX LE2MRX`; add a different sequence only after observing it.
 Do not grant general `bluetoothctl`, shell, or unrestricted sudo access.
 
-Run `sudo scripts/deploy-systemd-service.sh` only from the configured checkout.
-It builds a staged environment as `omi-collector`, checks the installed unit
-and wrapper as the exact checked-in pair, then atomically selects the release.
-Readiness or stability failure restores the previous verified environment.
+Run `sudo scripts/deploy-systemd-service.sh` from the reviewed production
+checkout. It checks the installed unit against the checked-in unit, validates
+the fixed operator configuration with the staged application, records the full
+source revision inside the sealed environment, then atomically selects the
+release. Readiness or stability failure restores the previous verified
+environment.
 
 Docker is for packaging and runtime QA only; it is not a production Bluetooth
 supervisor. Keep production state and publication roots configured explicitly,

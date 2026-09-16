@@ -82,7 +82,7 @@ class StagingFilesystem:
         self._statvfs = statvfs_fn
         self._durability: DurabilityConfig = config.durability
         self._terminal_retention_seconds = config.staging_retention.terminal_retention_seconds
-        self._active_leases: dict[str, DeviceLock] = {}
+        self._active_lease: DeviceLock | None = None
         if self.spool == self.capture_root:
             raise StagingError("spool and capture root must be distinct directories")
 
@@ -193,7 +193,7 @@ class StagingFilesystem:
 
     def _prepare_roots(self) -> None:
         spool_input = _absolute_root(self._spool_input, "spool")
-        capture_input = _absolute_root(self._capture_root_input, "capture root")
+        capture_input = _absolute_root(self._capture_root_input, "capture")
         try:
             spool = spool_input.resolve(strict=True)
             capture = capture_input.resolve(strict=True)
@@ -209,25 +209,25 @@ class StagingFilesystem:
         self.device_state_path = _contained_path(self.device_state_path, self.spool, "device state")
         _require_same_filesystem(self.spool, self.capture_root)
 
-    def _preflight(self, packet_count: int, device_slug: str) -> None:
+    def _preflight(self, packet_count: int) -> None:
         required = packet_count * RECORD_SIZE + max(
             self._durability.staging_headroom_bytes,
             int(packet_count * RECORD_SIZE * self._durability.staging_overhead_fraction),
         )
         self._prepare_roots()
-        self._ensure_real_directory(self.capture_root / device_slug, "capture device root")
+        self._ensure_real_directory(self.capture_root, "capture root")
         result = self._statvfs(self.spool)
         available = result.f_bavail * result.f_frsize  # type: ignore[attr-defined]
         if available < required:
             raise DiskSpaceError(f"need {required} bytes of free space; only {available} bytes available")
 
     @contextmanager
-    def device_lock(self, device_slug: str) -> Iterator[DeviceLock]:
+    def device_lock(self) -> Iterator[DeviceLock]:
         self._prepare_roots()
         self._ensure_directory(self.spool)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(self.lock_path, flags, 0o600)
-        lease = DeviceLock(self, device_slug)
+        lease = DeviceLock(self)
         locked = False
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -236,34 +236,32 @@ class StagingFilesystem:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
-                raise DeviceAlreadyRunningError(f"device recovery is already active for {device_slug}") from error
+                raise DeviceAlreadyRunningError("pendant recovery is already active") from error
             locked = True
-            self._active_leases[device_slug] = lease
+            self._active_lease = lease
             lease._activate()
             yield lease
         finally:
-            if locked and self._active_leases.get(device_slug) is lease:
-                del self._active_leases[device_slug]
+            if locked and self._active_lease is lease:
+                self._active_lease = None
             lease._release()
             with suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def require_device_lock(self, device_slug: str, lease: DeviceLock) -> None:
-        if self._active_leases.get(device_slug) is not lease or not lease._matches(self, device_slug):
-            raise AttemptStateError("consuming ring operations require this device's active spool lock")
+    def require_device_lock(self, lease: DeviceLock) -> None:
+        if self._active_lease is not lease or not lease._matches(self):
+            raise AttemptStateError("consuming ring operations require the active spool lock")
 
-    def validate_capture_destination(self, destination: Path, device_slug: str) -> int:
+    def validate_capture_destination(self, destination: Path) -> int:
         self._prepare_roots()
         self._ensure_real_directory(self.capture_root, "capture root")
-        device_root = self.capture_root / device_slug
-        self._ensure_real_directory(device_root, "capture device root")
-        if destination.parent != device_root:
-            raise StagingError("bundle destination escaped capture device root")
+        if destination.parent != self.capture_root:
+            raise StagingError("bundle destination escaped capture root")
         if os.path.lexists(destination) and destination.is_symlink():
             raise StagingError("bundle destination must not be a symlink")
         try:
-            return os.open(device_root, os.O_RDONLY | O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+            return os.open(self.capture_root, os.O_RDONLY | O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
         except OSError as error:
             raise StagingError("capture publication destination cannot be inspected") from error
 
@@ -275,27 +273,21 @@ class StagingFilesystem:
 class DeviceLock:
     """Opaque active lease proving one coordinator owns a device spool lock."""
 
-    def __init__(self, filesystem: StagingFilesystem, device_slug: str) -> None:
+    def __init__(self, filesystem: StagingFilesystem) -> None:
         self._filesystem = filesystem
-        self._device_slug = device_slug
         self._active = False
 
-    def _matches(self, filesystem: StagingFilesystem, device_slug: str) -> bool:
-        return self._active and self._filesystem is filesystem and self._device_slug == device_slug
+    def _matches(self, filesystem: StagingFilesystem) -> bool:
+        return self._active and self._filesystem is filesystem
 
     @property
     def filesystem(self) -> StagingFilesystem:
         """Return the only filesystem this lease may authorize."""
         return self._filesystem
 
-    @property
-    def device_slug(self) -> str:
-        """Return the only device this lease may authorize."""
-        return self._device_slug
-
     def require_active(self) -> None:
         """Prove the lease is still held before a consuming operation starts."""
-        self._filesystem.require_device_lock(self._device_slug, self)
+        self._filesystem.require_device_lock(self)
 
     def _release(self) -> None:
         self._active = False

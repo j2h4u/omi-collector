@@ -70,7 +70,7 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
         events.append("checkpoint")
 
     callbacks = SessionLifecycleCallbacks(
-        before_legacy_attempt=_noop,
+        before_direct_attempt=_noop,
         wait_presence_attempt=_wait,
         connected_step=connected_step,
         post_session_checkpoint=checkpoint,
@@ -80,7 +80,6 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
     options = OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(backoff=(1,), stop_after_drained=True))
     run = SessionLifecycleRun(
         provider=provider,
-        device_slug="omi",
         options=options,
         runtime=cast(CaptureRuntimePort, object()),
         callbacks=callbacks,
@@ -131,7 +130,7 @@ def test_connected_step_cancellation_identity_reaches_context_exit(monkeypatch: 
         events.append("checkpoint")
 
     callbacks = SessionLifecycleCallbacks(
-        before_legacy_attempt=_noop,
+        before_direct_attempt=_noop,
         wait_presence_attempt=_wait,
         connected_step=connected_step,
         post_session_checkpoint=checkpoint,
@@ -140,7 +139,6 @@ def test_connected_step_cancellation_identity_reaches_context_exit(monkeypatch: 
     )
     run = SessionLifecycleRun(
         provider=provider,
-        device_slug="omi",
         options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(backoff=(1,))),
         runtime=cast(CaptureRuntimePort, object()),
         callbacks=callbacks,
@@ -218,7 +216,7 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
 
     presence = Presence()
     callbacks = SessionLifecycleCallbacks(
-        before_legacy_attempt=_noop,
+        before_direct_attempt=_noop,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -227,7 +225,6 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
     )
     run = SessionLifecycleRun(
         provider=unused_provider,
-        device_slug="omi",
         options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(backoff=(1,)), presence=presence),
         runtime=cast(CaptureRuntimePort, object()),
         callbacks=callbacks,
@@ -276,7 +273,7 @@ def test_real_presence_setup_failure_closes_issued_permit(monkeypatch: pytest.Mo
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_legacy_attempt=_noop,
+        before_direct_attempt=_noop,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -285,7 +282,6 @@ def test_real_presence_setup_failure_closes_issued_permit(monkeypatch: pytest.Mo
     )
     run = SessionLifecycleRun(
         provider=unused_provider,
-        device_slug="omi",
         options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(backoff=(1,)), presence=presence),
         runtime=cast(CaptureRuntimePort, object()),
         callbacks=callbacks,
@@ -347,7 +343,7 @@ def test_presence_outcome_follows_gatt_teardown_and_checkpoint(monkeypatch: pyte
 
     presence = Presence()
     callbacks = SessionLifecycleCallbacks(
-        before_legacy_attempt=_noop,
+        before_direct_attempt=_noop,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=checkpoint,
@@ -356,7 +352,6 @@ def test_presence_outcome_follows_gatt_teardown_and_checkpoint(monkeypatch: pyte
     )
     run = SessionLifecycleRun(
         provider=lambda _candidate: Context(),
-        device_slug="omi",
         options=OpportunisticOptions(
             TransferTimeouts(1, 1), RetryPolicy(backoff=(1,), stop_after_drained=True), presence=presence
         ),

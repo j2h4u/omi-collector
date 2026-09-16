@@ -26,7 +26,7 @@ _RECEIPT_NAME: Final = "receipt.json"
 _ATTEMPT_KEYS: Final = frozenset(
     {
         "attempt_id",
-        "device_slug",
+        "schema_version",
         "start_sequence",
         "packet_count",
         "record_size",
@@ -38,6 +38,7 @@ _CHECKPOINT_KEYS: Final = frozenset({"version", "attempt_id", "record_count", "r
 _HEX = frozenset("0123456789abcdef")
 _ATTEMPT_ID_LENGTH = 32
 _SHA256_LENGTH = 64
+_ATTEMPT_SCHEMA_VERSION = 2
 
 
 def _never_defer() -> bool:
@@ -61,7 +62,6 @@ class QuarantinePublication:
     """The ordinary bundle produced from a quarantined checkpoint prefix."""
 
     bundle_path: Path
-    device_slug: str
     start_sequence: int
     next_sequence: int
     record_count: int
@@ -72,7 +72,6 @@ class QuarantinePublication:
     def as_dict(self) -> dict[str, object]:
         return {
             "bundle_path": str(self.bundle_path),
-            "device_slug": self.device_slug,
             "start_sequence": self.start_sequence,
             "next_sequence": self.next_sequence,
             "record_count": self.record_count,
@@ -96,36 +95,30 @@ class _Prefix:
 def publish_quarantined_prefix(
     source: Path,
     paths: StagingPaths,
-    device_slug: str,
     *,
     should_defer: Callable[[], bool] = _never_defer,
 ) -> QuarantinePublication:
     """Publish one checkpoint-bound prefix under the device spool lock."""
-    _validate_slug(device_slug)
-    with StagingStore.from_paths(paths).device_lock(device_slug, recover_capture_temporaries=False):
-        return _publish_quarantined_prefix(source, paths, device_slug, should_defer=should_defer)
+    with StagingStore.from_paths(paths).device_lock(recover_capture_temporaries=False):
+        return _publish_quarantined_prefix(source, paths, should_defer=should_defer)
 
 
 def _publish_quarantined_prefix(
     source: Path,
     paths: StagingPaths,
-    device_slug: str,
     *,
     should_defer: Callable[[], bool],
 ) -> QuarantinePublication:
     """Publish one checkpoint-bound prefix while leaving ``source`` untouched."""
-    _validate_slug(device_slug)
     source, spool = _validate_quarantine_source(
         source,
         paths.root,
-        device_slug,
         quarantine_root=paths.quarantine,
     )
     capture_root = paths.capture_root.absolute()
     _defer_if_requested(should_defer)
     prefix, raw_path, attempt_id = _read_authenticated_prefix(
         source,
-        device_slug,
         should_defer=should_defer,
     )
 
@@ -135,16 +128,13 @@ def _publish_quarantined_prefix(
             source,
             spool,
             capture_root,
-            device_slug,
             quarantine_root=paths.quarantine,
         )
-        destination = (
-            capture_root.absolute()
-            / device_slug
-            / f"{prefix.start_sequence}-{prefix.next_sequence}-{prefix.raw_sha256[:16]}"
+        destination = capture_root.absolute() / (
+            f"{prefix.start_sequence}-{prefix.next_sequence}-{prefix.raw_sha256[:16]}"
         )
         manifest = BundleManifest(
-            device_slug,
+            2,
             prefix.start_sequence,
             prefix.next_sequence,
             prefix.record_count,
@@ -161,7 +151,7 @@ def _publish_quarantined_prefix(
                 prefix.record_count * RECORD_SIZE,
                 should_defer=should_defer,
             ):
-                return _result(destination, device_slug, prefix, True)
+                return _result(destination, prefix, True)
             raise QuarantineOutputCollisionError(f"ordinary bundle collision at {destination}")
         _publish_atomic(
             destination,
@@ -175,19 +165,16 @@ def _publish_quarantined_prefix(
         raise
     except QuarantinePublishError as error:
         raise OSError("capture publication is temporarily unavailable") from error
-    return _result(destination, device_slug, prefix, False)
+    return _result(destination, prefix, False)
 
 
 def _read_authenticated_prefix(
     source: Path,
-    device_slug: str,
     *,
     should_defer: Callable[[], bool],
 ) -> tuple[_Prefix, Path, str]:
     """Read and authenticate the checkpoint-bound prefix from one attempt."""
     attempt = _read_attempt(source / _ATTEMPT_NAME, source.name)
-    if attempt["device_slug"] != device_slug:
-        raise QuarantinePublishError("attempt device slug does not match --device-slug")
     checkpoint = _read_checkpoint(source / _CHECKPOINT_NAME, cast(str, attempt["attempt_id"]))
     record_count = cast(int, checkpoint["record_count"])
     if record_count <= 0 or record_count > cast(int, attempt["packet_count"]):
@@ -209,13 +196,11 @@ def _read_authenticated_prefix(
 
 def _result(
     destination: Path,
-    device_slug: str,
     prefix: _Prefix,
     deduplicated: bool,
 ) -> QuarantinePublication:
     return QuarantinePublication(
         destination,
-        device_slug,
         prefix.start_sequence,
         prefix.next_sequence,
         prefix.record_count,
@@ -229,12 +214,11 @@ def _validate_source_location(
     source: Path,
     spool: Path,
     capture_root: Path,
-    device_slug: str,
     *,
     quarantine_root: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     capture_root = capture_root.absolute()
-    source, spool = _validate_quarantine_source(source, spool, device_slug, quarantine_root=quarantine_root)
+    source, spool = _validate_quarantine_source(source, spool, quarantine_root=quarantine_root)
     _require_regular_directory(capture_root, "capture root")
     try:
         canonical_capture_root = capture_root.resolve(strict=True)
@@ -254,9 +238,7 @@ def _validate_source_location(
     return source, spool, capture_root
 
 
-def _validate_quarantine_source(
-    source: Path, spool: Path, device_slug: str, *, quarantine_root: Path | None = None
-) -> tuple[Path, Path]:
+def _validate_quarantine_source(source: Path, spool: Path, *, quarantine_root: Path | None = None) -> tuple[Path, Path]:
     spool = spool.absolute()
     source = source.absolute()
     _require_regular_directory(spool, "spool")
@@ -267,13 +249,11 @@ def _validate_quarantine_source(
     quarantine = Path(quarantine_root).absolute() if quarantine_root is not None else spool / "quarantine"
     if quarantine.parent != spool:
         raise QuarantinePublishError("quarantine root must be directly beneath collector root")
-    quarantine_device = quarantine / device_slug
     _require_regular_directory(quarantine, "quarantine root")
-    _require_regular_directory(quarantine_device, "quarantine device directory")
     try:
-        relative = source.relative_to(quarantine_device)
+        relative = source.relative_to(quarantine)
     except ValueError as error:
-        raise QuarantinePublishError("source must be under collector quarantine/device") from error
+        raise QuarantinePublishError("source must be under collector quarantine") from error
     if len(relative.parts) != 1:
         raise QuarantinePublishError("source must be one quarantined attempt directory")
     _require_regular_directory(source, "quarantined attempt")
@@ -296,7 +276,8 @@ def _validate_attempt_identity(raw: dict[str, object], source_name: str) -> None
         raise QuarantinePublishError("attempt_id is invalid")
     if source_name != attempt_id and not source_name.startswith(f"{attempt_id}-"):
         raise QuarantinePublishError("quarantined directory does not identify attempt_id")
-    _validate_slug(_string(raw, "device_slug"))
+    if _nonnegative_int(raw, "schema_version") != _ATTEMPT_SCHEMA_VERSION:
+        raise QuarantinePublishError("attempt schema version is invalid")
 
 
 def _validate_attempt_range(raw: dict[str, object]) -> None:
@@ -403,18 +384,17 @@ def _publish_atomic(  # noqa: PLR0913
     should_defer: Callable[[], bool],
 ) -> None:
     _defer_if_requested(should_defer)
-    capture_root = _canonical_capture_root(destination.parent.parent)
-    parent = capture_root / destination.parent.name
+    capture_root = _canonical_capture_root(destination.parent)
+    parent = capture_root
     _ensure_real_directory(capture_root, "capture root")
-    _ensure_real_directory(parent, "bundle device directory")
     if destination.parent.resolve(strict=True) != parent:
         raise QuarantinePublishError("bundle destination escaped capture root")
-    device_fd = _open_directory_fd(parent, "bundle device directory")
+    capture_fd = _open_directory_fd(parent, "capture root")
     temporary_name = f".{destination.name}.{uuid4().hex}.tmp"
-    temporary = Path(f"/proc/self/fd/{device_fd}") / temporary_name
+    temporary = Path(f"/proc/self/fd/{capture_fd}") / temporary_name
     completed = False
     try:
-        os.mkdir(temporary_name, _SHARED_BUNDLE_DIRECTORY_MODE, dir_fd=device_fd)
+        os.mkdir(temporary_name, _SHARED_BUNDLE_DIRECTORY_MODE, dir_fd=capture_fd)
         _write_prefix_file(
             temporary / _RAW_NAME,
             raw_source,
@@ -435,7 +415,7 @@ def _publish_atomic(  # noqa: PLR0913
         _fsync_directory(temporary)
         _defer_if_requested(should_defer)
         try:
-            os.rename(temporary_name, destination.name, src_dir_fd=device_fd, dst_dir_fd=device_fd)
+            os.rename(temporary_name, destination.name, src_dir_fd=capture_fd, dst_dir_fd=capture_fd)
         except OSError as error:
             if not os.path.lexists(destination):
                 raise
@@ -455,7 +435,7 @@ def _publish_atomic(  # noqa: PLR0913
     finally:
         if not completed and temporary.exists():
             _remove_temporary(temporary)
-        os.close(device_fd)
+        os.close(capture_fd)
 
 
 def _canonical_capture_root(path: Path) -> Path:
@@ -572,13 +552,6 @@ def _nonnegative_int(raw: dict[str, object], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise QuarantinePublishError(f"{key} is invalid")
     return value
-
-
-def _validate_slug(value: str) -> None:
-    if not value or any(
-        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in value
-    ):
-        raise QuarantinePublishError("device slug is invalid")
 
 
 def _json_bytes(value: object) -> bytes:

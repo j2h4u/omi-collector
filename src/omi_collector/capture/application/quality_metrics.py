@@ -19,7 +19,6 @@ def utc_timestamp(epoch_seconds: float) -> str:
 class SessionQuality:
     """Mutable accounting limited to one connected physical session."""
 
-    device_slug: str
     advertisement_rssi_dbm: int | None
     phy_policy: str
     session_id: str = ""
@@ -52,7 +51,6 @@ class AdvertisementMetric:
 
     recorded_at: str
     session_id: str
-    device_slug: str
     advertisement_rssi_dbm: int
     release_version: str
     source_revision: str | None
@@ -60,11 +58,10 @@ class AdvertisementMetric:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": "advertisement_observation",
             "recorded_at": self.recorded_at,
             "session_id": self.session_id,
-            "device_slug": self.device_slug,
             "advertisement_rssi_dbm": self.advertisement_rssi_dbm,
             "release_version": self.release_version,
             "source_revision": self.source_revision,
@@ -78,7 +75,6 @@ class TransferSessionMetric:
 
     completed_at: str
     session_id: str
-    device_slug: str
     outcome: str
     termination_class: str
     active_read_elapsed_ms: int
@@ -94,11 +90,10 @@ class TransferSessionMetric:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": "transfer_session",
             "completed_at": self.completed_at,
             "session_id": self.session_id,
-            "device_slug": self.device_slug,
             "outcome": self.outcome,
             "termination_class": self.termination_class,
             "active_read_elapsed_ms": self.active_read_elapsed_ms,
@@ -121,7 +116,6 @@ class SequenceLossMetric:
 
     occurred_at: str
     session_id: str
-    device_slug: str
     missing_record_count: int
     missing_raw_bytes: int
     reason: str
@@ -131,11 +125,10 @@ class SequenceLossMetric:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": "sequence_loss",
             "occurred_at": self.occurred_at,
             "session_id": self.session_id,
-            "device_slug": self.device_slug,
             "missing_record_count": self.missing_record_count,
             "missing_raw_bytes": self.missing_raw_bytes,
             "reason": self.reason,
@@ -151,7 +144,6 @@ class ClockCorrectionMetric:
 
     occurred_at: str
     session_id: str
-    device_slug: str
     drift_seconds: float
     target_epoch: int
     boundary_sequence_min: int
@@ -162,11 +154,10 @@ class ClockCorrectionMetric:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": "clock_correction",
             "occurred_at": self.occurred_at,
             "session_id": self.session_id,
-            "device_slug": self.device_slug,
             "drift_seconds": self.drift_seconds,
             "target_epoch": self.target_epoch,
             "boundary_sequence_min": self.boundary_sequence_min,

@@ -57,7 +57,7 @@ class ClockCorrectionSink(Protocol):
     """Durable boundary around a pendant clock write."""
 
     def prepare(
-        self, device_slug: str, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
+        self, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
     ) -> object: ...
 
     def mark_unresolved(self, correction: object) -> object: ...
@@ -82,7 +82,6 @@ class TelemetryClock:
     host_clock_probe_timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SECONDS
     info_reader: InfoReader | None = None
     correction_sink: ClockCorrectionSink | None = None
-    device_slug: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +146,6 @@ async def collect_operational_telemetry(
             info,
             telemetry_clock.info_reader,
             telemetry_clock.correction_sink,
-            telemetry_clock.device_slug,
             telemetry_clock.now,
         )
     )
@@ -235,7 +233,6 @@ class _ClockSync:
     info_before: RingInfo
     info_reader: InfoReader | None
     correction_sink: ClockCorrectionSink | None
-    device_slug: str | None
     host_time: Callable[[], float]
 
 
@@ -313,15 +310,13 @@ async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> Ri
 
 
 def _prepare_clock_intent(sync: _ClockSync, event: dict[str, object], target: int, drift: float) -> object | None:
-    if sync.correction_sink is None or sync.device_slug is None:
+    if sync.correction_sink is None:
         event.update(action="none", outcome="intent_unavailable")
         return None
     assert sync.sample.epoch is not None
     assert sync.correction_sink is not None
     try:
-        correction = sync.correction_sink.prepare(
-            sync.device_slug, sync.sample.epoch, target, drift, sync.info_before.write_sequence
-        )
+        correction = sync.correction_sink.prepare(sync.sample.epoch, target, drift, sync.info_before.write_sequence)
         return sync.correction_sink.mark_unresolved(correction)
     except Exception:  # noqa: BLE001 - writing without durable intent is unsafe
         event.update(action="none", outcome="intent_persist_failed")

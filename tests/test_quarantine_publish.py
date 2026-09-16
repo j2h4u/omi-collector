@@ -38,7 +38,7 @@ def _record(marker: int) -> bytes:
 
 
 def _quarantined_attempt(spool: Path) -> tuple[Path, bytes, bytes]:
-    attempt = StagingStore(spool, spool.parent / "captures").prepare_streaming_attempt("omi_cv1", 100, 3)
+    attempt = StagingStore(spool, spool.parent / "captures").prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
     prefix = _record(1)
     tail = _record(2)
@@ -46,7 +46,7 @@ def _quarantined_attempt(spool: Path) -> tuple[Path, bytes, bytes]:
     attempt.checkpoint()
     attempt.append_record(1, 101, tail)
     attempt.close(durable=True)
-    source = StagingStore(spool, spool.parent / "captures").quarantine_attempt_source("omi_cv1", attempt.attempt_id)
+    source = StagingStore(spool, spool.parent / "captures").quarantine_attempt_source(attempt.attempt_id)
     return source, prefix, tail
 
 
@@ -54,17 +54,17 @@ def test_publishes_only_authenticated_prefix_and_leaves_source_unchanged(tmp_pat
     source, prefix, tail = _quarantined_attempt(tmp_path)
     source_raw = source.joinpath("records.bin").read_bytes()
 
-    result = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+    result = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
 
     assert not result.deduplicated
     assert result.record_count == 1
-    assert result.bundle_path == _capture_root(tmp_path) / "omi_cv1" / f"100-101-{sha256(prefix).hexdigest()[:16]}"
+    assert result.bundle_path == _capture_root(tmp_path) / f"100-101-{sha256(prefix).hexdigest()[:16]}"
     assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
     assert source.joinpath("records.bin").read_bytes() == source_raw == prefix + tail
     manifest = cast(dict[str, object], loads(result.bundle_path.joinpath("manifest.json").read_text(encoding="utf-8")))
     receipt = cast(dict[str, object], loads(result.bundle_path.joinpath("receipt.json").read_text(encoding="utf-8")))
     assert manifest == {
-        "device_slug": "omi_cv1",
+        "schema_version": 2,
         "start_sequence": 100,
         "next_sequence": 101,
         "record_count": 1,
@@ -80,8 +80,8 @@ def test_publishes_only_authenticated_prefix_and_leaves_source_unchanged(tmp_pat
         result.bundle_path / "manifest.json",
         result.bundle_path / "receipt.json",
     }
-    assert not tuple((_capture_root(tmp_path) / "omi_cv1").glob(".*.tmp"))
-    duplicate = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+    assert not tuple((_capture_root(tmp_path)).glob(".*.tmp"))
+    duplicate = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
     assert duplicate.deduplicated
 
 
@@ -103,7 +103,7 @@ def test_quarantine_publication_uses_shared_bundle_directory_mode(
         real_mkdir(path, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(quarantine_publish.os, "mkdir", observed_mkdir)
-    result = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+    result = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
 
     assert requested_modes == [0o770]
     mode = S_IMODE(result.bundle_path.stat().st_mode)
@@ -120,30 +120,30 @@ def test_rejects_symlinked_source_authority(tmp_path: Path, name: str) -> None:
     authority.symlink_to(target)
 
     with pytest.raises(QuarantinePublishError, match=r"missing or unreadable|regular file"):
-        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
 
-    assert not tuple((_capture_root(tmp_path) / "omi_cv1").glob("100-*"))
+    assert not tuple((_capture_root(tmp_path)).glob("100-*"))
 
 
 def test_rejects_nonidentical_existing_bundle_collision(tmp_path: Path) -> None:
     source, prefix, _ = _quarantined_attempt(tmp_path)
-    destination = _capture_root(tmp_path) / "omi_cv1" / f"100-101-{sha256(prefix).hexdigest()[:16]}"
+    destination = _capture_root(tmp_path) / f"100-101-{sha256(prefix).hexdigest()[:16]}"
     destination.mkdir(parents=True)
     (destination / "records.bin").write_bytes(_record(9))
     (destination / "manifest.json").write_text("{}", encoding="utf-8")
     (destination / "receipt.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(QuarantineOutputCollisionError, match="ordinary bundle collision"):
-        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
 
 
 def test_noncanonical_existing_bundle_is_retryable_not_a_conflict(tmp_path: Path) -> None:
     source, prefix, _ = _quarantined_attempt(tmp_path)
-    destination = _capture_root(tmp_path) / "omi_cv1" / f"100-101-{sha256(prefix).hexdigest()[:16]}"
+    destination = _capture_root(tmp_path) / f"100-101-{sha256(prefix).hexdigest()[:16]}"
     destination.mkdir(parents=True)
 
     with pytest.raises(OSError, match="not yet canonical"):
-        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
 
 
 def test_rejects_unknown_attempt_field(tmp_path: Path) -> None:
@@ -156,7 +156,7 @@ def test_rejects_unknown_attempt_field(tmp_path: Path) -> None:
     )
 
     with pytest.raises(QuarantinePublishError, match="schema is not exact"):
-        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths, "omi_cv1")
+        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
 
 
 @pytest.mark.parametrize("layout", ["alias", "nested"])
@@ -176,7 +176,7 @@ def test_rejects_alias_or_nested_publication_roots(tmp_path: Path, layout: str) 
         match=r"temporarily unavailable|real directory|regular directory|distinct, non-nested",
     ):
         paths = StagingStore(tmp_path, capture_root).paths
-        publish_quarantined_prefix(source, paths, "omi_cv1")
+        publish_quarantined_prefix(source, paths)
 
 
 def test_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -202,8 +202,8 @@ def test_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(quarantine_publish, "_publish_atomic", swap_before_atomic)
     with pytest.raises(OSError, match="temporarily unavailable"):
-        publish_quarantined_prefix(source, StagingStore(tmp_path, capture_root).paths, "omi_cv1")
-    assert not (outside / "omi_cv1").exists()
+        publish_quarantined_prefix(source, StagingStore(tmp_path, capture_root).paths)
+    assert not tuple(outside.iterdir())
 
 
 def test_manual_publish_respects_collector_device_lock(tmp_path: Path) -> None:
@@ -211,23 +211,23 @@ def test_manual_publish_respects_collector_device_lock(tmp_path: Path) -> None:
     capture_root = _capture_root(tmp_path)
     store = StagingStore(tmp_path, capture_root)
 
-    with store.device_lock("omi_cv1"), pytest.raises(DeviceAlreadyRunningError):
-        publish_quarantined_prefix(source, StagingStore(tmp_path, capture_root).paths, "omi_cv1")
+    with store.device_lock(), pytest.raises(DeviceAlreadyRunningError):
+        publish_quarantined_prefix(source, StagingStore(tmp_path, capture_root).paths)
 
-    assert not tuple((capture_root / "omi_cv1").glob(".*.tmp"))
+    assert not tuple((capture_root).glob(".*.tmp"))
 
 
 def test_hash_deferral_preserves_source_and_retries_byte_identically(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     count = quarantine_publish.DEFAULT_CONFIG.durability.io_chunk_bytes // RECORD_SIZE + 2
     payload = bytes(index % 251 for index in range(count * RECORD_SIZE))
-    attempt = store.prepare_streaming_attempt("omi_cv1", 100, count)
+    attempt = store.prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     attempt.accept_chunk(100, memoryview(payload))
     attempt.checkpoint()
     attempt_id = attempt.attempt_id
     attempt.close(durable=True)
-    source = store.quarantine_attempt_source("omi_cv1", attempt_id)
+    source = store.quarantine_attempt_source(attempt_id)
     before = {path.name: path.read_bytes() for path in source.iterdir()}
     defer_checks = 0
 
@@ -237,11 +237,11 @@ def test_hash_deferral_preserves_source_and_retries_byte_identically(tmp_path: P
         return defer_checks >= 3
 
     with pytest.raises(QuarantineSalvageDeferredError):
-        publish_quarantined_prefix(source, store.paths, "omi_cv1", should_defer=defer_after_first_chunk)
+        publish_quarantined_prefix(source, store.paths, should_defer=defer_after_first_chunk)
 
     assert {path.name: path.read_bytes() for path in source.iterdir()} == before
-    assert not tuple((_capture_root(tmp_path) / "omi_cv1").glob(".*.tmp"))
-    result = publish_quarantined_prefix(source, store.paths, "omi_cv1")
+    assert not tuple((_capture_root(tmp_path)).glob(".*.tmp"))
+    result = publish_quarantined_prefix(source, store.paths)
     assert result.bundle_path.joinpath("records.bin").read_bytes() == payload
 
 
@@ -259,7 +259,7 @@ def test_defer_requested_after_atomic_rename_finishes_publication(
         renamed = True
 
     monkeypatch.setattr(quarantine_publish.os, "rename", observed_rename)
-    result = publish_quarantined_prefix(source, store.paths, "omi_cv1", should_defer=lambda: renamed)
+    result = publish_quarantined_prefix(source, store.paths, should_defer=lambda: renamed)
 
     assert renamed
     assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix

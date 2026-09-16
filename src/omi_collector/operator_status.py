@@ -16,8 +16,7 @@ from omi_collector.config import DEFAULT_CONFIG
 from omi_collector.spool_metrics import collect_spool_metrics
 from omi_collector.storage_layout import StorageLayout
 
-_SCHEMA_VERSION = 1
-_DEVICE_SLUG = re.compile(r"[A-Za-z0-9_-]+\Z")
+_SCHEMA_VERSION = 2
 _SOURCE_REVISION = re.compile(r"[0-9a-f]{12}\Z")
 _TERMINATION_CLASSES = frozenset({"cancelled", "completed", "fatal_error", "retryable_error", "teardown_interrupted"})
 _ADVERTISEMENT_FIELDS = frozenset(
@@ -26,7 +25,6 @@ _ADVERTISEMENT_FIELDS = frozenset(
         "event",
         "recorded_at",
         "session_id",
-        "device_slug",
         "advertisement_rssi_dbm",
         "release_version",
         "source_revision",
@@ -39,7 +37,6 @@ _TRANSFER_FIELDS = frozenset(
         "event",
         "completed_at",
         "session_id",
-        "device_slug",
         "outcome",
         "termination_class",
         "active_read_elapsed_ms",
@@ -61,7 +58,6 @@ _LOSS_FIELDS = frozenset(
         "event",
         "occurred_at",
         "session_id",
-        "device_slug",
         "missing_record_count",
         "missing_raw_bytes",
         "reason",
@@ -76,7 +72,6 @@ _CLOCK_CORRECTION_FIELDS = frozenset(
         "event",
         "occurred_at",
         "session_id",
-        "device_slug",
         "drift_seconds",
         "target_epoch",
         "boundary_sequence_min",
@@ -193,7 +188,6 @@ class _QualityAccumulator:
 class _QualityEvent:
     event: str
     timestamp: datetime
-    device_slug: str
     advertisement_rssi_dbm: int | None = None
     outcome: str | None = None
     termination_class: str | None = None
@@ -206,7 +200,6 @@ class _QualityEvent:
 
 def collect_operator_status(
     layout: StorageLayout,
-    device_slug: str,
     *,
     hours: int,
     now: datetime | None = None,
@@ -219,13 +212,12 @@ def collect_operator_status(
         raise OperatorStatusError("status clock must be timezone-aware")
     start = end.astimezone(UTC) - timedelta(hours=hours)
     try:
-        observations = read_firmware_observations(layout.collector.device_state, device_slug)
+        observations = read_firmware_observations(layout.collector.device_state)
         spool = collect_spool_metrics(
             layout.publication.root,
-            device_slug,
             observation_root=layout.collector.device_state,
         )
-        quality = _quality_window(layout.collector.root, device_slug, start, end.astimezone(UTC))
+        quality = _quality_window(layout.collector.root, start, end.astimezone(UTC))
         runtime = _runtime_status(layout.collector.debug_log, end.astimezone(UTC))
     except ValueError as error:
         raise OperatorStatusError(str(error)) from error
@@ -368,18 +360,18 @@ def _window_status(quality: _QualityWindow) -> str:
     return "ok" if quality.completed_transfers else "unknown"
 
 
-def _quality_window(root: Path, device_slug: str, start: datetime, end: datetime) -> _QualityWindow:
+def _quality_window(root: Path, start: datetime, end: datetime) -> _QualityWindow:
     accumulator = _QualityAccumulator()
     for row in _quality_rows(root):
         event = _decode_quality_event(row)
-        _accumulate_quality_event(accumulator, event, device_slug, start, end)
+        _accumulate_quality_event(accumulator, event, start, end)
     return accumulator.build()
 
 
 def _accumulate_quality_event(
-    accumulator: _QualityAccumulator, event: _QualityEvent, device_slug: str, start: datetime, end: datetime
+    accumulator: _QualityAccumulator, event: _QualityEvent, start: datetime, end: datetime
 ) -> None:
-    if event.device_slug != device_slug or not start <= event.timestamp <= end:
+    if not start <= event.timestamp <= end:
         return
     if event.event == "advertisement_observation":
         _accumulate_advertisement(accumulator, event)
@@ -529,7 +521,7 @@ def _decode_quality_event(row: dict[str, object]) -> _QualityEvent:
 
 
 def _decode_advertisement(row: dict[str, object]) -> _QualityEvent:
-    timestamp, device_slug = _event_header(row, _ADVERTISEMENT_FIELDS, "recorded_at")
+    timestamp = _event_header(row, _ADVERTISEMENT_FIELDS, "recorded_at")
     _require_string(row, "session_id")
     _require_string(row, "release_version")
     _require_string(row, "phy_policy")
@@ -537,13 +529,12 @@ def _decode_advertisement(row: dict[str, object]) -> _QualityEvent:
     return _QualityEvent(
         "advertisement_observation",
         timestamp,
-        device_slug,
         advertisement_rssi_dbm=_integer(row, "advertisement_rssi_dbm"),
     )
 
 
 def _decode_transfer(row: dict[str, object]) -> _QualityEvent:
-    timestamp, device_slug = _event_header(row, _TRANSFER_FIELDS, "completed_at")
+    timestamp = _event_header(row, _TRANSFER_FIELDS, "completed_at")
     _require_string(row, "session_id")
     outcome = _require_string(row, "outcome")
     termination_class = _termination_class(row)
@@ -560,7 +551,6 @@ def _decode_transfer(row: dict[str, object]) -> _QualityEvent:
     return _QualityEvent(
         "transfer_session",
         timestamp,
-        device_slug,
         outcome=outcome,
         termination_class=termination_class,
         written_raw_bytes=_integer(row, "written_raw_bytes", minimum=0),
@@ -569,7 +559,7 @@ def _decode_transfer(row: dict[str, object]) -> _QualityEvent:
 
 
 def _decode_loss(row: dict[str, object]) -> _QualityEvent:
-    timestamp, device_slug = _event_header(row, _LOSS_FIELDS, "occurred_at")
+    timestamp = _event_header(row, _LOSS_FIELDS, "occurred_at")
     _require_string(row, "session_id")
     _require_string(row, "reason")
     _require_string(row, "release_version")
@@ -578,14 +568,13 @@ def _decode_loss(row: dict[str, object]) -> _QualityEvent:
     return _QualityEvent(
         "sequence_loss",
         timestamp,
-        device_slug,
         missing_record_count=_integer(row, "missing_record_count", minimum=0),
         missing_raw_bytes=_integer(row, "missing_raw_bytes", minimum=0),
     )
 
 
 def _decode_clock_correction(row: dict[str, object]) -> _QualityEvent:
-    timestamp, device_slug = _event_header(row, _CLOCK_CORRECTION_FIELDS, "occurred_at")
+    timestamp = _event_header(row, _CLOCK_CORRECTION_FIELDS, "occurred_at")
     _require_string(row, "session_id")
     _require_string(row, "release_version")
     _source_revision(row)
@@ -598,19 +587,16 @@ def _decode_clock_correction(row: dict[str, object]) -> _QualityEvent:
     drift = row.get("drift_seconds")
     if isinstance(drift, bool) or not isinstance(drift, int | float):
         raise OperatorStatusError("clock correction event has invalid drift_seconds")
-    return _QualityEvent("clock_correction", timestamp, device_slug, drift_seconds=float(drift))
+    return _QualityEvent("clock_correction", timestamp, drift_seconds=float(drift))
 
 
-def _event_header(row: dict[str, object], fields: frozenset[str], timestamp_key: str) -> tuple[datetime, str]:
+def _event_header(row: dict[str, object], fields: frozenset[str], timestamp_key: str) -> datetime:
     if set(row) != fields:
         raise OperatorStatusError("quality journal event fields are invalid")
     schema_version = row.get("schema_version")
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != _SCHEMA_VERSION:
         raise OperatorStatusError("quality journal event schema version is invalid")
-    device_slug = _require_string(row, "device_slug")
-    if _DEVICE_SLUG.fullmatch(device_slug) is None:
-        raise OperatorStatusError("quality journal event has invalid device_slug")
-    return _timestamp(row, timestamp_key), device_slug
+    return _timestamp(row, timestamp_key)
 
 
 def _timestamp(row: dict[str, object], key: str) -> datetime:

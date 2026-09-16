@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+_SCHEMA_VERSION = 2
+
 
 class ClockCorrectionError(RuntimeError):
     """A clock operation could not be persisted or applied safely."""
@@ -18,7 +20,6 @@ class ClockCorrectionError(RuntimeError):
 class ClockCorrection:
     version: int
     operation_id: str
-    device_slug: str
     state: str
     observed_epoch: int
     target_epoch: int
@@ -37,7 +38,6 @@ class ClockCorrectionStore:
 
     def prepare(
         self,
-        device_slug: str,
         observed_epoch: int,
         target_epoch: int,
         drift_seconds: float,
@@ -46,9 +46,8 @@ class ClockCorrectionStore:
         if self._has_active_attempt():
             raise ClockCorrectionError("clock correction waits for the active audio attempt")
         correction = ClockCorrection(
-            1,
+            2,
             uuid4().hex,
-            device_slug,
             "prepared",
             observed_epoch,
             target_epoch,
@@ -97,19 +96,18 @@ class ClockCorrectionStore:
         self._write_atomic(self._path(correction), unresolved)
         return unresolved
 
-    def confirmed(self, device_slug: str) -> tuple[ClockCorrection, ...]:
-        directory = self._root / device_slug
-        if not directory.exists():
+    def confirmed(self) -> tuple[ClockCorrection, ...]:
+        if not self._root.exists():
             return ()
         corrections = tuple(
             correction
-            for path in sorted(directory.glob("*.json"))
+            for path in sorted(self._root.glob("*.json"))
             if (correction := self._read(path)).state in {"applied", "resolved"}
         )
         return tuple(sorted(corrections, key=lambda item: item.boundary_sequence_min))
 
     def _path(self, correction: ClockCorrection) -> Path:
-        return self._root / correction.device_slug / f"{correction.operation_id}.json"
+        return self._root / f"{correction.operation_id}.json"
 
     def _attempts_root(self) -> Path:
         return self._pending_attempts
@@ -178,12 +176,27 @@ class ClockCorrectionStore:
     def _read(path: Path) -> ClockCorrection:
         try:
             value = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+            if (
+                set(value)
+                != {
+                    "version",
+                    "operation_id",
+                    "state",
+                    "observed_epoch",
+                    "target_epoch",
+                    "drift_seconds",
+                    "boundary_sequence_min",
+                    "boundary_sequence_max",
+                    "verified_epoch",
+                }
+                or value.get("version") != _SCHEMA_VERSION
+            ):
+                raise ValueError("clock correction schema is invalid")
             boundary_max = value.get("boundary_sequence_max")
             verified_epoch = value.get("verified_epoch")
             return ClockCorrection(
                 _integer(value, "version"),
                 _text(value, "operation_id"),
-                _text(value, "device_slug"),
                 _text(value, "state"),
                 _integer(value, "observed_epoch"),
                 _integer(value, "target_epoch"),

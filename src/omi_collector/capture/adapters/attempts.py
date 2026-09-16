@@ -130,7 +130,7 @@ class StagedAttempt:
             raise AttemptStateError("READ_BEGIN does not match the prepared READ range")
         descriptor = AttemptDescriptor(
             self.descriptor.attempt_id,
-            self.descriptor.device_slug,
+            2,
             self.descriptor.start_sequence,
             self.descriptor.packet_count,
             read_begin_start=notice.transfer_start_sequence,
@@ -284,7 +284,7 @@ class StagedAttempt:
             raise CollisionError(f"bundle collision preserved at {self.path}; destination is {bundle_path}")
         self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
         self._filesystem._write_json_atomic(self.path / _RECEIPT_NAME, self._receipt(raw_hash))
-        publish_full_directory(self._filesystem, self.path, bundle_path, self.descriptor.device_slug)
+        publish_full_directory(self._filesystem, self.path, bundle_path)
         shutil.rmtree(self.path)
         _sync_directory(self._filesystem.attempts_root, self._filesystem._fsync)
         return SealResult(bundle_path, False)
@@ -318,7 +318,7 @@ class StagedAttempt:
             )
             return None
 
-        destination = _prefix_destination_for(self._filesystem.capture_root, self.descriptor.device_slug, prefix)
+        destination = _prefix_destination_for(self._filesystem.capture_root, prefix)
         manifest = self._manifest_for_prefix(prefix)
         if destination.exists():
             if _prefix_destination_matches(
@@ -337,7 +337,6 @@ class StagedAttempt:
         publish_prefix_directory(
             self._filesystem,
             destination=destination,
-            device_slug=self.descriptor.device_slug,
             raw_source=self.path / _RAW_NAME,
             prefix_size=prefix_size,
             manifest=manifest,
@@ -636,18 +635,18 @@ class StagedAttempt:
         count = self.descriptor.read_begin_count
         if start is None or count is None:
             raise AttemptStateError("READ_BEGIN is missing")
-        return self._filesystem.capture_root / self.descriptor.device_slug / f"{start}-{start + count}-{raw_hash[:16]}"
+        return self._filesystem.capture_root / f"{start}-{start + count}-{raw_hash[:16]}"
 
     def _manifest(self, raw_hash: str) -> dict[str, object]:
         start = self.descriptor.read_begin_start
         count = self.descriptor.read_begin_count
         if start is None or count is None:
             raise AttemptStateError("READ_BEGIN is missing")
-        return BundleManifest(self.descriptor.device_slug, start, start + count, count, RECORD_SIZE, raw_hash).as_dict()
+        return BundleManifest(2, start, start + count, count, RECORD_SIZE, raw_hash).as_dict()
 
     def _manifest_for_prefix(self, prefix: DurablePrefix) -> dict[str, object]:
         return BundleManifest(
-            self.descriptor.device_slug,
+            2,
             prefix.start_sequence,
             prefix.next_sequence,
             prefix.record_count,

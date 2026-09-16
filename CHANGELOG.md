@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.8](https://github.com/j2h4u/omi-collector/compare/v0.5.7...v0.5.8) (2026-09-16)
+
+
+### Fixes
+
+* share unified config with pipeline ([39af17f](https://github.com/j2h4u/omi-collector/commit/39af17f5d2fce3d64abaee3fc635858063550bb8))
+
+
+### Refactoring
+
+* use one single-pendant configuration ([39af17f](https://github.com/j2h4u/omi-collector/commit/39af17f5d2fce3d64abaee3fc635858063550bb8))
+
 ## [0.5.7](https://github.com/j2h4u/omi-collector/compare/v0.5.6...v0.5.7) (2026-09-16)
 
 

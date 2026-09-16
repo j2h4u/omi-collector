@@ -104,8 +104,8 @@ sudo scripts/deploy-systemd-service.sh
 
 Replace the placeholder with the pendant Bluetooth address. The configuration
 contains only `[pendant]` and `address`; the fixed location determines storage.
-The installer creates the service account, protects the configuration as
-`root:omi-collector` mode `0640`, and enables the service. It does not start the
+The installer creates the service account, keeps the configuration root-owned
+and readable by both services as mode `0644`, and enables the service. It does not start the
 service unless `--restart` is explicit. Complete the first successful
 deployment before rebooting or leaving the host unattended because the unit
 has no selected runtime before then.

@@ -63,9 +63,9 @@ function validate_operator_config_file {
         || die "operator configuration is missing or unreadable: ${config_file}"
     metadata=$(stat -c '%U:%G:%a' -- "$config_file") \
         || die "could not inspect operator configuration: ${config_file}"
-    # assert: configuration is protected but readable by the service account
-    [[ "$metadata" == "root:${account_group}:640" ]] \
-        || die "operator configuration must be root:${account_group} 0640: ${config_file}"
+    # assert: the system collector and user-owned pipeline can both read it
+    [[ "$metadata" == "root:root:644" ]] \
+        || die "operator configuration must be root:root 0644: ${config_file}"
 }
 
 function prepare_deployment_directories {

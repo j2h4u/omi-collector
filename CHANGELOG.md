@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.7](https://github.com/j2h4u/omi-collector/compare/v0.5.6...v0.5.7) (2026-09-16)
+
+
+### Documentation
+
+* document stock pendant gotchas ([#69](https://github.com/j2h4u/omi-collector/issues/69)) ([075c483](https://github.com/j2h4u/omi-collector/commit/075c483594402b35f87402bd3738b691da27e5ae))
+
 ## [0.5.6](https://github.com/j2h4u/omi-collector/compare/v0.5.5...v0.5.6) (2026-09-15)
 
 

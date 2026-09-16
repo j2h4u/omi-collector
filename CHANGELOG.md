@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.9](https://github.com/j2h4u/omi-collector/compare/v0.5.8...v0.5.9) (2026-09-16)
+
+
+### Fixes
+
+* deploy with shared config permissions ([#73](https://github.com/j2h4u/omi-collector/issues/73)) ([2e7a88c](https://github.com/j2h4u/omi-collector/commit/2e7a88c2a3cf55c7e2f94669859eeda1bfcba6cb))
+
 ## [0.5.8](https://github.com/j2h4u/omi-collector/compare/v0.5.7...v0.5.8) (2026-09-16)
 
 

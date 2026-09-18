@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from ..domain.ring_protocol import RECORD_SIZE
 from .bundle_contract import BundleManifest, SealedReceipt
+from .clock_corrections import ClockCorrection, ClockCorrectionError, ClockCorrectionStore
 
 
 class TimelineGenerationError(RuntimeError):
@@ -44,7 +45,7 @@ class GenerationResult:
 def publish_from_ledger(captured_root: Path, publication_root: Path, collector_root: Path) -> GenerationResult:
     """Publish from the durable repair ledger only when clock evidence is settled."""
     repairs = _read_repairs(collector_root / "timeline-repairs.json")
-    _require_settled_clock_operations(collector_root / "clock-corrections")
+    _require_settled_clock_operations(collector_root / "clock-corrections", captured_root, repairs)
     return build_generation(captured_root, publication_root, repairs)
 
 
@@ -78,21 +79,40 @@ def build_generation(
     return GenerationResult(destination, len(bundles), records, identity)
 
 
-def _require_settled_clock_operations(root: Path) -> None:
+def _require_settled_clock_operations(
+    root: Path,
+    captured_root: Path,
+    repairs: tuple[TimeRepair, ...],
+) -> None:
     if not root.exists():
         return
-    for path in root.glob("*.json"):
-        try:
-            value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError) as error:
-            raise TimelineGenerationError("clock correction evidence is invalid") from error
-        if not isinstance(value, dict) or value.get("state") not in {
-            "prepared",
-            "not_written",
-            "not_applied",
-            "resolved",
-        }:
-            raise TimelineGenerationError("clock correction evidence is unresolved")
+    store = ClockCorrectionStore(root.parent / "device-state.json")
+    try:
+        store.recover_prepared()
+        operations = store.records()
+    except ClockCorrectionError as error:
+        for path in root.glob("*.json"):
+            try:
+                value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):  # fmt: skip
+                continue
+            if isinstance(value, dict) and value.get("state") in {"prepared", "unresolved"}:
+                raise TimelineGenerationError("clock correction evidence is unresolved") from error
+        raise TimelineGenerationError("clock correction evidence is invalid") from error
+    unresolved = tuple(
+        operation for operation in operations if operation.state in {"prepared", "unresolved", "applied"}
+    )
+    if any(operation.state in {"prepared", "unresolved"} for operation in unresolved):
+        raise TimelineGenerationError("clock correction evidence is unresolved")
+    applied = tuple(operation for operation in unresolved if operation.state == "applied")
+    if not applied:
+        return
+    _validate_applied_operations(captured_root, repairs, applied)
+    try:
+        for operation in applied:
+            store.resolve_applied(operation)
+    except ClockCorrectionError as error:
+        raise TimelineGenerationError("clock correction evidence is not durable") from error
 
 
 def _read_repairs(path: Path) -> tuple[TimeRepair, ...]:
@@ -100,7 +120,13 @@ def _read_repairs(path: Path) -> tuple[TimeRepair, ...]:
         return ()
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        if not isinstance(value, dict) or set(value) != {"repairs"}:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"version", "repairs"}
+            or isinstance(value["version"], bool)
+            or not isinstance(value["version"], int)
+            or value["version"] != 1
+        ):
             raise ValueError
         rows = value["repairs"]
         if not isinstance(rows, list):
@@ -121,6 +147,72 @@ def _repair(value: dict[str, object]) -> TimeRepair:
     if any(isinstance(item, bool) or not isinstance(item, int) for item in numbers) or not isinstance(evidence, str):
         raise ValueError
     return TimeRepair(cast(int, numbers[0]), cast(int, numbers[1]), cast(int, numbers[2]), evidence)
+
+
+def _validate_applied_operations(
+    captured_root: Path,
+    repairs: tuple[TimeRepair, ...],
+    operations: tuple[ClockCorrection, ...],
+) -> None:
+    """Prove every applied operation against immutable raw records before resolving it."""
+    _validate_repairs(repairs)
+    timestamps = _normalized_timestamps(captured_root, repairs)
+    for operation in operations:
+        boundary_max = operation.boundary_sequence_max
+        if (
+            operation.boundary_sequence_min < 0
+            or boundary_max is None
+            or boundary_max < operation.boundary_sequence_min
+        ):
+            raise TimelineGenerationError("clock correction ambiguity boundary is invalid")
+        if boundary_max == operation.boundary_sequence_min:
+            continue
+        ordered_sequences = tuple(sorted(timestamps))
+        predecessor = next(
+            (sequence for sequence in reversed(ordered_sequences) if sequence < operation.boundary_sequence_min),
+            None,
+        )
+        successor = next((sequence for sequence in ordered_sequences if sequence >= boundary_max), None)
+        if predecessor is None or successor is None:
+            raise TimelineGenerationError("clock correction ambiguity boundaries are incomplete")
+        previous: int | None = None
+        for sequence in ordered_sequences:
+            if sequence < predecessor or sequence > successor:
+                continue
+            timestamp = timestamps[sequence]
+            assert timestamp is not None
+            if previous is not None and timestamp < previous:
+                raise TimelineGenerationError("clock correction raw interval regresses")
+            previous = timestamp
+
+
+def _normalized_timestamps(captured_root: Path, repairs: tuple[TimeRepair, ...]) -> dict[int, int]:
+    bundles = _bundles(captured_root)
+    timestamps: dict[int, int] = {}
+    previous: int | None = None
+    for source, manifest in bundles:
+        raw = (source / "records.bin").read_bytes()
+        if sha256(raw).hexdigest() != manifest.raw_sha256 or len(raw) != manifest.record_count * RECORD_SIZE:
+            raise TimelineGenerationError("captured bundle does not match its manifest")
+        for index in range(manifest.record_count):
+            sequence = manifest.start_sequence + index
+            position = index * RECORD_SIZE
+            raw_timestamp = int.from_bytes(raw[position : position + 4], "big")
+            timestamp = raw_timestamp - _repair_offset(sequence, repairs)
+            if not 0 <= timestamp <= 2**32 - 1:
+                raise TimelineGenerationError("normalized timestamp is outside uint32")
+            if previous is not None and timestamp < previous:
+                raise TimelineGenerationError("normalized timestamp chain regresses")
+            timestamps[sequence] = timestamp
+            previous = timestamp
+    return timestamps
+
+
+def _repair_offset(sequence: int, repairs: tuple[TimeRepair, ...]) -> int:
+    return next(
+        (repair.offset_seconds for repair in repairs if repair.start_sequence <= sequence < repair.next_sequence),
+        0,
+    )
 
 
 def _append_generation(
@@ -273,9 +365,7 @@ def _normalize(
     output = bytearray(raw)
     for index in range(len(raw) // RECORD_SIZE):
         sequence = start_sequence + index
-        offset = next(
-            (repair.offset_seconds for repair in repairs if repair.start_sequence <= sequence < repair.next_sequence), 0
-        )
+        offset = _repair_offset(sequence, repairs)
         position = index * RECORD_SIZE
         timestamp = int.from_bytes(raw[position : position + 4], "big") - offset
         if not 0 <= timestamp <= 2**32 - 1:

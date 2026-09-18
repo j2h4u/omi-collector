@@ -8,11 +8,13 @@ from pathlib import Path
 from shutil import rmtree
 from struct import pack
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import omi_collector.capture.application.operational_telemetry as operational_telemetry
 from fakes import ScriptedRingSession, WriteStep
+from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.collector import TransferTimeouts
@@ -24,6 +26,7 @@ from omi_collector.capture.application.operational_telemetry import (
     MODEL_UUID,
     TIME_READ_UUID,
     TIME_WRITE_UUID,
+    ClockCorrectionSink,
     OperationalEmitter,
     TelemetryClock,
     collect_operational_telemetry,
@@ -64,6 +67,7 @@ class FakeOperationalSession:
 class FakeClockCorrectionSink:
     def __init__(self) -> None:
         self.finished: list[dict[str, object]] = []
+        self.reconcile_calls = 0
 
     def prepare(
         self,
@@ -80,6 +84,18 @@ class FakeClockCorrectionSink:
 
     def mark_unresolved(self, correction: object) -> object:
         return correction
+
+    def reconcile_observation(
+        self,
+        observed_epoch: int,
+        drift_seconds: float,
+        boundary_sequence_max: int,
+        *,
+        near_zero_threshold: float,
+    ) -> tuple[object, ...]:
+        self.reconcile_calls += 1
+        del observed_epoch, drift_seconds, boundary_sequence_max, near_zero_threshold
+        return ()
 
 
 def _event_emitter(events: list[dict[str, object]]) -> OperationalEmitter:
@@ -181,6 +197,31 @@ def test_boundary_drift_does_not_write_and_observation_is_safe() -> None:
     assert "audio" not in str(events)
 
 
+def test_unsynchronized_host_does_not_reconcile_near_zero_observation() -> None:
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
+    events: list[dict[str, object]] = []
+    sink = FakeClockCorrectionSink()
+
+    ticks = iter((1000.0, 1000.0, *(1000.0 for _ in range(5))))
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: False,
+                0.5,
+                correction_sink=sink,
+            ),
+        )
+    )
+
+    assert sink.reconcile_calls == 0
+    assert events[-1]["outcome"] == "host_unsynchronized"
+
+
 def test_drift_writes_then_reads_back_once_in_order() -> None:
     target = pack("<I", 1000)
     session = FakeOperationalSession(
@@ -218,6 +259,93 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
     assert events[-1]["boundary_sequence_max"] == 14
 
 
+def test_verified_zero_width_boundary_is_resolved_immediately() -> None:
+    target = pack("<I", 1000)
+    session = FakeOperationalSession(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)},
+        readback=target,
+    )
+    events: list[dict[str, object]] = []
+    sink = FakeClockCorrectionSink()
+    ticks = iter((1000.0,) * 8)
+
+    async def info_after() -> RingInfo:
+        return _info()
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=info_after,
+                correction_sink=sink,
+            ),
+        )
+    )
+
+    assert sink.finished[-1]["state"] == "resolved"
+    assert sink.finished[-1]["boundary_sequence_max"] == 12
+
+
+def test_verified_write_without_post_boundary_stays_unresolved() -> None:
+    target = pack("<I", 1000)
+    session = FakeOperationalSession(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)},
+        readback=target,
+    )
+    events: list[dict[str, object]] = []
+    sink = FakeClockCorrectionSink()
+    ticks = iter((1000.0,) * 8)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(lambda: next(ticks), lambda: True, 0.5, correction_sink=sink),
+        )
+    )
+
+    assert sink.finished[-1]["state"] == "unresolved"
+    assert sink.finished[-1]["boundary_sequence_max"] is None
+
+
+def test_incident_boundaries_use_trusted_near_zero_observation(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    zero = store.mark_unresolved(store.prepare(1000, 1000, 0.0, 7192026))
+    store.finish(zero, state="resolved", boundary_sequence_max=7192026, verified_epoch=1000)
+    pending = store.mark_unresolved(store.prepare(1302, 1002, 300.0, 7717545))
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
+    events: list[dict[str, object]] = []
+    ticks = iter((1000.0,) * 8)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            RingInfo(0, 7861464, 100, 2, RECORD_SIZE),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                correction_sink=cast(ClockCorrectionSink, store),
+            ),
+        )
+    )
+
+    correction = next(item for item in store.records() if item.operation_id == pending.operation_id)
+    assert correction.state == "applied"
+    assert correction.boundary_sequence_max == 7861464
+    assert events[-1]["outcome"] == "within_threshold"
+
+
 def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
     events: list[dict[str, object]] = []
@@ -248,6 +376,40 @@ def test_write_and_verification_failures_are_classified_without_retry() -> None:
     _run(verify_fail, verify_events)
     assert len(verify_fail.writes) == 1
     assert verify_events[-1]["outcome"] == "verification_failed"
+
+
+def test_verification_failure_keeps_unresolved_boundary_fields_empty(tmp_path: Path) -> None:
+    session = FakeOperationalSession(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)},
+        readback=pack("<I", 1005),
+    )
+    events: list[dict[str, object]] = []
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    ticks = iter((1000.0,) * 8)
+
+    async def info_after() -> RingInfo:
+        return RingInfo(10, 14, 100, 2, RECORD_SIZE)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=info_after,
+                correction_sink=cast(ClockCorrectionSink, store),
+            ),
+        )
+    )
+
+    correction = store.records()[0]
+    assert correction.state == "unresolved"
+    assert correction.boundary_sequence_max is None
+    assert correction.verified_epoch is None
 
 
 def test_missing_time_write_is_not_reported_as_performed() -> None:

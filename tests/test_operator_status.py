@@ -126,6 +126,8 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "attention_reasons": [],
         "battery_observed_at": None,
         "battery_percent": None,
+        "connection_rssi_dbm": None,
+        "connection_rssi_observed_at": None,
         "firmware": None,
         "last_error": None,
         "state": "unknown",
@@ -205,6 +207,11 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
     layout = _layout(tmp_path)
     rows = (
         {
+            "event": "ble_link_rssi_observed",
+            "fields": {"rssi_dbm": -47, "status_hex": "0x00", "status_name": "success"},
+            "timestamp": "2026-09-08T09:00:04+00:00",
+        },
+        {
             "event": "sync_progress",
             "fields": {"progress": {"event": "pendant_observation", "battery_percent": 96, "firmware": "3.0.21"}},
             "timestamp": "2026-09-08T09:00:00+00:00",
@@ -241,6 +248,8 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
     runtime = cast(dict[str, object], result["runtime"])
     assert runtime["battery_percent"] == 96
     assert runtime["battery_observed_at"] == "2026-09-08T09:00:00.000+00:00"
+    assert runtime["connection_rssi_dbm"] == -47
+    assert runtime["connection_rssi_observed_at"] == "2026-09-08T09:00:04.000+00:00"
     assert runtime["firmware"] == "3.0.22"
     assert runtime["last_error"] is None
     assert runtime["state"] == "transferring"

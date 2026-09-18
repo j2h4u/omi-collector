@@ -38,6 +38,7 @@ _PHY_UPDATE_BYTES = 5
 _DISCONNECT_BYTES = 4
 _COMMAND_COMPLETE_HEADER_BYTES = 4
 _READ_PHY_PARAMS_BYTES = 5
+_READ_RSSI_PARAMS_BYTES = 4
 _AF_BLUETOOTH = getattr(socket, "AF_BLUETOOTH", 31)
 _BTPROTO_HCI = getattr(socket, "BTPROTO_HCI", 1)
 _HCI_EVENT_MASK_WORD_BITS = 32
@@ -60,6 +61,8 @@ _LE_REMOTE_CONNECTION_PARAMETER_REQUEST = 0x06
 _LE_DATA_LENGTH_CHANGE = 0x07
 _LE_PHY_UPDATE_COMPLETE = 0x0C
 _LE_READ_PHY_OPCODE = 0x2030
+_READ_RSSI_OPCODE = 0x1405
+_RSSI_POLL_SECONDS = 30.0
 _PHY_1M = 0x01
 _PHY_2M = 0x02
 _PHY_CODED = 0x03
@@ -346,6 +349,13 @@ class _CommandCompleteEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class _RssiEvent:
+    handle: int | None
+    status: int
+    rssi_dbm: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class _DisconnectEvent:
     handle: int
     reason: int
@@ -405,6 +415,7 @@ def parse_hci_packet(
     | _ConnectionParameterRequestEvent
     | _DataLengthChangeEvent
     | _CommandCompleteEvent
+    | _RssiEvent
     | _DisconnectEvent
     | None
 ):
@@ -534,24 +545,45 @@ def _parse_disconnect(payload: bytes, packet: bytes, logger: logging.Logger) -> 
     return _DisconnectEvent(int.from_bytes(payload[1:3], "little") & 0x0FFF, payload[3]) if payload[0] == 0 else None
 
 
-def _parse_command_complete(payload: bytes, packet: bytes, logger: logging.Logger) -> _CommandCompleteEvent | None:
+def _parse_command_complete(
+    payload: bytes, packet: bytes, logger: logging.Logger
+) -> _CommandCompleteEvent | _RssiEvent | None:
     if len(payload) < _COMMAND_COMPLETE_HEADER_BYTES:
         _malformed(packet, "truncated_command_complete", logger)
         return None
     opcode = int.from_bytes(payload[1:3], "little")
-    if opcode != _LE_READ_PHY_OPCODE:
+    if opcode not in {_LE_READ_PHY_OPCODE, _READ_RSSI_OPCODE}:
         return None
     params = payload[3:]
     if len(params) < 1:
-        _malformed(packet, "truncated_read_phy_complete", logger)
+        _malformed(packet, "truncated_command_complete_parameters", logger)
         return None
+    if opcode == _READ_RSSI_OPCODE:
+        return _parse_read_rssi_complete(params, packet, logger)
+    return _parse_read_phy_complete(params, packet, logger)
+
+
+def _parse_read_rssi_complete(params: bytes, packet: bytes, logger: logging.Logger) -> _RssiEvent | None:
     if params[0] != 0:
-        return _CommandCompleteEvent(opcode, params[0], None, None, None)
+        return _RssiEvent(None, params[0], None)
+    if len(params) != _READ_RSSI_PARAMS_BYTES:
+        _malformed(packet, "malformed_read_rssi_complete", logger)
+        return None
+    return _RssiEvent(
+        int.from_bytes(params[1:3], "little") & 0x0FFF,
+        params[0],
+        int.from_bytes(params[3:4], "little", signed=True),
+    )
+
+
+def _parse_read_phy_complete(params: bytes, packet: bytes, logger: logging.Logger) -> _CommandCompleteEvent | None:
+    if params[0] != 0:
+        return _CommandCompleteEvent(_LE_READ_PHY_OPCODE, params[0], None, None, None)
     if len(params) != _READ_PHY_PARAMS_BYTES:
         _malformed(packet, "malformed_read_phy_complete", logger)
         return None
     return _CommandCompleteEvent(
-        opcode, params[0], int.from_bytes(params[1:3], "little") & 0x0FFF, params[3], params[4]
+        _LE_READ_PHY_OPCODE, params[0], int.from_bytes(params[1:3], "little") & 0x0FFF, params[3], params[4]
     )
 
 
@@ -645,6 +677,7 @@ class BleLinkObserver:
         self._lock = threading.Lock()
         self._active: _ActiveSession | None = None
         self._warning_emitted = False
+        self._next_rssi_poll_at: float | None = None
         self.observer_status = "not_started"
         self.dropped_packets = 0
 
@@ -808,6 +841,7 @@ class BleLinkObserver:
                 try:
                     packet = self._queue.get(timeout=self.config.observer_poll_seconds)
                 except queue.Empty:
+                    self._poll_rssi()
                     reader = self._reader
                     if self._stop.is_set() and (reader is None or not reader.is_alive()):
                         return
@@ -818,6 +852,7 @@ class BleLinkObserver:
                     self.handle_packet(packet)
                 except BaseException as error:  # noqa: BLE001 - malformed vendor packets are nonfatal
                     self._diagnostic_failure("ble_link_observer_parser_failed", error)
+                self._poll_rssi()
         finally:
             self._finish(None)
 
@@ -832,9 +867,23 @@ class BleLinkObserver:
         with self._lock:
             active = self._active
         event_handle = getattr(event, "handle", None)
-        snapshot_without_handle = isinstance(event, _CommandCompleteEvent) and event_handle is None
+        snapshot_without_handle = isinstance(event, _CommandCompleteEvent | _RssiEvent) and event_handle is None
         if active is None or (event_handle != active.handle and not snapshot_without_handle):
             return
+        self._handle_active_event(event)
+
+    def _handle_active_event(
+        self,
+        event: (
+            _PhyEvent
+            | _ConnectionParameterUpdateEvent
+            | _ConnectionParameterRequestEvent
+            | _DataLengthChangeEvent
+            | _CommandCompleteEvent
+            | _RssiEvent
+            | _DisconnectEvent
+        ),
+    ) -> None:
         if isinstance(event, _ConnectionParameterRequestEvent):
             self._record_connection_parameter_request(event)
         elif isinstance(event, _ConnectionParameterUpdateEvent):
@@ -845,6 +894,8 @@ class BleLinkObserver:
             self._record_phy_update(event)
         elif isinstance(event, _CommandCompleteEvent):
             self._record_phy_snapshot(event)
+        elif isinstance(event, _RssiEvent):
+            self._record_rssi(event)
         elif isinstance(event, _DisconnectEvent):
             self._finish(event.reason)
 
@@ -874,6 +925,24 @@ class BleLinkObserver:
             if self.observer_status == "available":
                 self._warning_emitted = False
         self._request_phy(event.handle)
+        self._request_rssi(event.handle)
+
+    def _poll_rssi(self) -> None:
+        now = self._clock()
+        with self._lock:
+            active = self._active
+            due = self._next_rssi_poll_at
+        if active is None or due is None or now < due:
+            return
+        self._request_rssi(active.handle)
+
+    def _request_rssi(self, handle: int) -> None:
+        self._send_handle_command(
+            _READ_RSSI_OPCODE,
+            handle,
+            failure_event="ble_link_read_rssi_send_failed",
+        )
+        self._next_rssi_poll_at = self._clock() + _RSSI_POLL_SECONDS
 
     def _record_connection_parameter_request(self, event: _ConnectionParameterRequestEvent) -> None:
         request = ConnectionParameterRequest(
@@ -918,10 +987,16 @@ class BleLinkObserver:
                 active.supervision_timeout = event.supervision_timeout
 
     def _request_phy(self, handle: int) -> None:
+        self._send_handle_command(
+            _LE_READ_PHY_OPCODE,
+            handle,
+            failure_event="ble_link_read_phy_send_failed",
+        )
+
+    def _send_handle_command(self, opcode: int, handle: int, *, failure_event: str) -> None:
         sock = self._socket
         if sock is None:
             return
-        opcode = _LE_READ_PHY_OPCODE
         command = bytes(
             (
                 _HCI_COMMAND_PACKET,
@@ -935,7 +1010,20 @@ class BleLinkObserver:
         try:
             sock.send(command)
         except BaseException as error:  # noqa: BLE001
-            self._diagnostic_failure("ble_link_read_phy_send_failed", error, handle=handle)
+            self._diagnostic_failure(failure_event, error, handle=handle)
+
+    def _record_rssi(self, event: _RssiEvent) -> None:
+        with self._lock:
+            active = self._active
+            if active is None or (event.handle is not None and event.handle != active.handle):
+                return
+        self._diagnostic(
+            "ble_link_rssi_observed",
+            handle=active.handle,
+            status_hex=f"0x{event.status:02x}",
+            status_name=_hci_status_name(event.status),
+            rssi_dbm=event.rssi_dbm,
+        )
 
     def _record_phy_snapshot(self, event: _CommandCompleteEvent) -> None:
         with self._lock:
@@ -1012,6 +1100,7 @@ class BleLinkObserver:
     def _finish(self, reason: int | None) -> None:
         with self._lock:
             active, self._active = self._active, None
+            self._next_rssi_poll_at = None
         if active is None:
             return
         elapsed = max(0.0, self._clock() - active.started)

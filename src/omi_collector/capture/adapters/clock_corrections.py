@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -10,6 +11,13 @@ from typing import cast
 from uuid import uuid4
 
 _SCHEMA_VERSION = 2
+_VALID_STATES = frozenset({"prepared", "not_written", "unresolved", "not_applied", "applied", "resolved"})
+_VALID_FINISH_STATES = frozenset({"not_written", "unresolved", "not_applied", "applied", "resolved"})
+_ALLOWED_TRANSITIONS = {
+    "prepared": frozenset({"not_written", "unresolved"}),
+    "unresolved": frozenset({"unresolved", "not_applied", "applied", "resolved"}),
+    "applied": frozenset({"resolved"}),
+}
 
 
 class ClockCorrectionError(RuntimeError):
@@ -45,6 +53,10 @@ class ClockCorrectionStore:
     ) -> ClockCorrection:
         if self._has_active_attempt():
             raise ClockCorrectionError("clock correction waits for the active audio attempt")
+        if self._has_pending_correction():
+            raise ClockCorrectionError("clock correction waits for a pending correction")
+        if not math.isfinite(drift_seconds) or boundary_sequence_min < 0:
+            raise ClockCorrectionError("clock correction intent values are invalid")
         correction = ClockCorrection(
             2,
             uuid4().hex,
@@ -67,18 +79,10 @@ class ClockCorrectionStore:
         boundary_sequence_max: int | None,
         verified_epoch: int | None,
     ) -> ClockCorrection:
-        if state not in {"not_written", "unresolved", "not_applied", "applied", "resolved"}:
-            raise ValueError("invalid clock correction state")
         current = self._read(self._path(correction))
         if current != correction or correction.state not in {"prepared", "unresolved", "applied"}:
             raise ClockCorrectionError("clock correction transition conflicts with durable state")
-        allowed = {
-            "prepared": {"not_written", "unresolved"},
-            "unresolved": {"unresolved", "not_applied", "applied"},
-            "applied": {"resolved"},
-        }
-        if state not in allowed[correction.state]:
-            raise ClockCorrectionError("clock correction state transition is invalid")
+        _validate_finish_transition(correction, state, boundary_sequence_max, verified_epoch)
         completed = replace(
             correction,
             state=state,
@@ -87,6 +91,84 @@ class ClockCorrectionStore:
         )
         self._write_atomic(self._path(correction), completed)
         return completed
+
+    def resolve_applied(self, correction: ClockCorrection) -> ClockCorrection:
+        """Resolve an applied operation after its raw ambiguity interval is checked."""
+        if correction.state != "applied":
+            raise ClockCorrectionError("clock correction is not applied")
+        return self.finish(
+            correction,
+            state="resolved",
+            boundary_sequence_max=correction.boundary_sequence_max,
+            verified_epoch=correction.verified_epoch,
+        )
+
+    def reconcile_observation(
+        self,
+        observed_epoch: int,
+        drift_seconds: float,
+        boundary_sequence_max: int,
+        *,
+        near_zero_threshold: float,
+    ) -> tuple[ClockCorrection, ...]:
+        """Reconcile unresolved writes from a later numeric clock observation."""
+        if near_zero_threshold <= 0:
+            raise ValueError("near-zero threshold must be positive")
+        if boundary_sequence_max < 0:
+            raise ValueError("clock observation boundary must be non-negative")
+        records = self.records()
+        pending = tuple(
+            correction
+            for correction in records
+            if correction.state == "unresolved" and boundary_sequence_max >= correction.boundary_sequence_min
+        )
+        if len(pending) != 1:
+            return ()
+        current = pending[0]
+        if any(
+            correction.state in {"applied", "resolved"}
+            and current.boundary_sequence_min <= correction.boundary_sequence_min <= boundary_sequence_max
+            for correction in records
+        ):
+            return ()
+        if abs(drift_seconds) <= near_zero_threshold:
+            state = "applied"
+            verified_epoch = observed_epoch
+        elif math.isclose(drift_seconds, current.drift_seconds, rel_tol=0.0, abs_tol=near_zero_threshold):
+            state = "not_applied"
+            verified_epoch = None
+        else:
+            return ()
+        completed = replace(
+            current,
+            state=state,
+            boundary_sequence_max=boundary_sequence_max,
+            verified_epoch=verified_epoch,
+        )
+        self._write_atomic(self._path(current), completed)
+        return (completed,)
+
+    def recover_prepared(self) -> tuple[ClockCorrection, ...]:
+        """Atomically settle intents that crashed before ambiguity was opened."""
+        recovered: list[ClockCorrection] = []
+        for correction in self.records():
+            if correction.state != "prepared":
+                continue
+            recovered.append(
+                self.finish(
+                    correction,
+                    state="not_written",
+                    boundary_sequence_max=None,
+                    verified_epoch=None,
+                )
+            )
+        return tuple(recovered)
+
+    def records(self) -> tuple[ClockCorrection, ...]:
+        """Read every durable clock operation in stable path order."""
+        if not self._root.exists():
+            return ()
+        return tuple(self._read(path) for path in sorted(self._root.glob("*.json")))
 
     def mark_unresolved(self, correction: ClockCorrection) -> ClockCorrection:
         """Persist ambiguity before the BLE write can possibly take effect."""
@@ -117,6 +199,9 @@ class ClockCorrectionStore:
         if not root.exists():
             return False
         return any(path.is_dir() and not (path / "terminal-retired.json").exists() for path in root.iterdir())
+
+    def _has_pending_correction(self) -> bool:
+        return any(correction.state in {"prepared", "unresolved", "applied"} for correction in self.records())
 
     @staticmethod
     def _payload(correction: ClockCorrection) -> bytes:
@@ -194,7 +279,7 @@ class ClockCorrectionStore:
                 raise ValueError("clock correction schema is invalid")
             boundary_max = value.get("boundary_sequence_max")
             verified_epoch = value.get("verified_epoch")
-            return ClockCorrection(
+            correction = ClockCorrection(
                 _integer(value, "version"),
                 _text(value, "operation_id"),
                 _text(value, "state"),
@@ -205,8 +290,80 @@ class ClockCorrectionStore:
                 None if boundary_max is None else _integer(value, "boundary_sequence_max"),
                 None if verified_epoch is None else _integer(value, "verified_epoch"),
             )
+            if correction.boundary_sequence_min < 0 or (
+                correction.boundary_sequence_max is not None
+                and correction.boundary_sequence_max < correction.boundary_sequence_min
+            ):
+                raise ValueError("clock correction boundary is invalid")
+            if correction.state not in _VALID_STATES:
+                raise ValueError("clock correction state is invalid")
+            if correction.state in {"prepared", "not_written", "unresolved"} and (
+                correction.boundary_sequence_max is not None or correction.verified_epoch is not None
+            ):
+                raise ValueError("clock correction state fields are invalid")
+            if correction.state == "not_applied" and correction.verified_epoch is not None:
+                raise ValueError("clock correction state fields are invalid")
+            if correction.state in {"applied", "resolved"} and (
+                correction.boundary_sequence_max is None or correction.verified_epoch is None
+            ):
+                raise ValueError("confirmed clock correction has no verified evidence")
+            return correction
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ClockCorrectionError("clock correction ledger is invalid") from error
+
+
+def _validate_finish_transition(
+    correction: ClockCorrection,
+    state: str,
+    boundary_sequence_max: int | None,
+    verified_epoch: int | None,
+) -> None:
+    if state not in _VALID_FINISH_STATES:
+        raise ValueError("invalid clock correction state")
+    _validate_finish_values(correction, boundary_sequence_max)
+    _validate_finish_state(correction, state)
+    _validate_finish_fields(state, boundary_sequence_max, verified_epoch)
+    _validate_resolved_boundary(correction, state, boundary_sequence_max)
+
+
+def _validate_finish_values(correction: ClockCorrection, boundary_sequence_max: int | None) -> None:
+    if not math.isfinite(correction.drift_seconds) or correction.boundary_sequence_min < 0:
+        raise ClockCorrectionError("clock correction values are invalid")
+    if boundary_sequence_max is not None and boundary_sequence_max < correction.boundary_sequence_min:
+        raise ClockCorrectionError("clock correction boundary is invalid")
+
+
+def _validate_finish_state(correction: ClockCorrection, state: str) -> None:
+    if state not in _ALLOWED_TRANSITIONS[correction.state]:
+        raise ClockCorrectionError("clock correction state transition is invalid")
+
+
+def _validate_finish_fields(
+    state: str,
+    boundary_sequence_max: int | None,
+    verified_epoch: int | None,
+) -> None:
+    if state in {"prepared", "not_written", "unresolved"} and (
+        boundary_sequence_max is not None or verified_epoch is not None
+    ):
+        raise ClockCorrectionError("clock correction state fields are invalid")
+    if state == "not_applied" and verified_epoch is not None:
+        raise ClockCorrectionError("clock correction state fields are invalid")
+    if state in {"applied", "resolved"} and (boundary_sequence_max is None or verified_epoch is None):
+        raise ClockCorrectionError("confirmed clock correction has no verified evidence")
+
+
+def _validate_resolved_boundary(
+    correction: ClockCorrection,
+    state: str,
+    boundary_sequence_max: int | None,
+) -> None:
+    if (
+        state == "resolved"
+        and correction.state == "unresolved"
+        and boundary_sequence_max != correction.boundary_sequence_min
+    ):
+        raise ClockCorrectionError("resolved clock correction has an ambiguous boundary")
 
 
 def _integer(value: dict[str, object], key: str) -> int:
@@ -227,4 +384,7 @@ def _number(value: dict[str, object], key: str) -> float:
     item = value.get(key)
     if isinstance(item, bool) or not isinstance(item, int | float):
         raise ValueError(f"{key} is not numeric")
-    return float(item)
+    number = float(item)
+    if not math.isfinite(number):
+        raise ValueError(f"{key} is not finite")
+    return number

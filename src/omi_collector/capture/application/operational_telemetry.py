@@ -71,6 +71,15 @@ class ClockCorrectionSink(Protocol):
         verified_epoch: int | None,
     ) -> object: ...
 
+    def reconcile_observation(
+        self,
+        observed_epoch: int,
+        drift_seconds: float,
+        boundary_sequence_max: int,
+        *,
+        near_zero_threshold: float,
+    ) -> object: ...
+
 
 @dataclass(frozen=True, slots=True)
 class TelemetryClock:
@@ -102,7 +111,7 @@ def system_host_clock_synchronized(timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SEC
             text=True,
             timeout=timeout,
         )
-    except OSError, subprocess.SubprocessError:
+    except (OSError, subprocess.SubprocessError):  # fmt: skip
         return False
     return result.returncode == 0 and result.stdout.strip().lower() == "yes"
 
@@ -262,10 +271,6 @@ async def _sync_clock(sync: _ClockSync) -> None:
         "threshold_seconds": CLOCK_DRIFT_THRESHOLD_SECONDS,
         "boundary_sequence_min": sync.info_before.write_sequence,
     }
-    if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
-        event.update(action="none", outcome="within_threshold")
-        await _emit(emit, event)
-        return
     try:
         trusted = await _run_host_clock_probe(host_clock_synchronized, operation_timeout)
     except Exception:  # noqa: BLE001 - trust is best effort
@@ -273,6 +278,11 @@ async def _sync_clock(sync: _ClockSync) -> None:
     event["host_ntp_synchronized"] = trusted
     if not trusted:
         event.update(action="none", outcome="host_unsynchronized")
+        await _emit(emit, event)
+        return
+    _reconcile_observation(sync, drift, event)
+    if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
+        event.update(action="none", outcome="within_threshold")
         await _emit(emit, event)
         return
     target = int(sync.host_time())
@@ -309,6 +319,25 @@ async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> Ri
     return None
 
 
+def _reconcile_observation(sync: _ClockSync, drift: float, event: dict[str, object]) -> None:
+    sink = sync.correction_sink
+    reconcile = getattr(sink, "reconcile_observation", None) if sink is not None else None
+    if not callable(reconcile) or sync.sample.epoch is None:
+        return
+    try:
+        reconciled = reconcile(
+            sync.sample.epoch,
+            drift,
+            sync.info_before.write_sequence,
+            near_zero_threshold=CLOCK_DRIFT_THRESHOLD_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - unresolved evidence must remain durable
+        event["reconciliation"] = "failed"
+        return
+    if isinstance(reconciled, tuple):
+        event["reconciled_operations"] = len(reconciled)
+
+
 def _prepare_clock_intent(sync: _ClockSync, event: dict[str, object], target: int, drift: float) -> object | None:
     if sync.correction_sink is None:
         event.update(action="none", outcome="intent_unavailable")
@@ -333,18 +362,28 @@ def _finish_clock_intent(
     assert sync.correction_sink is not None
     outcome = event.get("outcome")
     state = (
-        "applied"
+        "resolved"
         if outcome == "verified"
+        and info_after is not None
+        and info_after.write_sequence == sync.info_before.write_sequence
+        else "applied"
+        if outcome == "verified" and info_after is not None
         else "not_applied"
         if outcome in {"time_write_missing", "target_stale"}
         else "unresolved"
     )
     try:
+        boundary_max = (
+            info_after.write_sequence
+            if info_after is not None and state in {"applied", "resolved", "not_applied"}
+            else None
+        )
+        durable_verified_epoch = verified_epoch if state in {"applied", "resolved"} else None
         sync.correction_sink.finish(
             correction,
             state=state,
-            boundary_sequence_max=info_after.write_sequence if info_after is not None else None,
-            verified_epoch=verified_epoch,
+            boundary_sequence_max=boundary_max,
+            verified_epoch=durable_verified_epoch,
         )
     except Exception:  # noqa: BLE001 - prepared state truthfully records uncertainty
         event["outcome"] = "result_persist_failed"

@@ -78,6 +78,13 @@ def _read_rssi_complete(rssi_dbm: int = -47) -> bytes:
     return _packet(0x0E, payload + rssi_dbm.to_bytes(1, "little", signed=True))
 
 
+def test_parser_treats_controller_rssi_sentinel_as_unavailable() -> None:
+    event = parse_hci_packet(_read_rssi_complete(127))
+
+    assert event is not None
+    assert event.rssi_dbm is None  # type: ignore[union-attr]
+
+
 def _connection_update(
     *, status: int = 0, interval: int = 12, latency: int = 0, supervision_timeout: int = 400
 ) -> bytes:

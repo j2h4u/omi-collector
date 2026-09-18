@@ -62,6 +62,7 @@ _LE_DATA_LENGTH_CHANGE = 0x07
 _LE_PHY_UPDATE_COMPLETE = 0x0C
 _LE_READ_PHY_OPCODE = 0x2030
 _READ_RSSI_OPCODE = 0x1405
+_RSSI_UNAVAILABLE = 127
 _RSSI_POLL_SECONDS = 30.0
 _PHY_1M = 0x01
 _PHY_2M = 0x02
@@ -569,10 +570,11 @@ def _parse_read_rssi_complete(params: bytes, packet: bytes, logger: logging.Logg
     if len(params) != _READ_RSSI_PARAMS_BYTES:
         _malformed(packet, "malformed_read_rssi_complete", logger)
         return None
+    rssi_dbm = int.from_bytes(params[3:4], "little", signed=True)
     return _RssiEvent(
         int.from_bytes(params[1:3], "little") & 0x0FFF,
         params[0],
-        int.from_bytes(params[3:4], "little", signed=True),
+        None if rssi_dbm == _RSSI_UNAVAILABLE else rssi_dbm,
     )
 
 
@@ -1017,8 +1019,9 @@ class BleLinkObserver:
             active = self._active
             if active is None or (event.handle is not None and event.handle != active.handle):
                 return
-        self._diagnostic(
+        debug_event(
             "ble_link_rssi_observed",
+            logger=self._debug_logger,
             handle=active.handle,
             status_hex=f"0x{event.status:02x}",
             status_name=_hci_status_name(event.status),

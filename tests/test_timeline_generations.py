@@ -70,7 +70,6 @@ def test_ledger_publishes_only_settled_clock_evidence(tmp_path: Path) -> None:
     (collector / "timeline-repairs.json").write_text(
         json.dumps(
             {
-                "version": 2,
                 "repairs": [
                     {
                         "start_sequence": 10,

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+if (( $# != 0 )); then
+    printf 'Usage: omi-collector-status\n' >&2
+    exit 2
+fi
+
+exec /usr/sbin/runuser --user omi-collector -- \
+    /var/lib/omi-collector-deployments/current/bin/omi-collector \
+    device status --config /srv/pipelines/omi/config.toml --hours 24

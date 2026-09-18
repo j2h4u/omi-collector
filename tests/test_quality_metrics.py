@@ -156,7 +156,11 @@ def test_source_revision_requires_deployment_provided_lowercase_hex(value: str) 
 def test_source_revision_is_read_from_release_metadata(tmp_path: Path) -> None:
     path = tmp_path / "release.json"
     path.write_text(json.dumps({"source_revision": "a" * 40}), encoding="utf-8")
-    assert source_revision_from_release_metadata(path) == "a" * 12
+    revision = source_revision_from_release_metadata(path)
+    assert revision == "a" * 40
+    journal = JsonlQualityMetrics(tmp_path, release_version="1.2.3", source_revision=revision)
+    assert journal.source_revision == "a" * 12
+    assert journal.close()
     assert source_revision_from_release_metadata(tmp_path / "missing.json") is None
 
 

@@ -106,7 +106,7 @@ progress and battery observation, firmware state, published-bundle metrics,
 and the selected recent window from `quality.jsonl`:
 
 ```bash
-uv run omi-collector device status
+sudo -n /usr/local/sbin/omi-collector-status
 ```
 
 Interpret `ok` as a completed transfer with no confirmed loss or terminal

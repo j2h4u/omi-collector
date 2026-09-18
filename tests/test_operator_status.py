@@ -123,6 +123,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "write_sequence": 25,
     }
     assert result["runtime"] == {
+        "attention_reasons": [],
         "battery_observed_at": None,
         "battery_percent": None,
         "firmware": None,
@@ -156,6 +157,39 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "transfer_termination_classes": {"completed": 1, "retryable_error": 1},
         "written_raw_bytes": 4884,
     }
+
+
+def test_status_marks_persistent_runtime_failures_for_attention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    rows = (
+        {"event": "quality_metrics_configuration_error", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
+        {"event": "timeline_generation_blocked", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
+        {
+            "event": "sync_progress",
+            "fields": {
+                "progress": {
+                    "event": "pendant_clock_sync",
+                    "outcome": "intent_persist_failed",
+                    "status": "operational",
+                }
+            },
+            "timestamp": "2026-09-08T09:02:00+00:00",
+        },
+    )
+    layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    assert result["status"] == "attention"
+    runtime = cast(dict[str, object], result["runtime"])
+    assert runtime["attention_reasons"] == [
+        "clock_correction_blocked",
+        "quality_metrics_unavailable",
+        "timeline_publication_blocked",
+    ]
 
 
 def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

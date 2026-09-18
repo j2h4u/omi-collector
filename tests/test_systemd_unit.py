@@ -17,6 +17,8 @@ _UNIT = _ROOT / "systemd" / "omi-collector.service"
 _INSTALLER = _ROOT / "scripts" / "install-systemd-unit.sh"
 _DEPLOYER = _ROOT / "scripts" / "deploy-systemd-service.sh"
 _DEV_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
+_STATUS_COMMAND = _ROOT / "scripts" / "omi-collector-status"
+_STATUS_SUDOERS = _ROOT / "scripts" / "omi-collector-status.sudoers"
 _FEATURE = _ROOT / "features" / "opportunistic_collection.feature"
 _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 
@@ -78,6 +80,7 @@ def test_production_unit_uses_one_config_and_the_selected_release() -> None:
 
     assert service["User"] == "omi-collector"
     assert service["Group"] == "omi-collector"
+    assert service["ExecStartPre"] == "+/usr/bin/bluetoothctl --timeout 10 power on"
     assert "EnvironmentFile" not in service
     assert service["ExecStart"] == (
         "/var/lib/omi-collector-deployments/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml"
@@ -92,6 +95,8 @@ def test_production_unit_uses_one_config_and_the_selected_release() -> None:
     assert service["StateDirectory"] == "omi-collector"
     assert service["AmbientCapabilities"] == "CAP_NET_RAW"
     assert "WorkingDirectory" not in service
+    unit = _unit_sections()["Unit"]
+    assert unit["Requires"] == "bluetooth.service"
 
 
 def test_systemd_material_uses_only_the_fixed_unit_and_release_selector() -> None:
@@ -122,10 +127,23 @@ def test_installer_keeps_the_unit_and_config_targets_fixed() -> None:
     assert "systemd-analyze verify" in installer
     assert "rollback" in installer.lower()
     assert "--root=" not in installer
+    assert "/usr/local/sbin/omi-collector-status" in installer
+    assert "/etc/sudoers.d/omi-collector-status" in installer
+    assert "/usr/sbin/visudo -cf" in installer
+
+
+def test_operator_status_command_has_no_arguments_or_extra_privilege() -> None:
+    command = _STATUS_COMMAND.read_text(encoding="utf-8")
+    policy = _STATUS_SUDOERS.read_text(encoding="utf-8")
+
+    assert "(( $# != 0 ))" in command
+    assert "runuser --user omi-collector" in command
+    assert "device status --config /srv/pipelines/omi/config.toml --hours 24" in command.replace("\\\n", "")
+    assert policy == '%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-status ""\n'
 
 
 def test_shell_scripts_are_syntactically_clean() -> None:
-    scripts = (_INSTALLER, _DEPLOYER, _DEV_DEPLOYER)
+    scripts = (_INSTALLER, _DEPLOYER, _DEV_DEPLOYER, _STATUS_COMMAND)
 
     subprocess.run(("bash", "-n", *(str(script) for script in scripts)), check=True)
     subprocess.run(("shellcheck", *(str(script) for script in scripts)), check=True)

@@ -242,6 +242,7 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
     observation: tuple[datetime, dict[str, object]] | None = None
     battery_observation: tuple[datetime, dict[str, object]] | None = None
     error: tuple[datetime, dict[str, object]] | None = None
+    connection_rssi: tuple[datetime, int] | None = None
     attention: dict[str, bool] = {
         "quality_metrics_unavailable": False,
         "timeline_publication_blocked": False,
@@ -250,6 +251,7 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
     if _path_exists(path, "debug journal"):
         for row in _debug_rows(path):
             _update_runtime_attention(attention, row)
+            connection_rssi = _newest_connection_rssi(connection_rssi, _decode_connection_rssi(row))
             decoded = _decode_sync_progress(row)
             if decoded is None:
                 continue
@@ -275,6 +277,8 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
         "attention_reasons": sorted(reason for reason, active_reason in attention.items() if active_reason),
         "battery_percent": battery.get("battery_percent"),
         "battery_observed_at": _iso(battery_observation[0]) if battery_observation else None,
+        "connection_rssi_dbm": connection_rssi[1] if connection_rssi else None,
+        "connection_rssi_observed_at": _iso(connection_rssi[0]) if connection_rssi else None,
         "firmware": observed.get("firmware"),
         "last_error": _runtime_error(error),
         "state": "transferring" if active else state,
@@ -282,6 +286,30 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
         "updated_age_seconds": max(0, int((now - latest[0]).total_seconds())) if latest else None,
         "transfer": _active_transfer(current) if active else None,
     }
+
+
+def _decode_connection_rssi(row: dict[str, object]) -> tuple[datetime, int] | None:
+    if row.get("event") != "ble_link_rssi_observed":
+        return None
+    fields = row.get("fields")
+    if not isinstance(fields, dict):
+        raise OperatorStatusError("debug RSSI observation has invalid fields")
+    value = fields.get("rssi_dbm")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OperatorStatusError("debug RSSI observation has invalid rssi_dbm")
+    return _timestamp(row, "timestamp"), value
+
+
+def _newest_connection_rssi(
+    current: tuple[datetime, int] | None, candidate: tuple[datetime, int] | None
+) -> tuple[datetime, int] | None:
+    if candidate is None:
+        return current
+    if current is None or candidate[0] > current[0]:
+        return candidate
+    return current
 
 
 def _update_runtime_attention(attention: dict[str, bool], row: dict[str, object]) -> None:

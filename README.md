@@ -157,7 +157,7 @@ publication, and recent transfer/loss evidence,
 run:
 
 ```bash
-/var/lib/omi-collector-deployments/current/bin/omi-collector device status --hours 24
+sudo -n /usr/local/sbin/omi-collector-status
 ```
 
 Interpret `status=ok` as at least one completed transfer in the window with no

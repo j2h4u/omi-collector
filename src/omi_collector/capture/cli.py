@@ -330,16 +330,18 @@ def _quality_metrics(
     staging: StagingStore, config: CollectorConfig, debug_logger: logging.Logger | None = None
 ) -> JsonlQualityMetrics | None:
     """Build auxiliary evidence storage without making capture depend on it."""
-    from .adapters.debug_logging import debug_exception
+    from .adapters.debug_logging import debug_event, debug_exception
 
     try:
-        return JsonlQualityMetrics(
+        metrics = JsonlQualityMetrics(
             staging.paths.root,
             release_version=package_version(),
             source_revision=source_revision_from_release_metadata(),
             config=config.observability.quality_metrics,
             diagnostic_logger=debug_logger,
         )
+        debug_event("quality_metrics_ready", logger=debug_logger)
+        return metrics
     except Exception as error:  # noqa: BLE001 - provenance/journal setup is auxiliary
         debug_exception("quality_metrics_configuration_error", error, logger=debug_logger)
         return None

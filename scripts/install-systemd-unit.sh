@@ -122,33 +122,40 @@ function validate_staged_unit {
     local -r staged_unit="$1" service_name="$2"
 
     # vars
-    local validation_root validation_unit
+    local validation_root validation_unit validation_bluetooth
 
     # code
     validation_root=$(mktemp -d) || die 'could not create staged validation root'
     validation_unit="${validation_root}/${service_name}"
-    if ! sed 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$staged_unit" > "$validation_unit"; then
+    validation_bluetooth="${validation_root}/bluetooth.service"
+    if ! sed -e 's|^ExecStartPre=.*|ExecStartPre=/usr/bin/true|' \
+        -e 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$staged_unit" > "$validation_unit"; then
         rm -rf -- "$validation_root" || true
         die 'could not prepare staged unit for validation'
     fi
-    if ! chown root:root -- "$validation_unit" || ! chmod 0644 -- "$validation_unit"; then
+    printf '[Service]\nExecStart=/usr/bin/true\n' > "$validation_bluetooth" \
+        || die 'could not prepare Bluetooth validation unit'
+    if ! chown root:root -- "$validation_unit" "$validation_bluetooth" \
+        || ! chmod 0644 -- "$validation_unit" "$validation_bluetooth"; then
         rm -rf -- "$validation_root" || true
         die 'could not protect staged validation unit'
     fi
-    if ! systemd-analyze verify "$validation_unit"; then
+    if ! systemd-analyze verify "$validation_bluetooth" "$validation_unit"; then
         rm -rf -- "$validation_root" || true
         die 'systemd unit validation failed'
     fi
     rm -rf -- "$validation_root" || die 'could not remove staged validation root'
 }
 
-declare script_dir repo_root source_unit config_file storage_root unit_target service_name
+declare script_dir repo_root source_unit source_status source_status_sudoers config_file storage_root unit_target service_name
 declare account_user account_group state_dir staged_unit unit_backup
 declare -i restart_requested=0
 
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve installer directory'
 repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
 source_unit="${repo_root}/systemd/omi-collector.service"
+source_status="${repo_root}/scripts/omi-collector-status"
+source_status_sudoers="${repo_root}/scripts/omi-collector-status.sudoers"
 config_file='/srv/pipelines/omi/config.toml'
 storage_root=$(dirname -- "$config_file") || die 'cannot resolve storage root'
 unit_target='/etc/systemd/system/omi-collector.service'
@@ -183,11 +190,17 @@ done
 [[ -f "$source_unit" ]] || die "checked-in systemd unit is missing: ${source_unit}"
 command -v systemd-analyze &> /dev/null || die 'systemd-analyze is required'
 command -v systemctl &> /dev/null || die 'systemctl is required'
+[[ -x /usr/sbin/visudo ]] || die 'visudo is required'
 
 ensure_service_account "$account_user" "$account_group" "$state_dir"
 [[ -d "$storage_root" && ! -L "$storage_root" ]] \
     || die "storage root is missing or unsafe: ${storage_root}"
 validate_operator_config_file "$config_file" "$account_group"
+/usr/sbin/visudo -cf "$source_status_sudoers" || die 'status sudo policy is invalid'
+install -o root -g root -m 0755 -- "$source_status" /usr/local/sbin/omi-collector-status \
+    || die 'could not install operator status command'
+install -o root -g root -m 0440 -- "$source_status_sudoers" /etc/sudoers.d/omi-collector-status \
+    || die 'could not install operator status sudo policy'
 stage_file "$source_unit" "$unit_target" 0644 staged_unit
 validate_staged_unit "$staged_unit" "$service_name"
 backup_target "$unit_target" unit_backup

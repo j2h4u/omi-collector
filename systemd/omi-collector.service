@@ -1,6 +1,6 @@
 [Unit]
 Description=Omi CV1 pendant collector
-Wants=bluetooth.service
+Requires=bluetooth.service
 After=bluetooth.service
 StartLimitIntervalSec=0
 
@@ -9,6 +9,7 @@ Type=exec
 User=omi-collector
 Group=omi-collector
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 XDG_STATE_HOME=/var/lib/omi-collector
+ExecStartPre=+/usr/bin/bluetoothctl --timeout 10 power on
 ExecStart=/var/lib/omi-collector-deployments/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml
 Restart=always
 RestartSec=5s

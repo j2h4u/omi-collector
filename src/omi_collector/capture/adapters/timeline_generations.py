@@ -14,8 +14,6 @@ from uuid import uuid4
 from ..domain.ring_protocol import RECORD_SIZE
 from .bundle_contract import BundleManifest, SealedReceipt
 
-_REPAIR_LEDGER_VERSION = 2
-
 
 class TimelineGenerationError(RuntimeError):
     """A complete, monotonic audio generation could not be proven."""
@@ -102,11 +100,7 @@ def _read_repairs(path: Path) -> tuple[TimeRepair, ...]:
         return ()
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"version", "repairs"}
-            or value["version"] != _REPAIR_LEDGER_VERSION
-        ):
+        if not isinstance(value, dict) or set(value) != {"repairs"}:
             raise ValueError
         rows = value["repairs"]
         if not isinstance(rows, list):

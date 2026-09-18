@@ -223,6 +223,8 @@ def collect_operator_status(
         raise OperatorStatusError(str(error)) from error
     device = _device_status(observations[0]) if observations else None
     window_status = _window_status(quality)
+    if runtime["attention_reasons"]:
+        window_status = "attention"
     return {
         "device": device,
         "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
@@ -240,8 +242,14 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
     observation: tuple[datetime, dict[str, object]] | None = None
     battery_observation: tuple[datetime, dict[str, object]] | None = None
     error: tuple[datetime, dict[str, object]] | None = None
+    attention: dict[str, bool] = {
+        "quality_metrics_unavailable": False,
+        "timeline_publication_blocked": False,
+        "clock_correction_blocked": False,
+    }
     if _path_exists(path, "debug journal"):
         for row in _debug_rows(path):
+            _update_runtime_attention(attention, row)
             decoded = _decode_sync_progress(row)
             if decoded is None:
                 continue
@@ -264,6 +272,7 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
     state = current.get("status", "unknown")
     active = state == "progress"
     return {
+        "attention_reasons": sorted(reason for reason, active_reason in attention.items() if active_reason),
         "battery_percent": battery.get("battery_percent"),
         "battery_observed_at": _iso(battery_observation[0]) if battery_observation else None,
         "firmware": observed.get("firmware"),
@@ -273,6 +282,26 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
         "updated_age_seconds": max(0, int((now - latest[0]).total_seconds())) if latest else None,
         "transfer": _active_transfer(current) if active else None,
     }
+
+
+def _update_runtime_attention(attention: dict[str, bool], row: dict[str, object]) -> None:
+    event = row.get("event")
+    if event == "quality_metrics_configuration_error":
+        attention["quality_metrics_unavailable"] = True
+    elif event == "quality_metrics_ready":
+        attention["quality_metrics_unavailable"] = False
+    elif event == "timeline_generation_blocked":
+        attention["timeline_publication_blocked"] = True
+    elif event == "timeline_generation_published":
+        attention["timeline_publication_blocked"] = False
+    if event != "sync_progress":
+        return
+    fields = row.get("fields")
+    progress = fields.get("progress") if isinstance(fields, dict) else None
+    if not isinstance(progress, dict) or progress.get("event") != "pendant_clock_sync":
+        return
+    outcome = progress.get("outcome")
+    attention["clock_correction_blocked"] = outcome in {"intent_persist_failed", "result_persist_failed"}
 
 
 def _runtime_error(error: tuple[datetime, dict[str, object]] | None) -> dict[str, object] | None:

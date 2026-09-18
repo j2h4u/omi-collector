@@ -202,15 +202,20 @@ def source_revision_from_release_metadata(path: Path | None = None) -> str | Non
     revision = value["source_revision"]
     if not isinstance(revision, str):
         raise ValueError("release source revision is invalid")
-    return normalize_source_revision(revision)
+    _validate_source_revision(revision)
+    return revision
 
 
 def normalize_source_revision(value: str | None) -> str | None:
     if value is None or value == "":
         return None
+    _validate_source_revision(value)
+    return value[:12]
+
+
+def _validate_source_revision(value: str) -> None:
     if _REVISION.fullmatch(value) is None:
         raise ValueError("source revision must be 40 to 64 lowercase hexadecimal characters")
-    return value[:12]
 
 
 def _require_release_version(value: str) -> str:

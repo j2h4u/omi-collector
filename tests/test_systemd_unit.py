@@ -151,16 +151,20 @@ def test_shell_scripts_are_syntactically_clean() -> None:
 
 def test_checked_in_unit_passes_systemd_validation(tmp_path: Path) -> None:
     validation_unit = tmp_path / "omi-collector.service"
+    bluetooth_unit = tmp_path / "bluetooth.service"
     validation_unit.write_text(
-        _UNIT.read_text(encoding="utf-8").replace(
+        _UNIT.read_text(encoding="utf-8")
+        .replace(
             "ExecStart=/var/lib/omi-collector-deployments/current/bin/omi-collector "
             "service --config /srv/pipelines/omi/config.toml",
             "ExecStart=/usr/bin/true",
-        ),
+        )
+        .replace("ExecStartPre=+/usr/bin/bluetoothctl --timeout 10 power on", "ExecStartPre=/usr/bin/true"),
         encoding="utf-8",
     )
+    bluetooth_unit.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
 
-    subprocess.run(("systemd-analyze", "verify", str(validation_unit)), check=True)
+    subprocess.run(("systemd-analyze", "verify", str(bluetooth_unit), str(validation_unit)), check=True)
 
 
 def test_dev_release_deployer_accepts_https_with_readonly_caller_variable() -> None:

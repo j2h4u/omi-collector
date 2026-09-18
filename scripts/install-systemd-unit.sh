@@ -122,20 +122,25 @@ function validate_staged_unit {
     local -r staged_unit="$1" service_name="$2"
 
     # vars
-    local validation_root validation_unit
+    local validation_root validation_unit validation_bluetooth
 
     # code
     validation_root=$(mktemp -d) || die 'could not create staged validation root'
     validation_unit="${validation_root}/${service_name}"
-    if ! sed 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$staged_unit" > "$validation_unit"; then
+    validation_bluetooth="${validation_root}/bluetooth.service"
+    if ! sed -e 's|^ExecStartPre=.*|ExecStartPre=/usr/bin/true|' \
+        -e 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$staged_unit" > "$validation_unit"; then
         rm -rf -- "$validation_root" || true
         die 'could not prepare staged unit for validation'
     fi
-    if ! chown root:root -- "$validation_unit" || ! chmod 0644 -- "$validation_unit"; then
+    printf '[Service]\nExecStart=/usr/bin/true\n' > "$validation_bluetooth" \
+        || die 'could not prepare Bluetooth validation unit'
+    if ! chown root:root -- "$validation_unit" "$validation_bluetooth" \
+        || ! chmod 0644 -- "$validation_unit" "$validation_bluetooth"; then
         rm -rf -- "$validation_root" || true
         die 'could not protect staged validation unit'
     fi
-    if ! systemd-analyze verify "$validation_unit"; then
+    if ! systemd-analyze verify "$validation_bluetooth" "$validation_unit"; then
         rm -rf -- "$validation_root" || true
         die 'systemd unit validation failed'
     fi

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/j2h4u/omi-collector/compare/v0.6.0...v0.6.1) (2026-09-18)
+
+
+### Fixes
+
+* handle unavailable BLE connection RSSI ([#82](https://github.com/j2h4u/omi-collector/issues/82)) ([af72a84](https://github.com/j2h4u/omi-collector/commit/af72a849756746add522c5a23107f8d7efcc3c47))
+
 ## [0.6.0](https://github.com/j2h4u/omi-collector/compare/v0.5.10...v0.6.0) (2026-09-18)
 
 

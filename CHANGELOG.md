@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/j2h4u/omi-collector/compare/v0.6.1...v0.6.2) (2026-09-18)
+
+
+### Fixes
+
+* resume Omi timeline publication ([#84](https://github.com/j2h4u/omi-collector/issues/84)) ([8e9c25f](https://github.com/j2h4u/omi-collector/commit/8e9c25f50e844ecad008e3ea178b73d4a76a5b79))
+
 ## [0.6.1](https://github.com/j2h4u/omi-collector/compare/v0.6.0...v0.6.1) (2026-09-18)
 
 

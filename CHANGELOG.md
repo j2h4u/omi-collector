@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.10](https://github.com/j2h4u/omi-collector/compare/v0.5.9...v0.5.10) (2026-09-18)
+
+
+### Fixes
+
+* restore unattended collector readiness ([4441572](https://github.com/j2h4u/omi-collector/commit/4441572b2606b88f1c2d65ad3bfb7afd5994d763))
+
+
+### Documentation
+
+* add safe pendant operating routine ([#75](https://github.com/j2h4u/omi-collector/issues/75)) ([2d83fa5](https://github.com/j2h4u/omi-collector/commit/2d83fa5d77a4de68eb618a972aa77b0a36ef4f8b))
+* explain Windmill pipeline boundary ([#76](https://github.com/j2h4u/omi-collector/issues/76)) ([55e9924](https://github.com/j2h4u/omi-collector/commit/55e9924aedfc8d82f032d663f99b0bb82bcc8b9f))
+
+
+### Tests
+
+* isolate systemd validation dependencies ([4441572](https://github.com/j2h4u/omi-collector/commit/4441572b2606b88f1c2d65ad3bfb7afd5994d763))
+
 ## [0.5.9](https://github.com/j2h4u/omi-collector/compare/v0.5.8...v0.5.9) (2026-09-16)
 
 

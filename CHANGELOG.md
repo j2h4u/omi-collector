@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/j2h4u/omi-collector/compare/v0.5.10...v0.6.0) (2026-09-18)
+
+
+### Features
+
+* report live BLE connection RSSI ([#80](https://github.com/j2h4u/omi-collector/issues/80)) ([c3704d2](https://github.com/j2h4u/omi-collector/commit/c3704d2693e89d2699c1eb20ab09ead3a7ca6edf))
+
 ## [0.5.10](https://github.com/j2h4u/omi-collector/compare/v0.5.9...v0.5.10) (2026-09-18)
 
 

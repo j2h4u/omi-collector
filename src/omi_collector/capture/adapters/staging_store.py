@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from hashlib import sha256
 from os import fsync, statvfs
 from pathlib import Path
+from threading import get_ident
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
@@ -39,6 +41,14 @@ from .staging_filesystem import (
 )
 
 
+def _lease_owner_token() -> tuple[int, int | None]:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return get_ident(), id(task) if task is not None else None
+
+
 class StagingStore:
     """Stage transport state in spool and publish bundles in capture_root."""
 
@@ -60,6 +70,8 @@ class StagingStore:
         )
         self._validated_attempts: dict[str, StagedAttempt] = {}
         self._publication_root: Path | None = None
+        self._lease_owner: tuple[int, int | None] | None = None
+        self._lease_handoffs: dict[object, tuple[tuple[int, int | None], DeviceLock | None, bool]] = {}
 
     @classmethod
     def from_paths(
@@ -74,19 +86,148 @@ class StagingStore:
         store._filesystem = StagingFilesystem.from_paths(paths, config=config)
         store._validated_attempts = {}
         store._publication_root = publication_root
+        store._lease_owner = None
+        store._lease_handoffs = {}
         return store
 
-    def publish_timeline(self) -> object | None:
+    def publish_timeline(self, held_lease: DeviceLock | None = None) -> object | None:
         """Publish a complete normalized view when this store has an external boundary."""
         if self._publication_root is None:
             return None
+        if not self._has_captured_bundles():
+            return None
+        if held_lease is None:
+            with self.device_lock(recover_capture_temporaries=False):
+                return self._recover_and_publish_unlocked()
+        self._filesystem.require_device_lock(held_lease)
+        return self._recover_and_publish_unlocked()
+
+    def publish_timeline_with_handoff(self, token: object) -> object | None:
+        """Publish through an explicit operation-scoped lease handoff."""
+        if self._publication_root is None or not self._has_captured_bundles():
+            return None
+        with self.handoff_device_lease(token):
+            return self._recover_and_publish_unlocked()
+
+    def recover_and_publish(self, entries: object = (), *, apply: bool = True) -> object | None:
+        """Replay durable clock evidence and publish without a BLE connection."""
+        if self._publication_root is None:
+            return None
+        with self.device_lock(recover_capture_temporaries=False):
+            return self._recover_and_publish_unlocked(entries, apply=apply)
+
+    def _recover_and_publish_unlocked(self, entries: object = (), *, apply: bool = True) -> object:
+        from .clock_recovery import HistoricalClockImporter
+
+        publication_root = self._publication_root
+        if publication_root is None:
+            return None
+        decisions = HistoricalClockImporter(self.device_state_path, self.capture_root).recover(
+            entries,
+            apply=apply,
+            dry_run=not apply,
+        )
+        if not self._has_captured_bundles():
+            return decisions
         from .timeline_generations import publish_from_ledger
 
-        return publish_from_ledger(self.capture_root, self._publication_root, self.paths.root)
+        return publish_from_ledger(self.capture_root, publication_root, self.device_state_path.parent)
+
+    def _has_captured_bundles(self) -> bool:
+        try:
+            return any(self.capture_root.iterdir())
+        except FileNotFoundError:
+            return False
+
+    def recover_clock(self, entries: object = (), *, apply: bool = False) -> tuple[object, ...]:
+        """Validate/apply clock evidence while holding the collector lease."""
+        if self._publication_root is None:
+            return ()
+        publication_root = self._publication_root
+        with self.device_lock(recover_capture_temporaries=False):
+            from .clock_recovery import HistoricalClockImporter
+
+            importer = HistoricalClockImporter(self.device_state_path, self.capture_root)
+            decisions = importer.recover(entries, apply=apply, dry_run=not apply)
+            if apply and self._has_captured_bundles():
+                from .timeline_generations import publish_from_ledger
+
+                publish_from_ledger(self.capture_root, publication_root, self.device_state_path.parent)
+            return decisions
 
     @property
     def capture_root(self) -> Path:
         return self._filesystem.capture_root
+
+    @property
+    def active_device_lease(self) -> DeviceLock | None:
+        """Return a lease only to the task/thread that acquired it."""
+        lease = self._filesystem._active_lease
+        if lease is None or not lease._matches(self._filesystem) or self._lease_owner != _lease_owner_token():
+            return None
+        return lease
+
+    @property
+    def held_device_lease(self) -> DeviceLock | None:
+        """Return only a lease owned by this task/thread."""
+        return self.active_device_lease
+
+    def create_lease_handoff(self) -> object:
+        """Issue an operation-scoped capability for an explicit lease handoff."""
+        token = object()
+        owner = _lease_owner_token()
+        active_lease = self._filesystem._active_lease
+        lease = self.active_device_lease
+        self._lease_handoffs[token] = (owner, lease, active_lease is None)
+        return token
+
+    def _bind_pending_handoff(self) -> None:
+        """Bind the sole unbound operation handoff to this writer's active lease."""
+        active_lease = self._filesystem._active_lease
+        if active_lease is None:
+            return
+        candidates = tuple(
+            token for token, (_owner, lease, can_rebind) in self._lease_handoffs.items() if lease is None and can_rebind
+        )
+        if len(candidates) != 1:
+            return
+        token = candidates[0]
+        owner, _lease, _can_rebind = self._lease_handoffs[token]
+        self._lease_handoffs[token] = (owner, active_lease, False)
+
+    def release_lease_handoff(self, token: object) -> None:
+        """Revoke an operation-scoped lease handoff capability."""
+        self._lease_handoffs.pop(token, None)
+
+    @contextmanager
+    def handoff_device_lease(self, token: object) -> Iterator[DeviceLock]:
+        """Use an explicitly issued operation-scoped lease handoff."""
+        owner = _lease_owner_token()
+        handoff = self._lease_handoffs.get(token)
+        if handoff is None or handoff[0] != owner:
+            raise AttemptStateError("lease handoff belongs to another operation owner")
+        bound_lease = handoff[1]
+        active_lease = self._filesystem._active_lease
+        if bound_lease is not None and active_lease is not bound_lease:
+            self._lease_handoffs[token] = (owner, None, True)
+            bound_lease = None
+        if bound_lease is not None and active_lease is bound_lease and bound_lease._matches(self._filesystem):
+            self._filesystem.require_device_lock(bound_lease)
+            yield bound_lease
+            return
+        with self.device_lock(recover_capture_temporaries=False) as acquired:
+            self._lease_handoffs[token] = (owner, acquired, False)
+            try:
+                yield acquired
+            finally:
+                if self._lease_handoffs.get(token) == (owner, acquired, False):
+                    self._lease_handoffs[token] = (owner, None, True)
+
+    @contextmanager
+    def held_device_lock(self, lease: DeviceLock) -> Iterator[DeviceLock]:
+        """Use an explicitly supplied lease without taking the lock again."""
+        self._filesystem.require_device_lock(lease)
+        yield lease
 
     @property
     def attempts_root(self) -> Path:
@@ -168,6 +309,7 @@ class StagingStore:
         # https://github.com/BasedHardware/omi/blob/6f7c57ac1545c1931c806a01605646405d398198/app/lib/services/wals/ring_storage_sync.dart#L545-L608
         _validate_int(start_sequence, "start_sequence")
         _validate_count(packet_count)
+        self._bind_pending_handoff()
         self._filesystem._preflight(packet_count)
         self._filesystem._ensure_directory(self.attempts_root)
         descriptor = AttemptDescriptor(
@@ -224,6 +366,7 @@ class StagingStore:
         lease.require_active()
         if lease.filesystem is not self._filesystem:
             raise AttemptStateError("resume requires the active spool lock")
+        self._bind_pending_handoff()
         candidates = self.pending_attempts()
         if len(candidates) > 1:
             raise PendingAttemptError("multiple partial attempts block resume")
@@ -258,16 +401,20 @@ class StagingStore:
     ) -> Iterator[DeviceLock]:
         """Acquire the filesystem lease, then sequence publication recovery and quarantine."""
         with self._filesystem.device_lock() as lease:
-            if recover_capture_temporaries:
-                unsafe = publication.recover_capture_temporaries(self._filesystem)
-                for temporary, capture_root, reason in unsafe:
-                    quarantine.quarantine_capture_temporary(
-                        self._filesystem,
-                        temporary,
-                        capture_root,
-                        reason,
-                    )
-            yield lease
+            self._lease_owner = _lease_owner_token()
+            try:
+                if recover_capture_temporaries:
+                    unsafe = publication.recover_capture_temporaries(self._filesystem)
+                    for temporary, capture_root, reason in unsafe:
+                        quarantine.quarantine_capture_temporary(
+                            self._filesystem,
+                            temporary,
+                            capture_root,
+                            reason,
+                        )
+                yield lease
+            finally:
+                self._lease_owner = None
 
     def require_device_lock(self, lease: DeviceLock) -> None:
         """Reject consuming operations that are not protected by this active lease."""

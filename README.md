@@ -307,6 +307,14 @@ timestamp regression as authorized only when it falls within a verified clock
 correction boundary. Recheck both behaviors after every firmware upgrade; a
 new version number alone is not proof that either one was fixed.
 
+Clock observations are retained in a separate immutable evidence ledger. A
+restart replays that ledger and can publish a safe captured prefix without a
+new BLE visit. For an older incident, use `device clock-recover` with a finite
+machine-readable journald JSON export; the importer accepts only one host boot,
+numerically stable realtime/monotonic mapping, valid raw bundle hashes, and an
+unambiguous first record at the correction boundary. `--apply` performs the
+bounded recovery and publication; without it the command is validation-only.
+
 The optional `--force-1m` weak-RF workaround changes controller-wide PHY state.
 It is disabled by default and restores the prior selection after completion,
 failure, cancellation, or recovery. See the

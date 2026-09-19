@@ -22,6 +22,7 @@ def test_intent_is_durable_before_confirmation(tmp_path: Path) -> None:
         json.loads((tmp_path / "clock-corrections" / f"{intent.operation_id}.json").read_text()),
     )
     assert prepared["state"] == "prepared"
+    assert (tmp_path / "clock-corrections" / f"{intent.operation_id}.json").stat().st_mode & 0o777 == 0o600
 
     intent = store.mark_unresolved(intent)
     store.finish(intent, state="applied", boundary_sequence_max=22, verified_epoch=1001)
@@ -156,6 +157,86 @@ def test_later_matching_drift_observation_marks_unresolved_write_not_applied(tmp
     assert reconciled[0].state == "not_applied"
     assert reconciled[0].boundary_sequence_max == 24
     assert reconciled[0].verified_epoch is None
+
+
+def test_causal_observation_reconciles_by_typed_host_interval(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    store.observation_store.native_trusted(
+        observation_id="9" * 32,
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1300,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=intent.operation_id,
+        observation_role="initial",
+    )
+    store.observation_store.native_trusted(
+        observation_id="a" * 32,
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1000,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=intent.operation_id,
+        effective_boundary_sequence=20,
+        observation_role="later",
+    )
+    result = store.replay_observations(near_zero_threshold=5.0)
+    assert result[0].state == "applied"
+    assert store.replay_observations(near_zero_threshold=5.0) == ()
+
+
+def test_causal_observation_allows_ordered_successive_same_boundary_operation(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    first = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20, operation_id="first"))
+    store.finish(first, state="applied", boundary_sequence_max=20, verified_epoch=1000)
+    store.resolve_applied(store.records()[0])
+    second = store.mark_unresolved(store.prepare(1301, 1000, 301.0, 20, operation_id="second"))
+    initial = store.observation_store.native_trusted(
+        observation_id="c" * 32,
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1301,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=second.operation_id,
+        observation_role="initial",
+    )
+    later = store.observation_store.native_trusted(
+        observation_id="d" * 32,
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1001.0,
+        host_realtime_end=1001.0,
+        host_monotonic_start=2.0,
+        host_monotonic_end=2.0,
+        device_epoch=1001,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=second.operation_id,
+        effective_boundary_sequence=20,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+
+    result = store.reconcile_causal_observation(later, near_zero_threshold=5.0)
+
+    assert result[0].operation_id == second.operation_id
+    assert result[0].state == "applied"
 
 
 def test_clock_correction_schema_is_strict(tmp_path: Path) -> None:

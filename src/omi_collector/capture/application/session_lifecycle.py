@@ -13,18 +13,18 @@ import inspect
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, suppress
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, suppress
 from dataclasses import KW_ONLY, dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, RetryConfig
 from ..domain.ring_protocol import RECORD_SIZE, STATUS_STORAGE_NOT_READY, RingInfo, RingStatus, encode_stop_command
 from . import collector
 from .operational_telemetry import (
     ClockCorrectionSink,
+    ClockObservationSink,
     OperationalEmitter,
     TelemetryClock,
-    collect_battery_observation,
     collect_operational_telemetry,
     system_host_clock_synchronized,
 )
@@ -116,6 +116,8 @@ class OpportunisticOptions:
     presence: PresenceSchedulerPort | None = None
     quality_metrics: QualityMetricsPort | None = None
     clock_correction_sink: ClockCorrectionSink | None = None
+    timeline_publisher: Callable[[], object] | None = None
+    clock_lease: Callable[[], AbstractContextManager[object]] | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
 
@@ -387,56 +389,55 @@ class SessionLifecycle:
 
     async def _collect_telemetry(self, session: RingSession, info: RingInfo, phase: SessionPhaseState) -> None:
         options = self.run.options
-        if options.operational is None:
+        if options.operational is None and options.clock_correction_sink is None:
             return
         deadline = asyncio.get_running_loop().time() + options.config.retry.presence_preflight_budget_seconds
         phase.value = "telemetry"
         emitter = _quality_aware_operational_emitter(
-            options.operational, phase.quality, options.quality_metrics, options.host_time
+            options.operational or (lambda _event: None), phase.quality, options.quality_metrics, options.host_time
         )
-        try:
-            await collect_battery_observation(
-                session,
-                info,
-                emitter,
-                operation_timeout=min(
-                    options.config.telemetry.optional_operation_timeout_seconds,
-                    remaining_budget(deadline) / 2,
-                ),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001 - optional telemetry
-            await report_session_error(options.activity, "telemetry", error, self.run.runtime)
         status: object | None = None
         timeout = remaining_budget(deadline)
-        if timeout > 0:
-            try:
-                status = await bounded(session.read_status(), timeout)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - optional telemetry
-                await report_session_error(options.activity, "telemetry", error, self.run.runtime)
         try:
-            timeout = remaining_budget(deadline)
-            if timeout <= 0:
-                return
-            await bounded(
-                collect_operational_telemetry(
-                    session,
-                    status if isinstance(status, RingStatus) else None,
-                    info,
-                    emitter,
-                    clock=TelemetryClock(
-                        options.host_time,
-                        options.host_clock_synchronized or system_host_clock_synchronized,
-                        remaining_budget(deadline),
-                        info_reader=lambda: self._info(session),
-                        correction_sink=options.clock_correction_sink,
+            timeout = max(remaining_budget(deadline), 0.001)
+            # Reserve the latter half of this bounded preflight for status and
+            # metadata after the independent clock stage has completed.
+            operation_timeout = min(options.config.telemetry.optional_operation_timeout_seconds, timeout / 2)
+
+            async def run_telemetry() -> None:
+                await bounded(
+                    collect_operational_telemetry(
+                        session,
+                        status if isinstance(status, RingStatus) else None,
+                        info,
+                        emitter,
+                        clock=TelemetryClock(
+                            options.host_time,
+                            options.host_clock_synchronized or system_host_clock_synchronized,
+                            operation_timeout,
+                            info_reader=lambda: self._info(session),
+                            status_reader=session.read_status if options.operational is not None else None,
+                            correction_sink=options.clock_correction_sink,
+                            observation_sink=cast(
+                                ClockObservationSink | None,
+                                options.clock_correction_sink
+                                if options.clock_correction_sink is not None
+                                and callable(getattr(options.clock_correction_sink, "append", None))
+                                else None,
+                            ),
+                            monotonic=options.clock,
+                            session_id=phase.quality.session_id if phase.quality is not None else "native",
+                            publisher=options.timeline_publisher,
+                        ),
                     ),
-                ),
-                timeout,
-            )
+                    timeout,
+                )
+
+            if options.clock_lease is None:
+                await run_telemetry()
+            else:
+                with options.clock_lease():
+                    await run_telemetry()
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - optional telemetry

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from errno import EXDEV
+from hashlib import sha256
 from json import dumps, loads
 from os import PathLike, fsync
 from pathlib import Path
 from shutil import rmtree
+from threading import Barrier, Thread
 from typing import cast
 
 import pytest
@@ -19,12 +21,19 @@ from omi_collector.capture.adapters.attempts import (
     RecordMismatchError,
     RecordRegressionError,
 )
-from omi_collector.capture.adapters.staging_contract import AttemptStateError
+from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
+from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+from omi_collector.capture.adapters.staging_contract import AttemptStateError, DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.adapters.timeline_generations import GenerationResult, build_generation
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 from omi_collector.config import CollectorConfig, StagingRetentionConfig
+from omi_collector.spool_metrics import collect_spool_metrics
 
 _CAPTURE_ROOTS: set[Path] = set()
+_ACCEPTANCE_FIRST_BOUNDARY = 7_192_026
+_ACCEPTANCE_SECOND_BOUNDARY = 7_717_545
+_ACCEPTANCE_FRONTIER = 7_763_451
 
 
 def _capture_root(tmp_path: Path) -> Path:
@@ -44,6 +53,109 @@ def _record(marker: int) -> bytes:
     return marker.to_bytes(4, "big") + bytes((marker,)) * (RECORD_SIZE - 4)
 
 
+def _one_record_bundle(root: Path, sequence: int, timestamp: int) -> Path:
+    raw = timestamp.to_bytes(4, "big") + b"x" * (RECORD_SIZE - 4)
+    digest = sha256(raw).hexdigest()
+    bundle = root / f"{sequence}-{sequence + 1}-{digest[:16]}"
+    bundle.mkdir(parents=True)
+    (bundle / "records.bin").write_bytes(raw)
+    (bundle / "manifest.json").write_text(
+        dumps(BundleManifest(2, sequence, sequence + 1, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
+    )
+    (bundle / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
+    return bundle
+
+
+def _acceptance_sequences() -> tuple[int, ...]:
+    before = [
+        _ACCEPTANCE_FIRST_BOUNDARY + (_ACCEPTANCE_SECOND_BOUNDARY - _ACCEPTANCE_FIRST_BOUNDARY - 1) * index // 42
+        for index in range(43)
+    ]
+    after = [
+        _ACCEPTANCE_SECOND_BOUNDARY + (_ACCEPTANCE_FRONTIER - _ACCEPTANCE_SECOND_BOUNDARY) * index // 28
+        for index in range(29)
+    ]
+    return tuple(before + after)
+
+
+def _bundle_bytes(root: Path) -> dict[str, bytes]:
+    return {bundle.name: (bundle / "records.bin").read_bytes() for bundle in root.iterdir() if bundle.is_dir()}
+
+
+def _seed_acceptance_clock_state(tmp_path: Path) -> ClockCorrectionStore:
+    (tmp_path / "timeline-repairs.json").write_text(
+        dumps(
+            {
+                "version": 1,
+                "repairs": [
+                    {
+                        "start_sequence": _ACCEPTANCE_FIRST_BOUNDARY,
+                        "next_sequence": _ACCEPTANCE_SECOND_BOUNDARY,
+                        "offset_seconds": -29,
+                        "evidence": "native-clock-operation",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    corrections = ClockCorrectionStore(tmp_path / "device.json")
+    first_operation = corrections.mark_unresolved(corrections.prepare(43, 72, -29.0, _ACCEPTANCE_FIRST_BOUNDARY))
+    corrections.finish(
+        first_operation, state="applied", boundary_sequence_max=_ACCEPTANCE_FIRST_BOUNDARY, verified_epoch=72
+    )
+    second_id = "b" * 32
+    (tmp_path / "clock-corrections").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "clock-corrections" / f"{second_id}.json").write_text(
+        dumps(
+            {
+                "version": 2,
+                "operation_id": second_id,
+                "state": "prepared",
+                "observed_epoch": 43,
+                "target_epoch": 72,
+                "drift_seconds": -29.0,
+                "boundary_sequence_min": _ACCEPTANCE_SECOND_BOUNDARY,
+                "boundary_sequence_max": None,
+                "verified_epoch": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    second_operation = corrections.mark_unresolved(
+        corrections.prepare(43, 72, -29.0, _ACCEPTANCE_SECOND_BOUNDARY, operation_id=second_id)
+    )
+    initial = corrections.observation_store.native_trusted(
+        session_id="restart-session",
+        host_boot_id="boot",
+        host_realtime_start=43.0,
+        host_realtime_end=43.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=43,
+        info_sequence_min=_ACCEPTANCE_SECOND_BOUNDARY,
+        info_sequence_max=_ACCEPTANCE_SECOND_BOUNDARY,
+        operation_id=second_operation.operation_id,
+        observation_role="initial",
+    )
+    corrections.observation_store.native_trusted(
+        session_id="restart-session",
+        host_boot_id="boot",
+        host_realtime_start=72.0,
+        host_realtime_end=72.0,
+        host_monotonic_start=2.0,
+        host_monotonic_end=2.0,
+        device_epoch=72,
+        info_sequence_min=_ACCEPTANCE_SECOND_BOUNDARY,
+        info_sequence_max=_ACCEPTANCE_FRONTIER,
+        operation_id=second_operation.operation_id,
+        effective_boundary_sequence=_ACCEPTANCE_SECOND_BOUNDARY,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+    return corrections
+
+
 def _started_attempt(tmp_path: Path, *, count: int = 2):
     attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
@@ -54,6 +166,177 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
     attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
+
+
+def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_path: Path) -> None:
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path, _capture_root(tmp_path)).paths,
+        publication_root=tmp_path / "published",
+    )
+    correction_store = ClockCorrectionStore(store.device_state_path)
+    correction = correction_store.mark_unresolved(correction_store.prepare(1302, 1002, 300.0, 7717545))
+    initial = correction_store.observation_store.native_trusted(
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1302,
+        info_sequence_min=7717545,
+        info_sequence_max=7717545,
+        operation_id=correction.operation_id,
+        observation_role="initial",
+    )
+    correction_store.observation_store.native_trusted(
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1002.0,
+        host_realtime_end=1002.0,
+        host_monotonic_start=2.0,
+        host_monotonic_end=2.0,
+        device_epoch=1002,
+        info_sequence_min=7717545,
+        info_sequence_max=7717545,
+        operation_id=correction.operation_id,
+        effective_boundary_sequence=7717545,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+
+    result = store.recover_and_publish()
+
+    assert len(cast(tuple[object, ...], result)) == 1
+    assert correction_store.records()[0].state == "applied"
+    assert tuple(store.capture_root.iterdir()) == ()
+
+
+def test_restart_hands_43_published_to_72_captured_bundles_without_ble(tmp_path: Path) -> None:
+    captured = _capture_root(tmp_path)
+    published = tmp_path / "published"
+    sequences = _acceptance_sequences()
+    for sequence in sequences:
+        _one_record_bundle(captured, sequence, 43 if sequence < _ACCEPTANCE_SECOND_BOUNDARY else 72)
+    old_generation = build_generation(captured, published, (), max_sequence=sequences[43])
+    assert old_generation.bundle_count == 43
+    raw_before = _bundle_bytes(captured)
+    corrections = _seed_acceptance_clock_state(tmp_path)
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path, captured).paths,
+        publication_root=published,
+    )
+
+    result = store.recover_and_publish()
+
+    assert isinstance(result, GenerationResult)
+    assert result.bundle_count == 72
+    assert result.record_count == 72
+    assert (published / "current").resolve() == result.path
+    current_bundles = tuple(
+        path for path in (published / "current").iterdir() if path.is_dir() and (path / "manifest.json").is_file()
+    )
+    assert len(current_bundles) == 72
+    assert _bundle_bytes(captured) == raw_before
+    assert sorted(item.boundary_sequence_min for item in corrections.records()) == [
+        _ACCEPTANCE_FIRST_BOUNDARY,
+        _ACCEPTANCE_SECOND_BOUNDARY,
+    ]
+    assert all(item.state == "resolved" for item in corrections.records())
+    later = next(item for item in corrections.observation_store.records() if item.observation_role == "later")
+    assert later.info_sequence_max == _ACCEPTANCE_FRONTIER
+    assert loads((published / "current" / "generation.json").read_text(encoding="utf-8"))["record_count"] == 72
+    second_result = store.recover_and_publish()
+    assert isinstance(second_result, GenerationResult)
+    assert second_result.generation_id == result.generation_id
+    assert collect_spool_metrics(published).current_window.bundle_count == 72
+
+
+def test_background_thread_cannot_borrow_operation_lease(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    token = store.create_lease_handoff()
+    barrier = Barrier(2)
+    observed: dict[str, object] = {}
+
+    with store.device_lock():
+
+        def contend() -> None:
+            barrier.wait()
+            observed["active"] = store.active_device_lease
+            try:
+                with store.handoff_device_lease(token):
+                    observed["handoff"] = "borrowed"
+            except AttemptStateError:
+                observed["handoff"] = "rejected"
+            try:
+                with store.device_lock(recover_capture_temporaries=False):
+                    observed["lock"] = "borrowed"
+            except DeviceAlreadyRunningError:
+                observed["lock"] = "contended"
+
+        thread = Thread(target=contend)
+        thread.start()
+        barrier.wait()
+        thread.join()
+
+    store.release_lease_handoff(token)
+    assert observed == {"active": None, "handoff": "rejected", "lock": "contended"}
+
+
+def test_lease_handoff_does_not_adopt_foreign_active_lease(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    barrier = Barrier(2)
+
+    def hold_foreign_lease() -> None:
+        with store.device_lock(recover_capture_temporaries=False):
+            barrier.wait()
+            barrier.wait()
+
+    thread = Thread(target=hold_foreign_lease)
+    thread.start()
+    barrier.wait()
+    token = store.create_lease_handoff()
+    try:
+        with pytest.raises(DeviceAlreadyRunningError), store.handoff_device_lease(token):
+            pass
+    finally:
+        store.release_lease_handoff(token)
+        barrier.wait()
+        thread.join()
+
+
+def test_preissued_handoff_rejects_lease_acquired_by_foreign_thread(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    token = store.create_lease_handoff()
+    barrier = Barrier(2)
+
+    def hold_foreign_lease() -> None:
+        with store.device_lock(recover_capture_temporaries=False):
+            barrier.wait()
+            barrier.wait()
+
+    thread = Thread(target=hold_foreign_lease)
+    thread.start()
+    barrier.wait()
+    try:
+        with pytest.raises(DeviceAlreadyRunningError), store.handoff_device_lease(token):
+            pass
+    finally:
+        store.release_lease_handoff(token)
+        barrier.wait()
+        thread.join()
+
+
+def test_handoff_token_can_acquire_two_sequential_leases(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    token = store.create_lease_handoff()
+
+    try:
+        with store.handoff_device_lease(token) as first, store.handoff_device_lease(token) as nested_first:
+            assert nested_first is first
+        with store.handoff_device_lease(token) as second, store.handoff_device_lease(token) as nested_second:
+            assert nested_second is second
+    finally:
+        store.release_lease_handoff(token)
 
 
 def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:

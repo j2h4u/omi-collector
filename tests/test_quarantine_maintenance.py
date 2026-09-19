@@ -227,6 +227,32 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
     assert (bundles[0] / "records.bin").read_bytes() == expected
 
 
+def test_failed_clock_publication_does_not_gate_ble_and_retries_locally(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        attempts: list[int] = []
+
+        def recover_and_publish() -> None:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise OSError("transient local publication failure")
+
+        store.recover_and_publish = recover_and_publish  # type: ignore[method-assign]
+        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.001,)))
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
+
+        await maintenance.ensure_publication_ready()
+        first_return = len(attempts)
+        await asyncio.sleep(0.01)
+
+        assert first_return == len(config.retry.rapid_backoff) + 1
+        assert len(attempts) >= 3
+
+    _run(scenario())
+
+
 def test_quarantine_retry_cooldown_does_not_block_terminal_sweeps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

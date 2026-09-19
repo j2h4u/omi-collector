@@ -70,6 +70,9 @@ app.add_typer(config, name="config")
 collect_spool_metrics: object | None = None
 collect_operator_status: object | None = None
 
+_SYSTEMD_SERVICE_START_MESSAGE_ID = "7d4958e842da4a758f6c1cdc7b36dcc5"
+_CLOCK_JOURNAL_UNIT = "omi-collector.service"
+
 
 def _systemd_service_status(unit: str = "omi-collector.service") -> dict[str, object]:
     """Read the local supervisor state without requiring journal access."""
@@ -328,6 +331,145 @@ def service(
         err=True,
     )
     _sync(loaded, staging, force_1m=False, log_level=SyncLogLevel.INFO)
+
+
+def _clock_journal_entries(path: Path | None, *, lines: int) -> list[dict[str, object]]:
+    """Read JSON or JSONL, or obtain a bounded JSONL export from journald."""
+    return [
+        row
+        for candidate in _clock_journal_records(_clock_journal_text(path, lines=lines))
+        if (row := _normalize_clock_row(candidate)) is not None
+    ]
+
+
+def _clock_journal_text(path: Path | None, *, lines: int) -> str:
+    if path is not None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise ValueError(f"cannot read journal export: {path}") from error
+    try:
+        completed = subprocess.run(
+            (
+                "journalctl",
+                f"--unit={_CLOCK_JOURNAL_UNIT}",
+                "--output=json",
+                "--no-pager",
+                f"--lines={lines}",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(f"journal extractor failed: {type(error).__name__}") from error
+    if completed.returncode != 0:
+        raise ValueError(completed.stderr.strip() or "journal extractor failed")
+    return completed.stdout
+
+
+def _clock_journal_records(text: str) -> list[object]:
+    stripped = text.lstrip()
+    if stripped.startswith("["):
+        try:
+            decoded = cast(object, json.loads(text))
+        except json.JSONDecodeError as error:
+            raise ValueError("journal export is invalid JSON") from error
+        if not isinstance(decoded, list):
+            raise ValueError("journal export must be a JSON array or JSONL")
+        return cast(list[object], decoded)
+    records: list[object] = []
+    for line in text.splitlines():
+        if line.strip():
+            try:
+                records.append(cast(object, json.loads(line)))
+            except json.JSONDecodeError as error:
+                raise ValueError("journal export contains invalid JSONL") from error
+    return records
+
+
+def _normalize_clock_row(candidate: object) -> dict[str, object] | None:
+    if not isinstance(candidate, dict):
+        return None
+    row = dict(candidate)
+    message = row.get("MESSAGE")
+    if isinstance(message, str):
+        try:
+            decoded_message = cast(object, json.loads(message))
+        except json.JSONDecodeError:
+            decoded_message = None
+        if isinstance(decoded_message, dict):
+            row.update(decoded_message)
+    if "device_epoch" not in row and "device_time_epoch" in row:
+        row["device_epoch"] = row["device_time_epoch"]
+    invocation = row.get("INVOCATION_ID", row.get("_SYSTEMD_INVOCATION_ID"))
+    if isinstance(invocation, str) and invocation:
+        row.setdefault("INVOCATION_ID", invocation)
+        row.setdefault("_SYSTEMD_INVOCATION_ID", invocation)
+    for key in ("__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP"):
+        if isinstance(row.get(key), str):
+            row[key] = _journal_number(cast(str, row[key]))
+    required = {"_BOOT_ID", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP", "device_epoch", "write_sequence"}
+    if required.issubset(row):
+        return row
+    return row if _is_systemd_start_anchor(row) else None
+
+
+def _is_systemd_start_anchor(row: Mapping[str, object]) -> bool:
+    """Keep only structured systemd ``Starting`` records as pre-start anchors."""
+    if row.get("MESSAGE_ID") != _SYSTEMD_SERVICE_START_MESSAGE_ID:
+        return False
+    if row.get("UNIT") != _CLOCK_JOURNAL_UNIT:
+        return False
+    if row.get("SYSLOG_IDENTIFIER") != "systemd":
+        return False
+    invocation = row.get("INVOCATION_ID", row.get("_SYSTEMD_INVOCATION_ID"))
+    required = {"_BOOT_ID", "_SOURCE_REALTIME_TIMESTAMP", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP"}
+    return required.issubset(row) and isinstance(invocation, str) and bool(invocation)
+
+
+def _journal_number(value: str) -> float | int:
+    try:
+        number = int(value)
+    except ValueError:
+        return float(value)
+    return number
+
+
+def _decision_as_dict(decision: object) -> dict[str, object]:
+    """Render the stable historical-recovery decision contract for JSON."""
+    return {
+        name: getattr(decision, name)
+        for name in ("operation_id", "state", "boundary_sequence", "observation_id", "reason")
+    }
+
+
+@device.command("clock-recover")
+def device_clock_recover(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
+    journal_json: Annotated[
+        Path | None, typer.Option("--journal-json", help="Finite journald JSON or JSONL export.")
+    ] = None,
+    journal_lines: Annotated[
+        int, typer.Option("--journal-lines", min=1, max=10000, help="Maximum records read from systemd journal.")
+    ] = 1000,
+    apply: Annotated[bool, typer.Option("--apply", help="Apply only an unambiguous recovery and publish.")] = False,
+) -> None:
+    """Validate or apply bounded historical clock evidence without BLE."""
+    loaded = _load_config(config_path)
+    staging = _staging(loaded)
+    try:
+        entries = _clock_journal_entries(journal_json, lines=journal_lines)
+        decisions = staging.recover_clock(entries, apply=apply)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(
+        json.dumps(
+            {"apply": apply, "decisions": [_decision_as_dict(decision) for decision in decisions]}, sort_keys=True
+        )
+    )
 
 
 @device.command("phy-check")

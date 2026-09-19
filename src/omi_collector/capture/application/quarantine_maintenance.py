@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -65,11 +66,17 @@ class QuarantineMaintenance:
         self._maintenance_not_before = 0.0
         self._quarantine_retry_not_before = 0.0
         self._quarantine_retry_number = 0
+        self._publication_retry_not_before = 0.0
+        self._publication_retry_number = 0
+        self._publication_retry_handle: asyncio.TimerHandle | None = None
+        self._publication_retry_task: asyncio.Task[bool] | None = None
 
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
         if self._startup_state is not None:
             return self._startup_state
+
+        await self._recover_and_publish()
 
         try:
             pending = await self._pending_descriptor()
@@ -93,9 +100,75 @@ class QuarantineMaintenance:
                 state = PendingStartupState(None, None)
             else:
                 state = PendingStartupState(pending, durable_next)
+                await self._recover_and_publish()
 
         self._startup_state = state
         return state
+
+    async def _recover_and_publish(self) -> bool:
+        recover = getattr(self._staging, "recover_and_publish", None)
+        if not callable(recover):
+            return True
+        if self._publication_retry_not_before > monotonic():
+            self._schedule_publication_retry()
+            return False
+        # A local publication can lose a short race with another filesystem
+        # operation. Retry only this bounded local step before any BLE provider
+        # is opened; capture must not be used as an implicit publication retry.
+        backoff = self._config.retry.rapid_backoff
+        for attempt in range(len(backoff) + 1):
+            try:
+                await asyncio.to_thread(recover)
+                self._publication_retry_number = 0
+                self._publication_retry_not_before = 0.0
+                return True
+            except Exception as error:  # noqa: BLE001 - publication cannot block capture
+                self._runtime.debug_exception("timeline_generation_blocked", error, attempt=attempt + 1)
+                if attempt >= len(backoff):
+                    retry = backoff[-1] if backoff else 1.0
+                    self._publication_retry_not_before = monotonic() + retry
+                    self._publication_retry_number += 1
+                    self._schedule_publication_retry()
+                    return False
+                await asyncio.sleep(backoff[attempt])
+        return False
+
+    async def ensure_publication_ready(self) -> None:
+        """Run one bounded local recovery attempt without blocking BLE forever."""
+        await self._recover_and_publish()
+
+    def _schedule_publication_retry(self) -> None:
+        if self._publication_retry_handle is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        delay = max(self._publication_retry_not_before - monotonic(), 0.0)
+        self._publication_retry_handle = loop.call_later(delay, self._start_publication_retry)
+
+    def _start_publication_retry(self) -> None:
+        self._publication_retry_handle = None
+        task = asyncio.create_task(self._recover_and_publish())
+        self._publication_retry_task = task
+        task.add_done_callback(self._consume_publication_retry)
+
+    def _consume_publication_retry(self, task: asyncio.Task[bool]) -> None:
+        if self._publication_retry_task is task:
+            self._publication_retry_task = None
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    async def close(self) -> None:
+        """Cancel and join local publication retry work before loop shutdown."""
+        if self._publication_retry_handle is not None:
+            self._publication_retry_handle.cancel()
+            self._publication_retry_handle = None
+        task = self._publication_retry_task
+        self._publication_retry_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def run_once(self, should_defer: Callable[[], bool]) -> None:
         """Run one cooperative terminal sweep and quarantine salvage pass."""
@@ -156,6 +229,7 @@ class QuarantineMaintenance:
         """Move a discontinuous source aside without diagnostic metadata."""
         await asyncio.to_thread(self._staging.quarantine_attempt_source, attempt_id)
         await report_activity(self._activity, "evidence_quarantined")
+        await self._recover_and_publish()
 
     async def wait_for_presence_attempt(
         self,
@@ -180,6 +254,9 @@ class QuarantineMaintenance:
             done, _ = await asyncio.wait({presence_task, maintenance_task}, return_when=asyncio.FIRST_COMPLETED)
             if presence_task in done:
                 wake = presence_task.result()
+                # A scanner wake is not permission to open BLE while local
+                # clock publication is still retrying.
+                await self.ensure_publication_ready()
                 permit_returned = True
                 defer_requested.set()
                 await asyncio.shield(maintenance_task)
@@ -295,6 +372,7 @@ class QuarantineMaintenance:
             deduplicated=publication.deduplicated,
         )
         await report_activity(self._activity, "prefix_published")
+        await self._recover_and_publish()
         return True
 
     async def _mark_quarantine(
@@ -327,3 +405,4 @@ class QuarantineMaintenance:
                 raise original_error
             raise OpportunisticSyncError("unable to quarantine blocking evidence")
         await report_activity(self._activity, "evidence_quarantined")
+        await self._recover_and_publish()

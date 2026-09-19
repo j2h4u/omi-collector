@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -58,7 +59,7 @@ class _Run:
     maintenance: QuarantineMaintenance
 
 
-async def run_opportunistic_collector(
+async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams are explicit
     provider: SessionProvider,
     staging: StagingPort,
     options: OpportunisticOptions,
@@ -88,6 +89,17 @@ async def run_opportunistic_collector(
             options,
             clock_correction_sink=cast(ClockCorrectionSink, runtime.make_clock_correction_sink(staging)),
         )
+    lease_factory = getattr(staging, "device_lock", None)
+    handoff_token, handoff_lease_factory, release_handoff = _operation_handoff(staging)
+    options = _configure_timeline_publisher(options, staging, handoff_token)
+    if options.clock_lease is None and callable(lease_factory):
+
+        def clock_lease() -> object:
+            if handoff_token is not None and handoff_lease_factory is not None:
+                return handoff_lease_factory(handoff_token)
+            return lease_factory(recover_capture_temporaries=False)
+
+        options = replace(options, clock_lease=clock_lease)
     observation_writer = runtime.make_observation_writer(
         staging, options.config.firmware_observations, report_observation_error
     )
@@ -126,7 +138,38 @@ async def run_opportunistic_collector(
             try:
                 await _close_observation_writer(run, unwinding=unwinding)
             finally:
-                _close_quality_metrics(run)
+                try:
+                    await maintenance.close()
+                finally:
+                    _close_quality_metrics(run)
+                    if handoff_token is not None and release_handoff is not None:
+                        release_handoff(handoff_token)
+
+
+def _operation_handoff(
+    staging: object,
+) -> tuple[object | None, Callable[[object], object] | None, Callable[[object], object] | None]:
+    create = getattr(staging, "create_lease_handoff", None)
+    if not callable(create):
+        return None, None, None
+    token = create()
+    handoff = getattr(staging, "handoff_device_lease", None)
+    release = getattr(staging, "release_lease_handoff", None)
+    return token, handoff if callable(handoff) else None, release if callable(release) else None
+
+
+def _configure_timeline_publisher(
+    options: OpportunisticOptions, staging: object, handoff_token: object | None
+) -> OpportunisticOptions:
+    if options.timeline_publisher is not None:
+        return options
+    publisher = getattr(staging, "publish_timeline", None)
+    if not callable(publisher):
+        return options
+    handoff_publisher = getattr(staging, "publish_timeline_with_handoff", None)
+    if handoff_token is not None and callable(handoff_publisher):
+        return replace(options, timeline_publisher=lambda: handoff_publisher(handoff_token))
+    return replace(options, timeline_publisher=publisher)
 
 
 def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLifecycle:
@@ -149,8 +192,12 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
     async def post_session_checkpoint() -> None:
         await reconciler.checkpoint_after_session()
 
+    async def before_direct_attempt() -> None:
+        await run.maintenance.ensure_publication_ready()
+        await run.maintenance.run_once(lambda: False)
+
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=lambda: run.maintenance.run_once(lambda: False),
+        before_direct_attempt=before_direct_attempt,
         wait_presence_attempt=wait_presence_attempt,
         connected_step=reconciler.connected_step,
         post_session_checkpoint=post_session_checkpoint,

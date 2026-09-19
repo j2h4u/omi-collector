@@ -45,19 +45,21 @@ class GenerationResult:
 def publish_from_ledger(captured_root: Path, publication_root: Path, collector_root: Path) -> GenerationResult:
     """Publish from the durable repair ledger only when clock evidence is settled."""
     repairs = _read_repairs(collector_root / "timeline-repairs.json")
-    _require_settled_clock_operations(collector_root / "clock-corrections", captured_root, repairs)
-    return build_generation(captured_root, publication_root, repairs)
+    safe_prefix = _require_settled_clock_operations(collector_root / "clock-corrections", captured_root, repairs)
+    return build_generation(captured_root, publication_root, repairs, max_sequence=safe_prefix)
 
 
 def build_generation(
     captured_root: Path,
     publication_root: Path,
     repairs: tuple[TimeRepair, ...],
+    *,
+    max_sequence: int | None = None,
 ) -> GenerationResult:
     """Rebuild every bundle, validate the chain, and switch one symlink."""
-    bundles = _bundles(captured_root)
+    bundles = _bundles(captured_root, max_sequence=max_sequence)
     _validate_repairs(repairs)
-    identity = _generation_identity(bundles, repairs)
+    identity = _generation_identity(bundles, repairs, max_sequence)
     generations = publication_root / ".generations"
     generations.mkdir(mode=0o750, parents=True, exist_ok=True)
     destination = generations / identity
@@ -65,7 +67,7 @@ def build_generation(
         temporary = generations / f".{identity}.{uuid4().hex}.tmp"
         temporary.mkdir(mode=0o750)
         try:
-            records, _ = _write_bundles(temporary, bundles, repairs)
+            records, _ = _write_bundles(temporary, bundles, repairs, max_sequence=max_sequence)
             _write_generation_manifest(temporary, identity, bundles, repairs, records)
             _sync_tree(temporary)
             temporary.rename(destination)
@@ -74,7 +76,7 @@ def build_generation(
             shutil.rmtree(temporary, ignore_errors=True)
             raise
     else:
-        records = _append_generation(destination, identity, bundles, repairs)
+        records = _append_generation(destination, identity, bundles, repairs, max_sequence=max_sequence)
     _switch_current(publication_root, destination)
     return GenerationResult(destination, len(bundles), records, identity)
 
@@ -83,9 +85,9 @@ def _require_settled_clock_operations(
     root: Path,
     captured_root: Path,
     repairs: tuple[TimeRepair, ...],
-) -> None:
+) -> int | None:
     if not root.exists():
-        return
+        return None
     store = ClockCorrectionStore(root.parent / "device-state.json")
     try:
         store.recover_prepared()
@@ -99,20 +101,24 @@ def _require_settled_clock_operations(
             if isinstance(value, dict) and value.get("state") in {"prepared", "unresolved"}:
                 raise TimelineGenerationError("clock correction evidence is unresolved") from error
         raise TimelineGenerationError("clock correction evidence is invalid") from error
-    unresolved = tuple(
-        operation for operation in operations if operation.state in {"prepared", "unresolved", "applied"}
-    )
-    if any(operation.state in {"prepared", "unresolved"} for operation in unresolved):
-        raise TimelineGenerationError("clock correction evidence is unresolved")
+    unresolved = tuple(operation for operation in operations if operation.state in {"unresolved", "applied"})
+    pending = tuple(operation for operation in unresolved if operation.state == "unresolved")
+    if len(pending) > 1:
+        raise TimelineGenerationError("multiple unresolved clock corrections are ambiguous")
     applied = tuple(operation for operation in unresolved if operation.state == "applied")
-    if not applied:
-        return
-    _validate_applied_operations(captured_root, repairs, applied)
-    try:
-        for operation in applied:
-            store.resolve_applied(operation)
-    except ClockCorrectionError as error:
-        raise TimelineGenerationError("clock correction evidence is not durable") from error
+    if applied:
+        _validate_applied_operations(
+            captured_root,
+            repairs,
+            applied,
+            max_sequence=pending[0].boundary_sequence_min if pending else None,
+        )
+        try:
+            for operation in applied:
+                store.resolve_applied(operation)
+        except ClockCorrectionError as error:
+            raise TimelineGenerationError("clock correction evidence is not durable") from error
+    return pending[0].boundary_sequence_min if pending else None
 
 
 def _read_repairs(path: Path) -> tuple[TimeRepair, ...]:
@@ -153,10 +159,12 @@ def _validate_applied_operations(
     captured_root: Path,
     repairs: tuple[TimeRepair, ...],
     operations: tuple[ClockCorrection, ...],
+    *,
+    max_sequence: int | None = None,
 ) -> None:
     """Prove every applied operation against immutable raw records before resolving it."""
     _validate_repairs(repairs)
-    timestamps = _normalized_timestamps(captured_root, repairs)
+    timestamps = _normalized_timestamps(captured_root, repairs, max_sequence=max_sequence)
     for operation in operations:
         boundary_max = operation.boundary_sequence_max
         if (
@@ -186,8 +194,10 @@ def _validate_applied_operations(
             previous = timestamp
 
 
-def _normalized_timestamps(captured_root: Path, repairs: tuple[TimeRepair, ...]) -> dict[int, int]:
-    bundles = _bundles(captured_root)
+def _normalized_timestamps(
+    captured_root: Path, repairs: tuple[TimeRepair, ...], *, max_sequence: int | None = None
+) -> dict[int, int]:
+    bundles = _bundles(captured_root, max_sequence=max_sequence)
     timestamps: dict[int, int] = {}
     previous: int | None = None
     for source, manifest in bundles:
@@ -196,6 +206,8 @@ def _normalized_timestamps(captured_root: Path, repairs: tuple[TimeRepair, ...])
             raise TimelineGenerationError("captured bundle does not match its manifest")
         for index in range(manifest.record_count):
             sequence = manifest.start_sequence + index
+            if max_sequence is not None and sequence >= max_sequence:
+                break
             position = index * RECORD_SIZE
             raw_timestamp = int.from_bytes(raw[position : position + 4], "big")
             timestamp = raw_timestamp - _repair_offset(sequence, repairs)
@@ -220,6 +232,8 @@ def _append_generation(
     identity: str,
     captured: tuple[tuple[Path, BundleManifest], ...],
     repairs: tuple[TimeRepair, ...],
+    *,
+    max_sequence: int | None = None,
 ) -> int:
     existing, records, previous = _validate_existing_generation(destination, identity)
     if len(existing) > len(captured):
@@ -227,20 +241,24 @@ def _append_generation(
     validation_previous: int | None = None
     for index, (output_path, output_manifest) in enumerate(existing):
         source_path, source_manifest = captured[index]
+        expected_next = _bounded_next(source_manifest, max_sequence)
         if (output_manifest.start_sequence, output_manifest.next_sequence) != (
             source_manifest.start_sequence,
-            source_manifest.next_sequence,
+            expected_next,
         ):
             raise TimelineGenerationError("existing generation source order conflicts")
         raw = (source_path / "records.bin").read_bytes()
-        normalized, validation_previous = _normalize(raw, source_manifest.start_sequence, repairs, validation_previous)
+        count = expected_next - source_manifest.start_sequence
+        normalized, validation_previous = _normalize(
+            raw[: count * RECORD_SIZE], source_manifest.start_sequence, repairs, validation_previous
+        )
         if sha256(normalized).hexdigest() != output_manifest.raw_sha256:
             raise TimelineGenerationError("existing generation normalization conflicts")
         if sha256((output_path / "records.bin").read_bytes()).hexdigest() != output_manifest.raw_sha256:
             raise TimelineGenerationError("existing generation bundle is invalid")
     remaining = captured[len(existing) :]
     if remaining:
-        added, _ = _write_bundles(destination, remaining, repairs, previous)
+        added, _ = _write_bundles(destination, remaining, repairs, previous, max_sequence=max_sequence)
         records += added
     _replace_generation_manifest(destination, identity, captured, repairs, records)
     return records
@@ -282,15 +300,19 @@ def _replace_generation_manifest(
     _sync_directory(root)
 
 
-def _bundles(root: Path) -> tuple[tuple[Path, BundleManifest], ...]:
+def _bundles(root: Path, *, max_sequence: int | None = None) -> tuple[tuple[Path, BundleManifest], ...]:
     found: list[tuple[Path, BundleManifest]] = []
     for path in root.iterdir():
         if path.name.startswith(".") or path.is_symlink() or not path.is_dir():
+            continue
+        if _suffix_is_beyond_frontier(path, max_sequence):
             continue
         try:
             manifest = BundleManifest.from_json(cast(object, json.loads((path / "manifest.json").read_text())))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise TimelineGenerationError("captured bundle manifest is invalid") from error
+        if max_sequence is not None and manifest.start_sequence >= max_sequence:
+            continue
         found.append((path, manifest))
     found.sort(key=lambda item: item[1].start_sequence)
     previous = None
@@ -303,6 +325,16 @@ def _bundles(root: Path) -> tuple[tuple[Path, BundleManifest], ...]:
     return tuple(found)
 
 
+def _suffix_is_beyond_frontier(path: Path, max_sequence: int | None) -> bool:
+    """Skip a wholly unsafe suffix before reading its possibly partial manifest."""
+    if max_sequence is None:
+        return False
+    try:
+        return int(path.name.split("-", 1)[0]) >= max_sequence
+    except ValueError:
+        return False
+
+
 def _validate_repairs(repairs: tuple[TimeRepair, ...]) -> None:
     previous = -1
     for repair in sorted(repairs, key=lambda item: item.start_sequence):
@@ -311,12 +343,18 @@ def _validate_repairs(repairs: tuple[TimeRepair, ...]) -> None:
         previous = repair.next_sequence
 
 
-def _generation_identity(bundles: tuple[tuple[Path, BundleManifest], ...], repairs: tuple[TimeRepair, ...]) -> str:
+def _generation_identity(
+    bundles: tuple[tuple[Path, BundleManifest], ...], repairs: tuple[TimeRepair, ...], max_sequence: int | None = None
+) -> str:
     del bundles
-    evidence = {
+    evidence: dict[str, object] = {
         "algorithm": 2,
         "repairs": [asdict(repair) for repair in repairs],
     }
+    # Preserve the historical full-generation identity.  A bounded prefix is
+    # a different publication and therefore carries its explicit frontier.
+    if max_sequence is not None:
+        evidence["max_sequence"] = max_sequence
     return sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -325,22 +363,30 @@ def _write_bundles(
     bundles: tuple[tuple[Path, BundleManifest], ...],
     repairs: tuple[TimeRepair, ...],
     previous_timestamp: int | None = None,
+    *,
+    max_sequence: int | None = None,
 ) -> tuple[int, int]:
     total = 0
     for source, manifest in bundles:
         raw = (source / "records.bin").read_bytes()
         if sha256(raw).hexdigest() != manifest.raw_sha256 or len(raw) != manifest.record_count * RECORD_SIZE:
             raise TimelineGenerationError("captured bundle does not match its manifest")
+        if max_sequence is not None and manifest.start_sequence >= max_sequence:
+            continue
+        count = manifest.record_count
+        if max_sequence is not None:
+            count = min(count, max_sequence - manifest.start_sequence)
+            raw = raw[: count * RECORD_SIZE]
         normalized, previous_timestamp = _normalize(raw, manifest.start_sequence, repairs, previous_timestamp)
         digest = sha256(normalized).hexdigest()
-        target = destination / f"{manifest.start_sequence}-{manifest.next_sequence}-{digest[:16]}"
+        target = destination / f"{manifest.start_sequence}-{manifest.start_sequence + count}-{digest[:16]}"
         temporary = destination / f".{target.name}.{uuid4().hex}.tmp"
         temporary.mkdir(mode=0o750)
         output_manifest = BundleManifest(
             2,
             manifest.start_sequence,
-            manifest.next_sequence,
-            manifest.record_count,
+            manifest.start_sequence + count,
+            count,
             RECORD_SIZE,
             digest,
         )
@@ -351,9 +397,15 @@ def _write_bundles(
         _sync_directory(temporary)
         temporary.rename(target)
         _sync_directory(destination)
-        total += manifest.record_count
+        total += count
     assert previous_timestamp is not None
     return total, previous_timestamp
+
+
+def _bounded_next(manifest: BundleManifest, max_sequence: int | None) -> int:
+    if max_sequence is None:
+        return manifest.next_sequence
+    return min(manifest.next_sequence, max_sequence)
 
 
 def _normalize(

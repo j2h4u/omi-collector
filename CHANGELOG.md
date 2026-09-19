@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/j2h4u/omi-collector/compare/v0.6.2...v0.6.3) (2026-09-19)
+
+
+### Fixes
+
+* recover Omi timeline without reconnect ([#86](https://github.com/j2h4u/omi-collector/issues/86)) ([e1ededb](https://github.com/j2h4u/omi-collector/commit/e1ededb72f2805c15eb62f0ed0101d8fcdec77a3))
+
 ## [0.6.2](https://github.com/j2h4u/omi-collector/compare/v0.6.1...v0.6.2) (2026-09-18)
 
 

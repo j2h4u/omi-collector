@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.4](https://github.com/j2h4u/omi-collector/compare/v0.6.3...v0.6.4) (2026-09-20)
+
+
+### Fixes
+
+* select clock incident from full journal ([#88](https://github.com/j2h4u/omi-collector/issues/88)) ([dabff97](https://github.com/j2h4u/omi-collector/commit/dabff97fd6b5b74a56da14ea81b119b00efbc840))
+
 ## [0.6.3](https://github.com/j2h4u/omi-collector/compare/v0.6.2...v0.6.3) (2026-09-19)
 
 

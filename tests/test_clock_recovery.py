@@ -242,6 +242,198 @@ def test_historical_dry_run_preserves_device_epoch_and_raw_scale_shift(tmp_path:
     assert not (collector / "clock-observations").exists()
 
 
+def test_historical_recovery_selects_one_causal_triple_from_noisy_journal(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    captured.mkdir()
+    _bundle(captured, 7_717_545, (1_789_749_898,))
+    collector = tmp_path / "collector"
+    collector.mkdir()
+    store = ClockCorrectionStore(collector / "device.json")
+    operation = store.mark_unresolved(store.prepare(1_789_749_943, 1_789_749_500, 438.890716, 7_717_545))
+
+    anchor_realtime = 1_789_749_487.155169
+    initial_realtime = 1_789_749_504.123796
+    initial_monotonic = 92_278.957131
+    rows: list[dict[str, object]] = [
+        {
+            "boot_id": "real-boot",
+            "invocation_id": "f89",
+            "realtime": anchor_realtime,
+            "monotonic": 92_261.988504,
+            "event": "systemd_start",
+            "_SOURCE_REALTIME_TIMESTAMP": 1_789_749_487_155_169,
+        }
+    ]
+    rows.extend(
+        {
+            "boot_id": f"unrelated-boot-{index}",
+            "invocation_id": f"unrelated-invocation-{index}",
+            "realtime": 1_789_700_000.0 + index,
+            "monotonic": 1_000.0 + index,
+            "event": "systemd_start",
+            "_SOURCE_REALTIME_TIMESTAMP": int((1_789_700_000.0 + index) * 1_000_000),
+        }
+        for index in range(18)
+    )
+    rows.extend(
+        {
+            "boot_id": "other-boot",
+            "realtime": 1_789_800_000.0 + index,
+            "monotonic": 2_000.0 + index,
+            "device_epoch": 1_789_800_000 + index,
+            "event": "pendant_observation",
+            "write_sequence": 8_000_000 + index,
+        }
+        for index in range(21)
+    )
+    rows.extend(
+        [
+            {
+                "boot_id": "real-boot",
+                "invocation_id": "f89",
+                "realtime": initial_realtime - 1.0,
+                "monotonic": initial_monotonic - 1.0,
+                "device_epoch": 1_789_743_078,
+                "event": "pendant_observation",
+                "write_sequence": 7_717_545,
+            },
+            {
+                "boot_id": "real-boot",
+                "invocation_id": "f89",
+                "realtime": initial_realtime,
+                "monotonic": initial_monotonic,
+                "device_epoch": 1_789_749_943,
+                "event": "pendant_observation",
+                "write_sequence": 7_717_545,
+            },
+        ]
+    )
+    rows.extend(
+        {
+            "boot_id": "real-boot",
+            "invocation_id": "f89",
+            "realtime": initial_realtime + index,
+            "monotonic": initial_monotonic + index,
+            "device_epoch": int(initial_realtime + index),
+            "event": "pendant_observation",
+            "write_sequence": 7_717_545 + index,
+        }
+        for index in range(1, 26)
+    )
+    assert len(rows) == 67
+
+    decision = HistoricalClockImporter(collector / "device.json", captured).recover(rows, apply=True)[0]
+
+    assert decision.operation_id == operation.operation_id
+    assert decision.state == "applied"
+    assert decision.boundary_sequence == 7_717_545
+    assert store.records()[0].verified_epoch == int(initial_realtime + 1)
+    source = next((collector / "clock-imports").glob("*.json"))
+    imported = cast(dict[str, object], json.loads(source.read_text()))
+    assert len(cast(list[object], imported["entries"])) == 3
+
+
+def test_historical_recovery_rejects_conflicting_earliest_later_observations(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    captured.mkdir()
+    _bundle(captured, 10, (1000,))
+    collector = tmp_path / "collector"
+    collector.mkdir()
+    store = ClockCorrectionStore(collector / "device.json")
+    store.mark_unresolved(store.prepare(1045, 1000, 45.0, 10))
+
+    with pytest.raises(HistoricalRecoveryError, match="ambiguous causally later"):
+        HistoricalClockImporter(collector / "device.json", captured).recover(
+            [
+                {
+                    "boot_id": "boot",
+                    "invocation_id": "invocation",
+                    "realtime": 999.0,
+                    "monotonic": 9.0,
+                    "event": "systemd_start",
+                    "_SOURCE_REALTIME_TIMESTAMP": 999_000_000,
+                },
+                {
+                    "boot_id": "boot",
+                    "invocation_id": "invocation",
+                    "realtime": 1000.0,
+                    "monotonic": 10.0,
+                    "device_epoch": 1045,
+                    "event": "pendant_observation",
+                    "write_sequence": 10,
+                },
+                {
+                    "boot_id": "boot",
+                    "realtime": 1001.0,
+                    "monotonic": 11.0,
+                    "device_epoch": 1001,
+                    "event": "pendant_observation",
+                    "write_sequence": 11,
+                },
+                {
+                    "boot_id": "boot",
+                    "realtime": 1002.0,
+                    "monotonic": 11.0,
+                    "device_epoch": 1002,
+                    "event": "pendant_observation",
+                    "write_sequence": 12,
+                },
+            ],
+            dry_run=True,
+        )
+
+
+def test_historical_recovery_does_not_skip_earliest_monotonic_mapping_break(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    captured.mkdir()
+    _bundle(captured, 10, (1000,))
+    collector = tmp_path / "collector"
+    collector.mkdir()
+    store = ClockCorrectionStore(collector / "device.json")
+    store.mark_unresolved(store.prepare(1045, 1000, 45.0, 10))
+
+    with pytest.raises(HistoricalRecoveryError, match="realtime-minus-monotonic"):
+        HistoricalClockImporter(collector / "device.json", captured).recover(
+            [
+                {
+                    "boot_id": "boot",
+                    "invocation_id": "invocation",
+                    "realtime": 999.0,
+                    "monotonic": 9.0,
+                    "event": "systemd_start",
+                    "_SOURCE_REALTIME_TIMESTAMP": 999_000_000,
+                },
+                {
+                    "boot_id": "boot",
+                    "invocation_id": "invocation",
+                    "realtime": 1000.0,
+                    "monotonic": 10.0,
+                    "device_epoch": 1045,
+                    "event": "pendant_observation",
+                    "write_sequence": 10,
+                },
+                {
+                    "boot_id": "boot",
+                    "realtime": 999.0,
+                    "monotonic": 11.0,
+                    "device_epoch": 999,
+                    "event": "pendant_observation",
+                    "write_sequence": 11,
+                },
+                {
+                    "boot_id": "boot",
+                    "realtime": 1002.0,
+                    "monotonic": 12.0,
+                    "device_epoch": 1002,
+                    "event": "pendant_observation",
+                    "write_sequence": 12,
+                },
+            ],
+            apply=True,
+        )
+    assert store.records()[0].state == "unresolved"
+
+
 def test_real_incident_applies_boundary_without_late_raw_frontier(tmp_path: Path) -> None:
     captured = tmp_path / "captured"
     captured.mkdir()

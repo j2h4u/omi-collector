@@ -437,11 +437,7 @@ def _validate_mapping(entries: tuple[_Entry, ...], tolerance: float) -> None:
 def _prepare_incident(
     entries: tuple[_Entry, ...], operation: ClockCorrection, captured_root: Path
 ) -> tuple[_Entry, ...]:
-    if not any(item.role == "initial" for item in entries):
-        candidates = tuple(item for item in entries if item.sequence == operation.boundary_sequence_min)
-        if len(candidates) == 1:
-            initial = candidates[0]
-            entries = tuple(replace(item, role="initial") if item is initial else item for item in entries)
+    entries = _select_incident(entries, operation)
     initial = next((item for item in entries if item.role == "initial"), None)
     if initial is not None:
         entries = tuple(
@@ -449,6 +445,92 @@ def _prepare_incident(
             for item in entries
         )
     return tuple(_prepare_incident_entry(item, operation, captured_root) for item in entries)
+
+
+def _select_incident(entries: tuple[_Entry, ...], operation: ClockCorrection) -> tuple[_Entry, ...]:
+    """Select one typed causal incident before binding rows to an operation."""
+    initial = _select_initial(entries, operation)
+    anchor = _select_anchor(entries, initial)
+    later = _select_later(entries, initial)
+    selected = (initial, later) if anchor is None else (anchor, initial, later)
+    return tuple(replace(item, role="initial") if item is initial else item for item in selected)
+
+
+def _select_initial(entries: tuple[_Entry, ...], operation: ClockCorrection) -> _Entry:
+    candidates = tuple(item for item in entries if _matches_initial_identity(item, operation))
+    if len(candidates) != 1:
+        raise HistoricalRecoveryError("incident requires one operation-matching initial observation")
+    return candidates[0]
+
+
+def _matches_initial_identity(item: _Entry, operation: ClockCorrection) -> bool:
+    if item.role == "anchor" or item.sequence != operation.boundary_sequence_min:
+        return False
+    if item.role == "initial" and item.device_epoch == 0:
+        return True
+    return item.device_epoch == operation.observed_epoch and math.isclose(
+        item.device_epoch - item.realtime,
+        operation.drift_seconds,
+        rel_tol=0.0,
+        abs_tol=1.0,
+    )
+
+
+def _select_anchor(entries: tuple[_Entry, ...], initial: _Entry) -> _Entry | None:
+    anchors = tuple(item for item in entries if item.role == "anchor")
+    if not anchors:
+        return None
+    matching = tuple(item for item in anchors if _matches_anchor_lineage(item, initial))
+    if len(matching) != 1:
+        raise HistoricalRecoveryError("incident requires one matching systemd start anchor")
+    return matching[0]
+
+
+def _select_later(entries: tuple[_Entry, ...], initial: _Entry) -> _Entry:
+    candidates = tuple(item for item in entries if _matches_later_lineage(item, initial))
+    if not candidates:
+        raise HistoricalRecoveryError("incident requires one causally later observation")
+    earliest_monotonic = min(item.monotonic for item in candidates)
+    earliest = tuple(item for item in candidates if item.monotonic == earliest_monotonic)
+    if len({_later_identity(item) for item in earliest}) != 1:
+        raise HistoricalRecoveryError("incident has ambiguous causally later observations")
+    return min(earliest, key=lambda item: (item.sequence, item.realtime, item.source_hash))
+
+
+def _matches_later_lineage(item: _Entry, initial: _Entry) -> bool:
+    return (
+        item.role == "later"
+        and item.boot_id == initial.boot_id
+        and item.sequence > initial.sequence
+        and item.monotonic > initial.monotonic
+    )
+
+
+def _matches_anchor_lineage(anchor: _Entry, initial: _Entry) -> bool:
+    return bool(
+        anchor.boot_id == initial.boot_id
+        and anchor.invocation_id is not None
+        and anchor.invocation_id == initial.invocation_id
+        and anchor.source_realtime is not None
+        and anchor.source_realtime < initial.realtime
+        and anchor.realtime < initial.realtime
+    )
+
+
+def _later_identity(item: _Entry) -> tuple[object, ...]:
+    return (
+        item.boot_id,
+        item.realtime,
+        item.monotonic,
+        item.device_epoch,
+        item.sequence,
+        item.raw_timestamp,
+        item.raw_timestamp_hash,
+        item.operation_id,
+        item.event,
+        item.invocation_id,
+        item.source_realtime,
+    )
 
 
 def _prepare_incident_entry(item: _Entry, operation: ClockCorrection, captured_root: Path) -> _Entry:

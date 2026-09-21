@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.5](https://github.com/j2h4u/omi-collector/compare/v0.6.4...v0.6.5) (2026-09-21)
+
+
+### Fixes
+
+* create publication files with final mode ([6b37987](https://github.com/j2h4u/omi-collector/commit/6b37987ca6c668fda2066d9f793dcfbd7c8a3828))
+* keep collector alive during local contention ([6b37987](https://github.com/j2h4u/omi-collector/commit/6b37987ca6c668fda2066d9f793dcfbd7c8a3828))
+* keep new publication files private until sealed ([6b37987](https://github.com/j2h4u/omi-collector/commit/6b37987ca6c668fda2066d9f793dcfbd7c8a3828))
+
 ## [0.6.4](https://github.com/j2h4u/omi-collector/compare/v0.6.3...v0.6.4) (2026-09-20)
 
 

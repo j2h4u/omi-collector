@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.6](https://github.com/j2h4u/omi-collector/compare/v0.6.5...v0.6.6) (2026-09-21)
+
+
+### Fixes
+
+* repair existing publication ownership ([e56e61a](https://github.com/j2h4u/omi-collector/commit/e56e61a009328a5f23fea600fc2ce5abeb44d79a))
+
+
+### Tests
+
+* synchronize local contention recovery ([e56e61a](https://github.com/j2h4u/omi-collector/commit/e56e61a009328a5f23fea600fc2ce5abeb44d79a))
+
 ## [0.6.5](https://github.com/j2h4u/omi-collector/compare/v0.6.4...v0.6.5) (2026-09-21)
 
 

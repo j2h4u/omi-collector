@@ -247,7 +247,7 @@ class SessionLifecycle:
             await report_session_error(self.run.options.activity, "connect", error, self.run.runtime)
             if isinstance(error, CandidateUnavailableError):
                 return None, "candidate_unavailable"
-            if not retryable(error):
+            if not _retryable_for_runtime(error, self.run.runtime):
                 await report_activity(self.run.options.activity, "fatal")
                 raise
             return None, "retry"
@@ -334,7 +334,7 @@ class SessionLifecycle:
         metrics = self.run.options.quality_metrics
         if metrics is None or not quality.attempted_read:
             return
-        termination_class, terminal_outcome = _quality_terminal(outcome, teardown_error, error)
+        termination_class, terminal_outcome = _quality_terminal(outcome, teardown_error, error, self.run.runtime)
         try:
             metric = TransferSessionMetric(
                 utc_timestamp(self.run.options.host_time()),
@@ -500,11 +500,16 @@ def _record_clock_correction(
         return
 
 
-def _quality_terminal(outcome: str | None, teardown_error: bool, error: BaseException | None) -> tuple[str, str]:
+def _quality_terminal(
+    outcome: str | None,
+    teardown_error: bool,
+    error: BaseException | None,
+    runtime: CaptureRuntimePort,
+) -> tuple[str, str]:
     if isinstance(error, asyncio.CancelledError):
         return "cancelled", "cancelled"
     if error is not None:
-        return ("retryable_error" if retryable(error) else "fatal_error"), "failed"
+        return ("retryable_error" if _retryable_for_runtime(error, runtime) else "fatal_error"), "failed"
     if teardown_error:
         return "teardown_interrupted", "connected_interrupted"
     if outcome in {"drained", "collected"}:
@@ -520,7 +525,7 @@ async def recoverable_session_outcome(
     runtime: CaptureRuntimePort,
 ) -> str:
     await report_session_error(options.activity, phase, error, runtime)
-    outcome = session_retry_outcome(error, session is not None)
+    outcome = session_retry_outcome(error, session is not None, is_device_busy=runtime.is_device_busy_error)
     if outcome is None:
         await report_activity(options.activity, "fatal")
         raise error
@@ -543,7 +548,7 @@ async def teardown_was_interrupted(
         raise
     except BaseException as error:
         await report_session_error(activity, "teardown", error, runtime)
-        if retryable(error):
+        if _retryable_for_runtime(error, runtime):
             return True
         if primary is None:
             await report_activity(activity, "fatal")
@@ -558,8 +563,13 @@ async def stop_after_interruption(session: RingSession, timeout: float) -> None:
         await bounded(session.write_control(encode_stop_command()), timeout)
 
 
-def session_retry_outcome(error: BaseException, connected: bool) -> str | None:
-    if not retryable(error):
+def session_retry_outcome(
+    error: BaseException,
+    connected: bool,
+    *,
+    is_device_busy: Callable[[BaseException], bool] | None = None,
+) -> str | None:
+    if not _retryable(error, is_device_busy=is_device_busy):
         return None
     if isinstance(error, CandidateUnavailableError):
         return "candidate_unavailable"
@@ -580,10 +590,25 @@ def presence_attempt_outcome(outcome: str, durable_progress: bool) -> AttemptOut
 
 
 def retryable(error: BaseException) -> bool:
+    """Classify backend and protocol failures that are safe to retry."""
+    return _retryable(error)
+
+
+def _retryable_for_runtime(error: BaseException, runtime: CaptureRuntimePort) -> bool:
+    return _retryable(error, is_device_busy=runtime.is_device_busy_error)
+
+
+def _retryable(
+    error: BaseException,
+    *,
+    is_device_busy: Callable[[BaseException], bool] | None = None,
+) -> bool:
+    if is_device_busy is not None and is_device_busy(error):
+        return True
     if isinstance(error, collector.RingAcknowledgementError):
         return error.status == STATUS_STORAGE_NOT_READY
     if isinstance(error, collector.TransferInterruptedError) and error.__cause__ is not None:
-        return retryable(error.__cause__)
+        return _retryable(error.__cause__, is_device_busy=is_device_busy)
     return isinstance(
         error,
         (

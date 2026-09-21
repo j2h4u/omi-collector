@@ -8,6 +8,8 @@ from typing import Never, cast
 
 import pytest
 
+from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.application.collector import NoDataResult, TransferTimeouts
 from omi_collector.capture.application.ports import CaptureRuntimePort
 from omi_collector.capture.application.presence import (
@@ -91,6 +93,64 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
 
     _run(scenario())
     assert events == ["connected", "teardown", "checkpoint"]
+
+
+def test_held_clock_lease_is_a_retryable_session_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    info = RingInfo(10, 10, 100, 0, 512)
+    activity: list[object] = []
+
+    class BusyLease:
+        def __enter__(self) -> object:
+            raise DeviceAlreadyRunningError("collector lock is held")
+
+        def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    class Context:
+        async def __aenter__(self) -> RingSession:
+            return cast(RingSession, object())
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    async def connected_step(
+        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        return "drained", current
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    options = OpportunisticOptions(
+        TransferTimeouts(1, 1),
+        RetryPolicy(backoff=(1,), stop_after_drained=True),
+        activity=activity.append,
+        operational=lambda _event: None,
+        clock_lease=lambda: BusyLease(),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: Context(),
+        options=options,
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+
+    async def scenario() -> None:
+        monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+        await SessionLifecycle(run).run_session(Context())
+
+    _run(scenario())
+    assert [getattr(event, "state", None) for event in activity] == ["session_error"]
+    assert getattr(activity[0], "phase", None) == "telemetry"
 
 
 def test_connected_step_cancellation_identity_reaches_context_exit(monkeypatch: pytest.MonkeyPatch) -> None:

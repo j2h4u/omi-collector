@@ -19,8 +19,8 @@ from typer.testing import CliRunner
 
 from fakes import ScriptedRingSession, WriteStep
 from omi_collector.capture import cli as device_cli
+from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.collector import CollectionResult, ProgressEvent
 from omi_collector.capture.application.presence import PresenceScheduler
@@ -646,7 +646,15 @@ def test_collect_does_not_read_while_sync_writer_holds_the_device_lock(
         ),
     )
     contender = ScriptedRingSession(RingStatus(0, 0, 0, 1), (WriteStep(b"\x10", (_info_notification(10, 11),)),))
-    sessions = [session, contender]
+    recovered = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            WriteStep(b"\x10", (_info_notification(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_read_begin(10, 1), _data(_record(10)), _done(11))),
+        ),
+    )
+    sessions = [session, contender, recovered]
+    busy = asyncio.Event()
 
     class BlockingTransport:
         async def __aenter__(self) -> RingSession:
@@ -666,19 +674,33 @@ def test_collect_does_not_read_while_sync_writer_holds_the_device_lock(
     monkeypatch.setattr(device_cli, "make_transport", make_blocking_transport)
     monkeypatch.setattr(device_cli, "make_guard", tracked_guard)
 
+    original_debug_exception = OpportunisticRuntime.debug_exception
+
+    def observe_busy(runtime: OpportunisticRuntime, event: str, error: BaseException, **fields: object) -> None:
+        if event == "session_error" and fields.get("phase") == "read/reconcile":
+            busy.set()
+        original_debug_exception(runtime, event, error, **fields)
+
+    monkeypatch.setattr(OpportunisticRuntime, "debug_exception", observe_busy)
+
     async def contend() -> None:
         syncing = asyncio.create_task(device_cli.sync("AA:BB", "hci0", _store(tmp_path)))
         await entered.wait()
-        with pytest.raises(DeviceAlreadyRunningError):
-            await device_cli.collect("AA:BB", "hci0", _store(tmp_path), 1)
+        collecting = asyncio.create_task(device_cli.collect("AA:BB", "hci0", _store(tmp_path), 1))
+        await busy.wait()
+        assert encode_read_command(10, 1) not in contender.writes
+        assert encode_advance_command(11) not in contender.writes
         syncing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await syncing
+        result = await collecting
+        assert isinstance(result, CollectionResult)
 
     asyncio.run(contend())
-    assert calls == 2
-    assert guards == ["guard-enter", "guard-exit"]
-    assert contender.writes == [b"\x10"]
+    assert calls == 3
+    assert guards == ["guard-enter", "guard-exit"] * 2
+    assert encode_read_command(10, 1) not in contender.writes
+    assert encode_advance_command(11) not in contender.writes
     assert session.writes == [b"\x10", encode_read_command(10, 1), encode_stop_command()]
 
 

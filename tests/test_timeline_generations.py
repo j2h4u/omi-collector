@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 from hashlib import sha256
 from pathlib import Path
+from stat import S_IMODE
+from types import SimpleNamespace
 
 import pytest
 
+from omi_collector.capture.adapters import timeline_generations
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.timeline_generations import (
@@ -48,6 +52,200 @@ def test_generation_repairs_epoch_and_atomically_exposes_ordinary_bundles(tmp_pa
         raw = (bundle / "records.bin").read_bytes()
         timestamps.extend(int.from_bytes(raw[index : index + 4], "big") for index in range(0, len(raw), RECORD_SIZE))
     assert timestamps == [1000, 1001, 1002, 1003]
+
+
+def test_root_recovery_assigns_service_identity_before_service_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    published.mkdir(mode=0o750)
+    _bundle(captured, 10, (1000,), "a" * 32)
+
+    service_uid, service_gid = 4242, 4343
+    chown_calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(timeline_generations.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        timeline_generations.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=service_uid, pw_gid=service_gid),
+    )
+    monkeypatch.setattr(
+        timeline_generations.grp,
+        "getgrnam",
+        lambda _name: SimpleNamespace(gr_gid=service_gid),
+    )
+
+    def record_chown(_descriptor: int, uid: int, gid: int) -> None:
+        chown_calls.append((uid, gid))
+
+    monkeypatch.setattr(timeline_generations.os, "fchown", record_chown)
+
+    result = build_generation(captured, published, ())
+
+    generations = published / ".generations"
+    assert S_IMODE(generations.stat().st_mode) == 0o750
+    assert S_IMODE(result.path.stat().st_mode) == 0o750
+    assert chown_calls
+    assert all((uid, gid) == (service_uid, service_gid) for uid, gid in chown_calls)
+
+    _bundle(captured, 11, (1001,), "b" * 32)
+    appended = build_generation(captured, published, ())
+
+    assert appended.path == result.path
+    assert appended.bundle_count == 2
+    assert appended.record_count == 2
+    assert len(chown_calls) >= 5
+    assert S_IMODE(result.path.stat().st_mode) == 0o750
+
+
+def test_root_recovery_tree_is_service_readable_for_later_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    service_uid, service_gid = os.getuid(), os.getgid()
+    _bundle(captured, 10, (1000,), "a" * 32)
+
+    monkeypatch.setattr(timeline_generations.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        timeline_generations.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=service_uid, pw_gid=service_gid),
+    )
+    monkeypatch.setattr(
+        timeline_generations.grp,
+        "getgrnam",
+        lambda _name: SimpleNamespace(gr_gid=service_gid),
+    )
+
+    result = build_generation(captured, published, ())
+    bundle = next(path for path in result.path.iterdir() if path.is_dir())
+    assert (result.path.stat().st_uid, result.path.stat().st_gid) == (service_uid, service_gid)
+    assert S_IMODE(bundle.stat().st_mode) == 0o750
+    assert (bundle.stat().st_uid, bundle.stat().st_gid) == (service_uid, service_gid)
+    for path in (*bundle.iterdir(), result.path / "generation.json"):
+        assert S_IMODE(path.stat().st_mode) == 0o640
+        assert (path.stat().st_uid, path.stat().st_gid) == (service_uid, service_gid)
+    assert os.access(result.path / "generation.json", os.R_OK)
+
+    _bundle(captured, 11, (1001,), "b" * 32)
+    appended = build_generation(captured, published, ())
+
+    assert appended.path == result.path
+    assert appended.bundle_count == 2
+    assert appended.record_count == 2
+    assert os.access(appended.path / "generation.json", os.R_OK)
+
+
+def test_generation_repair_rejects_symlinked_generations_without_mutating_target(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    sentinel = tmp_path / "sentinel"
+    _bundle(captured, 10, (1000,), "a" * 32)
+    published.mkdir(mode=0o750)
+    sentinel.mkdir(mode=0o711)
+    before = sentinel.stat()
+    (published / ".generations").symlink_to(sentinel, target_is_directory=True)
+
+    with pytest.raises(TimelineGenerationError, match="service-writable"):
+        build_generation(captured, published, ())
+
+    after = sentinel.stat()
+    assert S_IMODE(after.st_mode) == S_IMODE(before.st_mode)
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+
+
+def test_existing_generation_repair_rejects_symlink_without_mutating_target(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    sentinel = tmp_path / "sentinel"
+    _bundle(captured, 10, (1000,), "a" * 32)
+    initial = build_generation(captured, published, ())
+    initial.path.rename(sentinel)
+    sentinel.chmod(0o711)
+    before = sentinel.stat()
+    initial.path.symlink_to(sentinel, target_is_directory=True)
+
+    with pytest.raises(TimelineGenerationError, match="service-writable"):
+        build_generation(captured, published, ())
+
+    after = sentinel.stat()
+    assert S_IMODE(after.st_mode) == S_IMODE(before.st_mode)
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+
+
+def test_post_repair_generations_swap_cannot_escape_to_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    sentinel = tmp_path / "sentinel"
+    displaced = tmp_path / "generations-original"
+    _bundle(captured, 10, (1000,), "a" * 32)
+    sentinel.mkdir(mode=0o711)
+    before = sentinel.stat()
+
+    real_prepare = timeline_generations._prepare_generation_directory
+    swapped = False
+
+    def swap_after_repair(path: Path, service_uid: int, service_gid: int) -> None:
+        nonlocal swapped
+        real_prepare(path, service_uid, service_gid)
+        if not swapped and path.name.startswith(".") and path.name.endswith(".tmp"):
+            swapped = True
+            (published / ".generations").rename(displaced)
+            (published / ".generations").symlink_to(sentinel, target_is_directory=True)
+
+    monkeypatch.setattr(timeline_generations, "_prepare_generation_directory", swap_after_repair)
+
+    with pytest.raises(TimelineGenerationError, match="was replaced"):
+        build_generation(captured, published, ())
+
+    after = sentinel.stat()
+    assert swapped
+    assert S_IMODE(after.st_mode) == S_IMODE(before.st_mode)
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+    assert not (sentinel / "current").exists()
+    assert tuple(sentinel.iterdir()) == ()
+
+
+def test_inner_bundle_temp_swap_cannot_write_or_publish_to_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    sentinel = tmp_path / "sentinel"
+    displaced = tmp_path / "inner-original"
+    _bundle(captured, 10, (1000,), "a" * 32)
+    sentinel.mkdir(mode=0o711)
+    before = sentinel.stat()
+
+    real_open_at = timeline_generations._open_directory_at
+    swapped = False
+
+    def swap_after_inner_temp_open(parent: int, name: str) -> int:
+        nonlocal swapped
+        descriptor = real_open_at(parent, name)
+        if not swapped and name.startswith(".") and name.endswith(".tmp"):
+            swapped = True
+            temporary = timeline_generations._descriptor_path(parent) / name
+            temporary.rename(displaced)
+            temporary.symlink_to(sentinel, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(timeline_generations, "_open_directory_at", swap_after_inner_temp_open)
+
+    with pytest.raises(TimelineGenerationError, match="bundle temporary directory was replaced"):
+        build_generation(captured, published, ())
+
+    after = sentinel.stat()
+    assert swapped
+    assert S_IMODE(after.st_mode) == S_IMODE(before.st_mode)
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+    assert tuple(sentinel.iterdir()) == ()
+    assert not (published / "current").exists()
 
 
 def test_generation_never_exposes_a_regressing_candidate(tmp_path: Path) -> None:

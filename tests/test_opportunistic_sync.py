@@ -23,7 +23,7 @@ from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterF
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError, DurablePrefix
+from omi_collector.capture.adapters.staging_contract import DurablePrefix
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application import batch_reconciliation
@@ -2745,6 +2745,7 @@ async def test_default_arena_budget_admits_a_full_pendant_snapshot_without_alloc
 @_async_test
 async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_path: Path) -> None:
     entered = asyncio.Event()
+    busy_reported = asyncio.Event()
 
     class BlockingReadSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -2760,19 +2761,54 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
         ),
     )
     second = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 11),)),))
+    recovered = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_advance_command(11), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(11, 11),)),
+        ),
+    )
+    activity: list[ActivityEvent] = []
+
+    async def report(event: ActivityEvent) -> None:
+        activity.append(event)
+        if (
+            event.state == "session_error"
+            and event.phase == "read/reconcile"
+            and event.error_type == "DeviceAlreadyRunningError"
+        ):
+            busy_reported.set()
+
     task = asyncio.create_task(
         run_opportunistic_collector(
             Provider([first]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     )
     await entered.wait()
-    with pytest.raises(DeviceAlreadyRunningError):
-        await run_opportunistic_collector(
-            Provider([second]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
+    contender = asyncio.create_task(
+        run_opportunistic_collector(
+            Provider([second, recovered]),
+            StagingStore(tmp_path, _capture_root(tmp_path)),
+            replace(_options(batch_records=1), activity=report),
         )
+    )
+    await busy_reported.wait()
+    assert second.writes == [b"\x10"]
     task.cancel()
     with pytest.raises(CollectionPreservedCancelledError):
         await task
+    result = await contender
+    assert isinstance(result, CollectionResult)
+    assert recovered.writes == [
+        b"\x10",
+        encode_read_command(10, 1),
+        b"\x10",
+        encode_advance_command(11),
+        b"\x10",
+    ]
 
 
 @_async_test

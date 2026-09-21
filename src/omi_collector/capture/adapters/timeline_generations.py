@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import grp
 import json
 import os
+import pwd
 import shutil
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
+from stat import S_ISDIR, S_ISLNK
 from typing import cast
 from uuid import uuid4
 
@@ -42,6 +46,25 @@ class GenerationResult:
     generation_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _GenerationBuild:
+    temporary: Path
+    destination: Path
+    generations_descriptor: int
+    bundles: tuple[tuple[Path, BundleManifest], ...]
+    repairs: tuple[TimeRepair, ...]
+    identity: str
+    service_uid: int
+    service_gid: int
+    max_sequence: int | None
+
+
+_PUBLICATION_DIRECTORY_MODE = 0o750
+_PUBLICATION_FILE_MODE = 0o640
+_SERVICE_ACCOUNT = "omi-collector"
+_SERVICE_GROUP = "omi-collector"
+
+
 def publish_from_ledger(captured_root: Path, publication_root: Path, collector_root: Path) -> GenerationResult:
     """Publish from the durable repair ledger only when clock evidence is settled."""
     repairs = _read_repairs(collector_root / "timeline-repairs.json")
@@ -61,24 +84,187 @@ def build_generation(
     _validate_repairs(repairs)
     identity = _generation_identity(bundles, repairs, max_sequence)
     generations = publication_root / ".generations"
-    generations.mkdir(mode=0o750, parents=True, exist_ok=True)
-    destination = generations / identity
-    if not destination.exists():
-        temporary = generations / f".{identity}.{uuid4().hex}.tmp"
-        temporary.mkdir(mode=0o750)
+    service_uid, service_gid = _publication_identity()
+    _prepare_generation_directory(publication_root, service_uid, service_gid)
+    try:
+        publication_descriptor = _open_directory(publication_root)
+    except OSError as error:
+        raise TimelineGenerationError("publication directory is not service-writable") from error
+    try:
+        generations_view = _descriptor_path(publication_descriptor) / ".generations"
+        _prepare_generation_directory(generations_view, service_uid, service_gid)
         try:
-            records, _ = _write_bundles(temporary, bundles, repairs, max_sequence=max_sequence)
-            _write_generation_manifest(temporary, identity, bundles, repairs, records)
-            _sync_tree(temporary)
-            temporary.rename(destination)
-            _sync_directory(generations)
-        except BaseException:
-            shutil.rmtree(temporary, ignore_errors=True)
-            raise
-    else:
-        records = _append_generation(destination, identity, bundles, repairs, max_sequence=max_sequence)
-    _switch_current(publication_root, destination)
-    return GenerationResult(destination, len(bundles), records, identity)
+            generations_descriptor = _open_directory(generations_view)
+        except OSError as error:
+            raise TimelineGenerationError("publication generation directory is not service-writable") from error
+        try:
+            destination = generations / identity
+            destination_view = _descriptor_path(generations_descriptor) / identity
+            temporary_view = _descriptor_path(generations_descriptor) / f".{identity}.{uuid4().hex}.tmp"
+            if not destination_view.exists():
+                records = _create_generation(
+                    _GenerationBuild(
+                        temporary_view,
+                        destination_view,
+                        generations_descriptor,
+                        bundles,
+                        repairs,
+                        identity,
+                        service_uid,
+                        service_gid,
+                        max_sequence,
+                    )
+                )
+            else:
+                _prepare_generation_directory(destination_view, service_uid, service_gid)
+                records = _append_generation(
+                    destination_view,
+                    identity,
+                    bundles,
+                    repairs,
+                    service_uid,
+                    service_gid,
+                    max_sequence=max_sequence,
+                )
+            try:
+                _assert_directory_identity(generations, generations_descriptor)
+                _assert_directory_identity(publication_root, publication_descriptor)
+            except OSError as error:
+                raise TimelineGenerationError("publication directory was replaced") from error
+            _switch_current(publication_root, destination, publication_descriptor=publication_descriptor)
+            return GenerationResult(destination, len(bundles), records, identity)
+        finally:
+            os.close(generations_descriptor)
+    finally:
+        os.close(publication_descriptor)
+
+
+def _create_generation(
+    build: _GenerationBuild,
+) -> int:
+    _prepare_generation_directory(build.temporary, build.service_uid, build.service_gid)
+    try:
+        records, _ = _write_bundles(
+            build.temporary,
+            build.bundles,
+            build.repairs,
+            service_uid=build.service_uid,
+            service_gid=build.service_gid,
+            max_sequence=build.max_sequence,
+        )
+        _write_generation_manifest(
+            build.temporary,
+            build.identity,
+            build.bundles,
+            build.repairs,
+            records,
+            build.service_uid,
+            build.service_gid,
+        )
+        _sync_tree(build.temporary)
+        temporary_descriptor = _open_directory(build.temporary)
+        try:
+            _assert_directory_identity(build.temporary, temporary_descriptor)
+            os.rename(
+                build.temporary.name,
+                build.destination.name,
+                src_dir_fd=build.generations_descriptor,
+                dst_dir_fd=build.generations_descriptor,
+            )
+        finally:
+            os.close(temporary_descriptor)
+        _sync_fd(build.generations_descriptor)
+        return records
+    except BaseException:
+        shutil.rmtree(build.temporary, ignore_errors=True)
+        raise
+
+
+def _prepare_generation_directory(path: Path, service_uid: int, service_gid: int) -> None:
+    try:
+        path.mkdir(mode=_PUBLICATION_DIRECTORY_MODE, parents=True, exist_ok=True)
+        _repair_directory_ownership(path, service_uid, service_gid)
+    except OSError as error:
+        raise TimelineGenerationError("publication generation directory is not service-writable") from error
+
+
+def _open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    return os.open(path, flags)
+
+
+def _open_directory_at(parent: int, name: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    return os.open(name, flags, dir_fd=parent)
+
+
+def _descriptor_path(descriptor: int) -> Path:
+    return Path(f"/proc/self/fd/{descriptor}")
+
+
+def _assert_directory_identity(path: Path, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    current = path.stat(follow_symlinks=False)
+    if not S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        raise OSError("publication directory was replaced during generation publication")
+
+
+def _assert_child_directory_identity(parent: int, name: str, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        raise TimelineGenerationError("bundle temporary directory was replaced during publication")
+
+
+def _remove_child_directory(parent: int, name: str) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if S_ISLNK(current.st_mode):
+        os.unlink(name, dir_fd=parent)
+        return
+    shutil.rmtree(_descriptor_path(parent) / name, ignore_errors=True)
+
+
+def _repair_directory_ownership(path: Path, service_uid: int, service_gid: int) -> None:
+    """Repair one directory through a stable, no-follow descriptor."""
+    descriptor = _open_directory(path)
+    try:
+        _assert_directory_identity(path, descriptor)
+        os.fchmod(descriptor, _PUBLICATION_DIRECTORY_MODE)
+        os.fchown(descriptor, service_uid, service_gid)
+    finally:
+        os.close(descriptor)
+
+
+def _repair_open_directory(descriptor: int, service_uid: int, service_gid: int) -> None:
+    metadata = os.fstat(descriptor)
+    if not S_ISDIR(metadata.st_mode):
+        raise OSError("publication path is not a directory")
+    os.fchmod(descriptor, _PUBLICATION_DIRECTORY_MODE)
+    os.fchown(descriptor, service_uid, service_gid)
+
+
+def _publication_identity() -> tuple[int, int]:
+    """Return the UID/GID that owns generated source directories.
+
+    The systemd unit and deployment scripts define the service account by
+    name. Root-run recovery must resolve that same contract through NSS; a
+    missing or mismatched account is an installation error, not a reason to
+    recreate an unwritable tree. A non-root process is already constrained to
+    its effective service identity in the supported deployment shape.
+    """
+    if os.geteuid() != 0:
+        return os.geteuid(), os.getegid()
+    try:
+        user = pwd.getpwnam(_SERVICE_ACCOUNT)
+        group = grp.getgrnam(_SERVICE_GROUP)
+    except KeyError as error:
+        raise TimelineGenerationError("collector service account is unavailable") from error
+    if user.pw_gid != group.gr_gid:
+        raise TimelineGenerationError("collector service account has an unexpected primary group")
+    return user.pw_uid, group.gr_gid
 
 
 def _require_settled_clock_operations(
@@ -227,11 +413,13 @@ def _repair_offset(sequence: int, repairs: tuple[TimeRepair, ...]) -> int:
     )
 
 
-def _append_generation(
+def _append_generation(  # noqa: PLR0913,PLR0917
     destination: Path,
     identity: str,
     captured: tuple[tuple[Path, BundleManifest], ...],
     repairs: tuple[TimeRepair, ...],
+    service_uid: int,
+    service_gid: int,
     *,
     max_sequence: int | None = None,
 ) -> int:
@@ -258,9 +446,17 @@ def _append_generation(
             raise TimelineGenerationError("existing generation bundle is invalid")
     remaining = captured[len(existing) :]
     if remaining:
-        added, _ = _write_bundles(destination, remaining, repairs, previous, max_sequence=max_sequence)
+        added, _ = _write_bundles(
+            destination,
+            remaining,
+            repairs,
+            previous,
+            service_uid=service_uid,
+            service_gid=service_gid,
+            max_sequence=max_sequence,
+        )
         records += added
-    _replace_generation_manifest(destination, identity, captured, repairs, records)
+    _replace_generation_manifest(destination, identity, captured, repairs, records, service_uid, service_gid)
     return records
 
 
@@ -286,18 +482,28 @@ def _validate_existing_generation(
     return bundles, records, previous
 
 
-def _replace_generation_manifest(
+def _replace_generation_manifest(  # noqa: PLR0913,PLR0917
     root: Path,
     identity: str,
     bundles: tuple[tuple[Path, BundleManifest], ...],
     repairs: tuple[TimeRepair, ...],
     records: int,
+    service_uid: int,
+    service_gid: int,
 ) -> None:
-    temporary = root / f".generation.{uuid4().hex}.tmp"
+    descriptor = _open_directory(root)
+    temporary_name = f".generation.{uuid4().hex}.tmp"
     value = _generation_manifest(identity, bundles, repairs, records)
-    _write(temporary, _json(value))
-    temporary.replace(root / "generation.json")
-    _sync_directory(root)
+    try:
+        _write_at(descriptor, temporary_name, _json(value), service_uid, service_gid)
+        os.replace(temporary_name, "generation.json", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        _sync_fd(descriptor)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=descriptor)
+        raise
+    finally:
+        os.close(descriptor)
 
 
 def _bundles(root: Path, *, max_sequence: int | None = None) -> tuple[tuple[Path, BundleManifest], ...]:
@@ -358,46 +564,82 @@ def _generation_identity(
     return sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _write_bundles(
+def _write_bundles(  # noqa: PLR0913
     destination: Path,
     bundles: tuple[tuple[Path, BundleManifest], ...],
     repairs: tuple[TimeRepair, ...],
     previous_timestamp: int | None = None,
     *,
+    service_uid: int,
+    service_gid: int,
     max_sequence: int | None = None,
 ) -> tuple[int, int]:
     total = 0
-    for source, manifest in bundles:
-        raw = (source / "records.bin").read_bytes()
-        if sha256(raw).hexdigest() != manifest.raw_sha256 or len(raw) != manifest.record_count * RECORD_SIZE:
-            raise TimelineGenerationError("captured bundle does not match its manifest")
-        if max_sequence is not None and manifest.start_sequence >= max_sequence:
-            continue
-        count = manifest.record_count
-        if max_sequence is not None:
-            count = min(count, max_sequence - manifest.start_sequence)
-            raw = raw[: count * RECORD_SIZE]
-        normalized, previous_timestamp = _normalize(raw, manifest.start_sequence, repairs, previous_timestamp)
-        digest = sha256(normalized).hexdigest()
-        target = destination / f"{manifest.start_sequence}-{manifest.start_sequence + count}-{digest[:16]}"
-        temporary = destination / f".{target.name}.{uuid4().hex}.tmp"
-        temporary.mkdir(mode=0o750)
-        output_manifest = BundleManifest(
-            2,
-            manifest.start_sequence,
-            manifest.start_sequence + count,
-            count,
-            RECORD_SIZE,
-            digest,
-        )
-        receipt = SealedReceipt.from_json(cast(object, json.loads((source / "receipt.json").read_text())))
-        _write(temporary / "records.bin", normalized)
-        _write(temporary / "manifest.json", _json(output_manifest.as_dict()))
-        _write(temporary / "receipt.json", _json(SealedReceipt(receipt.attempt_id, digest).as_dict()))
-        _sync_directory(temporary)
-        temporary.rename(target)
-        _sync_directory(destination)
-        total += count
+    destination_descriptor = _open_directory(destination)
+    try:
+        for source, manifest in bundles:
+            raw = (source / "records.bin").read_bytes()
+            if sha256(raw).hexdigest() != manifest.raw_sha256 or len(raw) != manifest.record_count * RECORD_SIZE:
+                raise TimelineGenerationError("captured bundle does not match its manifest")
+            if max_sequence is not None and manifest.start_sequence >= max_sequence:
+                continue
+            count = manifest.record_count
+            if max_sequence is not None:
+                count = min(count, max_sequence - manifest.start_sequence)
+                raw = raw[: count * RECORD_SIZE]
+            normalized, previous_timestamp = _normalize(raw, manifest.start_sequence, repairs, previous_timestamp)
+            digest = sha256(normalized).hexdigest()
+            target_name = f"{manifest.start_sequence}-{manifest.start_sequence + count}-{digest[:16]}"
+            temporary_name = f".{target_name}.{uuid4().hex}.tmp"
+            os.mkdir(temporary_name, mode=0o750, dir_fd=destination_descriptor)
+            try:
+                temporary_descriptor = _open_directory_at(destination_descriptor, temporary_name)
+            except BaseException:
+                _remove_child_directory(destination_descriptor, temporary_name)
+                raise
+            try:
+                _repair_open_directory(temporary_descriptor, service_uid, service_gid)
+                output_manifest = BundleManifest(
+                    2,
+                    manifest.start_sequence,
+                    manifest.start_sequence + count,
+                    count,
+                    RECORD_SIZE,
+                    digest,
+                )
+                receipt = SealedReceipt.from_json(cast(object, json.loads((source / "receipt.json").read_text())))
+                _write_at(temporary_descriptor, "records.bin", normalized, service_uid, service_gid)
+                _write_at(
+                    temporary_descriptor,
+                    "manifest.json",
+                    _json(output_manifest.as_dict()),
+                    service_uid,
+                    service_gid,
+                )
+                _write_at(
+                    temporary_descriptor,
+                    "receipt.json",
+                    _json(SealedReceipt(receipt.attempt_id, digest).as_dict()),
+                    service_uid,
+                    service_gid,
+                )
+                _sync_fd(temporary_descriptor)
+                _assert_child_directory_identity(destination_descriptor, temporary_name, temporary_descriptor)
+                os.rename(
+                    temporary_name,
+                    target_name,
+                    src_dir_fd=destination_descriptor,
+                    dst_dir_fd=destination_descriptor,
+                )
+            except BaseException:
+                _remove_child_directory(destination_descriptor, temporary_name)
+                raise
+            finally:
+                os.close(temporary_descriptor)
+            _sync_fd(destination_descriptor)
+            total += count
+    finally:
+        os.close(destination_descriptor)
     assert previous_timestamp is not None
     return total, previous_timestamp
 
@@ -430,14 +672,21 @@ def _normalize(
     return bytes(output), previous_timestamp
 
 
-def _write_generation_manifest(
+def _write_generation_manifest(  # noqa: PLR0913,PLR0917
     root: Path,
     identity: str,
     bundles: tuple[tuple[Path, BundleManifest], ...],
     repairs: tuple[TimeRepair, ...],
     records: int,
+    service_uid: int,
+    service_gid: int,
 ) -> None:
-    _write(root / "generation.json", _json(_generation_manifest(identity, bundles, repairs, records)))
+    _write(
+        root / "generation.json",
+        _json(_generation_manifest(identity, bundles, repairs, records)),
+        service_uid,
+        service_gid,
+    )
 
 
 def _generation_manifest(
@@ -455,39 +704,90 @@ def _generation_manifest(
     }
 
 
-def _switch_current(publication_root: Path, destination: Path) -> None:
-    publication_root.mkdir(mode=0o750, parents=True, exist_ok=True)
-    current = publication_root / "current"
-    if current.exists() and not current.is_symlink():
-        raise TimelineGenerationError("current publication path must be a generation link")
-    temporary = publication_root / f".current.{uuid4().hex}.tmp"
-    relative = destination.relative_to(publication_root)
-    temporary.symlink_to(relative, target_is_directory=True)
-    temporary.replace(current)
-    _sync_directory(publication_root)
+def _switch_current(publication_root: Path, destination: Path, *, publication_descriptor: int | None = None) -> None:
+    owns_descriptor = publication_descriptor is None
+    if owns_descriptor:
+        try:
+            publication_descriptor = _open_directory(publication_root)
+        except OSError as error:
+            raise TimelineGenerationError("publication current link is not service-writable") from error
+    assert publication_descriptor is not None
+    descriptor = publication_descriptor
+    temporary_name = f".current.{uuid4().hex}.tmp"
+    try:
+        try:
+            current = os.stat("current", dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not S_ISLNK(current.st_mode):
+                raise TimelineGenerationError("current publication path must be a generation link")
+        relative = destination.relative_to(publication_root)
+        os.symlink(relative, temporary_name, target_is_directory=True, dir_fd=descriptor)
+        try:
+            os.replace(temporary_name, "current", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        except BaseException:
+            os.unlink(temporary_name, dir_fd=descriptor)
+            raise
+        os.fsync(descriptor)
+    except OSError as error:
+        raise TimelineGenerationError("publication current link is not service-writable") from error
+    finally:
+        if owns_descriptor:
+            os.close(descriptor)
 
 
 def _json(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def _write(path: Path, payload: bytes) -> None:
-    with path.open("xb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
-def _sync_tree(root: Path) -> None:
-    for path in root.iterdir():
-        if path.is_dir():
-            _sync_directory(path)
-    _sync_directory(root)
-
-
-def _sync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+def _write(path: Path, payload: bytes, service_uid: int, service_gid: int) -> None:
+    descriptor = _open_directory(path.parent)
     try:
+        _write_at(descriptor, path.name, payload, service_uid, service_gid)
+    finally:
+        os.close(descriptor)
+
+
+def _write_at(parent: int, name: str, payload: bytes, service_uid: int, service_gid: int) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(name, flags, 0o666, dir_fd=parent)
+    try:
+        os.fchmod(descriptor, _PUBLICATION_FILE_MODE)
+        os.fchown(descriptor, service_uid, service_gid)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            remaining = remaining[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _sync_tree(root: Path) -> None:
+    descriptor = _open_directory(root)
+    try:
+        for entry in os.scandir(_descriptor_path(descriptor)):
+            if entry.is_dir(follow_symlinks=False):
+                child = _open_directory_at(descriptor, entry.name)
+                try:
+                    _sync_fd(child)
+                finally:
+                    os.close(child)
+            elif entry.is_symlink():
+                raise OSError("generation tree contains a symlink")
+        _sync_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = _open_directory(path)
+    try:
+        _sync_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_fd(descriptor: int) -> None:
+    os.fsync(descriptor)

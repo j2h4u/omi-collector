@@ -139,6 +139,48 @@ def test_root_recovery_tree_is_service_readable_for_later_append(
     assert os.access(appended.path / "generation.json", os.R_OK)
 
 
+def test_existing_generation_recovery_repairs_preexisting_bundle_tree_for_service_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    service_uid, service_gid = os.getuid(), os.getgid()
+    _bundle(captured, 10, (1000,), "a" * 32)
+    initial = build_generation(captured, published, ())
+    initial.path.chmod(0o700)
+    (initial.path / "generation.json").chmod(0o600)
+    first_bundle = next(path for path in initial.path.iterdir() if path.is_dir())
+    first_bundle.chmod(0o700)
+    for path in first_bundle.iterdir():
+        path.chmod(0o600)
+
+    monkeypatch.setattr(timeline_generations.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        timeline_generations.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=service_uid, pw_gid=service_gid),
+    )
+    monkeypatch.setattr(
+        timeline_generations.grp,
+        "getgrnam",
+        lambda _name: SimpleNamespace(gr_gid=service_gid),
+    )
+    _bundle(captured, 11, (1001,), "b" * 32)
+
+    appended = build_generation(captured, published, ())
+
+    assert appended.bundle_count == 2
+    assert appended.record_count == 2
+    assert S_IMODE(appended.path.stat().st_mode) == 0o750
+    assert S_IMODE((appended.path / "generation.json").stat().st_mode) == 0o640
+    for bundle in appended.path.iterdir():
+        if bundle.is_dir():
+            assert S_IMODE(bundle.stat().st_mode) == 0o750
+            assert os.access(bundle / "records.bin", os.R_OK)
+            for artifact in bundle.iterdir():
+                assert S_IMODE(artifact.stat().st_mode) == 0o640
+
+
 def test_generation_repair_rejects_symlinked_generations_without_mutating_target(tmp_path: Path) -> None:
     captured = tmp_path / "captured"
     published = tmp_path / "source"

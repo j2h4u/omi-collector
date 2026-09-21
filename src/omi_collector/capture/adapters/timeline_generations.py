@@ -751,7 +751,7 @@ def _write(path: Path, payload: bytes, service_uid: int, service_gid: int) -> No
 
 def _write_at(parent: int, name: str, payload: bytes, service_uid: int, service_gid: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-    descriptor = os.open(name, flags, 0o666, dir_fd=parent)
+    descriptor = os.open(name, flags, _PUBLICATION_FILE_MODE, dir_fd=parent)
     try:
         os.fchmod(descriptor, _PUBLICATION_FILE_MODE)
         os.fchown(descriptor, service_uid, service_gid)

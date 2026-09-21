@@ -121,6 +121,7 @@ class QuarantineMaintenance:
                 await asyncio.to_thread(recover)
                 self._publication_retry_number = 0
                 self._publication_retry_not_before = 0.0
+                self._runtime.debug_event("timeline_generation_published")
                 return True
             except Exception as error:  # noqa: BLE001 - publication cannot block capture
                 self._runtime.debug_exception("timeline_generation_blocked", error, attempt=attempt + 1)

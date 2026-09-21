@@ -147,8 +147,10 @@ function validate_staged_unit {
     rm -rf -- "$validation_root" || die 'could not remove staged validation root'
 }
 
-declare script_dir repo_root source_unit source_status source_status_sudoers config_file storage_root unit_target service_name
-declare account_user account_group state_dir staged_unit unit_backup
+declare script_dir repo_root source_unit source_status source_status_sudoers source_deploy_release source_deploy_release_sudoers
+declare config_file storage_root unit_target status_target status_sudoers_target deploy_release_target deploy_release_sudoers_target service_name
+declare account_user account_group state_dir staged_status staged_status_sudoers staged_deploy_release staged_deploy_release_sudoers staged_unit
+declare status_backup status_sudoers_backup deploy_release_backup deploy_release_sudoers_backup unit_backup
 declare -i restart_requested=0
 
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve installer directory'
@@ -156,19 +158,57 @@ repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve r
 source_unit="${repo_root}/systemd/omi-collector.service"
 source_status="${repo_root}/scripts/omi-collector-status"
 source_status_sudoers="${repo_root}/scripts/omi-collector-status.sudoers"
+source_deploy_release="${repo_root}/scripts/omi-collector-deploy-release"
+source_deploy_release_sudoers="${repo_root}/scripts/omi-collector-deploy-release.sudoers"
 config_file='/srv/pipelines/omi/config.toml'
 storage_root=$(dirname -- "$config_file") || die 'cannot resolve storage root'
 unit_target='/etc/systemd/system/omi-collector.service'
+status_target='/usr/local/sbin/omi-collector-status'
+status_sudoers_target='/etc/sudoers.d/omi-collector-status'
+deploy_release_target='/usr/local/sbin/omi-collector-deploy-release'
+deploy_release_sudoers_target='/etc/sudoers.d/omi-collector-deploy-release'
 service_name='omi-collector.service'
 account_user='omi-collector'
 account_group='omi-collector'
 state_dir='/var/lib/omi-collector'
+staged_status=''
+staged_status_sudoers=''
+staged_deploy_release=''
+staged_deploy_release_sudoers=''
 staged_unit=''
+status_backup=''
+status_sudoers_backup=''
+deploy_release_backup=''
+deploy_release_sudoers_backup=''
 unit_backup=''
 
 function cleanup {
+    if [[ -n "$staged_status" && ( -e "$staged_status" || -L "$staged_status" ) ]]; then
+        rm -f -- "$staged_status" || true
+    fi
+    if [[ -n "$staged_status_sudoers" && ( -e "$staged_status_sudoers" || -L "$staged_status_sudoers" ) ]]; then
+        rm -f -- "$staged_status_sudoers" || true
+    fi
+    if [[ -n "$staged_deploy_release" && ( -e "$staged_deploy_release" || -L "$staged_deploy_release" ) ]]; then
+        rm -f -- "$staged_deploy_release" || true
+    fi
+    if [[ -n "$staged_deploy_release_sudoers" && ( -e "$staged_deploy_release_sudoers" || -L "$staged_deploy_release_sudoers" ) ]]; then
+        rm -f -- "$staged_deploy_release_sudoers" || true
+    fi
     if [[ -n "$staged_unit" && ( -e "$staged_unit" || -L "$staged_unit" ) ]]; then
         rm -f -- "$staged_unit" || true
+    fi
+    if [[ -n "$status_backup" && ( -e "$status_backup" || -L "$status_backup" ) ]]; then
+        rm -f -- "$status_backup" || true
+    fi
+    if [[ -n "$status_sudoers_backup" && ( -e "$status_sudoers_backup" || -L "$status_sudoers_backup" ) ]]; then
+        rm -f -- "$status_sudoers_backup" || true
+    fi
+    if [[ -n "$deploy_release_backup" && ( -e "$deploy_release_backup" || -L "$deploy_release_backup" ) ]]; then
+        rm -f -- "$deploy_release_backup" || true
+    fi
+    if [[ -n "$deploy_release_sudoers_backup" && ( -e "$deploy_release_sudoers_backup" || -L "$deploy_release_sudoers_backup" ) ]]; then
+        rm -f -- "$deploy_release_sudoers_backup" || true
     fi
     if [[ -n "$unit_backup" && ( -e "$unit_backup" || -L "$unit_backup" ) ]]; then
         rm -f -- "$unit_backup" || true
@@ -197,29 +237,62 @@ ensure_service_account "$account_user" "$account_group" "$state_dir"
     || die "storage root is missing or unsafe: ${storage_root}"
 validate_operator_config_file "$config_file" "$account_group"
 /usr/sbin/visudo -cf "$source_status_sudoers" || die 'status sudo policy is invalid'
-install -o root -g root -m 0755 -- "$source_status" /usr/local/sbin/omi-collector-status \
-    || die 'could not install operator status command'
-install -o root -g root -m 0440 -- "$source_status_sudoers" /etc/sudoers.d/omi-collector-status \
-    || die 'could not install operator status sudo policy'
+/usr/sbin/visudo -cf "$source_deploy_release_sudoers" || die 'release deploy sudo policy is invalid'
+stage_file "$source_status" "$status_target" 0755 staged_status
+stage_file "$source_status_sudoers" "$status_sudoers_target" 0440 staged_status_sudoers
+stage_file "$source_deploy_release" "$deploy_release_target" 0755 staged_deploy_release
+stage_file "$source_deploy_release_sudoers" "$deploy_release_sudoers_target" 0440 staged_deploy_release_sudoers
 stage_file "$source_unit" "$unit_target" 0644 staged_unit
 validate_staged_unit "$staged_unit" "$service_name"
+backup_target "$status_target" status_backup
+backup_target "$status_sudoers_target" status_sudoers_backup
+backup_target "$deploy_release_target" deploy_release_backup
+backup_target "$deploy_release_sudoers_target" deploy_release_sudoers_backup
 backup_target "$unit_target" unit_backup
 
-if ! mv -f -- "$staged_unit" "$unit_target"; then
+if ! mv -f -- "$staged_status" "$status_target" \
+    || ! mv -f -- "$staged_status_sudoers" "$status_sudoers_target" \
+    || ! mv -f -- "$staged_deploy_release" "$deploy_release_target" \
+    || ! mv -f -- "$staged_deploy_release_sudoers" "$deploy_release_sudoers_target" \
+    || ! mv -f -- "$staged_unit" "$unit_target"; then
+    restore_target "$status_target" "$status_backup"
+    restore_target "$status_sudoers_target" "$status_sudoers_backup"
+    restore_target "$deploy_release_target" "$deploy_release_backup"
+    restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
     restore_target "$unit_target" "$unit_backup"
-    die "could not install ${unit_target}"
+    die 'could not install systemd and operator material'
 fi
+staged_status=''
+staged_status_sudoers=''
+staged_deploy_release=''
+staged_deploy_release_sudoers=''
 staged_unit=''
 if ! systemctl daemon-reload; then
+    restore_target "$status_target" "$status_backup"
+    restore_target "$status_sudoers_target" "$status_sudoers_backup"
+    restore_target "$deploy_release_target" "$deploy_release_backup"
+    restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
     restore_target "$unit_target" "$unit_backup"
     systemctl daemon-reload || die 'daemon-reload failed while restoring the previous unit'
-    die 'systemd daemon-reload failed; restored previous unit'
+    die 'systemd daemon-reload failed; restored previous systemd and operator material'
 fi
 if ! systemctl enable "$service_name"; then
+    restore_target "$status_target" "$status_backup"
+    restore_target "$status_sudoers_target" "$status_sudoers_backup"
+    restore_target "$deploy_release_target" "$deploy_release_backup"
+    restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
     restore_target "$unit_target" "$unit_backup"
     systemctl daemon-reload || die 'daemon-reload failed while restoring the previous unit'
-    die "could not enable ${service_name}; restored previous unit"
+    die "could not enable ${service_name}; restored previous systemd and operator material"
 fi
+rm -f -- "$status_backup" || die 'could not remove installed status-command rollback backup'
+status_backup=''
+rm -f -- "$status_sudoers_backup" || die 'could not remove installed status-policy rollback backup'
+status_sudoers_backup=''
+rm -f -- "$deploy_release_backup" || die 'could not remove installed release-deployer rollback backup'
+deploy_release_backup=''
+rm -f -- "$deploy_release_sudoers_backup" || die 'could not remove installed release-deployer policy rollback backup'
+deploy_release_sudoers_backup=''
 rm -f -- "$unit_backup" || die 'could not remove installed-unit rollback backup'
 unit_backup=''
 

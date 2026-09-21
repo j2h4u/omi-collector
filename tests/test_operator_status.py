@@ -194,6 +194,24 @@ def test_status_marks_persistent_runtime_failures_for_attention(
     ]
 
 
+def test_status_clears_timeline_publication_block_after_successful_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    rows = (
+        {"event": "timeline_generation_blocked", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
+        {"event": "timeline_generation_published", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
+    )
+    layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    runtime = cast(dict[str, object], result["runtime"])
+    assert runtime["attention_reasons"] == []
+    assert result["status"] == "unknown"
+
+
 def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     (layout.collector.root / "quality.jsonl").write_text("not-json\n", encoding="utf-8")

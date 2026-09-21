@@ -134,6 +134,17 @@ service unless `--restart` is explicit. Complete the first successful
 deployment before rebooting or leaving the host unattended because the unit
 has no selected runtime before then.
 
+The installer also installs the root-owned release wrapper at
+`/usr/local/sbin/omi-collector-deploy-release` and its fixed sudo policy. The
+wrapper accepts exactly one `vMAJOR.MINOR.PATCH` tag and delegates to the
+checked-in transactional `scripts/dev-deploy-release.sh` in `/opt/omi-collector`:
+
+```bash
+sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
+```
+
+It does not perform clock recovery or accept arbitrary commands.
+
 Follow the service with:
 
 ```bash

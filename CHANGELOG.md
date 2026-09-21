@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.7](https://github.com/j2h4u/omi-collector/compare/v0.6.6...v0.6.7) (2026-09-21)
+
+
+### Fixes
+
+* persist unattended collector operations ([#96](https://github.com/j2h4u/omi-collector/issues/96)) ([4a090df](https://github.com/j2h4u/omi-collector/commit/4a090df3f606a9de40629ee4cc5e4dde4749764c))
+
 ## [0.6.6](https://github.com/j2h4u/omi-collector/compare/v0.6.5...v0.6.6) (2026-09-21)
 
 

@@ -57,6 +57,17 @@ system account and state ownership, protects the configuration, validates the
 staged unit, and restores the prior unit if installation cannot be reloaded or
 enabled. It never starts the service without `--restart`.
 
+The installer also installs the root-owned
+`/usr/local/sbin/omi-collector-deploy-release` wrapper and its fixed sudo
+policy. The wrapper accepts exactly one `vMAJOR.MINOR.PATCH` tag and delegates
+to the checked-in transactional `/opt/omi-collector/scripts/dev-deploy-release.sh`;
+it does not perform clock recovery or accept arbitrary commands. Run a
+reviewed release as:
+
+```bash
+sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
+```
+
 The configuration is strict and contains only `[pendant] address`. Its fixed
 parent `/srv/pipelines/omi` is the storage root; `collector`, `captured`, and
 `source` are derived beneath it. The base unit grants the service write access

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+declare -r deployer='/opt/omi-collector/scripts/dev-deploy-release.sh'
+
+(( EUID == 0 )) || {
+    printf 'ERROR: this command must run through sudo\n' >&2
+    exit 1
+}
+[[ $# -eq 1 ]] || {
+    printf 'Usage: sudo -n omi-collector-deploy-release vMAJOR.MINOR.PATCH\n' >&2
+    exit 2
+}
+[[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    printf 'ERROR: invalid release tag: %s\n' "$1" >&2
+    exit 2
+}
+[[ -f "$deployer" && ! -L "$deployer" ]] || {
+    printf 'ERROR: trusted deployer is missing or unsafe\n' >&2
+    exit 1
+}
+[[ $(stat -c '%U:%G:%a' "$deployer") == 'root:root:755' ]] || {
+    printf 'ERROR: trusted deployer ownership or mode is unsafe\n' >&2
+    exit 1
+}
+
+exec "$deployer" "$1"

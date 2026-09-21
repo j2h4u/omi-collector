@@ -19,6 +19,8 @@ _DEPLOYER = _ROOT / "scripts" / "deploy-systemd-service.sh"
 _DEV_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
 _STATUS_COMMAND = _ROOT / "scripts" / "omi-collector-status"
 _STATUS_SUDOERS = _ROOT / "scripts" / "omi-collector-status.sudoers"
+_RELEASE_COMMAND = _ROOT / "scripts" / "omi-collector-deploy-release"
+_RELEASE_SUDOERS = _ROOT / "scripts" / "omi-collector-deploy-release.sudoers"
 _FEATURE = _ROOT / "features" / "opportunistic_collection.feature"
 _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 
@@ -132,6 +134,52 @@ def test_installer_keeps_the_unit_and_config_targets_fixed() -> None:
     assert "/usr/sbin/visudo -cf" in installer
 
 
+def test_installer_stages_root_owned_release_deploy_material_with_rollback() -> None:
+    installer = _INSTALLER.read_text(encoding="utf-8")
+
+    assert 'source_deploy_release="${repo_root}/scripts/omi-collector-deploy-release"' in installer
+    assert 'source_deploy_release_sudoers="${repo_root}/scripts/omi-collector-deploy-release.sudoers"' in installer
+    assert "deploy_release_target='/usr/local/sbin/omi-collector-deploy-release'" in installer
+    assert "deploy_release_sudoers_target='/etc/sudoers.d/omi-collector-deploy-release'" in installer
+    assert '/usr/sbin/visudo -cf "$source_deploy_release_sudoers"' in installer
+    assert 'stage_file "$source_deploy_release" "$deploy_release_target" 0755 staged_deploy_release' in installer
+    assert (
+        'stage_file "$source_deploy_release_sudoers" "$deploy_release_sudoers_target" 0440 '
+        "staged_deploy_release_sudoers"
+    ) in installer
+    assert 'backup_target "$deploy_release_target" deploy_release_backup' in installer
+    assert 'backup_target "$deploy_release_sudoers_target" deploy_release_sudoers_backup' in installer
+    assert 'restore_target "$deploy_release_target" "$deploy_release_backup"' in installer
+    assert 'restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"' in installer
+
+
+def test_release_deploy_wrapper_has_fixed_privileged_contract() -> None:
+    command = _RELEASE_COMMAND.read_text(encoding="utf-8")
+    policy = _RELEASE_SUDOERS.read_text(encoding="utf-8")
+
+    assert command.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
+    assert "declare -r deployer='/opt/omi-collector/scripts/dev-deploy-release.sh'" in command
+    assert "[[ $# -eq 1 ]]" in command
+    assert '[[ "$1" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]' in command
+    assert 'exec "$deployer" "$1"' in command
+    assert "stat -c '%U:%G:%a' \"$deployer\"" in command
+    assert "root:root:755" in command
+    assert policy == "%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-deploy-release\n"
+    assert (_RELEASE_COMMAND.stat().st_mode & 0o777) == 0o755
+    assert (_RELEASE_SUDOERS.stat().st_mode & 0o777) == 0o644
+
+
+def test_release_deploy_wrapper_rejects_invalid_arguments_without_delegating() -> None:
+    command = _RELEASE_COMMAND.read_text(encoding="utf-8")
+
+    assert "printf 'Usage: sudo -n omi-collector-deploy-release vMAJOR.MINOR.PATCH\\n'" in command
+    assert "printf 'ERROR: invalid release tag: %s\\n' \"$1\"" in command
+    assert "exit 2" in command
+    assert command.index("[[ $# -eq 1 ]]") < command.index('[[ "$1" =~')
+    assert command.index('[[ "$1" =~') < command.index('exec "$deployer" "$1"')
+    assert "clock-recover" not in command
+
+
 def test_operator_status_command_has_no_arguments_or_extra_privilege() -> None:
     command = _STATUS_COMMAND.read_text(encoding="utf-8")
     policy = _STATUS_SUDOERS.read_text(encoding="utf-8")
@@ -143,7 +191,7 @@ def test_operator_status_command_has_no_arguments_or_extra_privilege() -> None:
 
 
 def test_shell_scripts_are_syntactically_clean() -> None:
-    scripts = (_INSTALLER, _DEPLOYER, _DEV_DEPLOYER, _STATUS_COMMAND)
+    scripts = (_INSTALLER, _DEPLOYER, _DEV_DEPLOYER, _STATUS_COMMAND, _RELEASE_COMMAND)
 
     subprocess.run(("bash", "-n", *(str(script) for script in scripts)), check=True)
     subprocess.run(("shellcheck", *(str(script) for script in scripts)), check=True)

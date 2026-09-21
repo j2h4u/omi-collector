@@ -13,6 +13,7 @@ import pytest
 
 from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.ports import StagingPort
 from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
@@ -249,6 +250,42 @@ def test_failed_clock_publication_does_not_gate_ble_and_retries_locally(
 
         assert first_return == len(config.retry.rapid_backoff) + 1
         assert len(attempts) >= 3
+
+    _run(scenario())
+
+
+def test_successful_recovery_after_device_contention_emits_publication_after_blocked_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        attempts = 0
+        events: list[tuple[str, str]] = []
+
+        def recover_and_publish() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise DeviceAlreadyRunningError("recovery is already active")
+
+        store.recover_and_publish = recover_and_publish  # type: ignore[method-assign]
+        runtime = OpportunisticRuntime()
+        monkeypatch.setattr(
+            runtime,
+            "debug_exception",
+            lambda event, _error, **_fields: events.append(("exception", event)),
+        )
+        monkeypatch.setattr(runtime, "debug_event", lambda event, **_fields: events.append(("event", event)))
+        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.001,)))
+        maintenance = QuarantineMaintenance(store, None, runtime, config=config)
+
+        assert await maintenance.ensure_publication_ready() is None
+
+        assert attempts == 2
+        assert events == [
+            ("exception", "timeline_generation_blocked"),
+            ("event", "timeline_generation_published"),
+        ]
 
     _run(scenario())
 

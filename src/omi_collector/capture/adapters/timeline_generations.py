@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
-from stat import S_ISDIR, S_ISLNK
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import cast
 from uuid import uuid4
 
@@ -423,7 +423,9 @@ def _append_generation(  # noqa: PLR0913,PLR0917
     *,
     max_sequence: int | None = None,
 ) -> int:
-    existing, records, previous = _validate_existing_generation(destination, identity)
+    destination_metadata = destination.stat(follow_symlinks=False)
+    existing, records, previous, bundle_metadata = _validate_existing_generation(destination, identity)
+    _repair_existing_generation(destination, destination_metadata, existing, bundle_metadata, service_uid, service_gid)
     if len(existing) > len(captured):
         raise TimelineGenerationError("existing generation is ahead of captured source")
     validation_previous: int | None = None
@@ -460,26 +462,91 @@ def _append_generation(  # noqa: PLR0913,PLR0917
     return records
 
 
+def _repair_existing_generation(  # noqa: PLR0913,PLR0917
+    root: Path,
+    expected_root: os.stat_result,
+    bundles: tuple[tuple[Path, BundleManifest], ...],
+    bundle_metadata: tuple[tuple[str, os.stat_result], ...],
+    service_uid: int,
+    service_gid: int,
+) -> None:
+    descriptor = _open_directory(root)
+    try:
+        _assert_open_identity(descriptor, expected_root, "existing generation")
+        expected_names = {"generation.json", *(path.name for path, _ in bundles)}
+        _reject_unexpected_entries(descriptor, expected_names, "existing generation")
+        _repair_regular_file_at(descriptor, "generation.json", service_uid, service_gid)
+        metadata_by_name = dict(bundle_metadata)
+        for bundle, _ in bundles:
+            bundle_descriptor = _open_directory_at(descriptor, bundle.name)
+            try:
+                _assert_open_identity(bundle_descriptor, metadata_by_name[bundle.name], "existing bundle")
+                _repair_open_directory(bundle_descriptor, service_uid, service_gid)
+                _reject_unexpected_entries(
+                    bundle_descriptor,
+                    {"records.bin", "manifest.json", "receipt.json"},
+                    "existing bundle",
+                )
+                for name in ("records.bin", "manifest.json", "receipt.json"):
+                    _repair_regular_file_at(bundle_descriptor, name, service_uid, service_gid)
+            finally:
+                os.close(bundle_descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _assert_open_identity(descriptor: int, expected: os.stat_result, label: str) -> None:
+    actual = os.fstat(descriptor)
+    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        raise TimelineGenerationError(f"{label} was replaced during ownership repair")
+
+
+def _reject_unexpected_entries(parent: int, expected: set[str], label: str) -> None:
+    for entry in os.scandir(_descriptor_path(parent)):
+        if entry.name not in expected:
+            raise TimelineGenerationError(f"{label} contains an unexpected artifact")
+
+
+def _repair_regular_file_at(parent: int, name: str, service_uid: int, service_gid: int) -> None:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent)
+    except OSError as error:
+        raise TimelineGenerationError(f"existing publication artifact is not a regular file: {name}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not S_ISREG(metadata.st_mode):
+            raise TimelineGenerationError(f"existing publication artifact is not a regular file: {name}")
+        os.fchmod(descriptor, _PUBLICATION_FILE_MODE)
+        os.fchown(descriptor, service_uid, service_gid)
+    finally:
+        os.close(descriptor)
+
+
 def _validate_existing_generation(
     destination: Path, identity: str
-) -> tuple[tuple[tuple[Path, BundleManifest], ...], int, int]:
+) -> tuple[tuple[tuple[Path, BundleManifest], ...], int, int, tuple[tuple[str, os.stat_result], ...]]:
     try:
-        value = cast(object, json.loads((destination / "generation.json").read_text(encoding="utf-8")))
+        value = cast(object, json.loads(_read_regular_file(destination / "generation.json")))
     except (OSError, json.JSONDecodeError) as error:
         raise TimelineGenerationError("existing generation manifest is invalid") from error
     if not isinstance(value, dict) or value.get("generation_id") != identity:
         raise TimelineGenerationError("existing generation identity conflicts")
     bundles = _bundles(destination)
+    bundle_metadata = tuple((path.name, path.stat(follow_symlinks=False)) for path, _ in bundles)
     previous: int | None = None
     records = 0
     for source, manifest in bundles:
-        raw = (source / "records.bin").read_bytes()
+        raw = _read_regular_file(source / "records.bin")
         if sha256(raw).hexdigest() != manifest.raw_sha256 or len(raw) != manifest.record_count * RECORD_SIZE:
             raise TimelineGenerationError("existing generation bundle is invalid")
         _, previous = _normalize(raw, manifest.start_sequence, (), previous)
         records += manifest.record_count
-    assert previous is not None
-    return bundles, records, previous
+        _read_regular_file(source / "manifest.json")
+        _read_regular_file(source / "receipt.json")
+    if previous is None:
+        raise TimelineGenerationError("existing generation contains no authenticated bundles")
+    return bundles, records, previous, bundle_metadata
 
 
 def _replace_generation_manifest(  # noqa: PLR0913,PLR0917
@@ -514,7 +581,7 @@ def _bundles(root: Path, *, max_sequence: int | None = None) -> tuple[tuple[Path
         if _suffix_is_beyond_frontier(path, max_sequence):
             continue
         try:
-            manifest = BundleManifest.from_json(cast(object, json.loads((path / "manifest.json").read_text())))
+            manifest = BundleManifest.from_json(cast(object, json.loads(_read_regular_file(path / "manifest.json"))))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise TimelineGenerationError("captured bundle manifest is invalid") from error
         if max_sequence is not None and manifest.start_sequence >= max_sequence:
@@ -747,6 +814,27 @@ def _write(path: Path, payload: bytes, service_uid: int, service_gid: int) -> No
         _write_at(descriptor, path.name, payload, service_uid, service_gid)
     finally:
         os.close(descriptor)
+
+
+def _read_regular_file(path: Path) -> bytes:
+    parent = _open_directory(path.parent)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(path.name, flags, dir_fd=parent)
+    except OSError as error:
+        os.close(parent)
+        raise TimelineGenerationError(f"publication artifact is not a regular file: {path.name}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not S_ISREG(metadata.st_mode):
+            raise TimelineGenerationError(f"publication artifact is not a regular file: {path.name}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+        os.close(parent)
 
 
 def _write_at(parent: int, name: str, payload: bytes, service_uid: int, service_gid: int) -> None:

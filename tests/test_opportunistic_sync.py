@@ -2746,6 +2746,7 @@ async def test_default_arena_budget_admits_a_full_pendant_snapshot_without_alloc
 async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_path: Path) -> None:
     entered = asyncio.Event()
     busy_reported = asyncio.Event()
+    release_busy_retry = asyncio.Event()
 
     class BlockingReadSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -2781,6 +2782,7 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
             and event.error_type == "DeviceAlreadyRunningError"
         ):
             busy_reported.set()
+            await release_busy_retry.wait()
 
     task = asyncio.create_task(
         run_opportunistic_collector(
@@ -2800,6 +2802,7 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
     task.cancel()
     with pytest.raises(CollectionPreservedCancelledError):
         await task
+    release_busy_retry.set()
     result = await contender
     assert isinstance(result, CollectionResult)
     assert recovered.writes == [

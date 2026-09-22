@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.15](https://github.com/j2h4u/omi-collector/compare/v0.6.14...v0.6.15) (2026-09-22)
+
+
+### Fixes
+
+* retain historical timeline repairs ([#112](https://github.com/j2h4u/omi-collector/issues/112)) ([3c90b31](https://github.com/j2h4u/omi-collector/commit/3c90b31c52474e4fadec71c609c2097a4c3aff4f))
+
 ## [0.6.14](https://github.com/j2h4u/omi-collector/compare/v0.6.13...v0.6.14) (2026-09-22)
 
 

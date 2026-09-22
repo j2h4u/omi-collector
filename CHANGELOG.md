@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.14](https://github.com/j2h4u/omi-collector/compare/v0.6.13...v0.6.14) (2026-09-22)
+
+
+### Fixes
+
+* allow sealed internal Python aliases ([#110](https://github.com/j2h4u/omi-collector/issues/110)) ([d39e608](https://github.com/j2h4u/omi-collector/commit/d39e6080b4b863611dd4ad2f0a53e7780bdaad0b))
+
 ## [0.6.13](https://github.com/j2h4u/omi-collector/compare/v0.6.12...v0.6.13) (2026-09-22)
 
 

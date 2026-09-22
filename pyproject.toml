@@ -1,6 +1,6 @@
 [project]
 name = "omi-collector"
-version = "0.6.15"
+version = "0.6.16"
 description = "Self-hosted collector for offline audio from an Omi CV1 pendant."
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"

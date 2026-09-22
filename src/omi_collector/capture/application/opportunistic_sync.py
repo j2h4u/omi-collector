@@ -13,12 +13,11 @@ import inspect
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
 
 from ..domain.ring_protocol import RingInfo
 from . import collector
 from .batch_reconciliation import BatchReconciler
-from .operational_telemetry import ClockCorrectionSink, OperationalEmitter
+from .operational_telemetry import OperationalEmitter
 from .ports import CaptureRuntimePort, ObservationWriterPort, PublicationAuthorityPort, StagingPort
 from .presence import PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
@@ -70,6 +69,7 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
     transport and optional PHY guard belong to a single presence session and
     are recreated only after that session ends.
     """
+    _validate_composition(staging, runtime)
     validate_policy(options.policy, options.config.presence.max_drain_cooldown_seconds)
     validate_presence_policy(options)
     loop = asyncio.get_running_loop()
@@ -84,9 +84,11 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
             return
 
     if options.clock_correction_sink is None:
+        clock_sink = runtime.make_clock_correction_sink(staging)
         options = replace(
             options,
-            clock_correction_sink=cast(ClockCorrectionSink, runtime.make_clock_correction_sink(staging)),
+            clock_correction_sink=clock_sink,
+            clock_observation_sink=clock_sink,
         )
     maintenance = QuarantineMaintenance(staging, options.activity, runtime, config=options.config)
     if options.clock_lease is None:
@@ -152,6 +154,14 @@ def _configure_timeline_publisher(
 ) -> OpportunisticOptions:
     """Bind projection retries to the run-issued, task-independent capability."""
     return replace(options, timeline_publisher=authority)
+
+
+def _validate_composition(staging: object, runtime: object) -> None:
+    """Reject an incomplete production composition before storage or BLE work begins."""
+    if not isinstance(staging, StagingPort):
+        raise TypeError("opportunistic collection requires the complete staging capability")
+    if not isinstance(runtime, CaptureRuntimePort):
+        raise TypeError("opportunistic collection requires the complete capture runtime capability")
 
 
 def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLifecycle:

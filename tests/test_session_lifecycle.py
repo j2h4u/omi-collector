@@ -45,6 +45,17 @@ def _run(coroutine: Coroutine[object, object, object]) -> object:
     return asyncio.run(coroutine)
 
 
+class _Lease:
+    def __enter__(self) -> _Lease:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        return None
+
+    def require_active(self) -> None:
+        return None
+
+
 def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     info = RingInfo(10, 10, 100, 0, 512)
@@ -102,13 +113,6 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
     observed: list[object] = []
     errors: list[BaseException] = []
 
-    class Lease:
-        def __enter__(self) -> object:
-            return self
-
-        def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
-            return None
-
     class Context:
         async def __aenter__(self) -> RingSession:
             return cast(RingSession, object())
@@ -144,7 +148,7 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
         RetryPolicy(backoff=(1,), stop_after_drained=True),
         activity=activity.append,
         clock_correction_sink=cast(ClockCorrectionSink, object()),
-        clock_lease=lambda: Lease(),
+        clock_lease=lambda: _Lease(),
     )
     run = SessionLifecycleRun(
         provider=lambda _candidate: Context(),

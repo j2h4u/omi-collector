@@ -9,9 +9,11 @@ from hashlib import sha256
 from os import fsync, statvfs
 from pathlib import Path
 from threading import Lock
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
+from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from . import publication, quarantine
 from .attempts import StagedAttempt
 from .recovery import Recovery
@@ -38,6 +40,9 @@ from .staging_filesystem import (
     _never_defer,
     _require_regular_directory,
 )
+
+if TYPE_CHECKING:
+    from .quarantine_publish import QuarantinePublication
 
 
 class _PublicationAuthority:
@@ -304,6 +309,12 @@ class StagingStore:
             reason,
         )
 
+    def publish_quarantined_prefix(self, source: Path, *, should_defer: Callable[[], bool]) -> QuarantinePublication:
+        """Salvage one quarantined prefix through this store's explicit paths capability."""
+        from .quarantine_publish import publish_quarantined_prefix
+
+        return publish_quarantined_prefix(source, self.paths, should_defer=should_defer)
+
     def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.sweep_terminal_quarantine(
             self._filesystem,
@@ -338,6 +349,12 @@ class StagingStore:
         )
         return StagedAttempt(self._filesystem, attempt_path, descriptor)
 
+    def make_staging_writer(self, start: int, count: int) -> StagingWriterTargetPort:
+        """Construct the sole writer target without exposing this concrete store to runtime composition."""
+        from .staging_writer import StagingWriter
+
+        return StagingWriter(self, start, count)
+
     def open_attempt(self, attempt_id: str) -> StagedAttempt:
         """Open a valid persisted attempt without changing it."""
         _validate_attempt_id(attempt_id)
@@ -365,13 +382,15 @@ class StagingStore:
             previous.close()
         self._validated_attempts[attempt_id] = attempt
 
-    def resume_streaming_attempt(self, lease: DeviceLock) -> StagedAttempt | None:
+    def resume_streaming_attempt(self, lease: StorageLeasePort) -> StagedAttempt | None:
         """Validate and reopen the unique streaming partial under an active lease.
 
         ``open_attempt`` is deliberately inspection-only.  This consuming seam
         requires the same process's device lease and is the only path that can
         promote complete raw tail records into the durable checkpoint.
         """
+        if not isinstance(lease, DeviceLock):
+            raise AttemptStateError("resume requires an active device lease")
         lease.require_active()
         if lease.filesystem is not self._filesystem:
             raise AttemptStateError("resume requires the active spool lock")

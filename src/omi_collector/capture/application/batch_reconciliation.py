@@ -13,7 +13,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Never, cast
+from typing import Never
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification, RingInfo
 from ..domain.transfer_arena import TransferArena
@@ -339,10 +339,7 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
     )
     try:
         await writer.start()
-        prepared = await writer.prepare_leg(start, end - start)
-        if not _is_durable_prefix(prepared):
-            raise CursorConsistencyError("staging writer returned an invalid durable prefix")
-        prepared_prefix = cast(DurablePrefixShape, prepared)
+        prepared_prefix = await writer.prepare_leg(start, end - start)
         if durable_next is not None and prepared_prefix.next_sequence != durable_next:
             raise CursorConsistencyError("prepared durable prefix changed before recovery")
     except BaseException as error:
@@ -392,9 +389,7 @@ async def _read_and_seal(
         if run.runtime.is_writer_failed(error):
             _raise_writer_cause(batch.writer, error)
         raise
-    if not _is_seal_result(sealed):
-        raise CursorConsistencyError("staging writer returned an invalid seal result")
-    batch.seal = cast(SealResultShape, sealed)
+    batch.seal = sealed
     return current.read_sequence == batch.end
 
 
@@ -607,8 +602,6 @@ async def _publish_cursor_ahead(
     # durably publish its checkpoint-authenticated prefix on its own thread.
     await _rebind_durable_batch(batch, options)
     published = await _bounded(batch.writer.publish_prefix(), options.timeouts.transfer)
-    if published is not None and not _is_seal_result(published):
-        raise CursorConsistencyError("staging writer returned an invalid prefix publication")
     await _report_loss_detected(
         options,
         {
@@ -634,7 +627,7 @@ async def _publish_cursor_ahead(
             )
         except Exception as error:  # noqa: BLE001 - metrics cannot stop audio capture
             run.runtime.debug_exception("quality_metrics_write_error", error, event_type="sequence_loss")
-    return _PrefixPublished(cast(SealResultShape, published) if published is not None else None)
+    return _PrefixPublished(published)
 
 
 def _note_quality_counters(quality: SessionQuality | None, counters: collector.TransferCounters) -> None:
@@ -664,10 +657,7 @@ async def _invoke_operational(emitter: OperationalEmitter, event: dict[str, obje
 
 
 async def _checkpoint_batch(batch: _Batch, options: OpportunisticOptions) -> DurablePrefixShape:
-    result = await _bounded(batch.writer.checkpoint(), options.timeouts.transfer)
-    if not _is_durable_prefix(result):
-        raise CursorConsistencyError("writer checkpoint did not return a durable prefix")
-    durable = cast(DurablePrefixShape, result)
+    durable = await _bounded(batch.writer.checkpoint(), options.timeouts.transfer)
     batch.durable = durable
     return durable
 
@@ -813,14 +803,6 @@ def _drained_result(state: _State) -> collector.CollectResult:
     if state.last_result is None:
         raise RuntimeError("drained collection has no INFO result")
     return state.last_result
-
-
-def _is_durable_prefix(value: object) -> bool:
-    return all(hasattr(value, field) for field in ("start_sequence", "next_sequence", "record_count", "raw_sha256"))
-
-
-def _is_seal_result(value: object) -> bool:
-    return hasattr(value, "bundle_path") and hasattr(value, "deduplicated")
 
 
 def _raise_writer_cause(writer: BatchWriterPort, error: BaseException) -> Never:

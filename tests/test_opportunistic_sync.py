@@ -48,7 +48,7 @@ from omi_collector.capture.application.opportunistic_sync import CollectionPrese
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
 )
-from omi_collector.capture.application.ports import BatchWriterPort
+from omi_collector.capture.application.ports import BatchWriterPort, StagingPort, StorageLeaseContext
 from omi_collector.capture.application.presence import (
     PresenceCallback,
     PresencePolicy,
@@ -289,6 +289,17 @@ def _options(
 
 
 @_async_test
+async def test_incomplete_staging_composition_is_rejected_before_provider_open() -> None:
+    with pytest.raises(TypeError, match="complete staging capability"):
+        await _run_opportunistic_collector(
+            cast(Callable[[object | None], AbstractAsyncContextManager[RingSession]], object()),
+            cast(StagingPort, object()),
+            _options(),
+            runtime=_runtime(),
+        )
+
+
+@_async_test
 async def test_coordinator_wires_clock_telemetry_to_storage_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -296,7 +307,7 @@ async def test_coordinator_wires_clock_telemetry_to_storage_lease(
     lease_entries: list[str] = []
     original_lease = store.clock_mutation_lease
 
-    def clock_mutation_lease() -> object:
+    def clock_mutation_lease() -> StorageLeaseContext:
         lease_entries.append("created")
         return original_lease()
 

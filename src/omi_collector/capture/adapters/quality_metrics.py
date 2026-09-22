@@ -77,22 +77,24 @@ class JsonlQualityMetrics(QualityMetricsPort):
 
     def close(self, timeout_seconds: float | None = None) -> bool:
         """Stop the daemon writer, waiting only for the configured bounded interval."""
+        drop_reason: str | None = None
         with self._state_lock:
             self._closed = True
             timeout = self._shutdown_timeout if timeout_seconds is None else timeout_seconds
-            enqueue_stop = not self._stop_enqueued
-            self._stop_enqueued = True
-        if enqueue_stop:
-            while True:
-                try:
-                    self._queue.put_nowait(None)
-                    break
-                except queue.Full:
+            if not self._stop_enqueued:
+                while True:
                     try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        continue
-                    self._record_drop("shutdown_queue_overflow")
+                        self._queue.put_nowait(None)
+                        self._stop_enqueued = True
+                        break
+                    except queue.Full:
+                        try:
+                            self._queue.get_nowait()
+                        except queue.Empty:
+                            continue
+                        drop_reason = "shutdown_queue_overflow"
+        if drop_reason is not None:
+            self._record_drop(drop_reason)
         self._thread.join(timeout)
         stopped = not self._thread.is_alive()
         if not stopped:

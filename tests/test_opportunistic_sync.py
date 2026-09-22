@@ -69,6 +69,7 @@ from omi_collector.capture.application.session_lifecycle import (
     OpportunisticOptions,
     RetryPolicy,
     SessionLifecycle,
+    SessionPhaseState,
     report_session_error,
     retryable,
     validate_presence_policy,
@@ -286,6 +287,73 @@ def _options(
         clock=local_clock,
         sleep=local_clock.sleep,
     )
+
+
+class _BlockingSealTarget:
+    attempt_id = "a" * 32
+
+    def __init__(self, bundle_path: Path) -> None:
+        self.bundle_path = bundle_path
+        self.seal_started = threading.Event()
+        self.release_seal = threading.Event()
+        self.seal_calls = 0
+
+    def prepare(self) -> None:
+        return None
+
+    def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefix:
+        del start_sequence, record_count
+        return DurablePrefix(10, 10, 0, "a" * 64)
+
+    def read_begin(self, notice: object) -> None:
+        del notice
+
+    def append_chunk(self, offset: int, chunk: memoryview) -> None:
+        del offset, chunk
+
+    def checkpoint(self) -> DurablePrefix:
+        return DurablePrefix(10, 11, 1, "a" * 64)
+
+    def seal(self, done_notice: object) -> SealResult:
+        del done_notice
+        self.seal_calls += 1
+        self.seal_started.set()
+        assert self.release_seal.wait(1)
+        return SealResult(self.bundle_path, False)
+
+    def publish_prefix(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _SealResultBatchWriter:
+    def __init__(self, target: _BlockingSealTarget) -> None:
+        self.writer = AttemptWriter(target, bytearray(RECORD_SIZE))
+        self.close_requested = threading.Event()
+
+    @property
+    def thread(self) -> threading.Thread:
+        return self.writer.thread
+
+    @property
+    def progress(self) -> WriterProgress:
+        return self.writer.progress
+
+    @property
+    def failure(self) -> BaseException | None:
+        return self.writer.failure
+
+    async def checkpoint(self) -> DurablePrefix:
+        return cast(DurablePrefix, await self.writer.checkpoint())
+
+    async def await_seal_result(self) -> SealResult | None:
+        return cast(SealResult | None, await self.writer.await_seal_result())
+
+    async def close(self, *, timeout: float) -> None:
+        self.close_requested.set()
+        await self.writer.close(timeout=timeout)
 
 
 @_async_test
@@ -2743,6 +2811,9 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
         progress = WriterProgress(RECORD_SIZE, 0)
         failure = latched
 
+        async def await_seal_result(self) -> object | None:
+            return None
+
         async def checkpoint(self) -> object:
             raise wrapped
 
@@ -2766,6 +2837,116 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
     with pytest.raises(OSError) as raised:
         await reconciler.checkpoint_after_session()
     assert raised.value is latched
+
+
+@_async_test
+async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_path: Path) -> None:
+    target = _BlockingSealTarget(tmp_path / "sealed")
+    writer = _SealResultBatchWriter(target)
+    await writer.writer.start()
+    await writer.writer.read_begin(ReadBeginNotification(10, 1))
+    assert writer.writer.publish(RECORD_SIZE)
+    durable = await writer.checkpoint()
+    batch = batch_reconciliation._Batch(
+        RingInfo(10, 11, 10000, 0, RECORD_SIZE),
+        10,
+        11,
+        TransferArena(10, 1, max_bytes=RECORD_SIZE),
+        cast(BatchWriterPort, writer),
+        durable,
+    )
+
+    timed_out = asyncio.create_task(batch_reconciliation._bounded(writer.writer.seal(DoneNotification(0, 11)), 0.01))
+    assert await asyncio.to_thread(target.seal_started.wait, 1)
+    with pytest.raises(batch_reconciliation.collector.CollectorTimeoutError):
+        await timed_out
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(
+        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _options(),
+        _runtime(),
+        quarantine,
+    )
+    reconciler._state.batch = batch
+    adoption = asyncio.create_task(reconciler.checkpoint_after_session())
+    await asyncio.sleep(0)
+    assert not adoption.done()
+    assert target.seal_calls == 1
+    target.release_seal.set()
+    await adoption
+    assert batch.seal == SealResult(tmp_path / "sealed", False)
+
+    current = RingInfo(10, 11, 10000, 0, RECORD_SIZE)
+
+    async def info(_session: RingSession) -> RingInfo:
+        return current
+
+    first = ScriptedRingSession(
+        _status(),
+        (WriteStep(encode_advance_command(11), error=RingTransportDisconnectedError("unknown")),),
+    )
+    with pytest.raises(batch_reconciliation.collector.AdvanceUncertainError):
+        await reconciler.connected_step(first, current, info, SessionPhaseState("advance"))
+
+    second = ScriptedRingSession(_status(), (WriteStep(encode_advance_command(11), (b"\x01\x00",)),))
+    confirmed_info = RingInfo(11, 11, 10000, 0, RECORD_SIZE)
+    second_infos = iter((current, confirmed_info))
+
+    async def second_info_reader(_session: RingSession) -> RingInfo:
+        return next(second_infos)
+
+    outcome, confirmed = await reconciler.connected_step(
+        second, current, second_info_reader, SessionPhaseState("advance")
+    )
+    assert outcome is None
+    assert confirmed == confirmed_info
+    assert target.seal_calls == 1
+    assert not writer.thread.is_alive()
+
+
+@_async_test
+async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tmp_path: Path) -> None:
+    target = _BlockingSealTarget(tmp_path / "sealed")
+    writer = _SealResultBatchWriter(target)
+    await writer.writer.start()
+    await writer.writer.read_begin(ReadBeginNotification(10, 1))
+    assert writer.writer.publish(RECORD_SIZE)
+    durable = await writer.checkpoint()
+    batch = batch_reconciliation._Batch(
+        RingInfo(10, 11, 10000, 0, RECORD_SIZE),
+        10,
+        11,
+        TransferArena(10, 1, max_bytes=RECORD_SIZE),
+        cast(BatchWriterPort, writer),
+        durable,
+    )
+    timed_out = asyncio.create_task(batch_reconciliation._bounded(writer.writer.seal(DoneNotification(0, 11)), 0.01))
+    assert await asyncio.to_thread(target.seal_started.wait, 1)
+    with pytest.raises(batch_reconciliation.collector.CollectorTimeoutError):
+        await timed_out
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(
+        StagingStore(tmp_path, _capture_root(tmp_path)),
+        replace(_options(), timeouts=TransferTimeouts(1, 0.01)),
+        _runtime(),
+        quarantine,
+    )
+    reconciler._state.batch = batch
+    finalizing = asyncio.create_task(reconciler.finalize_active())
+    assert await asyncio.to_thread(writer.close_requested.wait, 1)
+    target.release_seal.set()
+    result = await finalizing
+    assert result.checkpoint_error is None
+    assert result.close_error is None
+    assert result.preserved_path == tmp_path / "sealed"
+    assert result.preserved_kind == "sealed bundle"
+    assert not writer.thread.is_alive()
 
 
 @_async_test

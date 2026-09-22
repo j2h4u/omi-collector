@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.8](https://github.com/j2h4u/omi-collector/compare/v0.6.7...v0.6.8) (2026-09-22)
+
+
+### Fixes
+
+* report expected pendant absence as healthy ([#98](https://github.com/j2h4u/omi-collector/issues/98)) ([6e6b283](https://github.com/j2h4u/omi-collector/commit/6e6b283a7818b34fc9a44c0ca28c86fdd2d2742f))
+
 ## [0.6.7](https://github.com/j2h4u/omi-collector/compare/v0.6.6...v0.6.7) (2026-09-21)
 
 

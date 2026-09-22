@@ -115,7 +115,7 @@ function ensure_build_account {
 function prepare_deployment_directories {
     # args
     local -r build_state_dir="$1" uv_cache_dir="$2" deployment_root="$3" deployments_dir="$4"
-    local -r python_install_dir="$5" build_user="$6" build_group="$7" output_name="$8"
+    local -r python_install_dir="$5" build_user="$6" build_group="$7"
 
     # code
     # assert: candidate cache and release storage have fixed, non-overlapping roles
@@ -138,9 +138,6 @@ function prepare_deployment_directories {
     if [[ ! -e "$python_install_dir" && ! -L "$python_install_dir" ]]; then
         install -d -o "$build_user" -g "$build_group" -m 0755 -- "$python_install_dir" \
             || die 'could not prepare managed Python installation directory'
-        printf -v "$output_name" '%s' '1'
-    else
-        printf -v "$output_name" '%s' '0'
     fi
     # assert: the service cannot write the builder cache or release selectors
     [[ $(stat -c '%U:%G:%a' -- "$build_state_dir") == 'root:root:755' && ! -L "$build_state_dir" ]] \
@@ -151,6 +148,52 @@ function prepare_deployment_directories {
         || die "deployment root must be root:root 0755: ${deployment_root}"
     [[ $(stat -c '%U:%G:%a' -- "$deployments_dir") == 'root:root:755' ]] \
         || die "deployment directory must be root:root 0755: ${deployments_dir}"
+}
+
+function find_managed_build_python {
+    # args
+    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" uv_cache_dir="$5"
+    local -r python_install_dir="$6" uv_bin="$7"
+
+    # code
+    # assert: the build user can resolve the exact offline managed interpreter used by uv sync
+    "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
+        UV_CACHE_DIR="$uv_cache_dir" \
+        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+        "$uv_bin" python find --managed-python --no-python-downloads --no-project 3.14
+}
+
+function install_managed_build_python_if_missing {
+    # args
+    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" uv_cache_dir="$5"
+    local -r python_install_dir="$6" uv_bin="$7"
+
+    # vars
+    local metadata
+
+    # code
+    if find_managed_build_python "$runuser_bin" "$build_user" "$build_group" "$build_home" "$uv_cache_dir" \
+        "$python_install_dir" "$uv_bin" &> /dev/null; then
+        return
+    fi
+    [[ -d "$python_install_dir" && ! -L "$python_install_dir" ]] \
+        || die "managed Python installation is missing or unsafe: ${python_install_dir}"
+    metadata=$(stat -c '%U:%G:%a' -- "$python_install_dir") \
+        || die "could not inspect managed Python installation: ${python_install_dir}"
+    if [[ "$metadata" == 'root:root:755' ]]; then
+        die "managed Python 3.14 is absent from root-sealed installation; refusing to modify ${python_install_dir}"
+    fi
+    [[ "$metadata" == "${build_user}:${build_group}:755" ]] \
+        || die "managed Python installation must be build-owned or root-sealed: ${python_install_dir}"
+    if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
+        UV_CACHE_DIR="$uv_cache_dir" \
+        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+        "$uv_bin" python install 3.14; then
+        die 'could not install the managed build Python'
+    fi
+    find_managed_build_python "$runuser_bin" "$build_user" "$build_group" "$build_home" "$uv_cache_dir" \
+        "$python_install_dir" "$uv_bin" \
+        || die 'managed build Python 3.14 is unavailable after installation'
 }
 
 function write_release_metadata {
@@ -386,7 +429,7 @@ declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
-declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0 python_install_pending=0
+declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0
 declare -i service_quiesced=0 release_created=0 deployment_lock_fd=-1
 declare -ri readiness_poll_attempts=5 readiness_poll_interval_seconds=1 stability_interval_seconds=6
 
@@ -493,7 +536,7 @@ source_revision=$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}') \
 require_clean_source_tree "$repo_root"
 ensure_build_account "$build_user" "$build_group" "$build_state_dir" "$account_user" "$account_group"
 prepare_deployment_directories "$build_state_dir" "$uv_cache_dir" "$deployment_root" "$deployments_dir" \
-    "$python_install_dir" "$build_user" "$build_group" python_install_pending
+    "$python_install_dir" "$build_user" "$build_group"
 exec {deployment_lock_fd}>>"$deployment_lock_file" || die 'could not open the deployment transaction lock'
 flock --nonblock "$deployment_lock_fd" || die 'another deployment transaction is already in progress'
 read_current_target "$current_link" "$deployments_dir" previous_target
@@ -508,21 +551,15 @@ chown "$build_user:$build_group" "$staged_environment" \
     || die 'could not set staged deployment ownership'
 chmod 0750 "$staged_environment" || die 'could not set staged deployment mode'
 
-if (( python_install_pending )); then
-    if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$uv_cache_dir" \
-        UV_CACHE_DIR="$uv_cache_dir" \
-        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
-        "$uv_bin" python install 3.14; then
-        die 'could not install the managed build Python'
-    fi
-fi
+install_managed_build_python_if_missing "$runuser_bin" "$build_user" "$build_group" "$uv_cache_dir" "$uv_cache_dir" \
+    "$python_install_dir" "$uv_bin"
 if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$uv_cache_dir" \
     UV_PROJECT_ENVIRONMENT="$staged_environment" \
     UV_LINK_MODE=copy \
     UV_CACHE_DIR="$uv_cache_dir" \
     UV_PYTHON_INSTALL_DIR="$python_install_dir" \
     "$uv_bin" sync --project "$repo_root" --locked --no-dev --no-editable --reinstall-package omi-collector \
-        --no-python-downloads; then
+        --managed-python --no-python-downloads; then
     die 'uv sync failed; systemd was not touched'
 fi
 verify_installed_package "$runuser_bin" "$build_user" "$build_group" "$uv_cache_dir" "$staged_environment" "$source_package"

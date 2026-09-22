@@ -40,6 +40,7 @@ class _DeploymentScenario:
     same_primary_gid: bool = False
     service_group_membership: bool = False
     busybox_tools: bool = False
+    root_sealed_python_without_interpreter: bool = False
 
 
 _DEFAULT_SCENARIO = _DeploymentScenario()
@@ -308,10 +309,18 @@ def _write_build_fakes(
         "set -uo pipefail\n"
         f'printf "uv cwd=%s args=%s\\n" "$PWD" "$*" >> {quoted_log}\n'
         '[[ "$DEPLOY_BUILD_FAIL" != 1 ]] || exit 1\n'
-        'if [[ "$1" == python && "$2" == install ]]; then\n'
-        '    mkdir --parents "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin"\n'
+        'if [[ "$1" == python && "$2" == find ]]; then\n'
+        '    [[ -x "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python" ]] || exit 1\n'
+        '    printf "%s\\n" "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python"\n'
         "    exit 0\n"
         "fi\n"
+        'if [[ "$1" == python && "$2" == install ]]; then\n'
+        '    mkdir --parents "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin"\n'
+        '    : > "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python"\n'
+        '    chmod 0755 "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python"\n'
+        "    exit 0\n"
+        "fi\n"
+        '[[ -x "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python" ]] || exit 3\n'
         'python3 -m venv --copies --clear "$UV_PROJECT_ENVIRONMENT"\n'
         'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c '
         "'import sysconfig; print(sysconfig.get_path(\"purelib\"))')\n"
@@ -394,6 +403,12 @@ def _write_filesystem_fakes(context: _FakeCommandContext, scenario: _DeploymentS
     )
     (fake_bin / "install").chmod(0o755)
 
+    python_install_status = (
+        "root:root:755"
+        if scenario.root_sealed_python_without_interpreter
+        else f"$(if [[ -x {quoted_python_install}/cpython-3.14/bin/python ]]; then "
+        f"printf '%s' 'root:root:755'; else printf '%s' '{context.build_user}:{context.build_group}:755'; fi)"
+    )
     (fake_bin / "stat").write_text(
         "#!/usr/bin/env bash\n"
         'path="${@: -1}"\n'
@@ -401,8 +416,9 @@ def _write_filesystem_fakes(context: _FakeCommandContext, scenario: _DeploymentS
         f"if [[ \"$path\" == {quoted_build_state} ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
         f"if [[ \"$path\" == {quoted_uv_cache} ]]; then printf '%s\\n' "
         f"'{context.build_user}:{context.build_group}:750'; exit 0; fi\n"
+        f'if [[ "$path" == {quoted_python_install} ]]; then printf "%s\\n" "{python_install_status}"; exit 0; fi\n'
         f'if [[ "$path" == {quoted_deployment_root} || "$path" == {quoted_deployments_dir} '
-        f'|| "$path" == {quoted_python_install} || "$path" == {quoted_deployments_dir}/release-* '
+        f'|| "$path" == {quoted_deployments_dir}/release-* '
         "|| \"$path\" == */share/omi-collector ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
         'exec /usr/bin/stat "$@"\n',
         encoding="utf-8",
@@ -659,12 +675,15 @@ def test_deployer_verifies_candidate_as_builder_before_root_seals_or_restarts(tm
     assert result.returncode == 0, result.stderr
     commands = harness.log.read_text(encoding="utf-8")
     builder_runs = [line for line in commands.splitlines() if line.startswith("runuser args=")]
-    assert len(builder_runs) == 4
+    assert len(builder_runs) == 6
     assert all("--user omi-collector-build-test --group omi-collector-build-test --" in line for line in builder_runs)
-    assert "python install 3.14" in builder_runs[0]
-    assert "sync --project" in builder_runs[1]
-    assert "/bin/python -I -B -c" in builder_runs[2]
-    assert "config check --config" in builder_runs[3]
+    assert "python find --managed-python --no-python-downloads --no-project 3.14" in builder_runs[0]
+    assert "python install 3.14" in builder_runs[1]
+    assert "python find --managed-python --no-python-downloads --no-project 3.14" in builder_runs[2]
+    assert "sync --project" in builder_runs[3]
+    assert "--managed-python --no-python-downloads" in builder_runs[3]
+    assert "/bin/python -I -B -c" in builder_runs[4]
+    assert "config check --config" in builder_runs[5]
     config_check = commands.index("config check --config")
     restart = commands.index("systemctl args=stop omi-collector.service")
     assert config_check < restart
@@ -685,11 +704,46 @@ def test_deployer_build_user_runs_uv_from_the_staged_repository_not_the_caller_d
     commands = harness.log.read_text(encoding="utf-8")
     expected_cwd = harness.deployer.parents[1]
     uv_runs = [line for line in commands.splitlines() if line.startswith("uv cwd=")]
-    assert len(uv_runs) == 2
+    assert len(uv_runs) == 4
     assert all(f"uv cwd={expected_cwd} " in line for line in uv_runs)
     assert all(f"uv cwd={caller_cwd} " not in line for line in uv_runs)
-    assert "args=python install 3.14" in uv_runs[0]
-    assert "args=sync --project" in uv_runs[1]
+    assert "args=python find --managed-python --no-python-downloads --no-project 3.14" in uv_runs[0]
+    assert "args=python install 3.14" in uv_runs[1]
+    assert "args=python find --managed-python --no-python-downloads --no-project 3.14" in uv_runs[2]
+    assert "args=sync --project" in uv_runs[3]
+    assert "--managed-python --no-python-downloads" in uv_runs[3]
+
+
+def test_deployer_bootstraps_a_preexisting_empty_managed_python_directory(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path)
+    python_install = harness.deployment_root / "python"
+    python_install.mkdir(parents=True)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode == 0, result.stderr
+    assert (python_install / "cpython-3.14" / "bin" / "python").is_file()
+    uv_runs = [line for line in harness.log.read_text(encoding="utf-8").splitlines() if line.startswith("uv cwd=")]
+    install = next(index for index, line in enumerate(uv_runs) if "args=python install 3.14" in line)
+    sync = next(index for index, line in enumerate(uv_runs) if "args=sync --project" in line)
+    assert install < sync
+
+
+def test_deployer_fails_closed_for_an_empty_root_sealed_managed_python_directory(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(root_sealed_python_without_interpreter=True))
+    previous = _previous_release(harness)
+    (harness.deployment_root / "python").mkdir(exist_ok=True)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "absent from root-sealed installation" in result.stderr
+    assert harness.current_link.resolve(strict=True) == previous
+    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
+    commands = harness.log.read_text(encoding="utf-8")
+    assert "python install 3.14" not in commands
+    assert "args=sync --project" not in commands
+    assert "systemctl args=" not in commands
 
 
 def test_deployer_keeps_the_service_untouched_when_the_build_user_uv_command_fails(tmp_path: Path) -> None:

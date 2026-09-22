@@ -222,7 +222,7 @@ def collect_operator_status(
     except ValueError as error:
         raise OperatorStatusError(str(error)) from error
     device = _device_status(observations[0]) if observations else None
-    window_status = _window_status(quality)
+    window_status = _window_status(quality, runtime_state=runtime["state"])
     if runtime["attention_reasons"]:
         window_status = "attention"
     return {
@@ -409,11 +409,13 @@ def _device_status(observation: FirmwareObservation) -> dict[str, object]:
     }
 
 
-def _window_status(quality: _QualityWindow) -> str:
+def _window_status(quality: _QualityWindow, *, runtime_state: object) -> str:
     if quality.loss_events:
         return "attention"
     if quality.last_transfer_termination_class in {"cancelled", "fatal_error", "teardown_interrupted"}:
         return "attention"
+    if runtime_state in {"away", "drained"}:
+        return "ok"
     return "ok" if quality.completed_transfers else "unknown"
 
 

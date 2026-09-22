@@ -212,6 +212,22 @@ def test_status_clears_timeline_publication_block_after_successful_generation(
     assert result["status"] == "unknown"
 
 
+def test_status_treats_expected_pendant_absence_as_healthy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    row = {
+        "event": "sync_progress",
+        "fields": {"progress": {"status": "away"}},
+        "timestamp": "2026-09-08T09:00:00+00:00",
+    }
+    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    assert result["status"] == "ok"
+    assert cast(dict[str, object], result["runtime"])["state"] == "away"
+
+
 def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     (layout.collector.root / "quality.jsonl").write_text("not-json\n", encoding="utf-8")

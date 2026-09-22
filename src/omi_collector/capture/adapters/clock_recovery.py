@@ -98,18 +98,6 @@ class HistoricalClockImporter:
         apply: bool,
         tolerance_seconds: float,
     ) -> tuple[HistoricalRecoveryDecision, ...]:
-        if not any(item.role == "anchor" for item in normalized):
-            _validate_legacy_incident(normalized, operation)
-            observation = self._draft_observation(normalized, operation)
-            return (
-                HistoricalRecoveryDecision(
-                    operation.operation_id,
-                    "unresolved",
-                    None,
-                    observation.observation_id,
-                    "systemd start anchor is absent",
-                ),
-            )
         _validate_incident(normalized, operation)
         _validate_mapping(normalized, tolerance_seconds)
         observation = (
@@ -585,14 +573,6 @@ def _validate_incident(entries: tuple[_Entry, ...], operation: ClockCorrection) 
         raise HistoricalRecoveryError("incident observation boundaries do not match the operation")
     if len({item.source_hash for item in entries}) != len(entries):
         raise HistoricalRecoveryError("historical incident contains duplicate evidence")
-
-
-def _validate_legacy_incident(entries: tuple[_Entry, ...], operation: ClockCorrection) -> None:
-    roles = [item.role for item in entries]
-    if roles.count("initial") != 1 or roles.count("later") != 1:
-        raise HistoricalRecoveryError("incident requires initial and later observations")
-    if any(item.operation_id != operation.operation_id for item in entries):
-        raise HistoricalRecoveryError("historical observation is bound to a competing operation")
 
 
 def _validate_incident_shape(entries: tuple[_Entry, ...], operation: ClockCorrection) -> None:

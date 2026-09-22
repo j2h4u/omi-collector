@@ -28,7 +28,7 @@ from .operational_telemetry import (
     collect_operational_telemetry,
     system_host_clock_synchronized,
 )
-from .ports import CaptureRuntimePort
+from .ports import CaptureRuntimePort, PublicationAuthorityPort
 from .presence import PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
@@ -116,7 +116,7 @@ class OpportunisticOptions:
     presence: PresenceSchedulerPort | None = None
     quality_metrics: QualityMetricsPort | None = None
     clock_correction_sink: ClockCorrectionSink | None = None
-    timeline_publisher: Callable[[], object] | None = None
+    timeline_publisher: PublicationAuthorityPort | None = None
     clock_lease: Callable[[], AbstractContextManager[object]] | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
@@ -436,16 +436,13 @@ class SessionLifecycle:
                             monotonic=options.clock,
                             session_id=phase.quality.session_id if phase.quality is not None else "native",
                             publisher=options.timeline_publisher,
+                            mutation_lease=options.clock_lease,
                         ),
                     ),
                     timeout,
                 )
 
-            if options.clock_lease is None:
-                await run_telemetry()
-            else:
-                with options.clock_lease():
-                    await run_telemetry()
+            await run_telemetry()
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - optional telemetry

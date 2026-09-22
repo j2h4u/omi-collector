@@ -4,7 +4,7 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable
-from json import dumps
+from json import dumps, loads
 from pathlib import Path
 from struct import pack
 from typing import cast
@@ -145,7 +145,7 @@ def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) 
     _run(scenario())
 
 
-def test_pending_startup_hydration_is_reused_by_lease_bound_resume(
+def test_pending_startup_hydration_streams_raw_evidence_for_lease_bound_promotion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
@@ -164,7 +164,7 @@ def test_pending_startup_hydration_is_reused_by_lease_bound_resume(
         resumed.close()
 
 
-def test_pending_startup_inspection_does_not_promote_tail_without_lease(tmp_path: Path) -> None:
+def test_pending_startup_establishes_aligned_tail_under_a_lease_before_binding(tmp_path: Path) -> None:
     store = _store(tmp_path)
     attempt = store.prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
@@ -181,9 +181,45 @@ def test_pending_startup_inspection_does_not_promote_tail_without_lease(tmp_path
         _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup()),
     )
 
-    assert state.durable_next == 101
-    assert (attempt.path / "checkpoint.json").read_text(encoding="utf-8") == checkpoint
+    assert state.durable_next == 102
+    assert (attempt.path / "checkpoint.json").read_text(encoding="utf-8") != checkpoint
+    assert loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8"))["record_count"] == 2
     assert (attempt.path / "records.bin").read_bytes() == raw
+
+
+def test_presence_startup_state_binds_once_after_a_completed_attempt(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                return None
+
+        store = _store(tmp_path)
+        _seed_streaming_partial(store, count=1)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        bound: list[PendingStartupState] = []
+
+        await maintenance.wait_for_presence_attempt(Presence(), bound.append)
+        pending = bound[0].pending
+        assert pending is not None
+        with store.device_lock() as lease:
+            completed = store.resume_streaming_attempt(lease)
+            assert completed is not None
+            assert completed.publish_prefix() is not None
+            completed.close(durable=True)
+        store.terminalize_prefix_attempt(pending.attempt_id)
+        assert store.pending_attempts() == ()
+
+        # A second wake must not bind maintenance's cached, now-completed
+        # descriptor back into the reconciler.
+        await maintenance.wait_for_presence_attempt(Presence(), bound.append)
+
+        assert len(bound) == 1
+        assert bound[0].pending is not None
+
+    _run(scenario())
 
 
 def test_retryable_quarantine_publication_observes_configured_cooldown(

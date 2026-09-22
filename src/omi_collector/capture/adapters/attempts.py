@@ -144,6 +144,7 @@ class StagedAttempt:
         if self.descriptor.read_begin_start is None:
             if (start, count) != self._requested_range():
                 raise AttemptStateError("initial READ does not match the prepared range")
+            self._admit_remaining_capture()
             return self.checkpoint()
         return self.begin_recovery(start, count)
 
@@ -179,6 +180,7 @@ class StagedAttempt:
         prefix = self.durable_prefix
         if start_sequence > prefix.next_sequence:
             raise RecordGapError("recovery leg starts after the next durable sequence")
+        self._admit_remaining_capture()
         # Recovery intent is ephemeral. The checkpoint is the sole durable
         # recovery frontier; after a restart the next READ begins at it again.
         self._recovery_start = start_sequence
@@ -414,6 +416,13 @@ class StagedAttempt:
 
     def _requested_range(self) -> tuple[int, int]:
         return self.descriptor.start_sequence, self.descriptor.packet_count
+
+    def _admit_remaining_capture(self) -> None:
+        """Recheck capacity before every consuming READ leg."""
+        self._filesystem._preflight(
+            self.descriptor.packet_count,
+            staged_bytes=self._stream_written_bytes,
+        )
 
     def _hydrate_streaming_prefix(self) -> None:
         """Authenticate the checkpoint prefix while hashing raw evidence once."""

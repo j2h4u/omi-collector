@@ -68,6 +68,7 @@ from omi_collector.capture.application.session_lifecycle import (
     ActivityEvent,
     OpportunisticOptions,
     RetryPolicy,
+    SessionLifecycle,
     report_session_error,
     retryable,
     validate_presence_policy,
@@ -285,6 +286,34 @@ def _options(
         clock=local_clock,
         sleep=local_clock.sleep,
     )
+
+
+@_async_test
+async def test_coordinator_wires_clock_telemetry_to_storage_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    lease_entries: list[str] = []
+    original_lease = store.clock_mutation_lease
+
+    def clock_mutation_lease() -> object:
+        lease_entries.append("created")
+        return original_lease()
+
+    async def observe_options(self: SessionLifecycle) -> NoDataResult:
+        lease = self.run.options.clock_lease
+        assert lease is not None
+        with lease():
+            lease_entries.append("entered")
+        return NoDataResult(RingInfo(0, 0, 0, 0, RECORD_SIZE))
+
+    monkeypatch.setattr(store, "clock_mutation_lease", clock_mutation_lease)
+    monkeypatch.setattr(SessionLifecycle, "run_direct", observe_options)
+
+    result = await run_opportunistic_collector(Provider([]), store, _options())
+
+    assert result.info.read_sequence == 0
+    assert lease_entries == ["created", "entered"]
 
 
 @_async_test
@@ -1289,6 +1318,52 @@ async def test_resume_cursor_matrix(
 
 
 @_async_test
+async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt(100, 3)
+    attempt.record_read_begin(ReadBeginNotification(100, 3))
+    attempt.append_record(0, 100, _record(100))
+    attempt.checkpoint()
+    attempt.append_record(1, 101, _record(101))
+    attempt.close(durable=True)
+
+    original_arena = batch_reconciliation.TransferArena
+    checkpoint_counts_at_allocation: list[int] = []
+
+    def observe_arena(
+        start_sequence: int,
+        total_records: int,
+        *,
+        max_bytes: int,
+        record_size: int = RECORD_SIZE,
+    ) -> TransferArena:
+        checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+        checkpoint_counts_at_allocation.append(cast(int, checkpoint["record_count"]))
+        return original_arena(start_sequence, total_records, max_bytes=max_bytes, record_size=record_size)
+
+    monkeypatch.setattr(batch_reconciliation, "TransferArena", observe_arena)
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(102, 103),)),
+            WriteStep(encode_read_command(102, 1), (_begin(102, 1), _data(_record(102)), _done(103))),
+            WriteStep(b"\x10", (_info(102, 103),)),
+            WriteStep(encode_advance_command(103), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(103, 103),)),
+        ),
+    )
+
+    result = await run_opportunistic_collector(Provider([session]), store, _options(batch_records=3))
+
+    assert isinstance(result, CollectionResult)
+    assert result.next_sequence == 103
+    assert checkpoint_counts_at_allocation == [2]
+    assert session.writes[1] == encode_read_command(102, 1)
+
+
+@_async_test
 async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
     session = ScriptedRingSession(
@@ -2269,6 +2344,69 @@ async def test_disconnect_next_day_replays_overlap_and_progress_counts_unique_by
     assert progress[-1].records_completed == progress[-1].records_total == 2
     assert progress[-1].bytes_completed == 2 * RECORD_SIZE
     assert progress[-1].eta in (0.0, None)
+
+
+@_async_test
+async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -> None:
+    first = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(
+                encode_read_command(10, 2),
+                (_begin(10, 2), _data(_record(10)), RingTransportDisconnectedError("gone")),
+            ),
+            WriteStep(encode_stop_command()),
+        ),
+    )
+    complete = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(11, 1), (_begin(11, 1), _data(_record(11)), _done(12))),
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_advance_command(12), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(12, 12),)),
+        ),
+    )
+
+    class ReadClock(Clock):
+        def __call__(self) -> float:
+            current = self.value
+            self.value += 1
+            return current
+
+    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
+    clock = ReadClock()
+    result = await run_opportunistic_collector(
+        Provider([first, complete]),
+        StagingStore(tmp_path, _capture_root(tmp_path)),
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.001,), batch_records=2, stop_after_drained=True),
+            clock=clock,
+            sleep=clock.sleep,
+            host_time=lambda: 1000.0,
+            quality_metrics=journal,
+        ),
+    )
+    assert journal.close()
+
+    metrics = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
+    assert isinstance(result, CollectionResult)
+    assert result.packet_count == 2
+    assert [metric["requested_record_count"] for metric in metrics] == [2, 1]
+    assert [metric["received_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
+    assert [metric["submitted_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
+    assert [metric["written_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
+    assert [metric["active_read_elapsed_ms"] for metric in metrics] == [1000, 1000]
+    assert sum(cast(int, metric["written_raw_bytes"]) for metric in metrics) == 2 * RECORD_SIZE
+    assert (
+        sum(cast(int, metric["written_raw_bytes"]) for metric in metrics)
+        * 1000
+        / sum(cast(int, metric["active_read_elapsed_ms"]) for metric in metrics)
+        == RECORD_SIZE
+    )
 
 
 @_async_test

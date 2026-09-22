@@ -20,7 +20,7 @@ from omi_collector.capture.adapters.attempts import (
     RecordGapError,
     RecordMismatchError,
 )
-from omi_collector.capture.adapters.staging_contract import AttemptStateError
+from omi_collector.capture.adapters.staging_contract import AttemptStateError, DiskSpaceError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
@@ -277,7 +277,7 @@ def test_durability_config_projects_headroom_overhead_and_checkpoint_batching(tm
         io_chunk_bytes=7,
     )
     config = CollectorConfig(durability=durability)
-    expected_required = 3 * RECORD_SIZE + max(10, 3 * RECORD_SIZE // 2)
+    expected_required = (2 * 3 * RECORD_SIZE) + max(10, 3 * RECORD_SIZE // 2)
 
     def statvfs(_: str | Path) -> object:
         return SimpleNamespace(f_bavail=expected_required, f_frsize=1)
@@ -289,8 +289,53 @@ def test_durability_config_projects_headroom_overhead_and_checkpoint_batching(tm
     attempt.append_record(1, 101, _record(2))
 
     checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text()))
-    assert expected_required == 1998
+    assert expected_required == 3330
     assert checkpoint["record_count"] == 2
+
+
+def test_resumed_attempt_rechecks_remaining_capacity_before_its_next_read(tmp_path: Path) -> None:
+    durability = DurabilityConfig(
+        staging_headroom_bytes=10,
+        staging_overhead_fraction=0.5,
+        checkpoint_records=2,
+        io_chunk_bytes=7,
+    )
+    config = CollectorConfig(durability=durability)
+    total_raw_bytes = 3 * RECORD_SIZE
+    reserve_bytes = max(10, total_raw_bytes // 2)
+    initial_required = (2 * total_raw_bytes) + reserve_bytes
+    resumed_required = (2 * RECORD_SIZE) + total_raw_bytes + reserve_bytes
+
+    def space(available: int) -> Callable[[str | Path], object]:
+        return lambda _path: SimpleNamespace(f_bavail=available, f_frsize=1)
+
+    initial_store = StagingStore(
+        tmp_path,
+        _capture_root(tmp_path),
+        statvfs_fn=space(initial_required),
+        config=config,
+    )
+    attempt = initial_store.prepare_streaming_attempt(100, 3)
+    attempt.prepare_leg(100, 3)
+    attempt.record_read_begin(ReadBeginNotification(100, 3))
+    first = _record(1)
+    attempt.append_record(0, 100, first)
+    attempt.checkpoint()
+    attempt.close(durable=True)
+
+    restarted = StagingStore(
+        tmp_path,
+        _capture_root(tmp_path),
+        statvfs_fn=space(resumed_required - 1),
+        config=config,
+    )
+    with restarted.device_lock() as lease:
+        resumed = restarted.resume_streaming_attempt(lease)
+        assert resumed is not None
+        with pytest.raises(DiskSpaceError, match=f"need {resumed_required} bytes"):
+            resumed.prepare_leg(101, 2)
+        assert (resumed.path / "records.bin").read_bytes() == first
+        resumed.close(durable=True)
 
 
 def test_writer_close_failure_preserves_recoverable_prefix_without_terminal_marker(
@@ -593,7 +638,10 @@ def test_read_begin_is_idempotent_and_rejects_mismatch(tmp_path: Path) -> None:
         attempt.record_read_begin(ReadBeginNotification(100, 2))
 
 
-@pytest.mark.parametrize(("start_sequence", "packet_count"), [(-1, 1), (1, 0), (True, 1)])
+@pytest.mark.parametrize(
+    ("start_sequence", "packet_count"),
+    [(-1, 1), (1, 0), (True, 1), (1, 1 << 32)],
+)
 def test_prepare_validates_sequences_and_counts(tmp_path: Path, start_sequence: int, packet_count: int) -> None:
     with pytest.raises(AttemptStateError):
         StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(start_sequence, packet_count)

@@ -209,11 +209,20 @@ class StagingFilesystem:
         self.device_state_path = _contained_path(self.device_state_path, self.spool, "device state")
         _require_same_filesystem(self.spool, self.capture_root)
 
-    def _preflight(self, packet_count: int) -> None:
-        required = packet_count * RECORD_SIZE + max(
+    def _preflight(self, packet_count: int, *, staged_bytes: int = 0) -> None:
+        captured_bytes = packet_count * RECORD_SIZE
+        if staged_bytes < 0 or staged_bytes > captured_bytes:
+            raise AttemptStateError("staged raw bytes exceed the prepared range")
+        reserve_bytes = max(
             self._durability.staging_headroom_bytes,
-            int(packet_count * RECORD_SIZE * self._durability.staging_overhead_fraction),
+            int(captured_bytes * self._durability.staging_overhead_fraction),
         )
+        # Full publication copies records.bin into a capture-local temporary
+        # directory before atomically renaming it.  The source attempt remains
+        # recoverable until that switch succeeds. Existing raw bytes are already
+        # allocated, so later READ legs reserve only the missing source suffix,
+        # then the full capture copy and configured metadata/durability reserve.
+        required = (captured_bytes - staged_bytes) + captured_bytes + reserve_bytes
         self._prepare_roots()
         self._ensure_real_directory(self.capture_root, "capture root")
         result = self._statvfs(self.spool)

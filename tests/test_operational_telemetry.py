@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections.abc import Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from hashlib import sha256
 from pathlib import Path
 from shutil import rmtree
@@ -281,6 +281,111 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
     assert events[-1]["boundary_sequence_max"] == 14
 
 
+def test_clock_mutation_lease_guards_durable_sync_writes() -> None:
+    active = False
+    entries: list[str] = []
+
+    @contextmanager
+    def mutation_lease():
+        nonlocal active
+        entries.append("entered")
+        active = True
+        try:
+            yield
+        finally:
+            active = False
+            entries.append("exited")
+
+    class GuardedSink(FakeClockCorrectionSink):
+        def append(self, **_values: object) -> object:
+            assert active
+            return object()
+
+        def prepare(
+            self, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
+        ) -> object:
+            assert active
+            return super().prepare(observed_epoch, target_epoch, drift_seconds, boundary_sequence_min)
+
+        def mark_unresolved(self, correction: object) -> object:
+            assert active
+            return super().mark_unresolved(correction)
+
+        def finish(self, correction: object, **values: object) -> object:
+            assert active
+            return super().finish(correction, **values)
+
+        def reconcile_observation(
+            self,
+            observed_epoch: int,
+            drift_seconds: float,
+            boundary_sequence_max: int,
+            *,
+            near_zero_threshold: float,
+        ) -> tuple[object, ...]:
+            assert active
+            return super().reconcile_observation(
+                observed_epoch, drift_seconds, boundary_sequence_max, near_zero_threshold=near_zero_threshold
+            )
+
+    session = FakeOperationalSession(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)}, readback=pack("<I", 1000)
+    )
+    events: list[dict[str, object]] = []
+    ticks = iter((1000.0,) * 8)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                correction_sink=GuardedSink(),
+                mutation_lease=mutation_lease,
+            ),
+        )
+    )
+
+    assert entries == ["entered", "exited"]
+    assert events[-1]["outcome"] == "verified"
+
+
+def test_busy_clock_mutation_lease_defers_clock_sync_without_a_session_error() -> None:
+    class BusyLease:
+        def __enter__(self) -> object:
+            raise OSError("writer owns the storage lease")
+
+        def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
+    events: list[dict[str, object]] = []
+    ticks = iter((1000.0,) * 8)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                correction_sink=FakeClockCorrectionSink(),
+                mutation_lease=lambda: BusyLease(),
+            ),
+        )
+    )
+
+    assert session.writes == []
+    assert events[-1]["outcome"] == "storage_lease_unavailable"
+
+
 def test_verified_zero_width_boundary_is_resolved_immediately() -> None:
     target = pack("<I", 1000)
     session = FakeOperationalSession(
@@ -431,6 +536,7 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
         StagingStore(tmp_path, capture_root).paths,
         publication_root=tmp_path / "published",
     )
+    authority = staging.create_publication_authority()
     before_raw = {path.name: (path / "records.bin").read_bytes() for path in capture_root.iterdir() if path.is_dir()}
     session = FakeOperationalSession(
         {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 43)},
@@ -444,22 +550,26 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     async def info_after() -> RingInfo:
         return frontier
 
-    asyncio.run(
-        collect_operational_telemetry(
-            session,
-            _status(),
-            info,
-            _event_emitter(events),
-            clock=TelemetryClock(
-                lambda: next(ticks),
-                lambda: True,
-                0.5,
-                info_reader=info_after,
-                correction_sink=cast(ClockCorrectionSink, ClockCorrectionStore(staging.device_state_path)),
-                publisher=staging.publish_timeline,
-            ),
+    async def collect_from_bounded_child() -> None:
+        task = asyncio.create_task(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                info,
+                _event_emitter(events),
+                clock=TelemetryClock(
+                    lambda: next(ticks),
+                    lambda: True,
+                    0.5,
+                    info_reader=info_after,
+                    correction_sink=cast(ClockCorrectionSink, ClockCorrectionStore(staging.device_state_path)),
+                    publisher=authority,
+                ),
+            )
         )
-    )
+        await task
+
+    asyncio.run(collect_from_bounded_child())
 
     durable_store = ClockCorrectionStore(staging.device_state_path)
     corrections = durable_store.records()
@@ -485,6 +595,7 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
         path.name: (path / "records.bin").read_bytes() for path in capture_root.iterdir() if path.is_dir()
     } == before_raw
     assert ClockCorrectionStore(staging.device_state_path).records()[0].state == "resolved"
+    authority.close()
 
 
 def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:

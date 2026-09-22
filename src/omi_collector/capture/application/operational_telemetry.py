@@ -11,6 +11,7 @@ import asyncio
 import subprocess
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from inspect import isawaitable
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Protocol, cast
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RingInfo, RingStatus
+from .ports import PublicationAuthorityPort
 
 TIME_SERVICE_UUID = "19b10030-e8f2-537e-4f6c-d104768a1214"
 TIME_WRITE_UUID = "19b10031-e8f2-537e-4f6c-d104768a1214"
@@ -46,6 +48,7 @@ type OptionalReader = Callable[[str], Awaitable[bytes | None]]
 type OptionalWriter = Callable[[str, bytes], Awaitable[object]]
 type InfoReader = Callable[[], Awaitable[RingInfo]]
 type StatusReader = Callable[[], Awaitable[RingStatus | None]]
+type ClockMutationLease = Callable[[], AbstractContextManager[object]]
 
 
 class OperationalSession(Protocol):
@@ -122,7 +125,8 @@ class TelemetryClock:
     monotonic: Callable[[], float] = time.monotonic
     host_boot_id: str = field(default_factory=system_host_boot_id)
     session_id: str = "native"
-    publisher: Callable[[], object] | None = None
+    publisher: PublicationAuthorityPort | None = None
+    mutation_lease: ClockMutationLease | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,25 +192,24 @@ async def collect_operational_telemetry(
         telemetry_clock.operation_timeout,
     )
     clock_events: list[dict[str, object]] = []
-    await _sync_clock(
-        _ClockSync(
-            reader,
-            writer,
-            sample,
-            synchronized,
-            clock_events.append,
-            telemetry_clock.operation_timeout,
-            info,
-            telemetry_clock.info_reader,
-            telemetry_clock.correction_sink,
-            telemetry_clock.now,
-            observation_sink,
-            telemetry_clock.host_boot_id,
-            telemetry_clock.session_id,
-            telemetry_clock.monotonic,
-            telemetry_clock.publisher,
-        )
+    sync = _ClockSync(
+        reader,
+        writer,
+        sample,
+        synchronized,
+        clock_events.append,
+        telemetry_clock.operation_timeout,
+        info,
+        telemetry_clock.info_reader,
+        telemetry_clock.correction_sink,
+        telemetry_clock.now,
+        observation_sink,
+        telemetry_clock.host_boot_id,
+        telemetry_clock.session_id,
+        telemetry_clock.monotonic,
+        telemetry_clock.publisher,
     )
+    await _sync_clock_with_mutation_lease(sync, telemetry_clock.mutation_lease)
     if status is None and telemetry_clock.status_reader is not None:
         try:
             status = await _bounded_optional(telemetry_clock.status_reader(), telemetry_clock.operation_timeout)
@@ -321,7 +324,28 @@ class _ClockSync:
     host_boot_id: str
     session_id: str
     host_monotonic: Callable[[], float]
-    publisher: Callable[[], object] | None
+    publisher: PublicationAuthorityPort | None
+
+
+async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: ClockMutationLease | None) -> None:
+    """Keep clock evidence under the staging lease without interrupting a resumed writer."""
+    if mutation_lease is None:
+        await _sync_clock(sync)
+        return
+    try:
+        with mutation_lease():
+            await _sync_clock(sync)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a held writer lease defers optional clock mutation
+        sync.emit(
+            {
+                "event": "pendant_clock_sync",
+                "action": "none",
+                "outcome": "storage_lease_unavailable",
+                "boundary_sequence_min": sync.info_before.write_sequence,
+            }
+        )
 
 
 async def _sync_clock(sync: _ClockSync) -> None:  # noqa: PLR0911 - each failure class is an explicit safe exit
@@ -402,7 +426,7 @@ async def _publish_timeline(sync: _ClockSync, event: dict[str, object]) -> None:
     if sync.publisher is None:
         return
     try:
-        result = sync.publisher()
+        result = sync.publisher.publish()
         if isawaitable(result):
             await _bounded_optional(cast(Awaitable[object], result), sync.operation_timeout)
     except asyncio.CancelledError:

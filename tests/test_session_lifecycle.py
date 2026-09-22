@@ -10,8 +10,8 @@ from typing import Never, cast
 import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.application.collector import NoDataResult, TransferTimeouts
+from omi_collector.capture.application.operational_telemetry import ClockCorrectionSink, TelemetryClock
 from omi_collector.capture.application.ports import CaptureRuntimePort
 from omi_collector.capture.application.presence import (
     PresenceAdvertisement,
@@ -96,13 +96,15 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
     assert events == ["connected", "teardown", "checkpoint"]
 
 
-def test_held_clock_lease_is_a_retryable_session_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     info = RingInfo(10, 10, 100, 0, 512)
     activity: list[object] = []
+    observed: list[object] = []
+    errors: list[BaseException] = []
 
-    class BusyLease:
+    class Lease:
         def __enter__(self) -> object:
-            raise DeviceAlreadyRunningError("collector lock is held")
+            return self
 
         def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
             return None
@@ -123,6 +125,12 @@ def test_held_clock_lease_is_a_retryable_session_error(monkeypatch: pytest.Monke
         del timeout
         return info
 
+    async def telemetry(*_args: object, clock: TelemetryClock, **_kwargs: object) -> None:
+        observed.append(clock.mutation_lease)
+
+    async def observe_error(_activity: object, _phase: object, error: BaseException, _runtime: object) -> None:
+        errors.append(error)
+
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=_noop,
         wait_presence_attempt=_wait,
@@ -135,8 +143,8 @@ def test_held_clock_lease_is_a_retryable_session_error(monkeypatch: pytest.Monke
         TransferTimeouts(1, 1),
         RetryPolicy(backoff=(1,), stop_after_drained=True),
         activity=activity.append,
-        operational=lambda _event: None,
-        clock_lease=lambda: BusyLease(),
+        clock_correction_sink=cast(ClockCorrectionSink, object()),
+        clock_lease=lambda: Lease(),
     )
     run = SessionLifecycleRun(
         provider=lambda _candidate: Context(),
@@ -147,11 +155,15 @@ def test_held_clock_lease_is_a_retryable_session_error(monkeypatch: pytest.Monke
 
     async def scenario() -> None:
         monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+        monkeypatch.setattr(
+            "omi_collector.capture.application.session_lifecycle.collect_operational_telemetry", telemetry
+        )
+        monkeypatch.setattr("omi_collector.capture.application.session_lifecycle.report_session_error", observe_error)
         await SessionLifecycle(run).run_session(Context())
 
     _run(scenario())
-    assert [getattr(event, "state", None) for event in activity] == ["session_error"]
-    assert getattr(activity[0], "phase", None) == "telemetry"
+    assert activity == [], errors
+    assert observed == [options.clock_lease]
 
 
 def test_connected_step_cancellation_identity_reaches_context_exit(monkeypatch: pytest.MonkeyPatch) -> None:

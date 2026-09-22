@@ -228,27 +228,6 @@ class ClockCorrectionStore:
             operation_id=operation_id,
         )
 
-    def replay_observations(self, *, near_zero_threshold: float) -> tuple[ClockCorrection, ...]:
-        """Replay durable later observations after a process restart."""
-        if near_zero_threshold <= 0:
-            raise ValueError("near-zero threshold must be positive")
-        changed: list[ClockCorrection] = []
-        for correction in self.records():
-            if correction.state != "unresolved":
-                continue
-            observations = self._observations.for_operation(correction.operation_id)
-            observation = next(
-                (
-                    item
-                    for item in reversed(observations)
-                    if item.observation_role == "later" and _replayable_observation(item, observations)
-                ),
-                None,
-            )
-            if observation is not None:
-                changed.extend(self.reconcile_causal_observation(observation, near_zero_threshold=near_zero_threshold))
-        return tuple(changed)
-
     def recover_prepared(self) -> tuple[ClockCorrection, ...]:
         """Atomically settle intents that crashed before ambiguity was opened."""
         recovered: list[ClockCorrection] = []
@@ -500,19 +479,6 @@ def _causal_inputs(observation: object, records: tuple[object, ...]) -> tuple[in
         operation_id,
         observation_id,
         float(observed_epoch) - ((float(start) + float(end)) / 2.0),
-    )
-
-
-def _replayable_observation(observation: object, records: tuple[object, ...]) -> bool:
-    parent_id = getattr(observation, "parent_observation_id", None)
-    if parent_id is None:
-        return False
-    parent = next((item for item in records if getattr(item, "observation_id", None) == parent_id), None)
-    return bool(
-        parent is not None
-        and getattr(parent, "operation_id", None) in {None, getattr(observation, "operation_id", None)}
-        and getattr(parent, "observation_role", None) in {"initial", "standalone"}
-        and getattr(parent, "causal_order", -1) < getattr(observation, "causal_order", -1)
     )
 
 

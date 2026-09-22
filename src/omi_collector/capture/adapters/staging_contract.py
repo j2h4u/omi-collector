@@ -27,6 +27,7 @@ _ATTEMPT_ID_LENGTH = 32
 _UUID_HEX_LENGTH = 32
 _SHA256_LENGTH = 64
 _ATTEMPT_SCHEMA_VERSION = 2
+_MAX_READ_PACKET_COUNT = (1 << 32) - 1
 
 
 class StagingError(RuntimeError):
@@ -104,6 +105,8 @@ def _validate_count(value: int) -> None:
     _validate_int(value, "packet_count")
     if value == 0:
         raise AttemptStateError("packet_count must be positive")
+    if value > _MAX_READ_PACKET_COUNT:
+        raise AttemptStateError("packet_count exceeds the protocol uint32 limit")
 
 
 def _validate_terminalized_at(value: int) -> None:

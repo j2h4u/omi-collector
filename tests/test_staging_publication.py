@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from errno import EXDEV
+from errno import ENOSPC, EXDEV
 from hashlib import sha256
 from json import dumps, loads
 from os import PathLike, fsync
@@ -27,6 +27,7 @@ from omi_collector.capture.adapters.staging_contract import (
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
+from omi_collector.config import DEFAULT_CONFIG
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -274,6 +275,69 @@ def test_full_seal_keeps_source_when_destination_copy_fails(tmp_path: Path, monk
         attempt.seal(DoneNotification(0, 101))
 
     assert attempt.path.exists()
+    assert not tuple(capture_root.glob("100-101-*"))
+    assert not tuple(capture_root.glob(".*.tmp"))
+
+
+def test_admission_reserves_staged_and_captured_raw_peak_before_read(tmp_path: Path) -> None:
+    count = 2
+    raw_bytes = count * RECORD_SIZE
+    reserve_bytes = max(
+        DEFAULT_CONFIG.durability.staging_headroom_bytes,
+        int(raw_bytes * DEFAULT_CONFIG.durability.staging_overhead_fraction),
+    )
+    required = (2 * raw_bytes) + reserve_bytes
+
+    class BoundarySpace:
+        f_frsize = 1
+
+        def __init__(self, available: int) -> None:
+            self.f_bavail = available
+
+    rejected = StagingStore(
+        tmp_path / "rejected-spool",
+        _capture_root(tmp_path / "rejected"),
+        statvfs_fn=lambda _path: BoundarySpace(required - 1),
+    )
+    with pytest.raises(DiskSpaceError, match=f"need {required} bytes"):
+        rejected.prepare_streaming_attempt(100, count)
+    assert not (tmp_path / "rejected-spool" / "attempts").exists()
+
+    admitted = StagingStore(
+        tmp_path / "admitted-spool",
+        _capture_root(tmp_path / "admitted"),
+        statvfs_fn=lambda _path: BoundarySpace(required),
+    )
+    attempt = admitted.prepare_streaming_attempt(100, count)
+    attempt.record_read_begin(ReadBeginNotification(100, count))
+    attempt.append_record(0, 100, _record(1))
+    attempt.append_record(1, 101, _record(2))
+
+    result = attempt.seal(DoneNotification(0, 102))
+
+    assert result.bundle_path.exists()
+
+
+def test_enospc_during_copy_preserves_recoverable_staged_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.append_record(0, 100, _record(1))
+    raw = (attempt.path / "records.bin").read_bytes()
+
+    def fail_copy(*_args: object) -> None:
+        raise OSError(ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(publication, "_copy_synced", fail_copy)
+
+    with pytest.raises(OSError) as raised:
+        attempt.seal(DoneNotification(0, 101))
+
+    assert raised.value.errno == ENOSPC
+    assert (attempt.path / "records.bin").read_bytes() == raw
     assert not tuple(capture_root.glob("100-101-*"))
     assert not tuple(capture_root.glob(".*.tmp"))
 

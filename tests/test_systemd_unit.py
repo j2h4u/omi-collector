@@ -8,14 +8,18 @@ import os
 import pwd
 import shlex
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).parents[1]
 _UNIT = _ROOT / "systemd" / "omi-collector.service"
 _INSTALLER = _ROOT / "scripts" / "install-systemd-unit.sh"
 _DEPLOYER = _ROOT / "scripts" / "deploy-systemd-service.sh"
+_SEALER = _ROOT / "scripts" / "seal_deployment_tree.py"
 _DEV_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
 _STATUS_COMMAND = _ROOT / "scripts" / "omi-collector-status"
 _STATUS_SUDOERS = _ROOT / "scripts" / "omi-collector-status.sudoers"
@@ -31,6 +35,11 @@ class _DeploymentScenario:
     config_check_failure: bool = False
     crash_loop: bool = False
     git_status: str = ""
+    metadata_symlink: bool = False
+    same_uid: bool = False
+    same_primary_gid: bool = False
+    service_group_membership: bool = False
+    busybox_tools: bool = False
 
 
 _DEFAULT_SCENARIO = _DeploymentScenario()
@@ -42,11 +51,15 @@ class _FakeCommandContext:
     log: Path
     config_file: Path
     source_package: Path
+    build_state: Path
     uv_cache: Path
+    python_install: Path
     deployment_root: Path
     deployments_dir: Path
     account_user: str
     account_group: str
+    build_user: str
+    build_group: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +127,44 @@ def test_systemd_material_uses_only_the_fixed_unit_and_release_selector() -> Non
     assert 'config check --config "$config_file"' in deployer
     assert "share/omi-collector" in deployer
     assert '{"source_revision":"%s"}' in deployer
+    assert "build_user='omi-collector-build'" in deployer
+    assert "build_group='omi-collector-build'" in deployer
+    assert "uv_cache_dir='/var/lib/omi-collector-build/uv-cache'" in deployer
+    assert "python_install_dir='/var/lib/omi-collector-deployments/python'" in deployer
+
+
+def test_deployer_runs_candidate_code_only_as_the_dedicated_build_identity() -> None:
+    deployer = _DEPLOYER.read_text(encoding="utf-8")
+
+    assert "build_user='omi-collector-build'" in deployer
+    assert "account_user='omi-collector'" in deployer
+    assert '[[ "$build_user" != "$service_user" && "$build_group" != "$service_group" ]]' in deployer
+    assert 'build_uid=$(id -u "$build_user")' in deployer
+    assert 'service_uid=$(id -u "$service_user")' in deployer
+    assert 'supplementary_output=$(id -G "$build_user")' in deployer
+    assert '"$group_id" != "$service_gid"' in deployer
+    assert 'verify_installed_package "$runuser_bin" "$build_user"' in deployer
+    assert 'validate_candidate_config "$runuser_bin" "$build_user"' in deployer
+    assert '"$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home"' in deployer
+    python_command = deployer.index('"${environment}/bin/python" -I -B -c')
+    assert deployer.rfind('"$runuser_bin" --user "$build_user" --group "$build_group"', 0, python_command) >= 0
+    assert deployer.index('validate_candidate_config "$runuser_bin" "$build_user"') < deployer.index(
+        'seal_deployment_environment "$staged_environment"'
+    )
+
+
+def test_deployer_seals_candidate_paths_before_root_metadata_writes() -> None:
+    deployer = _DEPLOYER.read_text(encoding="utf-8")
+
+    assert "seal_tree_with_descriptors" in deployer
+    assert "sealer_python='/usr/bin/python3'" in deployer
+    assert "'-I' '-B' '-S'" in deployer
+    assert "chown -hRP root:root" not in deployer
+    assert "find -P" not in deployer
+    assert '[[ ! -e "${environment}/share" && ! -L "${environment}/share" ]]' in deployer
+    assert deployer.index('seal_deployment_environment "$staged_environment"') < deployer.index(
+        'write_release_metadata "$staged_environment"'
+    )
 
 
 def test_installer_keeps_the_unit_and_config_targets_fixed() -> None:
@@ -250,14 +301,18 @@ def _write_build_fakes(
     config_file = context.config_file
     quoted_log = shlex.quote(str(context.log))
     quoted_source = shlex.quote(str(context.source_package))
-    quoted_user = shlex.quote(context.account_user)
+    quoted_user = shlex.quote(context.build_user)
 
     (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
         "set -uo pipefail\n"
         f'printf "uv args=%s\\n" "$*" >> {quoted_log}\n'
         '[[ "$DEPLOY_BUILD_FAIL" != 1 ]] || exit 1\n'
-        'python3 -m venv --clear "$UV_PROJECT_ENVIRONMENT"\n'
+        'if [[ "$1" == python && "$2" == install ]]; then\n'
+        '    mkdir --parents "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin"\n'
+        "    exit 0\n"
+        "fi\n"
+        'python3 -m venv --copies --clear "$UV_PROJECT_ENVIRONMENT"\n'
         'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c '
         "'import sysconfig; print(sysconfig.get_path(\"purelib\"))')\n"
         f'cp -a {quoted_source} "$purelib/omi_collector"\n'
@@ -265,7 +320,10 @@ def _write_build_fakes(
         "printf '%s\\n' '#!/usr/bin/env bash' > \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"${DEPLOY_CONFIG_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
         f'printf \'%s\\n\' \'printf \'"\'"\'{{"config":"{config_file}","status":"config_valid"}}\\n\'"\'"\'\' >> "$entrypoint"\n'
-        'chmod 0755 "$entrypoint"\n',
+        'chmod 0755 "$entrypoint"\n'
+        'if [[ "${DEPLOY_METADATA_SYMLINK:-0}" == 1 ]]; then\n'
+        '    ln --symbolic -- "$DEPLOY_SENTINEL" "$UV_PROJECT_ENVIRONMENT/share"\n'
+        "fi\n",
         encoding="utf-8",
     )
     (fake_bin / "uv").chmod(0o755)
@@ -285,27 +343,41 @@ def _write_build_fakes(
     (fake_bin / "runuser").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "runuser args=%s\\n" "$*" >> {quoted_log}\n'
-        f'[[ "$1" == --user && "$2" == {quoted_user} && "$3" == -- ]] || exit 2\n'
-        "shift 3\n"
+        f'[[ "$1" == --user && "$2" == {quoted_user} && "$3" == --group && "$4" == {shlex.quote(context.build_group)} && "$5" == -- ]] || exit 2\n'
+        "shift 5\n"
         'exec "$@"\n',
         encoding="utf-8",
     )
     (fake_bin / "runuser").chmod(0o755)
 
 
-def _write_filesystem_fakes(context: _FakeCommandContext) -> None:
+def _write_filesystem_fakes(context: _FakeCommandContext, scenario: _DeploymentScenario) -> None:
     fake_bin = context.fake_bin
     quoted_log = shlex.quote(str(context.log))
     quoted_config = shlex.quote(str(context.config_file))
+    quoted_build_state = shlex.quote(str(context.build_state))
     quoted_uv_cache = shlex.quote(str(context.uv_cache))
+    quoted_python_install = shlex.quote(str(context.python_install))
     quoted_deployment_root = shlex.quote(str(context.deployment_root))
     quoted_deployments_dir = shlex.quote(str(context.deployments_dir))
 
+    busybox_check = 'case "$*" in *--no-dereference*|*--recursive*) exit 64 ;; esac\n' if scenario.busybox_tools else ""
     (fake_bin / "chown").write_text(
-        f'#!/usr/bin/env bash\nprintf "chown args=%s\\n" "$*" >> {quoted_log}\nexit 0\n',
+        f'#!/usr/bin/env bash\n{busybox_check}printf "chown args=%s\\n" "$*" >> {quoted_log}\nexit 0\n',
         encoding="utf-8",
     )
     (fake_bin / "chown").chmod(0o755)
+
+    if scenario.busybox_tools:
+        busybox = shutil.which("busybox")
+        assert busybox is not None
+        quoted_busybox = shlex.quote(busybox)
+        for tool_name in ("chmod", "find"):
+            (fake_bin / tool_name).write_text(
+                f'#!/usr/bin/env bash\nexec {quoted_busybox} {tool_name} "$@"\n',
+                encoding="utf-8",
+            )
+            (fake_bin / tool_name).chmod(0o755)
 
     (fake_bin / "install").write_text(
         "#!/usr/bin/env bash\n"
@@ -326,10 +398,12 @@ def _write_filesystem_fakes(context: _FakeCommandContext) -> None:
         "#!/usr/bin/env bash\n"
         'path="${@: -1}"\n'
         f"if [[ \"$path\" == {quoted_config} ]]; then printf '%s\\n' 'root:root:644'; exit 0; fi\n"
+        f"if [[ \"$path\" == {quoted_build_state} ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
         f"if [[ \"$path\" == {quoted_uv_cache} ]]; then printf '%s\\n' "
-        f"'{context.account_user}:{context.account_group}:750'; exit 0; fi\n"
+        f"'{context.build_user}:{context.build_group}:750'; exit 0; fi\n"
         f'if [[ "$path" == {quoted_deployment_root} || "$path" == {quoted_deployments_dir} '
-        f"|| \"$path\" == {quoted_deployments_dir}/release-* ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
+        f'|| "$path" == {quoted_python_install} || "$path" == {quoted_deployments_dir}/release-* '
+        "|| \"$path\" == */share/omi-collector ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
         'exec /usr/bin/stat "$@"\n',
         encoding="utf-8",
     )
@@ -384,8 +458,41 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
 
 def _write_fake_commands(context: _FakeCommandContext, scenario: _DeploymentScenario) -> None:
     _write_build_fakes(context, scenario)
-    _write_filesystem_fakes(context)
+    _write_filesystem_fakes(context, scenario)
     _write_service_fakes(context, scenario)
+    _write_identity_fakes(context, scenario)
+
+
+def _write_identity_fakes(context: _FakeCommandContext, scenario: _DeploymentScenario) -> None:
+    fake_bin = context.fake_bin
+    quoted_build_user = shlex.quote(context.build_user)
+    quoted_build_group = shlex.quote(context.build_group)
+    quoted_service_user = shlex.quote(context.account_user)
+    build_uid = "1000" if scenario.same_uid else "1001"
+    build_gid = "2000" if scenario.same_primary_gid else "2001"
+    build_groups = f"{build_gid} 2000" if scenario.service_group_membership else build_gid
+    quoted_build_groups = shlex.quote(build_groups)
+
+    (fake_bin / "getent").write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == group && "$2" == {quoted_build_group} ]]; then exit 0; fi\n'
+        f'if [[ "$1" == passwd && "$2" == {quoted_build_user} ]]; then exit 0; fi\n'
+        'exec /usr/bin/getent "$@"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "getent").chmod(0o755)
+    (fake_bin / "id").write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == -gn && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {quoted_build_group}; exit 0; fi\n'
+        f'if [[ "$1" == -u && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {build_uid}; exit 0; fi\n'
+        f'if [[ "$1" == -g && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {build_gid}; exit 0; fi\n'
+        f'if [[ "$1" == -u && "$2" == {quoted_service_user} ]]; then printf \'%s\\n\' 1000; exit 0; fi\n'
+        f'if [[ "$1" == -g && "$2" == {quoted_service_user} ]]; then printf \'%s\\n\' 2000; exit 0; fi\n'
+        f'if [[ "$1" == -G && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {quoted_build_groups}; exit 0; fi\n'
+        'exec /usr/bin/id "$@"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "id").chmod(0o755)
 
 
 def _stage_harness_repository(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -398,6 +505,7 @@ def _stage_harness_repository(tmp_path: Path) -> tuple[Path, Path, Path]:
     systemd_dir.mkdir()
     source_root.mkdir()
     shutil.copytree(_SOURCE_PACKAGE, source_package)
+    shutil.copy2(_SEALER, scripts_dir / _SEALER.name)
     shutil.copy2(_UNIT, systemd_dir / _UNIT.name)
     installed_unit = tmp_path / "installed" / "omi-collector.service"
     installed_unit.parent.mkdir()
@@ -410,10 +518,11 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
     fake_bin.mkdir()
     log = tmp_path / "commands.log"
     log.touch()
-    state_dir = tmp_path / "state"
-    uv_cache = state_dir / "uv-cache"
+    build_state = tmp_path / "build-state"
+    uv_cache = build_state / "uv-cache"
     deployment_root = tmp_path / "deployments"
     deployments_dir = deployment_root / "releases"
+    python_install = deployment_root / "python"
     config_file = tmp_path / "config.toml"
     config_file.write_text(
         '[pendant]\naddress = "12:34:56:78:9A:BC"\n',
@@ -422,16 +531,22 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
     config_file.chmod(0o644)
     account_user = getpass.getuser()
     account_group = grp.getgrgid(pwd.getpwnam(account_user).pw_gid).gr_name
+    build_user = "omi-collector-build-test"
+    build_group = "omi-collector-build-test"
     return _FakeCommandContext(
         fake_bin,
         log,
         config_file,
         source_package,
+        build_state,
         uv_cache,
+        python_install,
         deployment_root,
         deployments_dir,
         account_user,
         account_group,
+        build_user,
+        build_group,
     )
 
 
@@ -456,10 +571,13 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         ),
         ("/var/lib/omi-collector-deployments/current", str(current_link)),
         ("/var/lib/omi-collector-deployments", str(context.deployment_root)),
-        ("/var/lib/omi-collector/uv-cache", str(context.uv_cache)),
-        ("/var/lib/omi-collector", str(context.uv_cache.parent)),
+        ("/var/lib/omi-collector-build/uv-cache", str(context.uv_cache)),
+        ("/var/lib/omi-collector-build", str(context.build_state)),
         ("account_user='omi-collector'", f"account_user={shlex.quote(context.account_user)}"),
         ("account_group='omi-collector'", f"account_group={shlex.quote(context.account_group)}"),
+        ("build_user='omi-collector-build'", f"build_user={shlex.quote(context.build_user)}"),
+        ("build_group='omi-collector-build'", f"build_group={shlex.quote(context.build_group)}"),
+        ("sealer_owner='0:0'", f"sealer_owner='{os.getuid()}:{os.getgid()}'"),
         ("(( EUID == 0 ))", "true"),
     )
     for production_value, harness_value in replacements:
@@ -474,6 +592,8 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "PATH": f"{context.fake_bin}{os.pathsep}{os.environ['PATH']}",
         "DEPLOY_BUILD_FAIL": "0",
         "DEPLOY_CONFIG_FAIL": "1" if scenario.config_check_failure else "0",
+        "DEPLOY_METADATA_SYMLINK": "1" if scenario.metadata_symlink else "0",
+        "DEPLOY_SENTINEL": str(tmp_path / "metadata-sentinel"),
     }
     return _DeploymentHarness(
         harness_deployer,
@@ -527,6 +647,147 @@ def test_deployer_builds_validates_selects_and_seals_one_release(tmp_path: Path)
     assert "systemctl args=stop omi-collector.service" in commands
     assert "systemctl args=restart omi-collector.service" in commands
     assert f"config={harness.config_file}" in result.stdout
+
+
+def test_deployer_verifies_candidate_as_builder_before_root_seals_or_restarts(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode == 0, result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    builder_runs = [line for line in commands.splitlines() if line.startswith("runuser args=")]
+    assert len(builder_runs) == 4
+    assert all("--user omi-collector-build-test --group omi-collector-build-test --" in line for line in builder_runs)
+    assert "python install 3.14" in builder_runs[0]
+    assert "sync --project" in builder_runs[1]
+    assert "/bin/python -I -B -c" in builder_runs[2]
+    assert "config check --config" in builder_runs[3]
+    config_check = commands.index("config check --config")
+    restart = commands.index("systemctl args=stop omi-collector.service")
+    assert config_check < restart
+    deployer = harness.deployer.read_text(encoding="utf-8")
+    assert deployer.index('validate_candidate_config "$runuser_bin" "$build_user"') < deployer.index(
+        'seal_deployment_environment "$staged_environment"'
+    )
+
+
+def test_deployer_rejects_candidate_metadata_symlink_before_service_restart(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(metadata_symlink=True))
+    sentinel = Path(harness.environment["DEPLOY_SENTINEL"])
+    sentinel.write_text("preserve me\n", encoding="utf-8")
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "refusing external symlink target" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "preserve me\n"
+    assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
+
+
+def test_deployer_sealing_is_compatible_with_busybox_paths(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(busybox_tools=True))
+
+    result = _run_deployer(harness)
+
+    assert result.returncode == 0, result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    assert "chown args=" in commands
+    assert "--no-dereference" not in commands
+
+
+def _run_tree_sealer(root: Path, *allowed_external: Path) -> subprocess.CompletedProcess[str]:
+    command = [
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        "-S",
+        str(_SEALER),
+        "--root",
+        str(root),
+        "--owner",
+        f"{os.getuid()}:{os.getgid()}",
+    ]
+    for allowed_path in allowed_external:
+        command.extend(("--allow-external", str(allowed_path)))
+    return subprocess.run(command, check=False, capture_output=True, text=True)
+
+
+def test_descriptor_sealer_rejects_swapped_candidate_symlink(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("preserve me\n", encoding="utf-8")
+    candidate = release / "candidate.py"
+    candidate.write_text("candidate\n", encoding="utf-8")
+    candidate.unlink()
+    candidate.symlink_to(sentinel)
+    original_mode = sentinel.stat().st_mode
+
+    result = _run_tree_sealer(release)
+
+    assert result.returncode != 0
+    assert "refusing external symlink target" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "preserve me\n"
+    assert sentinel.stat().st_mode == original_mode
+
+
+def test_descriptor_sealer_seals_regular_entries_without_following_safe_links(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    binary_dir = release / "bin"
+    binary_dir.mkdir(parents=True)
+    executable = binary_dir / "omi-collector"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+    data_file = release / "data.txt"
+    data_file.write_text("data\n", encoding="utf-8")
+    data_file.chmod(0o600)
+    (release / "data-link").symlink_to("data.txt")
+
+    result = _run_tree_sealer(release)
+
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(release.stat().st_mode) == 0o755
+    assert stat.S_IMODE(binary_dir.stat().st_mode) == 0o755
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o755
+    assert stat.S_IMODE(data_file.stat().st_mode) == 0o644
+
+
+def test_descriptor_sealer_contract_uses_fd_identity_and_no_follow_operations() -> None:
+    sealer = _SEALER.read_text(encoding="utf-8")
+    deployer = _DEPLOYER.read_text(encoding="utf-8")
+
+    assert "os.O_NOFOLLOW" in sealer
+    assert "os.O_DIRECTORY" in sealer
+    assert "os.fstat" in sealer
+    assert "st_dev != context.root_device" in sealer
+    assert "st_ino" in sealer
+    assert "os.fchown" in sealer
+    assert "os.fchmod" in sealer
+    assert "sealer_python='/usr/bin/python3'" in deployer
+    assert "'-I' '-B' '-S'" in deployer
+
+
+@pytest.mark.parametrize(
+    ("scenario", "message"),
+    (
+        (_DeploymentScenario(same_uid=True), "build UID must differ"),
+        (_DeploymentScenario(same_primary_gid=True), "build primary GID must differ"),
+        (_DeploymentScenario(service_group_membership=True), "must not belong to the live service group"),
+    ),
+)
+def test_deployer_rejects_build_identity_that_overlaps_the_service(
+    tmp_path: Path, scenario: _DeploymentScenario, message: str
+) -> None:
+    harness = _deployment_harness(tmp_path, scenario)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    assert "runuser args=" not in commands
+    assert "systemctl args=" not in commands
 
 
 def test_deployer_rejects_config_before_stopping_the_previous_service(tmp_path: Path) -> None:

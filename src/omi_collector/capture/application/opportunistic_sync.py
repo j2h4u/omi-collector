@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,7 +19,7 @@ from ..domain.ring_protocol import RingInfo
 from . import collector
 from .batch_reconciliation import BatchReconciler
 from .operational_telemetry import ClockCorrectionSink, OperationalEmitter
-from .ports import CaptureRuntimePort, ObservationWriterPort, StagingPort
+from .ports import CaptureRuntimePort, ObservationWriterPort, PublicationAuthorityPort, StagingPort
 from .presence import PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
 from .session_lifecycle import (
@@ -89,22 +88,23 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
             options,
             clock_correction_sink=cast(ClockCorrectionSink, runtime.make_clock_correction_sink(staging)),
         )
-    lease_factory = getattr(staging, "device_lock", None)
-    handoff_token, handoff_lease_factory, release_handoff = _operation_handoff(staging)
-    options = _configure_timeline_publisher(options, staging, handoff_token)
-    if options.clock_lease is None and callable(lease_factory):
+    maintenance = QuarantineMaintenance(staging, options.activity, runtime, config=options.config)
+    if options.clock_lease is None:
+        options = replace(options, clock_lease=staging.clock_mutation_lease)
 
-        def clock_lease() -> object:
-            if handoff_token is not None and handoff_lease_factory is not None:
-                return handoff_lease_factory(handoff_token)
-            return lease_factory(recover_capture_temporaries=False)
+    def schedule_publication_retry() -> None:
+        try:
+            loop.call_soon_threadsafe(maintenance.schedule_publication_retry)
+        except RuntimeError:
+            return
 
-        options = replace(options, clock_lease=clock_lease)
+    publication_authority: PublicationAuthorityPort | None = None
+    if options.timeline_publisher is None:
+        publication_authority = staging.create_publication_authority(schedule_publication_retry)
+        options = _configure_timeline_publisher(options, publication_authority)
     observation_writer = runtime.make_observation_writer(
         staging, options.config.firmware_observations, report_observation_error
     )
-
-    maintenance = QuarantineMaintenance(staging, options.activity, runtime, config=options.config)
     run = _Run(provider, staging, options, observation_writer, runtime, maintenance)
     reconciler = BatchReconciler(staging, options, runtime, maintenance.quarantine_attempt_source)
     lifecycle = _make_session_lifecycle(run, reconciler)
@@ -142,34 +142,16 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
                     await maintenance.close()
                 finally:
                     _close_quality_metrics(run)
-                    if handoff_token is not None and release_handoff is not None:
-                        release_handoff(handoff_token)
-
-
-def _operation_handoff(
-    staging: object,
-) -> tuple[object | None, Callable[[object], object] | None, Callable[[object], object] | None]:
-    create = getattr(staging, "create_lease_handoff", None)
-    if not callable(create):
-        return None, None, None
-    token = create()
-    handoff = getattr(staging, "handoff_device_lease", None)
-    release = getattr(staging, "release_lease_handoff", None)
-    return token, handoff if callable(handoff) else None, release if callable(release) else None
+                    if publication_authority is not None:
+                        publication_authority.close()
 
 
 def _configure_timeline_publisher(
-    options: OpportunisticOptions, staging: object, handoff_token: object | None
+    options: OpportunisticOptions,
+    authority: PublicationAuthorityPort,
 ) -> OpportunisticOptions:
-    if options.timeline_publisher is not None:
-        return options
-    publisher = getattr(staging, "publish_timeline", None)
-    if not callable(publisher):
-        return options
-    handoff_publisher = getattr(staging, "publish_timeline_with_handoff", None)
-    if handoff_token is not None and callable(handoff_publisher):
-        return replace(options, timeline_publisher=lambda: handoff_publisher(handoff_token))
-    return replace(options, timeline_publisher=publisher)
+    """Bind projection retries to the run-issued, task-independent capability."""
+    return replace(options, timeline_publisher=authority)
 
 
 def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLifecycle:

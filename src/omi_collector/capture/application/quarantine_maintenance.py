@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -12,6 +12,7 @@ from time import monotonic
 from typing import Protocol, cast
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
+from ..domain.ring_protocol import RECORD_SIZE
 from .ports import (
     AttemptDescriptorShape,
     CaptureRuntimePort,
@@ -33,6 +34,33 @@ class PresenceWaiterPort(Protocol):
     async def wait_for_attempt(self) -> PresenceWake: ...
 
     async def close(self) -> None: ...
+
+
+class ResumeAttemptPort(Protocol):
+    """Lease-bound restart attempt used to establish its durable frontier."""
+
+    @property
+    def attempt_id(self) -> str: ...
+
+    @property
+    def durable_prefix(self) -> object: ...
+
+    def close(self) -> None: ...
+
+
+class ResumeStagingPort(Protocol):
+    """The lease-scoped staging seam needed only for startup promotion."""
+
+    def device_lock(self) -> AbstractContextManager[object]: ...
+
+    def resume_streaming_attempt(self, lease: object) -> ResumeAttemptPort | None: ...
+
+
+class RecoveryFrontierPort(Protocol):
+    """Validated checkpoint and aligned raw-tail bounds from startup hydration."""
+
+    valid_records: int
+    raw_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +91,7 @@ class QuarantineMaintenance:
         self._runtime = runtime
         self._config = config
         self._startup_state: PendingStartupState | None = None
+        self._startup_state_bound = False
         self._maintenance_not_before = 0.0
         self._quarantine_retry_not_before = 0.0
         self._quarantine_retry_number = 0
@@ -137,6 +166,14 @@ class QuarantineMaintenance:
     async def ensure_publication_ready(self) -> None:
         """Run one bounded local recovery attempt without blocking BLE forever."""
         await self._recover_and_publish()
+
+    def schedule_publication_retry(self) -> None:
+        """Retry a known publication failure without waiting for another pendant visit."""
+        self._publication_retry_not_before = monotonic()
+        if self._publication_retry_handle is not None:
+            self._publication_retry_handle.cancel()
+            self._publication_retry_handle = None
+        self._schedule_publication_retry()
 
     def _schedule_publication_retry(self) -> None:
         if self._publication_retry_handle is not None:
@@ -292,7 +329,9 @@ class QuarantineMaintenance:
         bind_startup_state: Callable[[PendingStartupState], None],
     ) -> None:
         state = await self.prepare_pending_startup()
-        bind_startup_state(state)
+        if not self._startup_state_bound:
+            bind_startup_state(state)
+            self._startup_state_bound = True
         await self.run_once(defer_requested.is_set)
 
     async def _pending_descriptor(self) -> AttemptDescriptorShape | None:
@@ -308,12 +347,56 @@ class QuarantineMaintenance:
             await asyncio.to_thread(self._staging.open_attempt_for_resume, descriptor.attempt_id),
         )
         try:
-            recovery = await asyncio.to_thread(attempt.recover)
+            recovery = cast(RecoveryFrontierPort, await asyncio.to_thread(attempt.recover))
         except BaseException:
             await asyncio.to_thread(attempt.close)
             raise
         await asyncio.to_thread(self._staging.retain_validated_attempt, descriptor.attempt_id, attempt)
-        return descriptor.start_sequence + recovery.valid_records
+        try:
+            return await asyncio.to_thread(self._activate_pending_frontier, descriptor)
+        except Exception as error:
+            if not self._runtime.is_device_busy_error(error):
+                raise
+            # A competing writer owns the only lease that may promote the
+            # tail. Preserve this attempt and defer promotion to the normal
+            # writer admission retry. The authenticated raw boundary keeps
+            # that later admission's arena consistent with the promotion.
+            return self._authenticated_tail_frontier(descriptor, recovery)
+
+    @staticmethod
+    def _authenticated_tail_frontier(descriptor: AttemptDescriptorShape, recovery: RecoveryFrontierPort) -> int:
+        if recovery.raw_bytes % RECORD_SIZE:
+            raise OpportunisticSyncError("validated recovery returned an unaligned raw tail")
+        raw_records = recovery.raw_bytes // RECORD_SIZE
+        if recovery.valid_records > raw_records or raw_records > descriptor.packet_count:
+            raise OpportunisticSyncError("validated recovery returned inconsistent raw-tail bounds")
+        return descriptor.start_sequence + raw_records
+
+    def _activate_pending_frontier(self, descriptor: AttemptDescriptorShape) -> int:
+        """Promote an aligned raw tail under a lease before admission sizes RAM.
+
+        Startup validation authenticates the raw tail but deliberately leaves it
+        unconsumable.  Acquire the same staging lease boundary used by the
+        writer, consume that authenticated tail into the checkpoint, and close
+        the temporary handle before returning the authoritative frontier to
+        reconciliation.  A later writer reopens the already-promoted attempt.
+        """
+        staging = cast(ResumeStagingPort, self._staging)
+        with staging.device_lock() as lease:
+            resumed = staging.resume_streaming_attempt(lease)
+            if resumed is None or resumed.attempt_id != descriptor.attempt_id:
+                raise OpportunisticSyncError("validated pending attempt disappeared before lease-bound resume")
+            try:
+                prefix = resumed.durable_prefix
+                durable_next = getattr(prefix, "next_sequence", None)
+                end = descriptor.start_sequence + descriptor.packet_count
+                if isinstance(durable_next, bool) or not isinstance(durable_next, int):
+                    raise OpportunisticSyncError("lease-bound resume returned an invalid durable frontier")
+                if not descriptor.start_sequence <= durable_next <= end:
+                    raise OpportunisticSyncError("lease-bound resume returned an inconsistent durable frontier")
+                return durable_next
+            finally:
+                resumed.close()
 
     async def _sweep_terminal_retired(self, should_defer: Callable[[], bool]) -> None:
         try:

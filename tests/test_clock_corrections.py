@@ -176,7 +176,7 @@ def test_causal_observation_reconciles_by_typed_host_interval(tmp_path: Path) ->
         operation_id=intent.operation_id,
         observation_role="initial",
     )
-    store.observation_store.native_trusted(
+    later = store.observation_store.native_trusted(
         observation_id="a" * 32,
         session_id="session",
         host_boot_id="boot",
@@ -191,9 +191,9 @@ def test_causal_observation_reconciles_by_typed_host_interval(tmp_path: Path) ->
         effective_boundary_sequence=20,
         observation_role="later",
     )
-    result = store.replay_observations(near_zero_threshold=5.0)
+    result = store.reconcile_causal_observation(later, near_zero_threshold=5.0)
     assert result[0].state == "applied"
-    assert store.replay_observations(near_zero_threshold=5.0) == ()
+    assert store.reconcile_causal_observation(later, near_zero_threshold=5.0) == ()
 
 
 def test_causal_observation_allows_ordered_successive_same_boundary_operation(tmp_path: Path) -> None:

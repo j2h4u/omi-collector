@@ -12,25 +12,18 @@ Feature: Opportunistic raw collection from an Omi pendant
 
   Rule: Every visit is an opportunity to collect audio
 
-    Scenario: A nearby pendant is detected promptly
+    Scenario: A nearby pendant is admitted after stable visibility
       Given no collection session is active
-      When the pendant is observed nearby
-      Then one bounded collection attempt starts promptly
+      When the exact-address pendant remains visible for the configured arrival span
+      Then one bounded collection attempt starts from the current scanner candidate
       And no overlapping attempt is allowed
-
-    Scenario: Missing advertisements do not prevent collection
-      Given the pendant remains nearby without a fresh advertisement
-      When 300 seconds pass without a fresh advertisement
-      Then the collector attempts to reach the pendant
-      And GATT INFO determines whether records are available
-      And active scanning remains the primary presence detector between fallbacks
 
     Scenario: A completed drain respects the pendant battery
       Given all currently available records were collected
       When the final GATT INFO confirms a clean drain
       Then the collector disconnects
       And it waits 900 seconds before checking again
-      And advertisements cannot bypass that cooldown
+      And an isolated advertisement cannot bypass that cooldown or stable-arrival admission
 
     Scenario: An interrupted visit is retried
       Given a collection attempt is interrupted

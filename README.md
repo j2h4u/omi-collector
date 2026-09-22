@@ -126,8 +126,12 @@ sudo -u omi-collector bluetoothctl show
 sudo scripts/deploy-systemd-service.sh
 ```
 
-Replace the placeholder with the pendant Bluetooth address. The configuration
-contains only `[pendant]` and `address`; the fixed location determines storage.
+Replace the placeholder with the pendant Bluetooth address. The optional
+`[presence]` section controls automatic scanner admission: the default requires
+30 seconds of observations with no gap of 10 seconds or more before GATT is
+opened. A timer, a remembered address, or a stale scanner event cannot create
+an automatic connection permit. The fixed configuration location determines
+storage.
 The installer creates the service account, keeps the configuration root-owned
 and readable by both services as mode `0644`, and enables the service. It does not start the
 service unless `--restart` is explicit. Complete the first successful
@@ -241,8 +245,8 @@ published.
 
 The collector treats missing audio as worse than duplicate audio:
 
-- `INFO` is authoritative for the unread cursor; advertisements only trigger a
-  collection attempt.
+- `INFO` is authoritative for the unread cursor; automatic collection requires
+  a current exact-address scanner candidate after stable repeated visibility.
 - Reads are bounded and serialized per pendant. Destructive `CLEAR` is not
   exposed.
 - Bytes and checkpoints become durable before a record can be sealed.

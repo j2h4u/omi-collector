@@ -1,2 +1,8 @@
 [pendant]
 address = "AA:BB:CC:DD:EE:FF"
+
+# Automatic service and `device sync` require one exact-address scanner
+# candidate to remain visible for this span before opening GATT.
+[presence]
+arrival_stability_seconds = 30.0
+arrival_max_gap_seconds = 10.0

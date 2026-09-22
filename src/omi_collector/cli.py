@@ -42,7 +42,7 @@ class _CaptureCli(Protocol):
 
     def sync(self, *args: object, **kwargs: object) -> Coroutine[object, object, object]: ...
 
-    def make_presence_scheduler(self, address: str, adapter: str) -> object: ...
+    def make_presence_scheduler(self, address: str, adapter: str, **kwargs: object) -> object: ...
 
     def download_metrics(self, result: object, elapsed: float) -> object: ...
 
@@ -618,7 +618,11 @@ def _sync(
     )
     try:
         report_progress = SyncProgressReporter(log_level, debug_logger=debug_logger)
-        presence = _capture_cli().make_presence_scheduler(loaded.pendant.address, _capture_cli().SUPPORTED_ADAPTER)
+        presence = _capture_cli().make_presence_scheduler(
+            loaded.pendant.address,
+            _capture_cli().SUPPORTED_ADAPTER,
+            config=loaded.config,
+        )
         result = _run_device_operation(
             _capture_cli().sync(
                 loaded.pendant.address,
@@ -627,6 +631,7 @@ def _sync(
                 report_progress,
                 force_1m=force_1m,
                 presence=presence,
+                config=loaded.config,
                 link_terminal_callback=report_progress.report_ble_link,
                 debug_logger=debug_logger,
             )

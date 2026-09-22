@@ -92,7 +92,7 @@ class RetryPolicy:
     batch_records: int = DEFAULT_CONFIG.memory.arena_max_bytes // RECORD_SIZE
     stop_after_drained: bool = False
     _: KW_ONLY
-    drain_cooldown_seconds: float = DEFAULT_CONFIG.presence.fallback_seconds
+    drain_cooldown_seconds: float = DEFAULT_CONFIG.presence.drain_cooldown_seconds
     arena_max_bytes: int = DEFAULT_CONFIG.memory.arena_max_bytes
     advance_enabled: bool = True
 
@@ -208,6 +208,14 @@ class SessionLifecycle:
                 wake = await self.run.callbacks.wait_presence_attempt()
                 outcome_submitted = False
                 try:
+                    if (
+                        wake.observed_at is None
+                        or self.run.options.clock()
+                        >= wake.observed_at + self.run.options.config.presence.arrival_max_gap_seconds
+                    ):
+                        await presence.attempt_finished(CandidateUnavailable())
+                        outcome_submitted = True
+                        continue
                     completed_before = self.run.callbacks.completed_batch_query()
                     context, outcome = await self._open_context(wake.candidate)
                     if context is not None:
@@ -227,7 +235,7 @@ class SessionLifecycle:
                             return self.run.callbacks.drained_result()
                         await report_cooldown_started(
                             self.run.options.activity,
-                            presence.policy.drained_fallback_seconds,
+                            presence.policy.drain_cooldown_seconds,
                             presence.drained_cooldown_remaining_seconds,
                         )
                         continue
@@ -799,12 +807,12 @@ async def sleep(sleep_fn: Callable[[float], object], delay: float) -> None:
 
 
 def validate_policy(
-    policy: RetryPolicy, max_drained_fallback_seconds: float = DEFAULT_CONFIG.presence.max_drained_fallback_seconds
+    policy: RetryPolicy, max_drain_cooldown_seconds: float = DEFAULT_CONFIG.presence.max_drain_cooldown_seconds
 ) -> None:
     if (
         not policy.backoff
         or policy.drain_cooldown_seconds <= 0
-        or policy.drain_cooldown_seconds > max_drained_fallback_seconds
+        or policy.drain_cooldown_seconds > max_drain_cooldown_seconds
     ):
         raise ValueError("opportunistic recovery policy values must be positive")
     if (
@@ -823,6 +831,6 @@ def validate_presence_policy(options: OpportunisticOptions) -> None:
         return
     if (
         options.policy.backoff != presence.policy.rapid_backoff
-        or options.policy.drain_cooldown_seconds != presence.policy.drained_fallback_seconds
+        or options.policy.drain_cooldown_seconds != presence.policy.drain_cooldown_seconds
     ):
         raise ValueError("opportunistic and presence timing policies must match")

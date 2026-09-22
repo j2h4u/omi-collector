@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable, Coroutine
 from typing import Never, cast
 
@@ -223,7 +224,7 @@ async def _noop() -> None:
 
 
 async def _wait() -> PresenceWake:
-    return PresenceWake("test")
+    return PresenceWake("test", candidate=object(), observed_at=time.monotonic())
 
 
 def test_context_exit_receives_exact_primary_cancellation() -> None:
@@ -254,7 +255,7 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
         drained_cooldown_remaining_seconds = 0.0
 
         async def wait_for_attempt(self) -> PresenceWake:
-            return PresenceWake("test")
+            return PresenceWake("test", candidate=object(), observed_at=time.monotonic())
 
         async def attempt_finished(self, outcome: AttemptOutcome) -> None:
             del outcome
@@ -319,7 +320,14 @@ def test_real_presence_setup_failure_closes_issued_permit(monkeypatch: pytest.Mo
             self.callback(PresenceAdvertisement(object(), -72))
 
     observer = Observer()
-    presence = PresenceScheduler(observer, policy=PresencePolicy(rapid_backoff=(1.0,)))
+    presence = PresenceScheduler(
+        observer,
+        policy=PresencePolicy(
+            rapid_backoff=(1.0,),
+            arrival_stability_seconds=0.001,
+            arrival_max_gap_seconds=1.0,
+        ),
+    )
 
     async def broken_open(_candidate: object | None) -> object:
         raise RuntimeError("provider setup failed")
@@ -354,6 +362,8 @@ def test_real_presence_setup_failure_closes_issued_permit(monkeypatch: pytest.Mo
         while observer.callback is None:
             await asyncio.sleep(0)
         observer.advertise()
+        await asyncio.sleep(0.002)
+        observer.advertise()
         with pytest.raises(RuntimeError, match="provider setup failed"):
             await running
         assert not observer.active
@@ -372,7 +382,7 @@ def test_presence_outcome_follows_gatt_teardown_and_checkpoint(monkeypatch: pyte
         drained_cooldown_remaining_seconds = 1.0
 
         async def wait_for_attempt(self) -> PresenceWake:
-            return PresenceWake("test")
+            return PresenceWake("test", candidate=object(), observed_at=time.monotonic())
 
         async def attempt_finished(self, outcome: object) -> None:
             assert isinstance(outcome, CleanDrain)

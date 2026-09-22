@@ -41,6 +41,7 @@ class _DeploymentScenario:
     service_group_membership: bool = False
     busybox_tools: bool = False
     root_sealed_python_without_interpreter: bool = False
+    versioned_python_alias: bool = False
 
 
 _DEFAULT_SCENARIO = _DeploymentScenario()
@@ -303,6 +304,16 @@ def _write_build_fakes(
     quoted_log = shlex.quote(str(context.log))
     quoted_source = shlex.quote(str(context.source_package))
     quoted_user = shlex.quote(context.build_user)
+    alias_directory = "cpython-3.14-linux-x86_64-gnu"
+    versioned_directory = "cpython-3.14.6-linux-x86_64-gnu"
+    managed_python_directory = alias_directory if scenario.versioned_python_alias else "cpython-3.14"
+    installed_python_directory = versioned_directory if scenario.versioned_python_alias else managed_python_directory
+    alias_install = (
+        f'    ln --symbolic -- "$UV_PYTHON_INSTALL_DIR/{versioned_directory}" '
+        f'"$UV_PYTHON_INSTALL_DIR/{alias_directory}"\n'
+        if scenario.versioned_python_alias
+        else ""
+    )
 
     (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
@@ -310,17 +321,18 @@ def _write_build_fakes(
         f'printf "uv cwd=%s args=%s\\n" "$PWD" "$*" >> {quoted_log}\n'
         '[[ "$DEPLOY_BUILD_FAIL" != 1 ]] || exit 1\n'
         'if [[ "$1" == python && "$2" == find ]]; then\n'
-        '    [[ -x "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python" ]] || exit 1\n'
-        '    printf "%s\\n" "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python"\n'
+        f'    [[ -x "$UV_PYTHON_INSTALL_DIR/{managed_python_directory}/bin/python" ]] || exit 1\n'
+        f'    printf "%s\\n" "$UV_PYTHON_INSTALL_DIR/{managed_python_directory}/bin/python"\n'
         "    exit 0\n"
         "fi\n"
         'if [[ "$1" == python && "$2" == install ]]; then\n'
-        '    mkdir --parents "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin"\n'
-        '    : > "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python"\n'
-        '    chmod 0755 "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python"\n'
+        f'    mkdir --parents "$UV_PYTHON_INSTALL_DIR/{installed_python_directory}/bin"\n'
+        f'    : > "$UV_PYTHON_INSTALL_DIR/{installed_python_directory}/bin/python"\n'
+        f'    chmod 0755 "$UV_PYTHON_INSTALL_DIR/{installed_python_directory}/bin/python"\n'
+        f"{alias_install}"
         "    exit 0\n"
         "fi\n"
-        '[[ -x "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin/python" ]] || exit 3\n'
+        f'[[ -x "$UV_PYTHON_INSTALL_DIR/{managed_python_directory}/bin/python" ]] || exit 3\n'
         'python3 -m venv --copies --clear "$UV_PROJECT_ENVIRONMENT"\n'
         'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c '
         "'import sysconfig; print(sysconfig.get_path(\"purelib\"))')\n"
@@ -403,10 +415,11 @@ def _write_filesystem_fakes(context: _FakeCommandContext, scenario: _DeploymentS
     )
     (fake_bin / "install").chmod(0o755)
 
+    managed_python_directory = "cpython-3.14-linux-x86_64-gnu" if scenario.versioned_python_alias else "cpython-3.14"
     python_install_status = (
         "root:root:755"
         if scenario.root_sealed_python_without_interpreter
-        else f"$(if [[ -x {quoted_python_install}/cpython-3.14/bin/python ]]; then "
+        else f"$(if [[ -x {quoted_python_install}/{managed_python_directory}/bin/python ]]; then "
         f"printf '%s' 'root:root:755'; else printf '%s' '{context.build_user}:{context.build_group}:755'; fi)"
     )
     (fake_bin / "stat").write_text(
@@ -729,6 +742,20 @@ def test_deployer_bootstraps_a_preexisting_empty_managed_python_directory(tmp_pa
     assert install < sync
 
 
+def test_deployer_seals_managed_python_with_an_absolute_uv_alias(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(versioned_python_alias=True))
+
+    result = _run_deployer(harness)
+
+    python_install = harness.deployment_root / "python"
+    versioned = python_install / "cpython-3.14.6-linux-x86_64-gnu"
+    alias = python_install / "cpython-3.14-linux-x86_64-gnu"
+    assert result.returncode == 0, result.stderr
+    assert alias.is_symlink()
+    assert alias.readlink() == versioned
+    assert (alias / "bin" / "python").is_file()
+
+
 def test_deployer_fails_closed_for_an_empty_root_sealed_managed_python_directory(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(root_sealed_python_without_interpreter=True))
     previous = _previous_release(harness)
@@ -839,6 +866,170 @@ def test_descriptor_sealer_seals_regular_entries_without_following_safe_links(tm
     assert stat.S_IMODE(binary_dir.stat().st_mode) == 0o755
     assert stat.S_IMODE(executable.stat().st_mode) == 0o755
     assert stat.S_IMODE(data_file.stat().st_mode) == 0o644
+
+
+def test_descriptor_sealer_accepts_an_absolute_link_within_its_tree(tmp_path: Path) -> None:
+    python_root = tmp_path / "python"
+    versioned = python_root / "cpython-3.14.6-linux-x86_64-gnu"
+    versioned.mkdir(parents=True)
+    alias = python_root / "cpython-3.14-linux-x86_64-gnu"
+    alias.symlink_to(versioned)
+
+    result = _run_tree_sealer(python_root)
+
+    assert result.returncode == 0, result.stderr
+    assert alias.readlink() == versioned
+
+
+def test_descriptor_sealer_rejects_an_absolute_etc_link(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    (release / "etc").symlink_to("/etc")
+
+    result = _run_tree_sealer(release)
+
+    assert result.returncode != 0
+    assert "refusing external symlink target: /etc" in result.stderr
+
+
+def test_descriptor_sealer_rejects_a_textual_tree_root_prefix_escape(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    sibling = tmp_path / "release-external"
+    release.mkdir()
+    sibling.mkdir()
+    (release / "escape").symlink_to(sibling)
+
+    result = _run_tree_sealer(release)
+
+    assert result.returncode != 0
+    assert "refusing external symlink target" in result.stderr
+
+
+def test_descriptor_sealer_rejects_an_absolute_internal_parent_escape(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    (release / "escape").symlink_to(f"{release}/../outside")
+
+    result = _run_tree_sealer(release)
+
+    assert result.returncode != 0
+    assert "refusing external symlink target" in result.stderr
+
+
+def test_descriptor_sealer_rejects_an_allowed_root_parent_escape(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    allowed = tmp_path / "allowed"
+    release.mkdir()
+    allowed.mkdir()
+    (release / "escape").symlink_to(f"{allowed}/../outside")
+
+    result = _run_tree_sealer(release, allowed)
+
+    assert result.returncode != 0
+    assert "refusing external symlink target" in result.stderr
+
+
+def test_descriptor_sealer_accepts_an_external_link_inside_an_allowed_root(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    allowed = tmp_path / "allowed"
+    release.mkdir()
+    allowed.mkdir()
+    target = allowed / "python"
+    target.write_text("python\n", encoding="utf-8")
+    (release / "python").symlink_to(target)
+
+    result = _run_tree_sealer(release, allowed)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_descriptor_sealer_keeps_a_symlinked_allowed_root_lexical(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    allowed = tmp_path / "allowed"
+    allowed_link = tmp_path / "allowed-link"
+    release.mkdir()
+    allowed.mkdir()
+    allowed_link.symlink_to(allowed, target_is_directory=True)
+    target = allowed_link / "python"
+    (release / "python").symlink_to(target)
+
+    result = _run_tree_sealer(release, allowed_link)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_descriptor_sealer_does_not_resolve_a_symlinked_allowed_root(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    allowed = tmp_path / "allowed"
+    allowed_link = tmp_path / "allowed-link"
+    release.mkdir()
+    allowed.mkdir()
+    allowed_link.symlink_to(allowed, target_is_directory=True)
+    (release / "python").symlink_to(allowed / "python")
+
+    result = _run_tree_sealer(release, allowed_link)
+
+    assert result.returncode != 0
+    assert "refusing external symlink target" in result.stderr
+
+
+def test_descriptor_sealer_rejects_a_fifo_at_runtime(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    os.mkfifo(release / "fifo")
+
+    result = _run_tree_sealer(release)
+
+    assert result.returncode != 0
+    assert "refusing unsupported candidate filesystem entry: fifo" in result.stderr
+
+
+def test_descriptor_sealer_rejects_a_device_when_mknod_is_permitted(tmp_path: Path) -> None:
+    if os.geteuid() != 0:
+        pytest.skip("requires CAP_MKNOD")
+    release = tmp_path / "release"
+    release.mkdir()
+    device = release / "null"
+    try:
+        os.mknod(device, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+    except PermissionError:
+        pytest.skip("requires CAP_MKNOD")
+
+    result = _run_tree_sealer(release)
+
+    assert result.returncode != 0
+    assert "refusing unsupported candidate filesystem entry: null" in result.stderr
+
+
+def test_descriptor_sealer_rejects_a_mount_when_mounting_is_permitted(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    mountpoint = release / "mount"
+    mountpoint.mkdir(parents=True)
+    mount = shutil.which("mount")
+    unmount = shutil.which("umount")
+    if mount is None or unmount is None:
+        pytest.skip("requires mount and umount utilities")
+    mount_result = subprocess.run(
+        (mount, "--types", "tmpfs", "--options", "size=4096", "tmpfs", str(mountpoint)),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if mount_result.returncode != 0:
+        pytest.skip("requires CAP_SYS_ADMIN")
+    try:
+        result = _run_tree_sealer(release)
+
+        assert result.returncode != 0
+        assert "refusing non-directory or mount escape" in result.stderr
+    finally:
+        unmount_result = subprocess.run(
+            (unmount, str(mountpoint)),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert unmount_result.returncode == 0, unmount_result.stderr
 
 
 def test_descriptor_sealer_contract_uses_fd_identity_and_no_follow_operations() -> None:

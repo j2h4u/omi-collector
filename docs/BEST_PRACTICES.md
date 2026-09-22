@@ -80,7 +80,7 @@ service write access to that root. Use filesystem ownership or ACLs on the
 derived directories when a downstream account also needs access.
 
 After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
-builds the environment as the service account, copies dependencies into it,
+builds the environment as the dedicated build account, copies dependencies into it,
 then seals the selected release as root-owned under
 `/var/lib/omi-collector-deployments`. The first successful deployment creates
 the `current` selector used by the fixed unit command.

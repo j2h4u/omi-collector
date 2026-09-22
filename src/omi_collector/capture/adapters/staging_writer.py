@@ -35,7 +35,7 @@ class StagingWriterTarget(Protocol):
         """Acquire the device lease and prepare or resume the attempt."""
         ...
 
-    def prepare_leg(self, start_sequence: int, packet_count: int) -> DurablePrefix:
+    def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefix:
         """Persist the initial or recovery-leg intent."""
         ...
 
@@ -151,17 +151,17 @@ class StagingWriter:
         assert self._attempt is not None
         return self._attempt.attempt_id
 
-    def prepare_leg(self, start_sequence: int, packet_count: int) -> DurablePrefix:
+    def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefix:
         """Prepare an initial or in-process recovery range before READ."""
         self._enter("prepare_leg")
         if not self._prepared:
             self.prepare()
         self._require_prepared()
-        self._validate_leg(start_sequence, packet_count)
+        self._validate_leg(start_sequence, record_count)
         assert self._attempt is not None
-        prefix = self._attempt.prepare_leg(start_sequence, packet_count)
+        prefix = self._attempt.prepare_leg(start_sequence, record_count)
         self._active_start = start_sequence
-        self._active_count = packet_count
+        self._active_count = record_count
         self._read_started = False
         return prefix
 
@@ -243,17 +243,17 @@ class StagingWriter:
         self._require_lease()
         return self._attempt.checkpoint()
 
-    def seal(self, done: DoneNotification) -> SealResult:
+    def seal(self, done_notice: DoneNotification) -> SealResult:
         """Validate and publish through the existing staging API."""
         self._enter("seal")
         self._require_ready_for_data()
-        if not isinstance(done, DoneNotification):
-            raise TypeError("done must be a DoneNotification")
+        if not isinstance(done_notice, DoneNotification):
+            raise TypeError("done_notice must be a DoneNotification")
         if self._sealed:
             raise StagingWriterStateError("staging writer is already sealed")
         assert self._attempt is not None
         self._require_lease()
-        result = self._attempt.seal(done)
+        result = self._attempt.seal(done_notice)
         self._sealed = True
         return result
 

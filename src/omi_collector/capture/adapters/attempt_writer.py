@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from threading import Event, Lock, Thread
-from typing import Protocol, cast
+from typing import Protocol, runtime_checkable
 
 from ...config import DEFAULT_CONFIG, WriterConfig
 from ..domain.ring_protocol import RECORD_SIZE
@@ -86,6 +86,12 @@ class WriterTarget(Protocol):
 
     def close(self) -> object:
         """Release target resources."""
+
+
+@runtime_checkable
+class _DurableAcknowledgement(Protocol):
+    next_sequence: int
+    record_count: int
 
 
 class WriterState(Enum):
@@ -601,8 +607,10 @@ class AttemptWriter:
         return isinstance(command, CloseCommand)
 
     def _remember_durable_result(self, result: object) -> None:
-        next_sequence = getattr(result, "next_sequence", None)
-        record_count = getattr(result, "record_count", None)
+        if not isinstance(result, _DurableAcknowledgement):
+            return
+        next_sequence = result.next_sequence
+        record_count = result.record_count
         if not isinstance(next_sequence, int) or not isinstance(record_count, int):
             return
         if next_sequence < 0 or record_count < 0:
@@ -683,6 +691,7 @@ class AttemptWriter:
             if latched is None:
                 self._state = Failed(error)
                 latched = error
+            assert latched is not None
             submitted_high_water = self._published
             written_high_water = self._written
             pending = list(self._commands)
@@ -690,7 +699,7 @@ class AttemptWriter:
         if newly_latched:
             debug_exception(
                 "attempt_writer_failed",
-                cast(BaseException, latched),
+                latched,
                 writer_state=WriterState.FAILED.value,
                 submitted_high_water=submitted_high_water,
                 written_high_water=written_high_water,
@@ -700,7 +709,7 @@ class AttemptWriter:
                 with self._lock:
                     self._commands.appendleft(item)
                 break
-            self._complete(item.future, None, WriterFailedError("writer target failed", cast(BaseException, latched)))
+            self._complete(item.future, None, WriterFailedError("writer target failed", latched))
         return latched
 
     def _complete(self, future: asyncio.Future[object], result: object | None, error: BaseException | None) -> None:

@@ -135,7 +135,7 @@ and concurrent readers see either the old or the complete replacement.
 ### 6. Convert confirmed corrections into durable timeline repair intervals
 
 - [x] Implemented
-- [ ] Verified
+- [x] Verified
 
 Clock corrections are recorded and confirmed, but production has no path that
 writes the repair ledger consumed by timeline normalization. A verified backward
@@ -207,8 +207,8 @@ normalization stays within the configured resource budget.
 
 ### 10. Make required storage capabilities explicit typed ports
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Lease handoff, recovery, publication, and clock operations are mandatory in
 production but are omitted from application ports and discovered with

@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from shutil import rmtree
@@ -36,6 +37,12 @@ from omi_collector.capture.application.operational_telemetry import (
     collect_operational_telemetry,
 )
 from omi_collector.capture.application.opportunistic_sync import run_opportunistic_collector
+from omi_collector.capture.application.ports import (
+    ClockCorrectionShape,
+    ClockObservationPort,
+    ClockObservationShape,
+    StorageLeasePort,
+)
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo, RingStatus
 from omi_collector.config import DEFAULT_CONFIG
@@ -68,10 +75,83 @@ class FakeOperationalSession:
         self.writes.append((uuid, value))
 
 
+@dataclass(frozen=True, slots=True)
+class _FakeCorrection:
+    operation_id: str
+    state: str
+    boundary_sequence_min: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeObservation:
+    observation_id: str
+    evidence_kind: str
+    session_id: str
+    host_boot_id: str
+    host_realtime_start: float
+    host_realtime_end: float
+    host_monotonic_start: float
+    host_monotonic_end: float
+    device_epoch: int
+    info_sequence_min: int
+    info_sequence_max: int
+    operation_id: str | None
+    effective_boundary_sequence: int | None
+    observation_role: str
+    parent_observation_id: str | None
+
+
+class _FakeObservationStore:
+    def append(  # noqa: PLR0913 - mirrors the required durable evidence port
+        self,
+        *,
+        evidence_kind: str,
+        session_id: str,
+        host_boot_id: str,
+        host_realtime_start: float,
+        host_realtime_end: float,
+        host_monotonic_start: float,
+        host_monotonic_end: float,
+        device_epoch: int,
+        info_sequence_min: int,
+        info_sequence_max: int,
+        operation_id: str | None = None,
+        effective_boundary_sequence: int | None = None,
+        observation_id: str | None = None,
+        observation_role: str = "standalone",
+        parent_observation_id: str | None = None,
+    ) -> ClockObservationShape:
+        return _FakeObservation(
+            observation_id or "test-observation",
+            evidence_kind,
+            session_id,
+            host_boot_id,
+            host_realtime_start,
+            host_realtime_end,
+            host_monotonic_start,
+            host_monotonic_end,
+            device_epoch,
+            info_sequence_min,
+            info_sequence_max,
+            operation_id,
+            effective_boundary_sequence,
+            observation_role,
+            parent_observation_id,
+        )
+
+    def records(self) -> tuple[ClockObservationShape, ...]:
+        return ()
+
+
 class FakeClockCorrectionSink:
     def __init__(self) -> None:
         self.finished: list[dict[str, object]] = []
         self.reconcile_calls = 0
+        self._observations = _FakeObservationStore()
+
+    @property
+    def observation_store(self) -> ClockObservationPort:
+        return self._observations
 
     def prepare(
         self,
@@ -79,26 +159,37 @@ class FakeClockCorrectionSink:
         target_epoch: int,
         drift_seconds: float,
         boundary_sequence_min: int,
-    ) -> object:
-        return observed_epoch, target_epoch, drift_seconds, boundary_sequence_min
+    ) -> ClockCorrectionShape:
+        del observed_epoch, target_epoch, drift_seconds
+        return _FakeCorrection("test-operation", "prepared", boundary_sequence_min)
 
-    def finish(self, correction: object, **values: object) -> object:
+    def finish(
+        self,
+        correction: ClockCorrectionShape,
+        *,
+        state: str,
+        boundary_sequence_max: int | None,
+        verified_epoch: int | None,
+    ) -> ClockCorrectionShape:
+        values = {
+            "state": state,
+            "boundary_sequence_max": boundary_sequence_max,
+            "verified_epoch": verified_epoch,
+        }
         self.finished.append({"correction": correction, **values})
         return correction
 
-    def mark_unresolved(self, correction: object) -> object:
+    def mark_unresolved(self, correction: ClockCorrectionShape) -> ClockCorrectionShape:
         return correction
 
-    def reconcile_observation(
-        self,
-        observed_epoch: int,
-        drift_seconds: float,
-        boundary_sequence_max: int,
-        *,
-        near_zero_threshold: float,
-    ) -> tuple[object, ...]:
+    def records(self) -> tuple[ClockCorrectionShape, ...]:
+        return ()
+
+    def reconcile_causal_observation(
+        self, observation: ClockObservationShape, *, near_zero_threshold: float
+    ) -> tuple[ClockCorrectionShape, ...]:
         self.reconcile_calls += 1
-        del observed_epoch, drift_seconds, boundary_sequence_max, near_zero_threshold
+        del observation, near_zero_threshold
         return ()
 
 
@@ -285,48 +376,53 @@ def test_clock_mutation_lease_guards_durable_sync_writes() -> None:
     active = False
     entries: list[str] = []
 
+    class Lease:
+        def require_active(self) -> None:
+            return None
+
     @contextmanager
-    def mutation_lease():
+    def mutation_lease() -> Iterator[Lease]:
         nonlocal active
         entries.append("entered")
         active = True
         try:
-            yield
+            yield Lease()
         finally:
             active = False
             entries.append("exited")
 
     class GuardedSink(FakeClockCorrectionSink):
-        def append(self, **_values: object) -> object:
-            assert active
-            return object()
-
         def prepare(
             self, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
-        ) -> object:
+        ) -> ClockCorrectionShape:
             assert active
             return super().prepare(observed_epoch, target_epoch, drift_seconds, boundary_sequence_min)
 
-        def mark_unresolved(self, correction: object) -> object:
+        def mark_unresolved(self, correction: ClockCorrectionShape) -> ClockCorrectionShape:
             assert active
             return super().mark_unresolved(correction)
 
-        def finish(self, correction: object, **values: object) -> object:
-            assert active
-            return super().finish(correction, **values)
-
-        def reconcile_observation(
+        def finish(
             self,
-            observed_epoch: int,
-            drift_seconds: float,
-            boundary_sequence_max: int,
+            correction: ClockCorrectionShape,
             *,
-            near_zero_threshold: float,
-        ) -> tuple[object, ...]:
+            state: str,
+            boundary_sequence_max: int | None,
+            verified_epoch: int | None,
+        ) -> ClockCorrectionShape:
             assert active
-            return super().reconcile_observation(
-                observed_epoch, drift_seconds, boundary_sequence_max, near_zero_threshold=near_zero_threshold
+            return super().finish(
+                correction,
+                state=state,
+                boundary_sequence_max=boundary_sequence_max,
+                verified_epoch=verified_epoch,
             )
+
+        def reconcile_causal_observation(
+            self, observation: ClockObservationShape, *, near_zero_threshold: float
+        ) -> tuple[ClockCorrectionShape, ...]:
+            assert active
+            return super().reconcile_causal_observation(observation, near_zero_threshold=near_zero_threshold)
 
     session = FakeOperationalSession(
         {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)}, readback=pack("<I", 1000)
@@ -356,7 +452,7 @@ def test_clock_mutation_lease_guards_durable_sync_writes() -> None:
 
 def test_busy_clock_mutation_lease_defers_clock_sync_without_a_session_error() -> None:
     class BusyLease:
-        def __enter__(self) -> object:
+        def __enter__(self) -> StorageLeasePort:
             raise OSError("writer owns the storage lease")
 
         def __exit__(self, _type: object, _value: object, _traceback: object) -> None:

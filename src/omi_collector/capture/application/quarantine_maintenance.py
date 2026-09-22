@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import AbstractContextManager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 from time import monotonic
-from typing import Protocol, cast
+from typing import Protocol
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..domain.ring_protocol import RECORD_SIZE
 from .ports import (
     AttemptDescriptorShape,
     CaptureRuntimePort,
-    QuarantinePublicationShape,
-    StagedAttemptShape,
+    RecoveryShape,
     StagingPort,
 )
 from .presence import PresenceWake
@@ -34,33 +33,6 @@ class PresenceWaiterPort(Protocol):
     async def wait_for_attempt(self) -> PresenceWake: ...
 
     async def close(self) -> None: ...
-
-
-class ResumeAttemptPort(Protocol):
-    """Lease-bound restart attempt used to establish its durable frontier."""
-
-    @property
-    def attempt_id(self) -> str: ...
-
-    @property
-    def durable_prefix(self) -> object: ...
-
-    def close(self) -> None: ...
-
-
-class ResumeStagingPort(Protocol):
-    """The lease-scoped staging seam needed only for startup promotion."""
-
-    def device_lock(self) -> AbstractContextManager[object]: ...
-
-    def resume_streaming_attempt(self, lease: object) -> ResumeAttemptPort | None: ...
-
-
-class RecoveryFrontierPort(Protocol):
-    """Validated checkpoint and aligned raw-tail bounds from startup hydration."""
-
-    valid_records: int
-    raw_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,9 +107,6 @@ class QuarantineMaintenance:
         return state
 
     async def _recover_and_publish(self) -> bool:
-        recover = getattr(self._staging, "recover_and_publish", None)
-        if not callable(recover):
-            return True
         if self._publication_retry_not_before > monotonic():
             self._schedule_publication_retry()
             return False
@@ -147,7 +116,7 @@ class QuarantineMaintenance:
         backoff = self._config.retry.rapid_backoff
         for attempt in range(len(backoff) + 1):
             try:
-                await asyncio.to_thread(recover)
+                await asyncio.to_thread(self._staging.recover_and_publish)
                 self._publication_retry_number = 0
                 self._publication_retry_not_before = 0.0
                 self._runtime.debug_event("timeline_generation_published")
@@ -336,18 +305,15 @@ class QuarantineMaintenance:
 
     async def _pending_descriptor(self) -> AttemptDescriptorShape | None:
         pending = await asyncio.to_thread(self._staging.pending_attempts)
-        descriptors = cast(tuple[AttemptDescriptorShape, ...], pending)
+        descriptors = pending
         if len(descriptors) > 1:
             raise OpportunisticSyncError("multiple partial attempts block resume")
         return descriptors[0] if descriptors else None
 
     async def _validate_pending_evidence(self, descriptor: AttemptDescriptorShape) -> int:
-        attempt = cast(
-            StagedAttemptShape,
-            await asyncio.to_thread(self._staging.open_attempt_for_resume, descriptor.attempt_id),
-        )
+        attempt = await asyncio.to_thread(self._staging.open_attempt_for_resume, descriptor.attempt_id)
         try:
-            recovery = cast(RecoveryFrontierPort, await asyncio.to_thread(attempt.recover))
+            recovery = await asyncio.to_thread(attempt.recover)
         except BaseException:
             await asyncio.to_thread(attempt.close)
             raise
@@ -364,7 +330,7 @@ class QuarantineMaintenance:
             return self._authenticated_tail_frontier(descriptor, recovery)
 
     @staticmethod
-    def _authenticated_tail_frontier(descriptor: AttemptDescriptorShape, recovery: RecoveryFrontierPort) -> int:
+    def _authenticated_tail_frontier(descriptor: AttemptDescriptorShape, recovery: RecoveryShape) -> int:
         if recovery.raw_bytes % RECORD_SIZE:
             raise OpportunisticSyncError("validated recovery returned an unaligned raw tail")
         raw_records = recovery.raw_bytes // RECORD_SIZE
@@ -381,14 +347,13 @@ class QuarantineMaintenance:
         the temporary handle before returning the authoritative frontier to
         reconciliation.  A later writer reopens the already-promoted attempt.
         """
-        staging = cast(ResumeStagingPort, self._staging)
-        with staging.device_lock() as lease:
-            resumed = staging.resume_streaming_attempt(lease)
+        with self._staging.device_lock() as lease:
+            resumed = self._staging.resume_streaming_attempt(lease)
             if resumed is None or resumed.attempt_id != descriptor.attempt_id:
                 raise OpportunisticSyncError("validated pending attempt disappeared before lease-bound resume")
             try:
                 prefix = resumed.durable_prefix
-                durable_next = getattr(prefix, "next_sequence", None)
+                durable_next = prefix.next_sequence
                 end = descriptor.start_sequence + descriptor.packet_count
                 if isinstance(durable_next, bool) or not isinstance(durable_next, int):
                     raise OpportunisticSyncError("lease-bound resume returned an invalid durable frontier")
@@ -446,7 +411,7 @@ class QuarantineMaintenance:
         except Exception as error:  # noqa: BLE001 - retain source until a later lifecycle pass
             self._runtime.debug_exception("quarantine_terminal_mark_failed", error, source=source.name)
             return True
-        publication = cast(QuarantinePublicationShape, result)
+        publication = result
         self._quarantine_retry_number = 0
         self._quarantine_retry_not_before = 0.0
         self._runtime.debug_event(

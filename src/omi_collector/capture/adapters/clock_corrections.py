@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TextIO, cast
 from uuid import uuid4
 
+from ..application.ports import ClockCorrectionShape
 from .clock_observations import ClockObservationStore
 
 try:
@@ -107,12 +108,14 @@ class ClockCorrectionStore:
 
     def finish(
         self,
-        correction: ClockCorrection,
+        correction: ClockCorrectionShape,
         *,
         state: str,
         boundary_sequence_max: int | None,
         verified_epoch: int | None,
     ) -> ClockCorrection:
+        if not isinstance(correction, ClockCorrection):
+            raise ClockCorrectionError("clock correction is not issued by this store")
         current = self._read(self._path(correction))
         if (
             current.state == state
@@ -250,8 +253,10 @@ class ClockCorrectionStore:
             return ()
         return tuple(self._read(path) for path in sorted(self._root.glob("*.json")))
 
-    def mark_unresolved(self, correction: ClockCorrection) -> ClockCorrection:
+    def mark_unresolved(self, correction: ClockCorrectionShape) -> ClockCorrection:
         """Persist ambiguity before the BLE write can possibly take effect."""
+        if not isinstance(correction, ClockCorrection):
+            raise ClockCorrectionError("clock correction is not issued by this store")
         current = self._read(self._path(correction))
         if current.state == "unresolved":
             return current

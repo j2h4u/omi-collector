@@ -11,7 +11,6 @@ import asyncio
 import subprocess
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from inspect import isawaitable
 from pathlib import Path
@@ -20,7 +19,18 @@ from typing import Protocol, cast
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RingInfo, RingStatus
-from .ports import PublicationAuthorityPort
+from .ports import (
+    ClockCorrectionShape,
+    ClockObservationShape,
+    PublicationAuthorityPort,
+    StorageLeaseFactory,
+)
+from .ports import (
+    ClockDurabilityPort as ClockCorrectionSink,
+)
+from .ports import (
+    ClockObservationPort as ClockObservationSink,
+)
 
 TIME_SERVICE_UUID = "19b10030-e8f2-537e-4f6c-d104768a1214"
 TIME_WRITE_UUID = "19b10031-e8f2-537e-4f6c-d104768a1214"
@@ -48,7 +58,7 @@ type OptionalReader = Callable[[str], Awaitable[bytes | None]]
 type OptionalWriter = Callable[[str, bytes], Awaitable[object]]
 type InfoReader = Callable[[], Awaitable[RingInfo]]
 type StatusReader = Callable[[], Awaitable[RingStatus | None]]
-type ClockMutationLease = Callable[[], AbstractContextManager[object]]
+type ClockMutationLease = StorageLeaseFactory
 
 
 class OperationalSession(Protocol):
@@ -61,44 +71,6 @@ class OperationalSession(Protocol):
     async def write_optional_characteristic(self, uuid: str, value: bytes) -> object:
         """Write an optional characteristic; false means no write was performed."""
         ...
-
-
-class ClockCorrectionSink(Protocol):
-    """Durable boundary around a pendant clock write."""
-
-    def prepare(
-        self, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
-    ) -> object: ...
-
-    def mark_unresolved(self, correction: object) -> object: ...
-
-    def finish(
-        self,
-        correction: object,
-        *,
-        state: str,
-        boundary_sequence_max: int | None,
-        verified_epoch: int | None,
-    ) -> object: ...
-
-    def reconcile_observation(
-        self,
-        observed_epoch: int,
-        drift_seconds: float,
-        boundary_sequence_max: int,
-        *,
-        near_zero_threshold: float,
-    ) -> object: ...
-
-
-class ClockObservationSink(Protocol):
-    """Durable evidence sink required before a clock decision."""
-
-    def append(self, **values: object) -> object: ...
-
-
-class _ObservationReference(Protocol):
-    observation_id: str
 
 
 def system_host_boot_id() -> str:
@@ -179,9 +151,13 @@ async def collect_operational_telemetry(
     synchronized = telemetry_clock.synchronized or (
         lambda: system_host_clock_synchronized(telemetry_clock.host_clock_probe_timeout)
     )
-    observation_sink = telemetry_clock.observation_sink
-    if observation_sink is None and callable(getattr(telemetry_clock.correction_sink, "append", None)):
-        observation_sink = cast(ClockObservationSink, telemetry_clock.correction_sink)
+    observation_sink = (
+        telemetry_clock.observation_sink
+        if telemetry_clock.observation_sink is not None
+        else telemetry_clock.correction_sink.observation_store
+        if telemetry_clock.correction_sink is not None
+        else None
+    )
     reader, writer = _optional_accessors(session)
     # Clock evidence is its own bounded stage.  It must not depend on status,
     # metadata, or a potentially slow operational emitter.
@@ -387,7 +363,7 @@ async def _sync_clock(sync: _ClockSync) -> None:  # noqa: PLR0911 - each failure
         event.update(action="none", outcome="evidence_persist_failed")
         emit(event)
         return
-    _reconcile_observation(sync, drift, event, observation_evidence)
+    _reconcile_observation(sync, event, observation_evidence)
     if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
         event.update(action="none", outcome="within_threshold")
         await _publish_timeline(sync, event)
@@ -435,13 +411,13 @@ async def _publish_timeline(sync: _ClockSync, event: dict[str, object]) -> None:
         event["publication"] = "failed"
 
 
-def _persist_clock_observation(sync: _ClockSync) -> object | None:
+def _persist_clock_observation(sync: _ClockSync) -> ClockObservationShape | None:
     sink = sync.observation_sink
     if sink is None:
-        return False
+        return None
     sample = sync.sample
     if sample.epoch is None:
-        return False
+        return None
     values: dict[str, object] = {
         "evidence_kind": "native_trusted",
         "session_id": sync.session_id,
@@ -457,11 +433,10 @@ def _persist_clock_observation(sync: _ClockSync) -> object | None:
     pending_operation = _pending_observation_operation(sync)
     initial = _initial_observation(sync, pending_operation)
     if pending_operation is not None and initial is not None:
-        initial_reference = cast(_ObservationReference, initial)
         values.update(
             operation_id=pending_operation,
             observation_role="later",
-            parent_observation_id=initial_reference.observation_id,
+            parent_observation_id=initial.observation_id,
         )
     try:
         return sink.append(**values)
@@ -470,49 +445,40 @@ def _persist_clock_observation(sync: _ClockSync) -> object | None:
 
 
 def _pending_observation_operation(sync: _ClockSync) -> str | None:
-    records = getattr(sync.correction_sink, "records", None) if sync.correction_sink is not None else None
-    if not callable(records):
+    sink = sync.correction_sink
+    if sink is None:
         return None
     try:
-        pending = tuple(records())
+        pending = sink.records()
     except Exception:  # noqa: BLE001 - operation binding is best effort
         return None
     candidates = tuple(
         item
         for item in pending
-        if getattr(item, "state", None) == "unresolved"
-        and getattr(item, "boundary_sequence_min", sync.info_before.write_sequence + 1)
-        <= sync.info_before.write_sequence
+        if item.state == "unresolved" and item.boundary_sequence_min <= sync.info_before.write_sequence
     )
-    operation_id = getattr(candidates[-1], "operation_id", None) if candidates else None
+    operation_id = candidates[-1].operation_id if candidates else None
     return operation_id if isinstance(operation_id, str) and operation_id else None
 
 
-def _initial_observation(sync: _ClockSync, operation_id: str | None) -> object | None:
+def _initial_observation(sync: _ClockSync, operation_id: str | None) -> ClockObservationShape | None:
     if operation_id is None:
         return None
     sink = sync.observation_sink
-    store = getattr(sink, "observation_store", None) if sink is not None else None
-    records = getattr(store, "records", None)
-    if not callable(records):
+    if sink is None:
         return None
     try:
-        values = tuple(records())
+        values = sink.records()
     except Exception:  # noqa: BLE001 - missing durable linkage leaves evidence unresolved
         return None
     return next(
-        (
-            item
-            for item in reversed(values)
-            if getattr(item, "operation_id", None) == operation_id
-            and getattr(item, "observation_role", None) == "initial"
-        ),
+        (item for item in reversed(values) if item.operation_id == operation_id and item.observation_role == "initial"),
         None,
     )
 
 
 def _persist_post_clock_observation(
-    sync: _ClockSync, correction: object, info_after: RingInfo | None, readback: _ClockReadback | None
+    sync: _ClockSync, correction: ClockCorrectionShape, info_after: RingInfo | None, readback: _ClockReadback | None
 ) -> bool:
     sink = sync.observation_sink
     if sink is None or readback is None or readback.epoch is None:
@@ -534,16 +500,15 @@ def _persist_post_clock_observation(
         "device_epoch": readback.epoch,
         "info_sequence_min": sync.info_before.write_sequence,
         "info_sequence_max": boundary,
-        "operation_id": getattr(correction, "operation_id", None),
+        "operation_id": correction.operation_id,
         "effective_boundary_sequence": effective_boundary,
     }
     operation_id = values["operation_id"]
     initial = _initial_observation(sync, operation_id if isinstance(operation_id, str) else None)
     if initial is not None:
-        initial_reference = cast(_ObservationReference, initial)
         values.update(
             observation_role="later",
-            parent_observation_id=initial_reference.observation_id,
+            parent_observation_id=initial.observation_id,
         )
     try:
         sink.append(**values)
@@ -566,34 +531,16 @@ async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> Ri
 
 
 def _reconcile_observation(
-    sync: _ClockSync, drift: float, event: dict[str, object], observation: object | None = None
+    sync: _ClockSync, event: dict[str, object], observation: ClockObservationShape | None = None
 ) -> None:
     sink = sync.correction_sink
-    causal = getattr(sink, "reconcile_causal_observation", None) if sink is not None else None
-    if callable(causal):
-        if observation is None or not isinstance(getattr(observation, "observation_id", None), str):
-            event["reconciliation"] = "missing_durable_reference"
-            return
-        if not isinstance(getattr(observation, "operation_id", None), str) or sync.observation_sink is None:
-            event["reconciliation"] = "no_causal_operation"
-            return
-        try:
-            reconciled = causal(observation, near_zero_threshold=CLOCK_DRIFT_THRESHOLD_SECONDS)
-        except Exception:  # noqa: BLE001 - unresolved evidence must remain durable
-            event["reconciliation"] = "failed"
-            return
-        if isinstance(reconciled, tuple):
-            event["reconciled_operations"] = len(reconciled)
+    if sink is None or observation is None:
         return
-    reconcile = getattr(sink, "reconcile_observation", None) if sink is not None else None
-    if not callable(reconcile) or sync.sample.epoch is None:
+    if observation.operation_id is None or sync.observation_sink is None:
+        event["reconciliation"] = "no_causal_operation"
         return
     try:
-        kwargs: dict[str, object] = {"near_zero_threshold": CLOCK_DRIFT_THRESHOLD_SECONDS}
-        effective = getattr(observation, "effective_boundary_sequence", None)
-        if effective is not None:
-            kwargs["effective_boundary_sequence"] = effective
-        reconciled = reconcile(sync.sample.epoch, drift, sync.info_before.write_sequence, **kwargs)
+        reconciled = sink.reconcile_causal_observation(observation, near_zero_threshold=CLOCK_DRIFT_THRESHOLD_SECONDS)
     except Exception:  # noqa: BLE001 - unresolved evidence must remain durable
         event["reconciliation"] = "failed"
         return
@@ -606,8 +553,8 @@ def _prepare_clock_intent(
     event: dict[str, object],
     target: int,
     drift: float,
-    observation: object,
-) -> object | None:
+    observation: ClockObservationShape,
+) -> ClockCorrectionShape | None:
     if sync.correction_sink is None:
         event.update(action="none", outcome="intent_unavailable")
         return None
@@ -622,20 +569,16 @@ def _prepare_clock_intent(
         return None
 
 
-def _bind_observation_operation(sync: _ClockSync, correction: object, observation: object) -> None:
+def _bind_observation_operation(
+    sync: _ClockSync, correction: ClockCorrectionShape, observation: ClockObservationShape
+) -> None:
     sink = sync.observation_sink
-    store = getattr(sink, "observation_store", None) if sink is not None else None
-    operation_id = getattr(correction, "operation_id", None)
-    if store is None or not isinstance(operation_id, str):
+    if sink is None:
         return
-    source_id = getattr(observation, "observation_id", None)
-    if not isinstance(source_id, str):
+    source = next((item for item in sink.records() if item.observation_id == observation.observation_id), None)
+    if source is None or source.operation_id is not None:
         return
-    records = tuple(store.records())
-    source = next((item for item in records if getattr(item, "observation_id", None) == source_id), None)
-    if source is None or getattr(source, "operation_id", None) is not None:
-        return
-    store.append(
+    sink.append(
         evidence_kind=source.evidence_kind,
         session_id=source.session_id,
         host_boot_id=source.host_boot_id,
@@ -646,14 +589,14 @@ def _bind_observation_operation(sync: _ClockSync, correction: object, observatio
         device_epoch=source.device_epoch,
         info_sequence_min=source.info_sequence_min,
         info_sequence_max=source.info_sequence_max,
-        operation_id=operation_id,
+        operation_id=correction.operation_id,
         observation_role="initial",
     )
 
 
 def _finish_clock_intent(
     sync: _ClockSync,
-    correction: object,
+    correction: ClockCorrectionShape,
     event: dict[str, object],
     info_after: RingInfo | None,
     verified_epoch: int | None,

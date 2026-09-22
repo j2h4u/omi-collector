@@ -104,7 +104,7 @@ def test_writer_publication_failure_schedules_local_retry(tmp_path: Path, monkey
     store = _store(tmp_path)
     retries: list[str] = []
     authority = store.create_publication_authority(lambda: retries.append("scheduled"))
-    writer = _StagingWriterAdapter(store, 100, 1, 100)
+    writer = _StagingWriterAdapter(store.make_staging_writer(100, 1), store.notify_publication_failure, 100)
     writer.prepare()
     writer.prepare_leg(100, 1)
     writer.read_begin(ReadBeginNotification(100, 1))

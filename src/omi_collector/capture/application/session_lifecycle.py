@@ -13,9 +13,9 @@ import inspect
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, AbstractContextManager, suppress
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import KW_ONLY, dataclass
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, RetryConfig
 from ..domain.ring_protocol import RECORD_SIZE, STATUS_STORAGE_NOT_READY, RingInfo, RingStatus, encode_stop_command
@@ -28,7 +28,7 @@ from .operational_telemetry import (
     collect_operational_telemetry,
     system_host_clock_synchronized,
 )
-from .ports import CaptureRuntimePort, PublicationAuthorityPort
+from .ports import CaptureRuntimePort, PublicationAuthorityPort, StorageLeaseFactory
 from .presence import PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
@@ -116,8 +116,9 @@ class OpportunisticOptions:
     presence: PresenceSchedulerPort | None = None
     quality_metrics: QualityMetricsPort | None = None
     clock_correction_sink: ClockCorrectionSink | None = None
+    clock_observation_sink: ClockObservationSink | None = None
     timeline_publisher: PublicationAuthorityPort | None = None
-    clock_lease: Callable[[], AbstractContextManager[object]] | None = None
+    clock_lease: StorageLeaseFactory | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
 
@@ -426,13 +427,7 @@ class SessionLifecycle:
                             info_reader=lambda: self._info(session),
                             status_reader=session.read_status if options.operational is not None else None,
                             correction_sink=options.clock_correction_sink,
-                            observation_sink=cast(
-                                ClockObservationSink | None,
-                                options.clock_correction_sink
-                                if options.clock_correction_sink is not None
-                                and callable(getattr(options.clock_correction_sink, "append", None))
-                                else None,
-                            ),
+                            observation_sink=options.clock_observation_sink,
                             monotonic=options.clock,
                             session_id=phase.quality.session_id if phase.quality is not None else "native",
                             publisher=options.timeline_publisher,

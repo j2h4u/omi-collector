@@ -306,7 +306,7 @@ def _write_build_fakes(
     (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
         "set -uo pipefail\n"
-        f'printf "uv args=%s\\n" "$*" >> {quoted_log}\n'
+        f'printf "uv cwd=%s args=%s\\n" "$PWD" "$*" >> {quoted_log}\n'
         '[[ "$DEPLOY_BUILD_FAIL" != 1 ]] || exit 1\n'
         'if [[ "$1" == python && "$2" == install ]]; then\n'
         '    mkdir --parents "$UV_PYTHON_INSTALL_DIR/cpython-3.14/bin"\n'
@@ -612,13 +612,14 @@ def _previous_release(harness: _DeploymentHarness) -> Path:
     return release
 
 
-def _run_deployer(harness: _DeploymentHarness) -> subprocess.CompletedProcess[str]:
+def _run_deployer(harness: _DeploymentHarness, caller_cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [harness.deployer],
         check=False,
         capture_output=True,
         text=True,
         env=harness.environment,
+        cwd=caller_cwd,
     )
 
 
@@ -642,7 +643,8 @@ def test_deployer_builds_validates_selects_and_seals_one_release(tmp_path: Path)
     assert unrelated.is_dir()
     assert tuple(path for path in (harness.deployment_root / "releases").glob("release-*")) == (selected,)
     commands = harness.log.read_text(encoding="utf-8")
-    assert "uv args=sync --project" in commands
+    assert "uv cwd=" in commands
+    assert "args=sync --project" in commands
     assert "config check --config" in commands
     assert "systemctl args=stop omi-collector.service" in commands
     assert "systemctl args=restart omi-collector.service" in commands
@@ -670,6 +672,38 @@ def test_deployer_verifies_candidate_as_builder_before_root_seals_or_restarts(tm
     assert deployer.index('validate_candidate_config "$runuser_bin" "$build_user"') < deployer.index(
         'seal_deployment_environment "$staged_environment"'
     )
+
+
+def test_deployer_build_user_runs_uv_from_the_staged_repository_not_the_caller_directory(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path)
+    caller_cwd = tmp_path / "caller"
+    caller_cwd.mkdir()
+
+    result = _run_deployer(harness, caller_cwd)
+
+    assert result.returncode == 0, result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    expected_cwd = harness.deployer.parents[1]
+    uv_runs = [line for line in commands.splitlines() if line.startswith("uv cwd=")]
+    assert len(uv_runs) == 2
+    assert all(f"uv cwd={expected_cwd} " in line for line in uv_runs)
+    assert all(f"uv cwd={caller_cwd} " not in line for line in uv_runs)
+    assert "args=python install 3.14" in uv_runs[0]
+    assert "args=sync --project" in uv_runs[1]
+
+
+def test_deployer_keeps_the_service_untouched_when_the_build_user_uv_command_fails(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path)
+    previous = _previous_release(harness)
+    harness.environment["DEPLOY_BUILD_FAIL"] = "1"
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "could not install the managed build Python" in result.stderr
+    assert harness.current_link.resolve(strict=True) == previous
+    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
+    assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
 
 
 def test_deployer_rejects_candidate_metadata_symlink_before_service_restart(tmp_path: Path) -> None:

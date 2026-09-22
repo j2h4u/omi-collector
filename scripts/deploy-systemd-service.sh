@@ -392,6 +392,8 @@ declare -ri readiness_poll_attempts=5 readiness_poll_interval_seconds=1 stabilit
 
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve script directory'
 repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
+# assert: build-user processes inherit the reviewed production checkout, never the caller directory
+builtin cd -- "$repo_root" || die 'cannot enter repository root'
 source_package="${repo_root}/src/omi_collector"
 source_unit="${repo_root}/systemd/omi-collector.service"
 installed_unit='/etc/systemd/system/omi-collector.service'

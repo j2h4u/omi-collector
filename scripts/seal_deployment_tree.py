@@ -18,8 +18,10 @@ def _parse_owner(owner: str) -> tuple[int, int]:
 
 
 def _path_is_within(target: str, root: str) -> bool:
+    normalized_target = os.path.normpath(target)
+    normalized_root = os.path.normpath(root)
     try:
-        return os.path.commonpath((target, root)) == root
+        return os.path.commonpath((normalized_target, normalized_root)) == normalized_root
     except ValueError:
         return False
 
@@ -42,6 +44,7 @@ def _relative_target_stays_within(parent_parts: tuple[str, ...], target: str) ->
 class _SealContext:
     owner: tuple[int, int]
     root_device: int
+    tree_root: str
     allowed_external: tuple[str, ...]
 
 
@@ -58,8 +61,15 @@ class _ArgparseArguments(argparse.Namespace):
     allow_external: list[str]
 
 
-def _validate_link(target: str, parent_parts: tuple[str, ...], allowed_external: tuple[str, ...]) -> None:
+def _validate_link(
+    target: str,
+    tree_root: str,
+    parent_parts: tuple[str, ...],
+    allowed_external: tuple[str, ...],
+) -> None:
     if PurePosixPath(target).is_absolute():
+        if _path_is_within(target, tree_root):
+            return
         if any(_path_is_within(target, root) for root in allowed_external):
             return
         raise RuntimeError(f"refusing external symlink target: {target}")
@@ -101,7 +111,12 @@ def _seal_directory(
         for entry in entries:
             entry_stat = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
             if stat.S_ISLNK(entry_stat.st_mode):
-                _validate_link(os.readlink(entry.name, dir_fd=directory_fd), parent_parts, context.allowed_external)
+                _validate_link(
+                    os.readlink(entry.name, dir_fd=directory_fd),
+                    context.tree_root,
+                    parent_parts,
+                    context.allowed_external,
+                )
                 continue
             if stat.S_ISDIR(entry_stat.st_mode):
                 child_fd = _open_child(directory_fd, entry.name, os.O_RDONLY | os.O_DIRECTORY)
@@ -133,7 +148,7 @@ def _seal_directory(
 def _seal_tree(root: str, owner: tuple[int, int], allowed_external: tuple[str, ...]) -> None:
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        context = _SealContext(owner, os.fstat(root_fd).st_dev, allowed_external)
+        context = _SealContext(owner, os.fstat(root_fd).st_dev, root, allowed_external)
         _seal_directory(root_fd, context, ())
     finally:
         os.close(root_fd)
@@ -158,10 +173,11 @@ def main() -> int:
     arguments = _parse_arguments()
     if not PurePosixPath(arguments.root).is_absolute():
         raise ValueError("root must be absolute")
-    allowed_external = tuple(str(PurePosixPath(path)) for path in arguments.allow_external)
+    root = os.path.normpath(arguments.root)
+    allowed_external = tuple(os.path.normpath(path) for path in arguments.allow_external)
     if not all(PurePosixPath(path).is_absolute() for path in allowed_external):
         raise ValueError("allowed external paths must be absolute")
-    _seal_tree(arguments.root, _parse_owner(arguments.owner), allowed_external)
+    _seal_tree(root, _parse_owner(arguments.owner), allowed_external)
     return 0
 
 

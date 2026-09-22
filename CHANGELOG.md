@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.11](https://github.com/j2h4u/omi-collector/compare/v0.6.10...v0.6.11) (2026-09-22)
+
+
+### Fixes
+
+* harden capture recovery and publication ([#104](https://github.com/j2h4u/omi-collector/issues/104)) ([e7f7504](https://github.com/j2h4u/omi-collector/commit/e7f7504acfa69b6ffff069809ad88e52dcbba948))
+
 ## [0.6.10](https://github.com/j2h4u/omi-collector/compare/v0.6.9...v0.6.10) (2026-09-22)
 
 

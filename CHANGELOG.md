@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.12](https://github.com/j2h4u/omi-collector/compare/v0.6.11...v0.6.12) (2026-09-22)
+
+
+### Fixes
+
+* anchor deployment builds to repository root ([#106](https://github.com/j2h4u/omi-collector/issues/106)) ([c3bae07](https://github.com/j2h4u/omi-collector/commit/c3bae07ad63356efeafb2a9c869debba6229b3d9))
+
 ## [0.6.11](https://github.com/j2h4u/omi-collector/compare/v0.6.10...v0.6.11) (2026-09-22)
 
 

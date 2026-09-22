@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.9](https://github.com/j2h4u/omi-collector/compare/v0.6.8...v0.6.9) (2026-09-22)
+
+
+### Fixes
+
+* require stable presence before automatic sync ([#100](https://github.com/j2h4u/omi-collector/issues/100)) ([0c34673](https://github.com/j2h4u/omi-collector/commit/0c346735df402baac2d00e250342381257aa9c68))
+
 ## [0.6.8](https://github.com/j2h4u/omi-collector/compare/v0.6.7...v0.6.8) (2026-09-22)
 
 

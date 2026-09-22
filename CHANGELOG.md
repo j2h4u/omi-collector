@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.10](https://github.com/j2h4u/omi-collector/compare/v0.6.9...v0.6.10) (2026-09-22)
+
+
+### Documentation
+
+* add adversarial review remediation plan ([#102](https://github.com/j2h4u/omi-collector/issues/102)) ([6a09a47](https://github.com/j2h4u/omi-collector/commit/6a09a4765dedbd480aad25c71ff6a6b16bee37f2))
+
 ## [0.6.9](https://github.com/j2h4u/omi-collector/compare/v0.6.8...v0.6.9) (2026-09-22)
 
 

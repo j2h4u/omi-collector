@@ -71,7 +71,7 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
     transport and optional PHY guard belong to a single presence session and
     are recreated only after that session ends.
     """
-    validate_policy(options.policy, options.config.presence.max_drained_fallback_seconds)
+    validate_policy(options.policy, options.config.presence.max_drain_cooldown_seconds)
     validate_presence_policy(options)
     loop = asyncio.get_running_loop()
 

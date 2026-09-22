@@ -6,9 +6,11 @@ import os
 import re
 import stat
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
+
+from .config import CollectorConfig, PresenceConfig
 
 DEFAULT_CONFIG_PATH = Path("/srv/pipelines/omi/config.toml")
 _ADDRESS = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\Z")
@@ -63,6 +65,7 @@ class OperatorConfig:
     path: Path
     pendant: PendantConfig
     storage: StorageLayout
+    config: CollectorConfig = field(default_factory=CollectorConfig)
 
 
 def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
@@ -73,8 +76,8 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
         document = cast(dict[str, object], tomllib.loads(config_path.read_text(encoding="utf-8")))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise StorageLayoutError("config TOML is unreadable or malformed") from error
-    if not isinstance(document, dict) or set(document) != {"pendant"}:
-        raise StorageLayoutError("config must contain exactly [pendant]")
+    if not isinstance(document, dict) or set(document) not in ({"pendant"}, {"pendant", "presence"}):
+        raise StorageLayoutError("config must contain [pendant] and optional [presence]")
     pendant = _section(document["pendant"], {"address"}, "pendant")
     address = pendant["address"]
     if _ADDRESS.fullmatch(address) is None:
@@ -101,7 +104,22 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
             current=publication_root / "current",
         ),
     )
-    return OperatorConfig(config_path.absolute(), PendantConfig(address), layout)
+    runtime_config = CollectorConfig()
+    if "presence" in document:
+        presence = _number_section(
+            document["presence"], {"arrival_max_gap_seconds", "arrival_stability_seconds"}, "presence"
+        )
+        try:
+            runtime_config = replace(
+                runtime_config,
+                presence=PresenceConfig(
+                    arrival_stability_seconds=presence["arrival_stability_seconds"],
+                    arrival_max_gap_seconds=presence["arrival_max_gap_seconds"],
+                ),
+            )
+        except ValueError as error:
+            raise StorageLayoutError(f"presence settings are invalid: {error}") from error
+    return OperatorConfig(config_path.absolute(), PendantConfig(address), layout, runtime_config)
 
 
 def _section(value: object, keys: set[str], name: str) -> dict[str, str]:
@@ -112,6 +130,17 @@ def _section(value: object, keys: set[str], name: str) -> dict[str, str]:
         if not isinstance(item, str) or not item or item != item.strip():
             raise StorageLayoutError(f"{name}.{key} must be a non-empty string")
         result[key] = item
+    return result
+
+
+def _number_section(value: object, keys: set[str], name: str) -> dict[str, float]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise StorageLayoutError(f"[{name}] must contain exactly {', '.join(sorted(keys))}")
+    result: dict[str, float] = {}
+    for key, item in value.items():
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise StorageLayoutError(f"{name}.{key} must be a number")
+        result[key] = float(item)
     return result
 
 

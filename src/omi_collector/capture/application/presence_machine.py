@@ -15,9 +15,11 @@ class PresenceMachinePolicy:
     """Already-validated scheduling bounds, expressed in seconds."""
 
     absence_seconds: float
-    fallback_seconds: float
-    drained_fallback_seconds: float
+    scan_recheck_seconds: float
+    drain_cooldown_seconds: float
     rapid_backoff: tuple[float, ...]
+    arrival_stability_seconds: float = 30.0
+    arrival_max_gap_seconds: float = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,10 +33,12 @@ class Advertisement:
 
 @dataclass(frozen=True, slots=True)
 class Searching:
-    """Observing for a return while an ordinary fallback remains armed."""
+    """Observing for a return while a scanner recheck remains armed."""
 
     timer_epoch: int
-    fallback_at: float
+    scan_recheck_at: float
+    advertisement: Advertisement | None = None
+    arrival_started_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +48,8 @@ class CoolingDown:
     timer_epoch: int
     cooldown_at: float
     recheck_at: float
-    gatt_at: float | None
     advertisement: Advertisement | None
+    arrival_started_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,11 +57,11 @@ class RetryWaiting:
     """A nearby interrupted attempt is waiting for a bounded retry."""
 
     timer_epoch: int
-    retry_at: float
-    fallback_at: float
+    retry_at: float | None
+    scan_recheck_at: float
     retry_index: int
-    gatt_at: float | None
     advertisement: Advertisement | None
+    arrival_started_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,20 +72,13 @@ class AdvertisementTrigger:
 
 
 @dataclass(frozen=True, slots=True)
-class FallbackTrigger:
-    """Release an ordinary fallback, optionally with a fresh candidate."""
-
-    advertisement: Advertisement | None
-
-
-@dataclass(frozen=True, slots=True)
 class RapidRetryTrigger:
-    """Release a retry while presence evidence remains fresh."""
+    """Release a retry from a current scanner observation."""
 
-    advertisement: Advertisement | None
+    advertisement: Advertisement
 
 
-type AttemptTrigger = AdvertisementTrigger | FallbackTrigger | RapidRetryTrigger
+type AttemptTrigger = AdvertisementTrigger | RapidRetryTrigger
 # Waiting values are constructed only by this module's transitions.  Their
 # immutable fields therefore need no defensive constructor validation.
 type WaitingState = Searching | CoolingDown | RetryWaiting
@@ -108,6 +105,14 @@ class AdvertisementObserved:
     """A matching advertisement whose scanner generation was validated outside."""
 
     advertisement: Advertisement
+    processed_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScannerInterrupted:
+    """The active scanner stopped or failed before admission completed."""
+
+    at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +166,7 @@ class Shutdown:
     at: float
 
 
-type PresenceEvent = AdvertisementObserved | TimerFired | AttemptFinished | Shutdown
+type PresenceEvent = AdvertisementObserved | ScannerInterrupted | TimerFired | AttemptFinished | Shutdown
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,51 +221,19 @@ class UnexpectedAttemptOutcomeError(RuntimeError):
 
 
 def initial_state(started_at: float, policy: PresenceMachinePolicy) -> Searching:
-    """Create the initial fallback search state without reading a clock."""
-    return Searching(timer_epoch=0, fallback_at=started_at + policy.fallback_seconds)
+    """Create the initial scanner-recheck state without reading a clock."""
+    return Searching(timer_epoch=0, scan_recheck_at=started_at + policy.scan_recheck_seconds)
 
 
 def armed_deadline(state: WaitingState) -> float:
     """Project the one currently armed deadline for a waiting state."""
     if isinstance(state, Searching):
-        return state.fallback_at
+        return state.scan_recheck_at
     if isinstance(state, CoolingDown):
         return max(state.cooldown_at, state.recheck_at)
-    return min(state.retry_at, state.fallback_at)
-
-
-def latest_presence_at(gatt_at: float | None, advertisement: Advertisement | None) -> float | None:
-    """Return the later GATT or advertisement proof, if either exists."""
-    advertisement_at = advertisement.observed_at if advertisement is not None else None
-    if gatt_at is None:
-        return advertisement_at
-    if advertisement_at is None:
-        return gatt_at
-    return max(gatt_at, advertisement_at)
-
-
-def evidence_is_fresh(
-    gatt_at: float | None,
-    advertisement: Advertisement | None,
-    *,
-    at: float,
-    policy: PresenceMachinePolicy,
-) -> bool:
-    """Apply the one strict freshness rule; equality is already stale."""
-    evidence_at = latest_presence_at(gatt_at, advertisement)
-    return evidence_at is not None and at < evidence_at + policy.absence_seconds
-
-
-def fresh_advertisement(
-    advertisement: Advertisement | None,
-    *,
-    at: float,
-    policy: PresenceMachinePolicy,
-) -> Advertisement | None:
-    """Return only a candidate that remains fresh at the decision timestamp."""
-    if advertisement is None or at >= advertisement.observed_at + policy.absence_seconds:
-        return None
-    return advertisement
+    if state.retry_at is None:
+        return state.scan_recheck_at
+    return min(state.retry_at, state.scan_recheck_at)
 
 
 def drained_cooldown_remaining_seconds(state: PresenceState, *, at: float) -> float:
@@ -277,18 +250,22 @@ def transition(
 ) -> TransitionResult:
     """Apply one pure, closed-union transition."""
     if isinstance(state, Closed):
-        return TransitionResult(state, NoOperation())
-    if isinstance(event, Shutdown):
-        return TransitionResult(Closed(), Stop())
-    if isinstance(event, AttemptFinished):
+        result = TransitionResult(state, NoOperation())
+    elif isinstance(event, Shutdown):
+        result = TransitionResult(Closed(), Stop())
+    elif isinstance(event, AttemptFinished):
         if not isinstance(state, Attempting):
             raise UnexpectedAttemptOutcomeError(state)
-        return _handle_attempting(state, event, policy)
-    if isinstance(state, Attempting):
-        return TransitionResult(state, NoOperation())
-    if isinstance(event, AdvertisementObserved):
-        return _handle_advertisement(state, event, policy)
-    return _handle_timer(state, event, policy)
+        result = _handle_attempting(state, event, policy)
+    elif isinstance(state, Attempting):
+        result = TransitionResult(state, NoOperation())
+    elif isinstance(event, ScannerInterrupted):
+        result = _handle_scanner_interrupted(state, event, policy)
+    elif isinstance(event, AdvertisementObserved):
+        result = _handle_advertisement(state, event, policy)
+    else:
+        result = _handle_timer(state, event, policy)
+    return result
 
 
 def _handle_advertisement(
@@ -296,38 +273,29 @@ def _handle_advertisement(
     event: AdvertisementObserved,
     policy: PresenceMachinePolicy,
 ) -> TransitionResult:
+    processed_at = event.processed_at if event.processed_at is not None else event.advertisement.observed_at
+    if (
+        processed_at < event.advertisement.observed_at
+        or processed_at >= event.advertisement.observed_at + policy.arrival_max_gap_seconds
+    ):
+        return _observe(_clear_arrival(state))
     if isinstance(state, Searching):
-        return _begin(state, AdvertisementTrigger(event.advertisement))
-    if isinstance(state, CoolingDown):
-        if event.advertisement.observed_at >= state.cooldown_at:
-            return _begin(state, AdvertisementTrigger(event.advertisement))
-        refreshed = CoolingDown(
-            timer_epoch=state.timer_epoch,
-            cooldown_at=state.cooldown_at,
-            recheck_at=state.recheck_at,
-            gatt_at=state.gatt_at,
-            advertisement=event.advertisement,
-        )
-        return _observe(refreshed)
-    if not evidence_is_fresh(state.gatt_at, state.advertisement, at=event.advertisement.observed_at, policy=policy):
-        restarted = RetryWaiting(
-            timer_epoch=state.timer_epoch,
-            retry_at=state.retry_at,
-            fallback_at=state.fallback_at,
-            retry_index=0,
-            gatt_at=state.gatt_at,
-            advertisement=event.advertisement,
-        )
-        return _begin(restarted, AdvertisementTrigger(event.advertisement))
-    refreshed = RetryWaiting(
-        timer_epoch=state.timer_epoch,
-        retry_at=state.retry_at,
-        fallback_at=state.fallback_at,
-        retry_index=state.retry_index,
-        gatt_at=state.gatt_at,
-        advertisement=event.advertisement,
-    )
-    return _observe(refreshed)
+        result = _admit_advertisement(state, event.advertisement, policy=policy)
+    elif isinstance(state, CoolingDown):
+        if event.advertisement.observed_at < state.cooldown_at:
+            result = _observe(state)
+        else:
+            result = _admit_advertisement(state, event.advertisement, policy=policy)
+    elif state.retry_at is not None and event.advertisement.observed_at < state.retry_at:
+        result = _observe(state)
+    else:
+        result = _admit_advertisement(state, event.advertisement, policy=policy)
+        if isinstance(result.state, Attempting) and isinstance(result.state.trigger, AdvertisementTrigger):
+            result = TransitionResult(
+                result.state,
+                StopAndBeginAttempt(RapidRetryTrigger(result.state.trigger.advertisement)),
+            )
+    return result
 
 
 def _handle_timer(
@@ -338,9 +306,15 @@ def _handle_timer(
     if event.timer_epoch != state.timer_epoch or event.deadline != armed_deadline(state):
         return TransitionResult(state, NoOperation())
     if isinstance(state, Searching):
-        if event.at < state.fallback_at:
+        if event.at < state.scan_recheck_at:
             return _observe(state)
-        return _begin(state, FallbackTrigger(None))
+        refreshed = Searching(
+            timer_epoch=state.timer_epoch + 1,
+            scan_recheck_at=event.at + policy.scan_recheck_seconds,
+            advertisement=state.advertisement,
+            arrival_started_at=state.arrival_started_at,
+        )
+        return _observe(refreshed)
     if isinstance(state, CoolingDown):
         return _handle_cooldown_timer(state, event, policy)
     return _handle_retry_timer(state, event, policy)
@@ -353,17 +327,12 @@ def _handle_cooldown_timer(
 ) -> TransitionResult:
     if event.at < state.cooldown_at:
         return _observe(state)
-    if evidence_is_fresh(state.gatt_at, state.advertisement, at=event.at, policy=policy):
-        trigger = FallbackTrigger(fresh_advertisement(state.advertisement, at=event.at, policy=policy))
-        return _begin(state, trigger)
-    quiet = CoolingDown(
-        timer_epoch=state.timer_epoch + 1,
-        cooldown_at=state.cooldown_at,
-        recheck_at=event.at + policy.absence_seconds,
-        gatt_at=state.gatt_at,
-        advertisement=state.advertisement,
+    return _observe(
+        Searching(
+            timer_epoch=state.timer_epoch + 1,
+            scan_recheck_at=event.at + policy.scan_recheck_seconds,
+        )
     )
-    return _observe(quiet)
 
 
 def _handle_retry_timer(
@@ -373,18 +342,42 @@ def _handle_retry_timer(
 ) -> TransitionResult:
     if event.at < armed_deadline(state):
         return _observe(state)
-    if state.fallback_at < state.retry_at and event.at >= state.fallback_at:
-        trigger = FallbackTrigger(fresh_advertisement(state.advertisement, at=event.at, policy=policy))
-        return _begin(state, trigger)
-    if event.at < state.retry_at:
-        return _observe(state)
-    if evidence_is_fresh(state.gatt_at, state.advertisement, at=event.at, policy=policy):
-        trigger = RapidRetryTrigger(fresh_advertisement(state.advertisement, at=event.at, policy=policy))
-        return _begin(state, trigger)
-    if event.at >= state.fallback_at:
-        trigger = FallbackTrigger(fresh_advertisement(state.advertisement, at=event.at, policy=policy))
-        return _begin(state, trigger)
-    return _observe(Searching(timer_epoch=state.timer_epoch + 1, fallback_at=state.fallback_at))
+    if state.retry_at is not None and event.at < state.retry_at:
+        return _observe(
+            RetryWaiting(
+                timer_epoch=state.timer_epoch + 1,
+                retry_at=state.retry_at,
+                scan_recheck_at=event.at + policy.scan_recheck_seconds,
+                retry_index=state.retry_index,
+                advertisement=state.advertisement,
+                arrival_started_at=state.arrival_started_at,
+            )
+        )
+    if state.retry_at is not None:
+        return _observe(
+            RetryWaiting(
+                timer_epoch=state.timer_epoch + 1,
+                retry_at=None,
+                scan_recheck_at=state.scan_recheck_at
+                if state.scan_recheck_at > event.at
+                else event.at + policy.scan_recheck_seconds,
+                retry_index=state.retry_index,
+                advertisement=state.advertisement,
+                arrival_started_at=state.arrival_started_at,
+            )
+        )
+    return _observe(
+        RetryWaiting(
+            timer_epoch=state.timer_epoch + 1,
+            scan_recheck_at=state.scan_recheck_at
+            if state.scan_recheck_at > event.at
+            else event.at + policy.scan_recheck_seconds,
+            retry_at=None,
+            retry_index=state.retry_index,
+            advertisement=state.advertisement,
+            arrival_started_at=state.arrival_started_at,
+        )
+    )
 
 
 def _handle_attempting(
@@ -392,61 +385,33 @@ def _handle_attempting(
     event: AttemptFinished,
     policy: PresenceMachinePolicy,
 ) -> TransitionResult:
-    evidence = _attempt_evidence(state)
     if isinstance(event.outcome, CleanDrain):
         cooled = CoolingDown(
             timer_epoch=state.waiting.timer_epoch + 1,
-            cooldown_at=event.at + policy.drained_fallback_seconds,
-            recheck_at=event.at + policy.drained_fallback_seconds,
-            gatt_at=event.at,
-            advertisement=evidence.advertisement,
+            cooldown_at=event.at + policy.drain_cooldown_seconds,
+            recheck_at=event.at + policy.drain_cooldown_seconds,
+            advertisement=None,
         )
         return _observe(cooled)
     if isinstance(event.outcome, CandidateUnavailable):
-        return _observe(Searching(state.waiting.timer_epoch + 1, event.at + policy.fallback_seconds))
+        return _observe(Searching(state.waiting.timer_epoch + 1, event.at + policy.scan_recheck_seconds))
     if isinstance(event.outcome, ConnectedInterruption):
         return _retry_waiting(
             state.waiting,
             at=event.at,
-            evidence=_Evidence(gatt_at=event.at, advertisement=evidence.advertisement),
             durable_progress=event.outcome.durable_progress,
             policy=policy,
         )
-    if evidence_is_fresh(evidence.gatt_at, evidence.advertisement, at=event.at, policy=policy):
-        return _retry_waiting(
-            state.waiting,
-            at=event.at,
-            evidence=evidence,
-            durable_progress=event.outcome.durable_progress,
-            policy=policy,
-        )
-    return _observe(Searching(state.waiting.timer_epoch + 1, event.at + policy.fallback_seconds))
-
-
-@dataclass(frozen=True, slots=True)
-class _Evidence:
-    gatt_at: float | None
-    advertisement: Advertisement | None
-
-
-def _attempt_evidence(state: Attempting) -> _Evidence:
-    if isinstance(state.waiting, Searching):
-        gatt_at = None
-        advertisement = None
-    else:
-        gatt_at = state.waiting.gatt_at
-        advertisement = state.waiting.advertisement
-    trigger_advertisement = _trigger_advertisement(state.trigger)
-    if trigger_advertisement is not None and (
-        advertisement is None or trigger_advertisement.observed_at >= advertisement.observed_at
-    ):
-        advertisement = trigger_advertisement
-    return _Evidence(gatt_at=gatt_at, advertisement=advertisement)
+    return _retry_waiting(
+        state.waiting,
+        at=event.at,
+        durable_progress=event.outcome.durable_progress,
+        policy=policy,
+    )
 
 
 def _retry_waiting(
     waiting: WaitingState,
-    evidence: _Evidence,
     *,
     at: float,
     durable_progress: bool,
@@ -457,16 +422,11 @@ def _retry_waiting(
     retry = RetryWaiting(
         timer_epoch=waiting.timer_epoch + 1,
         retry_at=at + delay,
-        fallback_at=at + policy.fallback_seconds,
+        scan_recheck_at=at + policy.scan_recheck_seconds,
         retry_index=retry_index + 1,
-        gatt_at=evidence.gatt_at,
-        advertisement=evidence.advertisement,
+        advertisement=None,
     )
     return _observe(retry)
-
-
-def _trigger_advertisement(trigger: AttemptTrigger) -> Advertisement | None:
-    return trigger.advertisement
 
 
 def _begin(waiting: WaitingState, trigger: AttemptTrigger) -> TransitionResult:
@@ -475,3 +435,70 @@ def _begin(waiting: WaitingState, trigger: AttemptTrigger) -> TransitionResult:
 
 def _observe(state: WaitingState) -> TransitionResult:
     return TransitionResult(state, Observe(armed_deadline(state)))
+
+
+def _admit_advertisement(
+    state: WaitingState,
+    advertisement: Advertisement,
+    *,
+    policy: PresenceMachinePolicy,
+) -> TransitionResult:
+    """Accumulate one stable encounter and issue only a candidate-backed permit."""
+    previous = state.advertisement
+    if (
+        previous is None
+        or advertisement.observed_at <= previous.observed_at
+        or advertisement.observed_at - previous.observed_at >= policy.arrival_max_gap_seconds
+    ):
+        first_at = advertisement.observed_at
+    else:
+        first_at = _arrival_started_at(state)
+    if first_at is None:
+        first_at = advertisement.observed_at
+    if advertisement.observed_at - first_at >= policy.arrival_stability_seconds:
+        trigger: AttemptTrigger = AdvertisementTrigger(advertisement)
+        if isinstance(state, RetryWaiting):
+            trigger = RapidRetryTrigger(advertisement)
+        return _begin(state, trigger)
+    refreshed = _replace_advertisement(state, advertisement, first_at)
+    return _observe(refreshed)
+
+
+def _arrival_started_at(state: WaitingState) -> float | None:
+    return state.arrival_started_at
+
+
+def _replace_advertisement(state: WaitingState, advertisement: Advertisement, first_at: float) -> WaitingState:
+    if isinstance(state, Searching):
+        return Searching(state.timer_epoch, state.scan_recheck_at, advertisement, first_at)
+    if isinstance(state, CoolingDown):
+        return CoolingDown(state.timer_epoch, state.cooldown_at, state.recheck_at, advertisement, first_at)
+    return RetryWaiting(
+        state.timer_epoch,
+        state.retry_at,
+        state.scan_recheck_at,
+        state.retry_index,
+        advertisement,
+        first_at,
+    )
+
+
+def _clear_arrival(state: WaitingState) -> WaitingState:
+    if isinstance(state, Searching):
+        return Searching(state.timer_epoch, state.scan_recheck_at)
+    if isinstance(state, CoolingDown):
+        return CoolingDown(state.timer_epoch, state.cooldown_at, state.recheck_at, None)
+    return RetryWaiting(
+        state.timer_epoch,
+        state.retry_at,
+        state.scan_recheck_at,
+        state.retry_index,
+        None,
+    )
+
+
+def _handle_scanner_interrupted(
+    state: WaitingState, event: ScannerInterrupted, policy: PresenceMachinePolicy
+) -> TransitionResult:
+    del event, policy
+    return _observe(_clear_arrival(state))

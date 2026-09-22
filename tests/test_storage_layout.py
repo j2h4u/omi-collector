@@ -22,6 +22,37 @@ def test_config_parent_is_storage_root_and_loading_creates_nothing(tmp_path: Pat
     assert loaded.storage.publication.root == tmp_path / "source"
     assert loaded.storage.publication.current == tmp_path / "source" / "current"
     assert not loaded.storage.collector.root.exists()
+    assert loaded.config.presence.arrival_stability_seconds == 30.0
+    assert loaded.config.presence.arrival_max_gap_seconds == 10.0
+
+
+def test_config_accepts_strict_optional_presence_section(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n'
+        "[presence]\narrival_stability_seconds = 12.5\narrival_max_gap_seconds = 4.0\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_operator_config(path)
+
+    assert loaded.config.presence.arrival_stability_seconds == 12.5
+    assert loaded.config.presence.arrival_max_gap_seconds == 4.0
+
+
+@pytest.mark.parametrize(
+    "presence",
+    [
+        "arrival_stability_seconds = 12.5\n",
+        "arrival_stability_seconds = 12.5\narrival_max_gap_seconds = 4.0\nextra = 1\n",
+    ],
+)
+def test_config_rejects_incomplete_or_extended_presence_section(tmp_path: Path, presence: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[presence]\n' + presence, encoding="utf-8")
+
+    with pytest.raises(StorageLayoutError):
+        load_operator_config(path)
 
 
 @pytest.mark.parametrize(

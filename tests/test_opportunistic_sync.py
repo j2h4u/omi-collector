@@ -454,7 +454,7 @@ def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: in
 
 
 def test_retry_policy_requires_explicit_drain_cooldown() -> None:
-    assert RetryPolicy().drain_cooldown_seconds == 300
+    assert RetryPolicy().drain_cooldown_seconds == 900
     explicit = RetryPolicy(drain_cooldown_seconds=300)
     explicit_values = RetryPolicy(backoff=(1,), batch_records=4096, stop_after_drained=True, drain_cooldown_seconds=30)
 
@@ -475,7 +475,7 @@ def test_presence_validation_uses_clean_drain_cooldown() -> None:
 
     presence = PresenceScheduler(
         Observer(),
-        policy=PresencePolicy(fallback_seconds=30, drained_fallback_seconds=900),
+        policy=PresencePolicy(scan_recheck_seconds=30, drain_cooldown_seconds=900),
     )
     valid = OpportunisticOptions(
         TransferTimeouts(1, 1),
@@ -1019,15 +1019,17 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
     class BlockingPresence:
         closed = False
         policy = PresencePolicy(
-            fallback_seconds=30.0,
+            scan_recheck_seconds=30.0,
             rapid_backoff=(0.001,),
-            drained_fallback_seconds=DEFAULT_CONFIG.presence.fallback_seconds,
+            drain_cooldown_seconds=DEFAULT_CONFIG.presence.drain_cooldown_seconds,
         )
 
         async def wait_for_attempt(self) -> PresenceWake:
             scan_started.set()
             await release_wake.wait()
-            return PresenceWake("advertisement", advertisement_rssi_dbm=-72)
+            return PresenceWake(
+                "advertisement", candidate=object(), observed_at=time.monotonic(), advertisement_rssi_dbm=-72
+            )
 
         async def attempt_finished(self, _outcome: AttemptOutcome) -> None:
             return None
@@ -1092,9 +1094,9 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
     class BlockingPresence:
         closed = False
         policy = PresencePolicy(
-            fallback_seconds=30.0,
+            scan_recheck_seconds=30.0,
             rapid_backoff=(0.001,),
-            drained_fallback_seconds=DEFAULT_CONFIG.presence.fallback_seconds,
+            drain_cooldown_seconds=DEFAULT_CONFIG.presence.drain_cooldown_seconds,
         )
 
         async def wait_for_attempt(self) -> PresenceWake:
@@ -1616,10 +1618,13 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
     activity: list[ActivityEvent] = []
     cooldown_seconds = 9.0
     elapsed_during_scan_start = 2.0
+    visibility_elapsed = 0.001
 
     class Observer:
         async def start(self, callback: PresenceCallback) -> None:
-            del callback
+            callback(object())
+            clock.value += visibility_elapsed
+            callback(object())
 
         async def stop(self) -> None:
             return None
@@ -1644,7 +1649,13 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
 
     presence = PresenceScheduler(
         Observer(),
-        policy=PresencePolicy(fallback_seconds=1.0, drained_fallback_seconds=cooldown_seconds, rapid_backoff=(1.0,)),
+        policy=PresencePolicy(
+            scan_recheck_seconds=1.0,
+            drain_cooldown_seconds=cooldown_seconds,
+            arrival_stability_seconds=0.0005,
+            arrival_max_gap_seconds=1.0,
+            rapid_backoff=(1.0,),
+        ),
         clock=clock,
         sleep=clock.sleep,
     )
@@ -1666,7 +1677,7 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
     assert len(cooldowns) == 1
     assert cooldowns[0].reason == "clean_drain"
     assert cooldowns[0].duration_seconds == cooldown_seconds
-    assert cooldowns[0].next_attempt_in_seconds == cooldown_seconds - elapsed_during_scan_start
+    assert cooldowns[0].next_attempt_in_seconds == cooldown_seconds - elapsed_during_scan_start - visibility_elapsed
 
 
 @_async_test
@@ -1703,55 +1714,6 @@ async def test_absence_backoff_stops_at_30_and_never_uses_drain_cooldown(tmp_pat
     assert [event.retry_seconds for event in activity if event.state == "away"] == [1, 2, 4, 8, 16, 30]
     assert clock.value == 61
     assert 300 not in [event.retry_seconds for event in activity if event.state == "away"]
-
-
-@_async_test
-async def test_connected_interruption_after_initial_fallback_uses_first_rapid_retry(tmp_path: Path) -> None:
-    clock = Clock()
-    opened = 0
-
-    class Observer:
-        async def start(self, callback: Callable[[object], object]) -> None:
-            del callback
-
-        async def stop(self) -> None:
-            """Stop the fake scan."""
-
-    first = ScriptedRingSession(_status(), (WriteStep(b"\x10", error=RingTransportDisconnectedError("gone")),))
-    second = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
-
-    def provider(_candidate: object | None = None) -> AbstractAsyncContextManager[ScriptedRingSession]:
-        nonlocal opened
-        opened += 1
-        session = first if opened == 1 else second
-
-        @asynccontextmanager
-        async def context() -> AsyncIterator[ScriptedRingSession]:
-            yield session
-
-        return context()
-
-    presence = PresenceScheduler(
-        Observer(),
-        policy=PresencePolicy(fallback_seconds=30, drained_fallback_seconds=30, rapid_backoff=(1,)),
-        clock=clock,
-        sleep=clock.sleep,
-    )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(1,), drain_cooldown_seconds=30, stop_after_drained=True),
-            clock=clock,
-            sleep=clock.sleep,
-            presence=presence,
-        ),
-    )
-
-    assert isinstance(result, NoDataResult)
-    assert opened == 2
-    assert clock.value == 31
 
 
 @_async_test
@@ -1816,6 +1778,8 @@ async def test_presence_coordinator_forwards_exact_wake_candidate(tmp_path: Path
     class Observer:
         async def start(self, callback: Callable[[object], object]) -> None:
             callback(candidate)
+            await asyncio.sleep(0)
+            callback(candidate)
 
         async def stop(self) -> None:
             return None
@@ -1831,7 +1795,13 @@ async def test_presence_coordinator_forwards_exact_wake_candidate(tmp_path: Path
 
     presence = PresenceScheduler(
         Observer(),
-        policy=PresencePolicy(fallback_seconds=1, drained_fallback_seconds=1, rapid_backoff=(1,)),
+        policy=PresencePolicy(
+            scan_recheck_seconds=1,
+            drain_cooldown_seconds=1,
+            arrival_stability_seconds=0.000001,
+            arrival_max_gap_seconds=1,
+            rapid_backoff=(1,),
+        ),
     )
     result = await run_opportunistic_collector(
         provider,
@@ -1848,7 +1818,7 @@ async def test_presence_coordinator_forwards_exact_wake_candidate(tmp_path: Path
 
 
 @_async_test
-async def test_stale_candidate_restarts_scan_for_next_candidate_without_address_fallback(tmp_path: Path) -> None:
+async def test_stale_candidate_restarts_scan_for_next_stable_candidate(tmp_path: Path) -> None:
     candidate_a = BLEDevice("AA:BB", "omi-a", object())
     candidate_b = BLEDevice("AA:BB", "omi-b", object())
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
@@ -1860,6 +1830,8 @@ async def test_stale_candidate_restarts_scan_for_next_candidate_without_address_
         async def start(self, callback: Callable[[object], object]) -> None:
             candidate = candidate_a if self.starts == 0 else candidate_b
             self.starts += 1
+            callback(candidate)
+            await asyncio.sleep(0)
             callback(candidate)
 
         async def stop(self) -> None:
@@ -1878,7 +1850,13 @@ async def test_stale_candidate_restarts_scan_for_next_candidate_without_address_
 
     presence = PresenceScheduler(
         Observer(),
-        policy=PresencePolicy(fallback_seconds=1, drained_fallback_seconds=1, rapid_backoff=(1,)),
+        policy=PresencePolicy(
+            scan_recheck_seconds=1,
+            drain_cooldown_seconds=1,
+            arrival_stability_seconds=0.000001,
+            arrival_max_gap_seconds=1,
+            rapid_backoff=(1,),
+        ),
     )
     result = await run_opportunistic_collector(
         provider,
@@ -1894,62 +1872,19 @@ async def test_stale_candidate_restarts_scan_for_next_candidate_without_address_
     assert seen == [candidate_a, candidate_b]
 
 
-@_async_test
-async def test_connect_failure_without_presence_keeps_fallback_not_rapid_retry(tmp_path: Path) -> None:
-    clock = Clock()
-    opened = 0
-
-    class Observer:
-        async def start(self, callback: Callable[[object], object]) -> None:
-            del callback
-
-        async def stop(self) -> None:
-            """Stop the fake scan."""
-
-    second = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
-
-    def provider(_candidate: object | None = None) -> AbstractAsyncContextManager[ScriptedRingSession]:
-        nonlocal opened
-        opened += 1
-        if opened == 1:
-            raise RingTransportUnavailableError("away")
-
-        @asynccontextmanager
-        async def context() -> AsyncIterator[ScriptedRingSession]:
-            yield second
-
-        return context()
-
-    presence = PresenceScheduler(
-        Observer(),
-        policy=PresencePolicy(fallback_seconds=30, drained_fallback_seconds=30, rapid_backoff=(1,)),
-        clock=clock,
-        sleep=clock.sleep,
-    )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(1,), drain_cooldown_seconds=30, stop_after_drained=True),
-            clock=clock,
-            sleep=clock.sleep,
-            presence=presence,
-        ),
-    )
-
-    assert isinstance(result, NoDataResult)
-    assert opened == 2
-    assert clock.value == 60
-
-
 async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> None:
     clock = Clock()
     opened = 0
 
     class Observer:
         async def start(self, callback: Callable[[object], object]) -> None:
-            del callback
+            callback(object())
+            await asyncio.sleep(0)
+            clock.value += 0.001
+            callback(object())
+            await asyncio.sleep(0)
+            clock.value += 0.001
+            callback(object())
 
         async def stop(self) -> None:
             pass
@@ -1984,7 +1919,13 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
 
     presence = PresenceScheduler(
         Observer(),
-        policy=PresencePolicy(fallback_seconds=30, drained_fallback_seconds=30, rapid_backoff=(1,)),
+        policy=PresencePolicy(
+            scan_recheck_seconds=30,
+            drain_cooldown_seconds=30,
+            arrival_stability_seconds=0.0005,
+            arrival_max_gap_seconds=1,
+            rapid_backoff=(0.0005,),
+        ),
         clock=clock,
         sleep=clock.sleep,
     )
@@ -1993,7 +1934,7 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
         StagingStore(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
             TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(1,), batch_records=1, drain_cooldown_seconds=30, stop_after_drained=True),
+            RetryPolicy(backoff=(0.0005,), batch_records=1, drain_cooldown_seconds=30, stop_after_drained=True),
             clock=clock,
             sleep=clock.sleep,
             presence=presence,
@@ -2002,7 +1943,7 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
 
     assert isinstance(result, (NoDataResult, CollectionResult))
     assert opened == 2
-    assert clock.value == 31
+    assert clock.value < 1
 
 
 @_async_test
@@ -2734,7 +2675,7 @@ async def test_default_arena_budget_admits_a_full_pendant_snapshot_without_alloc
     batch_records = arena_max_bytes // RECORD_SIZE
 
     assert policy.backoff == DEFAULT_CONFIG.retry.rapid_backoff
-    assert policy.drain_cooldown_seconds == DEFAULT_CONFIG.presence.fallback_seconds
+    assert policy.drain_cooldown_seconds == DEFAULT_CONFIG.presence.drain_cooldown_seconds
     assert policy.arena_max_bytes == arena_max_bytes
     assert policy.batch_records == batch_records
     assert policy.batch_records * RECORD_SIZE <= policy.arena_max_bytes

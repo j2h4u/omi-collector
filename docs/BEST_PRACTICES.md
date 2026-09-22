@@ -23,9 +23,13 @@ then run the full contract before release or handoff.
 
 ## Capture safety
 
-`INFO` is the source of truth for unread state. Advertisements are advisory and
-only wake a bounded attempt. Serialize attempts per pendant and stop this
-collector's scanner before GATT work.
+`INFO` is the source of truth for unread state. Automatic service and sync
+admission requires a current exact-address scanner candidate that has remained
+visible for the configured stable-arrival span; the default is 30 seconds with
+no 10-second gap. Timers and remembered addresses never authorize GATT work.
+Serialize attempts per pendant and stop this collector's scanner before GATT
+work. Explicit probe, info, and confirmed collect commands remain direct
+operator paths.
 
 Before `READ`, admit enough disk space for the bounded batch and ensure staging
 metadata is durable. Write record bytes and checkpoints with `fsync`; publish a
@@ -68,11 +72,12 @@ reviewed release as:
 sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
 ```
 
-The configuration is strict and contains only `[pendant] address`. Its fixed
-parent `/srv/pipelines/omi` is the storage root; `collector`, `captured`, and
-`source` are derived beneath it. The base unit grants the service write access
-to that root. Use filesystem ownership or ACLs on the derived directories when
-a downstream account also needs access.
+The configuration is strict and contains `[pendant] address` plus the optional
+`[presence]` pair `arrival_stability_seconds` and `arrival_max_gap_seconds`.
+Its fixed parent `/srv/pipelines/omi` is the storage root; `collector`,
+`captured`, and `source` are derived beneath it. The base unit grants the
+service write access to that root. Use filesystem ownership or ACLs on the
+derived directories when a downstream account also needs access.
 
 After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
 builds the environment as the service account, copies dependencies into it,

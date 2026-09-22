@@ -34,7 +34,7 @@ from .application.opportunistic_sync import (
     run_opportunistic_collector,
 )
 from .application.presence import PresencePolicy, PresenceScheduler
-from .application.ring_transport import RingSession
+from .application.ring_transport import CandidateUnavailableError, RingSession
 from .application.session_lifecycle import ActivityEvent, OpportunisticOptions, RetryPolicy
 from .domain.ring_protocol import RingInfo, RingStatus
 
@@ -180,8 +180,10 @@ def make_presence_scheduler(
     if policy is None:
         policy = PresencePolicy(
             absence_seconds=config.presence.absence_seconds,
-            fallback_seconds=config.presence.fallback_seconds,
-            drained_fallback_seconds=config.presence.drained_fallback_seconds,
+            scan_recheck_seconds=config.presence.scan_recheck_seconds,
+            drain_cooldown_seconds=config.presence.drain_cooldown_seconds,
+            arrival_stability_seconds=config.presence.arrival_stability_seconds,
+            arrival_max_gap_seconds=config.presence.arrival_max_gap_seconds,
             rapid_backoff=config.retry.rapid_backoff,
             scan_transition_seconds=config.presence.scan_transition_seconds,
             scan_cancel_grace_min_seconds=config.presence.scan_cancel_grace_min_seconds,
@@ -269,6 +271,8 @@ async def sync(  # noqa: PLR0913
 
     def provider(candidate: object | None):
         # Reusing a disconnected Bleak client can retain stale subscriptions.
+        if presence is not None and candidate is None:
+            raise CandidateUnavailableError("automatic connection requires a stable scanner candidate")
         if force_1m:
             return _guarded_transport(
                 adapter,
@@ -289,9 +293,7 @@ async def sync(  # noqa: PLR0913
                 debug_logger=debug_logger,
                 att_mtu_query_timeout_seconds=config.ble.att_mtu_query_timeout_seconds,
             )
-        # The bounded fallback may run without a scanner candidate.  Keep the
-        # explicit address path as a safety net; the active scanner restarts
-        # after this attempt so it does not become the normal discovery path.
+        # Direct callers without presence retain their explicit address path.
         return make_transport(
             address,
             adapter=adapter,
@@ -304,10 +306,13 @@ async def sync(  # noqa: PLR0913
     retry_policy = (
         RetryPolicy(
             backoff=presence.policy.rapid_backoff,
-            drain_cooldown_seconds=presence.policy.drained_fallback_seconds,
+            drain_cooldown_seconds=presence.policy.drain_cooldown_seconds,
         )
         if presence is not None
-        else RetryPolicy(backoff=config.retry.rapid_backoff, drain_cooldown_seconds=config.presence.fallback_seconds)
+        else RetryPolicy(
+            backoff=config.retry.rapid_backoff,
+            drain_cooldown_seconds=config.presence.drain_cooldown_seconds,
+        )
     )
     options = OpportunisticOptions(
         timeouts=collector.TransferTimeouts(

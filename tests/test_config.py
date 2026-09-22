@@ -27,8 +27,10 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert isinstance(DEFAULT_CONFIG.presence, PresenceConfig)
     assert isinstance(DEFAULT_CONFIG.retry, RetryConfig)
     assert DEFAULT_CONFIG.presence.absence_seconds == 60.0
-    assert DEFAULT_CONFIG.presence.fallback_seconds == 300.0
-    assert DEFAULT_CONFIG.presence.drained_fallback_seconds == 900.0
+    assert DEFAULT_CONFIG.presence.scan_recheck_seconds == 300.0
+    assert DEFAULT_CONFIG.presence.drain_cooldown_seconds == 900.0
+    assert DEFAULT_CONFIG.presence.arrival_stability_seconds == 30.0
+    assert DEFAULT_CONFIG.presence.arrival_max_gap_seconds == 10.0
     assert DEFAULT_CONFIG.presence.scan_transition_seconds == 2.0
     assert DEFAULT_CONFIG.retry.rapid_backoff == (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
     assert DEFAULT_CONFIG.retry.storage_not_ready_backoff == (1.0, 2.0, 5.0)
@@ -107,8 +109,8 @@ def test_runtime_limits_must_be_positive(factory: type[object], field: str, valu
 
 
 def test_runtime_ranges_are_coherent() -> None:
-    with pytest.raises(ValueError, match="max_fallback"):
-        PresenceConfig(fallback_seconds=31.0, max_fallback_seconds=30.0)
+    with pytest.raises(ValueError, match="max_scan_recheck"):
+        PresenceConfig(scan_recheck_seconds=31.0, max_scan_recheck_seconds=30.0)
     with pytest.raises(ValueError, match="overhead"):
         DurabilityConfig(staging_overhead_fraction=1.1)
     with pytest.raises(ValueError, match="default_collect_records"):

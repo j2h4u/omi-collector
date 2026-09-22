@@ -911,7 +911,8 @@ def test_sync_constructs_production_presence_scheduler_once(monkeypatch: pytest.
     factory_calls: list[tuple[str, str]] = []
     captured: list[object] = []
 
-    def make_presence(address: str, adapter: str) -> object:
+    def make_presence(address: str, adapter: str, **kwargs: object) -> object:
+        assert kwargs["config"] == load_operator_config(_layout(tmp_path)).config
         factory_calls.append((address, adapter))
         return sentinel
 

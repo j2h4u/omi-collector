@@ -64,14 +64,16 @@ _RAPID_BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 
 @dataclass(frozen=True, slots=True)
 class PresenceConfig:
-    """Presence hysteresis and fallback timings, in seconds."""
+    """Presence admission, scanner pacing, and cooldown timings in seconds."""
 
     absence_seconds: float = 60.0
-    fallback_seconds: float = 300.0
-    drained_fallback_seconds: float = 900.0
+    scan_recheck_seconds: float = 300.0
+    drain_cooldown_seconds: float = 900.0
+    arrival_stability_seconds: float = 30.0
+    arrival_max_gap_seconds: float = 10.0
     scan_transition_seconds: float = 2.0
-    max_fallback_seconds: float = 300.0
-    max_drained_fallback_seconds: float = 900.0
+    max_scan_recheck_seconds: float = 300.0
+    max_drain_cooldown_seconds: float = 900.0
     scan_cancel_grace_min_seconds: float = 0.01
     scan_cancel_grace_max_seconds: float = 0.1
     scan_cancel_grace_fraction: float = 0.1
@@ -79,17 +81,19 @@ class PresenceConfig:
     def __post_init__(self) -> None:
         for name, value in (
             ("absence_seconds", self.absence_seconds),
-            ("fallback_seconds", self.fallback_seconds),
-            ("drained_fallback_seconds", self.drained_fallback_seconds),
+            ("scan_recheck_seconds", self.scan_recheck_seconds),
+            ("drain_cooldown_seconds", self.drain_cooldown_seconds),
+            ("arrival_stability_seconds", self.arrival_stability_seconds),
+            ("arrival_max_gap_seconds", self.arrival_max_gap_seconds),
             ("scan_transition_seconds", self.scan_transition_seconds),
-            ("max_fallback_seconds", self.max_fallback_seconds),
-            ("max_drained_fallback_seconds", self.max_drained_fallback_seconds),
+            ("max_scan_recheck_seconds", self.max_scan_recheck_seconds),
+            ("max_drain_cooldown_seconds", self.max_drain_cooldown_seconds),
         ):
             _require_positive_float(value, name)
-        if self.fallback_seconds > self.max_fallback_seconds:
-            raise ValueError("fallback_seconds must not exceed max_fallback_seconds")
-        if self.drained_fallback_seconds > self.max_drained_fallback_seconds:
-            raise ValueError("drained_fallback_seconds must not exceed its maximum")
+        if self.scan_recheck_seconds > self.max_scan_recheck_seconds:
+            raise ValueError("scan_recheck_seconds must not exceed max_scan_recheck_seconds")
+        if self.drain_cooldown_seconds > self.max_drain_cooldown_seconds:
+            raise ValueError("drain_cooldown_seconds must not exceed its maximum")
         _require_positive_float(self.scan_cancel_grace_min_seconds, "scan_cancel_grace_min_seconds")
         _require_positive_float(self.scan_cancel_grace_max_seconds, "scan_cancel_grace_max_seconds")
         if self.scan_cancel_grace_min_seconds > self.scan_cancel_grace_max_seconds:

@@ -45,8 +45,10 @@ class PresencePolicy:
     """Validated interpreter timings, expressed in seconds."""
 
     absence_seconds: float = DEFAULT_CONFIG.presence.absence_seconds
-    fallback_seconds: float = DEFAULT_CONFIG.presence.fallback_seconds
-    drained_fallback_seconds: float = DEFAULT_CONFIG.presence.drained_fallback_seconds
+    scan_recheck_seconds: float = DEFAULT_CONFIG.presence.scan_recheck_seconds
+    drain_cooldown_seconds: float = DEFAULT_CONFIG.presence.drain_cooldown_seconds
+    arrival_stability_seconds: float = DEFAULT_CONFIG.presence.arrival_stability_seconds
+    arrival_max_gap_seconds: float = DEFAULT_CONFIG.presence.arrival_max_gap_seconds
     rapid_backoff: tuple[float, ...] = DEFAULT_CONFIG.retry.rapid_backoff
     scan_transition_seconds: float = DEFAULT_CONFIG.presence.scan_transition_seconds
     scan_cancel_grace_min_seconds: float = DEFAULT_CONFIG.presence.scan_cancel_grace_min_seconds
@@ -58,8 +60,10 @@ class PresencePolicy:
             value <= 0
             for value in (
                 self.absence_seconds,
-                self.fallback_seconds,
-                self.drained_fallback_seconds,
+                self.scan_recheck_seconds,
+                self.drain_cooldown_seconds,
+                self.arrival_stability_seconds,
+                self.arrival_max_gap_seconds,
                 self.scan_transition_seconds,
                 self.scan_cancel_grace_min_seconds,
                 self.scan_cancel_grace_max_seconds,
@@ -77,9 +81,11 @@ class PresencePolicy:
         """Project validated runtime configuration into the pure policy."""
         return machine.PresenceMachinePolicy(
             absence_seconds=self.absence_seconds,
-            fallback_seconds=self.fallback_seconds,
-            drained_fallback_seconds=self.drained_fallback_seconds,
+            scan_recheck_seconds=self.scan_recheck_seconds,
+            drain_cooldown_seconds=self.drain_cooldown_seconds,
             rapid_backoff=self.rapid_backoff,
+            arrival_stability_seconds=self.arrival_stability_seconds,
+            arrival_max_gap_seconds=self.arrival_max_gap_seconds,
         )
 
 
@@ -220,7 +226,7 @@ class PresenceScheduler:
             await _cancel_task(changed_task)
 
     async def _handle_advertisement(self, advertisement: machine.Advertisement) -> PresenceWake | None:
-        result = self._apply(machine.AdvertisementObserved(advertisement))
+        result = self._apply(machine.AdvertisementObserved(advertisement, processed_at=self._clock()))
         return await self._redeem(result.directive)
 
     async def _handle_timer(self, deadline: float) -> PresenceWake | None:
@@ -272,6 +278,7 @@ class PresenceScheduler:
         except asyncio.CancelledError:
             self._active_scanner_generation = None
             self._discard_advertisements()
+            self._interrupt_presence()
             await self._best_effort_stop_locked(force=True)
             raise
         except PresenceScanTransitionError:
@@ -284,6 +291,7 @@ class PresenceScheduler:
         except Exception:  # noqa: BLE001 - a normal scanner-start refusal is soft
             self._active_scanner_generation = None
             self._discard_advertisements()
+            self._interrupt_presence()
             await self._best_effort_stop_locked(force=True)
             return False
         if isinstance(self._state, machine.Closed):
@@ -342,9 +350,15 @@ class PresenceScheduler:
         while not self._advertisements.empty():
             self._advertisements.get_nowait()
 
+    def _interrupt_presence(self) -> None:
+        if isinstance(self._state, machine.Closed | machine.Attempting):
+            return
+        self._apply(machine.ScannerInterrupted(at=self._clock()))
+
     async def _cancel_wait(self) -> None:
         try:
             await self._stop_scan()
+            self._interrupt_presence()
         except asyncio.CancelledError:
             await self._close_after_stop_failure()
         except Exception:  # noqa: BLE001 - cancelled waiting must leave no live scanner
@@ -384,15 +398,8 @@ def _waiting_state(state: machine.PresenceState) -> machine.WaitingState:
 
 
 def _wake(trigger: machine.AttemptTrigger) -> PresenceWake:
-    if isinstance(trigger, machine.AdvertisementTrigger):
-        reason = "advertisement"
-    elif isinstance(trigger, machine.RapidRetryTrigger):
-        reason = "rapid_retry"
-    else:
-        reason = "fallback"
+    reason = "advertisement" if isinstance(trigger, machine.AdvertisementTrigger) else "rapid_retry"
     advertisement = trigger.advertisement
-    if advertisement is None:
-        return PresenceWake(reason=reason)
     return PresenceWake(
         reason=reason,
         candidate=advertisement.candidate,

@@ -556,16 +556,18 @@ def test_sync_uses_injected_presence_scheduler_without_reconstruction(
     assert len(captured) == 1
     assert captured[0].presence is injected
     assert captured[0].policy.backoff == injected.policy.rapid_backoff
-    assert captured[0].policy.drain_cooldown_seconds == injected.policy.drained_fallback_seconds
+    assert captured[0].policy.drain_cooldown_seconds == injected.policy.drain_cooldown_seconds
 
 
 def test_presence_and_retry_policies_share_one_config_instance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = CollectorConfig(
         presence=PresenceConfig(
-            fallback_seconds=301.0,
-            max_fallback_seconds=301.0,
-            drained_fallback_seconds=901.0,
-            max_drained_fallback_seconds=901.0,
+            scan_recheck_seconds=301.0,
+            max_scan_recheck_seconds=301.0,
+            drain_cooldown_seconds=901.0,
+            max_drain_cooldown_seconds=901.0,
+            arrival_stability_seconds=31.0,
+            arrival_max_gap_seconds=9.0,
             scan_cancel_grace_min_seconds=0.02,
             scan_cancel_grace_max_seconds=0.03,
             scan_cancel_grace_fraction=0.5,
@@ -593,12 +595,14 @@ def test_presence_and_retry_policies_share_one_config_instance(monkeypatch: pyte
 
     assert isinstance(result, device_cli.collector.NoDataResult)
     assert presence.policy.rapid_backoff == config.retry.rapid_backoff
-    assert presence.policy.fallback_seconds == config.presence.fallback_seconds
+    assert presence.policy.scan_recheck_seconds == config.presence.scan_recheck_seconds
+    assert presence.policy.arrival_stability_seconds == config.presence.arrival_stability_seconds
+    assert presence.policy.arrival_max_gap_seconds == config.presence.arrival_max_gap_seconds
     assert presence.policy.scan_cancel_grace_min_seconds == config.presence.scan_cancel_grace_min_seconds
     assert presence.policy.scan_cancel_grace_max_seconds == config.presence.scan_cancel_grace_max_seconds
     assert presence.policy.scan_cancel_grace_fraction == config.presence.scan_cancel_grace_fraction
     assert captured[0].policy.backoff == config.retry.rapid_backoff
-    assert captured[0].policy.drain_cooldown_seconds == config.presence.drained_fallback_seconds
+    assert captured[0].policy.drain_cooldown_seconds == config.presence.drain_cooldown_seconds
     assert captured[0].config is config
     assert captured[0].timeouts == device_cli.collector.TransferTimeouts(3.0, 4.0)
 

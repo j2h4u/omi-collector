@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.13](https://github.com/j2h4u/omi-collector/compare/v0.6.12...v0.6.13) (2026-09-22)
+
+
+### Fixes
+
+* verify managed Python before deployment ([#108](https://github.com/j2h4u/omi-collector/issues/108)) ([e1ce7ef](https://github.com/j2h4u/omi-collector/commit/e1ce7ef6ff0bce1539026dc2e246dba5260c09d8))
+
 ## [0.6.12](https://github.com/j2h4u/omi-collector/compare/v0.6.11...v0.6.12) (2026-09-22)
 
 

@@ -59,6 +59,27 @@ class _GenerationBuild:
     max_sequence: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class _RepairMaterialization:
+    repairs: tuple[TimeRepair, ...]
+    safe_prefix: int | None
+    applied: tuple[ClockCorrection, ...]
+    store: ClockCorrectionStore
+
+
+@dataclass(frozen=True, slots=True)
+class _GenerationSelection:
+    publication_descriptor: int
+    generations_descriptor: int
+    generations: Path
+    identity: str
+    bundles: tuple[tuple[Path, BundleManifest], ...]
+    max_sequence: int | None
+    switch_current: bool
+    service_uid: int
+    service_gid: int
+
+
 _PUBLICATION_DIRECTORY_MODE = 0o750
 _PUBLICATION_FILE_MODE = 0o640
 _SERVICE_ACCOUNT = "omi-collector"
@@ -69,13 +90,20 @@ _LOWERCASE_HEX = frozenset("0123456789abcdef")
 
 
 def publish_from_ledger(captured_root: Path, publication_root: Path, collector_root: Path) -> GenerationResult:
-    """Materialize accepted clock evidence, then publish its normalized timeline."""
+    """Prepare a normalized generation before durably committing its evidence."""
     ledger = collector_root / "timeline-repairs.json"
-    repairs = _read_repairs(ledger)
-    repairs, safe_prefix = _materialize_clock_repairs(
-        collector_root / "clock-corrections", captured_root, ledger, repairs
+    existing = _read_repairs(ledger)
+    materialization = _plan_clock_repairs(collector_root / "clock-corrections", captured_root, existing)
+    result = build_generation(
+        captured_root,
+        publication_root,
+        materialization.repairs,
+        max_sequence=materialization.safe_prefix,
+        switch_current=False,
     )
-    return build_generation(captured_root, publication_root, repairs, max_sequence=safe_prefix)
+    _commit_clock_repairs(ledger, existing, materialization)
+    _switch_current(publication_root, result.path)
+    return result
 
 
 def build_generation(
@@ -84,8 +112,9 @@ def build_generation(
     repairs: tuple[TimeRepair, ...],
     *,
     max_sequence: int | None = None,
+    switch_current: bool = True,
 ) -> GenerationResult:
-    """Rebuild every bundle, validate the chain, and switch one symlink."""
+    """Rebuild every bundle, validate the chain, and optionally switch one symlink."""
     bundles = _bundles(captured_root, max_sequence=max_sequence)
     _validate_repairs(repairs)
     identity = _generation_identity(bundles, repairs, max_sequence)
@@ -104,15 +133,18 @@ def build_generation(
         except OSError as error:
             raise TimelineGenerationError("publication generation directory is not service-writable") from error
         try:
-            generation_id = _current_generation_id(publication_descriptor, identity) or identity
-            destination = generations / generation_id
-            destination_view = _descriptor_path(generations_descriptor) / generation_id
-            if destination_view.exists():
-                _prepare_generation_directory(destination_view, service_uid, service_gid)
-                if not _existing_sources_are_prefix(destination_view, generation_id, bundles, max_sequence):
-                    generation_id = _replacement_generation_id(identity, bundles, max_sequence)
-                    destination = generations / generation_id
-                    destination_view = _descriptor_path(generations_descriptor) / generation_id
+            selection = _GenerationSelection(
+                publication_descriptor,
+                generations_descriptor,
+                generations,
+                identity,
+                bundles,
+                max_sequence,
+                switch_current,
+                service_uid,
+                service_gid,
+            )
+            generation_id, destination, destination_view = _select_generation_destination(selection)
             temporary_view = _descriptor_path(generations_descriptor) / f".{generation_id}.{uuid4().hex}.tmp"
             if not destination_view.exists():
                 records = _create_generation(
@@ -129,7 +161,8 @@ def build_generation(
                     )
                 )
             else:
-                _prepare_generation_directory(destination_view, service_uid, service_gid)
+                if switch_current:
+                    _prepare_generation_directory(destination_view, service_uid, service_gid)
                 records = _append_generation(
                     destination_view,
                     generation_id,
@@ -138,18 +171,42 @@ def build_generation(
                     service_uid,
                     service_gid,
                     max_sequence=max_sequence,
+                    allow_append=switch_current,
                 )
             try:
                 _assert_directory_identity(generations, generations_descriptor)
                 _assert_directory_identity(publication_root, publication_descriptor)
             except OSError as error:
                 raise TimelineGenerationError("publication directory was replaced") from error
-            _switch_current(publication_root, destination, publication_descriptor=publication_descriptor)
+            if switch_current:
+                _switch_current(publication_root, destination, publication_descriptor=publication_descriptor)
             return GenerationResult(destination, len(bundles), records, generation_id)
         finally:
             os.close(generations_descriptor)
     finally:
         os.close(publication_descriptor)
+
+
+def _select_generation_destination(selection: _GenerationSelection) -> tuple[str, Path, Path]:
+    if not selection.switch_current:
+        _current_generation_id(selection.publication_descriptor, selection.identity)
+        generation_id = _replacement_generation_id(selection.identity, selection.bundles, selection.max_sequence)
+        return (
+            generation_id,
+            selection.generations / generation_id,
+            _descriptor_path(selection.generations_descriptor) / generation_id,
+        )
+
+    generation_id = _current_generation_id(selection.publication_descriptor, selection.identity) or selection.identity
+    destination = selection.generations / generation_id
+    destination_view = _descriptor_path(selection.generations_descriptor) / generation_id
+    if destination_view.exists():
+        _prepare_generation_directory(destination_view, selection.service_uid, selection.service_gid)
+        if not _existing_sources_are_prefix(destination_view, generation_id, selection.bundles, selection.max_sequence):
+            generation_id = _replacement_generation_id(selection.identity, selection.bundles, selection.max_sequence)
+            destination = selection.generations / generation_id
+            destination_view = _descriptor_path(selection.generations_descriptor) / generation_id
+    return generation_id, destination, destination_view
 
 
 def _create_generation(
@@ -314,16 +371,14 @@ def _publication_identity() -> tuple[int, int]:
     return user.pw_uid, group.gr_gid
 
 
-def _materialize_clock_repairs(
+def _plan_clock_repairs(
     root: Path,
     captured_root: Path,
-    ledger: Path,
     existing: tuple[TimeRepair, ...],
-) -> tuple[tuple[TimeRepair, ...], int | None]:
-    """Durably derive repairs before resolving the applied correction evidence."""
+) -> _RepairMaterialization:
+    """Validate the intended repair ledger without mutating durable evidence."""
     store = ClockCorrectionStore(root.parent / "device-state.json")
     try:
-        store.recover_prepared()
         operations = store.records()
     except ClockCorrectionError as error:
         for path in root.glob("*.json"):
@@ -338,10 +393,7 @@ def _materialize_clock_repairs(
     pending = tuple(operation for operation in unresolved if operation.state == "unresolved")
     if len(pending) > 1:
         raise TimelineGenerationError("multiple unresolved clock corrections are ambiguous")
-    applied = tuple(operation for operation in unresolved if operation.state == "applied")
-    confirmed = tuple(operation for operation in operations if operation.state in {"applied", "resolved"})
-    repairs = _repairs_from_confirmed_operations(confirmed)
-    _validate_resolved_repairs(existing, confirmed)
+    repairs, applied = _merge_clock_repairs(existing, operations)
     safe_prefix = pending[0].boundary_sequence_min if pending else None
     if applied:
         _validate_applied_operations(
@@ -350,14 +402,20 @@ def _materialize_clock_repairs(
             applied,
             max_sequence=safe_prefix,
         )
-    _persist_repairs(ledger, existing, repairs)
-    if applied:
-        try:
-            for operation in applied:
-                store.resolve_applied(operation)
-        except ClockCorrectionError as error:
-            raise TimelineGenerationError("clock correction evidence is not durable") from error
-    return repairs, safe_prefix
+    return _RepairMaterialization(repairs, safe_prefix, applied, store)
+
+
+def _commit_clock_repairs(
+    ledger: Path, existing: tuple[TimeRepair, ...], materialization: _RepairMaterialization
+) -> None:
+    """Commit repairs before the correction states that rely on them."""
+    _persist_repairs(ledger, existing, materialization.repairs)
+    try:
+        materialization.store.recover_prepared()
+        for operation in materialization.applied:
+            materialization.store.resolve_applied(operation)
+    except ClockCorrectionError as error:
+        raise TimelineGenerationError("clock correction evidence is not durable") from error
 
 
 def _repairs_from_confirmed_operations(operations: tuple[ClockCorrection, ...]) -> tuple[TimeRepair, ...]:
@@ -377,16 +435,35 @@ def _repairs_from_confirmed_operations(operations: tuple[ClockCorrection, ...]) 
     return repairs
 
 
-def _validate_resolved_repairs(existing: tuple[TimeRepair, ...], operations: tuple[ClockCorrection, ...]) -> None:
-    resolved = _repairs_from_confirmed_operations(
-        tuple(operation for operation in operations if operation.state == "resolved")
-    )
-    if any(repair not in existing for repair in resolved):
+def _merge_clock_repairs(
+    existing: tuple[TimeRepair, ...], operations: tuple[ClockCorrection, ...]
+) -> tuple[tuple[TimeRepair, ...], tuple[ClockCorrection, ...]]:
+    """Keep unknown retained repairs as baseline while appending current evidence."""
+    _validate_repairs(existing)
+    operation_ids = {operation.operation_id for operation in operations}
+    confirmed = tuple(operation for operation in operations if operation.state in {"applied", "resolved"})
+    derived = _repairs_from_confirmed_operations(confirmed)
+    derived_by_evidence = {repair.evidence: repair for repair in derived}
+    for repair in existing:
+        if repair.evidence in operation_ids and derived_by_evidence.get(repair.evidence) != repair:
+            raise TimelineGenerationError("timeline repair ledger conflicts with clock correction evidence")
+
+    resolved = tuple(operation for operation in confirmed if operation.state == "resolved")
+    resolved_repairs = _repairs_from_confirmed_operations(resolved)
+    if any(repair not in existing for repair in resolved_repairs):
         raise TimelineGenerationError("resolved clock correction has no durable timeline repair")
+
+    applied = tuple(operation for operation in confirmed if operation.state == "applied")
+    additions = tuple(repair for repair in _repairs_from_confirmed_operations(applied) if repair not in existing)
+    combined = (*existing, *additions)
+    _validate_repairs(combined)
+    if additions and existing and additions[0].start_sequence < max(repair.next_sequence for repair in existing):
+        raise TimelineGenerationError("timeline repair ledger does not permit retroactive insertion")
+    return combined, applied
 
 
 def _persist_repairs(ledger: Path, existing: tuple[TimeRepair, ...], repairs: tuple[TimeRepair, ...]) -> None:
-    """Replace the ledger only by extending its evidence-derived repair prefix."""
+    """Replace the ledger only by appending validated current-operation repairs."""
     if existing == repairs:
         return
     if existing != repairs[: len(existing)]:
@@ -539,10 +616,14 @@ def _append_generation(  # noqa: PLR0913,PLR0917
     service_gid: int,
     *,
     max_sequence: int | None = None,
+    allow_append: bool = True,
 ) -> int:
     destination_metadata = destination.stat(follow_symlinks=False)
     existing, records, previous, bundle_metadata = _validate_existing_generation(destination, identity)
-    _repair_existing_generation(destination, destination_metadata, existing, bundle_metadata, service_uid, service_gid)
+    if allow_append:
+        _repair_existing_generation(
+            destination, destination_metadata, existing, bundle_metadata, service_uid, service_gid
+        )
     if len(existing) > len(captured):
         raise TimelineGenerationError("existing generation is ahead of captured source")
     validation_previous: int | None = None
@@ -565,6 +646,8 @@ def _append_generation(  # noqa: PLR0913,PLR0917
             raise TimelineGenerationError("existing generation bundle is invalid")
     remaining = captured[len(existing) :]
     if remaining:
+        if not allow_append:
+            raise TimelineGenerationError("prepared replacement generation is incomplete")
         added, _ = _write_bundles(
             destination,
             remaining,
@@ -575,7 +658,8 @@ def _append_generation(  # noqa: PLR0913,PLR0917
             max_sequence=max_sequence,
         )
         records += added
-    _replace_generation_manifest(destination, identity, captured, repairs, records, service_uid, service_gid)
+    if allow_append:
+        _replace_generation_manifest(destination, identity, captured, repairs, records, service_uid, service_gid)
     return records
 
 

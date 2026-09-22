@@ -135,7 +135,7 @@ and concurrent readers see either the old or the complete replacement.
 ### 6. Convert confirmed corrections into durable timeline repair intervals
 
 - [x] Implemented
-- [x] Verified
+- [ ] Verified
 
 Clock corrections are recorded and confirmed, but production has no path that
 writes the repair ledger consumed by timeline normalization. A verified backward

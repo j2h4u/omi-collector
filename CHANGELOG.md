@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.16](https://github.com/j2h4u/omi-collector/compare/v0.6.15...v0.6.16) (2026-09-22)
+
+
+### Fixes
+
+* preserve concurrent writer finalization ([#115](https://github.com/j2h4u/omi-collector/issues/115)) ([6d4e505](https://github.com/j2h4u/omi-collector/commit/6d4e5056c8e45116a2cb84675028d65c2a63b5f3))
+
+
+### Refactoring
+
+* type required capture ports ([#114](https://github.com/j2h4u/omi-collector/issues/114)) ([9bee6cf](https://github.com/j2h4u/omi-collector/commit/9bee6cf9133012c6e51b3dbfec5938caf61935d9))
+
 ## [0.6.15](https://github.com/j2h4u/omi-collector/compare/v0.6.14...v0.6.15) (2026-09-22)
 
 

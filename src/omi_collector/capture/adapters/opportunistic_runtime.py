@@ -153,6 +153,12 @@ class _BatchWriter:
             raise TypeError("writer returned an invalid seal result")
         return result
 
+    async def await_seal_result(self) -> SealResultShape | None:
+        result = await self._writer.await_seal_result()
+        if result is not None and not isinstance(result, SealResultShape):
+            raise TypeError("writer retained an invalid seal result")
+        return result
+
     async def publish_prefix(self) -> SealResultShape | None:
         result = await self._writer.publish_prefix()
         if result is not None and not isinstance(result, SealResultShape):

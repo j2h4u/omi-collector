@@ -258,6 +258,9 @@ class AttemptWriter:
         self._durable_record_count: int | None = None
         self._state: AttemptWriterMachineState = Constructed()
         self._close_pending: asyncio.Future[object] | None = None
+        self._seal_pending: asyncio.Future[object] | None = None
+        self._seal_result: object | None = None
+        self._seal_completed = False
         self._thread = Thread(target=self._run, name="omi-attempt-writer", daemon=False)
         self._thread.start()
 
@@ -400,7 +403,17 @@ class AttemptWriter:
         )
         if future is None:
             return None
-        return await future
+        return await asyncio.shield(future)
+
+    async def await_seal_result(self) -> object | None:
+        """Return the retained seal result, waiting if a seal command is still running."""
+        with self._lock:
+            if self._seal_completed:
+                return self._seal_result
+            pending = self._seal_pending
+        if pending is None:
+            return None
+        return await asyncio.shield(pending)
 
     async def publish_prefix(self) -> object:
         """Flush published bytes and publish the durable prefix on the writer thread."""
@@ -502,6 +515,8 @@ class AttemptWriter:
             self._state = result.state
             if isinstance(command, CloseCommand):
                 self._close_pending = future
+            if isinstance(command, SealCommand):
+                self._seal_pending = future
             self._wake.set()
             return future
 
@@ -597,6 +612,9 @@ class AttemptWriter:
             return isinstance(command, CloseCommand)
         with self._lock:
             self._state = transition(self._state, self._success_event(command)).state
+            if isinstance(command, SealCommand):
+                self._seal_result = result
+                self._seal_completed = True
             failure = failure_of(self._state)
         if failure is None and isinstance(command, CheckpointCommand):
             self._remember_durable_result(result)

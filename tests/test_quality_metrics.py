@@ -85,7 +85,7 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
             "1.0.0",
         )
     )
-    assert journal.close()
+    assert journal.close(timeout_seconds=5)
 
     lines = journal.path.read_text(encoding="utf-8").splitlines()
     advertisement, transfer, loss, correction = (cast(dict[str, object], json.loads(line)) for line in lines)
@@ -284,6 +284,41 @@ def test_close_races_with_enqueue_without_losing_the_ordered_stop(
     assert not closer.is_alive()
     assert journal.close()
     assert len(journal.path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_concurrent_close_waits_until_the_stop_sentinel_is_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _journal(tmp_path)
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+    second_done = threading.Event()
+    results: list[bool] = []
+    original_put = journal._queue.put_nowait
+
+    def paused_stop(item: bytes | None) -> None:
+        if item is None:
+            stop_entered.set()
+            assert release_stop.wait(1)
+        original_put(item)
+
+    def close_second() -> None:
+        results.append(journal.close(timeout_seconds=1))
+        second_done.set()
+
+    monkeypatch.setattr(journal._queue, "put_nowait", paused_stop)
+    first = threading.Thread(target=lambda: results.append(journal.close(timeout_seconds=1)))
+    second = threading.Thread(target=close_second)
+    first.start()
+    assert stop_entered.wait(1)
+    second.start()
+    assert not second_done.wait(0.05)
+    release_stop.set()
+    first.join(1)
+    second.join(1)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == [True, True]
 
 
 def test_full_queue_drops_auxiliary_event_without_blocking(

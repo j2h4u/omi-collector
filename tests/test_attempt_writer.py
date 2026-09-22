@@ -489,7 +489,8 @@ def test_cancelled_seal_remains_admitted_and_converges_to_one_target_call() -> N
         with pytest.raises(WriterClosedError, match="seal is already pending"):
             await writer.seal("again")
         target.release_seal.set()
-        await asyncio.sleep(0)
+        assert await writer.await_seal_result() == "sealed"
+        assert await writer.await_seal_result() == "sealed"
         await writer.close()
         assert target.seal_calls == 1
 

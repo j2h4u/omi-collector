@@ -158,9 +158,9 @@ class BatchReconciler:
         batch = self._state.batch
         if batch is None:
             return FinalizationResult(None, None)
+        checkpoint_error, close_error = await _finalize_batch(batch, self._run.options, self._run.runtime)
         preserved_path = batch.seal.bundle_path if batch.seal is not None else self._run.staging.attempts_root
         preserved_kind = "sealed bundle" if batch.seal is not None else "partial collection"
-        checkpoint_error, close_error = await _finalize_batch(batch, self._run.options, self._run.runtime)
         return FinalizationResult(checkpoint_error, close_error, preserved_path, preserved_kind)
 
     def drained_result(self) -> collector.CollectResult:
@@ -175,7 +175,11 @@ class _CoordinatorContext:
 
 async def _checkpoint_after_session(state: _State, run: _Run) -> None:
     batch = state.batch
-    if batch is None or batch.seal is not None or not batch.writer.progress.submitted:
+    if batch is None or batch.seal is not None:
+        return
+    if await _adopt_seal_result(batch, run.options):
+        return
+    if not batch.writer.progress.submitted:
         return
     # A transport-originated interruption can arrive immediately after
     # READ_BEGIN was queued.  Do not mutate the staging target to synchronize:
@@ -662,6 +666,15 @@ async def _checkpoint_batch(batch: _Batch, options: OpportunisticOptions) -> Dur
     return durable
 
 
+async def _adopt_seal_result(batch: _Batch, options: OpportunisticOptions) -> bool:
+    """Record a seal command that outlived its original bounded await."""
+    sealed = await _bounded(batch.writer.await_seal_result(), options.timeouts.transfer)
+    if sealed is None:
+        return False
+    batch.seal = sealed
+    return True
+
+
 async def _finalize_batch(
     batch: _Batch, options: OpportunisticOptions, runtime: CaptureRuntimePort
 ) -> tuple[BaseException | None, BaseException | None]:
@@ -672,11 +685,12 @@ async def _finalize_batch(
     joins, so failures remain observable without claiming the batch was closed.
     """
     checkpoint_error: BaseException | None = None
-    close_error: BaseException | None = None
     try:
-        if batch.seal is None and batch.writer.progress.submitted:
+        if batch.seal is None:
             try:
-                await _checkpoint_for_finalization(batch, options, runtime)
+                sealed = await _adopt_seal_result(batch, options)
+                if not sealed and batch.writer.progress.submitted:
+                    await _checkpoint_for_finalization(batch, options, runtime)
             except (OSError, collector.CollectorTimeoutError) as error:
                 checkpoint_error = error
                 await _report_finalization_error(options.activity, "checkpoint", error, runtime)
@@ -686,18 +700,61 @@ async def _finalize_batch(
                 checkpoint_error = error
                 await _report_finalization_error(options.activity, "checkpoint", error, runtime)
     finally:
-        if batch.writer.thread.is_alive():
-            try:
-                await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
-            except (OSError, collector.CollectorTimeoutError) as error:
-                close_error = error
-                await _report_finalization_error(options.activity, "close", error, runtime)
-            except Exception as error:
-                if not (runtime.is_staging_error(error) or runtime.is_writer_error(error)):
-                    raise
-                close_error = error
-                await _report_finalization_error(options.activity, "close", error, runtime)
+        close_error, close_succeeded = await _close_finalizing_batch(batch, options, runtime)
+    if close_succeeded and batch.seal is None:
+        checkpoint_error = await _adopt_seal_after_close(batch, options, runtime, checkpoint_error)
     return checkpoint_error, close_error
+
+
+async def _close_finalizing_batch(
+    batch: _Batch, options: OpportunisticOptions, runtime: CaptureRuntimePort
+) -> tuple[BaseException | None, bool]:
+    """Close the writer and retain whether its queued commands completed."""
+    if not batch.writer.thread.is_alive():
+        return None, False
+    try:
+        await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
+    except (OSError, collector.CollectorTimeoutError) as error:
+        await _report_finalization_error(options.activity, "close", error, runtime)
+        return error, False
+    except Exception as error:
+        if not (runtime.is_staging_error(error) or runtime.is_writer_error(error)):
+            raise
+        await _report_finalization_error(options.activity, "close", error, runtime)
+        return error, False
+    return None, True
+
+
+async def _adopt_seal_after_close(
+    batch: _Batch,
+    options: OpportunisticOptions,
+    runtime: CaptureRuntimePort,
+    checkpoint_error: BaseException | None,
+) -> BaseException | None:
+    """Reconcile a seal completed ahead of the close command that followed it."""
+    try:
+        if await _adopt_seal_result(batch, options):
+            return None
+    except (OSError, collector.CollectorTimeoutError) as error:
+        return await _retain_finalization_error(options, runtime, checkpoint_error, error)
+    except Exception as error:
+        if not (runtime.is_staging_error(error) or runtime.is_writer_error(error)):
+            raise
+        return await _retain_finalization_error(options, runtime, checkpoint_error, error)
+    return checkpoint_error
+
+
+async def _retain_finalization_error(
+    options: OpportunisticOptions,
+    runtime: CaptureRuntimePort,
+    current: BaseException | None,
+    error: BaseException,
+) -> BaseException:
+    """Keep the first teardown error after recording it once."""
+    if current is not None:
+        return current
+    await _report_finalization_error(options.activity, "checkpoint", error, runtime)
+    return error
 
 
 async def _checkpoint_for_finalization(

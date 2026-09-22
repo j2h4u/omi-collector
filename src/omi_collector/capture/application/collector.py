@@ -244,6 +244,15 @@ class IngestWriter(Protocol):
     async def barrier(self) -> object: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _LegBaselines:
+    """Lifetime watermarks captured before one physical READ leg."""
+
+    received_bytes: int
+    submitted_bytes: int
+    written_bytes: int
+
+
 @dataclass(slots=True)
 class _IngestState:
     start: int
@@ -251,6 +260,7 @@ class _IngestState:
     began_at: float
     progress_mailbox: ProgressMailbox
     initial_received_records: int
+    baselines: _LegBaselines
     read_begin_future: asyncio.Future[object] | None = None
     started: bool = False
     latest_progress: ProgressEvent | None = None
@@ -301,6 +311,7 @@ async def read_leg(
     start, count, options = _parse_leg_args(leg_args, options)
     _require_positive(count, "count")
     _require_timeout(options.timeout)
+    baselines = _capture_leg_baselines(arena, writer)
     arena.begin_leg(start, count)
 
     # Preparation is deliberately before issuing READ.  Once READ is issued,
@@ -314,6 +325,7 @@ async def read_leg(
         time.monotonic(),
         options.progress_mailbox or ProgressMailbox(),
         arena.received_records,
+        baselines,
     )
     terminal = False
     try:
@@ -338,14 +350,17 @@ async def read_leg(
         raise RingTransferError("READ ended without terminal DONE")
     # These waits are intentionally after DONE.  READ_BEGIN remains ordered
     # ahead of the barrier in the writer's command queue.
-    barrier_result = await _finish_read(session, state, arena, writer, options)
+    await _finish_read(session, state, arena, writer, options)
+    counters = _leg_counters(arena, writer, baselines)
     return ReadLegResult(
         start,
         start + count,
         count,
-        received_bytes=arena.received_bytes,
-        submitted_bytes=writer_high_water(writer),
-        written_bytes=_writer_written(writer, barrier_result),
+        records_replayed=_replayed_records(arena, start, count, baselines),
+        records_appended=counters.received_records,
+        received_bytes=counters.received_bytes,
+        submitted_bytes=counters.submitted_bytes,
+        written_bytes=counters.written_bytes,
         progress=state.latest_progress,
     )
 
@@ -478,11 +493,29 @@ async def _interrupt(
         await _await_with_timeout(_await_read_begin(state.read_begin_future), wait_timeout)
     with suppress(BaseException):
         await _await_with_timeout(_await_writer_barrier(writer), wait_timeout)
-    return TransferInterruptedError(state.failure_message, _counters(arena, writer), cause=state.failure_cause)
+    return TransferInterruptedError(
+        state.failure_message, _leg_counters(arena, writer, state.baselines), cause=state.failure_cause
+    )
 
 
-def _counters(arena: TransferArena, writer: IngestWriter) -> TransferCounters:
-    return TransferCounters(arena.received_bytes, writer_high_water(writer), _writer_written(writer, None))
+def _capture_leg_baselines(arena: TransferArena, writer: IngestWriter) -> _LegBaselines:
+    """Snapshot lifetime progress before the next physical connection READ."""
+    return _LegBaselines(arena.received_bytes, writer_high_water(writer), _writer_written(writer, None))
+
+
+def _leg_counters(arena: TransferArena, writer: IngestWriter, baselines: _LegBaselines) -> TransferCounters:
+    """Return the leg delta without disturbing lifetime recovery watermarks."""
+    return TransferCounters(
+        arena.received_bytes - baselines.received_bytes,
+        writer_high_water(writer) - baselines.submitted_bytes,
+        _writer_written(writer, None) - baselines.written_bytes,
+    )
+
+
+def _replayed_records(arena: TransferArena, start: int, count: int, baselines: _LegBaselines) -> int:
+    """Describe resident replay separately from newly received arena bytes."""
+    received_end = arena.start_sequence + baselines.received_bytes // RECORD_SIZE
+    return max(0, min(start + count, received_end) - start)
 
 
 def _enqueue_read_begin(writer: IngestWriter, notice: ReadBeginNotification) -> asyncio.Future[object] | None:
@@ -522,7 +555,7 @@ async def _finish_read(
         raise
     except BaseException as error:
         raise TransferInterruptedError(
-            "writer failed after READ terminal", _counters(arena, writer), cause=error
+            "writer failed after READ terminal", _leg_counters(arena, writer, state.baselines), cause=error
         ) from error
 
 

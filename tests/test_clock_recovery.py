@@ -83,41 +83,54 @@ def test_historical_recovery_rejects_info_boundary_before_time_sample(tmp_path: 
     assert next(item for item in store.records() if item.operation_id == operation.operation_id).state == "unresolved"
 
 
-def test_historical_recovery_without_systemd_anchor_stays_unresolved(tmp_path: Path) -> None:
+def test_historical_recovery_without_systemd_anchor_rejects_without_side_effects(tmp_path: Path) -> None:
     captured = tmp_path / "captured"
     captured.mkdir()
+    _bundle(captured, 8, (1000, 1001))
     _bundle(captured, 10, (1300, 1301))
-    collector = tmp_path / "collector"
+    collector, published = tmp_path / "collector", tmp_path / "published"
     collector.mkdir()
+    repairs = json.dumps({"version": 1, "repairs": []})
+    (collector / "timeline-repairs.json").write_text(repairs)
     store = ClockCorrectionStore(collector / "device.json")
     operation = store.mark_unresolved(store.prepare(1301, 1000, 300.0, 10))
 
-    decision = HistoricalClockImporter(collector / "device.json", captured).recover(
-        [
-            {
-                "boot_id": "boot",
-                "realtime": 1000.0,
-                "monotonic": 10.0,
-                "device_epoch": 1301,
-                "event": "pendant_clock_sync",
-                "sequence": 10,
-            },
-            {
-                "boot_id": "boot",
-                "realtime": 1001.0,
-                "monotonic": 11.0,
-                "device_epoch": 1001,
-                "event": "pendant_observation",
-                "sequence": 11,
-            },
-        ],
-        dry_run=True,
-    )[0]
+    recover_and_publish(collector / "device.json", captured, published)
+    current = (published / "current").resolve()
+    generation = (current / "generation.json").read_bytes()
 
-    assert decision.operation_id == operation.operation_id
-    assert decision.state == "unresolved"
-    assert decision.boundary_sequence is None
-    assert "anchor" in decision.reason
+    with pytest.raises(HistoricalRecoveryError, match="anchor, initial, and later"):
+        recover_and_publish(
+            collector / "device.json",
+            captured,
+            published,
+            [
+                {
+                    "boot_id": "boot",
+                    "realtime": 1000.0,
+                    "monotonic": 10.0,
+                    "device_epoch": 1301,
+                    "event": "pendant_clock_sync",
+                    "sequence": 10,
+                },
+                {
+                    "boot_id": "boot",
+                    "realtime": 1001.0,
+                    "monotonic": 11.0,
+                    "device_epoch": 1001,
+                    "event": "pendant_observation",
+                    "sequence": 11,
+                },
+            ],
+        )
+
+    assert store.records()[0].operation_id == operation.operation_id
+    assert store.records()[0].state == "unresolved"
+    assert not (collector / "clock-imports").exists()
+    assert not (collector / "clock-observations").exists()
+    assert (collector / "timeline-repairs.json").read_text() == repairs
+    assert (published / "current").resolve() == current
+    assert (current / "generation.json").read_bytes() == generation
 
 
 def test_historical_recovery_rejects_boot_mismatch_and_gap(tmp_path: Path) -> None:

@@ -27,8 +27,8 @@ and a live service verification.
 
 Complete this design checkpoint before items 2, 8, 10, or 11 are implemented.
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Use one run-level session admission lease acquired before opening the BLE
 transport. Transfer its storage authority explicitly to the writer for staging
@@ -49,8 +49,8 @@ inventing separate lease types.
 
 ### 1. Publish a sealed capture under the lease already owned by the writer
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 `_StagingWriterAdapter.seal()` currently asks `StagingStore` to reacquire its
 own non-reentrant device lock. The failure is reduced to a diagnostic, leaving
@@ -67,8 +67,8 @@ publication state.
 
 ### 2. Make clock-triggered publication use an explicitly authorized owner
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 The handoff token is owned by the coordinator task, while bounded telemetry
 runs in child tasks. A child therefore cannot use the token to publish after a
@@ -84,8 +84,8 @@ publication retry does not require reconnecting the pendant.
 
 ### 3. Bind startup recovery state exactly once
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Quarantine maintenance currently rebinds the cached startup descriptor on
 every presence attempt. After successful reconciliation clears that descriptor,
@@ -100,8 +100,8 @@ absent and the new visit must proceed normally.
 
 ### 4. Admit an aligned recovered tail at its promoted durable frontier
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Resume activation correctly promotes complete raw records written after the
 last checkpoint, but batch admission still compares against the older startup
@@ -116,8 +116,8 @@ arena offsets and without a fatal restart.
 
 ### 5. Rebuild publication when late salvage changes source ordering
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 The fast generation path assumes every new source is appended after the
 currently published sources. A valid older bundle recovered from quarantine
@@ -134,8 +134,8 @@ and concurrent readers see either the old or the complete replacement.
 
 ### 6. Convert confirmed corrections into durable timeline repair intervals
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Clock corrections are recorded and confirmed, but production has no path that
 writes the repair ledger consumed by timeline normalization. A verified backward
@@ -152,8 +152,8 @@ regression remains blocked; restart produces the same repair result.
 
 ### 7. Consolidate restart clock reconciliation around the production path
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 `ClockCorrectionStore.replay_observations` and its selector are test-only and
 duplicate the causal-selection policy used by `HistoricalClockImporter`.
@@ -189,7 +189,7 @@ can still use their documented lease paths.
 
 ### 9. Reserve the actual peak disk footprint
 
-- [ ] Implemented
+- [x] Implemented
 - [ ] Verified
 
 Disk preflight accounts for the staged batch and a small reserve, while sealing
@@ -343,8 +343,8 @@ summary recovery after interruption is deterministic.
 
 ### 18. Correct reconnect quality counters
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Each physical reconnect reports arena and writer lifetime byte totals, which
 are then added again to session metrics.
@@ -360,8 +360,8 @@ metrics reconcile.
 
 ### 19. Never execute a mutable candidate interpreter as root
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Deployment builds a candidate environment and cache as the service account, then
 executes the candidate Python as root before ownership is sealed.

@@ -36,6 +36,14 @@ def _bundle(root: Path, start: int, timestamps: tuple[int, ...], attempt: str) -
     (path / "receipt.json").write_text(json.dumps(SealedReceipt(attempt, digest).as_dict()))
 
 
+def _generation_timestamps(root: Path) -> list[int]:
+    timestamps: list[int] = []
+    for bundle in sorted(path for path in root.iterdir() if path.is_dir()):
+        raw = (bundle / "records.bin").read_bytes()
+        timestamps.extend(int.from_bytes(raw[index : index + 4], "big") for index in range(0, len(raw), RECORD_SIZE))
+    return timestamps
+
+
 def test_generation_repairs_epoch_and_atomically_exposes_ordinary_bundles(tmp_path: Path) -> None:
     captured = tmp_path / "captured"
     published = tmp_path / "source"
@@ -308,27 +316,19 @@ def test_ledger_publishes_only_settled_clock_evidence(tmp_path: Path) -> None:
     _bundle(captured, 10, (1300, 1301), "a" * 32)
     _bundle(captured, 12, (1002, 1003), "b" * 32)
     collector.mkdir()
-    (collector / "timeline-repairs.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "repairs": [
-                    {
-                        "start_sequence": 10,
-                        "next_sequence": 12,
-                        "offset_seconds": 300,
-                        "evidence": "clock-op",
-                    }
-                ],
-            }
-        )
-    )
+    store = ClockCorrectionStore(collector / "device.json")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 10, operation_id="clock-op"))
+    store.finish(intent, state="applied", boundary_sequence_max=12, verified_epoch=1000)
 
     result = publish_from_ledger(captured, published, collector)
     assert result.record_count == 4
+    assert json.loads((collector / "timeline-repairs.json").read_text()) == {
+        "repairs": [{"evidence": "clock-op", "next_sequence": 12, "offset_seconds": 300, "start_sequence": 10}],
+        "version": 1,
+    }
 
     evidence = collector / "clock-corrections/op.json"
-    evidence.parent.mkdir(parents=True)
+    evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text(json.dumps({"state": "unresolved"}))
     with pytest.raises(TimelineGenerationError, match="unresolved"):
         publish_from_ledger(captured, published, collector)
@@ -361,21 +361,6 @@ def test_applied_clock_operation_resolves_after_raw_interval_is_monotonic(tmp_pa
     collector = tmp_path / "collector"
     _bundle(captured, 10, (1000, 1001, 1302, 1303, 1004), "a" * 32)
     collector.mkdir()
-    (collector / "timeline-repairs.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "repairs": [
-                    {
-                        "start_sequence": 12,
-                        "next_sequence": 14,
-                        "offset_seconds": 300,
-                        "evidence": "clock-op",
-                    }
-                ],
-            }
-        )
-    )
     store = ClockCorrectionStore(collector / "device.json")
     intent = store.mark_unresolved(store.prepare(1302, 1002, 300.0, 12))
     store.finish(intent, state="applied", boundary_sequence_max=14, verified_epoch=1002)
@@ -385,6 +370,21 @@ def test_applied_clock_operation_resolves_after_raw_interval_is_monotonic(tmp_pa
 
     assert result.record_count == 5
     assert json.loads(operation_path.read_text())["state"] == "resolved"
+    ledger = (collector / "timeline-repairs.json").read_bytes()
+    assert json.loads(ledger) == {
+        "repairs": [
+            {
+                "evidence": intent.operation_id,
+                "next_sequence": 14,
+                "offset_seconds": 300,
+                "start_sequence": 12,
+            }
+        ],
+        "version": 1,
+    }
+    repeated = publish_from_ledger(captured, published, collector)
+    assert repeated.generation_id == result.generation_id
+    assert (collector / "timeline-repairs.json").read_bytes() == ledger
 
 
 def test_applied_operation_resolves_across_legitimate_sequence_gaps(tmp_path: Path) -> None:
@@ -395,21 +395,6 @@ def test_applied_operation_resolves_across_legitimate_sequence_gaps(tmp_path: Pa
     _bundle(captured, 13, (1302, 1303), "b" * 32)
     _bundle(captured, 15, (1004,), "c" * 32)
     collector.mkdir()
-    (collector / "timeline-repairs.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "repairs": [
-                    {
-                        "start_sequence": 13,
-                        "next_sequence": 15,
-                        "offset_seconds": 300,
-                        "evidence": "clock-op",
-                    }
-                ],
-            }
-        )
-    )
     store = ClockCorrectionStore(collector / "device.json")
     intent = store.mark_unresolved(store.prepare(1302, 1002, 300.0, 12))
     store.finish(intent, state="applied", boundary_sequence_max=15, verified_epoch=1002)
@@ -429,21 +414,6 @@ def test_incident_boundaries_resolve_on_sparse_capture_frontier(tmp_path: Path) 
     _bundle(captured, 7717546, (1302, 1303), "b" * 32)
     _bundle(captured, 7861464, (1004,), "c" * 32)
     collector.mkdir()
-    (collector / "timeline-repairs.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "repairs": [
-                    {
-                        "start_sequence": 7717546,
-                        "next_sequence": 7861464,
-                        "offset_seconds": 300,
-                        "evidence": "clock-op",
-                    }
-                ],
-            }
-        )
-    )
     store = ClockCorrectionStore(collector / "device.json")
     zero = store.mark_unresolved(store.prepare(1000, 1000, 0.0, 7192026))
     store.finish(zero, state="resolved", boundary_sequence_max=7192026, verified_epoch=1000)
@@ -477,6 +447,73 @@ def test_applied_operation_rejects_regression_across_sequence_gap(tmp_path: Path
     with pytest.raises(TimelineGenerationError, match="regresses"):
         publish_from_ledger(captured, published, collector)
     assert json.loads(operation_path.read_text())["state"] == "applied"
+
+
+def test_applied_clock_operation_rejects_a_conflicting_manual_repair(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    collector = tmp_path / "collector"
+    _bundle(captured, 10, (1000, 1001, 1302, 1303, 1004), "a" * 32)
+    collector.mkdir()
+    store = ClockCorrectionStore(collector / "device.json")
+    intent = store.mark_unresolved(store.prepare(1302, 1002, 300.0, 12))
+    store.finish(intent, state="applied", boundary_sequence_max=14, verified_epoch=1002)
+    ledger = collector / "timeline-repairs.json"
+    ledger.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repairs": [{"start_sequence": 12, "next_sequence": 14, "offset_seconds": 300, "evidence": "forged"}],
+            }
+        )
+    )
+
+    with pytest.raises(TimelineGenerationError, match="conflicts"):
+        publish_from_ledger(captured, published, collector)
+
+    assert store.records()[0].state == "applied"
+    assert json.loads(ledger.read_text())["repairs"][0]["evidence"] == "forged"
+
+
+def test_zero_width_applied_clock_operation_resolves_without_a_repair_interval(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    collector = tmp_path / "collector"
+    _bundle(captured, 10, (1000,), "a" * 32)
+    collector.mkdir()
+    store = ClockCorrectionStore(collector / "device.json")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 10))
+    store.finish(intent, state="applied", boundary_sequence_max=10, verified_epoch=1000)
+
+    result = publish_from_ledger(captured, published, collector)
+
+    assert result.record_count == 1
+    assert store.records()[0].state == "resolved"
+    assert not (collector / "timeline-repairs.json").exists()
+
+
+def test_repair_ledger_must_be_durable_before_applied_operation_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    collector = tmp_path / "collector"
+    _bundle(captured, 10, (1000, 1001, 1302, 1303, 1004), "a" * 32)
+    collector.mkdir()
+    store = ClockCorrectionStore(collector / "device.json")
+    intent = store.mark_unresolved(store.prepare(1302, 1002, 300.0, 12))
+    store.finish(intent, state="applied", boundary_sequence_max=14, verified_epoch=1002)
+
+    def fail_ledger_rename(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated ledger rename failure")
+
+    monkeypatch.setattr(timeline_generations.os, "replace", fail_ledger_rename)
+
+    with pytest.raises(TimelineGenerationError, match="not durable"):
+        publish_from_ledger(captured, published, collector)
+
+    assert store.records()[0].state == "applied"
+    assert not (collector / "timeline-repairs.json").exists()
 
 
 def test_existing_generation_is_authenticated_before_reuse(tmp_path: Path) -> None:
@@ -570,3 +607,71 @@ def test_generation_appends_new_bundles_without_copying_history(tmp_path: Path) 
     assert second.generation_id == first.generation_id
     assert second.record_count == 4
     assert original.stat().st_ino == original_inode
+
+
+@pytest.mark.parametrize("suffix", ("not-a-digest", "a" * 63, "A" * 64))
+def test_current_rejects_malformed_replacement_generation_id(tmp_path: Path, suffix: str) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    _bundle(captured, 10, (1000,), "a" * 32)
+    initial = build_generation(captured, published, ())
+    current = published / "current"
+    current.unlink()
+    current.symlink_to(f".generations/{initial.generation_id}.{suffix}", target_is_directory=True)
+
+    with pytest.raises(TimelineGenerationError, match="must target a generation"):
+        build_generation(captured, published, ())
+
+
+def test_current_rejects_dangling_replacement_generation(tmp_path: Path) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    _bundle(captured, 10, (1000,), "a" * 32)
+    initial = build_generation(captured, published, ())
+    current = published / "current"
+    current.unlink()
+    current.symlink_to(f".generations/{initial.generation_id}.{'a' * 64}", target_is_directory=True)
+
+    with pytest.raises(TimelineGenerationError, match="generation is unavailable"):
+        build_generation(captured, published, ())
+
+
+def test_late_salvage_replaces_generation_without_exposing_a_partial_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "captured"
+    published = tmp_path / "source"
+    _bundle(captured, 102, (1002,), "a" * 32)
+    first = build_generation(captured, published, ())
+    _bundle(captured, 100, (1000, 1001), "b" * 32)
+
+    real_switch_current = timeline_generations._switch_current
+    reader_views: list[list[int]] = []
+
+    def switch_after_reader_can_observe_complete_generation(
+        publication_root: Path, destination: Path, *, publication_descriptor: int | None = None
+    ) -> None:
+        reader_views.append(_generation_timestamps((publication_root / "current").resolve()))
+        assert _generation_timestamps(destination) == [1000, 1001, 1002]
+        real_switch_current(publication_root, destination, publication_descriptor=publication_descriptor)
+
+    monkeypatch.setattr(timeline_generations, "_switch_current", switch_after_reader_can_observe_complete_generation)
+
+    replacement = build_generation(captured, published, ())
+    repeated = build_generation(captured, published, ())
+
+    assert replacement.generation_id != first.generation_id
+    assert replacement.path != first.path
+    replacement_digest = replacement.generation_id.removeprefix(f"{first.generation_id}.")
+    assert len(replacement_digest) == 64
+    assert set(replacement_digest) <= set("0123456789abcdef")
+    assert _generation_timestamps(first.path) == [1002]
+    assert reader_views == [[1002], [1000, 1001, 1002]]
+    assert _generation_timestamps((published / "current").resolve()) == [1000, 1001, 1002]
+    assert repeated.generation_id == replacement.generation_id
+    assert repeated.path == replacement.path
+    assert repeated.record_count == 3
+    assert {path for path in (published / ".generations").iterdir() if path.is_dir()} == {
+        first.path,
+        replacement.path,
+    }

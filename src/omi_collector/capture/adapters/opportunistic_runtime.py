@@ -81,10 +81,11 @@ class _StagingWriterAdapter:
 
     def _publish_timeline(self) -> None:
         try:
-            result = self._store.publish_timeline()
+            result = self._writer.publish_timeline()
             if result is not None:
                 debug_event("timeline_generation_published")
         except Exception as error:  # noqa: BLE001 - capture remains authoritative while publication waits
+            self._store.notify_publication_failure()
             debug_exception("timeline_generation_blocked", error)
 
     def close(self) -> None:

@@ -83,26 +83,10 @@ def _bundle_bytes(root: Path) -> dict[str, bytes]:
 
 
 def _seed_acceptance_clock_state(tmp_path: Path) -> ClockCorrectionStore:
-    (tmp_path / "timeline-repairs.json").write_text(
-        dumps(
-            {
-                "version": 1,
-                "repairs": [
-                    {
-                        "start_sequence": _ACCEPTANCE_FIRST_BOUNDARY,
-                        "next_sequence": _ACCEPTANCE_SECOND_BOUNDARY,
-                        "offset_seconds": -29,
-                        "evidence": "native-clock-operation",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
     corrections = ClockCorrectionStore(tmp_path / "device.json")
     first_operation = corrections.mark_unresolved(corrections.prepare(43, 72, -29.0, _ACCEPTANCE_FIRST_BOUNDARY))
     corrections.finish(
-        first_operation, state="applied", boundary_sequence_max=_ACCEPTANCE_FIRST_BOUNDARY, verified_epoch=72
+        first_operation, state="applied", boundary_sequence_max=_ACCEPTANCE_SECOND_BOUNDARY, verified_epoch=72
     )
     second_id = "b" * 32
     (tmp_path / "clock-corrections").mkdir(parents=True, exist_ok=True)
@@ -251,22 +235,27 @@ def test_restart_hands_43_published_to_72_captured_bundles_without_ble(tmp_path:
     assert collect_spool_metrics(published).current_window.bundle_count == 72
 
 
-def test_background_thread_cannot_borrow_operation_lease(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    token = store.create_lease_handoff()
+def _publication_store(tmp_path: Path) -> StagingStore:
+    capture_root = _capture_root(tmp_path)
+    _one_record_bundle(capture_root, 100, 1)
+    return StagingStore.from_paths(StagingStore(tmp_path, capture_root).paths, publication_root=tmp_path / "published")
+
+
+def test_background_thread_authority_does_not_borrow_an_unrelated_active_lease(tmp_path: Path) -> None:
+    store = _publication_store(tmp_path)
+    authority = store.create_publication_authority()
     barrier = Barrier(2)
     observed: dict[str, object] = {}
 
-    with store.device_lock():
+    with store.device_lock(recover_capture_temporaries=False):
 
         def contend() -> None:
             barrier.wait()
-            observed["active"] = store.active_device_lease
             try:
-                with store.handoff_device_lease(token):
-                    observed["handoff"] = "borrowed"
-            except AttemptStateError:
-                observed["handoff"] = "rejected"
+                authority.publish()
+                observed["publication"] = "borrowed"
+            except DeviceAlreadyRunningError:
+                observed["publication"] = "rejected"
             try:
                 with store.device_lock(recover_capture_temporaries=False):
                     observed["lock"] = "borrowed"
@@ -278,12 +267,12 @@ def test_background_thread_cannot_borrow_operation_lease(tmp_path: Path) -> None
         barrier.wait()
         thread.join()
 
-    store.release_lease_handoff(token)
-    assert observed == {"active": None, "handoff": "rejected", "lock": "contended"}
+    authority.close()
+    assert observed == {"publication": "rejected", "lock": "contended"}
 
 
-def test_lease_handoff_does_not_adopt_foreign_active_lease(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+def test_authority_issued_during_foreign_lease_does_not_adopt_it(tmp_path: Path) -> None:
+    store = _publication_store(tmp_path)
     barrier = Barrier(2)
 
     def hold_foreign_lease() -> None:
@@ -294,19 +283,19 @@ def test_lease_handoff_does_not_adopt_foreign_active_lease(tmp_path: Path) -> No
     thread = Thread(target=hold_foreign_lease)
     thread.start()
     barrier.wait()
-    token = store.create_lease_handoff()
+    authority = store.create_publication_authority()
     try:
-        with pytest.raises(DeviceAlreadyRunningError), store.handoff_device_lease(token):
-            pass
+        with pytest.raises(DeviceAlreadyRunningError):
+            authority.publish()
     finally:
-        store.release_lease_handoff(token)
+        authority.close()
         barrier.wait()
         thread.join()
 
 
-def test_preissued_handoff_rejects_lease_acquired_by_foreign_thread(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    token = store.create_lease_handoff()
+def test_preissued_authority_rejects_foreign_active_lease(tmp_path: Path) -> None:
+    store = _publication_store(tmp_path)
+    authority = store.create_publication_authority()
     barrier = Barrier(2)
 
     def hold_foreign_lease() -> None:
@@ -318,25 +307,27 @@ def test_preissued_handoff_rejects_lease_acquired_by_foreign_thread(tmp_path: Pa
     thread.start()
     barrier.wait()
     try:
-        with pytest.raises(DeviceAlreadyRunningError), store.handoff_device_lease(token):
-            pass
+        with pytest.raises(DeviceAlreadyRunningError):
+            authority.publish()
     finally:
-        store.release_lease_handoff(token)
+        authority.close()
         barrier.wait()
         thread.join()
 
 
-def test_handoff_token_can_acquire_two_sequential_leases(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    token = store.create_lease_handoff()
+def test_authority_can_acquire_two_sequential_publication_leases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _publication_store(tmp_path)
+    authority = store.create_publication_authority()
+    results = iter((object(), object()))
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", lambda: next(results))
 
-    try:
-        with store.handoff_device_lease(token) as first, store.handoff_device_lease(token) as nested_first:
-            assert nested_first is first
-        with store.handoff_device_lease(token) as second, store.handoff_device_lease(token) as nested_second:
-            assert nested_second is second
-    finally:
-        store.release_lease_handoff(token)
+    first = authority.publish()
+    second = authority.publish()
+
+    assert first is not second
+    authority.close()
 
 
 def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:

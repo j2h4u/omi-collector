@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from threading import Thread
 from typing import Literal, Protocol
@@ -99,6 +100,23 @@ class ObservationWriterPort(Protocol):
     def close(self) -> None: ...
 
 
+class PublicationAuthorityPort(Protocol):
+    """One lifecycle-bound authority to project captured bundles into ``source/current``.
+
+    Ownership is explicit throughout one collector run.  Before transport, the
+    coordinator holds this authority; while a writer owns the active device
+    lease, it passes that lease directly for its sealed-capture publication.
+    Clock telemetry may invoke this authority from a bounded child task.  After
+    shutdown the coordinator revokes it, so a stale authority cannot mutate
+    storage.  The authority is capability-based rather than tied to an
+    ``asyncio`` task identity.
+    """
+
+    def publish(self) -> object | None: ...
+
+    def close(self) -> None: ...
+
+
 class StagingPort(Protocol):
     """Synchronous local staging operations used by the coordinator."""
 
@@ -110,6 +128,12 @@ class StagingPort(Protocol):
 
     @property
     def paths(self) -> object: ...
+
+    def create_publication_authority(
+        self, on_failure: Callable[[], None] | None = None
+    ) -> PublicationAuthorityPort: ...
+
+    def clock_mutation_lease(self) -> AbstractContextManager[object]: ...
 
     def pending_attempts(self) -> tuple[object, ...]: ...
 

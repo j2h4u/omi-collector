@@ -128,6 +128,7 @@ class StagingWriter:
         lease: DeviceLock | None = None
         try:
             lease = context.__enter__()
+            self._store.transfer_publication_authority(lease)
             attempt = self._store.resume_streaming_attempt(lease)
             if attempt is None:
                 attempt = self._store.prepare_streaming_attempt(self._start_sequence, self._packet_count)
@@ -255,6 +256,14 @@ class StagingWriter:
         result = self._attempt.seal(done)
         self._sealed = True
         return result
+
+    def publish_timeline(self) -> object | None:
+        """Project sealed capture using this writer's already-held device lease."""
+        self._enter("publish_timeline")
+        self._require_prepared()
+        self._require_lease()
+        assert self._lease is not None
+        return self._store.publish_timeline(self._lease)
 
     def publish_prefix(self) -> SealResult | None:
         """Publish the checkpoint-authenticated prefix through staging."""

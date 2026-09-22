@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from hashlib import sha256
 from os import fsync, statvfs
 from pathlib import Path
-from threading import get_ident
+from threading import Lock
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
@@ -41,12 +40,29 @@ from .staging_filesystem import (
 )
 
 
-def _lease_owner_token() -> tuple[int, int | None]:
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:
-        task = None
-    return get_ident(), id(task) if task is not None else None
+class _PublicationAuthority:
+    """Store-issued, lifecycle-bound publication capability.
+
+    The store accepts only the exact instance it issued.  The capability may
+    move between asyncio tasks, but cannot outlive the collector run that
+    closes it.
+    """
+
+    __slots__ = ("_on_failure", "_store")
+
+    def __init__(self, store: StagingStore, on_failure: Callable[[], None] | None) -> None:
+        self._store = store
+        self._on_failure = on_failure
+
+    def publish(self) -> object | None:
+        return self._store._publish_with_authority(self)
+
+    def close(self) -> None:
+        self._store._revoke_publication_authority(self)
+
+    def schedule_retry(self) -> None:
+        if self._on_failure is not None:
+            self._on_failure()
 
 
 class StagingStore:
@@ -70,8 +86,9 @@ class StagingStore:
         )
         self._validated_attempts: dict[str, StagedAttempt] = {}
         self._publication_root: Path | None = None
-        self._lease_owner: tuple[int, int | None] | None = None
-        self._lease_handoffs: dict[object, tuple[tuple[int, int | None], DeviceLock | None, bool]] = {}
+        self._publication_authority: _PublicationAuthority | None = None
+        self._publication_authority_lease: DeviceLock | None = None
+        self._publication_lock = Lock()
 
     @classmethod
     def from_paths(
@@ -86,12 +103,21 @@ class StagingStore:
         store._filesystem = StagingFilesystem.from_paths(paths, config=config)
         store._validated_attempts = {}
         store._publication_root = publication_root
-        store._lease_owner = None
-        store._lease_handoffs = {}
+        store._publication_authority = None
+        store._publication_authority_lease = None
+        store._publication_lock = Lock()
         return store
 
     def publish_timeline(self, held_lease: DeviceLock | None = None) -> object | None:
         """Publish a complete normalized view when this store has an external boundary."""
+        if not self._publication_lock.acquire(blocking=False):
+            raise AttemptStateError("timeline publication is already active")
+        try:
+            return self._publish_timeline(held_lease)
+        finally:
+            self._publication_lock.release()
+
+    def _publish_timeline(self, held_lease: DeviceLock | None) -> object | None:
         if self._publication_root is None:
             return None
         if not self._has_captured_bundles():
@@ -102,12 +128,47 @@ class StagingStore:
         self._filesystem.require_device_lock(held_lease)
         return self._recover_and_publish_unlocked()
 
-    def publish_timeline_with_handoff(self, token: object) -> object | None:
-        """Publish through an explicit operation-scoped lease handoff."""
-        if self._publication_root is None or not self._has_captured_bundles():
-            return None
-        with self.handoff_device_lease(token):
-            return self._recover_and_publish_unlocked()
+    def create_publication_authority(self, on_failure: Callable[[], None] | None = None) -> _PublicationAuthority:
+        """Issue the sole capability allowed to publish during one collector run."""
+        with self._publication_lock:
+            if self._publication_authority is not None:
+                raise AttemptStateError("publication authority is already active")
+            authority = _PublicationAuthority(self, on_failure)
+            self._publication_authority = authority
+            self._publication_authority_lease = None
+            return authority
+
+    def _publish_with_authority(self, authority: _PublicationAuthority) -> object | None:
+        """Publish under an issued capability, never under task-local identity."""
+        if not self._publication_lock.acquire(blocking=False):
+            raise AttemptStateError("timeline publication is already active")
+        try:
+            if authority is not self._publication_authority:
+                raise AttemptStateError("publication authority is revoked or was not issued by this store")
+            try:
+                lease = self._publication_authority_lease
+                if lease is not None and lease._matches(self._filesystem):
+                    return self._publish_timeline(lease)
+                return self._publish_timeline(None)
+            except Exception:
+                authority.schedule_retry()
+                raise
+        finally:
+            self._publication_lock.release()
+
+    def notify_publication_failure(self) -> None:
+        """Schedule the run's existing local retry after writer-side projection fails."""
+        with self._publication_lock:
+            authority = self._publication_authority
+        if authority is not None:
+            authority.schedule_retry()
+
+    def _revoke_publication_authority(self, authority: _PublicationAuthority) -> None:
+        with self._publication_lock:
+            if authority is not self._publication_authority:
+                raise AttemptStateError("publication authority is revoked or was not issued by this store")
+            self._publication_authority = None
+            self._publication_authority_lease = None
 
     def recover_and_publish(self, entries: object = (), *, apply: bool = True) -> object | None:
         """Replay durable clock evidence and publish without a BLE connection."""
@@ -159,69 +220,18 @@ class StagingStore:
     def capture_root(self) -> Path:
         return self._filesystem.capture_root
 
-    @property
-    def active_device_lease(self) -> DeviceLock | None:
-        """Return a lease only to the task/thread that acquired it."""
-        lease = self._filesystem._active_lease
-        if lease is None or not lease._matches(self._filesystem) or self._lease_owner != _lease_owner_token():
-            return None
-        return lease
-
-    @property
-    def held_device_lease(self) -> DeviceLock | None:
-        """Return only a lease owned by this task/thread."""
-        return self.active_device_lease
-
-    def create_lease_handoff(self) -> object:
-        """Issue an operation-scoped capability for an explicit lease handoff."""
-        token = object()
-        owner = _lease_owner_token()
-        active_lease = self._filesystem._active_lease
-        lease = self.active_device_lease
-        self._lease_handoffs[token] = (owner, lease, active_lease is None)
-        return token
-
-    def _bind_pending_handoff(self) -> None:
-        """Bind the sole unbound operation handoff to this writer's active lease."""
-        active_lease = self._filesystem._active_lease
-        if active_lease is None:
-            return
-        candidates = tuple(
-            token for token, (_owner, lease, can_rebind) in self._lease_handoffs.items() if lease is None and can_rebind
-        )
-        if len(candidates) != 1:
-            return
-        token = candidates[0]
-        owner, _lease, _can_rebind = self._lease_handoffs[token]
-        self._lease_handoffs[token] = (owner, active_lease, False)
-
-    def release_lease_handoff(self, token: object) -> None:
-        """Revoke an operation-scoped lease handoff capability."""
-        self._lease_handoffs.pop(token, None)
-
-    @contextmanager
-    def handoff_device_lease(self, token: object) -> Iterator[DeviceLock]:
-        """Use an explicitly issued operation-scoped lease handoff."""
-        owner = _lease_owner_token()
-        handoff = self._lease_handoffs.get(token)
-        if handoff is None or handoff[0] != owner:
-            raise AttemptStateError("lease handoff belongs to another operation owner")
-        bound_lease = handoff[1]
-        active_lease = self._filesystem._active_lease
-        if bound_lease is not None and active_lease is not bound_lease:
-            self._lease_handoffs[token] = (owner, None, True)
-            bound_lease = None
-        if bound_lease is not None and active_lease is bound_lease and bound_lease._matches(self._filesystem):
-            self._filesystem.require_device_lock(bound_lease)
-            yield bound_lease
-            return
-        with self.device_lock(recover_capture_temporaries=False) as acquired:
-            self._lease_handoffs[token] = (owner, acquired, False)
-            try:
-                yield acquired
-            finally:
-                if self._lease_handoffs.get(token) == (owner, acquired, False):
-                    self._lease_handoffs[token] = (owner, None, True)
+    def transfer_publication_authority(self, lease: DeviceLock) -> None:
+        """Transfer this active writer lease to the run's publication capability."""
+        self._filesystem.require_device_lock(lease)
+        with self._publication_lock:
+            bound = self._publication_authority_lease
+            if self._publication_authority is None:
+                return
+            if bound is lease:
+                raise AttemptStateError("publication authority was already transferred to this writer")
+            if bound is not None and bound._matches(self._filesystem):
+                raise AttemptStateError("publication authority is already bound to another active writer")
+            self._publication_authority_lease = lease
 
     @contextmanager
     def held_device_lock(self, lease: DeviceLock) -> Iterator[DeviceLock]:
@@ -309,7 +319,6 @@ class StagingStore:
         # https://github.com/BasedHardware/omi/blob/6f7c57ac1545c1931c806a01605646405d398198/app/lib/services/wals/ring_storage_sync.dart#L545-L608
         _validate_int(start_sequence, "start_sequence")
         _validate_count(packet_count)
-        self._bind_pending_handoff()
         self._filesystem._preflight(packet_count)
         self._filesystem._ensure_directory(self.attempts_root)
         descriptor = AttemptDescriptor(
@@ -366,7 +375,6 @@ class StagingStore:
         lease.require_active()
         if lease.filesystem is not self._filesystem:
             raise AttemptStateError("resume requires the active spool lock")
-        self._bind_pending_handoff()
         candidates = self.pending_attempts()
         if len(candidates) > 1:
             raise PendingAttemptError("multiple partial attempts block resume")
@@ -401,20 +409,27 @@ class StagingStore:
     ) -> Iterator[DeviceLock]:
         """Acquire the filesystem lease, then sequence publication recovery and quarantine."""
         with self._filesystem.device_lock() as lease:
-            self._lease_owner = _lease_owner_token()
-            try:
-                if recover_capture_temporaries:
-                    unsafe = publication.recover_capture_temporaries(self._filesystem)
-                    for temporary, capture_root, reason in unsafe:
-                        quarantine.quarantine_capture_temporary(
-                            self._filesystem,
-                            temporary,
-                            capture_root,
-                            reason,
-                        )
-                yield lease
-            finally:
-                self._lease_owner = None
+            if recover_capture_temporaries:
+                unsafe = publication.recover_capture_temporaries(self._filesystem)
+                for temporary, capture_root, reason in unsafe:
+                    quarantine.quarantine_capture_temporary(
+                        self._filesystem,
+                        temporary,
+                        capture_root,
+                        reason,
+                    )
+            yield lease
+
+    @contextmanager
+    def clock_mutation_lease(self) -> Iterator[DeviceLock]:
+        """Protect clock files with the active writer lease or a newly acquired store lease."""
+        active = self._filesystem._active_lease
+        if active is not None:
+            self._filesystem.require_device_lock(active)
+            yield active
+            return
+        with self.device_lock(recover_capture_temporaries=False) as lease:
+            yield lease
 
     def require_device_lock(self, lease: DeviceLock) -> None:
         """Reject consuming operations that are not protected by this active lease."""

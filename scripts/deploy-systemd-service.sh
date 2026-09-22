@@ -68,28 +68,85 @@ function validate_operator_config_file {
         || die "operator configuration must be root:root 0644: ${config_file}"
 }
 
-function prepare_deployment_directories {
+function ensure_build_account {
     # args
-    local -r uv_cache_dir="$1" state_dir="$2" deployment_root="$3" deployments_dir="$4"
-    local -r account_user="$5" account_group="$6"
+    local -r build_user="$1" build_group="$2" build_state_dir="$3" service_user="$4" service_group="$5"
+
+    # vars
+    local primary_group build_uid build_gid service_uid service_gid supplementary_output group_id
+    local -a build_groups
 
     # code
-    # assert: cache and release storage have fixed, non-overlapping roles
-    [[ "$uv_cache_dir" == "${state_dir}"/* && ! -L "$uv_cache_dir" ]] \
-        || die "UV cache directory must be below ${state_dir}"
-    [[ "$deployment_root" == /* && "$deployment_root" != "${state_dir}"/* && ! -L "$deployment_root" ]] \
+    # assert: candidate code has a dedicated unprivileged identity
+    [[ "$build_user" != "$service_user" && "$build_group" != "$service_group" ]] \
+        || die 'build identity names must differ from the live service identity'
+    [[ ! -L "$build_state_dir" ]] || die "build state directory must not be a symlink: ${build_state_dir}"
+    if ! getent group "$build_group" &> /dev/null; then
+        groupadd --system "$build_group" || die "could not create build group ${build_group}"
+    fi
+    if ! getent passwd "$build_user" &> /dev/null; then
+        useradd --system --gid "$build_group" --home-dir "$build_state_dir" --shell /usr/sbin/nologin --no-create-home \
+            "$build_user" || die "could not create build user ${build_user}"
+    fi
+    primary_group=$(id -gn "$build_user") || die "could not determine primary group for ${build_user}"
+    build_uid=$(id -u "$build_user") || die "could not determine UID for ${build_user}"
+    build_gid=$(id -g "$build_user") || die "could not determine primary GID for ${build_user}"
+    service_uid=$(id -u "$service_user") || die "could not determine UID for ${service_user}"
+    service_gid=$(id -g "$service_user") || die "could not determine primary GID for ${service_user}"
+    supplementary_output=$(id -G "$build_user") || die "could not determine supplementary groups for ${build_user}"
+    read -r -a build_groups <<< "$supplementary_output"
+    # assert: the build account cannot inherit the service account group
+    [[ "$primary_group" == "$build_group" ]] \
+        || die "build user ${build_user} must have primary group ${build_group}"
+    [[ "$build_uid" =~ ^[0-9]+$ && "$build_gid" =~ ^[0-9]+$ && "$service_uid" =~ ^[0-9]+$ && "$service_gid" =~ ^[0-9]+$ ]] \
+        || die 'build and service account identifiers must be numeric'
+    [[ "$build_uid" != "$service_uid" ]] \
+        || die 'build UID must differ from the live service UID'
+    [[ "$build_gid" != "$service_gid" ]] \
+        || die 'build primary GID must differ from the live service GID'
+    (( ${#build_groups[@]} > 0 )) || die "build user ${build_user} has no initialized groups"
+    for group_id in "${build_groups[@]}"; do
+        [[ "$group_id" =~ ^[0-9]+$ ]] || die "build user ${build_user} has an invalid group identifier"
+        [[ "$group_id" != "$service_gid" ]] \
+            || die 'build user must not belong to the live service group'
+    done
+}
+
+function prepare_deployment_directories {
+    # args
+    local -r build_state_dir="$1" uv_cache_dir="$2" deployment_root="$3" deployments_dir="$4"
+    local -r python_install_dir="$5" build_user="$6" build_group="$7" output_name="$8"
+
+    # code
+    # assert: candidate cache and release storage have fixed, non-overlapping roles
+    [[ "$build_state_dir" == /* && ! -L "$build_state_dir" ]] \
+        || die 'build state directory must be a dedicated absolute state path'
+    [[ "$uv_cache_dir" == "${build_state_dir}"/* && ! -L "$uv_cache_dir" ]] \
+        || die "UV cache directory must be below ${build_state_dir}"
+    [[ "$deployment_root" == /* && "$deployment_root" != "${build_state_dir}"/* && ! -L "$deployment_root" ]] \
         || die 'deployment root must be a dedicated absolute state path'
     [[ "$deployments_dir" == "${deployment_root}"/* && ! -L "$deployments_dir" ]] \
         || die "deployment directory must be below ${deployment_root}"
-    install -d -o "$account_user" -g "$account_group" -m 0750 -- "$uv_cache_dir" \
-        || die 'could not prepare service UV cache'
-    install -d -o root -g root -m 0755 -- "$deployment_root" "$deployments_dir" \
+    [[ "$python_install_dir" == "${deployment_root}"/* && ! -L "$python_install_dir" ]] \
+        || die "managed Python directory must be below ${deployment_root}"
+    install -d -o root -g root -m 0755 -- "$build_state_dir" "$deployment_root" "$deployments_dir" \
         || die 'could not prepare root-owned deployment directories'
-    chown -R "$account_user:$account_group" -- "$uv_cache_dir" \
-        || die "could not make UV cache writable by ${account_user}"
-    # assert: deployer-owned and service-owned directories retain their trust boundaries
-    [[ $(stat -c '%U:%G:%a' -- "$uv_cache_dir") == "${account_user}:${account_group}:750" ]] \
-        || die "UV cache directory must be ${account_user}:${account_group} 0750: ${uv_cache_dir}"
+    if [[ ! -e "$uv_cache_dir" && ! -L "$uv_cache_dir" ]]; then
+        install -d -o "$build_user" -g "$build_group" -m 0750 -- "$uv_cache_dir" \
+            || die 'could not prepare build UV cache'
+    fi
+    if [[ ! -e "$python_install_dir" && ! -L "$python_install_dir" ]]; then
+        install -d -o "$build_user" -g "$build_group" -m 0755 -- "$python_install_dir" \
+            || die 'could not prepare managed Python installation directory'
+        printf -v "$output_name" '%s' '1'
+    else
+        printf -v "$output_name" '%s' '0'
+    fi
+    # assert: the service cannot write the builder cache or release selectors
+    [[ $(stat -c '%U:%G:%a' -- "$build_state_dir") == 'root:root:755' && ! -L "$build_state_dir" ]] \
+        || die "build state directory must be root:root 0755: ${build_state_dir}"
+    [[ $(stat -c '%U:%G:%a' -- "$uv_cache_dir") == "${build_user}:${build_group}:750" && ! -L "$uv_cache_dir" ]] \
+        || die "UV cache directory must be ${build_user}:${build_group} 0750: ${uv_cache_dir}"
     [[ $(stat -c '%U:%G:%a' -- "$deployment_root") == 'root:root:755' ]] \
         || die "deployment root must be root:root 0755: ${deployment_root}"
     [[ $(stat -c '%U:%G:%a' -- "$deployments_dir") == 'root:root:755' ]] \
@@ -98,7 +155,7 @@ function prepare_deployment_directories {
 
 function write_release_metadata {
     # args
-    local -r environment="$1" source_revision="$2"
+    local -r environment="$1" deployments_dir="$2" source_revision="$3"
 
     # vars
     local metadata_dir metadata_file
@@ -107,34 +164,75 @@ function write_release_metadata {
     # assert: provenance is one full lowercase Git object ID
     [[ "$source_revision" =~ ^[0-9a-f]{40,64}$ ]] \
         || die "source revision is not a full lowercase Git object ID: ${source_revision}"
+    # assert: root metadata is added only after a release is sealed at its fixed location
+    [[ "$environment" == "${deployments_dir}"/release-* && -d "$environment" && ! -L "$environment" ]] \
+        || die "completed deployment is missing or unsafe: ${environment}"
+    [[ $(stat -c '%U:%G:%a' -- "$environment") == 'root:root:755' ]] \
+        || die "completed deployment must be root:root 0755: ${environment}"
     metadata_dir="${environment}/share/omi-collector"
     metadata_file="${metadata_dir}/release.json"
-    install -d -m 0755 -- "$metadata_dir" || die 'could not create release metadata directory'
+    # assert: no build-controlled path can redirect root metadata writes
+    [[ ! -e "${environment}/share" && ! -L "${environment}/share" ]] \
+        || die 'candidate created an unsafe release metadata path'
+    install -d -o root -g root -m 0755 -- "$metadata_dir" || die 'could not create release metadata directory'
+    [[ -d "$metadata_dir" && ! -L "$metadata_dir" && $(stat -c '%U:%G:%a' -- "$metadata_dir") == 'root:root:755' ]] \
+        || die 'release metadata directory is unsafe after creation'
     printf '{"source_revision":"%s"}\n' "$source_revision" > "$metadata_file" \
         || die 'could not write release provenance'
-    chmod 0644 -- "$metadata_file" || die 'could not set release provenance mode'
+    # assert: the just-created metadata file cannot redirect the root mode update
+    [[ -f "$metadata_file" && ! -L "$metadata_file" ]] \
+        || die 'release metadata file is unsafe after creation'
+    chmod 0644 "$metadata_file" || die 'could not set release provenance mode'
+}
+
+function seal_tree_with_descriptors {
+    # args
+    local -r sealer_python="$1" sealer_script="$2" tree_root="$3" owner="$4" allowed_external="$5"
+
+    # vars
+    local -a command
+
+    # code
+    # assert: the fixed interpreter cannot import a builder-controlled site package
+    command=("$sealer_python" '-I' '-B' '-S' "$sealer_script" '--root' "$tree_root" '--owner' "$owner")
+    if [[ -n "$allowed_external" ]]; then
+        command+=('--allow-external' "$allowed_external")
+    fi
+    "${command[@]}" || die "could not seal completed deployment tree: ${tree_root}"
 }
 
 function seal_deployment_environment {
     # args
-    local -r environment="$1"
+    local -r environment="$1" deployments_dir="$2" sealer_python="$3" sealer_script="$4" sealer_owner="$5"
+    local -r python_install_dir="$6"
 
     # code
-    chown -R root:root -- "$environment" || die 'could not make completed deployment root-owned'
-    find -P "$environment" -type d -exec chmod 0755 -- {} + \
-        || die 'could not set completed deployment directory modes'
-    find -P "$environment" -type f -exec chmod 0644 -- {} + \
-        || die 'could not set completed deployment file modes'
-    find -P "$environment/bin" -type f -exec chmod 0755 -- {} + \
-        || die 'could not restore completed deployment executable modes'
+    # assert: root seals exactly one builder-created release, without following its links
+    [[ "$environment" == "${deployments_dir}"/release-* && -d "$environment" && ! -L "$environment" ]] \
+        || die "staged deployment is missing or unsafe: ${environment}"
+    seal_tree_with_descriptors "$sealer_python" "$sealer_script" "$environment" "$sealer_owner" "$python_install_dir"
     # assert: selected releases cannot be modified by the service account
     [[ $(stat -c '%U:%G:%a' -- "$environment") == 'root:root:755' ]] \
         || die "completed deployment must be root:root 0755: ${environment}"
 }
 
+function seal_managed_python {
+    # args
+    local -r python_install_dir="$1" deployment_root="$2" sealer_python="$3" sealer_script="$4" sealer_owner="$5"
+
+    # code
+    # assert: root seals only the fixed build-owned Python installation location
+    [[ "$python_install_dir" == "${deployment_root}"/* && -d "$python_install_dir" && ! -L "$python_install_dir" ]] \
+        || die "managed Python installation is missing or unsafe: ${python_install_dir}"
+    seal_tree_with_descriptors "$sealer_python" "$sealer_script" "$python_install_dir" "$sealer_owner" ''
+    # assert: later candidates can read but cannot replace the runtime interpreter
+    [[ $(stat -c '%U:%G:%a' -- "$python_install_dir") == 'root:root:755' ]] \
+        || die "managed Python installation must be root:root 0755: ${python_install_dir}"
+}
+
 function verify_installed_package {
     # args
-    local -r environment="$1" source_package="$2"
+    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" environment="$5" source_package="$6"
 
     # vars
     local resolver_output resolved_purelib package_dir compare_status
@@ -144,7 +242,8 @@ function verify_installed_package {
     # assert: the staged environment has its own interpreter and entry point
     [[ -x "${environment}/bin/python" && -x "${environment}/bin/omi-collector" ]] \
         || die "staged environment is incomplete: ${environment}"
-    resolver_output=$("${environment}/bin/python" -I -B -c '
+    resolver_output=$("$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
+        "${environment}/bin/python" -I -B -c '
 import importlib.util
 from pathlib import Path
 import sysconfig
@@ -176,13 +275,13 @@ print(Path(next(iter(spec.submodule_search_locations))).resolve())
 
 function validate_candidate_config {
     # args
-    local -r runuser_bin="$1" account_user="$2" environment="$3" config_file="$4"
+    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" environment="$5" config_file="$6"
 
     # vars
     local output expected
 
     # code
-    output=$("$runuser_bin" --user "$account_user" -- "${environment}/bin/omi-collector" \
+    output=$("$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" "${environment}/bin/omi-collector" \
         config check --config "$config_file") || die 'candidate rejected the operator configuration'
     expected=$(printf '{"config":"%s","status":"config_valid"}' "$config_file")
     # assert: the candidate validated the exact production configuration
@@ -282,11 +381,12 @@ function require_clean_source_tree {
 }
 
 declare script_dir repo_root source_package source_unit installed_unit config_file service_name
-declare uv_bin runuser_bin account_user account_group state_dir uv_cache_dir
+declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user account_group build_user build_group
+declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
-declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0
+declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0 python_install_pending=0
 declare -i service_quiesced=0 release_created=0 deployment_lock_fd=-1
 declare -ri readiness_poll_attempts=5 readiness_poll_interval_seconds=1 stability_interval_seconds=6
 
@@ -298,12 +398,18 @@ installed_unit='/etc/systemd/system/omi-collector.service'
 config_file='/srv/pipelines/omi/config.toml'
 service_name='omi-collector.service'
 uv_bin='/usr/local/bin/uv'
+sealer_python='/usr/bin/python3'
+sealer_script="${script_dir}/seal_deployment_tree.py"
+sealer_owner='0:0'
 account_user='omi-collector'
 account_group='omi-collector'
-state_dir='/var/lib/omi-collector'
-uv_cache_dir='/var/lib/omi-collector/uv-cache'
+build_user='omi-collector-build'
+build_group='omi-collector-build'
+build_state_dir='/var/lib/omi-collector-build'
+uv_cache_dir='/var/lib/omi-collector-build/uv-cache'
 deployment_root='/var/lib/omi-collector-deployments'
 deployments_dir='/var/lib/omi-collector-deployments/releases'
+python_install_dir='/var/lib/omi-collector-deployments/python'
 deployment_lock_file='/var/lib/omi-collector-deployments/.deployment.lock'
 current_link='/var/lib/omi-collector-deployments/current'
 temporary_link="${deployment_root}/.current.${BASHPID}.${RANDOM}"
@@ -367,6 +473,8 @@ trap 'handle_signal SIGUSR2 140' USR2
 [[ -f "$source_unit" && -d "$source_package" ]] || die 'checked-in deployment sources are missing'
 [[ -f "$uv_bin" && -x "$uv_bin" && ! -L "$uv_bin" ]] \
     || die "uv must be installed as an executable regular file: ${uv_bin}"
+[[ -x "$sealer_python" && -f "$sealer_script" && ! -L "$sealer_script" ]] \
+    || die 'trusted descriptor-based deployment sealer is missing or unsafe'
 [[ -r "$installed_unit" && -f "$installed_unit" && ! -L "$installed_unit" ]] \
     || die 'installed systemd unit is missing or unsafe; run sudo scripts/install-systemd-unit.sh once'
 cmp --silent -- "$source_unit" "$installed_unit" \
@@ -381,8 +489,9 @@ source_revision=$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}') \
 [[ "$source_revision" =~ ^[0-9a-f]{40,64}$ ]] \
     || die "source revision is not a full lowercase Git object ID: ${source_revision}"
 require_clean_source_tree "$repo_root"
-prepare_deployment_directories "$uv_cache_dir" "$state_dir" "$deployment_root" "$deployments_dir" \
-    "$account_user" "$account_group"
+ensure_build_account "$build_user" "$build_group" "$build_state_dir" "$account_user" "$account_group"
+prepare_deployment_directories "$build_state_dir" "$uv_cache_dir" "$deployment_root" "$deployments_dir" \
+    "$python_install_dir" "$build_user" "$build_group" python_install_pending
 exec {deployment_lock_fd}>>"$deployment_lock_file" || die 'could not open the deployment transaction lock'
 flock --nonblock "$deployment_lock_fd" || die 'another deployment transaction is already in progress'
 read_current_target "$current_link" "$deployments_dir" previous_target
@@ -393,22 +502,33 @@ release_path="${deployments_dir}/${release_name}"
 mkdir --mode=0750 -- "$release_path" || die 'could not create deployment environment'
 release_created=1
 staged_environment="$release_path"
-chown "$account_user:$account_group" -- "$staged_environment" \
+chown "$build_user:$build_group" "$staged_environment" \
     || die 'could not set staged deployment ownership'
-chmod 0750 -- "$staged_environment" || die 'could not set staged deployment mode'
+chmod 0750 "$staged_environment" || die 'could not set staged deployment mode'
 
-if ! "$runuser_bin" --user "$account_user" -- env \
+if (( python_install_pending )); then
+    if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$uv_cache_dir" \
+        UV_CACHE_DIR="$uv_cache_dir" \
+        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+        "$uv_bin" python install 3.14; then
+        die 'could not install the managed build Python'
+    fi
+fi
+if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$uv_cache_dir" \
     UV_PROJECT_ENVIRONMENT="$staged_environment" \
     UV_LINK_MODE=copy \
     UV_CACHE_DIR="$uv_cache_dir" \
+    UV_PYTHON_INSTALL_DIR="$python_install_dir" \
     "$uv_bin" sync --project "$repo_root" --locked --no-dev --no-editable --reinstall-package omi-collector \
         --no-python-downloads; then
     die 'uv sync failed; systemd was not touched'
 fi
-verify_installed_package "$staged_environment" "$source_package"
-write_release_metadata "$staged_environment" "$source_revision"
-validate_candidate_config "$runuser_bin" "$account_user" "$staged_environment" "$config_file"
-seal_deployment_environment "$staged_environment"
+verify_installed_package "$runuser_bin" "$build_user" "$build_group" "$uv_cache_dir" "$staged_environment" "$source_package"
+validate_candidate_config "$runuser_bin" "$build_user" "$build_group" "$uv_cache_dir" "$staged_environment" "$config_file"
+seal_managed_python "$python_install_dir" "$deployment_root" "$sealer_python" "$sealer_script" "$sealer_owner"
+seal_deployment_environment "$staged_environment" "$deployments_dir" "$sealer_python" "$sealer_script" "$sealer_owner" \
+    "$python_install_dir"
+write_release_metadata "$staged_environment" "$deployments_dir" "$source_revision"
 
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"

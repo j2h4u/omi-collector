@@ -14,6 +14,7 @@ from omi_collector.capture.application.collector import (
     ProgressEvent,
     ProgressMailbox,
     ReadLegOptions,
+    TransferCounters,
     TransferInterruptedError,
     read_leg,
 )
@@ -390,10 +391,15 @@ def test_read_leg_done_validates_current_continuation_leg() -> None:
         await read_leg(first_session, arena, first_writer, 10, 1, ReadLegOptions(1))
 
         continuation_session = BurstSession((_begin(11, 1), _data(second), _done(12)), start=11, count=1)
-        continuation_writer = FakeWriter(expected_start=11, expected_count=1)
-        result = await read_leg(continuation_session, arena, continuation_writer, 11, 1, ReadLegOptions(1))
+        first_writer.expected_start = 11
+        result = await read_leg(continuation_session, arena, first_writer, 11, 1, ReadLegOptions(1))
 
-        assert result.received_bytes == 2 * RECORD_SIZE
+        assert result.received_bytes == RECORD_SIZE
+        assert result.submitted_bytes == RECORD_SIZE
+        assert result.written_bytes == RECORD_SIZE
+        assert result.records_replayed == 0
+        assert result.records_appended == 1
+        assert arena.received_bytes == 2 * RECORD_SIZE
         assert result.next_sequence == 12
         assert result.progress is not None
         assert result.progress.records_completed == 2
@@ -403,12 +409,33 @@ def test_read_leg_done_validates_current_continuation_leg() -> None:
     asyncio.run(scenario())
 
 
+def test_replayed_read_reports_zero_watermark_delta_and_marks_replay() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+        writer = FakeWriter(expected_count=1)
+        first_session = BurstSession((_begin(10, 1), _data(record), _done(11)), start=10, count=1)
+        await read_leg(first_session, arena, writer, 10, 1, ReadLegOptions(1))
+
+        replay_session = BurstSession((_begin(10, 1), _data(record), _done(11)), start=10, count=1)
+        replay = await read_leg(replay_session, arena, writer, 10, 1, ReadLegOptions(1))
+
+        assert replay.records_replayed == 1
+        assert replay.records_appended == 0
+        assert replay.counters == TransferCounters(0, 0, 0)
+        assert arena.received_bytes == RECORD_SIZE
+
+    asyncio.run(scenario())
+
+
 def test_reconnect_progress_rate_excludes_records_from_previous_leg(monkeypatch: pytest.MonkeyPatch) -> None:
     arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
     arena.begin_leg(10, 1)
     arena.append(_record(10))
     arena.begin_leg(11, 1)
-    state = collector_module._IngestState(11, 1, 10.0, ProgressMailbox(), arena.received_records)
+    state = collector_module._IngestState(
+        11, 1, 10.0, ProgressMailbox(), arena.received_records, collector_module._LegBaselines(RECORD_SIZE, 0, 0)
+    )
     arena.append(_record(11))
     monkeypatch.setattr(collector_module.time, "monotonic", lambda: 11.0)
 

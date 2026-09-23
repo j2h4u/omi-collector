@@ -83,13 +83,7 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
         except RuntimeError:
             return
 
-    if options.clock_correction_sink is None:
-        clock_sink = runtime.make_clock_correction_sink(staging)
-        options = replace(
-            options,
-            clock_correction_sink=clock_sink,
-            clock_observation_sink=clock_sink,
-        )
+    options = _configure_clock_sinks(options, staging, runtime)
     maintenance = QuarantineMaintenance(staging, options.activity, runtime, config=options.config)
     if options.clock_lease is None:
         options = replace(options, clock_lease=staging.clock_mutation_lease)
@@ -154,6 +148,21 @@ def _configure_timeline_publisher(
 ) -> OpportunisticOptions:
     """Bind projection retries to the run-issued, task-independent capability."""
     return replace(options, timeline_publisher=authority)
+
+
+def _configure_clock_sinks(
+    options: OpportunisticOptions, staging: StagingPort, runtime: CaptureRuntimePort
+) -> OpportunisticOptions:
+    """Keep correction and observation capabilities typed and causally paired."""
+    correction = options.clock_correction_sink
+    if correction is None:
+        correction = runtime.make_clock_correction_sink(staging)
+    observation = options.clock_observation_sink
+    if observation is None:
+        observation = correction.observation_store
+    elif observation is not correction.observation_store:
+        raise ValueError("clock observation sink must belong to the clock correction sink")
+    return replace(options, clock_correction_sink=correction, clock_observation_sink=observation)
 
 
 def _validate_composition(staging: object, runtime: object) -> None:

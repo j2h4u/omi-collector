@@ -309,6 +309,32 @@ def test_boundary_drift_does_not_write_and_observation_is_safe() -> None:
     assert "audio" not in str(events)
 
 
+def test_healthy_clock_visit_does_not_persist_observation(tmp_path: Path) -> None:
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
+    events: list[dict[str, object]] = []
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    ticks = iter((1000.0,) * 8)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                correction_sink=cast(ClockCorrectionSink, store),
+            ),
+        )
+    )
+
+    assert store.records() == ()
+    assert store.observation_store.records() == ()
+    assert events[-1]["outcome"] == "within_threshold"
+
+
 def test_unsynchronized_host_does_not_reconcile_near_zero_observation() -> None:
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
     events: list[dict[str, object]] = []
@@ -610,6 +636,7 @@ def test_native_clock_handoff_43_to_72_at_incident_frontier(tmp_path: Path) -> N
                 0.5,
                 info_reader=info_after,
                 correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
             ),
         )
     )
@@ -620,6 +647,7 @@ def test_native_clock_handoff_43_to_72_at_incident_frontier(tmp_path: Path) -> N
     assert correction.boundary_sequence_min == 7_763_451
     assert correction.state == "resolved"
     assert correction.verified_epoch == 72
+    assert {"initial", "later"} <= {item.observation_role for item in store.observation_store.records()}
     assert events[-1]["outcome"] == "verified"
 
 
@@ -758,6 +786,35 @@ def test_verification_failure_keeps_unresolved_boundary_fields_empty(tmp_path: P
     assert correction.state == "unresolved"
     assert correction.boundary_sequence_max is None
     assert correction.verified_epoch is None
+
+
+def test_real_clock_store_binds_initial_observation_to_unresolved_intent(tmp_path: Path) -> None:
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
+    events: list[dict[str, object]] = []
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    ticks = iter((1000.0,) * 8)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+            ),
+        )
+    )
+
+    correction = store.records()[0]
+    initial = next(item for item in store.observation_store.records() if item.observation_role == "initial")
+    assert correction.state == "unresolved"
+    assert initial.operation_id == correction.operation_id
+    assert events[-1]["outcome"] == "verification_failed"
 
 
 def test_missing_time_write_is_not_reported_as_performed() -> None:

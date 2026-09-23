@@ -20,6 +20,7 @@ from bleak.exc import BleakDBusError, BleakError
 
 from fakes import DelayedNotification, ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError, WriterProgress
+from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
@@ -393,6 +394,74 @@ async def test_coordinator_wires_clock_telemetry_to_storage_lease(
 
     assert result.info.read_sequence == 0
     assert lease_entries == ["created", "entered"]
+
+
+@_async_test
+async def test_coordinator_wires_real_clock_observation_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    observed: list[object] = []
+
+    async def observe_options(self: SessionLifecycle) -> NoDataResult:
+        observed.extend((self.run.options.clock_correction_sink, self.run.options.clock_observation_sink))
+        return NoDataResult(RingInfo(0, 0, 0, 0, RECORD_SIZE))
+
+    monkeypatch.setattr(SessionLifecycle, "run_direct", observe_options)
+
+    await run_opportunistic_collector(Provider([]), store, _options())
+
+    correction, observation = observed
+    assert isinstance(correction, ClockCorrectionStore)
+    assert observation is correction.observation_store
+
+
+@_async_test
+async def test_coordinator_derives_observation_store_from_supplied_correction_sink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    correction = ClockCorrectionStore(tmp_path / "provided-device.json")
+    observed: list[object] = []
+
+    async def observe_options(self: SessionLifecycle) -> NoDataResult:
+        observed.append(self.run.options.clock_observation_sink)
+        return NoDataResult(RingInfo(0, 0, 0, 0, RECORD_SIZE))
+
+    monkeypatch.setattr(SessionLifecycle, "run_direct", observe_options)
+
+    await run_opportunistic_collector(Provider([]), store, replace(_options(), clock_correction_sink=correction))
+
+    assert observed == [correction.observation_store]
+
+
+@_async_test
+async def test_coordinator_rejects_observation_store_from_another_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    correction = ClockCorrectionStore(tmp_path / "provided-device.json")
+    other_correction = ClockCorrectionStore(tmp_path / "other-device.json")
+    lifecycle_started = False
+
+    async def observe_options(self: SessionLifecycle) -> NoDataResult:
+        del self
+        nonlocal lifecycle_started
+        lifecycle_started = True
+        return NoDataResult(RingInfo(0, 0, 0, 0, RECORD_SIZE))
+
+    monkeypatch.setattr(SessionLifecycle, "run_direct", observe_options)
+
+    with pytest.raises(ValueError, match="must belong"):
+        await run_opportunistic_collector(
+            Provider([]),
+            store,
+            replace(
+                _options(),
+                clock_correction_sink=correction,
+                clock_observation_sink=other_correction.observation_store,
+            ),
+        )
+
+    assert not lifecycle_started
 
 
 @_async_test

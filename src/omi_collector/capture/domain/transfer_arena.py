@@ -4,13 +4,11 @@ The arena is deliberately narrower than the durable staging layer.  A BLE
 notification callback may call :meth:`TransferArena.append` to copy bytes into
 the preallocated buffer, but this module never performs I/O, waits, or retains
 notification objects.  A writer receives complete records through a read-only
-submitted-prefix seam; only an explicit successful checkpoint acknowledgement
-advances the durable watermark.
+submitted-prefix seam.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass
 
 from .ring_protocol import RECORD_SIZE
@@ -41,7 +39,7 @@ class ArenaDataMismatchError(ArenaLegError):
 
 
 class ArenaPublicationError(TransferArenaError):
-    """A writer or checkpoint requested an invalid boundary."""
+    """A writer requested an invalid submission boundary."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,16 +73,6 @@ class TransferSnapshot:
         return self.start_sequence + self.total_records
 
 
-@dataclass(frozen=True, slots=True)
-class WriterCheckpoint:
-    """Successful writer result authorizing a durable arena watermark."""
-
-    next_sequence: int
-
-    def __post_init__(self) -> None:
-        _require_uint(self.next_sequence, "next_sequence")
-
-
 Buffer = bytes | bytearray | memoryview
 
 
@@ -115,7 +103,6 @@ class TransferArena:
         self._snapshot = snapshot
         self._received_bytes = 0
         self._submitted_bytes = 0
-        self._durable_bytes = 0
         self._leg_start = snapshot.start_sequence
         self._leg_bytes = 0
         self._leg_total_bytes = snapshot.total_bytes
@@ -185,21 +172,6 @@ class TransferArena:
         """Return the complete records handed to the writer."""
         return self._submitted_bytes // self.record_size
 
-    @property
-    def durable_bytes(self) -> int:
-        """Return the prefix confirmed by an explicit writer checkpoint."""
-        return self._durable_bytes
-
-    @property
-    def durable_records(self) -> int:
-        """Return the complete records confirmed by the writer checkpoint."""
-        return self._durable_bytes // self.record_size
-
-    @property
-    def durable_next_sequence(self) -> int:
-        """Return the first sequence after the durable prefix."""
-        return self.start_sequence + self.durable_records
-
     def begin_leg(self, start_sequence: int, record_count: int) -> None:
         """Validate and select a reconnect leg.
 
@@ -260,8 +232,6 @@ class TransferArena:
     def submit_prefix(self, record_count: int | None = None) -> memoryview:
         """Hand a complete-record prefix to a writer as a read-only view.
 
-        Submission is not a durability acknowledgement.  The coordinator must
-        call :meth:`acknowledge_durable` after a successful writer checkpoint.
         ``record_count`` is optional; when omitted, all currently complete
         records are submitted.  Submission never moves backward.
         """
@@ -282,39 +252,6 @@ class TransferArena:
     def readonly_source(self) -> memoryview:
         """Return a live read-only view over the full preallocated source."""
         return memoryview(self._buffer).toreadonly()
-
-    def acknowledge_durable(self, checkpoint: WriterCheckpoint) -> memoryview:
-        """Advance durability only from an explicit successful checkpoint."""
-        if not isinstance(checkpoint, WriterCheckpoint):
-            raise ArenaPublicationError("durability requires a WriterCheckpoint result")
-        next_sequence = checkpoint.next_sequence
-        if not self.start_sequence <= next_sequence <= self.start_sequence + self.submitted_records:
-            raise ArenaPublicationError("checkpoint exceeds the submitted prefix")
-        target_bytes = (next_sequence - self.start_sequence) * self.record_size
-        if target_bytes < self._durable_bytes:
-            raise ArenaPublicationError("durable prefix cannot move backward")
-        self._durable_bytes = target_bytes
-        return self.durable_prefix()
-
-    def durable_prefix(self) -> memoryview:
-        """Return the explicitly acknowledged durable prefix."""
-        return memoryview(self._buffer)[: self._durable_bytes].toreadonly()
-
-    def submitted_chunks(self, chunk_bytes: int) -> Iterator[memoryview]:
-        """Yield bounded read-only chunks from the submitted source prefix."""
-        return self._chunks(self._submitted_bytes, chunk_bytes)
-
-    def durable_chunks(self, chunk_bytes: int) -> Iterator[memoryview]:
-        """Yield bounded read-only chunks from the durable prefix."""
-        return self._chunks(self._durable_bytes, chunk_bytes)
-
-    def _chunks(self, limit: int, chunk_bytes: int) -> Iterator[memoryview]:
-        """Yield views without copying the arena's backing buffer."""
-        _require_uint(chunk_bytes, "chunk_bytes")
-        if chunk_bytes == 0:
-            raise ValueError("chunk_bytes must be positive")
-        for offset in range(0, limit, chunk_bytes):
-            yield memoryview(self._buffer)[offset : min(offset + chunk_bytes, limit)].toreadonly()
 
 
 def _require_uint(value: int, label: str) -> None:

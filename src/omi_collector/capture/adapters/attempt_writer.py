@@ -303,11 +303,6 @@ class AttemptWriter:
         return self.written_high_water
 
     @property
-    def source_capacity(self) -> int:
-        """Return the pre-admitted arena capacity in bytes."""
-        return len(self._arena)
-
-    @property
     def progress(self) -> WriterProgress:
         """Return submitted and written bytes from the in-memory counters."""
         with self._lock:

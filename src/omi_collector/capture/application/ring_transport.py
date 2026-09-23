@@ -157,11 +157,6 @@ class ControlNotificationStream(AsyncIterator[bytes]):
                 break
             self._buffered_bytes -= len(payload)
 
-    @property
-    def buffered_bytes(self) -> int:
-        """Return the number of accepted bytes awaiting consumption."""
-        return self._buffered_bytes
-
 
 class RingSession(Protocol):
     """Minimal session contract consumed by the collector."""
@@ -180,24 +175,4 @@ class RingSession(Protocol):
 
     async def close(self) -> None:
         """Stop notifications and disconnect the session."""
-        ...
-
-
-class RingTransport(Protocol):
-    """Async connection lifecycle expected from a ring transport."""
-
-    async def connect(self) -> RingSession:
-        """Connect and subscribe before returning a usable session."""
-        ...
-
-    async def disconnect(self) -> None:
-        """Idempotently tear down the active session."""
-        ...
-
-    async def __aenter__(self) -> RingSession:
-        """Connect the transport for an async context."""
-        ...
-
-    async def __aexit__(self, exc_type: object, _exc_value: object, traceback: object) -> None:
-        """Disconnect the transport when leaving an async context."""
         ...

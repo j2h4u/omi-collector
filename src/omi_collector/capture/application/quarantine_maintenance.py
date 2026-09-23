@@ -68,7 +68,6 @@ class QuarantineMaintenance:
         self._quarantine_retry_not_before = 0.0
         self._quarantine_retry_number = 0
         self._publication_retry_not_before = 0.0
-        self._publication_retry_number = 0
         self._publication_retry_handle: asyncio.TimerHandle | None = None
         self._publication_retry_task: asyncio.Task[bool] | None = None
 
@@ -117,7 +116,6 @@ class QuarantineMaintenance:
         for attempt in range(len(backoff) + 1):
             try:
                 published = await asyncio.to_thread(self._staging.recover_and_publish)
-                self._publication_retry_number = 0
                 self._publication_retry_not_before = 0.0
                 if published is not None:
                     self._runtime.debug_event("ready_publication_published")
@@ -127,7 +125,6 @@ class QuarantineMaintenance:
                 if attempt >= len(backoff):
                     retry = backoff[-1] if backoff else 1.0
                     self._publication_retry_not_before = monotonic() + retry
-                    self._publication_retry_number += 1
                     self._schedule_publication_retry()
                     return False
                 await asyncio.sleep(backoff[attempt])

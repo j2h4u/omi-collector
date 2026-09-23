@@ -14,7 +14,6 @@ from omi_collector.capture.domain.transfer_arena import (
     ArenaSequenceError,
     TransferArena,
     TransferSnapshot,
-    WriterCheckpoint,
 )
 
 
@@ -72,17 +71,17 @@ def test_readonly_source_is_full_capacity_live_view_without_cursor_changes() -> 
     assert source.readonly
     assert len(source) == 2 * RECORD_SIZE
     assert source.obj is arena._buffer
-    assert (arena.received_bytes, arena.submitted_bytes, arena.durable_bytes) == (0, 0, 0)
+    assert (arena.received_bytes, arena.submitted_bytes) == (0, 0)
 
     payload = _records(1, marker=23)
     arena.append(payload)
     assert bytes(source[:RECORD_SIZE]) == payload
-    assert (arena.received_bytes, arena.submitted_bytes, arena.durable_bytes) == (RECORD_SIZE, 0, 0)
+    assert (arena.received_bytes, arena.submitted_bytes) == (RECORD_SIZE, 0)
     with pytest.raises(TypeError):
         source[0] = 0
 
 
-def test_reconnect_leg_allows_resident_overlap_before_durable() -> None:
+def test_reconnect_leg_allows_resident_overlap() -> None:
     arena = TransferArena(100, 4, max_bytes=4 * RECORD_SIZE)
     arena.append(_records(2))
     arena.begin_leg(100, 2)
@@ -90,7 +89,6 @@ def test_reconnect_leg_allows_resident_overlap_before_durable() -> None:
 
     arena.submit_prefix(1)
     assert arena.submitted_records == 1
-    assert arena.durable_records == 0
 
     arena.begin_leg(101, 1)
     with pytest.raises(ArenaDataMismatchError):
@@ -98,8 +96,6 @@ def test_reconnect_leg_allows_resident_overlap_before_durable() -> None:
     arena.begin_leg(101, 1)
     arena.append(_records(1, marker=1))
 
-    arena.acknowledge_durable(WriterCheckpoint(101))
-    assert arena.durable_records == 1
     arena.begin_leg(101, 3)
     arena.append(_records(3, marker=1))
     assert arena.received_bytes == 4 * RECORD_SIZE
@@ -110,60 +106,38 @@ def test_reconnect_leg_allows_resident_overlap_before_durable() -> None:
         gap_arena.begin_leg(103, 1)
 
 
-def test_replayed_overlap_is_compared_and_durable_prefix_never_mutates() -> None:
+def test_replayed_overlap_is_compared_and_submitted_prefix_never_mutates() -> None:
     first = _records(2, marker=11)
     arena = TransferArena(50, 3, max_bytes=3 * RECORD_SIZE)
     arena.append(first)
     arena.submit_prefix()
-    assert arena.durable_records == 0
     submitted = arena.submitted_prefix()
     assert submitted.readonly
     assert bytes(submitted) == first
     with pytest.raises(TypeError):
         submitted[0] = 0
 
-    arena.acknowledge_durable(WriterCheckpoint(52))
-    durable = arena.durable_prefix()
-    assert bytes(durable) == first
-
     arena.begin_leg(51, 2)
     arena.append(first[RECORD_SIZE:] + _records(1, marker=33))
-    assert bytes(durable) == first
-    assert bytes(arena.durable_prefix()) == first
+    assert bytes(submitted) == first
 
     arena.begin_leg(51, 1)
     with pytest.raises(ArenaDataMismatchError):
         arena.append(b"z" * RECORD_SIZE)
-    assert bytes(arena.durable_prefix()) == first
+    assert bytes(submitted) == first
 
 
-def test_submitted_chunks_are_read_only_and_record_aligned() -> None:
+def test_submitted_prefix_is_read_only_and_cannot_move_backward() -> None:
     payload = _records(5)
     arena = TransferArena(1, 5, max_bytes=len(payload))
     arena.append(payload)
-    arena.submit_prefix(4)
-    chunks = tuple(arena.submitted_chunks(500))
-    assert [len(chunk) for chunk in chunks] == [500, 500, 500, 276]
-    assert all(chunk.readonly for chunk in chunks)
-    assert sum(map(len, chunks)) == 4 * RECORD_SIZE
+    submitted = arena.submit_prefix(4)
+    assert submitted.readonly
+    assert bytes(submitted) == payload[: 4 * RECORD_SIZE]
+    with pytest.raises(TypeError):
+        submitted[0] = 0
     with pytest.raises(ArenaPublicationError):
         arena.submit_prefix(3)
-
-
-def test_only_explicit_writer_checkpoint_advances_durable_cursor() -> None:
-    arena = TransferArena(10, 3, max_bytes=3 * RECORD_SIZE)
-    arena.append(_records(3))
-    arena.submit_prefix()
-    assert arena.submitted_bytes == 3 * RECORD_SIZE
-    assert arena.durable_bytes == 0
-
-    with pytest.raises(ArenaPublicationError, match="submitted prefix"):
-        arena.acknowledge_durable(WriterCheckpoint(14))
-    assert arena.durable_bytes == 0
-
-    arena.acknowledge_durable(WriterCheckpoint(11))
-    assert arena.durable_records == 1
-    assert arena.durable_next_sequence == 11
 
 
 def test_full_synthetic_burst_uses_one_backing_buffer() -> None:

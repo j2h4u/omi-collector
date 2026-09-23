@@ -203,7 +203,6 @@ async def _test_arena_is_shared_and_data_waits_for_read_begin() -> None:
     arena = bytearray(RECORD_SIZE * 2)
     writer = AttemptWriter(target, arena, chunk_size=RECORD_SIZE)
     assert writer.state is WriterState.CREATED
-    assert writer.source_capacity == RECORD_SIZE * 2
     await writer.start()
     assert writer.state is WriterState.STARTED
     arena[:RECORD_SIZE] = b"x" * RECORD_SIZE

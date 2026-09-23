@@ -133,7 +133,7 @@ def test_device_lock_finalizes_complete_capture_local_publication_temporary(tmp_
     capture_root = _capture_root(tmp_path)
     attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     result = attempt.seal(DoneNotification(0, 101))
     temporary = result.bundle_path.with_name(f".{result.bundle_path.name}.{'a' * 32}.tmp")
     result.bundle_path.replace(temporary)
@@ -195,7 +195,7 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
     store = StagingStore(tmp_path, _capture_root(tmp_path), config=config)
     attempt = store.prepare_streaming_attempt(100, 2)
     attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     result = attempt.publish_prefix()
     assert result is not None
@@ -258,7 +258,7 @@ def test_terminal_retired_sweep_does_not_rehash_records_before_delete(
 def test_quarantine_attempt_source_preserves_only_existing_attempt_files(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     attempt_id = attempt.attempt_id
     expected_files = {path.name for path in attempt.path.iterdir()}
@@ -275,7 +275,7 @@ def test_quarantine_attempt_source_preserves_only_existing_attempt_files(tmp_pat
 
 def test_streaming_partial_close_is_preserved_and_blocks_pending(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.close()
 
     reopened = StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
@@ -283,7 +283,7 @@ def test_streaming_partial_close_is_preserved_and_blocks_pending(tmp_path: Path)
     assert not recovery.clean
     assert recovery.raw_bytes == RECORD_SIZE
     with pytest.raises(AttemptStateError, match="preserved partial evidence"):
-        reopened.append_record(1, 101, _record(2))
+        reopened.accept_chunk(100, _record(2))
     with pytest.raises(PendingAttemptError):
         StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
     assert attempt.path.exists()
@@ -496,7 +496,7 @@ def test_quarantine_pending_moves_unsafe_partial_root_and_recreates_it(tmp_path:
 
 def test_pending_sealed_looking_partial_requires_the_real_destination_bundle(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     raw_hash = sha256(_record(1)).hexdigest()
     (attempt.path / "manifest.json").write_text(dumps(attempt._manifest(raw_hash)), encoding="utf-8")
@@ -508,7 +508,7 @@ def test_pending_sealed_looking_partial_requires_the_real_destination_bundle(tmp
 
 def test_pending_partial_with_a_corrupt_destination_bundle_remains_blocking(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     raw_hash = sha256(_record(1)).hexdigest()
     destination = attempt._bundle_path(raw_hash)

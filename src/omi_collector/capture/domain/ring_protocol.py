@@ -12,7 +12,6 @@ from typing import Literal
 
 RECORD_SIZE = 444
 TIMESTAMP_SIZE = 4
-AUDIO_PAYLOAD_SIZE = RECORD_SIZE - TIMESTAMP_SIZE
 
 NOTIFY_ACK = 0x01
 NOTIFY_INFO = 0x02
@@ -90,23 +89,6 @@ class ReadBeginNotification:
     packet_count: int
 
 
-@dataclass(frozen=True, slots=True)
-class RingRecord:
-    timestamp: int
-    audio_payload: bytes
-
-    @classmethod
-    def parse(cls, payload: bytes) -> RingRecord:
-        _require_exact_length(payload, RECORD_SIZE, "ring record")
-        return cls(
-            timestamp=int.from_bytes(payload[:TIMESTAMP_SIZE], "big"),
-            audio_payload=payload[TIMESTAMP_SIZE:],
-        )
-
-    def opus_frames(self) -> tuple[bytes, ...]:
-        return parse_audio_payload(self.audio_payload)
-
-
 def parse_status(payload: bytes) -> RingStatus:
     """Parse four little-endian unsigned integers from the status value."""
     _require_exact_length(payload, 16, "status")
@@ -181,48 +163,6 @@ def encode_read_command(start_sequence: int, packet_count: int | None = None) ->
 def encode_advance_command(new_read_sequence: int) -> bytes:
     _require_uint(new_read_sequence, 64, "new_read_sequence")
     return _ADVANCE.pack(CMD_ADVANCE, new_read_sequence)
-
-
-def parse_audio_payload(payload: bytes) -> tuple[bytes, ...]:
-    """Extract packed Opus frames from a record's 440-byte audio payload.
-
-    A zero size byte is padding.  A frame reaching or crossing the payload
-    boundary is incomplete and terminates parsing, matching firmware behavior.
-    """
-    _require_exact_length(payload, AUDIO_PAYLOAD_SIZE, "audio payload")
-    frames: list[bytes] = []
-    offset = 0
-    while offset < len(payload) - 1:
-        frame_size = payload[offset]
-        if frame_size == 0:
-            offset += 1
-            continue
-        frame_end = offset + 1 + frame_size
-        if frame_end >= len(payload):
-            break
-        frames.append(payload[offset + 1 : frame_end])
-        offset = frame_end
-    return tuple(frames)
-
-
-class RingRecordAssembler:
-    """Reassemble arbitrarily split DATA bytes into fixed-size ring records."""
-
-    def __init__(self) -> None:
-        self._pending = bytearray()
-
-    @property
-    def pending_bytes(self) -> int:
-        return len(self._pending)
-
-    def append(self, payload: bytes) -> tuple[RingRecord, ...]:
-        self._pending.extend(payload)
-        records: list[RingRecord] = []
-        while len(self._pending) >= RECORD_SIZE:
-            record = bytes(self._pending[:RECORD_SIZE])
-            del self._pending[:RECORD_SIZE]
-            records.append(RingRecord.parse(record))
-        return tuple(records)
 
 
 def _require_exact_length(payload: bytes, expected: int, label: str) -> None:

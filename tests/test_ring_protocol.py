@@ -4,18 +4,14 @@ from struct import pack
 import pytest
 
 from omi_collector.capture.domain.ring_protocol import (
-    AUDIO_PAYLOAD_SIZE,
     RECORD_SIZE,
     AckNotification,
     RingProtocolError,
-    RingRecord,
-    RingRecordAssembler,
     encode_advance_command,
     encode_info_command,
     encode_read_command,
     encode_stop_command,
     parse_ack_notification,
-    parse_audio_payload,
     parse_data_notification,
     parse_done_notification,
     parse_info_notification,
@@ -138,67 +134,3 @@ def test_command_encoders_preserve_wire_endianness_and_optional_count() -> None:
 def test_command_encoders_reject_out_of_range_values(call: Callable[[], bytes], match: str) -> None:
     with pytest.raises(RingProtocolError, match=match):
         call()
-
-
-def test_parse_audio_payload_handles_frames_and_zero_padding() -> None:
-    payload = b"\x02ab\x00\x03cde" + bytes(AUDIO_PAYLOAD_SIZE - 8)
-
-    assert parse_audio_payload(payload) == (b"ab", b"cde")
-
-
-def test_parse_audio_payload_stops_at_terminal_size_byte() -> None:
-    payload = bytearray(AUDIO_PAYLOAD_SIZE)
-    payload[-2] = 1
-    payload[-1] = ord("x")
-
-    assert parse_audio_payload(bytes(payload)) == ()
-
-
-def test_parse_audio_payload_stops_when_frame_crosses_boundary() -> None:
-    payload = bytearray(AUDIO_PAYLOAD_SIZE)
-    payload[-3] = 3
-    payload[-2:] = b"xy"
-
-    assert parse_audio_payload(bytes(payload)) == ()
-
-
-def test_parse_audio_payload_rejects_wrong_size() -> None:
-    with pytest.raises(RingProtocolError, match="exactly 440 bytes"):
-        parse_audio_payload(bytes(AUDIO_PAYLOAD_SIZE - 1))
-
-
-def _record(timestamp: int, marker: int) -> bytes:
-    return timestamp.to_bytes(4, "big") + bytes((marker,)) * AUDIO_PAYLOAD_SIZE
-
-
-def test_ring_record_parses_timestamp_and_payload() -> None:
-    audio_payload = b"\x02ab" + bytes(AUDIO_PAYLOAD_SIZE - 3)
-    record = RingRecord.parse(0x01020304.to_bytes(4, "big") + audio_payload)
-
-    assert record.timestamp == 0x01020304
-    assert record.audio_payload == audio_payload
-    assert record.opus_frames() == (b"ab",)
-
-
-def test_ring_record_rejects_wrong_size() -> None:
-    with pytest.raises(RingProtocolError, match=f"exactly {RECORD_SIZE} bytes"):
-        RingRecord.parse(bytes(RECORD_SIZE - 1))
-
-
-def test_assembler_handles_unaligned_chunks_and_multiple_records() -> None:
-    first = _record(1, 0x11)
-    second = _record(2, 0x22)
-    assembler = RingRecordAssembler()
-
-    assert assembler.append(first[:100]) == ()
-    assert assembler.pending_bytes == 100
-    records = assembler.append(first[100:] + second + b"tail")
-
-    assert [record.timestamp for record in records] == [1, 2]
-    assert assembler.pending_bytes == 4
-
-
-def test_assembler_accepts_empty_chunks_without_changing_state() -> None:
-    assembler = RingRecordAssembler()
-    assert assembler.append(b"") == ()
-    assert assembler.pending_bytes == 0

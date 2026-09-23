@@ -19,14 +19,12 @@ from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionStore
 from .clock_memberships import ClockMembershipStore
 from .ready_bundles import finalize_drafts, retire_acknowledged
-from .recovery import Recovery
 from .staging_contract import (
     _DESCRIPTOR_NAME,
     _RAW_NAME,
     AttemptDescriptor,
     AttemptStateError,
     PendingAttemptError,
-    StagingError,
     StreamingCheckpoint,
     _validate_attempt_id,
     _validate_count,
@@ -39,7 +37,6 @@ from .staging_filesystem import (
     StagingPaths,
     Statvfs,
     _create_empty_synced,
-    _file_size,
     _never_defer,
     _require_regular_directory,
 )
@@ -231,12 +228,6 @@ class StagingStore:
                 raise AttemptStateError("publication authority is already bound to another active writer")
             self._publication_authority_lease = lease
 
-    @contextmanager
-    def held_device_lock(self, lease: DeviceLock) -> Iterator[DeviceLock]:
-        """Use an explicitly supplied lease without taking the lock again."""
-        self._filesystem.require_device_lock(lease)
-        yield lease
-
     @property
     def attempts_root(self) -> Path:
         return self._filesystem.attempts_root
@@ -404,15 +395,6 @@ class StagingStore:
             attempt = StagedAttempt(self._filesystem, path, descriptor, live=False)
         attempt.activate_for_resume(lease)
         return attempt
-
-    def recover_attempt(self, attempt_id: str) -> Recovery:
-        """Inspect an attempt without deleting or truncating any evidence."""
-        _validate_attempt_id(attempt_id)
-        attempt_path = self.attempts_root / attempt_id
-        try:
-            return self.open_attempt(attempt_id).recover()
-        except StagingError as error:
-            return Recovery(attempt_id, 0, _file_size(attempt_path / _RAW_NAME), False, str(error))
 
     def pending_attempts(self) -> tuple[AttemptDescriptor, ...]:
         return quarantine.pending_attempts(self._filesystem)

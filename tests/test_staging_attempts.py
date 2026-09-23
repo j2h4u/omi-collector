@@ -143,18 +143,18 @@ def test_prepare_persists_descriptor_before_returning(tmp_path: Path) -> None:
     )
 
 
-def test_append_requires_read_begin_and_exact_order_and_size(tmp_path: Path) -> None:
+def test_accept_chunk_requires_read_begin_and_exact_order_and_size(tmp_path: Path) -> None:
     attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
     with pytest.raises(AttemptStateError, match="READ_BEGIN"):
-        attempt.append_record(0, 100, _record(1))
+        attempt.accept_chunk(100, _record(1))
 
     attempt.record_read_begin(ReadBeginNotification(100, 2))
-    with pytest.raises(AttemptStateError, match="exactly"):
-        attempt.append_record(0, 100, b"short")
+    with pytest.raises(AttemptStateError, match="positive multiple"):
+        attempt.accept_chunk(100, b"short")
     with pytest.raises(AttemptStateError, match="next expected"):
-        attempt.append_record(1, 101, _record(1))
-    attempt.append_record(0, 100, _record(1))
-    attempt.append_record(1, 101, _record(2))
+        attempt.accept_chunk(101, _record(1))
+    attempt.accept_chunk(100, _record(1))
+    attempt.accept_chunk(101, _record(2))
 
     assert (attempt.path / "records.bin").read_bytes() == _record(1) + _record(2)
 
@@ -190,7 +190,7 @@ def test_streaming_accept_chunk_matches_per_record_hash_and_checkpoint(tmp_path:
     per_record = _started_streaming_attempt(tmp_path / "per-record", count=1025)
     chunked = _started_streaming_attempt(tmp_path / "chunked", count=1025)
     for index in range(1025):
-        per_record.append_record(index, 100 + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
+        per_record.accept_chunk(100 + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
     chunked.accept_chunk(100, records)
 
     assert (per_record.path / "records.bin").read_bytes() == (chunked.path / "records.bin").read_bytes()
@@ -237,14 +237,14 @@ def test_streaming_checkpoint_is_bounded_and_flushes_an_explicit_tail(tmp_path: 
     attempt = _started_streaming_attempt(tmp_path, count=1025, fsync_fn=track_sync)
     before_records = sync_calls
     for index in range(1023):
-        attempt.append_record(index, 100 + index, _record((index + 1) % 256))
+        attempt.accept_chunk(100 + index, _record((index + 1) % 256))
     assert sync_calls == before_records
 
-    attempt.append_record(1023, 1123, _record(1024 % 256))
+    attempt.accept_chunk(1123, _record(1024 % 256))
     # A streaming checkpoint now durably publishes both the raw fsync and its
     # atomic checkpoint file (temporary-file fsync plus attempt-directory fsync).
     assert sync_calls == before_records + 3
-    attempt.append_record(1024, 1124, _record(1025 % 256))
+    attempt.accept_chunk(1124, _record(1025 % 256))
     assert sync_calls == before_records + 3
 
     attempt.checkpoint()
@@ -263,7 +263,7 @@ def test_streaming_checkpoints_never_rehash_the_growing_raw_file(
         lambda _path: (_ for _ in ()).throw(AssertionError("streaming staging must not use read_bytes")),
     )
     for index in range(1024):
-        attempt.append_record(index, 100 + index, _record(index % 256))
+        attempt.accept_chunk(100 + index, _record(index % 256))
     attempt.checkpoint()
 
     attempt.seal(DoneNotification(0, 1124))
@@ -285,8 +285,8 @@ def test_durability_config_projects_headroom_overhead_and_checkpoint_batching(tm
     store = StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=statvfs, config=config)
     attempt = store.prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
-    attempt.append_record(0, 100, _record(1))
-    attempt.append_record(1, 101, _record(2))
+    attempt.accept_chunk(100, _record(1))
+    attempt.accept_chunk(101, _record(2))
 
     checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text()))
     assert expected_required == 3330
@@ -319,7 +319,7 @@ def test_resumed_attempt_rechecks_remaining_capacity_before_its_next_read(tmp_pa
     attempt.prepare_leg(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
     first = _record(1)
-    attempt.append_record(0, 100, first)
+    attempt.accept_chunk(100, first)
     attempt.checkpoint()
     attempt.close(durable=True)
 
@@ -382,7 +382,7 @@ def test_terminal_marker_write_failure_leaves_only_recoverable_prefix(
     )
     attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
@@ -407,18 +407,16 @@ def test_terminal_marker_write_failure_leaves_only_recoverable_prefix(
 def test_streaming_rejects_malformed_sequence_and_count(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1)
     with pytest.raises(AttemptStateError, match="next expected"):
-        attempt.append_record(1, 101, _record(1))
-    with pytest.raises(AttemptStateError, match="next expected"):
-        attempt.append_record(0, 101, _record(1))
-    attempt.append_record(0, 100, _record(1))
+        attempt.accept_chunk(101, _record(1))
+    attempt.accept_chunk(100, _record(1))
     with pytest.raises(AttemptStateError, match="exceeds READ_BEGIN"):
-        attempt.append_record(1, 101, _record(2))
+        attempt.accept_chunk(101, _record(2))
 
 
 def test_streaming_reopen_does_not_rehash_or_trust_a_partial_prefix(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=3)
     first = _record(1)
-    attempt.append_record(0, 100, first)
+    attempt.accept_chunk(100, first)
     attempt.checkpoint()
     attempt.close()
     before = (attempt.path / "records.bin").read_bytes()
@@ -436,9 +434,9 @@ def test_streaming_resume_promotes_only_an_aligned_post_checkpoint_tail(tmp_path
     attempt = first_store.prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
     first, second = _record(1), _record(2)
-    attempt.append_record(0, 100, first)
+    attempt.accept_chunk(100, first)
     attempt.checkpoint()
-    attempt.append_record(1, 101, second)
+    attempt.accept_chunk(101, second)
     attempt.close(durable=True)
     checkpoint_before = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
 
@@ -463,7 +461,7 @@ def test_large_resume_hashes_raw_evidence_in_one_streaming_pass(
     attempt = store.prepare_streaming_attempt(100, 4097)
     attempt.record_read_begin(ReadBeginNotification(100, 4097))
     for index in range(4097):
-        attempt.append_record(index, 100 + index, _record(index % 256))
+        attempt.accept_chunk(100 + index, _record(index % 256))
     attempt.close(durable=True)
 
     reads = [0]
@@ -509,7 +507,7 @@ def test_streaming_resume_rejects_damaged_checkpoint_or_raw_evidence(tmp_path: P
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     attempt = store.prepare_streaming_attempt(100, 2)
     attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     attempt.close(durable=True)
     checkpoint = attempt.path / "checkpoint.json"
@@ -647,12 +645,10 @@ def test_prepare_validates_sequences_and_counts(tmp_path: Path, start_sequence: 
         StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(start_sequence, packet_count)
 
 
-def test_append_validates_integer_arguments_and_count_overflow(tmp_path: Path) -> None:
+def test_accept_chunk_validates_sequence_and_count_overflow(tmp_path: Path) -> None:
     attempt = _started_attempt(tmp_path, count=1)
-    with pytest.raises(AttemptStateError, match="index"):
-        attempt.append_record(-1, 100, _record(1))
-    with pytest.raises(AttemptStateError, match="sequence"):
-        attempt.append_record(0, -1, _record(1))
-    attempt.append_record(0, 100, _record(1))
+    with pytest.raises(AttemptStateError, match="start_sequence"):
+        attempt.accept_chunk(-1, _record(1))
+    attempt.accept_chunk(100, _record(1))
     with pytest.raises(AttemptStateError, match="exceeds READ_BEGIN"):
-        attempt.append_record(1, 101, _record(2))
+        attempt.accept_chunk(101, _record(2))

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from inspect import isawaitable
 from pathlib import Path
 from threading import Thread
-from typing import Protocol, cast
+from typing import cast
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RingInfo, RingStatus
@@ -60,18 +60,6 @@ type OptionalWriter = Callable[[str, bytes], Awaitable[object]]
 type InfoReader = Callable[[], Awaitable[RingInfo]]
 type StatusReader = Callable[[], Awaitable[RingStatus | None]]
 type ClockMutationLease = StorageLeaseFactory
-
-
-class OperationalSession(Protocol):
-    """Optional characteristic access kept separate from the ring contract."""
-
-    async def read_optional_characteristic(self, uuid: str) -> bytes | None:
-        """Return a value, or ``None`` when the characteristic is not exposed."""
-        ...
-
-    async def write_optional_characteristic(self, uuid: str, value: bytes) -> object:
-        """Write an optional characteristic; false means no write was performed."""
-        ...
 
 
 def system_host_boot_id() -> str:
@@ -210,34 +198,6 @@ async def collect_operational_telemetry(
     await _emit_safe(emit, observation, telemetry_clock.operation_timeout)
     for event in clock_events:
         await _emit_safe(emit, event, telemetry_clock.operation_timeout)
-
-
-async def collect_battery_observation(
-    session: object,
-    info: RingInfo,
-    emit: OperationalEmitter | None,
-    *,
-    operation_timeout: float,
-) -> None:
-    """Emit a battery attempt before slower optional telemetry can consume the session budget."""
-    if emit is None:
-        return
-    if operation_timeout <= 0:
-        raise ValueError("optional operation timeout must be positive")
-    reader, _ = _optional_accessors(session)
-    battery, outcome = await _read_battery(reader, operation_timeout)
-    observation: dict[str, object] = {
-        "event": "pendant_observation",
-        "read_sequence": info.read_sequence,
-        "write_sequence": info.write_sequence,
-        "capacity_packets": info.capacity_packets,
-        "dropped_packets": info.dropped_packets,
-        "packet_size": info.packet_size,
-        "optional_outcomes": {"battery": outcome},
-    }
-    if battery is not None:
-        observation["battery_percent"] = battery
-    await _emit_safe(emit, observation, operation_timeout)
 
 
 async def _build_observation(  # noqa: PLR0913, PLR0917 - operation inputs mirror the typed clock seam

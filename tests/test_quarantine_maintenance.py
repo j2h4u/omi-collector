@@ -42,7 +42,7 @@ def _seed_streaming_partial(store: StagingStore, count: int) -> bytes:
     records = b"".join(_record(sequence) for sequence in range(100, 100 + count))
     attempt.record_read_begin(ReadBeginNotification(100, count))
     for index in range(count):
-        attempt.append_record(index, 100 + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
+        attempt.accept_chunk(100 + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
     attempt.checkpoint()
     attempt.close(durable=True)
     return records
@@ -169,9 +169,9 @@ def test_pending_startup_establishes_aligned_tail_under_a_lease_before_binding(t
     attempt = store.prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
     first, second = _record(1), _record(2)
-    attempt.append_record(0, 100, first)
+    attempt.accept_chunk(100, first)
     attempt.checkpoint()
-    attempt.append_record(1, 101, second)
+    attempt.accept_chunk(101, second)
     attempt.close(durable=True)
     checkpoint = (attempt.path / "checkpoint.json").read_text(encoding="utf-8")
     raw = (attempt.path / "records.bin").read_bytes()

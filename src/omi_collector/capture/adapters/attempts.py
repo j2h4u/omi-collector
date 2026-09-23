@@ -148,11 +148,6 @@ class StagedAttempt:
             return self.checkpoint()
         return self.begin_recovery(start, count)
 
-    def append_record(self, index: int, sequence: int, record: bytes) -> None:
-        """Append and fsync one 444-byte record through the streaming writer."""
-        self._require_resume_lease()
-        self._append_streaming_record(index, sequence, record)
-
     @property
     def durable_prefix(self) -> DurablePrefix:
         """Return the verified streaming prefix without changing on-disk bytes."""
@@ -186,11 +181,6 @@ class StagedAttempt:
         self._recovery_start = start_sequence
         self._recovery_count = packet_count
         return prefix
-
-    def accept_record(self, sequence: int, record: bytes) -> RecordDisposition:
-        """Replay or append one record while preserving the durable prefix."""
-        dispositions = self.accept_chunk(sequence, record)
-        return dispositions[0]
 
     def accept_chunk(
         self, start_sequence: int, records: bytes | bytearray | memoryview
@@ -497,15 +487,6 @@ class StagedAttempt:
         else:
             digest.update(chunk)
         return prefix_remaining, prefix_hash
-
-    def _append_streaming_record(self, index: int, sequence: int, record: bytes) -> None:
-        _validate_int(index, "index")
-        _validate_int(sequence, "sequence")
-        if len(record) != RECORD_SIZE:
-            raise AttemptStateError(f"ring record must be exactly {RECORD_SIZE} bytes")
-        if sequence != self.descriptor.start_sequence + index:
-            raise AttemptStateError("record index or sequence is not the next expected value")
-        self._append_streaming_chunk(index, record)
 
     def _append_streaming_chunk(self, index: int, payload: bytes) -> None:
         """Write one contiguous suffix and advance its in-memory proofs."""

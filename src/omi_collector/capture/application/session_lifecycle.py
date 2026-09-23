@@ -592,11 +592,6 @@ def presence_attempt_outcome(outcome: str, durable_progress: bool) -> AttemptOut
     raise RuntimeError(f"unknown lifecycle attempt outcome: {outcome}")
 
 
-def retryable(error: BaseException) -> bool:
-    """Classify backend and protocol failures that are safe to retry."""
-    return _retryable(error)
-
-
 def _retryable_for_runtime(error: BaseException, runtime: CaptureRuntimePort) -> bool:
     return _retryable(error, is_device_busy=runtime.is_device_busy_error)
 

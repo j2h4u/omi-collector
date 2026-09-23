@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/j2h4u/omi-collector/compare/v0.7.2...v0.7.3) (2026-09-23)
+
+
+### Fixes
+
+* **collector:** attribute staging lock contention in service status ([#127](https://github.com/j2h4u/omi-collector/issues/127)) ([21e46c6](https://github.com/j2h4u/omi-collector/commit/21e46c6984bececec4610bc1ba20c5d38b956e96))
+
 ## [0.7.2](https://github.com/j2h4u/omi-collector/compare/v0.7.1...v0.7.2) (2026-09-23)
 
 

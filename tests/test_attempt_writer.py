@@ -19,7 +19,7 @@ from omi_collector.capture.adapters.attempt_writer import (
     WriterState,
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
-from omi_collector.config import DEFAULT_CONFIG, WriterConfig
+from omi_collector.config import WriterConfig
 
 
 @dataclass(frozen=True)
@@ -120,8 +120,8 @@ class FakeTarget:
         return "closed"
 
 
-async def _started(target: FakeTarget, source: bytes | bytearray, *, chunk_size: int = RECORD_SIZE) -> AttemptWriter:
-    writer = AttemptWriter(target, source, chunk_size=chunk_size)
+async def _started(target: FakeTarget, source: bytes | bytearray, *, chunk_records: int = 1) -> AttemptWriter:
+    writer = AttemptWriter(target, source, config=WriterConfig(chunk_records=chunk_records))
     await writer.start()
     await writer.read_begin("begin")
     return writer
@@ -131,32 +131,12 @@ def test_arena_is_shared_and_data_waits_for_read_begin() -> None:
     asyncio.run(_test_arena_is_shared_and_data_waits_for_read_begin())
 
 
-def test_writer_defaults_come_from_runtime_config() -> None:
-    writer = AttemptWriter(FakeTarget(), bytearray(RECORD_SIZE))
-    assert writer._max_controls == DEFAULT_CONFIG.writer.max_control_commands
-    assert writer._chunk_size == DEFAULT_CONFIG.writer.chunk_records * RECORD_SIZE
-    asyncio.run(writer.close())
-
-
-def test_writer_config_controls_defaults_and_explicit_overrides() -> None:
+def test_writer_config_controls_writer_settings() -> None:
     config = WriterConfig(chunk_records=2, max_control_commands=3, join_poll_seconds=0.123)
     writer = AttemptWriter(FakeTarget(), bytearray(RECORD_SIZE * 5), config=config)
     assert writer._config is config
-    assert writer._max_controls == 3
-    assert writer._chunk_size == RECORD_SIZE * 2
     assert writer._config.join_poll_seconds == 0.123
     asyncio.run(writer.close())
-
-    overridden = AttemptWriter(
-        FakeTarget(),
-        bytearray(RECORD_SIZE * 5),
-        config=config,
-        max_control_commands=7,
-        chunk_size=RECORD_SIZE * 4,
-    )
-    assert overridden._max_controls == 7
-    assert overridden._chunk_size == RECORD_SIZE * 4
-    asyncio.run(overridden.close())
 
 
 def test_writer_config_controls_control_capacity() -> None:
@@ -201,7 +181,7 @@ def test_writer_config_controls_default_close_timeout() -> None:
 async def _test_arena_is_shared_and_data_waits_for_read_begin() -> None:
     target = FakeTarget()
     arena = bytearray(RECORD_SIZE * 2)
-    writer = AttemptWriter(target, arena, chunk_size=RECORD_SIZE)
+    writer = AttemptWriter(target, arena, config=WriterConfig(chunk_records=1))
     assert writer.state is WriterState.CREATED
     await writer.start()
     assert writer.state is WriterState.STARTED
@@ -224,7 +204,7 @@ def test_submit_read_begin_is_nonblocking_and_orders_data() -> None:
 
 async def _test_submit_read_begin_is_nonblocking_and_orders_data() -> None:
     target = FakeTarget()
-    writer = AttemptWriter(target, bytearray(RECORD_SIZE), chunk_size=RECORD_SIZE)
+    writer = AttemptWriter(target, bytearray(RECORD_SIZE), config=WriterConfig(chunk_records=1))
     await writer.start()
     target.block_read_begin = True
     began = time.monotonic()
@@ -249,7 +229,7 @@ def test_prefix_and_done_seal_are_worker_owned_and_ordered() -> None:
 
 async def _test_prefix_and_done_seal_are_worker_owned_and_ordered() -> None:
     target = FakeTarget()
-    writer = AttemptWriter(target, bytearray(RECORD_SIZE * 2), chunk_size=RECORD_SIZE)
+    writer = AttemptWriter(target, bytearray(RECORD_SIZE * 2), config=WriterConfig(chunk_records=1))
     await writer.start()
     assert await writer.prepare_leg(100, 2) == "prepared"
     await writer.read_begin("begin")
@@ -290,7 +270,7 @@ def test_read_begin_failure_latches_and_forbids_later_controls() -> None:
 
 async def _test_read_begin_failure_latches_and_forbids_later_controls() -> None:
     target = FakeTarget(fail_read_begin=True)
-    writer = AttemptWriter(target, bytearray(RECORD_SIZE), chunk_size=RECORD_SIZE)
+    writer = AttemptWriter(target, bytearray(RECORD_SIZE), config=WriterConfig(chunk_records=1))
     await writer.start()
     future = writer.submit_read_begin("bad")
     with pytest.raises(WriterFailedError, match="target failed"):
@@ -333,12 +313,9 @@ async def _test_publish_is_nonblocking_while_target_append_is_slow() -> None:
     await writer.close()
 
 
-def test_chunk_and_publish_high_water_are_record_aligned() -> None:
-    with pytest.raises(ValueError, match="chunk_size"):
-        AttemptWriter(FakeTarget(), bytearray(RECORD_SIZE), chunk_size=RECORD_SIZE + 1)
-
+def test_publish_high_water_is_record_aligned() -> None:
     async def exercise() -> None:
-        writer = AttemptWriter(FakeTarget(), bytearray(RECORD_SIZE), chunk_size=RECORD_SIZE)
+        writer = AttemptWriter(FakeTarget(), bytearray(RECORD_SIZE), config=WriterConfig(chunk_records=1))
         with pytest.raises(ValueError, match="record-aligned"):
             writer.publish(1)
         await writer.close()
@@ -352,7 +329,7 @@ def test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
 
 async def _test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
     target = FakeTarget()
-    writer = await _started(target, bytearray(RECORD_SIZE * 10), chunk_size=RECORD_SIZE * 3)
+    writer = await _started(target, bytearray(RECORD_SIZE * 10), chunk_records=3)
 
     writer.publish(RECORD_SIZE * 2)
     writer.publish(RECORD_SIZE * 7)
@@ -521,7 +498,7 @@ def test_cancelled_start_remains_admitted_and_second_start_is_idempotent() -> No
 def test_close_after_queued_read_begin_drains_when_worker_reports_success() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_read_begin=True)
-        writer = AttemptWriter(target, bytearray(b"x" * RECORD_SIZE), chunk_size=RECORD_SIZE)
+        writer = AttemptWriter(target, bytearray(b"x" * RECORD_SIZE), config=WriterConfig(chunk_records=1))
         await writer.start()
         read_begin = writer.submit_read_begin("begin")
         assert await asyncio.to_thread(target.read_begin_started.wait, 1)
@@ -557,7 +534,7 @@ def test_failed_submit_read_begin_returns_an_already_failed_future() -> None:
 def test_queue_rejection_does_not_commit_finalizing_state() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_append=True)
-        writer = AttemptWriter(target, bytearray(RECORD_SIZE), max_control_commands=1)
+        writer = AttemptWriter(target, bytearray(RECORD_SIZE), config=WriterConfig(max_control_commands=1))
         await writer.start()
         await writer.read_begin("begin")
         writer.publish(RECORD_SIZE)
@@ -577,7 +554,7 @@ def test_queue_rejection_does_not_commit_finalizing_state() -> None:
 def test_pre_start_publication_waits_for_successful_read_begin() -> None:
     async def exercise() -> None:
         target = FakeTarget()
-        writer = AttemptWriter(target, bytearray(b"x" * RECORD_SIZE), chunk_size=RECORD_SIZE)
+        writer = AttemptWriter(target, bytearray(b"x" * RECORD_SIZE), config=WriterConfig(chunk_records=1))
         assert writer.publish(RECORD_SIZE)
         await writer.start()
         await asyncio.sleep(0)

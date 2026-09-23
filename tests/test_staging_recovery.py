@@ -113,7 +113,8 @@ def _seed_acceptance_clock_state(tmp_path: Path) -> ClockCorrectionStore:
     second_operation = corrections.mark_unresolved(
         corrections.prepare(43, 72, -29.0, _ACCEPTANCE_SECOND_BOUNDARY, operation_id=second_id)
     )
-    initial = corrections.observation_store.native_trusted(
+    initial = corrections.observation_store.append(
+        evidence_kind="native_trusted",
         session_id="restart-session",
         host_boot_id="boot",
         host_realtime_start=43.0,
@@ -126,7 +127,8 @@ def _seed_acceptance_clock_state(tmp_path: Path) -> ClockCorrectionStore:
         operation_id=second_operation.operation_id,
         observation_role="initial",
     )
-    corrections.observation_store.native_trusted(
+    corrections.observation_store.append(
+        evidence_kind="native_trusted",
         session_id="restart-session",
         host_boot_id="boot",
         host_realtime_start=72.0,
@@ -157,7 +159,8 @@ def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_p
     )
     correction_store = ClockCorrectionStore(store.device_state_path)
     correction = correction_store.mark_unresolved(correction_store.prepare(1302, 1002, 300.0, 7717545))
-    initial = correction_store.observation_store.native_trusted(
+    initial = correction_store.observation_store.append(
+        evidence_kind="native_trusted",
         session_id="session",
         host_boot_id="boot",
         host_realtime_start=1000.0,
@@ -170,7 +173,8 @@ def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_p
         operation_id=correction.operation_id,
         observation_role="initial",
     )
-    correction_store.observation_store.native_trusted(
+    correction_store.observation_store.append(
+        evidence_kind="native_trusted",
         session_id="session",
         host_boot_id="boot",
         host_realtime_start=1002.0,

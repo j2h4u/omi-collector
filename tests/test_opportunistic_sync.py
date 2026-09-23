@@ -490,7 +490,7 @@ async def test_coordinator_rejects_observation_store_from_another_correction(
 @_async_test
 async def test_progress_pump_coalesces_slow_callbacks_and_ignores_callback_failures() -> None:
     def event(records: int) -> ProgressEvent:
-        return ProgressEvent(records, 3, records * RECORD_SIZE, 3 * RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), None)
+        return ProgressEvent(records, 3, records * RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), None)
 
     mailbox = ProgressMailbox()
     entered = asyncio.Event()
@@ -535,7 +535,7 @@ async def test_progress_pump_coalesces_slow_callbacks_and_ignores_callback_failu
 @_async_test
 async def test_progress_pump_coalesces_arbitrary_revisions_before_cadence_release() -> None:
     def event(records: int) -> ProgressEvent:
-        return ProgressEvent(records, 3, records * RECORD_SIZE, 3 * RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), None)
+        return ProgressEvent(records, 3, records * RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), None)
 
     class SequencedMailbox(ProgressMailbox):
         def __init__(self) -> None:

@@ -351,7 +351,7 @@ def test_sync_uses_one_guard_and_transport_and_forwards_end_to_end_progress(
             assert connected is session
         progress = options.progress
         await cast(Callable[[ProgressEvent], Coroutine[object, object, object]], progress)(
-            ProgressEvent(1, 1, RECORD_SIZE, RECORD_SIZE, 0.0, 0.0, 0.0, None)
+            ProgressEvent(1, 1, RECORD_SIZE, 0.0, 0.0, 0.0, None)
         )
         return expected
 

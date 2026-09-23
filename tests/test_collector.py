@@ -25,6 +25,7 @@ from omi_collector.capture.domain.ring_protocol import (
     encode_stop_command,
 )
 from omi_collector.capture.domain.transfer_arena import TransferArena
+from omi_collector.config import WriterConfig
 
 
 def _record(value: int) -> bytes:
@@ -397,8 +398,6 @@ def test_read_leg_done_validates_current_continuation_leg() -> None:
         assert result.received_bytes == RECORD_SIZE
         assert result.submitted_bytes == RECORD_SIZE
         assert result.written_bytes == RECORD_SIZE
-        assert result.records_replayed == 0
-        assert result.records_appended == 1
         assert arena.received_bytes == 2 * RECORD_SIZE
         assert result.next_sequence == 12
         assert result.progress is not None
@@ -420,10 +419,9 @@ def test_replayed_read_reports_zero_watermark_delta_and_marks_replay() -> None:
         replay_session = BurstSession((_begin(10, 1), _data(record), _done(11)), start=10, count=1)
         replay = await read_leg(replay_session, arena, writer, 10, 1, ReadLegOptions(1))
 
-        assert replay.records_replayed == 1
-        assert replay.records_appended == 0
         assert replay.counters == TransferCounters(0, 0, 0)
         assert arena.received_bytes == RECORD_SIZE
+        assert not any(call.startswith("publish:") for call in writer.calls[4:])
 
     asyncio.run(scenario())
 
@@ -466,7 +464,7 @@ def test_real_attempt_writer_stall_does_not_stop_ble_ingest() -> None:
         session = BurstSession(notifications)
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
         target = BlockingWriterTarget()
-        writer = AttemptWriter(target, arena.readonly_source(), chunk_size=RECORD_SIZE)
+        writer = AttemptWriter(target, arena.readonly_source(), config=WriterConfig(chunk_records=1))
         heartbeat = 0
 
         async def tick() -> None:

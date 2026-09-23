@@ -28,16 +28,23 @@ def _values() -> dict[str, object]:
 
 def test_observation_store_is_causal_and_immutable(tmp_path: Path) -> None:
     store = ClockObservationStore(tmp_path / "device.json")
-    first = store.native_trusted(**_values())
-    second = store.native_trusted(
-        **{**_values(), "device_epoch": 1789749501, "info_sequence_min": 12, "info_sequence_max": 14}
+    first = store.append(evidence_kind="native_trusted", **_values())
+    second = store.append(
+        evidence_kind="native_trusted",
+        **{**_values(), "device_epoch": 1789749501, "info_sequence_min": 12, "info_sequence_max": 14},
+    )
+    established = store.append(
+        evidence_kind="native_trusted",
+        operation_id="op-a",
+        effective_boundary_sequence=11,
+        **_values(),
     )
 
-    assert [item.causal_order for item in store.records()] == [0, 1]
-    assert store.for_operation("missing") == ()
-    established = store.establish_effective_boundary(first, 11, operation_id="op-a")
+    assert [item.causal_order for item in store.records()] == [0, 1, 2]
     assert established.effective_boundary_sequence == 11
     assert established.causal_order == 2
+    assert established.parent_observation_id == first.observation_id
+    assert established.observation_role == "initial"
     assert store.records()[0].effective_boundary_sequence is None
     assert second.causal_order == 1
 
@@ -62,7 +69,7 @@ def test_store_rejects_untrusted_or_invalid_evidence(tmp_path: Path, field: str,
 
 def test_store_rejects_noncanonical_or_gapped_ledger(tmp_path: Path) -> None:
     store = ClockObservationStore(tmp_path / "device.json")
-    item = store.native_trusted(**_values())
+    item = store.append(evidence_kind="native_trusted", **_values())
     path = tmp_path / "clock-observations" / f"{item.observation_id}.json"
     document = json.loads(path.read_text())
     document["causal_order"] = 2

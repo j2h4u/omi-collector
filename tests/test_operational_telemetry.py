@@ -802,9 +802,12 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     _clock_bundle(capture_root, 7_192_026, 43)
     _clock_bundle(capture_root, 7_763_451, 72)
     (tmp_path / "timeline-repairs.json").write_text(json.dumps({"version": 1, "repairs": []}), encoding="utf-8")
+    published = tmp_path / "published"
+    published.mkdir(mode=0o2750)
+    published.chmod(0o2750)
     staging = StagingStore.from_paths(
         StagingStore(tmp_path, capture_root).paths,
-        publication_root=tmp_path / "published",
+        publication_root=published,
     )
     authority = staging.create_publication_authority()
     session = FakeOperationalSession(

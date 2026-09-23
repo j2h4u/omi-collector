@@ -5,6 +5,7 @@ from __future__ import annotations
 from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
+from stat import S_IMODE, S_ISGID
 from typing import cast
 
 import pytest
@@ -20,6 +21,9 @@ def _record(timestamp: int, marker: int) -> bytes:
 
 
 def _draft(root: Path, timestamps: tuple[int, ...], *, start_sequence: int = 10, marker_start: int = 1) -> Path:
+    ready = root.parent / "ready"
+    ready.mkdir(mode=0o2750, exist_ok=True)
+    ready.chmod(0o2750)
     raw = b"".join(_record(timestamp, marker_start + index) for index, timestamp in enumerate(timestamps))
     digest = sha256(raw).hexdigest()
     path = root / f"{start_sequence}-{start_sequence + len(timestamps)}-{digest[:16]}"
@@ -96,6 +100,16 @@ def test_finalization_rewrites_only_confirmed_timestamp_ranges(tmp_path: Path) -
         {"start_sequence": 12, "next_sequence": 13, "utc": None},
     ]
     assert not draft.exists()
+
+
+def test_finalization_refuses_ready_root_without_group_traversal(tmp_path: Path) -> None:
+    _draft(tmp_path / "draft", (100,))
+    (tmp_path / "ready").chmod(0o750)
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="not group-readable and setgid"):
+        ready_bundles.finalize_drafts(
+            tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(())
+        )
 
 
 def test_existing_ready_bundle_completes_crash_replay_before_draft_cleanup(
@@ -376,3 +390,27 @@ def test_checkpoint_without_ack_does_not_delete_ready_bundle(tmp_path: Path) -> 
 
     assert ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint) == ()
     assert published.path.exists()
+
+
+def test_ready_output_preserves_setgid_parent_without_setting_it_at_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _draft(tmp_path / "draft", (100,))
+    ready_root = tmp_path / "ready"
+    ready_root.chmod(0o2750)
+    chmod = Path.chmod
+
+    def restricted_chmod(path: Path, mode: int, *args: object, **kwargs: object) -> None:
+        if mode & S_ISGID:
+            raise PermissionError("runtime cannot set setgid")
+        chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", restricted_chmod)
+
+    published = ready_bundles.finalize_drafts(
+        tmp_path / "draft", ready_root, tmp_path / "ledger.json", ClockSegmentMap(())
+    )[0]
+
+    assert S_IMODE(ready_root.stat().st_mode) == 0o2750
+    assert S_IMODE(published.path.stat().st_mode) == 0o2750
+    assert all(S_IMODE(path.stat().st_mode) == 0o640 for path in published.path.iterdir())

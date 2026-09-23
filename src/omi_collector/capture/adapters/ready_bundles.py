@@ -6,6 +6,7 @@ import json
 import math
 import os
 import shutil
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -88,6 +89,7 @@ def finalize_drafts(
     """
     _prepare_directory(draft_root)
     _prepare_directory(ready_root)
+    _require_shared_ready_directory(ready_root)
     ledger = _read_ledger(ledger_path)
     results: list[ReadyBundleResult] = []
     finalization = _Finalization(ready_root, ledger_path, ledger, clock_segments)
@@ -363,6 +365,7 @@ def _write_ready(
     temporary = destination.parent / f".{destination.name}.{uuid4().hex}.tmp"
     temporary.mkdir(mode=_READY_DIRECTORY_MODE)
     try:
+        _require_shared_ready_directory(temporary)
         digest = _write_records(draft.path / _RAW_NAME, temporary / _RAW_NAME, source, ranges)
         manifest = _ready_manifest(source.manifest, digest, ranges)
         _write_file(temporary / _MANIFEST_NAME, _canonical(manifest))
@@ -404,6 +407,7 @@ def _write_records(
             digest.update(converted)
         output_stream.flush()
         os.fsync(output_stream.fileno())
+    destination.chmod(_READY_FILE_MODE)
     return digest.hexdigest()
 
 
@@ -814,6 +818,13 @@ def _prepare_directory(path: Path) -> None:
     path.mkdir(mode=_READY_DIRECTORY_MODE, parents=True, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
         raise ReadyBundleError("ready storage root is unsafe")
+
+
+def _require_shared_ready_directory(path: Path) -> None:
+    mode = path.stat().st_mode
+    required = stat.S_ISGID | stat.S_IRGRP | stat.S_IXGRP
+    if mode & required != required:
+        raise ReadyBundleError("ready directory is not group-readable and setgid")
 
 
 def _write_file(path: Path, payload: bytes) -> None:

@@ -18,7 +18,10 @@ def _store(tmp_path: Path) -> StagingStore:
     capture_root = tmp_path / "draft"
     capture_root.mkdir()
     bootstrap = StagingStore(tmp_path / "spool", capture_root)
-    return StagingStore.from_paths(bootstrap.paths, publication_root=tmp_path / "ready")
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    return StagingStore.from_paths(bootstrap.paths, publication_root=ready)
 
 
 def _record(value: int) -> bytes:

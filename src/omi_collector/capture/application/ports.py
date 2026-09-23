@@ -145,6 +145,12 @@ class ClockObservationPort(Protocol):
     def records(self) -> tuple[ClockObservationShape, ...]: ...
 
 
+class ClockMembershipPort(Protocol):
+    def record_membership(
+        self, observation_id: str, session_id: str, start_sequence: int, next_sequence: int
+    ) -> None: ...
+
+
 class ClockCorrectionPort(Protocol):
     """Durable clock-intent and reconciliation ledger."""
 
@@ -221,7 +227,7 @@ class StagingWriterTargetPort(Protocol):
 
     def publish_prefix(self) -> SealResultShape | None: ...
 
-    def publish_timeline(self) -> object | None: ...
+    def publish_ready(self) -> object | None: ...
 
     def close(self) -> None: ...
 
@@ -284,7 +290,7 @@ class ObservationWriterPort(Protocol):
 
 
 class PublicationAuthorityPort(Protocol):
-    """One lifecycle-bound authority to project captured bundles into ``source/current``.
+    """One lifecycle-bound authority to finalize draft bundles into ready bundles.
 
     Ownership is explicit throughout one collector run.  Before transport, the
     coordinator holds this authority; while a writer owns the active device
@@ -309,6 +315,9 @@ class StagingPort(Protocol):
 
     @property
     def device_state_path(self) -> Path: ...
+
+    @property
+    def clock_membership_store(self) -> ClockMembershipPort: ...
 
     @property
     def paths(self) -> object: ...

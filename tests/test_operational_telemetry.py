@@ -19,9 +19,9 @@ import omi_collector.capture.application.operational_telemetry as operational_te
 from fakes import ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+from omi_collector.capture.adapters.clock_memberships import ClockMembershipStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_store import StagingStore
-from omi_collector.capture.adapters.timeline_generations import GenerationResult
 from omi_collector.capture.application.collector import TransferTimeouts
 from omi_collector.capture.application.operational_telemetry import (
     BATTERY_UUID,
@@ -338,6 +338,72 @@ def test_healthy_clock_visit_persists_observation(tmp_path: Path) -> None:
     assert events[-1]["outcome"] == "within_threshold"
 
 
+def test_healthy_clock_visit_confirms_only_a_same_session_info_interval(tmp_path: Path) -> None:
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1000)})
+    events: list[dict[str, object]] = []
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    memberships = ClockMembershipStore(tmp_path / "device.json")
+    ticks = iter((1000.0,) * 8)
+
+    async def later_info() -> RingInfo:
+        return RingInfo(100, 110, 100, 2, RECORD_SIZE)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            RingInfo(90, 100, 100, 2, RECORD_SIZE),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=later_info,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+                membership_store=memberships,
+                session_id="healthy-session",
+            ),
+        )
+    )
+
+    segments = memberships.segments(store.observation_store.records())
+    assert segments.utc_for(100, 1000) == 1000.0
+    assert segments.utc_for(110, 1000) is None
+    assert events[-1]["outcome"] == "within_threshold"
+
+
+def test_disconnected_clock_visit_does_not_extend_membership(tmp_path: Path) -> None:
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1000)})
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    memberships = ClockMembershipStore(tmp_path / "device.json")
+    ticks = iter((1000.0,) * 8)
+
+    async def disconnected_info() -> RingInfo:
+        raise OSError("BLE disconnected")
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            RingInfo(90, 100, 100, 2, RECORD_SIZE),
+            _event_emitter([]),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=disconnected_info,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+                membership_store=memberships,
+                session_id="disconnected-session",
+            ),
+        )
+    )
+
+    assert memberships.records() == ()
+
+
 def test_unsynchronized_host_does_not_reconcile_near_zero_observation() -> None:
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
     events: list[dict[str, object]] = []
@@ -399,6 +465,83 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
     assert events[-1]["target_epoch"] == 1000
     assert events[-1]["boundary_sequence_min"] == 12
     assert events[-1]["boundary_sequence_max"] == 14
+
+
+def test_clock_write_confirms_post_readback_same_session_interval(tmp_path: Path) -> None:
+    session = FakeOperationalSession(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 43)},
+        readback=pack("<I", 72),
+    )
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    memberships = ClockMembershipStore(tmp_path / "device.json")
+    ticks = iter((72.0,) * 12)
+    infos = iter((RingInfo(90, 100, 100, 2, RECORD_SIZE), RingInfo(100, 110, 100, 2, RECORD_SIZE)))
+
+    async def next_info() -> RingInfo:
+        return next(infos)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            RingInfo(80, 90, 100, 2, RECORD_SIZE),
+            _event_emitter([]),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=next_info,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+                membership_store=memberships,
+                session_id="written-session",
+            ),
+        )
+    )
+
+    segments = memberships.segments(store.observation_store.records())
+    assert segments.utc_for(100, 72) == 72.0
+    assert segments.utc_for(110, 72) is None
+
+
+def test_timed_out_post_write_readback_does_not_record_membership(tmp_path: Path) -> None:
+    class DelayedReadback(FakeOperationalSession):
+        async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+            if uuid == TIME_READ_UUID and self.writes:
+                await asyncio.sleep(0.02)
+            return await super().read_optional_characteristic(uuid)
+
+    session = DelayedReadback(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 43)},
+        readback=pack("<I", 72),
+    )
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    memberships = ClockMembershipStore(tmp_path / "device.json")
+    ticks = iter((72.0,) * 12)
+
+    async def later_info() -> RingInfo:
+        return RingInfo(90, 100, 100, 2, RECORD_SIZE)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            RingInfo(80, 90, 100, 2, RECORD_SIZE),
+            _event_emitter([]),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.01,
+                info_reader=later_info,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+                membership_store=memberships,
+            ),
+        )
+    )
+
+    assert session.writes == [(TIME_WRITE_UUID, pack("<I", 72))]
+    assert memberships.records() == ()
 
 
 def test_clock_mutation_lease_guards_durable_sync_writes() -> None:
@@ -664,7 +807,6 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
         publication_root=tmp_path / "published",
     )
     authority = staging.create_publication_authority()
-    before_raw = {path.name: (path / "records.bin").read_bytes() for path in capture_root.iterdir() if path.is_dir()}
     session = FakeOperationalSession(
         {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 43)},
         readback=pack("<I", 72),
@@ -704,7 +846,7 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     assert corrections[0].target_epoch == 72
     assert corrections[0].boundary_sequence_min == 7_717_545
     assert corrections[0].boundary_sequence_max == 7_763_451
-    assert corrections[0].state == "resolved"
+    assert corrections[0].state == "applied"
     observations = durable_store.observation_store.records()
     initial = next(item for item in observations if item.observation_role == "initial")
     later = next(item for item in observations if item.observation_role == "later")
@@ -712,16 +854,12 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     assert later.device_epoch == 72
     assert later.parent_observation_id == initial.observation_id
 
-    generation = staging.recover_and_publish()
-
-    assert isinstance(generation, GenerationResult)
-    assert generation.bundle_count == 2
-    assert generation.record_count == 2
-    assert (tmp_path / "published" / "current").is_symlink()
-    assert {
-        path.name: (path / "records.bin").read_bytes() for path in capture_root.iterdir() if path.is_dir()
-    } == before_raw
-    assert ClockCorrectionStore(staging.device_state_path).records()[0].state == "resolved"
+    assert staging.recover_and_publish() is None
+    ready = tuple(path for path in (tmp_path / "published").iterdir() if path.is_dir())
+    assert len(ready) == 2
+    assert tuple(capture_root.iterdir()) == ()
+    assert all(json.loads((path / "manifest.json").read_text(encoding="utf-8"))["time_ranges"] for path in ready)
+    assert ClockCorrectionStore(staging.device_state_path).records()[0].state == "applied"
     authority.close()
 
 

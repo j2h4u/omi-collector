@@ -116,13 +116,14 @@ class QuarantineMaintenance:
         backoff = self._config.retry.rapid_backoff
         for attempt in range(len(backoff) + 1):
             try:
-                await asyncio.to_thread(self._staging.recover_and_publish)
+                published = await asyncio.to_thread(self._staging.recover_and_publish)
                 self._publication_retry_number = 0
                 self._publication_retry_not_before = 0.0
-                self._runtime.debug_event("timeline_generation_published")
+                if published is not None:
+                    self._runtime.debug_event("ready_publication_published")
                 return True
             except Exception as error:  # noqa: BLE001 - publication cannot block capture
-                self._runtime.debug_exception("timeline_generation_blocked", error, attempt=attempt + 1)
+                self._runtime.debug_exception("ready_publication_blocked", error, attempt=attempt + 1)
                 if attempt >= len(backoff):
                     retry = backoff[-1] if backoff else 1.0
                     self._publication_retry_not_before = monotonic() + retry

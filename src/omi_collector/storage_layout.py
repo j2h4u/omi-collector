@@ -41,11 +41,9 @@ class CollectorLayout:
 
 @dataclass(frozen=True, slots=True)
 class PublicationLayout:
-    """Normalized audio generations exposed to downstream processing."""
+    """Immutable ready bundles exposed to downstream processing."""
 
     root: Path
-    generations: Path
-    current: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +52,7 @@ class StorageLayout:
 
     root: Path
     collector: CollectorLayout
-    captured: Path
+    draft: Path
     publication: PublicationLayout
 
 
@@ -86,7 +84,7 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
     if os.path.lexists(root) and root.is_symlink():
         raise StorageLayoutError("config parent must not be a symlink")
     collector_root = root / "collector"
-    publication_root = root / "source"
+    publication_root = root / "ready"
     layout = StorageLayout(
         root=root,
         collector=CollectorLayout(
@@ -97,12 +95,8 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
             device_state=collector_root / "device.json",
             debug_log=collector_root / "debug.jsonl",
         ),
-        captured=root / "captured",
-        publication=PublicationLayout(
-            root=publication_root,
-            generations=publication_root / ".generations",
-            current=publication_root / "current",
-        ),
+        draft=root / "draft",
+        publication=PublicationLayout(root=publication_root),
     )
     runtime_config = CollectorConfig()
     if "presence" in document:

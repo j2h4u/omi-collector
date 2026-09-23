@@ -257,13 +257,13 @@ class StagingWriter:
         self._sealed = True
         return result
 
-    def publish_timeline(self) -> object | None:
+    def publish_ready(self) -> object | None:
         """Project sealed capture using this writer's already-held device lease."""
-        self._enter("publish_timeline")
+        self._enter("publish_ready")
         self._require_prepared()
         self._require_lease()
         assert self._lease is not None
-        return self._store.publish_timeline(self._lease)
+        return self._store.publish_ready(self._lease)
 
     def publish_prefix(self) -> SealResult | None:
         """Publish the checkpoint-authenticated prefix through staging."""

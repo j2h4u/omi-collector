@@ -25,10 +25,8 @@ from omi_collector.capture.adapters.bundle_contract import BundleManifest, Seale
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.staging_contract import AttemptStateError, DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
-from omi_collector.capture.adapters.timeline_generations import GenerationResult, build_generation
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 from omi_collector.config import CollectorConfig, StagingRetentionConfig
-from omi_collector.spool_metrics import collect_spool_metrics
 
 _CAPTURE_ROOTS: set[Path] = set()
 _ACCEPTANCE_FIRST_BOUNDARY = 7_192_026
@@ -195,44 +193,34 @@ def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_p
     assert tuple(store.capture_root.iterdir()) == ()
 
 
-def test_restart_hands_43_published_to_72_captured_bundles_without_ble(tmp_path: Path) -> None:
-    captured = _capture_root(tmp_path)
+def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
+    drafts = _capture_root(tmp_path)
     published = tmp_path / "published"
     sequences = _acceptance_sequences()
     for sequence in sequences:
-        _one_record_bundle(captured, sequence, 43 if sequence < _ACCEPTANCE_SECOND_BOUNDARY else 72)
-    old_generation = build_generation(captured, published, (), max_sequence=sequences[43])
-    assert old_generation.bundle_count == 43
-    raw_before = _bundle_bytes(captured)
+        _one_record_bundle(drafts, sequence, 43 if sequence < _ACCEPTANCE_SECOND_BOUNDARY else 72)
     corrections = _seed_acceptance_clock_state(tmp_path)
     store = StagingStore.from_paths(
-        StagingStore(tmp_path, captured).paths,
+        StagingStore(tmp_path, drafts).paths,
         publication_root=published,
     )
 
     result = store.recover_and_publish()
 
-    assert isinstance(result, GenerationResult)
-    assert result.bundle_count == 72
-    assert result.record_count == 72
-    assert (published / "current").resolve() == result.path
-    current_bundles = tuple(
-        path for path in (published / "current").iterdir() if path.is_dir() and (path / "manifest.json").is_file()
-    )
-    assert len(current_bundles) == 72
-    assert _bundle_bytes(captured) == raw_before
+    assert len(cast(tuple[object, ...], result)) == 72
+    ready_bundles = tuple(path for path in published.iterdir() if path.is_dir() and (path / "manifest.json").is_file())
+    assert len(ready_bundles) == 72
+    assert tuple(drafts.iterdir()) == ()
     assert sorted(item.boundary_sequence_min for item in corrections.records()) == [
         _ACCEPTANCE_FIRST_BOUNDARY,
         _ACCEPTANCE_SECOND_BOUNDARY,
     ]
-    assert all(item.state == "resolved" for item in corrections.records())
+    assert [item.state for item in corrections.records()] == ["applied", "applied"]
     later = next(item for item in corrections.observation_store.records() if item.observation_role == "later")
     assert later.info_sequence_max == _ACCEPTANCE_FRONTIER
-    assert loads((published / "current" / "generation.json").read_text(encoding="utf-8"))["record_count"] == 72
+    assert all(loads((bundle / "manifest.json").read_text(encoding="utf-8"))["time_ranges"] for bundle in ready_bundles)
     second_result = store.recover_and_publish()
-    assert isinstance(second_result, GenerationResult)
-    assert second_result.generation_id == result.generation_id
-    assert collect_spool_metrics(published).current_window.bundle_count == 72
+    assert second_result is None
 
 
 def _publication_store(tmp_path: Path) -> StagingStore:

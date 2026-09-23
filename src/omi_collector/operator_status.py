@@ -245,7 +245,7 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
     connection_rssi: tuple[datetime, int] | None = None
     attention: dict[str, bool] = {
         "quality_metrics_unavailable": False,
-        "timeline_publication_blocked": False,
+        "ready_publication_blocked": False,
         "clock_correction_blocked": False,
     }
     if _path_exists(path, "debug journal"):
@@ -318,10 +318,10 @@ def _update_runtime_attention(attention: dict[str, bool], row: dict[str, object]
         attention["quality_metrics_unavailable"] = True
     elif event == "quality_metrics_ready":
         attention["quality_metrics_unavailable"] = False
-    elif event == "timeline_generation_blocked":
-        attention["timeline_publication_blocked"] = True
-    elif event == "timeline_generation_published":
-        attention["timeline_publication_blocked"] = False
+    elif event == "ready_publication_blocked":
+        attention["ready_publication_blocked"] = True
+    elif event == "ready_publication_published":
+        attention["ready_publication_blocked"] = False
     if event != "sync_progress":
         return
     fields = row.get("fields")

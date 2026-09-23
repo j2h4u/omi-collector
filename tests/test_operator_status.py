@@ -167,7 +167,7 @@ def test_status_marks_persistent_runtime_failures_for_attention(
     layout = _layout(tmp_path)
     rows = (
         {"event": "quality_metrics_configuration_error", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
-        {"event": "timeline_generation_blocked", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
+        {"event": "ready_publication_blocked", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
         {
             "event": "sync_progress",
             "fields": {
@@ -190,17 +190,17 @@ def test_status_marks_persistent_runtime_failures_for_attention(
     assert runtime["attention_reasons"] == [
         "clock_correction_blocked",
         "quality_metrics_unavailable",
-        "timeline_publication_blocked",
+        "ready_publication_blocked",
     ]
 
 
-def test_status_clears_timeline_publication_block_after_successful_generation(
+def test_status_clears_ready_publication_block_after_successful_finalization(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
     rows = (
-        {"event": "timeline_generation_blocked", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
-        {"event": "timeline_generation_published", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
+        {"event": "ready_publication_blocked", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
+        {"event": "ready_publication_published", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
     )
     layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())

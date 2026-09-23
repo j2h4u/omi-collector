@@ -130,7 +130,7 @@ def _staging(operator_config: OperatorConfig) -> StagingStore:
     return StagingStore.from_paths(
         StagingPaths(
             layout.collector.root,
-            layout.captured,
+            layout.draft,
             layout.collector.attempts,
             layout.collector.quarantine,
             layout.collector.lock,

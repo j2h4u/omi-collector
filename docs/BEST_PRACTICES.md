@@ -75,7 +75,7 @@ sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
 The configuration is strict and contains `[pendant] address` plus the optional
 `[presence]` pair `arrival_stability_seconds` and `arrival_max_gap_seconds`.
 Its fixed parent `/srv/pipelines/omi` is the storage root; `collector`,
-`captured`, and `source` are derived beneath it. The base unit grants the
+`draft`, and `ready` are derived beneath it. The base unit grants the
 service write access to that root. Use filesystem ownership or ACLs on the
 derived directories when a downstream account also needs access.
 

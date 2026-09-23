@@ -17,6 +17,8 @@ from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from . import publication, quarantine
 from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionStore
+from .clock_memberships import ClockMembershipStore
+from .ready_bundles import finalize_drafts
 from .recovery import Recovery
 from .staging_contract import (
     _DESCRIPTOR_NAME,
@@ -114,19 +116,19 @@ class StagingStore:
         store._publication_lock = Lock()
         return store
 
-    def publish_timeline(self, held_lease: DeviceLock | None = None) -> object | None:
+    def publish_ready(self, held_lease: DeviceLock | None = None) -> object | None:
         """Publish a complete normalized view when this store has an external boundary."""
         if not self._publication_lock.acquire(blocking=False):
-            raise AttemptStateError("timeline publication is already active")
+            raise AttemptStateError("ready publication is already active")
         try:
-            return self._publish_timeline(held_lease)
+            return self._publish_ready(held_lease)
         finally:
             self._publication_lock.release()
 
-    def _publish_timeline(self, held_lease: DeviceLock | None) -> object | None:
+    def _publish_ready(self, held_lease: DeviceLock | None) -> object | None:
         if self._publication_root is None:
             return None
-        if not self._has_captured_bundles():
+        if not self._has_draft_bundles():
             return None
         if held_lease is None:
             with self.device_lock(recover_capture_temporaries=False):
@@ -147,15 +149,15 @@ class StagingStore:
     def _publish_with_authority(self, authority: _PublicationAuthority) -> object | None:
         """Publish under an issued capability, never under task-local identity."""
         if not self._publication_lock.acquire(blocking=False):
-            raise AttemptStateError("timeline publication is already active")
+            raise AttemptStateError("ready publication is already active")
         try:
             if authority is not self._publication_authority:
                 raise AttemptStateError("publication authority is revoked or was not issued by this store")
             try:
                 lease = self._publication_authority_lease
                 if lease is not None and lease._matches(self._filesystem):
-                    return self._publish_timeline(lease)
-                return self._publish_timeline(None)
+                    return self._publish_ready(lease)
+                return self._publish_ready(None)
             except Exception:
                 authority.schedule_retry()
                 raise
@@ -192,13 +194,17 @@ class StagingStore:
         corrections.reconcile_recovered_observations(
             near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
         )
-        if not self._has_captured_bundles():
+        if not self._has_draft_bundles():
             return None
-        from .timeline_generations import publish_from_ledger
+        segments = ClockMembershipStore(self.device_state_path).segments(corrections.observation_store.records())
+        return finalize_drafts(
+            self.capture_root,
+            publication_root,
+            self.device_state_path.parent / "ready-publications.json",
+            segments,
+        )
 
-        return publish_from_ledger(self.capture_root, publication_root, self.device_state_path.parent)
-
-    def _has_captured_bundles(self) -> bool:
+    def _has_draft_bundles(self) -> bool:
         try:
             return any(self.capture_root.iterdir())
         except FileNotFoundError:
@@ -234,6 +240,10 @@ class StagingStore:
     @property
     def device_state_path(self) -> Path:
         return self._filesystem.device_state_path
+
+    @property
+    def clock_membership_store(self) -> ClockMembershipStore:
+        return ClockMembershipStore(self.device_state_path)
 
     @property
     def paths(self) -> StagingPaths:

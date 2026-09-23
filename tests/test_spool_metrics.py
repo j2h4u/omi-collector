@@ -37,15 +37,6 @@ def _record(timestamp: int) -> bytes:
     return timestamp.to_bytes(4, "big") + bytes(payload)
 
 
-def _generation(publication_root: Path) -> Path:
-    generation = publication_root / ".generations" / "generation"
-    generation.mkdir(parents=True)
-    current = publication_root / "current"
-    if not current.is_symlink():
-        current.symlink_to(Path(".generations/generation"))
-    return generation
-
-
 def _bundle(
     root: Path,
     name: str,
@@ -58,21 +49,23 @@ def _bundle(
     raw = b"".join(records)
     raw_hash = hashlib.sha256(raw).hexdigest()
     (path / "records.bin").write_bytes(raw)
+    end = start + len(records)
+    bundle_id = hashlib.sha256(f"{start}:{end}:{raw_hash}".encode()).hexdigest()
     (path / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "bundle_id": bundle_id,
                 "start_sequence": start,
-                "next_sequence": start + len(records),
+                "next_sequence": end,
                 "record_count": len(records),
                 "record_size": RECORD_SIZE,
-                "raw_sha256": raw_hash,
+                "records_sha256": raw_hash,
+                "draft_raw_sha256": raw_hash,
+                "time_ranges": [{"start_sequence": start, "next_sequence": end, "utc": None}],
             }
         ),
         encoding="utf-8",
     )
-    receipt = {"attempt_id": "a" * 32, "raw_sha256": raw_hash, "status": "sealed"}
-    (path / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
     return path
 
 
@@ -99,18 +92,16 @@ def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.parametrize("kind", ["completion", "boolean_record_count"])
+@pytest.mark.parametrize("kind", ["unexpected_field", "boolean_record_count"])
 def test_metrics_rejects_noncanonical_bundle_evidence(tmp_path: Path, kind: str) -> None:
-    device_root = _generation(tmp_path)
+    device_root = tmp_path
     bundle = _bundle(device_root, "100-101", (_record(1),))
-    if kind == "completion":
-        receipt = cast(dict[str, object], json.loads((bundle / "receipt.json").read_text(encoding="utf-8")))
-        receipt["completion"] = "done"
-        (bundle / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+    manifest = cast(dict[str, object], json.loads((bundle / "manifest.json").read_text(encoding="utf-8")))
+    if kind == "unexpected_field":
+        manifest["obsolete"] = True
     else:
-        manifest = cast(dict[str, object], json.loads((bundle / "manifest.json").read_text(encoding="utf-8")))
         manifest["record_count"] = True
-        (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SpoolMetricsError):
         collect_spool_metrics(tmp_path)
@@ -131,33 +122,28 @@ def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path
     assert result.firmware_lifetime.latest == 9
 
 
-def test_published_generation_link_is_a_valid_device_spool(tmp_path: Path) -> None:
-    generation = tmp_path / ".generations/generation"
-    generation.mkdir(parents=True)
-    _bundle(generation, "10-12-a", (_record(1000), _record(1001)))
-    (generation / "generation.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "current").symlink_to(Path(".generations/generation"))
+def test_ready_bundle_is_a_valid_device_spool(tmp_path: Path) -> None:
+    _bundle(tmp_path, "10-12-a", (_record(1000), _record(1001)))
 
     result = collect_spool_metrics(tmp_path)
 
     assert result.current_window.bundle_count == 1
 
 
-def test_published_generation_link_cannot_escape_authority(tmp_path: Path) -> None:
+def test_ready_bundle_symlink_is_not_counted(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
-    (tmp_path / ".generations").mkdir(parents=True)
-    (tmp_path / "current").symlink_to(Path("outside"))
+    (tmp_path / "bundle").symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(SpoolMetricsError, match="authority"):
-        collect_spool_metrics(tmp_path)
+    assert collect_spool_metrics(tmp_path).current_window.bundle_count == 0
 
 
 def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path) -> None:
-    _generation(tmp_path)
     _firmware_observations(tmp_path, (4, 9, 12))
+    ready_root = tmp_path / "ready"
+    ready_root.mkdir()
 
-    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(ready_root, observation_root=tmp_path / "device.json")
 
     assert result.firmware_lifetime.observation_count == 3
     assert result.firmware_lifetime.initial == 4
@@ -171,10 +157,11 @@ def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path)
 
 
 def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
-    _generation(tmp_path)
     _firmware_observations(tmp_path, (4, 9, 3, 8, 2))
+    ready_root = tmp_path / "ready"
+    ready_root.mkdir()
 
-    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(ready_root, observation_root=tmp_path / "device.json")
 
     assert result.firmware_lifetime.observation_count == 5
     assert result.firmware_lifetime.initial == 4
@@ -186,7 +173,6 @@ def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
 
 
 def test_malformed_firmware_observation_chain_fails_closed(tmp_path: Path) -> None:
-    _generation(tmp_path)
     _firmware_observations(tmp_path, (4, 9))
     state = tmp_path / "device.json"
     state.write_text(state.read_text(encoding="utf-8") + "\n", encoding="utf-8")
@@ -196,7 +182,7 @@ def test_malformed_firmware_observation_chain_fails_closed(tmp_path: Path) -> No
 
 
 def test_sequence_discontinuity_is_aggregated_between_real_bundles(tmp_path: Path) -> None:
-    device = _generation(tmp_path)
+    device = tmp_path
     _bundle(device, "first", (_record(1), _record(2)))
     _bundle(device, "second", (_record(4), _record(5)), start=13)
 
@@ -208,7 +194,7 @@ def test_sequence_discontinuity_is_aggregated_between_real_bundles(tmp_path: Pat
 
 
 def test_conflicting_overlapping_ranges_fail_closed(tmp_path: Path) -> None:
-    device = _generation(tmp_path)
+    device = tmp_path
     _bundle(device, "first", (_record(1), _record(2)))
     _bundle(device, "overlap", (_record(3), _record(4)), start=11)
 
@@ -220,7 +206,7 @@ def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    device = _generation(tmp_path)
+    device = tmp_path
     _bundle(device, "first", (_record(1), _record(2)))
     original_read_bytes = Path.read_bytes
 
@@ -237,7 +223,7 @@ def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
 
 
 def test_partial_and_symlink_artifacts_are_not_counted(tmp_path: Path) -> None:
-    device = _generation(tmp_path)
+    device = tmp_path
     (device / "attempts").mkdir()
     target = device / ".real"
     target.mkdir()

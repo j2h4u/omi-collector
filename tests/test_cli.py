@@ -53,10 +53,10 @@ def test_health_command_reports_ok() -> None:
     assert result.output.strip() == "ok"
 
 
-def test_staging_keeps_capture_inside_collector_state(tmp_path: Path) -> None:
+def test_staging_keeps_raw_drafts_inside_collector_state(tmp_path: Path) -> None:
     store = cli._staging(load_operator_config(_layout(tmp_path)))
 
-    assert store.paths.capture_root == tmp_path / "captured"
+    assert store.paths.capture_root == tmp_path / "draft"
 
 
 def test_config_check_reports_canonical_path(tmp_path: Path) -> None:

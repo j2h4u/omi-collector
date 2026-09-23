@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.18](https://github.com/j2h4u/omi-collector/compare/v0.6.17...v0.6.18) (2026-09-23)
+
+
+### Fixes
+
+* **clock:** keep healthy observations ephemeral ([5b64a9d](https://github.com/j2h4u/omi-collector/commit/5b64a9d9d0fd52c97d2bae8b472c98d699d5f134))
+* restore pendant clock correction ([88a5ac9](https://github.com/j2h4u/omi-collector/commit/88a5ac90b18888e0901a922790976a061e810b70))
+
 ## [0.6.17](https://github.com/j2h4u/omi-collector/compare/v0.6.16...v0.6.17) (2026-09-23)
 
 

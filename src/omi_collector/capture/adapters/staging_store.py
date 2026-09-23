@@ -351,16 +351,6 @@ class StagingStore:
         _require_regular_directory(attempt_path)
         return StagedAttempt(self._filesystem, attempt_path, descriptor, live=False)
 
-    def open_attempt_for_resume(self, attempt_id: str) -> StagedAttempt:
-        """Hydrate a pending attempt once for startup validation and reuse."""
-        _validate_attempt_id(attempt_id)
-        attempt_path = self.attempts_root / attempt_id
-        descriptor = self._filesystem._read_descriptor(attempt_path)
-        _require_regular_directory(attempt_path)
-        # This is still inspection.  Promotion is performed only by
-        # ``activate_for_resume`` after the device lease is held.
-        return StagedAttempt(self._filesystem, attempt_path, descriptor, live=False)
-
     def retain_validated_attempt(self, attempt_id: str, attempt: object) -> None:
         """Transfer ownership of a startup-hydrated attempt to the next lease."""
         if not isinstance(attempt, StagedAttempt):

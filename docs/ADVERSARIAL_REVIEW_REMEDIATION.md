@@ -578,8 +578,8 @@ removed island; protocol and arena suites remain complete.
 
 ### 33. Collapse compatibility constructors and duplicate staging openers
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Use only `WriterConfig` for `AttemptWriter`, one store-based `StagingWriter`
 constructor, and one staging inspection opener. Keep resume activation as the
@@ -590,26 +590,18 @@ knobs or identically implemented `open_attempt` variants remain.
 
 ### 34. Remove confirmed zero-consumer production surfaces
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Remove, after a fresh reference check:
 
-Completed in this pass:
-
-- the unused staging-contract conversion/hash helpers and resulting imports;
-- unused filesystem `file_size` and append helper;
-- unused held-lease aliases;
-- the duplicate `StagingWriterTarget` protocol;
-- the unused `RingTransport` and `OperationalSession` protocols;
-- unused battery-first collection helper;
-- the unread publication retry counter;
-- test-only convenience entrypoints whose tests can use production paths.
-
-Still pending:
-
-- unused observation-boundary helper;
-- unpopulated replay/append result fields and unread progress total.
+The cleanup removes the unused staging-contract conversion/hash helpers and
+resulting imports, filesystem `file_size` and append helpers, held-lease
+aliases, the duplicate `StagingWriterTarget` protocol, `RingTransport` and
+`OperationalSession` protocols, the battery-first collection helper, the
+unread publication retry counter, and test-only convenience entrypoints whose
+tests can use production paths. It also removes the unused observation-boundary
+helper and the unread replay/append result fields and unread progress total.
 
 Do not remove framework-dispatched logging overrides, Typer commands, pytest
 fixtures, consumed protocol parameters, `RingSession`, `WriterTarget`, lease

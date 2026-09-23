@@ -309,7 +309,7 @@ class QuarantineMaintenance:
         return descriptors[0] if descriptors else None
 
     async def _validate_pending_evidence(self, descriptor: AttemptDescriptorShape) -> int:
-        attempt = await asyncio.to_thread(self._staging.open_attempt_for_resume, descriptor.attempt_id)
+        attempt = await asyncio.to_thread(self._staging.open_attempt, descriptor.attempt_id)
         try:
             recovery = await asyncio.to_thread(attempt.recover)
         except BaseException:

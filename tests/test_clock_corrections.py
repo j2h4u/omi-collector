@@ -73,7 +73,8 @@ def test_prepared_intent_recovers_as_not_written(tmp_path: Path) -> None:
 def test_startup_replay_ignores_legacy_anchored_monotonic_observations(tmp_path: Path) -> None:
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
     correction = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
-    initial = store.observation_store.anchored_monotonic(
+    initial = store.observation_store.append(
+        evidence_kind="anchored_monotonic",
         session_id="legacy",
         host_boot_id="host-boot",
         host_realtime_start=1000.0,
@@ -86,7 +87,8 @@ def test_startup_replay_ignores_legacy_anchored_monotonic_observations(tmp_path:
         operation_id=correction.operation_id,
         observation_role="initial",
     )
-    store.observation_store.anchored_monotonic(
+    store.observation_store.append(
+        evidence_kind="anchored_monotonic",
         session_id="legacy",
         host_boot_id="host-boot",
         host_realtime_start=1000.0,
@@ -198,7 +200,8 @@ def test_later_matching_drift_observation_marks_unresolved_write_not_applied(tmp
 def test_causal_observation_reconciles_by_typed_host_interval(tmp_path: Path) -> None:
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
     intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
-    store.observation_store.native_trusted(
+    store.observation_store.append(
+        evidence_kind="native_trusted",
         observation_id="9" * 32,
         session_id="session",
         host_boot_id="boot",
@@ -212,7 +215,8 @@ def test_causal_observation_reconciles_by_typed_host_interval(tmp_path: Path) ->
         operation_id=intent.operation_id,
         observation_role="initial",
     )
-    later = store.observation_store.native_trusted(
+    later = store.observation_store.append(
+        evidence_kind="native_trusted",
         observation_id="a" * 32,
         session_id="session",
         host_boot_id="boot",
@@ -238,7 +242,8 @@ def test_causal_observation_allows_ordered_successive_same_boundary_operation(tm
     store.finish(first, state="applied", boundary_sequence_max=20, verified_epoch=1000)
     store.resolve_applied(store.records()[0])
     second = store.mark_unresolved(store.prepare(1301, 1000, 301.0, 20, operation_id="second"))
-    initial = store.observation_store.native_trusted(
+    initial = store.observation_store.append(
+        evidence_kind="native_trusted",
         observation_id="c" * 32,
         session_id="session",
         host_boot_id="boot",
@@ -252,7 +257,8 @@ def test_causal_observation_allows_ordered_successive_same_boundary_operation(tm
         operation_id=second.operation_id,
         observation_role="initial",
     )
-    later = store.observation_store.native_trusted(
+    later = store.observation_store.append(
+        evidence_kind="native_trusted",
         observation_id="d" * 32,
         session_id="session",
         host_boot_id="boot",

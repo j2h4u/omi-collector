@@ -66,11 +66,6 @@ class ClockObservation:
     def __post_init__(self) -> None:
         _validate_observation(self)
 
-    @property
-    def observation_boundary(self) -> int:
-        """The sequence frontier observed, not the correction's effective edge."""
-        return self.info_sequence_max
-
 
 class ClockObservationStore:
     """Append-only JSON records with strict canonical decoding and fsync."""
@@ -132,48 +127,6 @@ class ClockObservationStore:
         )
         return self._write_new(observation)
 
-    def native_trusted(self, **values: object) -> ClockObservation:
-        """Convenience constructor for a host-trusted native sample."""
-        values["evidence_kind"] = "native_trusted"
-        return self.append(**cast(dict[str, object], values))
-
-    def anchored_monotonic(self, **values: object) -> ClockObservation:
-        """Convenience constructor for bounded historical evidence."""
-        values["evidence_kind"] = "anchored_monotonic"
-        return self.append(**cast(dict[str, object], values))
-
-    def establish_effective_boundary(
-        self, observation: ClockObservation, boundary_sequence: int, *, operation_id: str | None = None
-    ) -> ClockObservation:
-        """Record a causal boundary decision without rewriting source evidence."""
-        if observation not in self.records():
-            raise ClockObservationError("observation is not in this ledger")
-        if boundary_sequence < 0 or boundary_sequence > observation.info_sequence_max:
-            raise ClockObservationError("effective boundary is outside observation frontier")
-        if observation.effective_boundary_sequence is not None:
-            if observation.effective_boundary_sequence != boundary_sequence:
-                raise ClockObservationError("effective boundary conflicts with durable evidence")
-            return observation
-        return self.append(
-            evidence_kind=observation.evidence_kind,
-            session_id=observation.session_id,
-            host_boot_id=observation.host_boot_id,
-            host_realtime_start=observation.host_realtime_start,
-            host_realtime_end=observation.host_realtime_end,
-            host_monotonic_start=observation.host_monotonic_start,
-            host_monotonic_end=observation.host_monotonic_end,
-            device_epoch=observation.device_epoch,
-            info_sequence_min=observation.info_sequence_min,
-            info_sequence_max=observation.info_sequence_max,
-            operation_id=operation_id or observation.operation_id,
-            effective_boundary_sequence=boundary_sequence,
-            observation_role=observation.observation_role,
-            parent_observation_id=observation.observation_id,
-            raw_timestamp=observation.raw_timestamp,
-            raw_timestamp_hash=observation.raw_timestamp_hash,
-            observation_id=f"{observation.observation_id}-{boundary_sequence:016x}",
-        )
-
     def records(self) -> tuple[ClockObservation, ...]:
         if not self._root.exists():
             return ()
@@ -185,11 +138,6 @@ class ClockObservationStore:
                 raise ClockObservationError("clock observation causal order has a gap")
             previous = item.causal_order
         return records
-
-    def for_operation(self, operation_id: str) -> tuple[ClockObservation, ...]:
-        if not operation_id:
-            raise ValueError("operation_id is required")
-        return tuple(item for item in self.records() if item.operation_id == operation_id)
 
     def _write_new(self, observation: ClockObservation) -> ClockObservation:
         try:

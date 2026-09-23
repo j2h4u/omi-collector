@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import sys
 from contextlib import AbstractContextManager
-from pathlib import Path
 from threading import get_ident
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
@@ -42,29 +41,19 @@ class StagingWriterStateError(StagingWriterError):
 class StagingWriter:
     """Own one streaming attempt and its device lease on one thread.
 
-    The constructor only stores immutable transfer intent and constructs a
-    ``StagingStore`` object.  It does not create directories, locks, or partial
+    The constructor only stores immutable transfer intent and the supplied
+    ``StagingStore``.  It does not create directories, locks, or partial
     attempts.  ``prepare`` first resumes the unique streaming partial, if one
     exists, and otherwise creates a fresh streaming attempt.
     """
 
     def __init__(
         self,
-        root: Path | str | StagingStore,
+        store: StagingStore,
         start_sequence: int,
         packet_count: int,
-        *,
-        capture_root: Path | str | None = None,
-        store: StagingStore | None = None,
     ) -> None:
-        if store is not None:
-            self._store = store
-        elif isinstance(root, StagingStore):
-            self._store = root
-        else:
-            if capture_root is None:
-                raise TypeError("capture_root is required when constructing StagingWriter from a path")
-            self._store = StagingStore(Path(root), Path(capture_root))
+        self._store = store
         self._start_sequence = start_sequence
         self._packet_count = packet_count
         self._lease_context: AbstractContextManager[DeviceLock] | None = None

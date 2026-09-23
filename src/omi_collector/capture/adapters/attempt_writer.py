@@ -220,26 +220,14 @@ class AttemptWriter:
     issued while retaining strict target ownership.
     """
 
-    def __init__(  # noqa: PLR0913 - independent compatibility knobs are explicit
+    def __init__(
         self,
         target: WriterTarget,
         source: bytes | bytearray | memoryview,
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         config: WriterConfig = DEFAULT_CONFIG.writer,
-        max_control_commands: int | None = None,
-        chunk_size: int | None = None,
     ) -> None:
-        if max_control_commands is None:
-            max_control_commands = config.max_control_commands
-        if chunk_size is None:
-            chunk_size = config.chunk_records * RECORD_SIZE
-        if max_control_commands < 1:
-            raise ValueError("max_control_commands must be positive")
-        if chunk_size < 1:
-            raise ValueError("chunk_size must be positive")
-        if chunk_size % RECORD_SIZE:
-            raise ValueError(f"chunk_size must be a multiple of record size ({RECORD_SIZE})")
         self._target = target
         arena = memoryview(source)
         if not arena.c_contiguous:
@@ -247,8 +235,6 @@ class AttemptWriter:
         self._arena = arena.cast("B") if arena.format != "B" else arena
         self._loop = loop
         self._config = config
-        self._max_controls = max_control_commands
-        self._chunk_size = chunk_size
         self._commands: deque[_Pending] = deque()
         self._lock = Lock()
         self._wake = Event()
@@ -502,7 +488,7 @@ class AttemptWriter:
                 assert self._close_pending is not None
                 return self._close_pending
             assert isinstance(result.directive, Admit)
-            if not isinstance(event, CloseRequested) and len(self._commands) >= self._max_controls:
+            if not isinstance(event, CloseRequested) and len(self._commands) >= self._config.max_control_commands:
                 raise WriterQueueFullError("writer control queue is full")
             command = command_factory(self._published)
             future = self._new_future_locked()
@@ -669,7 +655,7 @@ class AttemptWriter:
         wrote = False
         while start < target:
             end = target
-            end = min(end, start + self._chunk_size)
+            end = min(end, start + self._config.chunk_records * RECORD_SIZE)
             chunk = self._arena[start:end].toreadonly()
             self._target.append_chunk(start, chunk)
             with self._lock:

@@ -144,7 +144,6 @@ class ProgressEvent:
     records_completed: int
     records_total: int
     bytes_completed: int
-    bytes_total: int
     elapsed: float
     records_per_second: float
     bytes_per_second: float
@@ -212,8 +211,6 @@ class ReadLegResult:
     start_sequence: int
     next_sequence: int
     packet_count: int
-    records_replayed: int = 0
-    records_appended: int = 0
     received_bytes: int = 0
     submitted_bytes: int = 0
     written_bytes: int = 0
@@ -356,8 +353,6 @@ async def read_leg(
         start,
         start + count,
         count,
-        records_replayed=_replayed_records(arena, start, count, baselines),
-        records_appended=counters.received_records,
         received_bytes=counters.received_bytes,
         submitted_bytes=counters.submitted_bytes,
         written_bytes=counters.written_bytes,
@@ -512,12 +507,6 @@ def _leg_counters(arena: TransferArena, writer: IngestWriter, baselines: _LegBas
     )
 
 
-def _replayed_records(arena: TransferArena, start: int, count: int, baselines: _LegBaselines) -> int:
-    """Describe resident replay separately from newly received arena bytes."""
-    received_end = arena.start_sequence + baselines.received_bytes // RECORD_SIZE
-    return max(0, min(start + count, received_end) - start)
-
-
 def _enqueue_read_begin(writer: IngestWriter, notice: ReadBeginNotification) -> asyncio.Future[object] | None:
     result = writer.submit_read_begin(notice)
     if isinstance(result, asyncio.Future):
@@ -597,7 +586,6 @@ def _publish_progress(state: _IngestState, arena: TransferArena, *, terminal: bo
         records,
         total,
         records * RECORD_SIZE,
-        total * RECORD_SIZE,
         elapsed,
         rate,
         rate * RECORD_SIZE,

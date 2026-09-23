@@ -716,7 +716,8 @@ def test_incident_boundaries_use_trusted_near_zero_observation(tmp_path: Path) -
     zero = store.mark_unresolved(store.prepare(1000, 1000, 0.0, 7192026))
     store.finish(zero, state="resolved", boundary_sequence_max=7192026, verified_epoch=1000)
     pending = store.mark_unresolved(store.prepare(1302, 1002, 300.0, 7717545))
-    initial = store.observation_store.native_trusted(
+    initial = store.observation_store.append(
+        evidence_kind="native_trusted",
         session_id="session",
         host_boot_id="boot",
         host_realtime_start=1000.0,

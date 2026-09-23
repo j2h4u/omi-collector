@@ -71,7 +71,7 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 
 # Unit tests.
 unit:
-    uv run pytest -q -n auto -m "not slow"
+    timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
 
 # Test coverage report.
 coverage:

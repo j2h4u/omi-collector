@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/j2h4u/omi-collector/compare/v0.7.1...v0.7.2) (2026-09-23)
+
+
+### Maintenance
+
+* remove completed two-zone migration artifacts ([#125](https://github.com/j2h4u/omi-collector/issues/125)) ([de245ce](https://github.com/j2h4u/omi-collector/commit/de245cede580e409fc2154a976fbacdddbace467))
+
 ## [0.7.1](https://github.com/j2h4u/omi-collector/compare/v0.7.0...v0.7.1) (2026-09-23)
 
 

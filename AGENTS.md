@@ -18,6 +18,8 @@ make a change pass.
 - `just docker-build` must pass because the service runs in Docker; it includes
   Dockerfile and Compose static validation before image build.
 - Use `uv` only. Keep `uv.lock` current and use hardlink mode outside Docker.
+- Bound direct `uv run pytest` commands with `timeout --signal=TERM --kill-after=5s 600s`.
+  If a tool returns a running session, poll it to completion or terminate it before moving on.
 - Keep stable QA and runtime practices in `docs/BEST_PRACTICES.md`; keep this
   file compact.
 

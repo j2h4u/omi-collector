@@ -6,25 +6,30 @@ import fcntl
 import os
 import shutil
 import stat
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from json import JSONDecodeError, dumps, loads
 from os import O_DIRECTORY, O_RDONLY, close, fsync, statvfs
 from os import open as os_open
 from pathlib import Path
+from threading import get_ident
 from typing import Final, cast
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, DurabilityConfig
 from ..domain.ring_protocol import RECORD_SIZE
+from .debug_logging import debug_event
 from .staging_contract import (
     _CHECKPOINT_NAME,
     _DESCRIPTOR_NAME,
     AttemptStateError,
     DeviceAlreadyRunningError,
     DiskSpaceError,
+    LockContext,
     MaintenanceDeferredError,
     StagingError,
     StreamingCheckpoint,
@@ -40,6 +45,10 @@ Statvfs = Callable[[str | Path], object]
 # group class rwx so a parent default ACL can retain its named downstream-user
 # entry and mask; world access remains disabled.
 _SHARED_BUNDLE_DIRECTORY_MODE: Final = 0o770
+_LOCK_SCOPE: Final = "collector_lock"
+_LOCK_METADATA_VERSION: Final = 1
+_LOCK_METADATA_MAX_BYTES: Final = 4096
+_UNKNOWN_OPERATION: Final = "unknown"
 
 
 def _never_defer() -> bool:
@@ -231,13 +240,15 @@ class StagingFilesystem:
             raise DiskSpaceError(f"need {required} bytes of free space; only {available} bytes available")
 
     @contextmanager
-    def device_lock(self) -> Iterator[DeviceLock]:
+    def device_lock(self, *, operation: str = _UNKNOWN_OPERATION) -> Iterator[DeviceLock]:
         self._prepare_roots()
         self._ensure_directory(self.spool)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(self.lock_path, flags, 0o600)
         lease = DeviceLock(self)
         locked = False
+        acquired_monotonic_ns: int | None = None
+        metadata_status = "unavailable"
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise StagingError("device lock is not a regular file")
@@ -245,14 +256,38 @@ class StagingFilesystem:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
-                raise DeviceAlreadyRunningError("pendant recovery is already active") from error
+                lock_context = _read_lock_context(fd, operation)
+                cast(Callable[..., None], debug_event)("device_lock_busy", **lock_context.as_dict())
+                raise DeviceAlreadyRunningError(lock_context=lock_context) from error
             locked = True
+            acquired_monotonic_ns = time.monotonic_ns()
+            metadata_status = _write_lock_metadata(fd, operation, acquired_monotonic_ns)
             self._active_lease = lease
             lease._activate()
+            debug_event(
+                "device_lock_acquired",
+                operation=operation,
+                scope=_LOCK_SCOPE,
+                pid=os.getpid(),
+                thread_id=get_ident(),
+                metadata_status=metadata_status,
+            )
             yield lease
         finally:
             if locked and self._active_lease is lease:
                 self._active_lease = None
+            if locked:
+                duration_seconds = None
+                if acquired_monotonic_ns is not None:
+                    duration_seconds = max(0.0, (time.monotonic_ns() - acquired_monotonic_ns) / 1_000_000_000)
+                debug_event(
+                    "device_lock_released",
+                    operation=operation,
+                    scope=_LOCK_SCOPE,
+                    duration_seconds=duration_seconds,
+                    metadata_status=metadata_status,
+                )
+                _clear_lock_metadata(fd)
             lease._release()
             with suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -303,6 +338,115 @@ class DeviceLock:
 
     def _activate(self) -> None:
         self._active = True
+
+
+def _write_lock_metadata(fd: int, operation: str, acquired_monotonic_ns: int) -> str:
+    """Best-effort owner metadata; lock semantics never depend on this write."""
+    metadata = {
+        "version": _LOCK_METADATA_VERSION,
+        "pid": os.getpid(),
+        "process_start": _process_start(),
+        "thread_id": get_ident(),
+        "operation": operation,
+        "scope": _LOCK_SCOPE,
+        "acquired_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+        "acquired_monotonic_ns": acquired_monotonic_ns,
+    }
+    payload = _json_bytes(metadata)
+    if len(payload) > _LOCK_METADATA_MAX_BYTES:
+        return "oversized"
+    try:
+        os.ftruncate(fd, 0)
+        written = os.pwrite(fd, payload, 0)
+        if written != len(payload):
+            return "write_failed"
+        os.ftruncate(fd, len(payload))
+    except OSError:
+        return "write_failed"
+    return "valid"
+
+
+def _read_lock_context(fd: int, requested_operation: str) -> LockContext:
+    metadata: object = None
+    metadata_status = "valid"
+    try:
+        payload = os.pread(fd, _LOCK_METADATA_MAX_BYTES, 0)
+    except OSError:
+        metadata_status = "unreadable"
+    else:
+        if not payload:
+            metadata_status = "missing"
+        else:
+            try:
+                metadata = cast(object, loads(payload.decode("utf-8")))
+            except JSONDecodeError, UnicodeDecodeError, ValueError:
+                metadata_status = "invalid"
+    if metadata_status != "valid":
+        return LockContext(requested_operation, None, None, None, None, "unknown", metadata_status)
+    if not isinstance(metadata, dict) or metadata.get("version") != _LOCK_METADATA_VERSION:
+        return LockContext(requested_operation, None, None, None, None, "unknown", "invalid")
+    operation = metadata.get("operation")
+    pid = metadata.get("pid")
+    thread_id = metadata.get("thread_id")
+    scope = metadata.get("scope")
+    process_start = metadata.get("process_start")
+    acquired_monotonic_ns = metadata.get("acquired_monotonic_ns")
+    if not (
+        isinstance(operation, str)
+        and isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and isinstance(thread_id, int)
+        and not isinstance(thread_id, bool)
+        and thread_id > 0
+        and isinstance(scope, str)
+        and isinstance(acquired_monotonic_ns, int)
+        and not isinstance(acquired_monotonic_ns, bool)
+        and acquired_monotonic_ns > 0
+    ):
+        return LockContext(requested_operation, None, None, None, None, "unknown", "invalid")
+    age_seconds = max(0.0, (time.monotonic_ns() - acquired_monotonic_ns) / 1_000_000_000)
+    holder_scope = _holder_scope(pid, process_start)
+    if holder_scope == "unknown":
+        return LockContext(requested_operation, None, None, None, None, "unknown", "stale")
+    return LockContext(
+        requested_operation,
+        operation,
+        pid,
+        thread_id,
+        age_seconds,
+        holder_scope,
+        "valid",
+    )
+
+
+def _holder_scope(holder_pid: int, holder_start: object) -> str:
+    if holder_pid != os.getpid():
+        current_start = _process_start(holder_pid)
+        if not isinstance(holder_start, int) or current_start is None or holder_start != current_start:
+            return "unknown"
+        return "other_process"
+    current_start = _process_start()
+    if not isinstance(holder_start, int) or current_start is None:
+        return "unknown"
+    return "current_process" if holder_start == current_start else "unknown"
+
+
+def _process_start(pid: int | None = None) -> int | None:
+    try:
+        stat_path = Path(f"/proc/{pid}/stat") if pid is not None else Path("/proc/self/stat")
+        stat_text = stat_path.read_text(encoding="utf-8")
+        after_comm = stat_text.rsplit(")", 1)[1].split()
+        if pid is not None and after_comm[0] == "Z":
+            return None
+        return int(after_comm[19])
+    except OSError, IndexError, ValueError:
+        return None
+
+
+def _clear_lock_metadata(fd: int) -> None:
+    with suppress(OSError):
+        os.ftruncate(fd, 0)
 
 
 def _json_bytes(value: object, *, newline: bool = False) -> bytes:

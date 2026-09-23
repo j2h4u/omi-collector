@@ -124,7 +124,7 @@ class StagingWriter:
             assert self._attempt is not None
             return self._attempt.descriptor
 
-        context = self._store.device_lock()
+        context = self._store.device_lock(operation="capture_batch")
         lease: DeviceLock | None = None
         try:
             lease = context.__enter__()

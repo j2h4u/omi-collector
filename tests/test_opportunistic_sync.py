@@ -24,7 +24,7 @@ from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStor
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
-from omi_collector.capture.adapters.staging_contract import DurablePrefix
+from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError, DurablePrefix, LockContext
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application import batch_reconciliation
@@ -215,6 +215,29 @@ async def test_session_error_keeps_raw_exception_for_debug_ring(monkeypatch: pyt
     await report_session_error(None, "connect", raw_error, _runtime())
 
     assert captured == [("session_error", raw_error, {"phase": "connect"})]
+
+
+@_async_test
+async def test_session_error_serializes_lock_context_in_normal_progress_line() -> None:
+    context = LockContext("capture_batch", "capture_batch", 321, 654, 1.25, "other_process", "valid")
+    activity: list[ActivityEvent] = []
+    await report_session_error(
+        activity.append,
+        "connect",
+        DeviceAlreadyRunningError(lock_context=context),
+        _runtime(),
+    )
+
+    from omi_collector.capture import cli as device_cli
+
+    updates: list[object] = []
+    callback = device_cli._activity_callback(updates.append)
+    assert callback is not None
+    await cast(Awaitable[None], callback(activity[0]))
+    progress = cast(device_cli.DownloadProgress, updates[0])
+    progress = progress.as_dict()
+    assert progress["status"] == "session_error"
+    assert progress["lock_context"] == context.as_dict()
 
 
 def _done(next_sequence: int) -> bytes:
@@ -3157,6 +3180,10 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
     )
     await busy_reported.wait()
     assert second.writes == [b"\x10"]
+    busy_event = next(event for event in activity if event.state == "session_error")
+    assert busy_event.lock_context is not None
+    assert busy_event.lock_context["requested_operation"] == "capture_batch"
+    assert busy_event.lock_context["holder_operation"] == "capture_batch"
     task.cancel()
     with pytest.raises(CollectionPreservedCancelledError):
         await task

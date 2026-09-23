@@ -129,7 +129,7 @@ class StagingStore:
         if self._publication_root is None:
             return None
         if held_lease is None:
-            with self.device_lock(recover_capture_temporaries=False):
+            with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
                 return self._recover_and_publish_unlocked()
         self._filesystem.require_device_lock(held_lease)
         return self._recover_and_publish_unlocked()
@@ -180,7 +180,7 @@ class StagingStore:
         """Replay native durable clock evidence and publish without a BLE connection."""
         if self._publication_root is None:
             return None
-        with self.device_lock(recover_capture_temporaries=False):
+        with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
             return self._recover_and_publish_unlocked()
 
     def _recover_and_publish_unlocked(self) -> object | None:
@@ -422,9 +422,10 @@ class StagingStore:
         self,
         *,
         recover_capture_temporaries: bool = True,
+        operation: str = "unknown",
     ) -> Iterator[DeviceLock]:
         """Acquire the filesystem lease, then sequence publication recovery and quarantine."""
-        with self._filesystem.device_lock() as lease:
+        with self._filesystem.device_lock(operation=operation) as lease:
             if recover_capture_temporaries:
                 unsafe = publication.recover_capture_temporaries(self._filesystem)
                 for temporary, capture_root, reason in unsafe:
@@ -444,7 +445,7 @@ class StagingStore:
             self._filesystem.require_device_lock(active)
             yield active
             return
-        with self.device_lock(recover_capture_temporaries=False) as lease:
+        with self.device_lock(recover_capture_temporaries=False, operation="clock_mutation") as lease:
             yield lease
 
     def require_device_lock(self, lease: DeviceLock) -> None:

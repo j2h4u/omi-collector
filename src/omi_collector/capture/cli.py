@@ -93,6 +93,7 @@ class DownloadProgress:
     reason: str | None = None
     duration_seconds: float | None = None
     next_attempt_in_seconds: float | None = None
+    lock_context: Mapping[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return progress fields suitable for one JSON line on stderr."""
@@ -126,6 +127,8 @@ class DownloadProgress:
             result["duration_seconds"] = round(self.duration_seconds, 2)
         if self.next_attempt_in_seconds is not None:
             result["next_attempt_in_seconds"] = round(self.next_attempt_in_seconds, 2)
+        if self.lock_context is not None:
+            result["lock_context"] = dict(self.lock_context)
         return result
 
 
@@ -400,6 +403,7 @@ def _activity_callback(progress: ProgressReporter | None) -> Callable[[ActivityE
                 reason=event.reason,
                 duration_seconds=event.duration_seconds,
                 next_attempt_in_seconds=event.next_attempt_in_seconds,
+                lock_context=event.lock_context,
             )
         )
         if inspect.isawaitable(result):

@@ -5,6 +5,9 @@ from __future__ import annotations
 from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
+from stat import S_IMODE
+from subprocess import CompletedProcess
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -114,6 +117,7 @@ def test_plan_keeps_one_contained_duplicate_out_of_draft(tmp_path: Path, monkeyp
     monkeypatch.setattr(migration, "_quiescent", lambda _paths: None)
     monkeypatch.setattr(migration, "_inactive", lambda _service, **_kwargs: None)
     monkeypatch.setattr(migration, "_windmill_quiescent", lambda: None)
+    monkeypatch.setattr(migration.os, "geteuid", lambda: 0)
     migration.execute(paths)
 
     ready = next(paths.ready.iterdir())
@@ -130,6 +134,14 @@ def test_plan_keeps_one_contained_duplicate_out_of_draft(tmp_path: Path, monkeyp
     assert mappings[0]["ready"]["bundle_id"] == ready.name
     assert inventory["schema"] == "omi-two-zone-frozen-inventory-v1"
     assert len(cast(list[object], inventory["legacy_evidence"])) == 1
+    assert paths.ready.stat().st_gid == paths.speech.stat().st_gid
+    assert S_IMODE(paths.ready.stat().st_mode) == 0o2750
+    assert S_IMODE(ready.stat().st_mode) == 0o2750
+    assert all(S_IMODE(path.stat().st_mode) == 0o640 for path in ready.iterdir())
+    assert paths.ledger.stat().st_uid == paths.ledger.parent.stat().st_uid
+    assert paths.state.stat().st_gid == paths.state.parent.stat().st_gid
+    assert paths.evidence.stat().st_uid == (root / "work").stat().st_uid
+    assert paths.generation_evidence.stat().st_gid == (root / "work").stat().st_gid
     migration.execute(paths)
     checkpoint.write_text(
         dumps(
@@ -200,3 +212,101 @@ def test_historic_ack_identity_set_rejects_one_later_ready_bundle(
 
     with pytest.raises(migration.MigrationError, match="historic acknowledgement"):
         migration._retirement_acknowledged(paths, inventory)
+
+
+def _systemctl_result(load: str, active: str, unit_file: str) -> CompletedProcess[str]:
+    return CompletedProcess(
+        ["systemctl"],
+        0,
+        f"LoadState={load}\nActiveState={active}\nUnitFileState={unit_file}\n",
+        "",
+    )
+
+
+def test_system_jit_may_be_absent_but_collector_must_be_loaded_and_inactive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(migration, "_run", lambda _command: _systemctl_result("not-found", "inactive", ""))
+
+    migration._inactive("omi-speech-archive-jit.service", disabled=True, optional=True)
+    with pytest.raises(migration.MigrationError, match="not loaded"):
+        migration._inactive("omi-collector.service")
+
+    monkeypatch.setattr(migration, "_run", lambda _command: _systemctl_result("loaded", "inactive", "enabled"))
+    with pytest.raises(migration.MigrationError, match="not disabled"):
+        migration._inactive("omi-speech-archive-jit.service", disabled=True, optional=True)
+
+    monkeypatch.setattr(migration, "_run", lambda _command: _systemctl_result("loaded", "inactive", "disabled"))
+    migration._inactive("omi-collector.service")
+
+
+def test_root_runner_rejects_unplanned_output_before_moving_legacy(tmp_path: Path) -> None:
+    root = tmp_path / "omi"
+    paths, _legacy_source, _tail, legacy, _checkpoint = _scenario(root)
+    paths.ready.mkdir()
+    (paths.ready / "unplanned").mkdir()
+
+    plan = migration.build_plan(paths)
+
+    with pytest.raises(migration.MigrationError, match="non-migration output"):
+        migration._validate_ready_destinations(paths, plan)
+    assert legacy.exists()
+
+
+def test_root_runner_sets_only_expected_runtime_ownership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "omi"
+    paths, _legacy_source, _tail, _legacy, _checkpoint = _scenario(root)
+    paths.draft.mkdir()
+    paths.ready.mkdir()
+    ready = paths.ready / "ready"
+    draft = paths.draft / "draft"
+    ready.mkdir()
+    draft.mkdir()
+    (ready / "records.bin").write_bytes(b"ready")
+    (draft / "records.bin").write_bytes(b"draft")
+    paths.ledger.write_text("{}", encoding="utf-8")
+    paths.state.write_text("{}", encoding="utf-8")
+    calls: list[tuple[Path, int, int, int]] = []
+
+    def record(path: Path, uid: int, gid: int, *, directory_mode: int = 0o750) -> None:
+        calls.append((path, uid, gid, directory_mode))
+
+    owner_modes = {
+        paths.captured: SimpleNamespace(st_uid=996, st_gid=1000),
+        paths.root / "work": SimpleNamespace(st_uid=1000, st_gid=981),
+        paths.speech: SimpleNamespace(st_uid=1000, st_gid=1000),
+        paths.ledger.parent: SimpleNamespace(st_uid=996, st_gid=981),
+    }
+    observed_stats: list[Path] = []
+    original_stat = Path.stat
+
+    def runtime_stat(path: Path, *args: object, **kwargs: object) -> object:
+        observed_stats.append(path)
+        return owner_modes.get(path, original_stat(path, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "stat", runtime_stat)
+    monkeypatch.setattr(migration, "_set_runtime_ownership", record)
+
+    migration._set_runtime_outputs(paths, (ready,), (draft,))
+
+    assert paths.root / "work" not in observed_stats
+    assert calls == [
+        (paths.draft, 996, 1000, 0o750),
+        (draft, 996, 1000, 0o750),
+        (draft / "records.bin", 996, 1000, 0o750),
+        (paths.ready, 996, 1000, 0o2750),
+        (ready, 996, 1000, 0o2750),
+        (ready / "records.bin", 996, 1000, 0o2750),
+        (paths.ledger, 996, 981, 0o750),
+        (paths.state, 996, 981, 0o750),
+    ]
+
+
+def test_root_runner_rejects_symlink_ownership_target(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"audio")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+
+    with pytest.raises(migration.MigrationError, match="unsafe"):
+        migration._set_runtime_ownership(link, 996, 1000)

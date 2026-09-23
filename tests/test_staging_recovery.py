@@ -47,6 +47,12 @@ def _isolate_capture_root(tmp_path: Path) -> None:
     rmtree(_capture_root(tmp_path), ignore_errors=True)
 
 
+def _shared_ready(path: Path) -> Path:
+    path.mkdir(mode=0o2750, exist_ok=True)
+    path.chmod(0o2750)
+    return path
+
+
 def _record(marker: int) -> bytes:
     return marker.to_bytes(4, "big") + bytes((marker,)) * (RECORD_SIZE - 4)
 
@@ -153,7 +159,7 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
 def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_path: Path) -> None:
     store = StagingStore.from_paths(
         StagingStore(tmp_path, _capture_root(tmp_path)).paths,
-        publication_root=tmp_path / "published",
+        publication_root=_shared_ready(tmp_path / "published"),
     )
     correction_store = ClockCorrectionStore(store.device_state_path)
     correction = correction_store.mark_unresolved(correction_store.prepare(1302, 1002, 300.0, 7717545))
@@ -195,7 +201,7 @@ def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_p
 
 def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
     drafts = _capture_root(tmp_path)
-    published = tmp_path / "published"
+    published = _shared_ready(tmp_path / "published")
     sequences = _acceptance_sequences()
     for sequence in sequences:
         _one_record_bundle(drafts, sequence, 43 if sequence < _ACCEPTANCE_SECOND_BOUNDARY else 72)
@@ -225,7 +231,7 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
 
 def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path) -> None:
     drafts = _capture_root(tmp_path)
-    published = tmp_path / "ready"
+    published = _shared_ready(tmp_path / "ready")
     _one_record_bundle(drafts, 100, 43)
     store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published)
     first = cast(tuple[object, ...], store.recover_and_publish())
@@ -261,7 +267,9 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
 def _publication_store(tmp_path: Path) -> StagingStore:
     capture_root = _capture_root(tmp_path)
     _one_record_bundle(capture_root, 100, 1)
-    return StagingStore.from_paths(StagingStore(tmp_path, capture_root).paths, publication_root=tmp_path / "published")
+    return StagingStore.from_paths(
+        StagingStore(tmp_path, capture_root).paths, publication_root=_shared_ready(tmp_path / "published")
+    )
 
 
 def test_background_thread_authority_does_not_borrow_an_unrelated_active_lease(tmp_path: Path) -> None:

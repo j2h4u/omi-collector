@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Iterable, Iterator
@@ -34,7 +35,9 @@ class MigrationError(RuntimeError):
 
 _SHA256_HEX_LENGTH = 64
 _SPEECH_PAIR_COUNT = 12
-_SYSTEMCTL_INACTIVE = 3
+_OUTPUT_DIRECTORY_MODE = 0o750
+_READY_DIRECTORY_MODE = 0o2750
+_OUTPUT_FILE_MODE = 0o640
 _WINDMILL_JOB_LIMIT = 100
 _TEMPORARY_NAME_PARTS = 4
 _UUID_HEX_LENGTH = 32
@@ -376,10 +379,69 @@ def _write(path: Path, payload: bytes) -> None:
 
 
 def _prepare_output(path: Path) -> None:
-    path.mkdir(mode=0o750, parents=True, exist_ok=True)
+    path.mkdir(mode=_OUTPUT_DIRECTORY_MODE, parents=True, exist_ok=True)
     _directory(path, "migration output")
     if not os.access(path, os.W_OK | os.X_OK):
         raise MigrationError(f"migration output is not writable: {path}")
+
+
+def _set_runtime_ownership(path: Path, uid: int, gid: int, *, directory_mode: int = _OUTPUT_DIRECTORY_MODE) -> None:
+    details = path.lstat()
+    if stat.S_ISLNK(details.st_mode):
+        raise MigrationError(f"migration ownership target is unsafe: {path}")
+    if stat.S_ISDIR(details.st_mode):
+        flags, mode = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, directory_mode
+    elif stat.S_ISREG(details.st_mode):
+        flags, mode = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, _OUTPUT_FILE_MODE
+    else:
+        raise MigrationError(f"migration ownership target is unsafe: {path}")
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise MigrationError(f"migration ownership target is unavailable: {path}") from error
+    try:
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+    except OSError as error:
+        raise MigrationError(f"cannot set migration runtime ownership: {path}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _set_runtime_tree_ownership(
+    root: Path, uid: int, gid: int, *, directory_mode: int = _OUTPUT_DIRECTORY_MODE
+) -> None:
+    _directory(root, "migration output")
+    paths = (root, *sorted(root.rglob("*")))
+    for path in paths:
+        _set_runtime_ownership(path, uid, gid, directory_mode=directory_mode)
+    ready_bundles._sync_directory(root.parent)
+
+
+def _exact_output_tree(root: Path, outputs: tuple[Path, ...]) -> None:
+    _directory(root, "migration output")
+    if any(path.parent != root for path in outputs):
+        raise MigrationError("migration output path escapes its root")
+    if {path.name for path in root.iterdir()} != {path.name for path in outputs}:
+        raise MigrationError(f"migration output inventory is not exact: {root}")
+
+
+def _runtime_owners(paths: Paths) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    captured = paths.captured.stat()
+    speech = paths.speech.stat()
+    collector = paths.ledger.parent.stat()
+    return (captured.st_uid, captured.st_gid), (captured.st_uid, speech.st_gid), (collector.st_uid, collector.st_gid)
+
+
+def _set_runtime_outputs(paths: Paths, ready: tuple[Path, ...], drafts: tuple[Path, ...]) -> None:
+    _exact_output_tree(paths.draft, drafts)
+    _exact_output_tree(paths.ready, ready)
+    draft_owner, ready_owner, collector_owner = _runtime_owners(paths)
+    _set_runtime_tree_ownership(paths.draft, *draft_owner)
+    _set_runtime_tree_ownership(paths.ready, *ready_owner, directory_mode=_READY_DIRECTORY_MODE)
+    _set_runtime_ownership(paths.ledger, *collector_owner)
+    _set_runtime_ownership(paths.state, *collector_owner)
 
 
 def _rename(source: Path, destination: Path) -> None:
@@ -597,7 +659,17 @@ def _legacy_evidence(paths: Paths, plan: Plan) -> list[dict[str, str]]:
                 "receipt_sha256": _digest(receipt),
             }
         )
+    if {path.name for path in paths.evidence.iterdir()} != {item["source_id"] for item in result}:
+        raise MigrationError("legacy evidence inventory is not exact")
     return result
+
+
+def _set_work_evidence_ownership(paths: Paths) -> None:
+    work = paths.root / "work"
+    _directory(work, "work root")
+    owner = work.stat()
+    _set_runtime_tree_ownership(paths.evidence, owner.st_uid, owner.st_gid)
+    _set_runtime_ownership(paths.generation_evidence, owner.st_uid, owner.st_gid)
 
 
 def _generation_evidence(paths: Paths, plan: Plan) -> dict[str, str]:
@@ -629,23 +701,35 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
         raise MigrationError(f"quiescence check unavailable: {' '.join(command)}") from error
 
 
-def _inactive(service: str, *, disabled: bool = False) -> None:
-    active = _run(["systemctl", "is-active", "--quiet", service]).returncode
-    if active == 0:
-        raise MigrationError(f"service is active: {service}")
-    if active != _SYSTEMCTL_INACTIVE:
-        raise MigrationError(f"service activity probe failed: {service}")
-    if disabled:
-        enabled = _run(["systemctl", "is-enabled", "--quiet", service]).returncode
-        if enabled == 0:
-            raise MigrationError(f"service is enabled: {service}")
-        if enabled != 1:
-            raise MigrationError(f"service enablement probe failed: {service}")
+def _inactive(service: str, *, disabled: bool = False, optional: bool = False) -> None:
+    result = _run(
+        [
+            "systemctl",
+            "show",
+            service,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=UnitFileState",
+        ]
+    )
+    if result.returncode != 0:
+        raise MigrationError(f"service probe failed: {service}")
+    properties = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if set(properties) != {"LoadState", "ActiveState", "UnitFileState"}:
+        raise MigrationError(f"service probe is incomplete: {service}")
+    if properties["LoadState"] == "not-found":
+        if optional and properties["ActiveState"] == "inactive":
+            return
+        raise MigrationError(f"service is not loaded: {service}")
+    if properties["LoadState"] != "loaded" or properties["ActiveState"] != "inactive":
+        raise MigrationError(f"service is not inactive: {service}")
+    if disabled and properties["UnitFileState"] != "disabled":
+        raise MigrationError(f"service is not disabled: {service}")
 
 
 def _quiescent(paths: Paths) -> None:
     _inactive("omi-collector.service")
-    _inactive("omi-speech-archive-jit.service", disabled=True)
+    _inactive("omi-speech-archive-jit.service", disabled=True, optional=True)
     _windmill_quiescent()
     for root in (paths.captured, paths.draft, paths.ready, paths.ledger.parent, paths.current.resolve()):
         result = _run(["lsof", "-t", "+D", str(root)])
@@ -969,7 +1053,9 @@ def _prepare_state(paths: Paths) -> tuple[Plan, dict[str, object], dict[str, obj
             raise MigrationError("migration control files are incomplete")
         plan = build_plan(paths)
         evidence = _legacy_evidence(paths, plan)
-        before = _frozen_before(paths, plan, evidence, _generation_evidence(paths, plan))
+        generation_evidence = _generation_evidence(paths, plan)
+        _set_work_evidence_ownership(paths)
+        before = _frozen_before(paths, plan, evidence, generation_evidence)
         provenance = _log(paths, plan)
         _write(paths.state, _canonical(_state(plan, before)))
         _write(paths.log, _canonical(provenance))
@@ -981,6 +1067,7 @@ def _prepare_state(paths: Paths) -> tuple[Plan, dict[str, object], dict[str, obj
 def _validate_preflight(paths: Paths, plan: Plan, provenance: dict[str, object]) -> None:
     _validate_provenance(plan, provenance)
     _validate_ready_destinations(paths, plan)
+    _validate_draft_destinations(paths, plan)
     _validate_ledger_destinations(paths, plan)
 
 
@@ -996,6 +1083,8 @@ def _validate_ready_destinations(paths: Paths, plan: Plan) -> None:
     ready_ids = [ready_bundles._bundle_id(move.captured.manifest) for move in plan.ready]
     if len(set(ready_ids)) != len(ready_ids):
         raise MigrationError("ready destinations are not unique")
+    if {path.name for path in paths.ready.iterdir()} - set(ready_ids):
+        raise MigrationError("ready root contains a non-migration output")
     for move, bundle_id in zip(plan.ready, ready_ids, strict=True):
         destination = paths.ready / bundle_id
         if destination.exists():
@@ -1006,6 +1095,46 @@ def _validate_ready_destinations(paths: Paths, plan: Plan) -> None:
                     raise MigrationError("ready destination conflicts with frozen plan") from error
         elif not move.legacy.path.exists():
             raise MigrationError("legacy source vanished before ready move")
+
+
+def _cropped_draft_digest(move: DraftMove) -> str:
+    digest = sha256()
+    offset = (move.start_sequence - move.source.manifest.start_sequence) * RECORD_SIZE
+    remaining = (move.next_sequence - move.start_sequence) * RECORD_SIZE
+    with (move.source.path / "records.bin").open("rb") as stream:
+        stream.seek(offset)
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise MigrationError("captured records ended while validating cropped draft")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def _draft_destination(paths: Paths, move: DraftMove) -> Path:
+    if move.complete:
+        return paths.draft / move.source.path.name
+    return paths.draft / f"{move.start_sequence}-{move.next_sequence}-{_cropped_draft_digest(move)[:16]}"
+
+
+def _validate_draft_destinations(paths: Paths, plan: Plan) -> None:
+    destinations = tuple(_draft_destination(paths, move) for move in plan.drafts)
+    if len(set(destinations)) != len(destinations):
+        raise MigrationError("draft destinations are not unique")
+    if {path.name for path in paths.draft.iterdir()} - {path.name for path in destinations}:
+        raise MigrationError("draft root contains a non-migration output")
+    for move, destination in zip(plan.drafts, destinations, strict=True):
+        if not destination.exists():
+            continue
+        existing = _bundle(destination)
+        raw_sha256 = move.source.manifest.raw_sha256 if move.complete else _cropped_draft_digest(move)
+        if (
+            existing.manifest.start_sequence != move.start_sequence
+            or existing.manifest.next_sequence != move.next_sequence
+            or existing.manifest.raw_sha256 != raw_sha256
+        ):
+            raise MigrationError("draft destination conflicts with frozen plan")
 
 
 def _validate_ledger_destinations(paths: Paths, plan: Plan) -> None:
@@ -1025,7 +1154,7 @@ def _record_state_phase(paths: Paths, phase: str) -> None:
     _write(paths.state, _canonical(state))
 
 
-def _move_ready(paths: Paths, move: ReadyMove, ledger: dict[str, object]) -> None:
+def _move_ready(paths: Paths, move: ReadyMove, ledger: dict[str, object]) -> Path:
     source = move.captured.manifest
     destination = paths.ready / ready_bundles._bundle_id(source)
     if destination.exists():
@@ -1041,6 +1170,7 @@ def _move_ready(paths: Paths, move: ReadyMove, ledger: dict[str, object]) -> Non
         _rename(move.legacy.path, destination)
         validated = _finish_ready(destination, source, move.ranges)
     ready_bundles._record_ready(paths.ledger, ledger, validated, source)
+    return validated.path
 
 
 def _moved_legacy(destination: Path, legacy: Bundle) -> bool:
@@ -1074,43 +1204,38 @@ def _finish_ready(
     return ready_bundles._read_ready_source(destination).result
 
 
-def _move_draft(paths: Paths, move: DraftMove) -> None:
+def _move_draft(paths: Paths, move: DraftMove) -> Path:
+    destination = _draft_destination(paths, move)
+    if destination.exists():
+        existing = _bundle(destination)
+        raw_sha256 = move.source.manifest.raw_sha256 if move.complete else _cropped_draft_digest(move)
+        if (
+            existing.manifest.start_sequence != move.start_sequence
+            or existing.manifest.next_sequence != move.next_sequence
+            or existing.manifest.raw_sha256 != raw_sha256
+        ):
+            raise MigrationError("draft destination conflicts with frozen plan")
+        return destination
     if move.complete:
-        destination = paths.draft / move.source.path.name
-        if destination.exists():
-            existing = _bundle(destination)
-            if existing.manifest != move.source.manifest or existing.receipt != move.source.receipt:
-                raise MigrationError("draft destination conflicts with frozen plan")
-            return
         if not move.source.path.exists():
             raise MigrationError("draft source vanished before move")
         _rename(move.source.path, destination)
-        return
-    expected = sha256()
-    offset = (move.start_sequence - move.source.manifest.start_sequence) * RECORD_SIZE
-    remaining = (move.next_sequence - move.start_sequence) * RECORD_SIZE
-    with (move.source.path / "records.bin").open("rb") as stream:
-        stream.seek(offset)
-        while remaining:
-            chunk = stream.read(min(1024 * 1024, remaining))
-            if not chunk:
-                raise MigrationError("captured records ended while validating cropped draft")
-            expected.update(chunk)
-            remaining -= len(chunk)
-    destination = paths.draft / f"{move.start_sequence}-{move.next_sequence}-{expected.hexdigest()[:16]}"
-    if destination.exists():
-        existing = _bundle(destination)
-        if existing.manifest.raw_sha256 != expected.hexdigest():
-            raise MigrationError("cropped draft destination conflicts with frozen plan")
-        return
+        return destination
     _copy_slice(move, paths.draft)
+    return destination
+
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        raise MigrationError("migration execute and finalize require root")
 
 
 def execute(paths: Paths) -> Plan:
+    _require_root()
     _quiescent(paths)
     with _held_producer_locks(paths):
         _inactive("omi-collector.service")
-        _inactive("omi-speech-archive-jit.service", disabled=True)
+        _inactive("omi-speech-archive-jit.service", disabled=True, optional=True)
         _windmill_quiescent()
         for root in (paths.draft, paths.ready, paths.evidence, paths.ledger.parent):
             if root.exists():
@@ -1126,13 +1251,12 @@ def execute(paths: Paths) -> Plan:
             _write(paths.ledger, _canonical({"bundles": {}, "frontier": 0}))
         _record_state_phase(paths, "applying")
         ledger = ready_bundles._read_ledger(paths.ledger)
-        for move in plan.ready:
-            _move_ready(paths, move, ledger)
-        for move in plan.drafts:
-            _move_draft(paths, move)
+        ready = tuple(_move_ready(paths, move, ledger) for move in plan.ready)
+        drafts = tuple(_move_draft(paths, move) for move in plan.drafts)
         inventory = _frozen_inventory(paths, before, provenance)
         _write(paths.inventory, _canonical(inventory))
         _record_state_phase(paths, "published")
+        _set_runtime_outputs(paths, ready, drafts)
     return plan
 
 
@@ -1334,10 +1458,11 @@ def _remove_retirement_controls(paths: Paths) -> None:
 
 
 def finalize(paths: Paths) -> None:
+    _require_root()
     _quiescent(paths)
     with _held_producer_locks(paths):
         _inactive("omi-collector.service")
-        _inactive("omi-speech-archive-jit.service", disabled=True)
+        _inactive("omi-speech-archive-jit.service", disabled=True, optional=True)
         _windmill_quiescent()
         phase = _retirement_phase(paths)
         if phase == "retired":

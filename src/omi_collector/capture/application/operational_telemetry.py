@@ -324,9 +324,7 @@ async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: Cloc
         )
 
 
-async def _sync_clock(sync: _ClockSync) -> None:  # noqa: PLR0911 - each failure class is an explicit safe exit
-    reader = sync.reader
-    writer = sync.writer
+async def _sync_clock(sync: _ClockSync) -> None:
     sample = sync.sample
     host_clock_synchronized = sync.host_clock_synchronized
     emit = sync.emit
@@ -356,34 +354,53 @@ async def _sync_clock(sync: _ClockSync) -> None:  # noqa: PLR0911 - each failure
     event["host_ntp_synchronized"] = trusted
     if not trusted:
         event.update(action="none", outcome="host_unsynchronized")
-        emit(event)
+        sync.emit(event)
         return
-    observation_evidence = _persist_clock_observation(sync)
+    await _sync_trusted_clock(sync, event, drift)
+
+
+async def _sync_trusted_clock(sync: _ClockSync, event: dict[str, object], drift: float) -> None:
+    """Persist only clock evidence needed for a correction or reconciliation."""
+    pending_operation = _pending_observation_operation(sync)
+    if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS and pending_operation is None:
+        event.update(action="none", outcome="within_threshold")
+        await _publish_timeline(sync, event)
+        sync.emit(event)
+        return
+    observation_evidence = _persist_clock_observation(sync, pending_operation)
     if observation_evidence is None:
         event.update(action="none", outcome="evidence_persist_failed")
-        emit(event)
+        sync.emit(event)
         return
     _reconcile_observation(sync, event, observation_evidence)
     if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
         event.update(action="none", outcome="within_threshold")
         await _publish_timeline(sync, event)
-        emit(event)
+        sync.emit(event)
         return
     target = int(sync.host_time())
     if not 0 <= target <= MAX_U32:
         event.update(action="none", outcome="target_unrepresentable")
-        emit(event)
+        sync.emit(event)
         return
-    if writer is None:
+    if sync.writer is None:
         event.update(action="none", outcome="time_write_missing")
-        emit(event)
+        sync.emit(event)
         return
     correction = _prepare_clock_intent(sync, event, target, drift, observation_evidence)
     if correction is None:
-        emit(event)
+        sync.emit(event)
         return
     readback = await _write_and_verify(
-        _ClockWrite(reader, writer, target, event, operation_timeout, sync.host_time, sync.host_monotonic)
+        _ClockWrite(
+            sync.reader,
+            sync.writer,
+            target,
+            event,
+            sync.operation_timeout,
+            sync.host_time,
+            sync.host_monotonic,
+        )
     )
     info_after = await _read_boundary_after(sync, event)
     if not _persist_post_clock_observation(
@@ -395,7 +412,7 @@ async def _sync_clock(sync: _ClockSync) -> None:  # noqa: PLR0911 - each failure
         event["outcome"] = "result_persist_failed"
     _finish_clock_intent(sync, correction, event, info_after, readback.epoch if readback else None)
     await _publish_timeline(sync, event)
-    emit(event)
+    sync.emit(event)
 
 
 async def _publish_timeline(sync: _ClockSync, event: dict[str, object]) -> None:
@@ -411,7 +428,7 @@ async def _publish_timeline(sync: _ClockSync, event: dict[str, object]) -> None:
         event["publication"] = "failed"
 
 
-def _persist_clock_observation(sync: _ClockSync) -> ClockObservationShape | None:
+def _persist_clock_observation(sync: _ClockSync, pending_operation: str | None) -> ClockObservationShape | None:
     sink = sync.observation_sink
     if sink is None:
         return None
@@ -430,7 +447,6 @@ def _persist_clock_observation(sync: _ClockSync) -> ClockObservationShape | None
         "info_sequence_min": sync.info_before.read_sequence,
         "info_sequence_max": sync.info_before.write_sequence,
     }
-    pending_operation = _pending_observation_operation(sync)
     initial = _initial_observation(sync, pending_operation)
     if pending_operation is not None and initial is not None:
         values.update(

@@ -8,6 +8,8 @@ from itertools import pairwise
 
 from .clock_observations import ClockObservation
 
+_RTC_QUANTIZATION_UNCERTAINTY_SECONDS = 1.0
+
 
 class ClockSegmentError(ValueError):
     """A proposed clock segment is ambiguous or invalid."""
@@ -47,7 +49,8 @@ class ClockSegment:
             membership.start_sequence,
             membership.next_sequence,
             midpoint - observation.device_epoch,
-            (observation.host_realtime_end - observation.host_realtime_start) / 2.0,
+            (observation.host_realtime_end - observation.host_realtime_start) / 2.0
+            + _RTC_QUANTIZATION_UNCERTAINTY_SECONDS,
         )
 
     def __post_init__(self) -> None:

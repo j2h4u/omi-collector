@@ -36,7 +36,7 @@ def test_segment_uses_rtc_read_midpoint_and_leaves_unconfirmed_records_unknown()
     mapping = ClockSegmentMap((segment,))
 
     assert segment.utc_offset_seconds == pytest.approx(-4.9)
-    assert segment.uncertainty_seconds == pytest.approx(0.1)
+    assert segment.uncertainty_seconds == pytest.approx(1.1)
     assert mapping.utc_for(12, 105) == pytest.approx(100.1)
     assert mapping.utc_for(11, 105) is None
     assert mapping.utc_for(15, 105) is None

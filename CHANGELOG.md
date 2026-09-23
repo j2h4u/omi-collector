@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.0](https://github.com/j2h4u/omi-collector/compare/v0.6.18...v0.7.0) (2026-09-23)
+
+
+### Features
+
+* **clock:** persist confirmed RTC segment evidence ([0fe50ef](https://github.com/j2h4u/omi-collector/commit/0fe50ef9d62c20364a39360ea82059fb4f86cd94))
+* **collector:** add one-time two-zone migration tool ([0fe50ef](https://github.com/j2h4u/omi-collector/commit/0fe50ef9d62c20364a39360ea82059fb4f86cd94))
+* **collector:** finalize raw drafts into ready bundles ([0fe50ef](https://github.com/j2h4u/omi-collector/commit/0fe50ef9d62c20364a39360ea82059fb4f86cd94))
+* **collector:** retire acknowledged ready bundles ([0fe50ef](https://github.com/j2h4u/omi-collector/commit/0fe50ef9d62c20364a39360ea82059fb4f86cd94))
+
+
+### Fixes
+
+* **clock:** bound RTC timestamp uncertainty ([0fe50ef](https://github.com/j2h4u/omi-collector/commit/0fe50ef9d62c20364a39360ea82059fb4f86cd94))
+* **collector:** accept terminal ready acknowledgements ([0fe50ef](https://github.com/j2h4u/omi-collector/commit/0fe50ef9d62c20364a39360ea82059fb4f86cd94))
+
+
+### Documentation
+
+* plan two-zone Omi pipeline migration ([0fe50ef](https://github.com/j2h4u/omi-collector/commit/0fe50ef9d62c20364a39360ea82059fb4f86cd94))
+
 ## [0.6.18](https://github.com/j2h4u/omi-collector/compare/v0.6.17...v0.6.18) (2026-09-23)
 
 

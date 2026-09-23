@@ -223,6 +223,41 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
     assert second_result is None
 
 
+def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path) -> None:
+    drafts = _capture_root(tmp_path)
+    published = tmp_path / "ready"
+    _one_record_bundle(drafts, 100, 43)
+    store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published)
+    first = cast(tuple[object, ...], store.recover_and_publish())
+    assert len(first) == 1
+    bundle = next(published.iterdir())
+    manifest = cast(dict[str, object], loads((bundle / "manifest.json").read_text(encoding="utf-8")))
+    checkpoint = published.parent / "work" / "omi-ready-checkpoint.json"
+    checkpoint.parent.mkdir()
+    identity = {"bundle_id": manifest["bundle_id"], "records_sha256": manifest["records_sha256"]}
+    decision = {
+        **identity,
+        "packet_ranges": [],
+        "packet_count": 0,
+        "input_id": None,
+        "input_sha256": None,
+        "receipt_sha256": None,
+    }
+    checkpoint.write_text(
+        dumps(
+            {"analysis_cursor": None, "vad_decisions": [decision], "open_speech_tail": None, "acknowledged": [identity]}
+        ),
+        encoding="utf-8",
+    )
+
+    assert store.recover_and_publish() is None
+    assert tuple(published.iterdir()) == ()
+    ledger = cast(dict[str, object], loads((tmp_path / "ready-publications.json").read_text(encoding="utf-8")))
+    bundles = cast(dict[str, dict[str, object]], ledger["bundles"])
+    bundle_id = cast(str, manifest["bundle_id"])
+    assert bundles[bundle_id]["state"] == "retired"
+
+
 def _publication_store(tmp_path: Path) -> StagingStore:
     capture_root = _capture_root(tmp_path)
     _one_record_bundle(capture_root, 100, 1)

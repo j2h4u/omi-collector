@@ -38,8 +38,10 @@ Omi Collector provides the narrow first stage:
 - atomically finalizes sealed ready bundles with per-range UTC metadata;
 - records operational metrics and recent debug context in local state.
 
-It deliberately does **not** transcode, run VAD, transcribe, call the Omi cloud,
-or delete published bundles. Those are downstream responsibilities.
+It deliberately does **not** transcode, run VAD, transcribe, or call the Omi
+cloud. Windmill owns downstream processing; the collector removes a ready
+bundle only after Windmill durably acknowledges that exact bundle and digest.
+Bundles referenced by Windmill's open speech tail remain available.
 
 ## What comes next
 
@@ -72,6 +74,11 @@ range, record count, hashes, and time ranges. Windmill discovers only complete
 ready bundles. The `draft` and `collector` directories remain internal to Omi Collector,
 `work` is temporary Windmill state, and `speech` contains Windmill's completed
 audio and passport artifacts.
+
+Windmill's durable checkpoint acknowledges a ready bundle only after every
+packet has durable speech or no-speech handling. The collector validates that
+ACK against the ready manifest and its producer ledger, records retirement,
+then removes the exact ready directory. An open speech tail is never an ACK.
 
 ## Requirements
 

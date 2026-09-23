@@ -18,7 +18,7 @@ from . import publication, quarantine
 from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionStore
 from .clock_memberships import ClockMembershipStore
-from .ready_bundles import finalize_drafts
+from .ready_bundles import finalize_drafts, retire_acknowledged
 from .recovery import Recovery
 from .staging_contract import (
     _DESCRIPTOR_NAME,
@@ -128,8 +128,6 @@ class StagingStore:
     def _publish_ready(self, held_lease: DeviceLock | None) -> object | None:
         if self._publication_root is None:
             return None
-        if not self._has_draft_bundles():
-            return None
         if held_lease is None:
             with self.device_lock(recover_capture_temporaries=False):
                 return self._recover_and_publish_unlocked()
@@ -194,13 +192,19 @@ class StagingStore:
         corrections.reconcile_recovered_observations(
             near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
         )
+        ledger_path = self.device_state_path.parent / "ready-publications.json"
+        retire_acknowledged(
+            publication_root,
+            ledger_path,
+            publication_root.parent / "work" / "omi-ready-checkpoint.json",
+        )
         if not self._has_draft_bundles():
             return None
         segments = ClockMembershipStore(self.device_state_path).segments(corrections.observation_store.records())
         return finalize_drafts(
             self.capture_root,
             publication_root,
-            self.device_state_path.parent / "ready-publications.json",
+            ledger_path,
             segments,
         )
 

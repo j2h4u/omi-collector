@@ -175,7 +175,7 @@ def test_split_roots_publish_only_completed_bundles_to_capture_root(tmp_path: Pa
     capture_root = _capture_root(tmp_path)
     attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
 
     result = attempt.seal(DoneNotification(0, 101))
 
@@ -227,7 +227,7 @@ def test_recovery_quarantines_capture_temporary_with_malformed_manifest_scalar(t
 def test_prefix_publication_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     capture_root = _capture_root(tmp_path)
     attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     source_raw = (attempt.path / "records.bin").read_bytes()
 
@@ -248,7 +248,7 @@ def test_full_seal_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest
     capture_root = _capture_root(tmp_path)
     attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
 
     _guard_rename_to_capture(monkeypatch)
 
@@ -264,7 +264,7 @@ def test_full_seal_keeps_source_when_destination_copy_fails(tmp_path: Path, monk
     capture_root = _capture_root(tmp_path)
     attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
 
     def fail_copy(*_: object) -> None:
         raise OSError("simulated destination-copy failure")
@@ -310,8 +310,8 @@ def test_admission_reserves_staged_and_captured_raw_peak_before_read(tmp_path: P
     )
     attempt = admitted.prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
-    attempt.append_record(0, 100, _record(1))
-    attempt.append_record(1, 101, _record(2))
+    attempt.accept_chunk(100, _record(1))
+    attempt.accept_chunk(101, _record(2))
 
     result = attempt.seal(DoneNotification(0, 102))
 
@@ -325,7 +325,7 @@ def test_enospc_during_copy_preserves_recoverable_staged_evidence(
     capture_root = _capture_root(tmp_path)
     attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     raw = (attempt.path / "records.bin").read_bytes()
 
     def fail_copy(*_args: object) -> None:
@@ -347,7 +347,7 @@ def test_seal_rejects_capture_root_symlink_swap_before_rename(tmp_path: Path) ->
     capture_root = _capture_root(tmp_path)
     attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     outside = tmp_path / "outside"
     outside.mkdir()
     backup = tmp_path / "capture-backup"
@@ -366,7 +366,7 @@ def test_prefix_publication_rejects_capture_root_symlink_swap_before_rename(tmp_
     capture_root = _capture_root(tmp_path)
     attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -390,8 +390,8 @@ def test_streaming_seal_is_the_raw_durability_boundary(tmp_path: Path) -> None:
         fsync(fd)
 
     attempt = _started_streaming_attempt(tmp_path, count=2, fsync_fn=track_sync)
-    attempt.append_record(0, 100, _record(1))
-    attempt.append_record(1, 101, _record(2))
+    attempt.accept_chunk(100, _record(1))
+    attempt.accept_chunk(101, _record(2))
     before_seal = sync_calls
 
     result = attempt.seal(DoneNotification(0, 102))
@@ -406,9 +406,9 @@ def test_cursor_ahead_publishes_ordinary_prefix_and_preserves_source_raw(tmp_pat
     attempt = _started_streaming_attempt(tmp_path, count=4)
     first = _record(1)
     tail = _record(2)
-    attempt.append_record(0, 100, first)
+    attempt.accept_chunk(100, first)
     attempt.checkpoint()
-    attempt.append_record(1, 101, tail)
+    attempt.accept_chunk(101, tail)
     source_raw = (attempt.path / "records.bin").read_bytes()
 
     result = attempt.publish_prefix()
@@ -437,7 +437,7 @@ def test_cursor_ahead_publishes_ordinary_prefix_and_preserves_source_raw(tmp_pat
 
 def test_cursor_ahead_publication_uses_only_checkpoint_prefix(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
 
     result = attempt.publish_prefix()
@@ -471,7 +471,7 @@ def test_zero_prefix_preserves_nonempty_raw_evidence(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     attempt = store.prepare_streaming_attempt(100, 2)
     attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     raw = (attempt.path / "records.bin").read_bytes()
     assert attempt.publish_prefix() is None
     assert attempt.path.exists()
@@ -485,11 +485,11 @@ def test_zero_prefix_preserves_nonempty_raw_evidence(tmp_path: Path) -> None:
 
 def test_streaming_deduplicates_identical_sealed_bundle(tmp_path: Path) -> None:
     first = _started_streaming_attempt(tmp_path, count=1)
-    first.append_record(0, 100, _record(1))
+    first.accept_chunk(100, _record(1))
     bundle = first.seal(DoneNotification(0, 101)).bundle_path
 
     duplicate = _started_streaming_attempt(tmp_path, count=1)
-    duplicate.append_record(0, 100, _record(1))
+    duplicate.accept_chunk(100, _record(1))
     result = duplicate.seal(DoneNotification(0, 101))
 
     assert result.bundle_path == bundle
@@ -505,8 +505,8 @@ def test_streaming_deduplicates_identical_sealed_bundle(tmp_path: Path) -> None:
 
 def test_seal_writes_bundle_manifest_and_receipt(tmp_path: Path) -> None:
     attempt = _started_attempt(tmp_path)
-    attempt.append_record(0, 100, _record(1))
-    attempt.append_record(1, 101, _record(2))
+    attempt.accept_chunk(100, _record(1))
+    attempt.accept_chunk(101, _record(2))
 
     result = attempt.seal(DoneNotification(0, 102))
 
@@ -534,7 +534,7 @@ def test_full_publication_uses_shared_bundle_directory_mode(tmp_path: Path, monk
 
     monkeypatch.setattr(publication.os, "mkdir", observed_mkdir)
     attempt = _started_attempt(tmp_path, count=1)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
 
     bundle = attempt.seal(DoneNotification(0, 101)).bundle_path
 
@@ -546,7 +546,7 @@ def test_full_publication_uses_shared_bundle_directory_mode(tmp_path: Path, monk
 
 def test_seal_requires_success_complete_count_and_next_sequence(tmp_path: Path) -> None:
     attempt = _started_attempt(tmp_path)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
 
     with pytest.raises(AttemptStateError):
         attempt.seal(DoneNotification(1, 102))
@@ -560,13 +560,13 @@ def test_exact_bundle_collision_deduplicates_but_other_content_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = _started_attempt(tmp_path)
-    first.append_record(0, 100, _record(1))
-    first.append_record(1, 101, _record(2))
+    first.accept_chunk(100, _record(1))
+    first.accept_chunk(101, _record(2))
     bundle = first.seal(DoneNotification(0, 102)).bundle_path
 
     duplicate = _started_attempt(tmp_path)
-    duplicate.append_record(0, 100, _record(1))
-    duplicate.append_record(1, 101, _record(2))
+    duplicate.accept_chunk(100, _record(1))
+    duplicate.accept_chunk(101, _record(2))
     deduplicated = duplicate.seal(DoneNotification(0, 102))
 
     assert deduplicated.bundle_path == bundle
@@ -575,8 +575,8 @@ def test_exact_bundle_collision_deduplicates_but_other_content_is_preserved(
     assert loads((bundle / "receipt.json").read_text(encoding="utf-8"))["attempt_id"] != duplicate.attempt_id
 
     conflict = _started_attempt(tmp_path)
-    conflict.append_record(0, 100, _record(9))
-    conflict.append_record(1, 101, _record(2))
+    conflict.accept_chunk(100, _record(9))
+    conflict.accept_chunk(101, _record(2))
     monkeypatch.setattr(StagedAttempt, "_bundle_path", lambda _attempt, _hash: bundle)
     with pytest.raises(CollisionError):
         conflict.seal(DoneNotification(0, 102))
@@ -588,8 +588,8 @@ def test_exact_bundle_collision_deduplicates_but_other_content_is_preserved(
 )
 def test_invalid_bundle_receipt_prevents_deduplication(tmp_path: Path, damage: str) -> None:
     first = _started_attempt(tmp_path)
-    first.append_record(0, 100, _record(1))
-    first.append_record(1, 101, _record(2))
+    first.accept_chunk(100, _record(1))
+    first.accept_chunk(101, _record(2))
     bundle = first.seal(DoneNotification(0, 102)).bundle_path
     receipt = bundle / "receipt.json"
     if damage == "missing":
@@ -609,8 +609,8 @@ def test_invalid_bundle_receipt_prevents_deduplication(tmp_path: Path, damage: s
         receipt.write_text(dumps(value), encoding="utf-8")
 
     duplicate = _started_attempt(tmp_path)
-    duplicate.append_record(0, 100, _record(1))
-    duplicate.append_record(1, 101, _record(2))
+    duplicate.accept_chunk(100, _record(1))
+    duplicate.accept_chunk(101, _record(2))
 
     with pytest.raises(CollisionError):
         duplicate.seal(DoneNotification(0, 102))
@@ -619,14 +619,14 @@ def test_invalid_bundle_receipt_prevents_deduplication(tmp_path: Path, damage: s
 
 def test_invalid_bundle_manifest_boolean_prevents_deduplication(tmp_path: Path) -> None:
     first = _started_attempt(tmp_path, count=1)
-    first.append_record(0, 100, _record(1))
+    first.accept_chunk(100, _record(1))
     bundle = first.seal(DoneNotification(0, 101)).bundle_path
     manifest = cast(dict[str, object], loads((bundle / "manifest.json").read_text(encoding="utf-8")))
     manifest["record_count"] = True
     (bundle / "manifest.json").write_text(dumps(manifest), encoding="utf-8")
 
     duplicate = _started_attempt(tmp_path, count=1)
-    duplicate.append_record(0, 100, _record(1))
+    duplicate.accept_chunk(100, _record(1))
 
     with pytest.raises(CollisionError):
         duplicate.seal(DoneNotification(0, 101))
@@ -667,11 +667,11 @@ def test_collision_detects_different_raw_size_and_invalid_receipt_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = _started_attempt(tmp_path, count=1)
-    first.append_record(0, 100, _record(1))
+    first.accept_chunk(100, _record(1))
     bundle = first.seal(DoneNotification(0, 101)).bundle_path
 
     duplicate = _started_attempt(tmp_path, count=1)
-    duplicate.append_record(0, 100, _record(1))
+    duplicate.accept_chunk(100, _record(1))
     monkeypatch.setattr(StagedAttempt, "_bundle_path", lambda _attempt, _hash: bundle)
     (bundle / "records.bin").write_bytes(b"short")
     with pytest.raises(CollisionError):

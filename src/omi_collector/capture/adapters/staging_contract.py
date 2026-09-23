@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 from json import JSONDecodeError, loads
 from pathlib import Path
 from typing import cast
@@ -211,10 +210,6 @@ def _descriptor_from_json(raw: dict[str, object]) -> AttemptDescriptor:
     )
 
 
-def _is_int(value: object, expected: int) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value == expected
-
-
 def _checkpoint_from_json(raw: dict[str, object], attempt_id: str) -> StreamingCheckpoint:
     if set(raw) != {"version", "attempt_id", "record_count", "raw_sha256"}:
         raise ValueError("checkpoint schema")
@@ -239,23 +234,3 @@ def _read_checkpoint(path: Path, attempt_id: str) -> StreamingCheckpoint:
         return _checkpoint_from_json(cast(dict[str, object], raw), attempt_id)
     except (OSError, JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as error:
         raise AttemptStateError("streaming checkpoint is malformed") from error
-
-
-def _manifest_prefix(prefix: DurablePrefix) -> dict[str, object]:
-    return {
-        "schema_version": 2,
-        "start_sequence": prefix.start_sequence,
-        "next_sequence": prefix.next_sequence,
-        "record_count": prefix.record_count,
-        "raw_sha256": prefix.raw_sha256,
-    }
-
-
-def _sha256_bytes(payload: bytes) -> str:
-    return sha256(payload).hexdigest()
-
-
-def _as_object(value: object) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise TypeError("expected JSON object")
-    return cast(dict[str, object], value)

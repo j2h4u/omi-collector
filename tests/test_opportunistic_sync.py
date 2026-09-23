@@ -72,7 +72,7 @@ from omi_collector.capture.application.session_lifecycle import (
     SessionLifecycle,
     SessionPhaseState,
     report_session_error,
-    retryable,
+    session_retry_outcome,
     validate_presence_policy,
 )
 from omi_collector.capture.domain.ring_protocol import (
@@ -1096,7 +1096,7 @@ async def test_startup_sweep_removes_only_aged_terminal_retired_partials(
     )
     attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(100))
+    attempt.accept_chunk(100, _record(100))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
@@ -1137,7 +1137,7 @@ async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startu
     )
     attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(100))
+    attempt.accept_chunk(100, _record(100))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
@@ -1495,9 +1495,9 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     attempt = store.prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
-    attempt.append_record(0, 100, _record(100))
+    attempt.accept_chunk(100, _record(100))
     attempt.checkpoint()
-    attempt.append_record(1, 101, _record(101))
+    attempt.accept_chunk(101, _record(101))
     attempt.close(durable=True)
 
     original_arena = batch_reconciliation.TransferArena
@@ -2701,15 +2701,15 @@ async def test_storage_not_ready_read_ack_reconnects_and_continues_collection(tm
     ]
 
 
-def test_only_storage_not_ready_ack_is_retryable() -> None:
-    assert retryable(RingAcknowledgementError(STATUS_STORAGE_NOT_READY))
-    assert not retryable(RingAcknowledgementError(1))
+def test_session_retry_outcome_only_storage_not_ready_ack_is_retryable() -> None:
+    assert session_retry_outcome(RingAcknowledgementError(STATUS_STORAGE_NOT_READY), connected=False) == "retry"
+    assert session_retry_outcome(RingAcknowledgementError(1), connected=False) is None
 
 
-def test_interrupted_read_timeout_is_retryable() -> None:
+def test_session_retry_outcome_retries_nested_transfer_cause() -> None:
     error = TransferInterruptedError("timed out", TransferCounters(0, 0, 0), cause=TimeoutError())
 
-    assert retryable(error)
+    assert session_retry_outcome(error, connected=True) == "connected_interrupted"
 
 
 @_async_test

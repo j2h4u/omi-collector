@@ -309,10 +309,6 @@ class StagingFilesystem:
         except OSError as error:
             raise StagingError("capture publication destination cannot be inspected") from error
 
-    def file_size(self, path: Path) -> int:
-        """Read one evidence size through the filesystem boundary."""
-        return _file_size(path)
-
 
 class DeviceLock:
     """Opaque active lease proving one coordinator owns a device spool lock."""
@@ -488,13 +484,6 @@ def _create_empty_synced(path: Path, sync: Fsync) -> None:
 
 def _fsync_path(path: Path, sync: Fsync) -> None:
     with path.open("rb") as file:
-        sync(file.fileno())
-
-
-def _append_synced(path: Path, payload: bytes, sync: Fsync) -> None:
-    with path.open("ab") as file:
-        file.write(payload)
-        file.flush()
         sync(file.fileno())
 
 

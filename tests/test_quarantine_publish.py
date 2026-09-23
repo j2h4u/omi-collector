@@ -42,9 +42,9 @@ def _quarantined_attempt(spool: Path) -> tuple[Path, bytes, bytes]:
     attempt.record_read_begin(ReadBeginNotification(100, 3))
     prefix = _record(1)
     tail = _record(2)
-    attempt.append_record(0, 100, prefix)
+    attempt.accept_chunk(100, prefix)
     attempt.checkpoint()
-    attempt.append_record(1, 101, tail)
+    attempt.accept_chunk(101, tail)
     attempt.close(durable=True)
     source = StagingStore(spool, spool.parent / "captures").quarantine_attempt_source(attempt.attempt_id)
     return source, prefix, tail

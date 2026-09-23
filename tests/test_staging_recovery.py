@@ -23,7 +23,7 @@ from omi_collector.capture.adapters.attempts import (
 )
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
-from omi_collector.capture.adapters.staging_contract import AttemptStateError, DeviceAlreadyRunningError
+from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 from omi_collector.config import CollectorConfig, StagingRetentionConfig
@@ -142,12 +142,6 @@ def _seed_acceptance_clock_state(tmp_path: Path) -> ClockCorrectionStore:
         parent_observation_id=initial.observation_id,
     )
     return corrections
-
-
-def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
-    attempt.record_read_begin(ReadBeginNotification(100, count))
-    return attempt
 
 
 def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
@@ -412,7 +406,7 @@ class _RecordingStream:
         self.wrapped.close()  # type: ignore[attr-defined]
 
 
-def test_streaming_append_uses_one_buffer_and_no_per_record_recovery_or_fsync(tmp_path: Path) -> None:
+def test_streaming_chunk_uses_one_buffer_and_no_per_record_recovery_or_fsync(tmp_path: Path) -> None:
     sync_calls = 0
 
     def track_sync(fd: int) -> None:
@@ -424,7 +418,7 @@ def test_streaming_append_uses_one_buffer_and_no_per_record_recovery_or_fsync(tm
     before_records = sync_calls
     attempt.recover = lambda: (_ for _ in ()).throw(AssertionError("streaming append recovered"))
     for index in range(3):
-        attempt.append_record(index, 100 + index, _record(index + 1))
+        attempt.accept_chunk(100 + index, _record(index + 1))
     assert sync_calls == before_records
     attempt.close()
     assert (attempt.path / "records.bin").read_bytes() == _record(1) + _record(2) + _record(3)
@@ -444,7 +438,7 @@ def test_terminal_retired_recognition_requires_checkpoint(tmp_path: Path, monkey
     )
     attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
@@ -462,7 +456,7 @@ def test_malformed_terminal_retired_marker_blocks_admission(tmp_path: Path) -> N
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     attempt = store.prepare_streaming_attempt(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
@@ -476,13 +470,13 @@ def test_malformed_terminal_retired_marker_blocks_admission(tmp_path: Path) -> N
 def test_recovery_accepts_overlap_replay_then_exact_append(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=3)
     first, second, third = _record(1), _record(2), _record(3)
-    attempt.append_record(0, 100, first)
+    attempt.accept_chunk(100, first)
     attempt.checkpoint()
     reopened = attempt
     reopened.begin_recovery(100, 3)
-    assert reopened.accept_record(100, first) is RecordDisposition.REPLAYED
-    assert reopened.accept_record(101, second) is RecordDisposition.APPENDED
-    assert reopened.accept_record(102, third) is RecordDisposition.APPENDED
+    assert reopened.accept_chunk(100, first)[0] is RecordDisposition.REPLAYED
+    assert reopened.accept_chunk(101, second)[0] is RecordDisposition.APPENDED
+    assert reopened.accept_chunk(102, third)[0] is RecordDisposition.APPENDED
     reopened.checkpoint()
     assert (reopened.path / "records.bin").read_bytes() == first + second + third
 
@@ -490,45 +484,24 @@ def test_recovery_accepts_overlap_replay_then_exact_append(tmp_path: Path) -> No
 def test_recovery_rejects_mismatch_gap_and_regression(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=3)
     first = _record(1)
-    attempt.append_record(0, 100, first)
+    attempt.accept_chunk(100, first)
     attempt.checkpoint()
     reopened = attempt
 
     reopened.begin_recovery(100, 3)
     with pytest.raises(RecordMismatchError):
-        reopened.accept_record(100, _record(9))
+        reopened.accept_chunk(100, _record(9))
     with pytest.raises(RecordGapError):
-        reopened.accept_record(102, _record(2))
+        reopened.accept_chunk(102, _record(2))
     with pytest.raises(RecordRegressionError):
-        reopened.accept_record(99, _record(9))
+        reopened.accept_chunk(99, _record(9))
 
 
 def test_recovery_accepts_replayed_durable_record(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.append_record(0, 100, _record(1))
+    attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     reopened = attempt
     reopened.begin_recovery(100, 2)
 
-    assert reopened.accept_record(100, _record(1)) is RecordDisposition.REPLAYED
-
-
-@pytest.mark.parametrize("damage", ["truncate", "tamper"])
-def test_recovery_uses_only_valid_contiguous_prefix(tmp_path: Path, damage: str) -> None:
-    attempt = _started_attempt(tmp_path, count=2)
-    attempt.append_record(0, 100, _record(1))
-    raw = attempt.path / "records.bin"
-    if damage == "truncate":
-        raw.write_bytes(raw.read_bytes()[:-1])
-    else:
-        raw.write_bytes(b"x" + raw.read_bytes()[1:])
-
-    recovery = StagingStore(tmp_path, _capture_root(tmp_path)).recover_attempt(attempt.attempt_id)
-
-    assert recovery.valid_records == 0
-    assert not recovery.clean
-    assert raw.exists()
-    with pytest.raises(AttemptStateError, match=r"record aligned|checkpoint hash|preserved"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id).append_record(
-            0, 100, _record(1)
-        )
+    assert reopened.accept_chunk(100, _record(1))[0] is RecordDisposition.REPLAYED

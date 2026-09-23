@@ -541,8 +541,8 @@ jobs cannot produce a successful aggregate result.
 
 ### 30. Delete the superseded record-oriented staging API
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Remove unused `StagingWriter.accept_record`. Migrate tests from
 `StagedAttempt.append_record` and its private helper to the production chunk
@@ -553,8 +553,8 @@ chunk validation, replay comparison, checkpoints, and crash scenarios.
 
 ### 31. Remove durability state from `TransferArena`
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Arena durability checkpoints and durable/submitted chunk iterators have no
 production consumer. Actual durability belongs to the staging writer and batch
@@ -566,8 +566,8 @@ behavior.
 
 ### 32. Remove the unused record decoder/assembler island
 
-- [ ] Implemented
-- [ ] Verified
+- [x] Implemented
+- [x] Verified
 
 Remove `RingRecord`, `parse_audio_payload`, and `RingRecordAssembler` with their
 isolated tests. Retain wire notification parsing, record-size constants, arena
@@ -595,16 +595,21 @@ knobs or identically implemented `open_attempt` variants remain.
 
 Remove, after a fresh reference check:
 
+Completed in this pass:
+
 - the unused staging-contract conversion/hash helpers and resulting imports;
 - unused filesystem `file_size` and append helper;
 - unused held-lease aliases;
 - the duplicate `StagingWriterTarget` protocol;
 - the unused `RingTransport` and `OperationalSession` protocols;
 - unused battery-first collection helper;
-- unused observation-boundary helper;
-- unread publication retry counter;
-- unpopulated replay/append result fields and unread progress total;
+- the unread publication retry counter;
 - test-only convenience entrypoints whose tests can use production paths.
+
+Still pending:
+
+- unused observation-boundary helper;
+- unpopulated replay/append result fields and unread progress total.
 
 Do not remove framework-dispatched logging overrides, Typer commands, pytest
 fixtures, consumed protocol parameters, `RingSession`, `WriterTarget`, lease

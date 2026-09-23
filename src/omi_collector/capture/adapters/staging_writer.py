@@ -18,7 +18,6 @@ import sys
 from contextlib import AbstractContextManager
 from pathlib import Path
 from threading import get_ident
-from typing import Protocol
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .attempts import RecordDisposition, StagedAttempt
@@ -26,42 +25,6 @@ from .publication import SealResult
 from .staging_contract import AttemptDescriptor, DurablePrefix
 from .staging_filesystem import DeviceLock
 from .staging_store import StagingStore
-
-
-class StagingWriterTarget(Protocol):
-    """Synchronous target surface suitable for :class:`AttemptWriter`."""
-
-    def prepare(self) -> AttemptDescriptor:
-        """Acquire the device lease and prepare or resume the attempt."""
-        ...
-
-    def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefix:
-        """Persist the initial or recovery-leg intent."""
-        ...
-
-    def read_begin(self, notice: ReadBeginNotification) -> None:
-        """Persist the device's READ_BEGIN metadata."""
-        ...
-
-    def append_chunk(self, offset: int, chunk: memoryview) -> tuple[RecordDisposition, ...]:
-        """Accept one aligned chunk from the shared transfer arena."""
-        ...
-
-    def checkpoint(self) -> DurablePrefix:
-        """Return the staging layer's durable prefix."""
-        ...
-
-    def seal(self, done: DoneNotification) -> SealResult:
-        """Validate and publish a completed attempt."""
-        ...
-
-    def publish_prefix(self) -> SealResult | None:
-        """Publish the checkpoint-authenticated prefix as an ordinary bundle."""
-        ...
-
-    def close(self) -> None:
-        """Flush and release the attempt and device lease."""
-        ...
 
 
 class StagingWriterError(RuntimeError):
@@ -222,18 +185,6 @@ class StagingWriter:
         self._require_lease()
         sequence = self._active_start + offset // RECORD_SIZE
         return self._attempt.accept_chunk(sequence, chunk)
-
-    def accept_record(self, sequence: int, record: bytes) -> RecordDisposition:
-        """Compatibility seam for the existing record-oriented read helper."""
-        self._enter("accept_record")
-        self._require_ready_for_data()
-        if sequence < self._active_start or sequence >= self._active_start + self._active_count:
-            raise ValueError("record sequence is outside the prepared READ leg")
-        if len(record) != RECORD_SIZE:
-            raise ValueError(f"record must be exactly {RECORD_SIZE} bytes")
-        assert self._attempt is not None
-        self._require_lease()
-        return self._attempt.accept_record(sequence, record)
 
     def checkpoint(self) -> DurablePrefix:
         """Checkpoint through the existing staging API."""

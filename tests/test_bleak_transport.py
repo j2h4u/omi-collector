@@ -326,11 +326,8 @@ async def test_notification_stream_validates_and_closes_idempotently() -> None:
     stream = ControlNotificationStream(buffer_bytes=64)
     assert stream.__aiter__() is stream
     stream.feed(memoryview(b"queued"))
-    assert stream.buffered_bytes == len(b"queued")
     stream.close()
-    assert stream.buffered_bytes == 0
     stream.close()
-    assert stream.buffered_bytes == 0
     stream.feed(b"ignored")
 
     with pytest.raises(StopAsyncIteration):
@@ -356,7 +353,6 @@ async def test_notification_stream_rejects_repeated_empty_payloads_without_queue
     for _ in range(1000):
         stream.feed(b"")
 
-    assert stream.buffered_bytes == 0
     assert stream._queue.qsize() == 0
     with pytest.raises(NotificationProtocolError, match="must not be empty"):
         await stream.__anext__()
@@ -367,11 +363,8 @@ async def test_notification_stream_close_after_overflow_discards_pending_bytes()
     stream = ControlNotificationStream(buffer_bytes=3)
     stream.feed(b"one")
     stream.feed(b"two")
-    assert stream.buffered_bytes == 3
-
     stream.close()
     stream.close()
-    assert stream.buffered_bytes == 0
     with pytest.raises(NotificationOverflowError, match="overflowed"):
         await stream.__anext__()
 
@@ -381,11 +374,8 @@ async def test_notification_stream_close_after_disconnect_discards_pending_bytes
     stream = ControlNotificationStream(buffer_bytes=3)
     stream.feed(b"one")
     stream.fail_disconnected()
-    assert stream.buffered_bytes == 3
-
     stream.close()
     stream.close()
-    assert stream.buffered_bytes == 0
     with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
         await stream.__anext__()
 
@@ -401,10 +391,8 @@ async def test_notification_stream_disconnect_drains_queued_data_in_order() -> N
 
     for payload in payloads:
         assert await stream.__anext__() == payload
-    assert stream.buffered_bytes == 0
     with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
         await stream.__anext__()
-    assert stream.buffered_bytes == 0
 
 
 @_async_test
@@ -438,12 +426,10 @@ async def test_notification_stream_accepts_exact_byte_boundary_and_accounts_dequ
     stream = ControlNotificationStream(buffer_bytes=8)
     stream.feed(b"1234")
     stream.feed(b"5678")
-    assert stream.buffered_bytes == 8
-
     assert await stream.__anext__() == b"1234"
-    assert stream.buffered_bytes == 4
+    stream.feed(b"abcd")
     assert await stream.__anext__() == b"5678"
-    assert stream.buffered_bytes == 0
+    assert await stream.__anext__() == b"abcd"
 
 
 @_async_test
@@ -453,9 +439,7 @@ async def test_notification_stream_rejects_first_over_budget_payload_and_drains_
     stream.feed(b"56")
     stream.feed(b"ignored")
 
-    assert stream.buffered_bytes == 4
     assert await stream.__anext__() == b"1234"
-    assert stream.buffered_bytes == 0
     with pytest.raises(NotificationOverflowError, match="overflowed"):
         await stream.__anext__()
 
@@ -478,16 +462,12 @@ async def test_notification_stream_default_budget_accepts_full_maximum_read() ->
         chunk_size = min(19, audio_bytes - index * 19)
         stream.feed(b"\x03" + bytes(chunk_size))
 
-    expected_bytes = sum(map(len, control_payloads)) + audio_bytes + notification_count
-    assert stream.buffered_bytes == expected_bytes
-
     for payload in control_payloads:
         assert await stream.__anext__() == payload
     for index in range(notification_count):
         payload = await stream.__anext__()
         assert payload[0] == 0x03
         assert len(payload) == 1 + min(19, audio_bytes - index * 19)
-    assert stream.buffered_bytes == 0
 
 
 def test_transport_defaults_project_from_central_config() -> None:

@@ -298,11 +298,12 @@ def test_successful_recovery_after_device_contention_emits_publication_after_blo
         attempts = 0
         events: list[tuple[str, str]] = []
 
-        def recover_and_publish() -> None:
+        def recover_and_publish() -> object | None:
             nonlocal attempts
             attempts += 1
             if attempts == 1:
                 raise DeviceAlreadyRunningError("recovery is already active")
+            return ("ready",)
 
         store.recover_and_publish = recover_and_publish  # type: ignore[method-assign]
         runtime = OpportunisticRuntime()
@@ -319,9 +320,23 @@ def test_successful_recovery_after_device_contention_emits_publication_after_blo
 
         assert attempts == 2
         assert events == [
-            ("exception", "timeline_generation_blocked"),
-            ("event", "timeline_generation_published"),
+            ("exception", "ready_publication_blocked"),
+            ("event", "ready_publication_published"),
         ]
+
+    _run(scenario())
+
+
+def test_empty_recovery_does_not_claim_ready_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        runtime = OpportunisticRuntime()
+        monkeypatch.setattr(runtime, "debug_event", lambda event, **_fields: events.append(event))
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, runtime)
+
+        await maintenance.ensure_publication_ready()
+
+        assert events == []
 
     _run(scenario())
 

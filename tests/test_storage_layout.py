@@ -18,9 +18,8 @@ def test_config_parent_is_storage_root_and_loading_creates_nothing(tmp_path: Pat
     assert loaded.pendant.address == "AA:BB:CC:DD:EE:FF"
     assert loaded.storage.root == tmp_path
     assert loaded.storage.collector.root == tmp_path / "collector"
-    assert loaded.storage.captured == tmp_path / "captured"
-    assert loaded.storage.publication.root == tmp_path / "source"
-    assert loaded.storage.publication.current == tmp_path / "source" / "current"
+    assert loaded.storage.draft == tmp_path / "draft"
+    assert loaded.storage.publication.root == tmp_path / "ready"
     assert not loaded.storage.collector.root.exists()
     assert loaded.config.presence.arrival_stability_seconds == 30.0
     assert loaded.config.presence.arrival_max_gap_seconds == 10.0

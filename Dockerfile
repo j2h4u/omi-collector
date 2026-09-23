@@ -32,7 +32,7 @@ COPY --chown=1000:1000 config/config.toml.example /data/omi/config.toml
 
 RUN groupadd --gid 1000 app \
     && useradd --uid 1000 --gid 1000 --create-home app \
-    && mkdir -p /data/omi/collector /data/omi/captured /data/omi/source \
+    && mkdir -p /data/omi/collector /data/omi/draft /data/omi/ready \
     && chown -R app:app /data/omi
 
 USER 1000:1000

@@ -162,7 +162,12 @@ def _configure_clock_sinks(
         observation = correction.observation_store
     elif observation is not correction.observation_store:
         raise ValueError("clock observation sink must belong to the clock correction sink")
-    return replace(options, clock_correction_sink=correction, clock_observation_sink=observation)
+    return replace(
+        options,
+        clock_correction_sink=correction,
+        clock_observation_sink=observation,
+        clock_membership_store=options.clock_membership_store or staging.clock_membership_store,
+    )
 
 
 def _validate_composition(staging: object, runtime: object) -> None:

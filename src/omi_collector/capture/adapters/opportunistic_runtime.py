@@ -68,23 +68,23 @@ class _StagingWriterAdapter:
         if not isinstance(done_notice, DoneNotification):
             raise TypeError("done_notice must be a DoneNotification")
         result = self._writer.seal(done_notice)
-        self._publish_timeline()
+        self._publish_ready()
         return result
 
     def publish_prefix(self) -> SealResultShape | None:
         result = self._writer.publish_prefix()
         if result is not None:
-            self._publish_timeline()
+            self._publish_ready()
         return result
 
-    def _publish_timeline(self) -> None:
+    def _publish_ready(self) -> None:
         try:
-            result = self._writer.publish_timeline()
+            result = self._writer.publish_ready()
             if result is not None:
-                debug_event("timeline_generation_published")
+                debug_event("ready_publication_published")
         except Exception as error:  # noqa: BLE001 - capture remains authoritative while publication waits
             self._notify_publication_failure()
-            debug_exception("timeline_generation_blocked", error)
+            debug_exception("ready_publication_blocked", error)
 
     def close(self) -> None:
         self._writer.close()

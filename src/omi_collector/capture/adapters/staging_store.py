@@ -16,6 +16,9 @@ from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from . import publication, quarantine
 from .attempts import StagedAttempt
+from .clock_corrections import ClockCorrectionStore
+from .clock_memberships import ClockMembershipStore
+from .ready_bundles import finalize_drafts, retire_acknowledged
 from .recovery import Recovery
 from .staging_contract import (
     _DESCRIPTOR_NAME,
@@ -113,19 +116,17 @@ class StagingStore:
         store._publication_lock = Lock()
         return store
 
-    def publish_timeline(self, held_lease: DeviceLock | None = None) -> object | None:
+    def publish_ready(self, held_lease: DeviceLock | None = None) -> object | None:
         """Publish a complete normalized view when this store has an external boundary."""
         if not self._publication_lock.acquire(blocking=False):
-            raise AttemptStateError("timeline publication is already active")
+            raise AttemptStateError("ready publication is already active")
         try:
-            return self._publish_timeline(held_lease)
+            return self._publish_ready(held_lease)
         finally:
             self._publication_lock.release()
 
-    def _publish_timeline(self, held_lease: DeviceLock | None) -> object | None:
+    def _publish_ready(self, held_lease: DeviceLock | None) -> object | None:
         if self._publication_root is None:
-            return None
-        if not self._has_captured_bundles():
             return None
         if held_lease is None:
             with self.device_lock(recover_capture_temporaries=False):
@@ -146,15 +147,15 @@ class StagingStore:
     def _publish_with_authority(self, authority: _PublicationAuthority) -> object | None:
         """Publish under an issued capability, never under task-local identity."""
         if not self._publication_lock.acquire(blocking=False):
-            raise AttemptStateError("timeline publication is already active")
+            raise AttemptStateError("ready publication is already active")
         try:
             if authority is not self._publication_authority:
                 raise AttemptStateError("publication authority is revoked or was not issued by this store")
             try:
                 lease = self._publication_authority_lease
                 if lease is not None and lease._matches(self._filesystem):
-                    return self._publish_timeline(lease)
-                return self._publish_timeline(None)
+                    return self._publish_ready(lease)
+                return self._publish_ready(None)
             except Exception:
                 authority.schedule_retry()
                 raise
@@ -175,51 +176,43 @@ class StagingStore:
             self._publication_authority = None
             self._publication_authority_lease = None
 
-    def recover_and_publish(self, entries: object = (), *, apply: bool = True) -> object | None:
-        """Replay durable clock evidence and publish without a BLE connection."""
+    def recover_and_publish(self) -> object | None:
+        """Replay native durable clock evidence and publish without a BLE connection."""
         if self._publication_root is None:
             return None
         with self.device_lock(recover_capture_temporaries=False):
-            return self._recover_and_publish_unlocked(entries, apply=apply)
+            return self._recover_and_publish_unlocked()
 
-    def _recover_and_publish_unlocked(self, entries: object = (), *, apply: bool = True) -> object:
-        from .clock_recovery import HistoricalClockImporter
-
+    def _recover_and_publish_unlocked(self) -> object | None:
         publication_root = self._publication_root
         if publication_root is None:
             return None
-        decisions = HistoricalClockImporter(self.device_state_path, self.capture_root).recover(
-            entries,
-            apply=apply,
-            dry_run=not apply,
+        corrections = ClockCorrectionStore(self.device_state_path)
+        corrections.recover_prepared()
+        corrections.reconcile_recovered_observations(
+            near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
         )
-        if not self._has_captured_bundles():
-            return decisions
-        from .timeline_generations import publish_from_ledger
+        ledger_path = self.device_state_path.parent / "ready-publications.json"
+        retire_acknowledged(
+            publication_root,
+            ledger_path,
+            publication_root.parent / "work" / "omi-ready-checkpoint.json",
+        )
+        if not self._has_draft_bundles():
+            return None
+        segments = ClockMembershipStore(self.device_state_path).segments(corrections.observation_store.records())
+        return finalize_drafts(
+            self.capture_root,
+            publication_root,
+            ledger_path,
+            segments,
+        )
 
-        return publish_from_ledger(self.capture_root, publication_root, self.device_state_path.parent)
-
-    def _has_captured_bundles(self) -> bool:
+    def _has_draft_bundles(self) -> bool:
         try:
             return any(self.capture_root.iterdir())
         except FileNotFoundError:
             return False
-
-    def recover_clock(self, entries: object = (), *, apply: bool = False) -> tuple[object, ...]:
-        """Validate/apply clock evidence while holding the collector lease."""
-        if self._publication_root is None:
-            return ()
-        publication_root = self._publication_root
-        with self.device_lock(recover_capture_temporaries=False):
-            from .clock_recovery import HistoricalClockImporter
-
-            importer = HistoricalClockImporter(self.device_state_path, self.capture_root)
-            decisions = importer.recover(entries, apply=apply, dry_run=not apply)
-            if apply and self._has_captured_bundles():
-                from .timeline_generations import publish_from_ledger
-
-                publish_from_ledger(self.capture_root, publication_root, self.device_state_path.parent)
-            return decisions
 
     @property
     def capture_root(self) -> Path:
@@ -251,6 +244,10 @@ class StagingStore:
     @property
     def device_state_path(self) -> Path:
         return self._filesystem.device_state_path
+
+    @property
+    def clock_membership_store(self) -> ClockMembershipStore:
+        return ClockMembershipStore(self.device_state_path)
 
     @property
     def paths(self) -> StagingPaths:

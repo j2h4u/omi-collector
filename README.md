@@ -9,7 +9,7 @@
 
 Omi Collector discovers a nearby pendant over Bluetooth Low Energy, downloads
 its buffered records, survives interrupted transfers, corrects known clock
-shifts, and publishes validated source bundles for the audio pipeline that
+shifts, and finalizes immutable ready bundles for the audio pipeline that
 follows. It works with the stock pendant firmware and runs unattended as a
 systemd service.
 
@@ -35,15 +35,17 @@ Omi Collector provides the narrow first stage:
 - resumes after ordinary disconnects and process restarts;
 - verifies replayed overlap instead of silently skipping records;
 - corrects timestamps around recorded pendant clock changes;
-- atomically publishes sealed bundles with one consistent timeline;
+- atomically finalizes sealed ready bundles with per-range UTC metadata;
 - records operational metrics and recent debug context in local state.
 
-It deliberately does **not** transcode, run VAD, transcribe, call the Omi cloud,
-or delete published bundles. Those are downstream responsibilities.
+It deliberately does **not** transcode, run VAD, transcribe, or call the Omi
+cloud. Windmill owns downstream processing; the collector removes a ready
+bundle only after Windmill durably acknowledges that exact bundle and digest.
+Bundles referenced by Windmill's open speech tail remain available.
 
 ## What comes next
 
-Our production installation passes the published source bundles to a private
+Our production installation passes the ready bundles to a private
 Windmill flow. That downstream implementation is not published in this
 repository. Windmill prepares temporary audio for voice activity detection
 (VAD), keeps only speech for long-term storage, and publishes one ordinary Ogg
@@ -57,22 +59,26 @@ runtime dependency and other users can attach a different processing pipeline.
 ### Pipeline boundary
 
 ```text
-Omi pendant -> Omi Collector -> source/current -> Windmill -> speech/*.ogg + speech/*.json
+Omi pendant -> Omi Collector -> ready/<bundle_id> -> Windmill -> speech/*.ogg + speech/*.json
 ```
 
-Omi Collector owns Bluetooth transfer, interruption recovery, source-loss
-reporting, clock correction, and publication of a consistent record timeline.
-Its public handoff is the generation exposed atomically at `source/current`.
-Each generation contains `generation.json` plus sequence-range directories;
-each range contains `records.bin`, `manifest.json`, and `receipt.json`.
+Omi Collector owns Bluetooth transfer, interruption recovery, sequence-loss
+reporting, clock correction, and finalization of ready bundles. Its public
+handoff is one immutable directory per bundle in `ready`. Each directory
+contains `records.bin` and `manifest.json`.
 
-`records.bin` stores consecutive 444-byte pendant records: a normalized Unix
-timestamp followed by the packed Opus payload. The manifest binds the sequence
-range, record count, size, and content hash; the receipt marks the bundle as
-sealed. Windmill discovers only these complete published ranges. The
-`captured` and `collector` directories remain internal to Omi Collector,
+`records.bin` stores consecutive 444-byte pendant records: a UTC timestamp
+only for confirmed clock ranges, otherwise the original device timestamp,
+followed by the unchanged packed Opus payload. The manifest binds the sequence
+range, record count, hashes, and time ranges. Windmill discovers only complete
+ready bundles. The `draft` and `collector` directories remain internal to Omi Collector,
 `work` is temporary Windmill state, and `speech` contains Windmill's completed
 audio and passport artifacts.
+
+Windmill's durable checkpoint acknowledges a ready bundle only after every
+packet has durable speech or no-speech handling. The collector validates that
+ACK against the ready manifest and its producer ledger, records retirement,
+then removes the exact ready directory. An open speech tail is never an ACK.
 
 ## Requirements
 
@@ -120,7 +126,7 @@ sudo install -o root -g root -m 0644 config/config.toml.example /srv/pipelines/o
 sudoedit /srv/pipelines/omi/config.toml
 sudo scripts/install-systemd-unit.sh
 sudo install -d -o omi-collector -g omi-collector -m 0750 \
-  /srv/pipelines/omi/collector /srv/pipelines/omi/captured /srv/pipelines/omi/source
+  /srv/pipelines/omi/collector /srv/pipelines/omi/draft /srv/pipelines/omi/ready
 sudo systemctl enable --now bluetooth.service
 sudo -u omi-collector bluetoothctl show
 sudo scripts/deploy-systemd-service.sh
@@ -225,16 +231,16 @@ sudo scripts/dev-deploy-release.sh v0.3.0
 
 `/srv/pipelines/omi/config.toml` is the single operator-facing configuration.
 Its parent is the storage root. The collector uses `collector` for private
-state, `captured` for captured inputs, and `source` for the current published
-history. The checked-in systemd unit grants write access to this one fixed root.
+state, `draft` for unfinished raw audio, and `ready` for immutable published
+bundles. The checked-in systemd unit grants write access to this one fixed root.
 
 Published bundles are a shared boundary. If another local account consumes
-them, configure either a shared Unix group or a default ACL on the source root.
+them, configure either a shared Unix group or a default ACL on the ready root.
 For a named downstream account, the ACL shape is:
 
 ```bash
-sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /srv/pipelines/omi/source
-sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /srv/pipelines/omi/source
+sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /srv/pipelines/omi/ready
+sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /srv/pipelines/omi/ready
 ```
 
 Replace `DOWNSTREAM`, and ensure every parent directory is traversable by both
@@ -308,27 +314,25 @@ distinguish among RTC restoration, sleep-time accounting, reset behavior, or
 another firmware defect.
 
 Correcting the clock can make later raw records appear earlier than records
-captured immediately before the write. The collector therefore persists its
-intent before changing the clock, reads the value back afterward, and records
-the exact sequence interval in which a verified reset occurred. It applies
-only this evidence-backed correction when publishing the audio timeline and
-also records the event in the operational journal. A bundle boundary alone is
-not proof of a clock correction.
+written immediately before the change. The collector persists its intent,
+verifies the readback, and confirms a sequence interval only after two INFO
+reads in the same BLE session. It rewrites timestamps only inside such a
+confirmed interval. Other records retain their device timestamps and are
+marked `utc: null` in the ready manifest. A bundle boundary alone is not proof
+of a clock correction.
 
-This gives consumers one monotonic recording timeline while preserving the
-device evidence. It does not explain or fix the underlying RTC behavior. Treat
-`sequence_loss` as confirmed unrecoverable source loss, and treat a raw
-timestamp regression as authorized only when it falls within a verified clock
-correction boundary. Recheck both behaviors after every firmware upgrade; a
-new version number alone is not proof that either one was fixed.
+This preserves device evidence without inventing UTC for historical backlog.
+It does not explain or fix the underlying RTC behavior. Treat `sequence_loss`
+as confirmed unrecoverable loss, and treat a raw timestamp regression as UTC
+known only when it falls within a confirmed clock-membership range. Recheck
+both behaviors after every firmware upgrade; a new version number alone is not
+proof that either one was fixed.
 
-Clock observations are retained in a separate immutable evidence ledger. A
-restart replays that ledger and can publish a safe captured prefix without a
-new BLE visit. For an older incident, use `device clock-recover` with a finite
-machine-readable journald JSON export; the importer accepts only one host boot,
-numerically stable realtime/monotonic mapping, valid raw bundle hashes, and an
-unambiguous first record at the correction boundary. `--apply` performs the
-bounded recovery and publication; without it the command is validation-only.
+Clock observations, including healthy reads, are retained in a separate
+immutable evidence ledger. A restart replays native causal observations without
+a new BLE visit. UTC is estimated only for an explicitly confirmed clock
+segment from the host midpoint at its RTC read; records outside such a segment
+remain unknown rather than being assigned a guessed time.
 
 The optional `--force-1m` weak-RF workaround changes controller-wide PHY state.
 It is disabled by default and restores the prior selection after completion,

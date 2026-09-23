@@ -21,6 +21,7 @@ from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RingInfo, RingStatus
 from .ports import (
     ClockCorrectionShape,
+    ClockMembershipPort,
     ClockObservationShape,
     PublicationAuthorityPort,
     StorageLeaseFactory,
@@ -94,6 +95,7 @@ class TelemetryClock:
     status_reader: StatusReader | None = None
     correction_sink: ClockCorrectionSink | None = None
     observation_sink: ClockObservationSink | None = None
+    membership_store: ClockMembershipPort | None = None
     monotonic: Callable[[], float] = time.monotonic
     host_boot_id: str = field(default_factory=system_host_boot_id)
     session_id: str = "native"
@@ -183,6 +185,7 @@ async def collect_operational_telemetry(
         telemetry_clock.host_boot_id,
         telemetry_clock.session_id,
         telemetry_clock.monotonic,
+        telemetry_clock.membership_store,
         telemetry_clock.publisher,
     )
     await _sync_clock_with_mutation_lease(sync, telemetry_clock.mutation_lease)
@@ -300,6 +303,7 @@ class _ClockSync:
     host_boot_id: str
     session_id: str
     host_monotonic: Callable[[], float]
+    membership_store: ClockMembershipPort | None
     publisher: PublicationAuthorityPort | None
 
 
@@ -362,20 +366,17 @@ async def _sync_clock(sync: _ClockSync) -> None:
 async def _sync_trusted_clock(sync: _ClockSync, event: dict[str, object], drift: float) -> None:
     """Persist only clock evidence needed for a correction or reconciliation."""
     pending_operation = _pending_observation_operation(sync)
-    if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS and pending_operation is None:
-        event.update(action="none", outcome="within_threshold")
-        await _publish_timeline(sync, event)
-        sync.emit(event)
-        return
     observation_evidence = _persist_clock_observation(sync, pending_operation)
     if observation_evidence is None:
         event.update(action="none", outcome="evidence_persist_failed")
         sync.emit(event)
         return
-    _reconcile_observation(sync, event, observation_evidence)
+    if pending_operation is not None:
+        _reconcile_observation(sync, event, observation_evidence)
     if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
         event.update(action="none", outcome="within_threshold")
-        await _publish_timeline(sync, event)
+        await _record_same_session_membership(sync, observation_evidence, sync.info_before.write_sequence)
+        await _publish_ready(sync, event)
         sync.emit(event)
         return
     target = int(sync.host_time())
@@ -403,19 +404,27 @@ async def _sync_trusted_clock(sync: _ClockSync, event: dict[str, object], drift:
         )
     )
     info_after = await _read_boundary_after(sync, event)
-    if not _persist_post_clock_observation(
+    post_observation = _persist_post_clock_observation(
         sync,
         correction,
         info_after,
         readback,
+    )
+    if (
+        sync.observation_sink is not None
+        and readback is not None
+        and readback.epoch is not None
+        and post_observation is None
     ):
         event["outcome"] = "result_persist_failed"
+    elif info_after is not None and post_observation is not None:
+        await _record_same_session_membership(sync, post_observation, info_after.write_sequence)
     _finish_clock_intent(sync, correction, event, info_after, readback.epoch if readback else None)
-    await _publish_timeline(sync, event)
+    await _publish_ready(sync, event)
     sync.emit(event)
 
 
-async def _publish_timeline(sync: _ClockSync, event: dict[str, object]) -> None:
+async def _publish_ready(sync: _ClockSync, event: dict[str, object]) -> None:
     if sync.publisher is None:
         return
     try:
@@ -495,10 +504,10 @@ def _initial_observation(sync: _ClockSync, operation_id: str | None) -> ClockObs
 
 def _persist_post_clock_observation(
     sync: _ClockSync, correction: ClockCorrectionShape, info_after: RingInfo | None, readback: _ClockReadback | None
-) -> bool:
+) -> ClockObservationShape | None:
     sink = sync.observation_sink
     if sink is None or readback is None or readback.epoch is None:
-        return True
+        return None
     boundary = info_after.write_sequence if info_after is not None else sync.info_before.write_sequence
     effective_boundary = (
         info_after.write_sequence
@@ -527,10 +536,23 @@ def _persist_post_clock_observation(
             parent_observation_id=initial.observation_id,
         )
     try:
-        sink.append(**values)
+        return sink.append(**values)
     except Exception:  # noqa: BLE001 - uncertain result remains unresolved
-        return False
-    return True
+        return None
+
+
+async def _record_same_session_membership(
+    sync: _ClockSync, observation: ClockObservationShape, start_sequence: int
+) -> None:
+    store = sync.membership_store
+    if store is None or sync.info_reader is None:
+        return
+    try:
+        later = await _bounded_optional(sync.info_reader(), sync.operation_timeout)
+    except Exception:  # noqa: BLE001 - disconnected sessions never extend membership
+        return
+    if isinstance(later, RingInfo) and later.write_sequence > start_sequence:
+        store.record_membership(observation.observation_id, sync.session_id, start_sequence, later.write_sequence)
 
 
 async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> RingInfo | None:

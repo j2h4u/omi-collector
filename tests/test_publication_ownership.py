@@ -15,10 +15,10 @@ from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotifica
 
 
 def _store(tmp_path: Path) -> StagingStore:
-    capture_root = tmp_path / "captured"
+    capture_root = tmp_path / "draft"
     capture_root.mkdir()
     bootstrap = StagingStore(tmp_path / "spool", capture_root)
-    return StagingStore.from_paths(bootstrap.paths, publication_root=tmp_path / "source")
+    return StagingStore.from_paths(bootstrap.paths, publication_root=tmp_path / "ready")
 
 
 def _record(value: int) -> bytes:
@@ -40,10 +40,10 @@ def test_sealed_writer_publishes_with_its_held_lease(tmp_path: Path) -> None:
     authority = store.create_publication_authority()
     writer = _seal_writer(store)
 
-    generation = writer.publish_timeline()
+    ready = writer.publish_ready()
 
-    assert generation is not None
-    assert (tmp_path / "source" / "current").is_symlink()
+    assert ready is not None
+    assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     writer.close()
     authority.close()
 
@@ -61,7 +61,7 @@ def test_authorized_clock_child_task_publishes_after_writer_releases(tmp_path: P
         return await asyncio.create_task(publish())
 
     assert asyncio.run(publish_from_child_task()) is not None
-    assert (tmp_path / "source" / "current").is_symlink()
+    assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     authority.close()
 
 
@@ -88,14 +88,14 @@ def test_failed_sealed_publication_retains_capture_for_authorized_retry(
 
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", fail_publication)
     with pytest.raises(OSError, match="source unavailable"):
-        writer.publish_timeline()
+        writer.publish_ready()
 
     assert tuple(store.capture_root.iterdir())
-    assert not (tmp_path / "source" / "current").exists()
+    assert not tuple((tmp_path / "ready").glob("*/manifest.json"))
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", original)
 
     assert authority.publish() is not None
-    assert (tmp_path / "source" / "current").is_symlink()
+    assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     writer.close()
     authority.close()
 

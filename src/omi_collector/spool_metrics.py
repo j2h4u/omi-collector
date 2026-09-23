@@ -9,7 +9,6 @@ from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
-from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.firmware_observations import (
     FirmwareObservation,
     FirmwareObservationError,
@@ -17,6 +16,8 @@ from omi_collector.capture.adapters.firmware_observations import (
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
+
+_SHA256_HEX_LENGTH = 64
 
 
 class SpoolMetricsError(ValueError):
@@ -91,6 +92,16 @@ class _BundleMeasurement:
     ranges: tuple[tuple[int, int], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _ReadyManifest:
+    bundle_id: str
+    start_sequence: int
+    next_sequence: int
+    record_count: int
+    record_size: int
+    records_sha256: str
+
+
 def collect_spool_metrics(
     publication_root: Path,
     *,
@@ -108,34 +119,13 @@ def collect_spool_metrics(
 
 
 def _current_measurements(publication_root: Path) -> tuple[_BundleMeasurement, ...]:
-    current = publication_root / "current"
-    if not current.exists() and not current.is_symlink():
-        return ()
-    return _read_artifacts(_published_root(publication_root, current))
-
-
-def _published_root(publication_root: Path, current: Path) -> Path:
-    if not current.is_symlink():
-        raise SpoolMetricsError("current publication must be a generation link")
-    target = current.readlink()
-    if target.is_absolute():
-        raise SpoolMetricsError("current generation link must be relative")
-    authority = publication_root / ".generations"
-    try:
-        resolved = current.resolve(strict=True)
-        resolved_authority = authority.resolve(strict=True)
-    except OSError as error:
-        raise SpoolMetricsError("current generation link cannot be resolved") from error
-    if not resolved.is_dir() or resolved.parent != resolved_authority:
-        raise SpoolMetricsError("current generation link escapes its authority")
-    return resolved
+    return _read_artifacts(publication_root)
 
 
 def _read_artifacts(root: Path) -> tuple[_BundleMeasurement, ...]:
     measurements: list[_BundleMeasurement] = []
-    for entry in _entries(root, "publication generation"):
-        if entry.name.startswith(".") or entry.name in {"generation.json", "incidents"}:
-            # Retired gap-only incident directories are intentionally opaque.
+    for entry in _entries(root, "ready publication"):
+        if entry.name.startswith("."):
             continue
         if entry.is_symlink():
             continue
@@ -158,13 +148,10 @@ def _read_artifact(path: Path) -> _BundleMeasurement | None:
 
 def _read_bundle_artifact(path: Path) -> _BundleMeasurement:
     manifest = _read_manifest_and_raw(path)
-    _validate_receipt(path, manifest.raw_sha256)
     return _BundleMeasurement(
         (
-            "bundle",
-            manifest.start_sequence,
-            manifest.next_sequence,
-            manifest.raw_sha256,
+            "ready",
+            manifest.bundle_id,
         ),
         manifest.record_count,
         manifest.record_count * manifest.record_size,
@@ -172,18 +159,64 @@ def _read_bundle_artifact(path: Path) -> _BundleMeasurement:
     )
 
 
-def _read_manifest_and_raw(path: Path) -> BundleManifest:
-    manifest = _read_json(path / "manifest.json", "manifest.json")
-    try:
-        parsed = BundleManifest.from_json(manifest)
-    except ValueError as error:
-        raise SpoolMetricsError(f"manifest is invalid: {path}") from error
+def _read_manifest_and_raw(path: Path) -> _ReadyManifest:
+    manifest = _ready_manifest(path)
     raw_path = path / "records.bin"
     _require_regular_file(raw_path, "records.bin")
     raw_size, calculated_hash = _stream_size_and_hash(raw_path)
-    if raw_size != parsed.record_count * RECORD_SIZE or calculated_hash != parsed.raw_sha256:
+    if raw_size != manifest.record_count * RECORD_SIZE or calculated_hash != manifest.records_sha256:
         raise SpoolMetricsError(f"records.bin does not match manifest: {path}")
-    return parsed
+    return manifest
+
+
+def _ready_manifest(path: Path) -> _ReadyManifest:
+    value = _read_json(path / "manifest.json", "manifest.json")
+    required = {
+        "bundle_id",
+        "start_sequence",
+        "next_sequence",
+        "record_count",
+        "record_size",
+        "records_sha256",
+        "draft_raw_sha256",
+        "time_ranges",
+    }
+    if set(value) != required:
+        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
+    return _ready_manifest_values(value, path)
+
+
+def _ready_manifest_values(value: dict[str, object], path: Path) -> _ReadyManifest:
+    numeric = ("start_sequence", "next_sequence", "record_count", "record_size")
+    if any(isinstance(value[name], bool) or not isinstance(value[name], int) for name in numeric):
+        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
+    start, end, count, size = (cast(int, value[name]) for name in numeric)
+    if not _ready_dimensions_are_valid(start, end, count, size):
+        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
+    if not _ready_hashes_are_valid(value):
+        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
+    if not isinstance(value["time_ranges"], list) or not value["time_ranges"]:
+        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
+    identity = f"{start}:{end}:{value['draft_raw_sha256']}".encode()
+    if value["bundle_id"] != sha256(identity).hexdigest():
+        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
+    return _ReadyManifest(cast(str, value["bundle_id"]), start, end, count, size, cast(str, value["records_sha256"]))
+
+
+def _ready_dimensions_are_valid(start: int, end: int, count: int, size: int) -> bool:
+    return start >= 0 and end == start + count and count > 0 and size == RECORD_SIZE
+
+
+def _ready_hashes_are_valid(value: dict[str, object]) -> bool:
+    return all(_sha256(value[name]) for name in ("bundle_id", "records_sha256", "draft_raw_sha256"))
+
+
+def _sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == _SHA256_HEX_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _stream_size_and_hash(path: Path) -> tuple[int, str]:
@@ -261,16 +294,6 @@ def _unproven_hole_records(values: tuple[_BundleMeasurement, ...]) -> int:
         holes += max(0, start - previous_end)
         previous_end = max(previous_end, end)
     return holes
-
-
-def _validate_receipt(path: Path, raw_hash: str) -> None:
-    receipt = _read_json(path / "receipt.json", "receipt.json")
-    try:
-        parsed = SealedReceipt.from_json(receipt)
-    except ValueError as error:
-        raise SpoolMetricsError(f"sealed receipt fields are invalid: {path}") from error
-    if parsed.raw_sha256 != raw_hash:
-        raise SpoolMetricsError(f"sealed receipt does not authenticate artifact: {path}")
 
 
 def _read_json(path: Path, label: str) -> dict[str, object]:

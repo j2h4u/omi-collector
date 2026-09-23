@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/j2h4u/omi-collector/compare/v0.7.3...v0.7.4) (2026-09-23)
+
+
+### Refactoring
+
+* **collector:** remove obsolete capture paths ([#129](https://github.com/j2h4u/omi-collector/issues/129)) ([0da2550](https://github.com/j2h4u/omi-collector/commit/0da25509dae62d0e6c6b26a612de03eeed132c2e))
+
 ## [0.7.3](https://github.com/j2h4u/omi-collector/compare/v0.7.2...v0.7.3) (2026-09-23)
 
 

@@ -309,7 +309,7 @@ def test_boundary_drift_does_not_write_and_observation_is_safe() -> None:
     assert "audio" not in str(events)
 
 
-def test_healthy_clock_visit_does_not_persist_observation(tmp_path: Path) -> None:
+def test_healthy_clock_visit_persists_observation(tmp_path: Path) -> None:
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
     events: list[dict[str, object]] = []
     store = ClockCorrectionStore(tmp_path / "device.json")
@@ -331,7 +331,10 @@ def test_healthy_clock_visit_does_not_persist_observation(tmp_path: Path) -> Non
     )
 
     assert store.records() == ()
-    assert store.observation_store.records() == ()
+    observations = store.observation_store.records()
+    assert len(observations) == 1
+    assert observations[0].device_epoch == 1005
+    assert observations[0].observation_role == "standalone"
     assert events[-1]["outcome"] == "within_threshold"
 
 

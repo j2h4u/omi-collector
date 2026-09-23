@@ -70,6 +70,42 @@ def test_prepared_intent_recovers_as_not_written(tmp_path: Path) -> None:
     assert store.records()[0].state == "not_written"
 
 
+def test_startup_replay_ignores_legacy_anchored_monotonic_observations(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    correction = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    initial = store.observation_store.anchored_monotonic(
+        session_id="legacy",
+        host_boot_id="host-boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1300,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=correction.operation_id,
+        observation_role="initial",
+    )
+    store.observation_store.anchored_monotonic(
+        session_id="legacy",
+        host_boot_id="host-boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=2.0,
+        host_monotonic_end=2.0,
+        device_epoch=1000,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=correction.operation_id,
+        effective_boundary_sequence=20,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+
+    assert store.reconcile_recovered_observations(near_zero_threshold=5.0) == ()
+    assert store.records()[0].state == "unresolved"
+
+
 @pytest.mark.parametrize("state", ["prepared", "unresolved", "applied"])
 def test_prepare_rejects_any_pending_correction(tmp_path: Path, state: str) -> None:
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")

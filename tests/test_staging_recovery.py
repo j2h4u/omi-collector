@@ -190,7 +190,7 @@ def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_p
 
     result = store.recover_and_publish()
 
-    assert len(cast(tuple[object, ...], result)) == 1
+    assert result is None
     assert correction_store.records()[0].state == "applied"
     assert tuple(store.capture_root.iterdir()) == ()
 

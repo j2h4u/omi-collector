@@ -16,6 +16,7 @@ from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from . import publication, quarantine
 from .attempts import StagedAttempt
+from .clock_corrections import ClockCorrectionStore
 from .recovery import Recovery
 from .staging_contract import (
     _DESCRIPTOR_NAME,
@@ -175,26 +176,24 @@ class StagingStore:
             self._publication_authority = None
             self._publication_authority_lease = None
 
-    def recover_and_publish(self, entries: object = (), *, apply: bool = True) -> object | None:
-        """Replay durable clock evidence and publish without a BLE connection."""
+    def recover_and_publish(self) -> object | None:
+        """Replay native durable clock evidence and publish without a BLE connection."""
         if self._publication_root is None:
             return None
         with self.device_lock(recover_capture_temporaries=False):
-            return self._recover_and_publish_unlocked(entries, apply=apply)
+            return self._recover_and_publish_unlocked()
 
-    def _recover_and_publish_unlocked(self, entries: object = (), *, apply: bool = True) -> object:
-        from .clock_recovery import HistoricalClockImporter
-
+    def _recover_and_publish_unlocked(self) -> object | None:
         publication_root = self._publication_root
         if publication_root is None:
             return None
-        decisions = HistoricalClockImporter(self.device_state_path, self.capture_root).recover(
-            entries,
-            apply=apply,
-            dry_run=not apply,
+        corrections = ClockCorrectionStore(self.device_state_path)
+        corrections.recover_prepared()
+        corrections.reconcile_recovered_observations(
+            near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
         )
         if not self._has_captured_bundles():
-            return decisions
+            return None
         from .timeline_generations import publish_from_ledger
 
         return publish_from_ledger(self.capture_root, publication_root, self.device_state_path.parent)
@@ -204,22 +203,6 @@ class StagingStore:
             return any(self.capture_root.iterdir())
         except FileNotFoundError:
             return False
-
-    def recover_clock(self, entries: object = (), *, apply: bool = False) -> tuple[object, ...]:
-        """Validate/apply clock evidence while holding the collector lease."""
-        if self._publication_root is None:
-            return ()
-        publication_root = self._publication_root
-        with self.device_lock(recover_capture_temporaries=False):
-            from .clock_recovery import HistoricalClockImporter
-
-            importer = HistoricalClockImporter(self.device_state_path, self.capture_root)
-            decisions = importer.recover(entries, apply=apply, dry_run=not apply)
-            if apply and self._has_captured_bundles():
-                from .timeline_generations import publish_from_ledger
-
-                publish_from_ledger(self.capture_root, publication_root, self.device_state_path.parent)
-            return decisions
 
     @property
     def capture_root(self) -> Path:

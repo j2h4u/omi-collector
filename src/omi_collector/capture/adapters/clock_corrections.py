@@ -247,6 +247,20 @@ class ClockCorrectionStore:
             )
         return tuple(recovered)
 
+    def reconcile_recovered_observations(self, *, near_zero_threshold: float) -> tuple[ClockCorrection, ...]:
+        """Replay only durable native causal observations after a process restart."""
+        reconciled: list[ClockCorrection] = []
+        for observation in self._observations.records():
+            if observation.evidence_kind != "native_trusted" or observation.observation_role != "later":
+                continue
+            try:
+                reconciled.extend(
+                    self.reconcile_causal_observation(observation, near_zero_threshold=near_zero_threshold)
+                )
+            except ClockCorrectionError:
+                continue
+        return tuple(reconciled)
+
     def records(self) -> tuple[ClockCorrection, ...]:
         """Read every durable clock operation in stable path order."""
         if not self._root.exists():

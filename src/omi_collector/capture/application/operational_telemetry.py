@@ -362,17 +362,13 @@ async def _sync_clock(sync: _ClockSync) -> None:
 async def _sync_trusted_clock(sync: _ClockSync, event: dict[str, object], drift: float) -> None:
     """Persist only clock evidence needed for a correction or reconciliation."""
     pending_operation = _pending_observation_operation(sync)
-    if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS and pending_operation is None:
-        event.update(action="none", outcome="within_threshold")
-        await _publish_timeline(sync, event)
-        sync.emit(event)
-        return
     observation_evidence = _persist_clock_observation(sync, pending_operation)
     if observation_evidence is None:
         event.update(action="none", outcome="evidence_persist_failed")
         sync.emit(event)
         return
-    _reconcile_observation(sync, event, observation_evidence)
+    if pending_operation is not None:
+        _reconcile_observation(sync, event, observation_evidence)
     if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
         event.update(action="none", outcome="within_threshold")
         await _publish_timeline(sync, event)

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.5](https://github.com/j2h4u/omi-collector/compare/v0.7.4...v0.7.5) (2026-09-23)
+
+
+### Refactoring
+
+* **collector:** remove unused compatibility capture APIs ([#131](https://github.com/j2h4u/omi-collector/issues/131)) ([301f0b5](https://github.com/j2h4u/omi-collector/commit/301f0b5c9a07959a6f8e2d7b3ed5a63089c24b56))
+
 ## [0.7.4](https://github.com/j2h4u/omi-collector/compare/v0.7.3...v0.7.4) (2026-09-23)
 
 

@@ -339,6 +339,7 @@ def _runtime_error(error: tuple[datetime, dict[str, object]] | None) -> dict[str
     return {
         "error_message": progress.get("error_message"),
         "error_type": progress.get("error_type"),
+        "lock_context": progress.get("lock_context"),
         "occurred_at": _iso(timestamp),
         "phase": progress.get("phase"),
     }

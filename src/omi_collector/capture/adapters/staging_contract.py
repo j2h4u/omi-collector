@@ -50,8 +50,36 @@ class PendingAttemptError(StagingError):
     """Partial staging evidence blocks another READ for the same device."""
 
 
+@dataclass(frozen=True, slots=True)
+class LockContext:
+    """Safe attribution captured when another process owns the collector lock."""
+
+    requested_operation: str
+    holder_operation: str | None
+    holder_pid: int | None
+    holder_thread_id: int | None
+    holder_age_seconds: float | None
+    holder_scope: str
+    metadata_status: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "requested_operation": self.requested_operation,
+            "holder_operation": self.holder_operation,
+            "holder_pid": self.holder_pid,
+            "holder_thread_id": self.holder_thread_id,
+            "holder_age_seconds": self.holder_age_seconds,
+            "holder_scope": self.holder_scope,
+            "metadata_status": self.metadata_status,
+        }
+
+
 class DeviceAlreadyRunningError(StagingError):
     """Another coordinator holds the exclusive spool lock for this device."""
+
+    def __init__(self, message: str = "pendant recovery is already active", *, lock_context: LockContext | None = None):
+        super().__init__(message)
+        self.lock_context = lock_context
 
 
 class MaintenanceDeferredError(Exception):

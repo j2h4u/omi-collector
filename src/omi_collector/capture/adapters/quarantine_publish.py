@@ -99,7 +99,9 @@ def publish_quarantined_prefix(
     should_defer: Callable[[], bool] = _never_defer,
 ) -> QuarantinePublication:
     """Publish one checkpoint-bound prefix under the device spool lock."""
-    with StagingStore.from_paths(paths).device_lock(recover_capture_temporaries=False):
+    with StagingStore.from_paths(paths).device_lock(
+        recover_capture_temporaries=False, operation="publish_quarantined_prefix"
+    ):
         return _publish_quarantined_prefix(source, paths, should_defer=should_defer)
 
 

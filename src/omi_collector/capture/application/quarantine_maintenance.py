@@ -348,7 +348,7 @@ class QuarantineMaintenance:
         the temporary handle before returning the authoritative frontier to
         reconciliation.  A later writer reopens the already-promoted attempt.
         """
-        with self._staging.device_lock() as lease:
+        with self._staging.device_lock(operation="resume_pending_attempt") as lease:
             resumed = self._staging.resume_streaming_attempt(lease)
             if resumed is None or resumed.attempt_id != descriptor.attempt_id:
                 raise OpportunisticSyncError("validated pending attempt disappeared before lease-bound resume")

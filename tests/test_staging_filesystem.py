@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from errno import EXDEV
 from json import dumps, loads
+from multiprocessing import Event, Process
+from multiprocessing.synchronize import Event as EventType
 from os import PathLike, fsync
 from pathlib import Path
 from shutil import rmtree
@@ -13,7 +15,7 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import staging_filesystem
-from omi_collector.capture.adapters.staging_contract import AttemptStateError, StagingError
+from omi_collector.capture.adapters.staging_contract import AttemptStateError, DeviceAlreadyRunningError, StagingError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 
@@ -79,6 +81,108 @@ def _guard_rename_to_capture(monkeypatch: pytest.MonkeyPatch) -> None:
         real_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(staging_filesystem.os, "rename", guarded_rename)
+
+
+def _hold_device_lock(spool: str, capture_root: str, ready: EventType, release: EventType) -> None:
+    with StagingStore(Path(spool), Path(capture_root)).device_lock(operation="capture_batch"):
+        ready.set()
+        release.wait(10)
+
+
+def test_device_lock_contention_attributes_process_holder_and_reacquires(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    ready = Event()
+    release = Event()
+    holder = Process(target=_hold_device_lock, args=(str(spool), str(capture_root), ready, release))
+    holder.start()
+    try:
+        assert ready.wait(10)
+        with (
+            pytest.raises(DeviceAlreadyRunningError) as raised,
+            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
+        ):
+            pass
+        error = raised.value
+        context = error.lock_context
+        assert context is not None
+        assert context.requested_operation == "resume_pending_attempt"
+        assert context.holder_operation == "capture_batch"
+        assert context.holder_pid == holder.pid
+        assert context.holder_thread_id is not None
+        assert context.holder_age_seconds is not None
+        assert context.holder_age_seconds >= 0
+        assert context.holder_scope == "other_process"
+        assert context.metadata_status == "valid"
+    finally:
+        release.set()
+        holder.join(10)
+    assert holder.exitcode == 0
+    with StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"):
+        pass
+    assert (spool / "collector.lock").read_bytes() == b""
+
+
+def test_device_lock_rejects_stale_owner_metadata(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(spool, capture_root)
+    with store.device_lock(operation="capture_batch"):
+        (spool / "collector.lock").write_text(
+            dumps(
+                {
+                    "version": 1,
+                    "pid": 999_999_999,
+                    "process_start": 1,
+                    "thread_id": 1,
+                    "operation": "old_operation",
+                    "scope": "collector_lock",
+                    "acquired_monotonic_ns": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with (
+            pytest.raises(DeviceAlreadyRunningError) as raised,
+            StagingStore(spool, capture_root).device_lock(operation="capture_batch"),
+        ):
+            pass
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.metadata_status == "stale"
+    assert context.holder_scope == "unknown"
+    assert context.holder_pid is None
+
+
+def test_device_lock_rejects_same_pid_with_mismatched_process_start(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(spool, capture_root)
+    with store.device_lock(operation="capture_batch"):
+        (spool / "collector.lock").write_text(
+            dumps(
+                {
+                    "version": 1,
+                    "pid": staging_filesystem.os.getpid(),
+                    "process_start": 1,
+                    "thread_id": 1,
+                    "operation": "old_operation",
+                    "scope": "collector_lock",
+                    "acquired_monotonic_ns": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with (
+            pytest.raises(DeviceAlreadyRunningError) as raised,
+            StagingStore(spool, capture_root).device_lock(operation="capture_batch"),
+        ):
+            pass
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.metadata_status == "stale"
+    assert context.holder_scope == "unknown"
+    assert context.holder_pid is None
 
 
 class _RecordingStream:

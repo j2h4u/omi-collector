@@ -194,6 +194,40 @@ def test_status_marks_persistent_runtime_failures_for_attention(
     ]
 
 
+def test_status_preserves_lock_context_from_session_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    context = {
+        "requested_operation": "capture_batch",
+        "holder_operation": "quarantine_pending",
+        "holder_pid": 321,
+        "holder_thread_id": 654,
+        "holder_age_seconds": 1.25,
+        "holder_scope": "other_process",
+        "metadata_status": "valid",
+    }
+    row = {
+        "event": "sync_progress",
+        "fields": {
+            "progress": {
+                "status": "session_error",
+                "phase": "read/reconcile",
+                "error_type": "DeviceAlreadyRunningError",
+                "error_message": "pendant recovery is already active",
+                "lock_context": context,
+            }
+        },
+        "timestamp": "2026-09-08T09:00:00+00:00",
+    }
+    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    runtime = cast(dict[str, object], result["runtime"])
+    error = cast(dict[str, object], runtime["last_error"])
+    assert error["lock_context"] == context
+
+
 def test_status_clears_ready_publication_block_after_successful_finalization(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

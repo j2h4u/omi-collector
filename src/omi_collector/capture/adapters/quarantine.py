@@ -68,7 +68,7 @@ def quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tuple[Path
     if not isinstance(reason, str) or not reason.strip():
         raise AttemptStateError("quarantine reason must be a non-empty string")
 
-    with filesystem.device_lock():
+    with filesystem.device_lock(operation="quarantine_pending"):
         root_candidate = _quarantine_attempts_root(filesystem, reason)
         if root_candidate is not None:
             return (root_candidate,)
@@ -86,7 +86,7 @@ def quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tuple[Path
 def quarantine_attempt_source(filesystem: StagingFilesystem, attempt_id: str) -> Path:
     """Move one preserved attempt source without adding diagnostic metadata."""
     _validate_attempt_id(attempt_id)
-    with filesystem.device_lock():
+    with filesystem.device_lock(operation="quarantine_attempt_source"):
         path = filesystem.attempts_root / attempt_id
         descriptor = filesystem._read_descriptor(path)
         if is_nonblocking_attempt(filesystem, path, descriptor):
@@ -108,7 +108,7 @@ def terminalize_prefix_attempt(filesystem: StagingFilesystem, attempt_id: str) -
     published capture directory.
     """
     _validate_attempt_id(attempt_id)
-    with filesystem.device_lock():
+    with filesystem.device_lock(operation="terminalize_prefix_attempt"):
         path = filesystem.attempts_root / attempt_id
         descriptor = filesystem._read_descriptor(path)
         if _is_terminal_retired_attempt(path):
@@ -155,7 +155,7 @@ def sweep_terminal_retired(
     now_unix_ns = _wall_clock_ns()
     _validate_terminalized_at(now_unix_ns)
     removed: list[Path] = []
-    with filesystem.device_lock():
+    with filesystem.device_lock(operation="sweep_terminal_retired"):
         try:
             if not os.path.lexists(filesystem.attempts_root):
                 return ()
@@ -276,7 +276,7 @@ def mark_quarantine_unprocessable(filesystem: StagingFilesystem, source: Path, r
 
 
 def _mark_quarantine(filesystem: StagingFilesystem, source: Path, marker_name: str, payload: dict[str, object]) -> None:
-    with filesystem.device_lock():
+    with filesystem.device_lock(operation="mark_quarantine"):
         root = filesystem.quarantine_root
         try:
             relative = Path(source).absolute().relative_to(root)
@@ -299,7 +299,7 @@ def sweep_terminal_quarantine(
     retention_ns = _seconds_to_nanoseconds(filesystem._terminal_retention_seconds)
     now_unix_ns = _wall_clock_ns()
     removed: list[Path] = []
-    with filesystem.device_lock():
+    with filesystem.device_lock(operation="sweep_terminal_quarantine"):
         root = filesystem.quarantine_root
         try:
             mode = root.lstat().st_mode

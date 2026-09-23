@@ -15,7 +15,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import KW_ONLY, dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, RetryConfig
 from ..domain.ring_protocol import RECORD_SIZE, STATUS_STORAGE_NOT_READY, RingInfo, RingStatus, encode_stop_command
@@ -136,6 +136,7 @@ class ActivityEvent:
     reason: str | None = None
     duration_seconds: float | None = None
     next_attempt_in_seconds: float | None = None
+    lock_context: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,6 +712,7 @@ async def report_session_error(
 ) -> None:
     runtime.debug_exception("session_error", error, phase=phase)
     cause = session_error_cause(error)
+    lock_context = _lock_context(cause)
     await report_activity(
         callback,
         "session_error",
@@ -719,6 +721,7 @@ async def report_session_error(
             phase=phase,
             error_type=type(cause).__name__,
             error_message=sanitize_error_message(cause),
+            lock_context=lock_context,
         ),
     )
 
@@ -751,6 +754,15 @@ def session_error_cause(error: BaseException) -> BaseException:
     while isinstance(cause, collector.TransferInterruptedError) and cause.__cause__ is not None:
         cause = cause.__cause__
     return cause
+
+
+def _lock_context(error: BaseException) -> Mapping[str, object] | None:
+    value = getattr(error, "lock_context", None)
+    serializer = getattr(value, "as_dict", None)
+    if not callable(serializer):
+        return None
+    result = cast(Callable[[], object], serializer)()
+    return result if isinstance(result, Mapping) else None
 
 
 def sanitize_error_message(error: BaseException) -> str:

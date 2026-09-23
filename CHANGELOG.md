@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/j2h4u/omi-collector/compare/v0.7.0...v0.7.1) (2026-09-23)
+
+
+### Fixes
+
+* **collector:** make two-zone migration root-runnable ([#123](https://github.com/j2h4u/omi-collector/issues/123)) ([94bc6ae](https://github.com/j2h4u/omi-collector/commit/94bc6ae78d2d4bd760cf657a9d5de8459490bd92))
+
 ## [0.7.0](https://github.com/j2h4u/omi-collector/compare/v0.6.18...v0.7.0) (2026-09-23)
 
 

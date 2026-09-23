@@ -692,13 +692,11 @@ def _windmill_acknowledged(checkpoint_path: Path) -> tuple[tuple[str, str], ...]
         raise ReadyBundleError("Windmill ready checkpoint is invalid")
     if value["analysis_cursor"] is not None:
         _windmill_decisions([value["analysis_cursor"]])
-    decisions = _windmill_decisions(value["vad_decisions"])
+    _windmill_decisions(value["vad_decisions"])
     tail = _windmill_tail(value["open_speech_tail"])
     acknowledged = _windmill_identities(value["acknowledged"], "acknowledged")
     if len(acknowledged) != len(set(acknowledged)):
         raise ReadyBundleError("Windmill acknowledgement is duplicated")
-    if not set(acknowledged) <= decisions:
-        raise ReadyBundleError("Windmill acknowledgement lacks durable VAD evidence")
     if set(acknowledged) & tail:
         raise ReadyBundleError("Windmill acknowledgement conflicts with open speech tail")
     return tuple(acknowledged)

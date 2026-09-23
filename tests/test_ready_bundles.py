@@ -31,7 +31,13 @@ def _draft(root: Path, timestamps: tuple[int, ...], *, start_sequence: int = 10,
     return path
 
 
-def _checkpoint(root: Path, identities: list[tuple[str, str]], *, tail: list[tuple[str, str]] | None = None) -> Path:
+def _checkpoint(
+    root: Path,
+    identities: list[tuple[str, str]],
+    *,
+    tail: list[tuple[str, str]] | None = None,
+    decisions: list[tuple[str, str]] | None = None,
+) -> Path:
     def decision(bundle_id: str, records_sha256: str) -> dict[str, object]:
         return {
             "bundle_id": bundle_id,
@@ -49,7 +55,8 @@ def _checkpoint(root: Path, identities: list[tuple[str, str]], *, tail: list[tup
         dumps(
             {
                 "analysis_cursor": None,
-                "vad_decisions": [decision(*identity) for identity in identities],
+                "vad_decisions": [decision(*identity) for identity in identities if decisions is None]
+                + [decision(*identity) for identity in decisions or []],
                 "open_speech_tail": {"entries": [decision(*identity) for identity in tail]} if tail else None,
                 "acknowledged": [
                     {"bundle_id": bundle_id, "records_sha256": records_sha256}
@@ -301,6 +308,25 @@ def test_forged_or_open_tail_ack_never_deletes_ready_bundle(tmp_path: Path) -> N
     with pytest.raises(ready_bundles.ReadyBundleError, match="open speech tail"):
         ready_bundles.retire_acknowledged(ready_root, ledger, tail)
     assert published.path.exists()
+
+
+def test_ack_without_vad_decision_retires_exact_identity_but_not_mismatch(tmp_path: Path) -> None:
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(tmp_path / "draft", (100,), start_sequence=100)
+    exact = ready_bundles.finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(exact.bundle_id, exact.records_sha256)], decisions=[])
+
+    ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+    assert not exact.path.exists()
+
+    _draft(tmp_path / "draft", (101,), start_sequence=101)
+    mismatch = ready_bundles.finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(mismatch.bundle_id, "b" * 64)], decisions=[])
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="published ready bundle"):
+        ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+    assert mismatch.path.exists()
 
 
 def test_mixed_ack_batch_preflights_every_identity_before_retiring_any_bundle(tmp_path: Path) -> None:

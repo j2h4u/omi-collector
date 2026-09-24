@@ -16,7 +16,6 @@ import pytest
 
 from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
-    RecordDisposition,
     RecordGapError,
     RecordMismatchError,
     RecordRegressionError,
@@ -478,9 +477,10 @@ def test_recovery_accepts_overlap_replay_then_exact_append(tmp_path: Path) -> No
     attempt.checkpoint()
     reopened = attempt
     reopened.begin_recovery(100, 3)
-    assert reopened.accept_chunk(100, first)[0] is RecordDisposition.REPLAYED
-    assert reopened.accept_chunk(101, second)[0] is RecordDisposition.APPENDED
-    assert reopened.accept_chunk(102, third)[0] is RecordDisposition.APPENDED
+    reopened.accept_chunk(100, first)
+    assert (reopened.path / "records.bin").read_bytes() == first
+    reopened.accept_chunk(101, second)
+    reopened.accept_chunk(102, third)
     reopened.checkpoint()
     assert (reopened.path / "records.bin").read_bytes() == first + second + third
 
@@ -508,4 +508,5 @@ def test_recovery_accepts_replayed_durable_record(tmp_path: Path) -> None:
     reopened = attempt
     reopened.begin_recovery(100, 2)
 
-    assert reopened.accept_chunk(100, _record(1))[0] is RecordDisposition.REPLAYED
+    reopened.accept_chunk(100, _record(1))
+    assert (reopened.path / "records.bin").read_bytes() == _record(1)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import shutil
 from contextlib import suppress
 from dataclasses import asdict
-from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from typing import BinaryIO, Protocol, cast
@@ -63,13 +62,6 @@ class RecordGapError(RecordAcceptanceError):
 
 class RecordRegressionError(RecordAcceptanceError):
     """A recovery record precedes the original snapshot or requested range."""
-
-
-class RecordDisposition(Enum):
-    """The idempotent result of accepting one recovery record."""
-
-    REPLAYED = "replayed"
-    APPENDED = "appended"
 
 
 class _HashDigest(Protocol):
@@ -182,9 +174,7 @@ class StagedAttempt:
         self._recovery_count = packet_count
         return prefix
 
-    def accept_chunk(
-        self, start_sequence: int, records: bytes | bytearray | memoryview
-    ) -> tuple[RecordDisposition, ...]:
+    def accept_chunk(self, start_sequence: int, records: bytes | bytearray | memoryview) -> None:
         """Replay or append one contiguous block of complete ring records.
 
         The raw stream is a synchronous disk target; callers own transport
@@ -200,23 +190,19 @@ class StagedAttempt:
         if not payload or len(payload) % RECORD_SIZE:
             raise AttemptStateError(f"ring chunk must be a positive multiple of {RECORD_SIZE} bytes")
         record_count = len(payload) // RECORD_SIZE
-        return self._accept_streaming_chunk(start_sequence, payload, record_count)
+        self._accept_streaming_chunk(start_sequence, payload, record_count)
 
-    def _accept_streaming_chunk(
-        self, start_sequence: int, payload: bytes, record_count: int
-    ) -> tuple[RecordDisposition, ...]:
+    def _accept_streaming_chunk(self, start_sequence: int, payload: bytes, record_count: int) -> None:
 
         if self._recovery_start is None or self._recovery_count is None:
             expected = self.descriptor.start_sequence + self._stream_next_index
             if start_sequence != expected:
                 raise AttemptStateError("initial record is not the next expected sequence")
             self._append_streaming_chunk(self._stream_next_index, payload)
-            return (RecordDisposition.APPENDED,) * record_count
-        return self._accept_recovery_chunk(start_sequence, payload, record_count)
+            return
+        self._accept_recovery_chunk(start_sequence, payload, record_count)
 
-    def _accept_recovery_chunk(
-        self, start_sequence: int, payload: bytes, record_count: int
-    ) -> tuple[RecordDisposition, ...]:
+    def _accept_recovery_chunk(self, start_sequence: int, payload: bytes, record_count: int) -> None:
         end_sequence = start_sequence + record_count
         recovery_start = self._recovery_start
         recovery_count = self._recovery_count
@@ -241,7 +227,6 @@ class StagedAttempt:
         appended_count = record_count - replay_count
         if appended_count:
             self._append_streaming_chunk(self._stream_next_index, payload[replay_count * RECORD_SIZE :])
-        return (RecordDisposition.REPLAYED,) * replay_count + (RecordDisposition.APPENDED,) * appended_count
 
     def recover(self) -> Recovery:
         """Return the checkpoint-authenticated prefix and raw evidence status."""

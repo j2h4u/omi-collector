@@ -135,17 +135,6 @@ class ClockCorrectionStore:
         self._write_atomic(self._path(correction), completed)
         return completed
 
-    def resolve_applied(self, correction: ClockCorrection) -> ClockCorrection:
-        """Resolve an applied operation after its raw ambiguity interval is checked."""
-        if correction.state != "applied":
-            raise ClockCorrectionError("clock correction is not applied")
-        return self.finish(
-            correction,
-            state="resolved",
-            boundary_sequence_max=correction.boundary_sequence_max,
-            verified_epoch=correction.verified_epoch,
-        )
-
     def reconcile_observation(  # noqa: PLR0913 - explicit causal reconciliation inputs
         self,
         observed_epoch: int,

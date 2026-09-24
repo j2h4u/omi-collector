@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0](https://github.com/j2h4u/omi-collector/compare/v0.7.6...v0.8.0) (2026-09-24)
+
+
+### Features
+
+* batch contiguous Omi drafts into hour-scale ready bundles ([b1bdb8e](https://github.com/j2h4u/omi-collector/commit/b1bdb8e5a5219f721a87b926d2090bea0616af52))
+* batch contiguous Omi drafts into hour-scale ready bundles ([3276dd0](https://github.com/j2h4u/omi-collector/commit/3276dd05484f1e19bae3232509cc3e2bf9ec94d6))
+
 ## [0.7.6](https://github.com/j2h4u/omi-collector/compare/v0.7.5...v0.7.6) (2026-09-24)
 
 

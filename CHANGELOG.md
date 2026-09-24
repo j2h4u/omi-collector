@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.6](https://github.com/j2h4u/omi-collector/compare/v0.7.5...v0.7.6) (2026-09-24)
+
+
+### Refactoring
+
+* **collector:** remove unused capture results ([#133](https://github.com/j2h4u/omi-collector/issues/133)) ([715cddd](https://github.com/j2h4u/omi-collector/commit/715cddd3f04aff9664f82858556e1e84c0f6d9c6))
+
 ## [0.7.5](https://github.com/j2h4u/omi-collector/compare/v0.7.4...v0.7.5) (2026-09-23)
 
 

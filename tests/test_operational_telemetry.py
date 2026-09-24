@@ -45,7 +45,7 @@ from omi_collector.capture.application.ports import (
 )
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo, RingStatus
-from omi_collector.config import DEFAULT_CONFIG
+from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, ReadyConfig
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -209,7 +209,7 @@ def _status() -> RingStatus:
 
 
 def _clock_bundle(root: Path, start_sequence: int, timestamp: int) -> Path:
-    raw = timestamp.to_bytes(4, "big") + b"x" * (RECORD_SIZE - 4)
+    raw = timestamp.to_bytes(4, "big") + bytes((2, 8, 0x55)) + bytes(RECORD_SIZE - 7)
     digest = sha256(raw).hexdigest()
     bundle = root / f"{start_sequence}-{start_sequence + 1}-{digest[:16]}"
     bundle.mkdir(parents=True)
@@ -809,6 +809,7 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     staging = StagingStore.from_paths(
         StagingStore(tmp_path, capture_root).paths,
         publication_root=published,
+        config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
     authority = staging.create_publication_authority()
     session = FakeOperationalSession(

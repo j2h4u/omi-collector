@@ -190,20 +190,22 @@ class StagingStore:
             near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
         )
         ledger_path = self.device_state_path.parent / "ready-publications.json"
+        published: tuple[object, ...] = ()
+        if self._has_draft_bundles():
+            segments = ClockMembershipStore(self.device_state_path).segments(corrections.observation_store.records())
+            published = finalize_drafts(
+                self.capture_root,
+                publication_root,
+                ledger_path,
+                segments,
+                config=self._filesystem._ready,
+            )
         retire_acknowledged(
             publication_root,
             ledger_path,
             publication_root.parent / "work" / "omi-ready-checkpoint.json",
         )
-        if not self._has_draft_bundles():
-            return None
-        segments = ClockMembershipStore(self.device_state_path).segments(corrections.observation_store.records())
-        return finalize_drafts(
-            self.capture_root,
-            publication_root,
-            ledger_path,
-            segments,
-        )
+        return published or None
 
     def _has_draft_bundles(self) -> bool:
         try:

@@ -137,7 +137,10 @@ Replace the placeholder with the pendant Bluetooth address. The optional
 30 seconds of observations with no gap of 10 seconds or more before GATT is
 opened. A timer, a remembered address, or a stale scanner event cannot create
 an automatic connection permit. The fixed configuration location determines
-storage.
+storage. `[ready]` sets the soft captured-audio target and maximum age for
+publishing contiguous sealed drafts; it is required, with example values of
+3600 and 86400 seconds.
+Duration is the sum of valid 20 ms Opus packet durations.
 The installer creates the service account, keeps the configuration root-owned
 and readable by both services as mode `0644`, and enables the service. It does not start the
 service unless `--restart` is explicit. Complete the first successful

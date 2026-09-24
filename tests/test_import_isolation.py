@@ -6,7 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-_CONFIG = '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n'
+_CONFIG = (
+    '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\nmax_wait_seconds = 86400.0\n'
+)
 
 
 def test_product_namespace_is_importable() -> None:

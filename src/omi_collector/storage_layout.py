@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
-from .config import CollectorConfig, PresenceConfig
+from .config import CollectorConfig, PresenceConfig, ReadyConfig
 
 DEFAULT_CONFIG_PATH = Path("/srv/pipelines/omi/config.toml")
 _ADDRESS = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\Z")
@@ -74,8 +74,9 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
         document = cast(dict[str, object], tomllib.loads(config_path.read_text(encoding="utf-8")))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise StorageLayoutError("config TOML is unreadable or malformed") from error
-    if not isinstance(document, dict) or set(document) not in ({"pendant"}, {"pendant", "presence"}):
-        raise StorageLayoutError("config must contain [pendant] and optional [presence]")
+    allowed = {"pendant", "presence", "ready"}
+    if not isinstance(document, dict) or not {"pendant", "ready"} <= set(document) or not set(document) <= allowed:
+        raise StorageLayoutError("config must contain [pendant] and [ready], with optional [presence]")
     pendant = _section(document["pendant"], {"address"}, "pendant")
     address = pendant["address"]
     if _ADDRESS.fullmatch(address) is None:
@@ -113,6 +114,12 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
             )
         except ValueError as error:
             raise StorageLayoutError(f"presence settings are invalid: {error}") from error
+    if "ready" in document:
+        ready = _number_section(document["ready"], {"target_audio_seconds", "max_wait_seconds"}, "ready")
+        try:
+            runtime_config = replace(runtime_config, ready=ReadyConfig(**ready))
+        except ValueError as error:
+            raise StorageLayoutError(f"ready settings are invalid: {error}") from error
     return OperatorConfig(config_path.absolute(), PendantConfig(address), layout, runtime_config)
 
 

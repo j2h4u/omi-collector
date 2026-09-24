@@ -12,6 +12,7 @@ from omi_collector.capture.adapters.staging_contract import AttemptStateError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
+from omi_collector.config import CollectorConfig, ReadyConfig
 
 
 def _store(tmp_path: Path) -> StagingStore:
@@ -21,11 +22,15 @@ def _store(tmp_path: Path) -> StagingStore:
     ready = tmp_path / "ready"
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
-    return StagingStore.from_paths(bootstrap.paths, publication_root=ready)
+    return StagingStore.from_paths(
+        bootstrap.paths,
+        publication_root=ready,
+        config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
+    )
 
 
 def _record(value: int) -> bytes:
-    return pack(">I", value) + bytes((value % 256,)) * (RECORD_SIZE - 4)
+    return pack(">I", value) + bytes((2, 8, value % 256)) + bytes(RECORD_SIZE - 7)
 
 
 def _seal_writer(store: StagingStore) -> StagingWriter:

@@ -179,6 +179,9 @@ class QuarantineMaintenance:
         """Run one cooperative terminal sweep and quarantine salvage pass."""
         if not self._maintenance_due(should_defer):
             return
+        await self._recover_and_publish()
+        if should_defer():
+            return
         await self._sweep_terminal_retired(should_defer)
         if should_defer():
             return

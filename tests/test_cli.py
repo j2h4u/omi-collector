@@ -35,7 +35,11 @@ def _capture_root(tmp_path: Path) -> Path:
 
 def _layout(tmp_path: Path) -> Path:
     path = tmp_path / "config.toml"
-    path.write_text('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n', encoding="utf-8")
+    path.write_text(
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n'
+        "[ready]\ntarget_audio_seconds = 3600.0\nmax_wait_seconds = 86400.0\n",
+        encoding="utf-8",
+    )
     return path
 
 
@@ -54,9 +58,16 @@ def test_health_command_reports_ok() -> None:
 
 
 def test_staging_keeps_raw_drafts_inside_collector_state(tmp_path: Path) -> None:
-    store = cli._staging(load_operator_config(_layout(tmp_path)))
+    config_path = _layout(tmp_path)
+    config_path.write_text(
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 123.0\nmax_wait_seconds = 456.0\n',
+        encoding="utf-8",
+    )
+    store = cli._staging(load_operator_config(config_path))
 
     assert store.paths.capture_root == tmp_path / "draft"
+    assert store._filesystem._ready.target_audio_seconds == 123.0
+    assert store._filesystem._ready.max_wait_seconds == 456.0
 
 
 def test_config_check_reports_canonical_path(tmp_path: Path) -> None:

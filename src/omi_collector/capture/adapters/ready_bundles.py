@@ -11,10 +11,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from itertools import pairwise
+from math import ceil
 from pathlib import Path
+from time import time
 from typing import cast
 from uuid import uuid4
 
+from ...config import ReadyConfig
+from ..domain.opus_duration import count_20ms_packets
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
 from .bundle_contract import BundleManifest, SealedReceipt
 from .clock_segments import ClockSegmentMap
@@ -45,6 +49,12 @@ class _Draft:
 
 
 @dataclass(frozen=True, slots=True)
+class _DraftGroup:
+    drafts: tuple[_Draft, ...]
+    manifest: BundleManifest
+
+
+@dataclass(frozen=True, slots=True)
 class _ReadySource:
     """A validated ready bundle used only to compare replayed payloads."""
 
@@ -71,9 +81,7 @@ _LEDGER_FIELDS = frozenset({"bundles", "frontier"})
 _LEDGER_ENTRY_FIELDS = frozenset({"records_sha256", "state", "start_sequence", "next_sequence", "draft_raw_sha256"})
 _LEGACY_LEDGER_ENTRY_FIELDS = frozenset({"records_sha256", "state"})
 _WINDMILL_CHECKPOINT_FIELDS = frozenset({"analysis_cursor", "vad_decisions", "open_speech_tail", "acknowledged"})
-_WINDMILL_DECISION_FIELDS = frozenset(
-    {"bundle_id", "records_sha256", "packet_ranges", "packet_count", "input_id", "input_sha256", "receipt_sha256"}
-)
+_WINDMILL_TAIL_FIELDS = frozenset({"entries", "opened_at", "outputs"})
 
 
 def finalize_drafts(
@@ -81,6 +89,8 @@ def finalize_drafts(
     ready_root: Path,
     ledger_path: Path,
     clock_segments: ClockSegmentMap,
+    *,
+    config: ReadyConfig,
 ) -> tuple[ReadyBundleResult, ...]:
     """Publish every authenticated draft once, then remove its raw source.
 
@@ -94,41 +104,124 @@ def finalize_drafts(
     results: list[ReadyBundleResult] = []
     finalization = _Finalization(ready_root, ledger_path, ledger, clock_segments)
     _reconcile_ready_ledger(finalization)
-    for draft in _drafts(draft_root):
-        result = _finalize_one(draft, finalization)
+    drafts = _drafts(draft_root)
+    ready = _ready_sources(ready_root)
+    eligible: list[_Draft] = []
+    for draft in drafts:
+        source = _unique_suffix(draft, ready)
+        if source is None:
+            _remove_draft(draft.path)
+        else:
+            eligible.append(source)
+    for group in _draft_groups(tuple(eligible), config.target_audio_seconds, config.max_wait_seconds):
+        result = _finalize_group(group, finalization)
         if result is not None:
             results.append(result)
     return tuple(results)
 
 
-def _finalize_one(draft: _Draft, finalization: _Finalization) -> ReadyBundleResult | None:
-    bundle_id = _bundle_id(draft.manifest)
+def _draft_groups(drafts: tuple[_Draft, ...], target: float, max_wait: float) -> tuple[_DraftGroup, ...]:
+    groups: list[_DraftGroup] = []
+    segment: list[_Draft] = []
+    packets = 0
+    target_packets = ceil(target * 50) if target > 0 else 0
+
+    def flush_if_target() -> None:
+        nonlocal packets
+        if segment and (target_packets == 0 or packets >= target_packets):
+            groups.append(_make_group(tuple(segment)))
+            segment.clear()
+            packets = 0
+
+    def flush_if_stale() -> None:
+        nonlocal packets
+        if segment:
+            oldest = min((draft.path / _MANIFEST_NAME).stat().st_mtime for draft in segment)
+            if time() - oldest >= max_wait:
+                groups.append(_make_group(tuple(segment)))
+                segment.clear()
+                packets = 0
+
+    for draft in drafts:
+        if segment and segment[-1].manifest.next_sequence != draft.manifest.start_sequence:
+            groups.append(_make_group(tuple(segment)))
+            segment.clear()
+            packets = 0
+        segment.append(draft)
+        if target_packets > 0:
+            packets += _draft_audio_packets(draft)
+        flush_if_target()
+    flush_if_stale()
+    return tuple(groups)
+
+
+def _make_group(drafts: tuple[_Draft, ...]) -> _DraftGroup:
+    if not drafts:
+        raise ReadyBundleError("cannot publish an empty draft group")
+    digest = sha256()
+    count = 0
+    for draft in drafts:
+        with (draft.path / _RAW_NAME).open("rb") as stream:
+            stream.seek(draft.byte_offset)
+            remaining = draft.manifest.record_count * RECORD_SIZE
+            while remaining:
+                block = stream.read(min(remaining, 1024 * 1024))
+                if not block:
+                    raise ReadyBundleError("draft records ended unexpectedly")
+                digest.update(block)
+                remaining -= len(block)
+        count += draft.manifest.record_count
+    first, last = drafts[0].manifest, drafts[-1].manifest
+    manifest = BundleManifest(2, first.start_sequence, last.next_sequence, count, RECORD_SIZE, digest.hexdigest())
+    return _DraftGroup(drafts, manifest)
+
+
+def _draft_audio_packets(draft: _Draft) -> int:
+    total = 0
+    with (draft.path / _RAW_NAME).open("rb") as stream:
+        stream.seek(draft.byte_offset)
+        for _ in range(draft.manifest.record_count):
+            record = stream.read(RECORD_SIZE)
+            if len(record) != RECORD_SIZE:
+                raise ReadyBundleError("draft records ended unexpectedly")
+            try:
+                total += count_20ms_packets(record)
+            except ValueError as error:
+                raise ReadyBundleError("draft contains an invalid 20 ms Opus packet") from error
+    return total
+
+
+def _finalize_group(group: _DraftGroup, finalization: _Finalization) -> ReadyBundleResult | None:
+    manifest = group.manifest
+    bundle_id = _bundle_id(manifest)
     retired = _retired_entry(finalization.ledger, bundle_id)
     if retired is not None:
-        _validate_retired_duplicate(retired, draft.manifest)
-        _remove_draft(draft.path)
+        _validate_retired_duplicate(retired, manifest)
+        for draft in group.drafts:
+            _remove_draft(draft.path)
         return None
-    _reject_retired_overlap(finalization.ledger, draft.manifest)
+    _reject_retired_overlap(finalization.ledger, manifest)
     destination = finalization.ready_root / bundle_id
     if destination.exists():
-        ranges = _time_ranges(draft.manifest, finalization.clock_segments)
-        result = _validate_ready(destination, draft.manifest, ranges)
-        _record_ready(finalization.ledger_path, finalization.ledger, result, draft.manifest)
-        _remove_draft(draft.path)
+        ready = _read_ready_source(destination)
+        ready_start = ready.result.next_sequence - ready.result.record_count
+        if (
+            ready_start != manifest.start_sequence
+            or ready.result.next_sequence != manifest.next_sequence
+            or ready.result.record_count != manifest.record_count
+            or ready.draft_raw_sha256 != manifest.raw_sha256
+        ):
+            raise ReadyBundleError("ready destination conflicts with its draft group")
+        result = ready.result
+        _record_ready(finalization.ledger_path, finalization.ledger, result, manifest)
+        for draft in group.drafts:
+            _remove_draft(draft.path)
         return result
-    source = _unique_suffix(draft, _ready_sources(finalization.ready_root))
-    if source is None:
+    ranges = _time_ranges(manifest, finalization.clock_segments)
+    result = _write_ready_group(group, destination, ranges)
+    _record_ready(finalization.ledger_path, finalization.ledger, result, manifest)
+    for draft in group.drafts:
         _remove_draft(draft.path)
-        return None
-    bundle_id = _bundle_id(source.manifest)
-    destination = finalization.ready_root / bundle_id
-    ranges = _time_ranges(source.manifest, finalization.clock_segments)
-    if destination.exists():
-        result = _validate_ready(destination, source.manifest, ranges)
-    else:
-        result = _write_ready(draft, source, destination, ranges)
-    _record_ready(finalization.ledger_path, finalization.ledger, result, source.manifest)
-    _remove_draft(draft.path)
     return result
 
 
@@ -356,9 +449,8 @@ def _crop_draft(draft: _Draft, start_sequence: int) -> _Draft:
     return _Draft(draft.path, manifest, offset)
 
 
-def _write_ready(
-    draft: _Draft,
-    source: _Draft,
+def _write_ready_group(
+    group: _DraftGroup,
     destination: Path,
     ranges: tuple[dict[str, object], ...],
 ) -> ReadyBundleResult:
@@ -366,49 +458,41 @@ def _write_ready(
     temporary.mkdir(mode=_READY_DIRECTORY_MODE)
     try:
         _require_shared_ready_directory(temporary)
-        digest = _write_records(draft.path / _RAW_NAME, temporary / _RAW_NAME, source, ranges)
-        manifest = _ready_manifest(source.manifest, digest, ranges)
-        _write_file(temporary / _MANIFEST_NAME, _canonical(manifest))
+        digest = sha256()
+        range_index = 0
+        with (temporary / _RAW_NAME).open("xb") as output:
+            for draft in group.drafts:
+                with (draft.path / _RAW_NAME).open("rb") as source:
+                    source.seek(draft.byte_offset)
+                    for index in range(draft.manifest.record_count):
+                        record = source.read(RECORD_SIZE)
+                        if len(record) != RECORD_SIZE:
+                            raise ReadyBundleError("draft records ended unexpectedly")
+                        sequence = draft.manifest.start_sequence + index
+                        next_sequence = ranges[range_index]["next_sequence"]
+                        assert isinstance(next_sequence, int)
+                        while sequence >= next_sequence:
+                            range_index += 1
+                            next_sequence = ranges[range_index]["next_sequence"]
+                            assert isinstance(next_sequence, int)
+                        converted = _convert_record(record, ranges[range_index])
+                        if converted[TIMESTAMP_SIZE:] != record[TIMESTAMP_SIZE:]:
+                            raise ReadyBundleError("ready conversion changed an Opus payload")
+                        output.write(converted)
+                        digest.update(converted)
+            output.flush()
+            os.fsync(output.fileno())
+        (temporary / _RAW_NAME).chmod(_READY_FILE_MODE)
+        _write_file(temporary / _MANIFEST_NAME, _canonical(_ready_manifest(group.manifest, digest.hexdigest(), ranges)))
         _sync_directory(temporary)
         temporary.rename(destination)
         _sync_directory(destination.parent)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    manifest = source.manifest
-    return ReadyBundleResult(destination.name, destination, manifest.next_sequence, manifest.record_count, digest)
-
-
-def _write_records(
-    source_path: Path,
-    destination: Path,
-    source: _Draft,
-    ranges: tuple[dict[str, object], ...],
-) -> str:
-    digest = sha256()
-    range_index = 0
-    with source_path.open("rb") as input_stream, destination.open("xb") as output_stream:
-        input_stream.seek(source.byte_offset)
-        for index in range(source.manifest.record_count):
-            record = input_stream.read(RECORD_SIZE)
-            if len(record) != RECORD_SIZE:
-                raise ReadyBundleError("draft records ended unexpectedly")
-            sequence = source.manifest.start_sequence + index
-            next_sequence = ranges[range_index]["next_sequence"]
-            assert isinstance(next_sequence, int)
-            while sequence >= next_sequence:
-                range_index += 1
-                next_sequence = ranges[range_index]["next_sequence"]
-                assert isinstance(next_sequence, int)
-            converted = _convert_record(record, ranges[range_index])
-            if converted[TIMESTAMP_SIZE:] != record[TIMESTAMP_SIZE:]:
-                raise ReadyBundleError("ready conversion changed an Opus payload")
-            output_stream.write(converted)
-            digest.update(converted)
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
-    destination.chmod(_READY_FILE_MODE)
-    return digest.hexdigest()
+    return ReadyBundleResult(
+        destination.name, destination, group.manifest.next_sequence, group.manifest.record_count, digest.hexdigest()
+    )
 
 
 def _convert_record(record: bytes, time_range: Mapping[str, object]) -> bytes:
@@ -472,23 +556,6 @@ def _ready_manifest(
         "draft_raw_sha256": source.raw_sha256,
         "time_ranges": list(ranges),
     }
-
-
-def _validate_ready(
-    destination: Path,
-    source: BundleManifest,
-    ranges: tuple[dict[str, object], ...],
-) -> ReadyBundleResult:
-    if destination.is_symlink() or not destination.is_dir():
-        raise ReadyBundleError("ready destination is unsafe")
-    manifest = _read_json(destination / _MANIFEST_NAME)
-    expected = _ready_manifest(source, _digest(destination / _RAW_NAME), ranges)
-    raw = destination / _RAW_NAME
-    if raw.stat().st_size != source.record_count * RECORD_SIZE or manifest != expected:
-        raise ReadyBundleError("ready destination conflicts with its draft")
-    digest = expected["records_sha256"]
-    assert isinstance(digest, str)
-    return ReadyBundleResult(destination.name, destination, source.next_sequence, source.record_count, digest)
 
 
 def _record_ready(
@@ -694,35 +761,37 @@ def _windmill_acknowledged(checkpoint_path: Path) -> tuple[tuple[str, str], ...]
     value = _read_json(checkpoint_path)
     if not isinstance(value, dict) or set(value) != _WINDMILL_CHECKPOINT_FIELDS:
         raise ReadyBundleError("Windmill ready checkpoint is invalid")
-    if value["analysis_cursor"] is not None:
-        _windmill_decisions([value["analysis_cursor"]])
-    _windmill_decisions(value["vad_decisions"])
-    tail = _windmill_tail(value["open_speech_tail"])
+    if not isinstance(value["vad_decisions"], list):
+        raise ReadyBundleError("Windmill ready checkpoint is invalid")
+    tail = _windmill_tail_identities(value["open_speech_tail"])
     acknowledged = _windmill_identities(value["acknowledged"], "acknowledged")
     if len(acknowledged) != len(set(acknowledged)):
         raise ReadyBundleError("Windmill acknowledgement is duplicated")
     if set(acknowledged) & tail:
-        raise ReadyBundleError("Windmill acknowledgement conflicts with open speech tail")
+        raise ReadyBundleError("Windmill acknowledgement conflicts with pending tail")
     return tuple(acknowledged)
 
 
-def _windmill_decisions(value: object) -> set[tuple[str, str]]:
-    if not isinstance(value, list):
-        raise ReadyBundleError("Windmill checkpoint decisions are invalid")
-    identities: set[tuple[str, str]] = set()
-    for decision in value:
-        if not isinstance(decision, dict) or set(decision) != _WINDMILL_DECISION_FIELDS:
-            raise ReadyBundleError("Windmill checkpoint decisions are invalid")
-        identities.add((_sha256(decision["bundle_id"]), _sha256(decision["records_sha256"])))
-    return identities
-
-
-def _windmill_tail(value: object) -> set[tuple[str, str]]:
+def _windmill_tail_identities(value: object) -> set[tuple[str, str]]:
     if value is None:
         return set()
-    if not isinstance(value, dict) or set(value) != {"entries"}:
-        raise ReadyBundleError("Windmill open speech tail is invalid")
-    return _windmill_decisions(value["entries"])
+    if not isinstance(value, dict) or set(value) != _WINDMILL_TAIL_FIELDS:
+        raise ReadyBundleError("Windmill pending tail is invalid")
+    if (
+        isinstance(value["opened_at"], bool)
+        or not isinstance(value["opened_at"], int)
+        or not isinstance(value["outputs"], list)
+    ):
+        raise ReadyBundleError("Windmill pending tail is invalid")
+    entries = value["entries"]
+    if not isinstance(entries, list):
+        raise ReadyBundleError("Windmill pending tail is invalid")
+    identities: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or not {"bundle_id", "records_sha256"} <= set(entry):
+            raise ReadyBundleError("Windmill pending tail identities are invalid")
+        identities.add((_sha256(entry["bundle_id"]), _sha256(entry["records_sha256"])))
+    return identities
 
 
 def _windmill_identities(value: object, label: str) -> list[tuple[str, str]]:

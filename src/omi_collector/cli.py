@@ -137,6 +137,7 @@ def _staging(operator_config: OperatorConfig) -> StagingStore:
             layout.collector.device_state,
         ),
         publication_root=layout.publication.root,
+        config=operator_config.config,
     )
 
 

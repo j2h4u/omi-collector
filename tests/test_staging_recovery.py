@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from errno import EXDEV
 from hashlib import sha256
 from json import dumps, loads
-from os import PathLike, fsync
+from os import PathLike, fsync, utime
 from pathlib import Path
 from shutil import rmtree
 from threading import Barrier, Thread
@@ -14,7 +15,7 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters import quarantine, staging_filesystem
+from omi_collector.capture.adapters import quarantine, ready_bundles, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
     RecordGapError,
     RecordMismatchError,
@@ -22,10 +23,12 @@ from omi_collector.capture.adapters.attempts import (
 )
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
-from omi_collector.config import CollectorConfig, StagingRetentionConfig
+from omi_collector.config import CollectorConfig, ReadyConfig, StagingRetentionConfig
 
 _CAPTURE_ROOTS: set[Path] = set()
 _ACCEPTANCE_FIRST_BOUNDARY = 7_192_026
@@ -57,7 +60,7 @@ def _record(marker: int) -> bytes:
 
 
 def _one_record_bundle(root: Path, sequence: int, timestamp: int) -> Path:
-    raw = timestamp.to_bytes(4, "big") + b"x" * (RECORD_SIZE - 4)
+    raw = timestamp.to_bytes(4, "big") + bytes((2, 8, 0x55)) + bytes(RECORD_SIZE - 7)
     digest = sha256(raw).hexdigest()
     bundle = root / f"{sequence}-{sequence + 1}-{digest[:16]}"
     bundle.mkdir(parents=True)
@@ -206,6 +209,7 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
     store = StagingStore.from_paths(
         StagingStore(tmp_path, drafts).paths,
         publication_root=published,
+        config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
 
     result = store.recover_and_publish()
@@ -230,7 +234,11 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
     drafts = _capture_root(tmp_path)
     published = _shared_ready(tmp_path / "ready")
     _one_record_bundle(drafts, 100, 43)
-    store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published)
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path, drafts).paths,
+        publication_root=published,
+        config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
+    )
     first = cast(tuple[object, ...], store.recover_and_publish())
     assert len(first) == 1
     bundle = next(published.iterdir())
@@ -241,6 +249,7 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
     decision = {
         **identity,
         "packet_ranges": [],
+        "no_speech_packet_ranges": [],
         "packet_count": 0,
         "input_id": None,
         "input_sha256": None,
@@ -248,7 +257,12 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
     }
     checkpoint.write_text(
         dumps(
-            {"analysis_cursor": None, "vad_decisions": [decision], "open_speech_tail": None, "acknowledged": [identity]}
+            {
+                "analysis_cursor": decision,
+                "vad_decisions": [decision],
+                "open_speech_tail": None,
+                "acknowledged": [identity],
+            }
         ),
         encoding="utf-8",
     )
@@ -258,6 +272,75 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
     ledger = cast(dict[str, object], loads((tmp_path / "ready-publications.json").read_text(encoding="utf-8")))
     bundles = cast(dict[str, dict[str, object]], ledger["bundles"])
     bundle_id = cast(str, manifest["bundle_id"])
+    assert bundles[bundle_id]["state"] == "retired"
+
+
+def test_scheduled_maintenance_flushes_stale_draft_without_pendant(tmp_path: Path) -> None:
+    drafts = _capture_root(tmp_path)
+    published = _shared_ready(tmp_path / "ready")
+    bundle = _one_record_bundle(drafts, 100, 43)
+    utime(bundle / "manifest.json", (1, 1))
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=60, max_wait_seconds=1))
+    store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
+
+    asyncio.run(maintenance.run_once(lambda: False))
+
+    assert not tuple(drafts.iterdir())
+    ready = tuple(published.iterdir())
+    assert len(ready) == 1
+    assert (ready[0] / "records.bin").is_file()
+
+
+def test_acknowledged_group_recovery_cleans_child_drafts_before_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drafts = _capture_root(tmp_path)
+    published = _shared_ready(tmp_path / "ready")
+    _one_record_bundle(drafts, 100, 43)
+    _one_record_bundle(drafts, 101, 44)
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.039))
+    store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
+    remove = ready_bundles._remove_draft
+    monkeypatch.setattr(ready_bundles, "_remove_draft", lambda _: (_ for _ in ()).throw(OSError("crash")))
+
+    with pytest.raises(OSError, match="crash"):
+        store.recover_and_publish()
+    assert len(tuple(published.iterdir())) == 1
+    assert len(tuple(drafts.iterdir())) == 2
+    manifest = cast(dict[str, object], loads((next(published.iterdir()) / "manifest.json").read_text(encoding="utf-8")))
+    bundle_id = cast(str, manifest["bundle_id"])
+    identity = {"bundle_id": bundle_id, "records_sha256": manifest["records_sha256"]}
+    decision = {
+        **identity,
+        "packet_ranges": [],
+        "no_speech_packet_ranges": [],
+        "packet_count": 0,
+        "input_id": None,
+        "input_sha256": None,
+        "receipt_sha256": None,
+    }
+    checkpoint = published.parent / "work" / "omi-ready-checkpoint.json"
+    checkpoint.parent.mkdir()
+    checkpoint.write_text(
+        dumps(
+            {
+                "analysis_cursor": decision,
+                "vad_decisions": [decision],
+                "open_speech_tail": None,
+                "acknowledged": [identity],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ready_bundles, "_remove_draft", remove)
+    restarted = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
+
+    assert restarted.recover_and_publish() is None
+    assert tuple(drafts.iterdir()) == ()
+    assert tuple(published.iterdir()) == ()
+    ledger = cast(dict[str, object], loads((tmp_path / "ready-publications.json").read_text(encoding="utf-8")))
+    bundles = cast(dict[str, dict[str, object]], ledger["bundles"])
     assert bundles[bundle_id]["state"] == "retired"
 
 

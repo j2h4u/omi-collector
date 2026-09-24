@@ -23,7 +23,11 @@ from omi_collector.storage_layout import load_operator_config
 
 def _layout(tmp_path: Path):
     path = tmp_path / "config.toml"
-    path.write_text('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n', encoding="utf-8")
+    path.write_text(
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n'
+        "[ready]\ntarget_audio_seconds = 3600.0\nmax_wait_seconds = 86400.0\n",
+        encoding="utf-8",
+    )
     (tmp_path / "collector").mkdir()
     return load_operator_config(path).storage
 

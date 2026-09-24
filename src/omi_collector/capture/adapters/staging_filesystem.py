@@ -20,7 +20,7 @@ from threading import get_ident
 from typing import Final, cast
 from uuid import uuid4
 
-from ...config import DEFAULT_CONFIG, CollectorConfig, DurabilityConfig
+from ...config import DEFAULT_CONFIG, CollectorConfig, DurabilityConfig, ReadyConfig
 from ..domain.ring_protocol import RECORD_SIZE
 from .debug_logging import debug_event
 from .staging_contract import (
@@ -90,6 +90,7 @@ class StagingFilesystem:
         self._fsync = fsync_fn
         self._statvfs = statvfs_fn
         self._durability: DurabilityConfig = config.durability
+        self._ready: ReadyConfig = config.ready
         self._terminal_retention_seconds = config.staging_retention.terminal_retention_seconds
         self._active_lease: DeviceLock | None = None
         if self.spool == self.capture_root:

@@ -554,7 +554,8 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
     python_install = deployment_root / "python"
     config_file = tmp_path / "config.toml"
     config_file.write_text(
-        '[pendant]\naddress = "12:34:56:78:9A:BC"\n',
+        '[pendant]\naddress = "12:34:56:78:9A:BC"\n'
+        "[ready]\ntarget_audio_seconds = 3600.0\nmax_wait_seconds = 86400.0\n",
         encoding="utf-8",
     )
     config_file.chmod(0o644)

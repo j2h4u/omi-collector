@@ -19,7 +19,7 @@ from contextlib import AbstractContextManager
 from threading import get_ident
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from .attempts import RecordDisposition, StagedAttempt
+from .attempts import StagedAttempt
 from .publication import SealResult
 from .staging_contract import AttemptDescriptor, DurablePrefix
 from .staging_filesystem import DeviceLock
@@ -153,7 +153,7 @@ class StagingWriter:
         self._attempt.record_read_begin(notice)
         self._read_started = True
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> tuple[RecordDisposition, ...]:
+    def append_chunk(self, offset: int, chunk: memoryview) -> None:
         """Map an arena-relative byte offset to the exact ring sequence."""
         self._enter("append_chunk")
         self._require_ready_for_data()
@@ -173,7 +173,7 @@ class StagingWriter:
         assert self._attempt is not None
         self._require_lease()
         sequence = self._active_start + offset // RECORD_SIZE
-        return self._attempt.accept_chunk(sequence, chunk)
+        self._attempt.accept_chunk(sequence, chunk)
 
     def checkpoint(self) -> DurablePrefix:
         """Checkpoint through the existing staging API."""

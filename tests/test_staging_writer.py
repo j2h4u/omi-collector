@@ -6,7 +6,6 @@ from shutil import rmtree
 
 import pytest
 
-from omi_collector.capture.adapters.attempts import RecordDisposition
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter, StagingWriterStateError, ThreadAffinityError
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
@@ -51,9 +50,7 @@ def test_writer_maps_arena_offsets_and_owns_streaming_mutations(tmp_path: Path) 
     second = _record(2)
 
     _begin(writer)
-    dispositions = writer.append_chunk(0, memoryview(first + second))
-
-    assert dispositions == (RecordDisposition.APPENDED, RecordDisposition.APPENDED)
+    writer.append_chunk(0, memoryview(first + second))
     prefix = writer.checkpoint()
     assert prefix.record_count == 2
     assert prefix.start_sequence == 100
@@ -91,10 +88,7 @@ def test_prepare_resumes_partial_and_replays_from_checkpoint(tmp_path: Path) -> 
     prefix = resumed.prepare_leg(100, 2)
     assert prefix.next_sequence == 101
     resumed.read_begin(ReadBeginNotification(100, 2))
-    assert resumed.append_chunk(0, memoryview(first + second)) == (
-        RecordDisposition.REPLAYED,
-        RecordDisposition.APPENDED,
-    )
+    resumed.append_chunk(0, memoryview(first + second))
     resumed.checkpoint()
     result = resumed.seal(DoneNotification(0, 102))
     resumed.close()

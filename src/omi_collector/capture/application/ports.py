@@ -57,10 +57,6 @@ class SealResultShape(Protocol):
     def deduplicated(self) -> bool: ...
 
 
-class QuarantinePublicationShape(SealResultShape, Protocol):
-    pass
-
-
 class ClockCorrectionShape(Protocol):
     @property
     def operation_id(self) -> str: ...
@@ -346,9 +342,7 @@ class StagingPort(Protocol):
 
     def notify_publication_failure(self) -> None: ...
 
-    def publish_quarantined_prefix(
-        self, source: Path, *, should_defer: Callable[[], bool]
-    ) -> QuarantinePublicationShape: ...
+    def publish_quarantined_prefix(self, source: Path, *, should_defer: Callable[[], bool]) -> SealResultShape: ...
 
     def retain_validated_attempt(self, attempt_id: str, attempt: StagedAttemptShape) -> None: ...
 
@@ -394,7 +388,7 @@ class CaptureRuntimePort(Protocol):
         source: Path,
         staging: StagingPort,
         should_defer: Callable[[], bool],
-    ) -> QuarantinePublicationShape: ...
+    ) -> SealResultShape: ...
 
     def classify_quarantine_error(self, error: BaseException) -> QuarantineErrorKind | None: ...
 

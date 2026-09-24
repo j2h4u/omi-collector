@@ -15,7 +15,6 @@ from ..application.ports import (
     DurablePrefixShape,
     ObservationWriterPort,
     QuarantineErrorKind,
-    QuarantinePublicationShape,
     SealResultShape,
     StagingPort,
     StagingWriterTargetPort,
@@ -214,7 +213,7 @@ class OpportunisticRuntime(CaptureRuntimePort):
         source: Path,
         staging: StagingPort,
         should_defer: Callable[[], bool],
-    ) -> QuarantinePublicationShape:
+    ) -> SealResultShape:
         return staging.publish_quarantined_prefix(source, should_defer=should_defer)
 
     def classify_quarantine_error(self, error: BaseException) -> QuarantineErrorKind | None:

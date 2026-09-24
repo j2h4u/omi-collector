@@ -240,7 +240,13 @@ def test_causal_observation_allows_ordered_successive_same_boundary_operation(tm
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
     first = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20, operation_id="first"))
     store.finish(first, state="applied", boundary_sequence_max=20, verified_epoch=1000)
-    store.resolve_applied(store.records()[0])
+    applied = store.records()[0]
+    store.finish(
+        applied,
+        state="resolved",
+        boundary_sequence_max=applied.boundary_sequence_max,
+        verified_epoch=applied.verified_epoch,
+    )
     second = store.mark_unresolved(store.prepare(1301, 1000, 301.0, 20, operation_id="second"))
     initial = store.observation_store.append(
         evidence_kind="native_trusted",

@@ -16,7 +16,6 @@ import pytest
 
 from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
-    RecordDisposition,
     RecordGapError,
     RecordMismatchError,
 )
@@ -166,13 +165,7 @@ def test_streaming_accept_chunk_replays_overlap_and_appends_one_suffix(tmp_path:
     attempt.checkpoint()
     attempt.begin_recovery(100, 3)
 
-    dispositions = attempt.accept_chunk(100, first + second + third)
-
-    assert dispositions == (
-        RecordDisposition.REPLAYED,
-        RecordDisposition.APPENDED,
-        RecordDisposition.APPENDED,
-    )
+    attempt.accept_chunk(100, first + second + third)
     assert (attempt.path / "records.bin").read_bytes() == first + second + third
 
 

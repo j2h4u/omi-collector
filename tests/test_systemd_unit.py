@@ -18,6 +18,7 @@ import pytest
 _ROOT = Path(__file__).parents[1]
 _UNIT = _ROOT / "systemd" / "omi-collector.service"
 _INSTALLER = _ROOT / "scripts" / "install-systemd-unit.sh"
+_BLUETOOTH_READY = _ROOT / "scripts" / "omi-collector-bluetooth-ready"
 _DEPLOYER = _ROOT / "scripts" / "deploy-systemd-service.sh"
 _SEALER = _ROOT / "scripts" / "seal_deployment_tree.py"
 _DEV_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
@@ -97,7 +98,7 @@ def test_production_unit_uses_one_config_and_the_selected_release() -> None:
 
     assert service["User"] == "omi-collector"
     assert service["Group"] == "omi-collector"
-    assert service["ExecStartPre"] == "+/usr/bin/bluetoothctl --timeout 10 power on"
+    assert service["ExecStartPre"] == "+/usr/local/sbin/omi-collector-bluetooth-ready"
     assert "EnvironmentFile" not in service
     assert service["ExecStart"] == (
         "/var/lib/omi-collector-deployments/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml"
@@ -123,6 +124,8 @@ def test_systemd_material_uses_only_the_fixed_unit_and_release_selector() -> Non
 
     assert {path.name for path in (_ROOT / "systemd").iterdir()} == {_UNIT.name}
     assert "EnvironmentFile" not in unit
+    assert 'source_bluetooth_ready="${repo_root}/scripts/omi-collector-bluetooth-ready"' in installer
+    assert "bluetooth_ready_target='/usr/local/sbin/omi-collector-bluetooth-ready'" in installer
     assert "config_file='/srv/pipelines/omi/config.toml'" in installer
     assert "config_file='/srv/pipelines/omi/config.toml'" in deployer
     assert "current_link='/var/lib/omi-collector-deployments/current'" in deployer
@@ -178,6 +181,7 @@ def test_installer_keeps_the_unit_and_config_targets_fixed() -> None:
     assert "useradd --system" in installer
     assert 'chmod 0644 -- "$config_file"' in installer
     assert 'stage_file "$source_unit" "$unit_target" 0644 staged_unit' in installer
+    assert 'stage_file "$source_bluetooth_ready" "$bluetooth_ready_target" 0755 staged_bluetooth_ready' in installer
     assert "ExecStart=/usr/bin/true" in installer
     assert "systemd-analyze verify" in installer
     assert "rollback" in installer.lower()
@@ -244,7 +248,7 @@ def test_operator_status_command_has_no_arguments_or_extra_privilege() -> None:
 
 
 def test_shell_scripts_are_syntactically_clean() -> None:
-    scripts = (_INSTALLER, _DEPLOYER, _DEV_DEPLOYER, _STATUS_COMMAND, _RELEASE_COMMAND)
+    scripts = (_INSTALLER, _BLUETOOTH_READY, _DEPLOYER, _DEV_DEPLOYER, _STATUS_COMMAND, _RELEASE_COMMAND)
 
     subprocess.run(("bash", "-n", *(str(script) for script in scripts)), check=True)
     subprocess.run(("shellcheck", *(str(script) for script in scripts)), check=True)
@@ -260,12 +264,87 @@ def test_checked_in_unit_passes_systemd_validation(tmp_path: Path) -> None:
             "service --config /srv/pipelines/omi/config.toml",
             "ExecStart=/usr/bin/true",
         )
-        .replace("ExecStartPre=+/usr/bin/bluetoothctl --timeout 10 power on", "ExecStartPre=/usr/bin/true"),
+        .replace("ExecStartPre=+/usr/local/sbin/omi-collector-bluetooth-ready", "ExecStartPre=/usr/bin/true"),
         encoding="utf-8",
     )
     bluetooth_unit.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
 
     subprocess.run(("systemd-analyze", "verify", str(bluetooth_unit), str(validation_unit)), check=True)
+
+
+def _bluetooth_ready_harness(tmp_path: Path, mode: str) -> tuple[Path, Path]:
+    fake_bluetoothctl = tmp_path / "bluetoothctl"
+    calls = tmp_path / "calls"
+    state = tmp_path / "powered"
+    fake_bluetoothctl.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        f"calls={shlex.quote(str(calls))}\n"
+        f"state={shlex.quote(str(state))}\n"
+        f"mode={shlex.quote(mode)}\n"
+        'if [[ "$3" == power && "$4" == on ]]; then\n'
+        "    printf 'power on\\n' >> \"$calls\"\n"
+        '    if [[ "$mode" == false-success ]]; then exit 0; fi\n'
+        '    : > "$state"\n'
+        "    exit 0\n"
+        "fi\n"
+        'if [[ "$3" != show ]]; then exit 2; fi\n'
+        "printf 'show\\n' >> \"$calls\"\n"
+        'if [[ "$mode" == no-controller ]]; then\n'
+        "    printf 'No default controller available\\n'\n"
+        "    exit 0\n"
+        "fi\n"
+        'show_calls=$(wc -l < "$calls")\n'
+        'if [[ "$mode" == delayed && "$show_calls" -lt 2 ]]; then\n'
+        "    printf 'No default controller available\\n'\n"
+        "    exit 0\n"
+        "fi\n"
+        'if [[ -f "$state" ]]; then\n'
+        "    printf 'Controller 12:34:56:78:9A:BC (public)\\n\\tPowered: yes\\n'\n"
+        "else\n"
+        "    printf 'Controller 12:34:56:78:9A:BC (public)\\n\\tPowered: no\\n'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_bluetoothctl.chmod(0o755)
+    helper = tmp_path / "omi-collector-bluetooth-ready"
+    helper.write_text(
+        _BLUETOOTH_READY.read_text(encoding="utf-8")
+        .replace("bluetoothctl_bin='/usr/bin/bluetoothctl'", f"bluetoothctl_bin={shlex.quote(str(fake_bluetoothctl))}")
+        .replace("wait_seconds=30", "wait_seconds=8"),
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    return helper, calls
+
+
+def test_bluetooth_ready_waits_for_controller_and_verifies_power(tmp_path: Path) -> None:
+    helper, calls = _bluetooth_ready_harness(tmp_path, "delayed")
+
+    result = subprocess.run((str(helper),), check=False, capture_output=True, text=True, timeout=15)
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines().count("power on") == 1
+
+
+def test_bluetooth_ready_fails_without_controller(tmp_path: Path) -> None:
+    helper, calls = _bluetooth_ready_harness(tmp_path, "no-controller")
+
+    result = subprocess.run((str(helper),), check=False, capture_output=True, text=True, timeout=15)
+
+    assert result.returncode != 0
+    assert "Powered: yes" in result.stderr
+    assert "power on" not in calls.read_text(encoding="utf-8")
+
+
+def test_bluetooth_ready_rejects_false_success_from_power_command(tmp_path: Path) -> None:
+    helper, calls = _bluetooth_ready_harness(tmp_path, "false-success")
+
+    result = subprocess.run((str(helper),), check=False, capture_output=True, text=True, timeout=15)
+
+    assert result.returncode != 0
+    assert "Powered: yes" in result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines().count("power on") == 1
 
 
 def test_dev_release_deployer_accepts_https_with_readonly_caller_variable() -> None:

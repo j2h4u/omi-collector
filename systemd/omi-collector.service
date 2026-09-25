@@ -9,7 +9,7 @@ Type=exec
 User=omi-collector
 Group=omi-collector
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 XDG_STATE_HOME=/var/lib/omi-collector
-ExecStartPre=+/usr/bin/bluetoothctl --timeout 10 power on
+ExecStartPre=+/usr/local/sbin/omi-collector-bluetooth-ready
 ExecStart=/var/lib/omi-collector-deployments/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml
 Restart=always
 RestartSec=5s

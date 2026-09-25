@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/j2h4u/omi-collector/compare/v0.8.0...v0.8.1) (2026-09-25)
+
+
+### Fixes
+
+* restore Bluetooth startup and device status ([#137](https://github.com/j2h4u/omi-collector/issues/137)) ([d3510d3](https://github.com/j2h4u/omi-collector/commit/d3510d34959e8e09ffd9bebb8023cb345d0b76d1))
+
 ## [0.8.0](https://github.com/j2h4u/omi-collector/compare/v0.7.6...v0.8.0) (2026-09-24)
 
 

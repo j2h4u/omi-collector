@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/j2h4u/omi-collector/compare/v0.8.1...v0.8.2) (2026-09-25)
+
+
+### Maintenance
+
+* **deps:** sync Ruff and GitHub Actions updates ([#139](https://github.com/j2h4u/omi-collector/issues/139)) ([db11e7c](https://github.com/j2h4u/omi-collector/commit/db11e7c7065db0d8f4276009bd31272d51ff80b3))
+
 ## [0.8.1](https://github.com/j2h4u/omi-collector/compare/v0.8.0...v0.8.1) (2026-09-25)
 
 

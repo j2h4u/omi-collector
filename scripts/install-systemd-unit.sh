@@ -147,15 +147,16 @@ function validate_staged_unit {
     rm -rf -- "$validation_root" || die 'could not remove staged validation root'
 }
 
-declare script_dir repo_root source_unit source_status source_status_sudoers source_deploy_release source_deploy_release_sudoers
-declare config_file storage_root unit_target status_target status_sudoers_target deploy_release_target deploy_release_sudoers_target service_name
-declare account_user account_group state_dir staged_status staged_status_sudoers staged_deploy_release staged_deploy_release_sudoers staged_unit
-declare status_backup status_sudoers_backup deploy_release_backup deploy_release_sudoers_backup unit_backup
+declare script_dir repo_root source_unit source_bluetooth_ready source_status source_status_sudoers source_deploy_release source_deploy_release_sudoers
+declare config_file storage_root unit_target bluetooth_ready_target status_target status_sudoers_target deploy_release_target deploy_release_sudoers_target service_name
+declare account_user account_group state_dir staged_status staged_status_sudoers staged_deploy_release staged_deploy_release_sudoers staged_unit staged_bluetooth_ready
+declare status_backup status_sudoers_backup deploy_release_backup deploy_release_sudoers_backup unit_backup bluetooth_ready_backup
 declare -i restart_requested=0
 
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve installer directory'
 repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
 source_unit="${repo_root}/systemd/omi-collector.service"
+source_bluetooth_ready="${repo_root}/scripts/omi-collector-bluetooth-ready"
 source_status="${repo_root}/scripts/omi-collector-status"
 source_status_sudoers="${repo_root}/scripts/omi-collector-status.sudoers"
 source_deploy_release="${repo_root}/scripts/omi-collector-deploy-release"
@@ -163,6 +164,7 @@ source_deploy_release_sudoers="${repo_root}/scripts/omi-collector-deploy-release
 config_file='/srv/pipelines/omi/config.toml'
 storage_root=$(dirname -- "$config_file") || die 'cannot resolve storage root'
 unit_target='/etc/systemd/system/omi-collector.service'
+bluetooth_ready_target='/usr/local/sbin/omi-collector-bluetooth-ready'
 status_target='/usr/local/sbin/omi-collector-status'
 status_sudoers_target='/etc/sudoers.d/omi-collector-status'
 deploy_release_target='/usr/local/sbin/omi-collector-deploy-release'
@@ -176,11 +178,13 @@ staged_status_sudoers=''
 staged_deploy_release=''
 staged_deploy_release_sudoers=''
 staged_unit=''
+staged_bluetooth_ready=''
 status_backup=''
 status_sudoers_backup=''
 deploy_release_backup=''
 deploy_release_sudoers_backup=''
 unit_backup=''
+bluetooth_ready_backup=''
 
 function cleanup {
     if [[ -n "$staged_status" && ( -e "$staged_status" || -L "$staged_status" ) ]]; then
@@ -198,6 +202,9 @@ function cleanup {
     if [[ -n "$staged_unit" && ( -e "$staged_unit" || -L "$staged_unit" ) ]]; then
         rm -f -- "$staged_unit" || true
     fi
+    if [[ -n "$staged_bluetooth_ready" && ( -e "$staged_bluetooth_ready" || -L "$staged_bluetooth_ready" ) ]]; then
+        rm -f -- "$staged_bluetooth_ready" || true
+    fi
     if [[ -n "$status_backup" && ( -e "$status_backup" || -L "$status_backup" ) ]]; then
         rm -f -- "$status_backup" || true
     fi
@@ -212,6 +219,9 @@ function cleanup {
     fi
     if [[ -n "$unit_backup" && ( -e "$unit_backup" || -L "$unit_backup" ) ]]; then
         rm -f -- "$unit_backup" || true
+    fi
+    if [[ -n "$bluetooth_ready_backup" && ( -e "$bluetooth_ready_backup" || -L "$bluetooth_ready_backup" ) ]]; then
+        rm -f -- "$bluetooth_ready_backup" || true
     fi
 }
 trap cleanup EXIT
@@ -228,6 +238,7 @@ done
 # assert: installation has the authority and tools needed to change systemd
 (( EUID == 0 )) || die 'must run as root (use sudo)'
 [[ -f "$source_unit" ]] || die "checked-in systemd unit is missing: ${source_unit}"
+[[ -f "$source_bluetooth_ready" ]] || die "checked-in Bluetooth readiness helper is missing: ${source_bluetooth_ready}"
 command -v systemd-analyze &> /dev/null || die 'systemd-analyze is required'
 command -v systemctl &> /dev/null || die 'systemctl is required'
 [[ -x /usr/sbin/visudo ]] || die 'visudo is required'
@@ -243,23 +254,27 @@ stage_file "$source_status_sudoers" "$status_sudoers_target" 0440 staged_status_
 stage_file "$source_deploy_release" "$deploy_release_target" 0755 staged_deploy_release
 stage_file "$source_deploy_release_sudoers" "$deploy_release_sudoers_target" 0440 staged_deploy_release_sudoers
 stage_file "$source_unit" "$unit_target" 0644 staged_unit
+stage_file "$source_bluetooth_ready" "$bluetooth_ready_target" 0755 staged_bluetooth_ready
 validate_staged_unit "$staged_unit" "$service_name"
 backup_target "$status_target" status_backup
 backup_target "$status_sudoers_target" status_sudoers_backup
 backup_target "$deploy_release_target" deploy_release_backup
 backup_target "$deploy_release_sudoers_target" deploy_release_sudoers_backup
 backup_target "$unit_target" unit_backup
+backup_target "$bluetooth_ready_target" bluetooth_ready_backup
 
 if ! mv -f -- "$staged_status" "$status_target" \
     || ! mv -f -- "$staged_status_sudoers" "$status_sudoers_target" \
     || ! mv -f -- "$staged_deploy_release" "$deploy_release_target" \
     || ! mv -f -- "$staged_deploy_release_sudoers" "$deploy_release_sudoers_target" \
-    || ! mv -f -- "$staged_unit" "$unit_target"; then
+    || ! mv -f -- "$staged_unit" "$unit_target" \
+    || ! mv -f -- "$staged_bluetooth_ready" "$bluetooth_ready_target"; then
     restore_target "$status_target" "$status_backup"
     restore_target "$status_sudoers_target" "$status_sudoers_backup"
     restore_target "$deploy_release_target" "$deploy_release_backup"
     restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
     restore_target "$unit_target" "$unit_backup"
+    restore_target "$bluetooth_ready_target" "$bluetooth_ready_backup"
     die 'could not install systemd and operator material'
 fi
 staged_status=''
@@ -267,12 +282,14 @@ staged_status_sudoers=''
 staged_deploy_release=''
 staged_deploy_release_sudoers=''
 staged_unit=''
+staged_bluetooth_ready=''
 if ! systemctl daemon-reload; then
     restore_target "$status_target" "$status_backup"
     restore_target "$status_sudoers_target" "$status_sudoers_backup"
     restore_target "$deploy_release_target" "$deploy_release_backup"
     restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
     restore_target "$unit_target" "$unit_backup"
+    restore_target "$bluetooth_ready_target" "$bluetooth_ready_backup"
     systemctl daemon-reload || die 'daemon-reload failed while restoring the previous unit'
     die 'systemd daemon-reload failed; restored previous systemd and operator material'
 fi
@@ -282,6 +299,7 @@ if ! systemctl enable "$service_name"; then
     restore_target "$deploy_release_target" "$deploy_release_backup"
     restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
     restore_target "$unit_target" "$unit_backup"
+    restore_target "$bluetooth_ready_target" "$bluetooth_ready_backup"
     systemctl daemon-reload || die 'daemon-reload failed while restoring the previous unit'
     die "could not enable ${service_name}; restored previous systemd and operator material"
 fi
@@ -295,6 +313,8 @@ rm -f -- "$deploy_release_sudoers_backup" || die 'could not remove installed rel
 deploy_release_sudoers_backup=''
 rm -f -- "$unit_backup" || die 'could not remove installed-unit rollback backup'
 unit_backup=''
+rm -f -- "$bluetooth_ready_backup" || die 'could not remove installed Bluetooth readiness rollback backup'
+bluetooth_ready_backup=''
 
 printf 'Installed and enabled %s.\n' "$service_name"
 if (( restart_requested )); then

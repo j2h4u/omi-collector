@@ -275,6 +275,21 @@ def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPat
         collect_operator_status(layout, hours=24)
 
 
+def test_status_accepts_nul_prefix_before_valid_debug_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    row = {
+        "event": "sync_progress",
+        "fields": {"progress": {"status": "away"}},
+        "timestamp": "2026-09-08T09:00:00+00:00",
+    }
+    layout.collector.debug_log.write_bytes(b"\x00" * 2_195 + json.dumps(row).encode() + b"\n")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    assert cast(dict[str, object], result["runtime"])["state"] == "away"
+
+
 def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     rows = (

@@ -356,6 +356,7 @@ def _debug_rows(path: Path) -> list[dict[str, object]]:
     for line in payload.splitlines():
         if len(line) > config.max_record_bytes:
             raise OperatorStatusError(f"debug journal record exceeds configured size: {path.name}")
+        line = line.lstrip(b"\x00")
         try:
             value = cast(object, json.loads(line))
         except (json.JSONDecodeError, UnicodeDecodeError) as error:

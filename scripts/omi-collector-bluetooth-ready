@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+declare -r bluetoothctl_bin='/usr/bin/bluetoothctl'
+declare -ri wait_seconds=30
+declare -ri poll_seconds=1
+declare -ri bluetoothctl_timeout_seconds=10
+
+function show_controller {
+    local -n output_ref="$1"
+
+    output_ref=$("$bluetoothctl_bin" --timeout "$bluetoothctl_timeout_seconds" show 2>&1) || return 1
+    [[ "$output_ref" =~ Controller[[:space:]][[:xdigit:]:]{17} ]]
+}
+
+function controller_is_powered {
+    local -r output="$1"
+
+    [[ "$output" =~ Powered:[[:space:]]+yes([[:space:]]|$) ]]
+}
+
+function main {
+    local output deadline
+
+    deadline=$((SECONDS + wait_seconds))
+    while (( SECONDS < deadline )); do
+        if show_controller output; then
+            "$bluetoothctl_bin" --timeout "$bluetoothctl_timeout_seconds" power on >/dev/null 2>&1 || return 1
+            while (( SECONDS < deadline )); do
+                if show_controller output && controller_is_powered "$output"; then
+                    return 0
+                fi
+                sleep "$poll_seconds"
+            done
+            break
+        fi
+        sleep "$poll_seconds"
+    done
+
+    printf 'ERROR: Bluetooth controller did not become Powered: yes within %ss\n' "$wait_seconds" >&2
+    return 1
+}
+
+main "$@"

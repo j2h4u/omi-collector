@@ -390,6 +390,21 @@ class _SealResultBatchWriter:
         await self.writer.close(timeout=timeout)
 
 
+async def _real_batch_writer(store: StagingStore, start: int, count: int) -> BatchWriterPort:
+    writer = _runtime().make_batch_writer(
+        store,
+        start,
+        count,
+        source_start=start,
+        source=memoryview(_records(start, count)),
+        config=DEFAULT_CONFIG.writer,
+    )
+    await writer.start()
+    await writer.prepare_leg(start, count)
+    await writer.read_begin(ReadBeginNotification(start, count))
+    return writer
+
+
 @_async_test
 async def test_incomplete_staging_composition_is_rejected_before_provider_open() -> None:
     with pytest.raises(TypeError, match="complete staging capability"):
@@ -2974,6 +2989,91 @@ def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) 
     assert empty_reconciler.durable_progress() == 0
     empty_reconciler._state.batch.durable = DurablePrefix(100, 101, 1, "b" * 64)
     assert empty_reconciler.durable_progress() == 101
+
+
+@_async_test
+async def test_close_visit_absence_publishes_partial_prefix_before_terminal_closure(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    writer = await _real_batch_writer(store, 100, 2)
+    assert writer.publish(RECORD_SIZE)
+    attempt_path = store.attempts_root / writer.attempt_id
+    batch = batch_reconciliation._Batch(
+        RingInfo(100, 102, 10000, 0, RECORD_SIZE),
+        100,
+        102,
+        TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
+        writer,
+    )
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+    reconciler._state.batch = batch
+    await reconciler.close_visit("absence")
+
+    assert reconciler._state.batch is None
+    assert reconciler.durable_progress() == 0
+    assert not writer.thread.is_alive()
+    assert (attempt_path / "prefix-publication.json").is_file()
+    assert (attempt_path / "terminal-retired.json").is_file()
+    assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+        {"next_sequence": 101, "reason": "absence"}
+    ]
+
+
+@_async_test
+async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_close(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    writer = await _real_batch_writer(store, 100, 2)
+    assert writer.publish(RECORD_SIZE * 2)
+    seal = await writer.seal(DoneNotification(0, 102))
+    assert seal is not None
+    batch = batch_reconciliation._Batch(
+        RingInfo(100, 102, 10000, 0, RECORD_SIZE),
+        100,
+        102,
+        TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
+        writer,
+        seal=seal,
+    )
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+    reconciler._state.batch = batch
+    await reconciler.close_visit("absence")
+
+    assert not writer.thread.is_alive()
+    assert seal.bundle_path.is_dir()
+    assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+        {"next_sequence": 102, "reason": "absence"}
+    ]
+
+
+@_async_test
+async def test_close_visit_empty_batch_closes_writer_without_creating_visit_closure(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    writer = await _real_batch_writer(store, 100, 1)
+    batch = batch_reconciliation._Batch(
+        RingInfo(100, 100, 10000, 0, RECORD_SIZE),
+        100,
+        100,
+        TransferArena(100, 0, max_bytes=0),
+        writer,
+    )
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+    reconciler._state.batch = batch
+    await reconciler.close_visit("absence")
+
+    assert reconciler._state.batch is None
+    assert not writer.thread.is_alive()
+    assert not store.ready_closures_path.exists()
 
 
 @_async_test

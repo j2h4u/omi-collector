@@ -46,6 +46,11 @@ depend on explicit timer, availability, and fairness assumptions. No FSM
 library replaces these contracts; prefer the existing pure reducers unless a
 dependency removes concrete complexity.
 
+Foreground attempt and closure effects own priority over background publication
+retries. Join any running retry before admission and defer new retries until
+the foreground scope exits. Inline clock publication uses the explicitly
+transferred clock lease; it must not reacquire the same filesystem lock.
+
 `INFO` is the source of truth for unread state. Automatic service and sync
 admission requires a current exact-address scanner candidate that has remained
 visible for the configured stable-arrival span; the default is 30 seconds with

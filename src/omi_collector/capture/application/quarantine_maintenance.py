@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from threading import Event
 from time import monotonic
@@ -59,6 +60,12 @@ class PendingStartupState:
     disposition: RecoveryDisposition = "empty"
 
 
+class _PublicationPriority(Enum):
+    BACKGROUND_ALLOWED = auto()
+    CAPTURE = auto()
+    CLOSED = auto()
+
+
 class QuarantineMaintenance:
     """Own restart evidence, quarantine salvage, and presence coordination."""
 
@@ -83,6 +90,7 @@ class QuarantineMaintenance:
         self._publication_retry_handle: asyncio.TimerHandle | None = None
         self._publication_retry_task: asyncio.Task[bool] | None = None
         self._publication_retry_requested = False
+        self._publication_priority = _PublicationPriority.BACKGROUND_ALLOWED
 
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
@@ -162,6 +170,8 @@ class QuarantineMaintenance:
 
     def schedule_publication_retry(self) -> None:
         """Retry a known publication failure without waiting for another pendant visit."""
+        if self._publication_priority is _PublicationPriority.CLOSED:
+            return
         self._publication_retry_not_before = monotonic()
         if self._publication_retry_handle is not None:
             self._publication_retry_handle.cancel()
@@ -169,6 +179,11 @@ class QuarantineMaintenance:
         self._schedule_publication_retry()
 
     def _schedule_publication_retry(self) -> None:
+        if self._publication_priority is _PublicationPriority.CLOSED:
+            return
+        if self._publication_priority is _PublicationPriority.CAPTURE:
+            self._publication_retry_requested = True
+            return
         if self._publication_retry_task is not None and not self._publication_retry_task.done():
             self._publication_retry_requested = True
             return
@@ -183,6 +198,11 @@ class QuarantineMaintenance:
 
     def _start_publication_retry(self) -> None:
         self._publication_retry_handle = None
+        if self._publication_priority is _PublicationPriority.CLOSED:
+            return
+        if self._publication_priority is _PublicationPriority.CAPTURE:
+            self._publication_retry_requested = True
+            return
         if self._publication_retry_task is not None and not self._publication_retry_task.done():
             self._publication_retry_requested = True
             return
@@ -193,14 +213,42 @@ class QuarantineMaintenance:
     def _consume_publication_retry(self, task: asyncio.Task[bool]) -> None:
         if self._publication_retry_task is task:
             self._publication_retry_task = None
-            if self._publication_retry_requested:
+            if (
+                self._publication_retry_requested
+                and self._publication_priority is _PublicationPriority.BACKGROUND_ALLOWED
+            ):
                 self._publication_retry_requested = False
                 self._schedule_publication_retry()
         with suppress(asyncio.CancelledError, Exception):
             task.result()
 
+    async def enter_capture_priority(self) -> None:
+        """Admit capture only after a prior background mutation has stopped."""
+        if self._publication_priority is not _PublicationPriority.BACKGROUND_ALLOWED:
+            raise RuntimeError("capture priority cannot be entered twice or after close")
+        self._publication_priority = _PublicationPriority.CAPTURE
+        if self._publication_retry_handle is not None:
+            self._publication_retry_handle.cancel()
+            self._publication_retry_handle = None
+            self._publication_retry_requested = True
+        task = self._publication_retry_task
+        if task is not None and not task.done():
+            self._publication_retry_requested = True
+            task.cancel()
+            await join_owned(asyncio.gather(task, return_exceptions=True))
+
+    def exit_capture_priority(self) -> None:
+        """Release foreground priority and resume one deferred publication."""
+        if self._publication_priority is not _PublicationPriority.CAPTURE:
+            return
+        self._publication_priority = _PublicationPriority.BACKGROUND_ALLOWED
+        if self._publication_retry_requested:
+            self._publication_retry_requested = False
+            self._schedule_publication_retry()
+
     async def close(self) -> None:
         """Cancel and join local publication retry work before loop shutdown."""
+        self._publication_priority = _PublicationPriority.CLOSED
         self._publication_retry_requested = False
         if self._publication_retry_handle is not None:
             self._publication_retry_handle.cancel()

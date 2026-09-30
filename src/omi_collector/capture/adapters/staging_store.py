@@ -325,7 +325,7 @@ class StagingStore:
         return self._filesystem.capture_root
 
     def transfer_publication_authority(self, lease: DeviceLock) -> None:
-        """Transfer this active writer lease to the run's publication capability."""
+        """Bind this active storage lease to the run's publication capability."""
         self._filesystem.require_device_lock(lease)
         with self._publication_lock:
             bound = self._publication_authority_lease
@@ -534,6 +534,7 @@ class StagingStore:
             yield active
             return
         with self.device_lock(recover_capture_temporaries=False, operation="clock_mutation") as lease:
+            self.transfer_publication_authority(lease)
             yield lease
 
     def require_device_lock(self, lease: DeviceLock) -> None:

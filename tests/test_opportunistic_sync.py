@@ -2562,6 +2562,96 @@ async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path)
     ]
 
 
+class _ProjectionClockSession(ScriptedRingSession):
+    def __init__(self, steps: tuple[WriteStep, ...], events: list[str]) -> None:
+        super().__init__(_status(), steps)
+        self.events = events
+        self.clock_read = False
+
+    async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+        if uuid == TIME_READ_UUID:
+            self.clock_read = True
+            return pack("<I", 10_000)
+        return None
+
+    async def write_control(self, payload: bytes) -> None:
+        if payload == encode_read_command(10, 1):
+            await asyncio.sleep(0.01)
+            assert self.events == ["clock_projection_failed"]
+            self.events.append("read")
+        await super().write_control(payload)
+
+
+@_async_test
+async def test_clock_projection_failure_defers_retry_until_after_real_capture_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path / "spool", _capture_root(tmp_path)).paths,
+        publication_root=ready,
+    )
+    events: list[str] = []
+    original_publish = store._recover_and_publish_unlocked
+    original_closure = BatchReconciler.close_visit
+    original_background = store.recover_and_publish
+    failed = False
+
+    def publish() -> object | None:
+        nonlocal failed
+        if session.clock_read and not failed:
+            failed = True
+            events.append("clock_projection_failed")
+            raise OSError("ready projection failed")
+        return original_publish()
+
+    def background() -> object | None:
+        if failed:
+            events.append("retry")
+        return original_background()
+
+    async def close_visit(reconciler: BatchReconciler, reason: str) -> None:
+        await original_closure(reconciler, reason)
+        events.append("closure")
+
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
+    monkeypatch.setattr(store, "recover_and_publish", background)
+    monkeypatch.setattr(BatchReconciler, "close_visit", close_visit)
+
+    session = _ProjectionClockSession(
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_advance_command(11), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(11, 11),)),
+        ),
+        events,
+    )
+
+    async def activity(event: ActivityEvent) -> None:
+        if event.state == "drained":
+            await asyncio.sleep(0.02)
+
+    result = await run_opportunistic_collector(
+        Provider([session]),
+        store,
+        replace(
+            _options(batch_records=1),
+            operational=lambda _event: None,
+            host_time=lambda: 10_000.0,
+            host_clock_synchronized=lambda: True,
+            activity=activity,
+        ),
+    )
+
+    assert isinstance(result, CollectionResult)
+    assert events == ["clock_projection_failed", "read", "closure", "retry"]
+
+
 @_async_test
 async def test_disconnect_next_day_replays_overlap_and_progress_counts_unique_bytes(tmp_path: Path) -> None:
     first = ScriptedRingSession(

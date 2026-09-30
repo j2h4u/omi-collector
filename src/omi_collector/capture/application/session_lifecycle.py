@@ -92,6 +92,7 @@ from .visit_machine import (
     TransitionResult,
     VisitCommand,
     VisitEvent,
+    VisitState,
     WaitForAttempt,
     initial_transition,
     transition,
@@ -210,6 +211,12 @@ class SessionLifecycleCallbacks:
     close_visit: Callable[[str], Awaitable[None]] | None = None
     load_recovery: Callable[[], Awaitable[VisitRecoveryDisposition]] | None = None
     invalidate_recovery: Callable[[], None] | None = None
+    enter_capture_priority: Callable[[], Awaitable[None]] | None = None
+    exit_capture_priority: Callable[[], None] | None = None
+
+    def __post_init__(self) -> None:
+        if (self.enter_capture_priority is None) != (self.exit_capture_priority is None):
+            raise ValueError("capture priority callbacks must be supplied together")
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +262,7 @@ class SessionLifecycle:
         """Execute effects, then feed their completed facts to the pure policy."""
         presence = self.run.options.presence if with_presence else None
         result = initial_transition()
+        capture_priority_active = False
         try:
             while True:
                 command = result.command
@@ -268,19 +276,45 @@ class SessionLifecycle:
                     raise asyncio.CancelledError("visit lifecycle stopped before closure acknowledgement")
                 if isinstance(command, NoOp):
                     return self.run.callbacks.drained_result()
-                try:
-                    event = await self._run_visit_command(command, with_presence=with_presence)
-                except BaseException:
-                    if isinstance(command, CommitClosure):
-                        result = transition(result.state, CloseFailed())
-                    raise
+                if self._should_enter_capture_priority(command, capture_priority_active):
+                    capture_priority_active = True
+                    enter_capture_priority = self.run.callbacks.enter_capture_priority
+                    assert enter_capture_priority is not None
+                    await enter_capture_priority()
+                event = await self._execute_visit_command(command, result.state, with_presence=with_presence)
                 result = transition(result.state, event, stop_after_drained=self.run.options.policy.stop_after_drained)
+                capture_priority_active = self._release_capture_priority_after(result.command, capture_priority_active)
         except asyncio.CancelledError:
             transition(result.state, Shutdown())
             raise
         finally:
+            self._release_capture_priority_after(None, capture_priority_active)
             if presence is not None:
                 await presence.close()
+
+    def _should_enter_capture_priority(self, command: VisitCommand, active: bool) -> bool:
+        return (
+            isinstance(command, (RunAttempt, CommitClosure))
+            and not active
+            and self.run.callbacks.enter_capture_priority is not None
+        )
+
+    def _release_capture_priority_after(self, next_command: VisitCommand | None, active: bool) -> bool:
+        if active and not isinstance(next_command, (CommitClosure, InspectRecovery)):
+            if self.run.callbacks.exit_capture_priority is not None:
+                self.run.callbacks.exit_capture_priority()
+            return False
+        return active
+
+    async def _execute_visit_command(
+        self, command: VisitCommand, state: VisitState, *, with_presence: bool
+    ) -> VisitEvent:
+        try:
+            return await self._run_visit_command(command, with_presence=with_presence)
+        except BaseException:
+            if isinstance(command, CommitClosure):
+                transition(state, CloseFailed())
+            raise
 
     async def _run_visit_command(self, command: VisitCommand, *, with_presence: bool) -> VisitEvent:
         if isinstance(command, InspectRecovery):

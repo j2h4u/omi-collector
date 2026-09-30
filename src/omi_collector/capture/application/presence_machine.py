@@ -285,7 +285,16 @@ def transition(
             raise UnexpectedAttemptOutcomeError(state)
         result = _handle_attempting(state, event, policy)
     elif isinstance(state, Attempting):
-        result = TransitionResult(state, NoOperation())
+        if isinstance(event, ResumeInterruptedVisit):
+            result = TransitionResult(
+                Attempting(
+                    trigger=state.trigger,
+                    waiting=_resume_waiting(state.waiting, event, policy),
+                ),
+                NoOperation(),
+            )
+        else:
+            result = TransitionResult(state, NoOperation())
     elif isinstance(event, ResumeInterruptedVisit):
         result = _handle_resume_interrupted_visit(state, event, policy)
     elif isinstance(event, ScannerInterrupted):
@@ -592,7 +601,15 @@ def _handle_resume_interrupted_visit(
 ) -> TransitionResult:
     if isinstance(state, CoolingDown):
         return TransitionResult(state, NoOperation())
-    retry = RetryWaiting(
+    return _observe(_resume_waiting(state, event, policy))
+
+
+def _resume_waiting(
+    state: WaitingState,
+    event: ResumeInterruptedVisit,
+    policy: PresenceMachinePolicy,
+) -> RetryWaiting:
+    return RetryWaiting(
         timer_epoch=state.timer_epoch,
         retry_at=state.retry_at if isinstance(state, RetryWaiting) else None,
         scan_recheck_at=state.scan_recheck_at,
@@ -601,4 +618,3 @@ def _handle_resume_interrupted_visit(
         arrival_started_at=state.arrival_started_at,
         absence_at=event.at + policy.absence_seconds,
     )
-    return _observe(retry)

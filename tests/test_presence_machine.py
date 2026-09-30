@@ -104,14 +104,40 @@ def test_resume_interrupted_visit_arms_absence_without_erasing_arrival() -> None
     )
 
 
-def test_resume_interrupted_visit_does_not_rearm_an_outstanding_attempt() -> None:
+def test_resume_interrupted_visit_preserves_an_outstanding_attempt() -> None:
     waiting = Searching(timer_epoch=1, scan_recheck_at=100.0)
     attempting = Attempting(AdvertisementTrigger(_advertisement(10.0)), waiting)
 
     resumed = transition(attempting, ResumeInterruptedVisit(at=20.0), POLICY)
 
-    assert resumed.state is attempting
+    assert isinstance(resumed.state, Attempting)
+    assert isinstance(resumed.state.waiting, RetryWaiting)
+    assert resumed.state.trigger is attempting.trigger
     assert isinstance(resumed.directive, NoOperation)
+
+
+def test_resume_during_attempt_preserves_permit_then_closes_after_unavailable() -> None:
+    attempting = Attempting(
+        AdvertisementTrigger(_advertisement(10.0)),
+        Searching(timer_epoch=1, scan_recheck_at=100.0),
+    )
+
+    resumed = transition(attempting, ResumeInterruptedVisit(at=20.0), POLICY)
+
+    assert isinstance(resumed.state, Attempting)
+    assert isinstance(resumed.state.waiting, RetryWaiting)
+    assert resumed.state.trigger is attempting.trigger
+    assert isinstance(resumed.directive, NoOperation)
+
+    unavailable = transition(
+        resumed.state,
+        AttemptFinished(at=21.0, outcome=CandidateUnavailable()),
+        POLICY,
+    )
+    assert isinstance(unavailable.state, RetryWaiting)
+    ended = transition(unavailable.state, _timer(unavailable.state, 30.0), POLICY)
+
+    assert ended == type(ended)(Searching(2, 130.0), EndVisit("absence"))
 
 
 def test_queued_stale_observation_requires_a_new_stable_encounter() -> None:

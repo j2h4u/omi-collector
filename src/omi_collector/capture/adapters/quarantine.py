@@ -41,6 +41,7 @@ from .staging_contract import (
     _validate_terminalized_at,
 )
 from .staging_filesystem import (
+    DeviceLock,
     StagingFilesystem,
     _never_defer,
     _read_json,
@@ -109,40 +110,51 @@ def terminalize_prefix_attempt(filesystem: StagingFilesystem, attempt_id: str) -
     """
     _validate_attempt_id(attempt_id)
     with filesystem.device_lock(operation="terminalize_prefix_attempt"):
-        path = filesystem.attempts_root / attempt_id
-        descriptor = filesystem._read_descriptor(path)
-        if _is_terminal_retired_attempt(path):
-            return
-        if _has_terminal_retirement_marker(path):
-            raise AttemptStateError("terminal-retired marker is invalid")
-        prefix_marker = path / _PREFIX_PUBLICATION_NAME
-        _require_regular_file(prefix_marker, "recoverable prefix publication marker")
-        marker = PrefixPublicationEvidence.from_json(_read_json(prefix_marker))
-        if not _prefix_publication_matches(
-            path,
-            descriptor,
-            marker,
-            filesystem=filesystem,
-            io_chunk_bytes=filesystem._durability.io_chunk_bytes,
-        ):
-            raise AttemptStateError("recoverable prefix publication marker is invalid")
-        _published_prefix(path, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
-        terminalized_at_unix_ns = _wall_clock_ns()
-        _validate_terminalized_at(terminalized_at_unix_ns)
-        terminal_marker = path / _TERMINAL_RETIRED_NAME
-        try:
+        _terminalize_prefix_attempt_held(filesystem, attempt_id)
+
+
+def terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: str, held_lease: DeviceLock) -> None:
+    """Terminalize one prefix while the caller retains the active spool lease."""
+    _validate_attempt_id(attempt_id)
+    filesystem.require_device_lock(held_lease)
+    _terminalize_prefix_attempt_held(filesystem, attempt_id)
+
+
+def _terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: str) -> None:
+    path = filesystem.attempts_root / attempt_id
+    descriptor = filesystem._read_descriptor(path)
+    if _is_terminal_retired_attempt(path):
+        return
+    if _has_terminal_retirement_marker(path):
+        raise AttemptStateError("terminal-retired marker is invalid")
+    prefix_marker = path / _PREFIX_PUBLICATION_NAME
+    _require_regular_file(prefix_marker, "recoverable prefix publication marker")
+    marker = PrefixPublicationEvidence.from_json(_read_json(prefix_marker))
+    if not _prefix_publication_matches(
+        path,
+        descriptor,
+        marker,
+        filesystem=filesystem,
+        io_chunk_bytes=filesystem._durability.io_chunk_bytes,
+    ):
+        raise AttemptStateError("recoverable prefix publication marker is invalid")
+    _published_prefix(path, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
+    terminalized_at_unix_ns = _wall_clock_ns()
+    _validate_terminalized_at(terminalized_at_unix_ns)
+    terminal_marker = path / _TERMINAL_RETIRED_NAME
+    try:
+        _sync_directory(path, filesystem._fsync)
+        filesystem._write_json_atomic(
+            terminal_marker,
+            TerminalRetirementEvidence(terminalized_at_unix_ns).as_dict(),
+        )
+        _sync_directory(path, filesystem._fsync)
+    except BaseException:
+        with suppress(OSError):
+            terminal_marker.unlink()
+        with suppress(OSError):
             _sync_directory(path, filesystem._fsync)
-            filesystem._write_json_atomic(
-                terminal_marker,
-                TerminalRetirementEvidence(terminalized_at_unix_ns).as_dict(),
-            )
-            _sync_directory(path, filesystem._fsync)
-        except BaseException:
-            with suppress(OSError):
-                terminal_marker.unlink()
-            with suppress(OSError):
-                _sync_directory(path, filesystem._fsync)
-            raise
+        raise
 
 
 def sweep_terminal_retired(

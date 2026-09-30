@@ -63,6 +63,7 @@ class StagingWriter:
         self._prepared = False
         self._read_started = False
         self._sealed = False
+        self._prefix_published = False
         self._closed = False
         self._active_start = start_sequence
         self._active_count = packet_count
@@ -212,6 +213,7 @@ class StagingWriter:
         assert self._attempt is not None
         self._require_lease()
         result = self._attempt.publish_prefix()
+        self._prefix_published = True
         self._sealed = True
         return result
 
@@ -225,6 +227,9 @@ class StagingWriter:
             if self._attempt is not None:
                 self._require_lease()
                 self._attempt.close(durable=True)
+                if self._prefix_published:
+                    assert self._lease is not None
+                    self._store.terminalize_prefix_attempt_held(self._attempt.attempt_id, self._lease)
         except BaseException as caught:  # noqa: BLE001 - release must run for every failure
             error = caught
         finally:

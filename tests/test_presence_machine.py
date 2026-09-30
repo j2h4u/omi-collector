@@ -13,12 +13,14 @@ from omi_collector.capture.application.presence_machine import (
     Closed,
     ConnectedInterruption,
     CoolingDown,
+    EndVisit,
     NoOperation,
     NotConnected,
     Observe,
     PresenceEvent,
     PresenceMachinePolicy,
     RapidRetryTrigger,
+    ResumeInterruptedVisit,
     RetryWaiting,
     ScannerInterrupted,
     Searching,
@@ -90,6 +92,58 @@ def test_scanner_interruption_clears_unfinished_arrival() -> None:
     assert interrupted.directive == Observe(100.0)
 
 
+def test_resume_interrupted_visit_arms_absence_without_erasing_arrival() -> None:
+    advertisement = _advertisement(9.0)
+    state = Searching(timer_epoch=3, scan_recheck_at=100.0, advertisement=advertisement, arrival_started_at=9.0)
+
+    resumed = transition(state, ResumeInterruptedVisit(at=20.0), POLICY)
+
+    assert resumed == type(resumed)(
+        RetryWaiting(3, None, 100.0, 0, advertisement, 9.0, 30.0),
+        Observe(30.0),
+    )
+
+
+@pytest.mark.parametrize(
+    "waiting",
+    [Searching(timer_epoch=1, scan_recheck_at=100.0), CoolingDown(1, 9.0, 100.0, None)],
+)
+def test_resume_interrupted_visit_preserves_an_outstanding_attempt(waiting: Searching | CoolingDown) -> None:
+    attempting = Attempting(AdvertisementTrigger(_advertisement(10.0)), waiting)
+
+    resumed = transition(attempting, ResumeInterruptedVisit(at=20.0), POLICY)
+
+    assert isinstance(resumed.state, Attempting)
+    assert isinstance(resumed.state.waiting, RetryWaiting)
+    assert resumed.state.waiting.scan_recheck_at == 100.0
+    assert resumed.state.trigger is attempting.trigger
+    assert isinstance(resumed.directive, NoOperation)
+
+
+def test_resume_during_attempt_preserves_permit_then_closes_after_unavailable() -> None:
+    attempting = Attempting(
+        AdvertisementTrigger(_advertisement(10.0)),
+        Searching(timer_epoch=1, scan_recheck_at=100.0),
+    )
+
+    resumed = transition(attempting, ResumeInterruptedVisit(at=20.0), POLICY)
+
+    assert isinstance(resumed.state, Attempting)
+    assert isinstance(resumed.state.waiting, RetryWaiting)
+    assert resumed.state.trigger is attempting.trigger
+    assert isinstance(resumed.directive, NoOperation)
+
+    unavailable = transition(
+        resumed.state,
+        AttemptFinished(at=21.0, outcome=CandidateUnavailable()),
+        POLICY,
+    )
+    assert isinstance(unavailable.state, RetryWaiting)
+    ended = transition(unavailable.state, _timer(unavailable.state, 30.0), POLICY)
+
+    assert ended == type(ended)(Searching(2, 130.0), EndVisit("absence"))
+
+
 def test_queued_stale_observation_requires_a_new_stable_encounter() -> None:
     state = Searching(timer_epoch=0, scan_recheck_at=100.0)
     observed = transition(
@@ -148,6 +202,44 @@ def test_retry_advertisement_begins_a_fresh_encounter_after_backoff() -> None:
     assert restarted.state.advertisement is absent_advertisement
     assert restarted.state.arrival_started_at == 20.0
     assert restarted.directive == Observe(20.0)
+
+
+def test_fresh_retry_advertisements_refresh_absence_and_reject_old_timer() -> None:
+    state = RetryWaiting(
+        timer_epoch=1,
+        retry_at=None,
+        scan_recheck_at=100.0,
+        retry_index=1,
+        advertisement=None,
+        absence_at=20.0,
+    )
+
+    refreshed = transition(state, AdvertisementObserved(_advertisement(15.0)), POLICY)
+    assert isinstance(refreshed.state, RetryWaiting)
+    stale = transition(
+        refreshed.state,
+        TimerFired(at=20.0, deadline=20.0, timer_epoch=refreshed.state.timer_epoch),
+        POLICY,
+    )
+
+    assert refreshed.state.absence_at == 25.0
+    assert refreshed.directive == Observe(25.0)
+    assert stale.state is refreshed.state and isinstance(stale.directive, NoOperation)
+
+
+def test_retry_absence_ends_visit_without_an_attempt_permit() -> None:
+    waiting = RetryWaiting(
+        timer_epoch=1,
+        retry_at=None,
+        scan_recheck_at=100.0,
+        retry_index=1,
+        advertisement=None,
+        absence_at=20.0,
+    )
+
+    ended = transition(waiting, _timer(waiting, 20.0), POLICY)
+
+    assert ended == type(ended)(Searching(2, 120.0), EndVisit("absence"))
 
 
 def test_retry_backoff_returns_to_scanning_with_retained_recheck() -> None:
@@ -251,8 +343,39 @@ def test_retry_outcomes_schedule_backoff_and_durable_progress_resets_it() -> Non
         POLICY,
     )
 
-    assert interrupted == type(interrupted)(RetryWaiting(4, 14.0, 110.0, 2, None), Observe(14.0))
-    assert after_progress == type(after_progress)(RetryWaiting(4, 12.0, 110.0, 1, None), Observe(12.0))
+    assert interrupted == type(interrupted)(RetryWaiting(4, 14.0, 110.0, 2, None, None, 20.0), Observe(14.0))
+    assert isinstance(interrupted.state, RetryWaiting)
+    exhausted = transition(
+        Attempting(RapidRetryTrigger(_advertisement(14.0)), interrupted.state),
+        AttemptFinished(at=14.0, outcome=ConnectedInterruption(durable_progress=False)),
+        POLICY,
+    )
+    assert exhausted == type(exhausted)(Searching(5, 114.0), EndVisit("recovery_exhausted"))
+    assert after_progress == type(after_progress)(RetryWaiting(4, 12.0, 110.0, 0, None, None, 20.0), Observe(12.0))
+
+
+def test_durable_progress_resets_exhaustion_counter_for_next_failure() -> None:
+    first = transition(
+        Attempting(AdvertisementTrigger(_advertisement(10.0)), Searching(0, 100.0)),
+        AttemptFinished(10.0, NotConnected(durable_progress=False)),
+        POLICY,
+    )
+    assert isinstance(first.state, RetryWaiting)
+    progress = transition(
+        Attempting(RapidRetryTrigger(_advertisement(11.0)), first.state),
+        AttemptFinished(11.0, ConnectedInterruption(durable_progress=True)),
+        POLICY,
+    )
+    assert isinstance(progress.state, RetryWaiting)
+    next_failure = transition(
+        Attempting(RapidRetryTrigger(_advertisement(12.0)), progress.state),
+        AttemptFinished(12.0, ConnectedInterruption(durable_progress=False)),
+        POLICY,
+    )
+
+    assert progress.state.retry_index == 0
+    assert isinstance(next_failure.state, RetryWaiting)
+    assert next_failure.state.retry_index == 1
 
 
 def test_not_connected_requires_a_fresh_candidate_after_backoff() -> None:
@@ -273,7 +396,7 @@ def test_not_connected_without_fresh_evidence_still_waits_for_backoff() -> None:
 
     result = transition(attempting, AttemptFinished(15.0, NotConnected(durable_progress=False)), POLICY)
 
-    assert result == type(result)(RetryWaiting(4, 17.0, 115.0, 1, None, None), Observe(17.0))
+    assert result == type(result)(RetryWaiting(4, 17.0, 115.0, 1, None, None, 25.0), Observe(17.0))
 
 
 def test_attempting_blocks_late_timer_and_advertisement_until_one_outcome() -> None:

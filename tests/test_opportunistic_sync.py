@@ -24,7 +24,12 @@ from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStor
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError, DurablePrefix, LockContext
+from omi_collector.capture.adapters.staging_contract import (
+    AttemptDescriptor,
+    DeviceAlreadyRunningError,
+    DurablePrefix,
+    LockContext,
+)
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application import batch_reconciliation
@@ -132,6 +137,11 @@ def _capture_root(tmp_path: Path) -> Path:
         rmtree(root, ignore_errors=True)
         _CAPTURE_ROOTS.add(tmp_path)
     return root
+
+
+@pytest.fixture(autouse=True)
+def _isolate_capture_root(tmp_path: Path) -> None:
+    rmtree(_capture_root(tmp_path), ignore_errors=True)
 
 
 def _status() -> RingStatus:
@@ -378,6 +388,21 @@ class _SealResultBatchWriter:
     async def close(self, *, timeout: float) -> None:
         self.close_requested.set()
         await self.writer.close(timeout=timeout)
+
+
+async def _real_batch_writer(store: StagingStore, start: int, count: int) -> BatchWriterPort:
+    writer = _runtime().make_batch_writer(
+        store,
+        start,
+        count,
+        source_start=start,
+        source=memoryview(_records(start, count)),
+        config=DEFAULT_CONFIG.writer,
+    )
+    await writer.start()
+    await writer.prepare_leg(start, count)
+    await writer.read_begin(ReadBeginNotification(start, count))
+    return writer
 
 
 @_async_test
@@ -2931,6 +2956,126 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
     assert raised.value is latched
 
 
+def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) -> None:
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(
+        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _options(),
+        _runtime(),
+        quarantine,
+    )
+    descriptor = AttemptDescriptor("a" * 32, 2, 100, 2)
+    reconciler.set_startup_state(descriptor, 100)
+    assert reconciler.durable_progress() == 0
+    reconciler.set_startup_state(descriptor, 101)
+    assert reconciler.durable_progress() == 101
+
+    empty_reconciler = BatchReconciler(
+        StagingStore(tmp_path / "empty", _capture_root(tmp_path / "empty")),
+        _options(),
+        _runtime(),
+        quarantine,
+    )
+    empty_reconciler._state.batch = batch_reconciliation._Batch(
+        RingInfo(100, 100, 10000, 0, RECORD_SIZE),
+        100,
+        100,
+        TransferArena(100, 1, max_bytes=RECORD_SIZE),
+        cast(BatchWriterPort, object()),
+        DurablePrefix(100, 100, 0, "a" * 64),
+    )
+    assert empty_reconciler.durable_progress() == 0
+    empty_reconciler._state.batch.durable = DurablePrefix(100, 101, 1, "b" * 64)
+    assert empty_reconciler.durable_progress() == 101
+
+
+@_async_test
+async def test_close_visit_absence_publishes_partial_prefix_before_terminal_closure(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    writer = await _real_batch_writer(store, 100, 2)
+    assert writer.publish(RECORD_SIZE)
+    attempt_path = store.attempts_root / writer.attempt_id
+    batch = batch_reconciliation._Batch(
+        RingInfo(100, 102, 10000, 0, RECORD_SIZE),
+        100,
+        102,
+        TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
+        writer,
+    )
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+    reconciler._state.batch = batch
+    await reconciler.close_visit("absence")
+
+    assert reconciler._state.batch is None
+    assert reconciler.durable_progress() == 0
+    assert not writer.thread.is_alive()
+    assert (attempt_path / "prefix-publication.json").is_file()
+    assert (attempt_path / "terminal-retired.json").is_file()
+    assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+        {"next_sequence": 101, "reason": "absence"}
+    ]
+
+
+@_async_test
+async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_close(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    writer = await _real_batch_writer(store, 100, 2)
+    assert writer.publish(RECORD_SIZE * 2)
+    seal = await writer.seal(DoneNotification(0, 102))
+    assert seal is not None
+    batch = batch_reconciliation._Batch(
+        RingInfo(100, 102, 10000, 0, RECORD_SIZE),
+        100,
+        102,
+        TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
+        writer,
+        seal=seal,
+    )
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+    reconciler._state.batch = batch
+    await reconciler.close_visit("absence")
+
+    assert not writer.thread.is_alive()
+    assert seal.bundle_path.is_dir()
+    assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+        {"next_sequence": 102, "reason": "absence"}
+    ]
+
+
+@_async_test
+async def test_close_visit_empty_batch_closes_writer_without_creating_visit_closure(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    writer = await _real_batch_writer(store, 100, 1)
+    batch = batch_reconciliation._Batch(
+        RingInfo(100, 100, 10000, 0, RECORD_SIZE),
+        100,
+        100,
+        TransferArena(100, 0, max_bytes=0),
+        writer,
+    )
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+    reconciler._state.batch = batch
+    await reconciler.close_visit("absence")
+
+    assert reconciler._state.batch is None
+    assert not writer.thread.is_alive()
+    assert not store.ready_closures_path.exists()
+
+
 @_async_test
 async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_path: Path) -> None:
     target = _BlockingSealTarget(tmp_path / "sealed")
@@ -3126,8 +3271,6 @@ async def test_default_arena_budget_admits_a_full_pendant_snapshot_without_alloc
 @_async_test
 async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_path: Path) -> None:
     entered = asyncio.Event()
-    busy_reported = asyncio.Event()
-    release_busy_retry = asyncio.Event()
 
     class BlockingReadSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -3153,42 +3296,29 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
             WriteStep(b"\x10", (_info(11, 11),)),
         ),
     )
-    activity: list[ActivityEvent] = []
-
-    async def report(event: ActivityEvent) -> None:
-        activity.append(event)
-        if (
-            event.state == "session_error"
-            and event.phase == "read/reconcile"
-            and event.error_type == "DeviceAlreadyRunningError"
-        ):
-            busy_reported.set()
-            await release_busy_retry.wait()
-
     task = asyncio.create_task(
         run_opportunistic_collector(
             Provider([first]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     )
     await entered.wait()
-    contender = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([second, recovered]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
-            replace(_options(batch_records=1), activity=report),
+    contender = Provider([second])
+    with pytest.raises(DeviceAlreadyRunningError) as raised:
+        await run_opportunistic_collector(
+            contender, StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
-    )
-    await busy_reported.wait()
-    assert second.writes == [b"\x10"]
-    busy_event = next(event for event in activity if event.state == "session_error")
-    assert busy_event.lock_context is not None
-    assert busy_event.lock_context["requested_operation"] == "capture_batch"
-    assert busy_event.lock_context["holder_operation"] == "capture_batch"
+    assert contender.opened == 0
+    assert second.writes == []
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.requested_operation == "inspect_recovery"
+    assert context.holder_operation == "capture_batch"
     task.cancel()
     with pytest.raises(CollectionPreservedCancelledError):
         await task
-    release_busy_retry.set()
-    result = await contender
+    result = await run_opportunistic_collector(
+        Provider([recovered]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
+    )
     assert isinstance(result, CollectionResult)
     assert recovered.writes == [
         b"\x10",
@@ -3197,6 +3327,44 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
         encode_advance_command(11),
         b"\x10",
     ]
+
+
+@_async_test
+async def test_machine_closes_published_restart_prefix_before_waiting_without_device(tmp_path: Path) -> None:
+    records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.open_attempt(next((tmp_path / "attempts").iterdir()).name)
+    with store.device_lock() as lease:
+        attempt.activate_for_resume(lease)
+        publication = attempt.publish_prefix()
+        assert publication is not None
+        attempt.close(durable=True)
+    publication.bundle_path.rename(tmp_path / "previously-published-prefix")
+    scanning = asyncio.Event()
+
+    class Observer:
+        async def start(self, callback: Callable[[object], object]) -> None:
+            del callback
+            scanning.set()
+
+        async def stop(self) -> None:
+            return None
+
+    provider = Provider([])
+    presence = PresenceScheduler(Observer(), policy=PresencePolicy(rapid_backoff=(0.001,)))
+    task = asyncio.create_task(run_opportunistic_collector(provider, store, replace(_options(), presence=presence)))
+    try:
+        await asyncio.wait_for(scanning.wait(), 2)
+        assert not task.done()
+        assert provider.opened == 0
+        assert (attempt.path / "terminal-retired.json").is_file()
+        assert store.pending_attempts() == ()
+        assert (attempt.path / "records.bin").read_bytes() == records
+        assert not store.inspect_recovery()[1], "durable closure must cover retained drafts"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 @_async_test

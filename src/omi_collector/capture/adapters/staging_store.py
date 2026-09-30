@@ -14,14 +14,16 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
-from . import publication, quarantine
+from . import publication, quarantine, ready_closures
 from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionStore
 from .clock_memberships import ClockMembershipStore
-from .ready_bundles import finalize_drafts, retire_acknowledged
+from .ready_bundles import draft_frontier, finalize_drafts, has_drafts_at_or_below, resume_retired, retire_acknowledged
 from .staging_contract import (
     _DESCRIPTOR_NAME,
+    _PREFIX_PUBLICATION_NAME,
     _RAW_NAME,
+    _TERMINAL_RETIRED_NAME,
     AttemptDescriptor,
     AttemptStateError,
     PendingAttemptError,
@@ -39,6 +41,7 @@ from .staging_filesystem import (
     _create_empty_synced,
     _never_defer,
     _require_regular_directory,
+    _require_regular_file,
 )
 
 if TYPE_CHECKING:
@@ -180,6 +183,91 @@ class StagingStore:
         with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
             return self._recover_and_publish_unlocked()
 
+    def inspect_recovery(self) -> tuple[bool, bool]:
+        """Report prefix-marker and orphan-draft evidence under the device lease."""
+        with self.device_lock(recover_capture_temporaries=False, operation="inspect_recovery"):
+            recoverable_prefix = False
+            if self.attempts_root.exists():
+                _require_regular_directory(self.attempts_root)
+                for path in self.attempts_root.iterdir():
+                    if path.is_symlink() or not path.is_dir():
+                        raise AttemptStateError("partial staging root contains a non-directory entry")
+                    if (path / _TERMINAL_RETIRED_NAME).exists():
+                        continue
+                    if (path / _PREFIX_PUBLICATION_NAME).exists():
+                        recoverable_prefix = True
+                        break
+            frontier = draft_frontier(self.capture_root)
+            closures = ready_closures.load(self.ready_closures_path)
+            unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
+            return recoverable_prefix, unclosed_drafts
+
+    @property
+    def ready_closures_path(self) -> Path:
+        return self.device_state_path.parent / "ready-closures.json"
+
+    def append_ready_closure(self, next_sequence: int, reason: str) -> ready_closures.ReadyClosure:
+        """Durably close one physical visit before allowing ready publication."""
+        with self.device_lock(recover_capture_temporaries=False, operation="ready_closure") as lease:
+            return self._append_ready_closure_unlocked(lease, next_sequence, reason)
+
+    def close_orphaned_drafts(self, reason: str) -> object | None:
+        """Create a restart closure for authenticated drafts without a pending attempt."""
+        with self.device_lock(recover_capture_temporaries=False, operation="close_orphaned_drafts") as lease:
+            frontier = draft_frontier(self.capture_root)
+            if frontier is None:
+                return None
+            return self._append_ready_closure_unlocked(lease, frontier, reason)
+
+    def close_pending_prefix(
+        self, reason: str, *, include_unpublished: bool = True
+    ) -> ready_closures.ReadyClosure | None:
+        """Replay and close every published or resumable prefix under one lease."""
+        with self.device_lock(recover_capture_temporaries=False, operation="close_pending_prefix") as lease:
+            if not self.attempts_root.exists():
+                return None
+            _require_regular_directory(self.attempts_root)
+            pending_ids = (
+                {descriptor.attempt_id for descriptor in self.pending_attempts()} if include_unpublished else set()
+            )
+            candidates: list[tuple[int, Path, AttemptDescriptor]] = []
+            for path in tuple(self.attempts_root.iterdir()):
+                if path.is_symlink() or not path.is_dir():
+                    raise AttemptStateError("partial staging root contains a non-directory entry")
+                marker = path / _PREFIX_PUBLICATION_NAME
+                terminal_marker = path / _TERMINAL_RETIRED_NAME
+                if terminal_marker.is_symlink():
+                    raise AttemptStateError("terminal-retired marker must not be a symlink")
+                if terminal_marker.exists():
+                    continue
+                marker_present = marker.exists() or marker.is_symlink()
+                if not marker_present and path.name not in pending_ids:
+                    continue
+                if marker_present:
+                    _require_regular_file(marker, "recoverable prefix publication marker")
+                descriptor = self._filesystem._read_descriptor(path)
+                candidates.append((descriptor.start_sequence, path, descriptor))
+
+            last_closure: ready_closures.ReadyClosure | None = None
+            for _start_sequence, _path, descriptor in sorted(candidates, key=lambda item: item[0]):
+                attempt = self.open_attempt(descriptor.attempt_id)
+                try:
+                    attempt.activate_for_resume(lease)
+                    prefix = attempt.durable_prefix
+                    attempt.publish_prefix()
+                    attempt.close(durable=True)
+                    self.terminalize_prefix_attempt_held(attempt.attempt_id, lease)
+                    last_closure = self._append_ready_closure_unlocked(lease, prefix.next_sequence, reason)
+                finally:
+                    attempt.close(durable=True)
+            return last_closure
+
+    def _append_ready_closure_unlocked(
+        self, lease: DeviceLock, next_sequence: int, reason: str
+    ) -> ready_closures.ReadyClosure:
+        self._filesystem.require_device_lock(lease)
+        return ready_closures.append(self.ready_closures_path, next_sequence, reason)
+
     def _recover_and_publish_unlocked(self) -> object | None:
         publication_root = self._publication_root
         if publication_root is None:
@@ -190,28 +278,32 @@ class StagingStore:
             near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
         )
         ledger_path = self.device_state_path.parent / "ready-publications.json"
-        published: tuple[object, ...] = ()
-        if self._has_draft_bundles():
+        resume_retired(publication_root, ledger_path)
+        published: list[object] = []
+        closures = ready_closures.load(self.ready_closures_path)
+        while closures:
+            closure = closures[0]
             segments = ClockMembershipStore(self.device_state_path).segments(corrections.observation_store.records())
-            published = finalize_drafts(
-                self.capture_root,
-                publication_root,
-                ledger_path,
-                segments,
-                config=self._filesystem._ready,
+            published.extend(
+                finalize_drafts(
+                    self.capture_root,
+                    publication_root,
+                    ledger_path,
+                    segments,
+                    config=self._filesystem._ready,
+                    frontier=closure.next_sequence,
+                )
             )
+            if has_drafts_at_or_below(self.capture_root, closure.next_sequence):
+                break
+            ready_closures.remove(self.ready_closures_path, closure)
+            closures = ready_closures.load(self.ready_closures_path)
         retire_acknowledged(
             publication_root,
             ledger_path,
             publication_root.parent / "work" / "omi-ready-checkpoint.json",
         )
-        return published or None
-
-    def _has_draft_bundles(self) -> bool:
-        try:
-            return any(self.capture_root.iterdir())
-        except FileNotFoundError:
-            return False
+        return tuple(published) or None
 
     @property
     def capture_root(self) -> Path:
@@ -273,6 +365,10 @@ class StagingStore:
             self._filesystem,
             attempt_id,
         )
+
+    def terminalize_prefix_attempt_held(self, attempt_id: str, lease: DeviceLock) -> None:
+        """Terminalize a prefix under the writer's already-held device lease."""
+        quarantine.terminalize_prefix_attempt_held(self._filesystem, attempt_id, lease)
 
     def sweep_terminal_retired(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.sweep_terminal_retired(

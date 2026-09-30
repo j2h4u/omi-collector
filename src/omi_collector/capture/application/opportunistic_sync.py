@@ -19,7 +19,7 @@ from . import collector
 from .batch_reconciliation import BatchReconciler
 from .operational_telemetry import OperationalEmitter
 from .ports import CaptureRuntimePort, ObservationWriterPort, PublicationAuthorityPort, StagingPort
-from .presence import PresenceWake
+from .presence import PresenceEnd, PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
 from .session_lifecycle import (
     OpportunisticOptions,
@@ -27,12 +27,14 @@ from .session_lifecycle import (
     SessionLifecycleCallbacks,
     SessionLifecycleRun,
     SessionProvider,
+    joined_to_thread,
     validate_policy,
     validate_presence_policy,
 )
 from .session_lifecycle import (
     bounded as _bounded,
 )
+from .visit_machine import RecoveryDisposition
 
 # Cached status and optional characteristics are useful observations, but they
 # must never hold up the first audio operation for the 30-second INFO timeout.
@@ -109,8 +111,6 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
     try:
         if options.presence is not None:
             return await lifecycle.run_with_presence()
-        state = await maintenance.prepare_pending_startup()
-        _bind_startup_state(reconciler, state)
         return await lifecycle.run_direct()
     except BaseException as error:
         cancelled = isinstance(error, asyncio.CancelledError)
@@ -181,13 +181,22 @@ def _validate_composition(staging: object, runtime: object) -> None:
 def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLifecycle:
     """Bind coordinator-owned decisions to one physical-session lifecycle."""
 
-    async def wait_presence_attempt() -> PresenceWake:
+    async def wait_presence_attempt() -> PresenceWake | PresenceEnd:
         presence = run.options.presence
         assert presence is not None
+
         return await run.maintenance.wait_for_presence_attempt(
             presence,
-            lambda state: _bind_startup_state(reconciler, state),
+            lambda _state: None,
         )
+
+    async def load_recovery() -> RecoveryDisposition:
+        state = await run.maintenance.prepare_pending_startup()
+        _bind_startup_state(reconciler, state)
+        return state.disposition
+
+    def invalidate_recovery() -> None:
+        run.maintenance.invalidate_startup_state()
 
     def observe_info(info: RingInfo) -> None:
         try:
@@ -197,6 +206,10 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
 
     async def post_session_checkpoint() -> None:
         await reconciler.checkpoint_after_session()
+
+    async def close_visit(reason: str) -> None:
+        await reconciler.close_visit(reason)
+        run.maintenance.schedule_publication_retry()
 
     async def before_direct_attempt() -> None:
         await run.maintenance.ensure_publication_ready()
@@ -208,8 +221,12 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         connected_step=reconciler.connected_step,
         post_session_checkpoint=post_session_checkpoint,
         completed_batch_query=lambda: reconciler.completed_batches,
+        durable_progress_query=reconciler.durable_progress,
         drained_result=reconciler.drained_result,
         observe_info=observe_info,
+        close_visit=close_visit,
+        load_recovery=load_recovery,
+        invalidate_recovery=invalidate_recovery,
     )
     return SessionLifecycle(SessionLifecycleRun(run.provider, run.options, run.runtime, callbacks))
 
@@ -263,7 +280,7 @@ async def _close_observation_writer(run: _Run, *, unwinding: bool) -> None:
     """Close the run-scoped writer without changing collection outcomes."""
     timeout = run.options.config.firmware_observations.close_timeout_seconds
     try:
-        await _bounded(asyncio.to_thread(run.observation_writer.close), timeout)
+        await _bounded(joined_to_thread(run.observation_writer.close), timeout)
     except asyncio.CancelledError:
         if unwinding:
             # Preserve the cancellation or error already being unwound by the

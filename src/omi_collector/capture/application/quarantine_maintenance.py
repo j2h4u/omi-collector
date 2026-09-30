@@ -19,18 +19,21 @@ from .ports import (
     RecoveryShape,
     StagingPort,
 )
-from .presence import PresenceWake
+from .presence import PresenceEnd, PresenceWake
 from .session_lifecycle import (
     ActivityCallback,
     OpportunisticSyncError,
+    join_owned,
+    joined_to_thread,
     report_activity,
 )
+from .visit_machine import RecoveryDisposition
 
 
 class PresenceWaiterPort(Protocol):
     """The maintenance race owns only permit acquisition and fail-closed close."""
 
-    async def wait_for_attempt(self) -> PresenceWake: ...
+    async def wait_for_attempt(self) -> PresenceWake | PresenceEnd: ...
 
     async def close(self) -> None: ...
 
@@ -45,6 +48,7 @@ class PendingStartupState:
 
     pending: AttemptDescriptorShape | None
     durable_next: int | None
+    disposition: RecoveryDisposition = "empty"
 
 
 class QuarantineMaintenance:
@@ -70,6 +74,7 @@ class QuarantineMaintenance:
         self._publication_retry_not_before = 0.0
         self._publication_retry_handle: asyncio.TimerHandle | None = None
         self._publication_retry_task: asyncio.Task[bool] | None = None
+        self._publication_retry_requested = False
 
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
@@ -77,6 +82,12 @@ class QuarantineMaintenance:
             return self._startup_state
 
         await self._recover_and_publish()
+
+        prefix, orphaned = await joined_to_thread(self._staging.inspect_recovery)
+        if prefix:
+            state = PendingStartupState(None, None, "needs_interrupted_close")
+            self._startup_state = state
+            return state
 
         try:
             pending = await self._pending_descriptor()
@@ -89,7 +100,8 @@ class QuarantineMaintenance:
             await self._quarantine_pending(str(error), original_error=error)
             pending = None
         if pending is None:
-            state = PendingStartupState(None, None)
+            disposition: RecoveryDisposition = "needs_interrupted_close" if orphaned else "empty"
+            state = PendingStartupState(None, None, disposition)
         else:
             try:
                 durable_next = await self._validate_pending_evidence(pending)
@@ -97,13 +109,17 @@ class QuarantineMaintenance:
                 if not self._runtime.is_staging_error(error):
                     raise
                 await self._quarantine_pending(str(error), original_error=error)
-                state = PendingStartupState(None, None)
+                state = PendingStartupState(None, None, "empty")
             else:
-                state = PendingStartupState(pending, durable_next)
-                await self._recover_and_publish()
+                state = PendingStartupState(pending, durable_next, "resumable")
 
         self._startup_state = state
         return state
+
+    def invalidate_startup_state(self) -> None:
+        """Force the next machine recovery inspection to reread local evidence."""
+        self._startup_state = None
+        self._startup_state_bound = False
 
     async def _recover_and_publish(self) -> bool:
         if self._publication_retry_not_before > monotonic():
@@ -115,7 +131,7 @@ class QuarantineMaintenance:
         backoff = self._config.retry.rapid_backoff
         for attempt in range(len(backoff) + 1):
             try:
-                published = await asyncio.to_thread(self._staging.recover_and_publish)
+                published = await joined_to_thread(self._staging.recover_and_publish)
                 self._publication_retry_not_before = 0.0
                 if published is not None:
                     self._runtime.debug_event("ready_publication_published")
@@ -143,6 +159,9 @@ class QuarantineMaintenance:
         self._schedule_publication_retry()
 
     def _schedule_publication_retry(self) -> None:
+        if self._publication_retry_task is not None and not self._publication_retry_task.done():
+            self._publication_retry_requested = True
+            return
         if self._publication_retry_handle is not None:
             return
         try:
@@ -154,6 +173,9 @@ class QuarantineMaintenance:
 
     def _start_publication_retry(self) -> None:
         self._publication_retry_handle = None
+        if self._publication_retry_task is not None and not self._publication_retry_task.done():
+            self._publication_retry_requested = True
+            return
         task = asyncio.create_task(self._recover_and_publish())
         self._publication_retry_task = task
         task.add_done_callback(self._consume_publication_retry)
@@ -161,11 +183,15 @@ class QuarantineMaintenance:
     def _consume_publication_retry(self, task: asyncio.Task[bool]) -> None:
         if self._publication_retry_task is task:
             self._publication_retry_task = None
+            if self._publication_retry_requested:
+                self._publication_retry_requested = False
+                self._schedule_publication_retry()
         with suppress(asyncio.CancelledError, Exception):
             task.result()
 
     async def close(self) -> None:
         """Cancel and join local publication retry work before loop shutdown."""
+        self._publication_retry_requested = False
         if self._publication_retry_handle is not None:
             self._publication_retry_handle.cancel()
             self._publication_retry_handle = None
@@ -173,7 +199,7 @@ class QuarantineMaintenance:
         self._publication_retry_task = None
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await join_owned(asyncio.gather(task, return_exceptions=True))
 
     async def run_once(self, should_defer: Callable[[], bool]) -> None:
         """Run one cooperative terminal sweep and quarantine salvage pass."""
@@ -208,7 +234,7 @@ class QuarantineMaintenance:
 
     async def _sweep_terminal_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
-            removed = await asyncio.to_thread(
+            removed = await joined_to_thread(
                 self._staging.sweep_terminal_quarantine,
                 should_defer=should_defer,
             )
@@ -222,7 +248,7 @@ class QuarantineMaintenance:
 
     async def _salvage_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
-            sources = await asyncio.to_thread(
+            sources = await joined_to_thread(
                 self._staging.quarantined_attempts,
                 should_defer=should_defer,
             )
@@ -235,7 +261,7 @@ class QuarantineMaintenance:
 
     async def quarantine_attempt_source(self, attempt_id: str) -> None:
         """Move a discontinuous source aside without diagnostic metadata."""
-        await asyncio.to_thread(self._staging.quarantine_attempt_source, attempt_id)
+        await joined_to_thread(self._staging.quarantine_attempt_source, attempt_id)
         await report_activity(self._activity, "evidence_quarantined")
         await self._recover_and_publish()
 
@@ -243,7 +269,7 @@ class QuarantineMaintenance:
         self,
         presence: PresenceWaiterPort,
         bind_startup_state: Callable[[PendingStartupState], None],
-    ) -> PresenceWake:
+    ) -> PresenceWake | PresenceEnd:
         """Race scanning with maintenance while joining both scoped tasks.
 
         Startup inspection, validation, quarantine, and state binding are never
@@ -267,31 +293,47 @@ class QuarantineMaintenance:
                 await self.ensure_publication_ready()
                 permit_returned = True
                 defer_requested.set()
-                await asyncio.shield(maintenance_task)
+                await join_owned(maintenance_task)
                 return wake
             maintenance_task.result()
             return await presence_task
         except BaseException as error:
             primary = error
             defer_requested.set()
-            if permit_returned:
-                await presence.close()
-            if not presence_task.done():
-                presence_task.cancel()
-            await asyncio.gather(presence_task, return_exceptions=True)
-            if maintenance_task is not None and not maintenance_task.done():
-                try:
-                    await asyncio.shield(maintenance_task)
-                except BaseException:
-                    if isinstance(error, asyncio.CancelledError):
-                        raise error from None
-                    raise
+            try:
+                await join_owned(
+                    self._join_presence_tasks(
+                        presence, presence_task, maintenance_task, permit_returned=permit_returned
+                    )
+                )
+            except BaseException:
+                if isinstance(error, asyncio.CancelledError):
+                    raise error from None
+                raise
             raise
         finally:
             # ``wait`` returns with one task complete, but always consume the
             # other result too. This keeps task identity scoped to this call.
             if primary is None and maintenance_task is not None:
                 await asyncio.gather(presence_task, maintenance_task, return_exceptions=True)
+
+    async def _join_presence_tasks(
+        self,
+        presence: PresenceWaiterPort,
+        presence_task: asyncio.Task[PresenceWake | PresenceEnd],
+        maintenance_task: asyncio.Task[None] | None,
+        *,
+        permit_returned: bool,
+    ) -> None:
+        if not presence_task.done():
+            presence_task.cancel()
+        try:
+            await asyncio.gather(presence_task, return_exceptions=True)
+            if maintenance_task is not None:
+                await maintenance_task
+        finally:
+            if permit_returned:
+                await presence.close()
 
     async def _prepare_and_run(
         self,
@@ -305,22 +347,22 @@ class QuarantineMaintenance:
         await self.run_once(defer_requested.is_set)
 
     async def _pending_descriptor(self) -> AttemptDescriptorShape | None:
-        pending = await asyncio.to_thread(self._staging.pending_attempts)
+        pending = await joined_to_thread(self._staging.pending_attempts)
         descriptors = pending
         if len(descriptors) > 1:
             raise OpportunisticSyncError("multiple partial attempts block resume")
         return descriptors[0] if descriptors else None
 
     async def _validate_pending_evidence(self, descriptor: AttemptDescriptorShape) -> int:
-        attempt = await asyncio.to_thread(self._staging.open_attempt, descriptor.attempt_id)
+        attempt = await joined_to_thread(self._staging.open_attempt, descriptor.attempt_id)
         try:
-            recovery = await asyncio.to_thread(attempt.recover)
+            recovery = await joined_to_thread(attempt.recover)
         except BaseException:
-            await asyncio.to_thread(attempt.close)
+            await joined_to_thread(attempt.close)
             raise
-        await asyncio.to_thread(self._staging.retain_validated_attempt, descriptor.attempt_id, attempt)
+        await joined_to_thread(self._staging.retain_validated_attempt, descriptor.attempt_id, attempt)
         try:
-            return await asyncio.to_thread(self._activate_pending_frontier, descriptor)
+            return await joined_to_thread(self._activate_pending_frontier, descriptor)
         except Exception as error:
             if not self._runtime.is_device_busy_error(error):
                 raise
@@ -366,7 +408,7 @@ class QuarantineMaintenance:
 
     async def _sweep_terminal_retired(self, should_defer: Callable[[], bool]) -> None:
         try:
-            removed = await asyncio.to_thread(
+            removed = await joined_to_thread(
                 self._staging.sweep_terminal_retired,
                 should_defer=should_defer,
             )
@@ -380,7 +422,7 @@ class QuarantineMaintenance:
 
     async def _salvage_quarantined_prefix(self, source: Path, should_defer: Callable[[], bool]) -> bool:
         try:
-            result = await asyncio.to_thread(
+            result = await joined_to_thread(
                 self._runtime.publish_quarantined_prefix,
                 source,
                 self._staging,
@@ -408,7 +450,7 @@ class QuarantineMaintenance:
             self._quarantine_retry_number += 1
             return False
         try:
-            await asyncio.to_thread(self._staging.mark_quarantine_published, source)
+            await joined_to_thread(self._staging.mark_quarantine_published, source)
         except Exception as error:  # noqa: BLE001 - retain source until a later lifecycle pass
             self._runtime.debug_exception("quarantine_terminal_mark_failed", error, source=source.name)
             return True
@@ -433,7 +475,7 @@ class QuarantineMaintenance:
         reason: str,
     ) -> None:
         try:
-            await asyncio.to_thread(marker, source, reason)
+            await joined_to_thread(marker, source, reason)
         except Exception as marking_error:  # noqa: BLE001 - source remains safe
             self._runtime.debug_exception(
                 "quarantine_classification_failed",
@@ -449,7 +491,7 @@ class QuarantineMaintenance:
         *,
         original_error: BaseException | None = None,
     ) -> None:
-        moved = await asyncio.to_thread(self._staging.quarantine_pending, reason)
+        moved = await joined_to_thread(self._staging.quarantine_pending, reason)
         if not moved:
             if original_error is not None:
                 raise original_error

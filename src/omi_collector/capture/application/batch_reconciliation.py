@@ -35,6 +35,7 @@ from .session_lifecycle import (
     OpportunisticSyncError,
     RetryPolicy,
     SessionPhaseState,
+    joined_to_thread,
 )
 from .session_lifecycle import bounded as _bounded
 from .session_lifecycle import report_activity as _report_activity
@@ -91,6 +92,7 @@ class _State:
     completed_batches: int = 0
     pending_descriptor: AttemptDescriptorShape | None = None
     pending_durable_next: int | None = None
+    visit_frontier: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +138,64 @@ class BatchReconciler:
     def completed_batches(self) -> int:
         return self._state.completed_batches
 
+    def durable_progress(self) -> int:
+        """Return the highest authenticated frontier retained for this visit."""
+        values = [self._state.visit_frontier or 0]
+        pending = self._state.pending_descriptor
+        if (
+            pending is not None
+            and self._state.pending_durable_next is not None
+            and self._state.pending_durable_next > pending.start_sequence
+        ):
+            values.append(self._state.pending_durable_next)
+        if (
+            self._state.batch is not None
+            and self._state.batch.durable is not None
+            and self._state.batch.durable.record_count
+        ):
+            values.append(self._state.batch.durable.next_sequence)
+        return max(values)
+
     def set_startup_state(self, pending: AttemptDescriptorShape | None, durable_next: int | None) -> None:
         self._state.pending_descriptor = pending
         self._state.pending_durable_next = durable_next
+        if pending is not None and durable_next is not None and durable_next > pending.start_sequence:
+            self._state.visit_frontier = max(self._state.visit_frontier or durable_next, durable_next)
+
+    async def close_visit(self, reason: str) -> None:
+        """Close the physical visit and enqueue its durable publication frontier."""
+        batch = self._state.batch
+        if batch is None:
+            # Startup recovery may have found a published prefix marker or an
+            # authenticated draft without a live writer.  The storage adapter
+            # terminalizes it before appending its closure, under one lease.
+            await joined_to_thread(
+                self._run.staging.close_pending_prefix, reason, include_unpublished=reason != "restart_interrupted"
+            )
+            await joined_to_thread(self._run.staging.close_orphaned_drafts, reason)
+            self._state.pending_descriptor = None
+            self._state.pending_durable_next = None
+            self._state.visit_frontier = None
+            return
+        if batch.seal is None and batch.writer.progress.submitted:
+            durable = await _checkpoint_for_finalization(batch, self._run.options, self._run.runtime)
+            self._state.pending_durable_next = durable.next_sequence
+            _retain_durable_frontier(self._state, durable)
+            if durable.record_count:
+                await _bounded(batch.writer.publish_prefix(), self._run.options.timeouts.transfer)
+        elif batch.seal is not None and batch.count:
+            self._state.visit_frontier = max(self._state.visit_frontier or batch.end, batch.end)
+        await _bounded(
+            batch.writer.close(timeout=self._run.options.timeouts.transfer), self._run.options.timeouts.transfer
+        )
+        self._state.batch = None
+        self._state.pending_descriptor = None
+        self._state.pending_durable_next = None
+        frontier = self._state.visit_frontier
+        if frontier is None:
+            return
+        await joined_to_thread(self._run.staging.append_ready_closure, frontier, reason)
+        self._state.visit_frontier = None
 
     async def connected_step(
         self,
@@ -173,6 +230,12 @@ class _CoordinatorContext:
     state: _State
 
 
+def _retain_durable_frontier(state: _State, prefix: DurablePrefixShape) -> None:
+    """Retain only a frontier backed by at least one authenticated record."""
+    if prefix.record_count:
+        state.visit_frontier = max(state.visit_frontier or prefix.next_sequence, prefix.next_sequence)
+
+
 async def _checkpoint_after_session(state: _State, run: _Run) -> None:
     batch = state.batch
     if batch is None or batch.seal is not None:
@@ -192,6 +255,7 @@ async def _checkpoint_after_session(state: _State, run: _Run) -> None:
             await _checkpoint_batch(batch, run.options)
             if batch.durable is not None:
                 state.pending_durable_next = batch.durable.next_sequence
+                _retain_durable_frontier(state, batch.durable)
             return
         except BaseException as error:
             if run.runtime.is_writer_failed(error):
@@ -373,7 +437,7 @@ async def _read_and_seal(
     run = context.run
     reconciliation = await _read_or_reconcile(session, current, batch, run, phase)
     if isinstance(reconciliation, _PrefixPublished):
-        await _continue_after_prefix(context.state, batch, reconciliation, run.staging, run.options)
+        await _continue_after_prefix(context.state, batch, reconciliation, run.options)
         return None
     if isinstance(reconciliation, _ReconcileRestart):
         _continue_after_reconcile_restart(context.state)
@@ -781,7 +845,6 @@ async def _continue_after_prefix(
     state: _State,
     batch: _Batch,
     publication: _PrefixPublished,
-    staging: StagingPort,
     options: OpportunisticOptions,
 ) -> None:
     """Retire a prefix-publication attempt while keeping the session available for READ."""
@@ -801,9 +864,8 @@ async def _continue_after_prefix(
         state.last_result = collector.CollectionResult(
             batch.info, prefix.record_count, publication.seal, prefix.next_sequence, False
         )
-    attempt_id = batch.writer.attempt_id
+    _retain_durable_frontier(state, prefix)
     await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
-    await asyncio.to_thread(staging.terminalize_prefix_attempt, attempt_id)
     state.batch = None
     state.pending_descriptor = None
     state.pending_durable_next = None
@@ -849,6 +911,8 @@ async def _complete_batch(
     assert batch.seal is not None
     assert batch.info is not None
     state.last_result = collector.CollectionResult(batch.info, batch.count, batch.seal, batch.end, advance_confirmed)
+    if batch.count:
+        state.visit_frontier = max(state.visit_frontier or batch.end, batch.end)
     await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
     state.batch = None
     state.pending_descriptor = None

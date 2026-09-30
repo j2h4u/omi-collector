@@ -29,7 +29,7 @@ from .operational_telemetry import (
     system_host_clock_synchronized,
 )
 from .ports import CaptureRuntimePort, ClockMembershipPort, PublicationAuthorityPort, StorageLeaseFactory
-from .presence import PresencePolicy, PresenceWake
+from .presence import PresenceEnd, PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
     AdvertisementMetric,
@@ -46,6 +46,35 @@ from .ring_transport import (
     RingTransportDisconnectedError,
     RingTransportUnavailableError,
 )
+from .visit_machine import (
+    AttemptGranted,
+    CloseFailed,
+    ClosureCommitted,
+    CommitClosure,
+    DrainConfirmed,
+    FinishVisit,
+    InspectRecovery,
+    Interrupted,
+    NoOp,
+    OperatorBatchCompleted,
+    PreserveAndStop,
+    RecoveryEnded,
+    RecoveryLoaded,
+    RunAttempt,
+    SessionFinished,
+    SessionOutcome,
+    Shutdown,
+    TransitionResult,
+    VisitCommand,
+    VisitEvent,
+    WaitForAttempt,
+    initial_transition,
+    transition,
+)
+from .visit_machine import (
+    CandidateUnavailable as MachineCandidateUnavailable,
+)
+from .visit_machine import RecoveryDisposition as VisitRecoveryDisposition
 
 
 class OpportunisticSyncError(RuntimeError):
@@ -74,9 +103,11 @@ class PresenceSchedulerPort(Protocol):
     @property
     def drained_cooldown_remaining_seconds(self) -> float: ...
 
-    async def wait_for_attempt(self) -> PresenceWake: ...
+    async def wait_for_attempt(self) -> PresenceWake | PresenceEnd: ...
 
-    async def attempt_finished(self, outcome: AttemptOutcome) -> None: ...
+    async def attempt_finished(self, outcome: AttemptOutcome) -> PresenceEnd | None: ...
+
+    def resume_interrupted_visit(self) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -144,12 +175,16 @@ class SessionLifecycleCallbacks:
     """Coordinator closures used by the physical-session lifecycle."""
 
     before_direct_attempt: Callable[[], Awaitable[None]]
-    wait_presence_attempt: Callable[[], Awaitable[PresenceWake]]
+    wait_presence_attempt: Callable[[], Awaitable[PresenceWake | PresenceEnd]]
     connected_step: ConnectedStep
     post_session_checkpoint: Callable[[], Awaitable[None]]
     completed_batch_query: Callable[[], int]
     drained_result: Callable[[], collector.CollectResult]
     observe_info: Callable[[RingInfo], object] | None = None
+    durable_progress_query: Callable[[], int] | None = None
+    close_visit: Callable[[str], Awaitable[None]] | None = None
+    load_recovery: Callable[[], Awaitable[VisitRecoveryDisposition]] | None = None
+    invalidate_recovery: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,82 +207,192 @@ class SessionLifecycle:
     def __init__(self, run: SessionLifecycleRun) -> None:
         self.run = run
         self._storage_not_ready_responses = 0
+        self._pending_wake: PresenceWake | None = None
+        self._direct_retry = 0
+        self._pending_presence_outcome: CleanDrain | None = None
 
     async def run_direct(self) -> collector.CollectResult:
-        retry = 0
-        while True:
-            await self.run.callbacks.before_direct_attempt()
-            await report_activity(self.run.options.activity, "connecting")
-            completed_before = self.run.callbacks.completed_batch_query()
-            context, outcome = await self._open_context(None)
-            if context is not None:
-                outcome = await self.run_session(context)
-            if outcome == "drained":
-                retry = 0
-                await report_activity(self.run.options.activity, "drained")
-                if self.run.options.policy.stop_after_drained:
-                    return self.run.callbacks.drained_result()
-                await report_cooldown_started(
-                    self.run.options.activity,
-                    self.run.options.policy.drain_cooldown_seconds,
-                    self.run.options.policy.drain_cooldown_seconds,
-                )
-                await sleep(self.run.options.sleep, self.run.options.policy.drain_cooldown_seconds)
-                continue
-            if outcome == "collected":
-                return self.run.callbacks.drained_result()
-            if self.run.callbacks.completed_batch_query() > completed_before:
-                retry = 0
-            delay = self.run.options.policy.delay_for(retry)
-            retry += 1
-            await report_activity(self.run.options.activity, "away", delay)
-            await sleep(self.run.options.sleep, delay)
+        return await self._run_visit_machine(with_presence=False)
 
     async def run_with_presence(self) -> collector.CollectResult:
-        presence = self.run.options.presence
-        assert presence is not None
+        return await self._run_visit_machine(with_presence=True)
+
+    async def _run_visit_machine(self, *, with_presence: bool) -> collector.CollectResult:
+        """Execute effects, then feed their completed facts to the pure policy."""
+        presence = self.run.options.presence if with_presence else None
+        result = initial_transition()
         try:
             while True:
-                wake = await self.run.callbacks.wait_presence_attempt()
-                outcome_submitted = False
-                try:
-                    if (
-                        wake.observed_at is None
-                        or self.run.options.clock()
-                        >= wake.observed_at + self.run.options.config.presence.arrival_max_gap_seconds
-                    ):
-                        await presence.attempt_finished(CandidateUnavailable())
-                        outcome_submitted = True
-                        continue
-                    completed_before = self.run.callbacks.completed_batch_query()
-                    context, outcome = await self._open_context(wake.candidate)
-                    if context is not None:
-                        outcome = await self.run_session(context, wake.advertisement_rssi_dbm)
-                    durable_progress = self.run.callbacks.completed_batch_query() > completed_before
-                    attempt_outcome = presence_attempt_outcome(outcome, durable_progress)
-                    await presence.attempt_finished(attempt_outcome)
-                    outcome_submitted = True
-                except BaseException:
-                    if not outcome_submitted:
-                        await presence.close()
-                    raise
-                if isinstance(attempt_outcome, CleanDrain):
-                    if outcome == "drained":
-                        await report_activity(self.run.options.activity, "drained")
-                        if self.run.options.policy.stop_after_drained:
-                            return self.run.callbacks.drained_result()
-                        await report_cooldown_started(
-                            self.run.options.activity,
-                            presence.policy.drain_cooldown_seconds,
-                            presence.drained_cooldown_remaining_seconds,
-                        )
-                        continue
+                command = result.command
+                if isinstance(command, FinishVisit):
+                    await self._finish_visit(command.reason, command.stop, presence)
+                    if command.stop:
+                        return self.run.callbacks.drained_result()
+                    result = TransitionResult(result.state, WaitForAttempt())
+                    continue
+                if isinstance(command, PreserveAndStop):
+                    raise asyncio.CancelledError("visit lifecycle stopped before closure acknowledgement")
+                if isinstance(command, NoOp):
                     return self.run.callbacks.drained_result()
-                if self.run.callbacks.completed_batch_query() > completed_before:
-                    await report_activity(self.run.options.activity, "batch_complete")
-                await report_activity(self.run.options.activity, "away")
+                try:
+                    event = await self._run_visit_command(command, with_presence=with_presence)
+                except BaseException:
+                    if isinstance(command, CommitClosure):
+                        result = transition(result.state, CloseFailed())
+                    raise
+                result = transition(result.state, event, stop_after_drained=self.run.options.policy.stop_after_drained)
+        except asyncio.CancelledError:
+            transition(result.state, Shutdown())
+            raise
         finally:
-            await presence.close()
+            if presence is not None:
+                await presence.close()
+
+    async def _run_visit_command(self, command: VisitCommand, *, with_presence: bool) -> VisitEvent:
+        if isinstance(command, InspectRecovery):
+            return RecoveryLoaded(await self._load_recovery())
+        if isinstance(command, WaitForAttempt):
+            return await self._wait_for_visit_attempt(command, with_presence=with_presence)
+        if isinstance(command, RunAttempt):
+            return SessionFinished(await self._attempt_visit(with_presence=with_presence))
+        if isinstance(command, CommitClosure):
+            await self._close_visit(command.reason)
+            invalidate = self.run.callbacks.invalidate_recovery
+            if command.reason == "restart_interrupted" and invalidate is not None:
+                invalidate()
+            return ClosureCommitted()
+        raise RuntimeError(f"unhandled visit command: {type(command).__name__}")
+
+    async def _wait_for_visit_attempt(
+        self, command: WaitForAttempt, *, with_presence: bool
+    ) -> AttemptGranted | RecoveryEnded:
+        if not with_presence:
+            if command.previous_outcome is not None:
+                delay = self.run.options.policy.delay_for(self._direct_retry)
+                self._direct_retry += 1
+                await report_activity(self.run.options.activity, "away", delay)
+                await sleep(self.run.options.sleep, delay)
+            await self.run.callbacks.before_direct_attempt()
+            return AttemptGranted()
+        presence = self.run.options.presence
+        assert presence is not None
+        if command.arm_restored:
+            presence.resume_interrupted_visit()
+        end = await self._submit_presence_outcome(command.previous_outcome, presence)
+        if end is not None:
+            return _visit_recovery_end(end)
+        if command.previous_outcome is not None:
+            await report_activity(self.run.options.activity, "away")
+        wake = await self.run.callbacks.wait_presence_attempt()
+        if isinstance(wake, PresenceEnd):
+            return _visit_recovery_end(wake)
+        self._pending_wake = wake
+        return AttemptGranted()
+
+    async def _attempt_visit(self, *, with_presence: bool) -> SessionOutcome:
+        completed_before = self.run.callbacks.completed_batch_query()
+        progress_before = self._durable_progress()
+        outcome = await self._run_one_attempt(with_presence)
+        durable_progress = (
+            self.run.callbacks.completed_batch_query() > completed_before or self._durable_progress() > progress_before
+        )
+        event = self._session_event(outcome, durable_progress)
+        if isinstance(event, DrainConfirmed):
+            self._pending_presence_outcome = CleanDrain() if with_presence else None
+            self._direct_retry = 0
+        elif self.run.callbacks.completed_batch_query() > completed_before:
+            self._direct_retry = 0
+        if (
+            with_presence
+            and isinstance(event, Interrupted)
+            and self.run.callbacks.completed_batch_query() > completed_before
+        ):
+            await report_activity(self.run.options.activity, "batch_complete")
+        return event
+
+    async def _load_recovery(self) -> VisitRecoveryDisposition:
+        callback = self.run.callbacks.load_recovery
+        if callback is None:
+            return "empty"
+        return await callback()
+
+    def _take_wake(self) -> PresenceWake | None:
+        wake = self._pending_wake
+        self._pending_wake = None
+        return wake
+
+    async def _submit_presence_outcome(
+        self, previous: Interrupted | MachineCandidateUnavailable | None, presence: PresenceSchedulerPort
+    ) -> PresenceEnd | None:
+        if previous is None:
+            return None
+        if isinstance(previous, Interrupted):
+            outcome: AttemptOutcome = (
+                ConnectedInterruption(previous.durable_progress)
+                if previous.connected
+                else NotConnected(previous.durable_progress)
+            )
+        else:
+            outcome = CandidateUnavailable()
+        return await presence.attempt_finished(outcome)
+
+    async def _run_one_attempt(self, with_presence: bool) -> str:
+        wake = self._take_wake() if with_presence else None
+        candidate = wake.candidate if isinstance(wake, PresenceWake) else None
+        advertisement = wake.advertisement_rssi_dbm if isinstance(wake, PresenceWake) else None
+        if with_presence and (
+            wake is None
+            or not _wake_is_fresh(
+                wake, self.run.options.clock(), self.run.options.config.presence.arrival_max_gap_seconds
+            )
+        ):
+            return "candidate_unavailable"
+        await report_activity(self.run.options.activity, "connecting")
+        context, outcome = await self._open_context(candidate)
+        if context is not None:
+            outcome = await self.run_session(context, advertisement)
+        return outcome
+
+    @staticmethod
+    def _session_event(
+        outcome: str, durable_progress: bool
+    ) -> DrainConfirmed | Interrupted | MachineCandidateUnavailable | OperatorBatchCompleted:
+        if outcome == "drained":
+            return DrainConfirmed()
+        if outcome == "collected":
+            return OperatorBatchCompleted()
+        if outcome == "candidate_unavailable":
+            return MachineCandidateUnavailable()
+        if outcome in {"retry", "connected_interrupted"}:
+            return Interrupted(outcome == "connected_interrupted", durable_progress)
+        raise RuntimeError(f"unknown lifecycle attempt outcome: {outcome}")
+
+    async def _finish_visit(self, reason: str, stop: bool, presence: PresenceSchedulerPort | None) -> None:
+        if reason != "drained":
+            return
+        if presence is not None and self._pending_presence_outcome is not None:
+            await presence.attempt_finished(self._pending_presence_outcome)
+            self._pending_presence_outcome = None
+        await report_activity(self.run.options.activity, "drained")
+        if not stop:
+            cooldown = (
+                presence.policy.drain_cooldown_seconds
+                if presence is not None
+                else self.run.options.policy.drain_cooldown_seconds
+            )
+            remaining = presence.drained_cooldown_remaining_seconds if presence is not None else cooldown
+            await report_cooldown_started(self.run.options.activity, cooldown, remaining)
+            if presence is None:
+                await sleep(self.run.options.sleep, cooldown)
+
+    async def _close_visit(self, reason: str) -> None:
+        callback = self.run.callbacks.close_visit
+        if callback is not None:
+            await callback(reason)
+
+    def _durable_progress(self) -> int:
+        query = self.run.callbacks.durable_progress_query
+        return query() if query is not None else 0
 
     async def _open_context(
         self, candidate: object | None
@@ -592,6 +737,16 @@ def presence_attempt_outcome(outcome: str, durable_progress: bool) -> AttemptOut
     raise RuntimeError(f"unknown lifecycle attempt outcome: {outcome}")
 
 
+def _visit_recovery_end(end: PresenceEnd) -> RecoveryEnded:
+    if end.reason not in {"absence", "recovery_exhausted"}:
+        raise ValueError(f"unknown presence end reason: {end.reason}")
+    return RecoveryEnded(cast(Literal["absence", "recovery_exhausted"], end.reason))
+
+
+def _wake_is_fresh(wake: PresenceWake, now: float, max_gap: float) -> bool:
+    return wake.observed_at is not None and now < wake.observed_at + max_gap
+
+
 def _retryable_for_runtime(error: BaseException, runtime: CaptureRuntimePort) -> bool:
     return _retryable(error, is_device_busy=runtime.is_device_busy_error)
 
@@ -665,9 +820,30 @@ async def exit_context(
             secondary.append(error)
 
 
+async def joined_to_thread[T](function: Callable[..., T], *args: object, **kwargs: object) -> T:
+    """Join a storage mutation before propagating cancellation to its caller."""
+    return await join_owned(asyncio.to_thread(function, *args, **kwargs))
+
+
+async def join_owned[T](awaitable: Awaitable[T]) -> T:
+    """Keep ownership through repeated cancellation until the task settles."""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        while not task.done():
+            with suppress(BaseException):
+                await asyncio.shield(task)
+        try:
+            task.result()
+        except BaseException as mutation_error:
+            raise cancelled from mutation_error
+        raise cancelled
+
+
 async def cancel_task[T](task: asyncio.Future[T]) -> None:
     task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    await join_owned(asyncio.gather(task, return_exceptions=True))
 
 
 async def report_activity(

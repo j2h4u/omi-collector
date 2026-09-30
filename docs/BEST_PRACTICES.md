@@ -23,6 +23,14 @@ then run the full contract before release or handoff.
 
 ## Capture safety
 
+Keep physical-download policy in the pure `visit_machine`: it alone authorizes
+drained, interrupted, restart, or operator-limit closure. Session, presence, and
+storage code supply facts or execute its commands; they do not choose a second
+closure policy. Test event traces independently from BLE and filesystem tests.
+Only a fresh final zero-unread INFO with settled reconciliation, successful
+teardown, and checkpoint can produce `DrainConfirmed`. Publication uses a
+separate durable FIFO; its retries do not change the current visit state.
+
 `INFO` is the source of truth for unread state. Automatic service and sync
 admission requires a current exact-address scanner candidate that has remained
 visible for the configured stable-arrival span; the default is 30 seconds with
@@ -72,10 +80,11 @@ reviewed release as:
 sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
 ```
 
-The configuration is strict and contains `[pendant] address` and required
-`[ready]` sections, plus optional `[presence]`. `[ready]` accepts exactly
-`target_audio_seconds` and `max_wait_seconds`; maintenance publishes stale
-subtarget drafts even while the pendant is away.
+The configuration is strict and contains `[pendant] address`, plus optional
+`[presence]` and backwards-compatible `[ready]` sections. `[ready]` accepts
+exactly `target_audio_seconds` and `max_wait_seconds`; those legacy values do
+not trigger publication. Ready bundles are published after a durable physical
+visit closure, including closures recovered after restart.
 Its fixed parent `/srv/pipelines/omi` is the storage root; `collector`,
 `draft`, and `ready` are derived beneath it. The base unit grants the
 service write access to that root. Use filesystem ownership or ACLs on the

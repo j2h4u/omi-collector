@@ -8,12 +8,18 @@ import pytest
 from omi_collector.capture.application import presence as presence_module
 from omi_collector.capture.application.presence import (
     PresenceAdvertisement,
+    PresenceEnd,
     PresencePolicy,
     PresenceScanStopError,
     PresenceScanTransitionError,
     PresenceScheduler,
 )
-from omi_collector.capture.application.presence_machine import CandidateUnavailable, CleanDrain, ConnectedInterruption
+from omi_collector.capture.application.presence_machine import (
+    CandidateUnavailable,
+    CleanDrain,
+    ConnectedInterruption,
+    NotConnected,
+)
 from omi_collector.config import PresenceConfig
 
 
@@ -673,6 +679,135 @@ def test_typed_outcome_restarts_observation_and_no_candidate_invalidation_api_re
 
         assert observer.active
         assert not hasattr(scheduler, "invalidate_candidate")
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_absence_end_returns_without_a_gatt_permit() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, rapid_backoff=(0.001, 0.002)),
+        )
+        first = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer)
+        assert not isinstance(await first, PresenceEnd)
+        assert await scheduler.attempt_finished(NotConnected(durable_progress=False)) is None
+
+        ended = await scheduler.wait_for_attempt()
+
+        assert ended == PresenceEnd("absence")
+        assert not observer.active
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_recovery_exhaustion_returns_end_without_restarting_scanner() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(observer, policy=_test_policy(rapid_backoff=(0.01,)))
+        first = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer)
+        assert not isinstance(await first, PresenceEnd)
+
+        assert await scheduler.attempt_finished(NotConnected(durable_progress=False)) is None
+        retry = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await asyncio.sleep(0.02)
+        await _emit_stable(observer)
+        assert not isinstance(await asyncio.wait_for(retry, 1.0), PresenceEnd)
+        ended = await scheduler.attempt_finished(NotConnected(durable_progress=False))
+
+        assert ended == PresenceEnd("recovery_exhausted")
+        assert not observer.active
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_startup_interrupted_visit_ends_on_absence_without_a_permit() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+        )
+        scheduler.resume_interrupted_visit()
+
+        ended = await scheduler.wait_for_attempt()
+
+        assert ended == PresenceEnd("absence")
+        assert observer.events == ["start", "stop"]
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_startup_interrupted_visit_can_resume_from_a_fresh_advertisement() -> None:
+    async def scenario() -> None:
+        candidate = object()
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.05, scan_recheck_seconds=60.0),
+        )
+        scheduler.resume_interrupted_visit()
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer, candidate)
+
+        wake = await waiter
+
+        assert not isinstance(wake, PresenceEnd)
+        assert wake.candidate is candidate
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_startup_resume_refreshes_an_existing_waiters_timer() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+
+        scheduler.resume_interrupted_visit()
+        ended = await asyncio.wait_for(waiter, timeout=1.0)
+
+        assert ended == PresenceEnd("absence")
+        assert observer.events == ["start", "stop"]
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_startup_rearm_keeps_absence_after_an_early_unavailable_permit() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+        )
+        first = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer)
+        assert not isinstance(await first, PresenceEnd)
+
+        scheduler.resume_interrupted_visit()
+        assert not observer.active
+        assert await scheduler.attempt_finished(CandidateUnavailable()) is None
+        ended = await asyncio.wait_for(scheduler.wait_for_attempt(), timeout=1.0)
+
+        assert ended == PresenceEnd("absence")
         await scheduler.close()
 
     _run(scenario())

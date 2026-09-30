@@ -14,6 +14,7 @@ import pytest
 from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_segments import ClockSegment, ClockSegmentMap
+from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import ReadyConfig
 
@@ -77,6 +78,39 @@ def test_contiguous_drafts_publish_on_captured_audio_target_and_keep_remainder(t
     assert first.exists() is False
     assert second.exists() is False
     assert remainder.exists()
+
+
+def test_closed_frontier_publishes_all_eligible_contiguous_drafts_and_keeps_future_drafts(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    first = _audio_draft(draft_root, sequence=10)
+    second = _audio_draft(draft_root, sequence=11)
+    future = _audio_draft(draft_root, sequence=12)
+
+    result = _finalize_drafts(
+        draft_root,
+        tmp_path / "ready",
+        tmp_path / "ledger.json",
+        ClockSegmentMap(()),
+        config=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=0.01),
+        frontier=12,
+    )
+
+    assert [(item.next_sequence - item.record_count, item.next_sequence) for item in result] == [(10, 12)]
+    assert not first.exists() and not second.exists()
+    assert future.exists()
+
+
+def test_closed_frontier_does_not_cleanup_replay_overlap_from_a_future_draft(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    _audio_draft(draft_root, sequence=10)
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "ledger.json"
+    _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()), frontier=11)
+    future = _audio_draft(draft_root, sequence=10)
+
+    _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()), frontier=10)
+
+    assert future.exists()
 
 
 def test_sequence_gap_splits_subtarget_drafts(tmp_path: Path) -> None:
@@ -417,6 +451,40 @@ def test_ack_retirement_records_ledger_before_unlink_and_recovers_after_each_bou
         ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
     monkeypatch.setattr(ready_bundles, "_remove_retired_ready", original_remove)
     assert ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)[0].bundle_id == published.bundle_id
+
+
+def test_new_closure_recovers_retirement_committed_before_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drafts = tmp_path / "draft"
+    ready = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(drafts, (100,), start_sequence=100)
+    old = _finalize_drafts(drafts, ready, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(old.bundle_id, old.records_sha256)])
+    original_remove = ready_bundles._remove_retired_ready
+
+    def interrupt_retirement(_path: Path) -> None:
+        raise OSError("after retirement ledger commit")
+
+    monkeypatch.setattr(ready_bundles, "_remove_retired_ready", interrupt_retirement)
+    with pytest.raises(OSError, match="after retirement ledger commit"):
+        ready_bundles.retire_acknowledged(ready, ledger, checkpoint)
+    monkeypatch.setattr(ready_bundles, "_remove_retired_ready", original_remove)
+    checkpoint.unlink()
+    _draft(drafts, (101,), start_sequence=101)
+    open_draft = _draft(drafts, (102,), start_sequence=102)
+    store = StagingStore.from_paths(StagingStore(tmp_path / "collector", drafts).paths, publication_root=ready)
+    store.append_ready_closure(102, "drained")
+
+    published = cast(tuple[ready_bundles.ReadyBundleResult, ...], store.recover_and_publish())
+
+    assert [item.next_sequence for item in published] == [102]
+    assert not old.path.exists()
+    assert open_draft.exists()
+    assert loads(ledger.read_text())["bundles"][old.bundle_id]["state"] == "retired"
+    assert store.recover_and_publish() is None
+    assert open_draft.exists()
 
 
 def test_forged_or_open_tail_ack_never_deletes_ready_bundle(tmp_path: Path) -> None:

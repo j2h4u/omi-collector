@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from ...config import DEFAULT_CONFIG
 from . import presence_machine as machine
@@ -99,6 +99,13 @@ class PresenceWake:
     advertisement_rssi_dbm: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PresenceEnd:
+    """A completed interrupted visit that issued no GATT permit."""
+
+    reason: Literal["absence", "recovery_exhausted"]
+
+
 class PresenceScanTransitionError(RuntimeError):
     """A scanner transition remained live after bounded cancellation."""
 
@@ -143,8 +150,14 @@ class PresenceScheduler:
         """Return operator telemetry without exposing product state."""
         return machine.drained_cooldown_remaining_seconds(self._state, at=self._clock())
 
-    async def wait_for_attempt(self) -> PresenceWake:
-        """Return one permit only after the matching scanner has stopped."""
+    def resume_interrupted_visit(self) -> None:
+        """Arm startup absence recovery without starting a scanner or GATT attempt."""
+        if isinstance(self._state, machine.Closed):
+            raise RuntimeError("presence scheduler is closed")
+        self._apply(machine.ResumeInterruptedVisit(at=self._clock()))
+
+    async def wait_for_attempt(self) -> PresenceWake | PresenceEnd:
+        """Return a permit or close an interrupted visit without a permit."""
         if isinstance(self._state, machine.Closed):
             raise RuntimeError("presence scheduler is closed")
         if isinstance(self._state, machine.Attempting):
@@ -161,7 +174,7 @@ class PresenceScheduler:
         finally:
             self._waiter_active = False
 
-    async def attempt_finished(self, outcome: machine.AttemptOutcome) -> None:
+    async def attempt_finished(self, outcome: machine.AttemptOutcome) -> PresenceEnd | None:
         """Submit the single typed outcome for an outstanding permit."""
         try:
             result = self._apply(machine.AttemptFinished(at=self._clock(), outcome=outcome))
@@ -170,15 +183,18 @@ class PresenceScheduler:
             self._changed.set()
             await self._best_effort_stop(force=True)
             raise
+        if isinstance(result.directive, machine.EndVisit):
+            return PresenceEnd(result.directive.reason)
         if isinstance(result.directive, machine.Observe):
             await self._start_scan()
+        return None
 
     async def close(self) -> None:
         """Idempotently close product state and make one bounded stop attempt."""
         self._close_state()
         await self._best_effort_stop(force=self._force_stop_required)
 
-    async def _wait_for_attempt(self) -> PresenceWake:
+    async def _wait_for_attempt(self) -> PresenceWake | PresenceEnd:
         while True:
             if isinstance(self._state, machine.Closed):
                 raise RuntimeError("presence scheduler is closed")
@@ -201,7 +217,7 @@ class PresenceScheduler:
             if wake is not None:
                 return wake
 
-    async def _wait_until_event(self, deadline: float) -> PresenceWake | None:
+    async def _wait_until_event(self, deadline: float) -> PresenceWake | PresenceEnd | None:
         self._changed.clear()
         advertisement_task = asyncio.create_task(self._advertisements.get())
         timer_task = asyncio.create_task(self._sleep_until(deadline))
@@ -225,16 +241,28 @@ class PresenceScheduler:
             await _cancel_task(timer_task)
             await _cancel_task(changed_task)
 
-    async def _handle_advertisement(self, advertisement: machine.Advertisement) -> PresenceWake | None:
+    async def _handle_advertisement(self, advertisement: machine.Advertisement) -> PresenceWake | PresenceEnd | None:
         result = self._apply(machine.AdvertisementObserved(advertisement, processed_at=self._clock()))
         return await self._redeem(result.directive)
 
-    async def _handle_timer(self, deadline: float) -> PresenceWake | None:
+    async def _handle_timer(self, deadline: float) -> PresenceWake | PresenceEnd | None:
         state = _waiting_state(self._state)
         result = self._apply(machine.TimerFired(at=self._clock(), deadline=deadline, timer_epoch=state.timer_epoch))
         return await self._redeem(result.directive)
 
-    async def _redeem(self, directive: machine.PresenceDirective) -> PresenceWake | None:
+    async def _redeem(self, directive: machine.PresenceDirective) -> PresenceWake | PresenceEnd | None:
+        if isinstance(directive, machine.EndVisit):
+            try:
+                await self._stop_scan()
+            except asyncio.CancelledError:
+                await self._close_after_stop_failure()
+                raise
+            except Exception:
+                await self._close_after_stop_failure()
+                raise
+            if isinstance(self._state, machine.Closed):
+                raise RuntimeError("presence scheduler is closed")
+            return PresenceEnd(directive.reason)
         if not isinstance(directive, machine.StopAndBeginAttempt):
             return None
         try:

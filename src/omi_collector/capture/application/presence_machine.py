@@ -8,6 +8,7 @@ interpret the single directive returned by each transition.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +63,7 @@ class RetryWaiting:
     retry_index: int
     advertisement: Advertisement | None
     arrival_started_at: float | None = None
+    absence_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,7 @@ class RapidRetryTrigger:
 
 
 type AttemptTrigger = AdvertisementTrigger | RapidRetryTrigger
+type VisitEndReason = Literal["absence", "recovery_exhausted"]
 # Waiting values are constructed only by this module's transitions.  Their
 # immutable fields therefore need no defensive constructor validation.
 type WaitingState = Searching | CoolingDown | RetryWaiting
@@ -111,6 +114,13 @@ class AdvertisementObserved:
 @dataclass(frozen=True, slots=True)
 class ScannerInterrupted:
     """The active scanner stopped or failed before admission completed."""
+
+    at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeInterruptedVisit:
+    """Arm absence recovery for a startup visit with unfinished durable work."""
 
     at: float
 
@@ -166,7 +176,9 @@ class Shutdown:
     at: float
 
 
-type PresenceEvent = AdvertisementObserved | ScannerInterrupted | TimerFired | AttemptFinished | Shutdown
+type PresenceEvent = (
+    AdvertisementObserved | ScannerInterrupted | ResumeInterruptedVisit | TimerFired | AttemptFinished | Shutdown
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +205,14 @@ class NoOperation:
     """Do nothing for a stale or late event."""
 
 
-type PresenceDirective = Observe | StopAndBeginAttempt | Stop | NoOperation
+@dataclass(frozen=True, slots=True)
+class EndVisit:
+    """Close the interrupted visit without issuing another GATT permit."""
+
+    reason: VisitEndReason
+
+
+type PresenceDirective = Observe | StopAndBeginAttempt | Stop | NoOperation | EndVisit
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,9 +250,12 @@ def armed_deadline(state: WaitingState) -> float:
         return state.scan_recheck_at
     if isinstance(state, CoolingDown):
         return max(state.cooldown_at, state.recheck_at)
-    if state.retry_at is None:
-        return state.scan_recheck_at
-    return min(state.retry_at, state.scan_recheck_at)
+    deadlines = [state.scan_recheck_at]
+    if state.retry_at is not None:
+        deadlines.append(state.retry_at)
+    if state.absence_at is not None:
+        deadlines.append(state.absence_at)
+    return min(deadlines)
 
 
 def drained_cooldown_remaining_seconds(state: PresenceState, *, at: float) -> float:
@@ -258,7 +280,18 @@ def transition(
             raise UnexpectedAttemptOutcomeError(state)
         result = _handle_attempting(state, event, policy)
     elif isinstance(state, Attempting):
-        result = TransitionResult(state, NoOperation())
+        if isinstance(event, ResumeInterruptedVisit):
+            result = TransitionResult(
+                Attempting(
+                    trigger=state.trigger,
+                    waiting=_resume_waiting(state.waiting, event, policy),
+                ),
+                NoOperation(),
+            )
+        else:
+            result = TransitionResult(state, NoOperation())
+    elif isinstance(event, ResumeInterruptedVisit):
+        result = _handle_resume_interrupted_visit(state, event, policy)
     elif isinstance(event, ScannerInterrupted):
         result = _handle_scanner_interrupted(state, event, policy)
     elif isinstance(event, AdvertisementObserved):
@@ -279,6 +312,7 @@ def _handle_advertisement(
         or processed_at >= event.advertisement.observed_at + policy.arrival_max_gap_seconds
     ):
         return _observe(_clear_arrival(state))
+    state = _refresh_retry_absence(state, event.advertisement.observed_at, policy)
     if isinstance(state, Searching):
         result = _admit_advertisement(state, event.advertisement, policy=policy)
     elif isinstance(state, CoolingDown):
@@ -342,6 +376,8 @@ def _handle_retry_timer(
 ) -> TransitionResult:
     if event.at < armed_deadline(state):
         return _observe(state)
+    if state.absence_at is not None and event.at >= state.absence_at:
+        return _end_visit(state, at=event.at, reason="absence", policy=policy)
     if state.retry_at is not None and event.at < state.retry_at:
         return _observe(
             RetryWaiting(
@@ -351,6 +387,7 @@ def _handle_retry_timer(
                 retry_index=state.retry_index,
                 advertisement=state.advertisement,
                 arrival_started_at=state.arrival_started_at,
+                absence_at=state.absence_at,
             )
         )
     if state.retry_at is not None:
@@ -364,6 +401,7 @@ def _handle_retry_timer(
                 retry_index=state.retry_index,
                 advertisement=state.advertisement,
                 arrival_started_at=state.arrival_started_at,
+                absence_at=state.absence_at,
             )
         )
     return _observe(
@@ -376,6 +414,7 @@ def _handle_retry_timer(
             retry_index=state.retry_index,
             advertisement=state.advertisement,
             arrival_started_at=state.arrival_started_at,
+            absence_at=state.absence_at,
         )
     )
 
@@ -394,6 +433,8 @@ def _handle_attempting(
         )
         return _observe(cooled)
     if isinstance(event.outcome, CandidateUnavailable):
+        if isinstance(state.waiting, RetryWaiting):
+            return _observe(_clear_arrival(state.waiting))
         return _observe(Searching(state.waiting.timer_epoch + 1, event.at + policy.scan_recheck_seconds))
     if isinstance(event.outcome, ConnectedInterruption):
         return _retry_waiting(
@@ -417,16 +458,36 @@ def _retry_waiting(
     durable_progress: bool,
     policy: PresenceMachinePolicy,
 ) -> TransitionResult:
-    retry_index = 0 if durable_progress or not isinstance(waiting, RetryWaiting) else waiting.retry_index
-    delay = policy.rapid_backoff[min(retry_index, len(policy.rapid_backoff) - 1)]
+    previous_count = waiting.retry_index if isinstance(waiting, RetryWaiting) else 0
+    retry_index = 0 if durable_progress else previous_count + 1
+    # The first interrupted encounter earns one reconnect confirmation. The
+    # configured backoff length counts retries after that initial failure.
+    if not durable_progress and previous_count >= len(policy.rapid_backoff):
+        return _end_visit(waiting, at=at, reason="recovery_exhausted", policy=policy)
+    delay_index = 0 if durable_progress else retry_index - 1
+    delay = policy.rapid_backoff[min(delay_index, len(policy.rapid_backoff) - 1)]
     retry = RetryWaiting(
         timer_epoch=waiting.timer_epoch + 1,
         retry_at=at + delay,
         scan_recheck_at=at + policy.scan_recheck_seconds,
-        retry_index=retry_index + 1,
+        retry_index=retry_index,
         advertisement=None,
+        absence_at=at + policy.absence_seconds,
     )
     return _observe(retry)
+
+
+def _end_visit(
+    waiting: WaitingState,
+    *,
+    at: float,
+    reason: VisitEndReason,
+    policy: PresenceMachinePolicy,
+) -> TransitionResult:
+    return TransitionResult(
+        Searching(waiting.timer_epoch + 1, at + policy.scan_recheck_seconds),
+        EndVisit(reason),
+    )
 
 
 def _begin(waiting: WaitingState, trigger: AttemptTrigger) -> TransitionResult:
@@ -468,6 +529,27 @@ def _arrival_started_at(state: WaitingState) -> float | None:
     return state.arrival_started_at
 
 
+def _refresh_retry_absence(
+    state: WaitingState,
+    observed_at: float,
+    policy: PresenceMachinePolicy,
+) -> WaitingState:
+    if not isinstance(state, RetryWaiting):
+        return state
+    absence_at = observed_at + policy.absence_seconds
+    if state.absence_at is not None:
+        absence_at = max(absence_at, state.absence_at)
+    return RetryWaiting(
+        state.timer_epoch,
+        state.retry_at,
+        state.scan_recheck_at,
+        state.retry_index,
+        state.advertisement,
+        state.arrival_started_at,
+        absence_at,
+    )
+
+
 def _replace_advertisement(state: WaitingState, advertisement: Advertisement, first_at: float) -> WaitingState:
     if isinstance(state, Searching):
         return Searching(state.timer_epoch, state.scan_recheck_at, advertisement, first_at)
@@ -480,6 +562,7 @@ def _replace_advertisement(state: WaitingState, advertisement: Advertisement, fi
         state.retry_index,
         advertisement,
         first_at,
+        state.absence_at,
     )
 
 
@@ -494,6 +577,8 @@ def _clear_arrival(state: WaitingState) -> WaitingState:
         state.scan_recheck_at,
         state.retry_index,
         None,
+        None,
+        state.absence_at,
     )
 
 
@@ -502,3 +587,29 @@ def _handle_scanner_interrupted(
 ) -> TransitionResult:
     del event, policy
     return _observe(_clear_arrival(state))
+
+
+def _handle_resume_interrupted_visit(
+    state: WaitingState,
+    event: ResumeInterruptedVisit,
+    policy: PresenceMachinePolicy,
+) -> TransitionResult:
+    if isinstance(state, CoolingDown):
+        return TransitionResult(state, NoOperation())
+    return _observe(_resume_waiting(state, event, policy))
+
+
+def _resume_waiting(
+    state: WaitingState,
+    event: ResumeInterruptedVisit,
+    policy: PresenceMachinePolicy,
+) -> RetryWaiting:
+    return RetryWaiting(
+        timer_epoch=state.timer_epoch,
+        retry_at=state.retry_at if isinstance(state, RetryWaiting) else None,
+        scan_recheck_at=state.recheck_at if isinstance(state, CoolingDown) else state.scan_recheck_at,
+        retry_index=state.retry_index if isinstance(state, RetryWaiting) else 0,
+        advertisement=state.advertisement,
+        arrival_started_at=state.arrival_started_at,
+        absence_at=event.at + policy.absence_seconds,
+    )

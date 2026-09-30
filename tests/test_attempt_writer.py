@@ -18,6 +18,7 @@ from omi_collector.capture.adapters.attempt_writer import (
     WriterShutdownTimeoutError,
     WriterState,
 )
+from omi_collector.capture.application.session_lifecycle import bounded
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import WriterConfig
 
@@ -450,6 +451,33 @@ async def _test_close_timeout_is_reported_until_blocking_target_is_released() ->
     assert await writer.close(timeout=1) == "closed"
     assert writer.state is WriterState.CLOSED
     assert not writer.thread.is_alive()
+
+
+def test_bounded_close_survives_repeated_cancellation_until_target_release() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_close=True)
+        writer = await _started(target, bytearray())
+        owner = asyncio.create_task(bounded(writer.close(timeout=3), 3))
+        for _ in range(100):
+            if target.close_calls == 1:
+                break
+            await asyncio.sleep(0.001)
+        assert target.close_calls == 1
+
+        owner.cancel()
+        await asyncio.sleep(0)
+        owner.cancel()
+        await asyncio.sleep(0)
+        assert not owner.done()
+        assert writer.thread.is_alive()
+
+        target.release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        assert not writer.thread.is_alive()
+        assert writer.state is WriterState.CLOSED
+
+    asyncio.run(exercise())
 
 
 def test_cancelled_seal_remains_admitted_and_converges_to_one_target_call() -> None:

@@ -715,6 +715,12 @@ def test_recovery_exhaustion_returns_end_without_restarting_scanner() -> None:
         await _emit_stable(observer)
         assert not isinstance(await first, PresenceEnd)
 
+        assert await scheduler.attempt_finished(NotConnected(durable_progress=False)) is None
+        retry = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await asyncio.sleep(0.02)
+        await _emit_stable(observer)
+        assert not isinstance(await asyncio.wait_for(retry, 1.0), PresenceEnd)
         ended = await scheduler.attempt_finished(NotConnected(durable_progress=False))
 
         assert ended == PresenceEnd("recovery_exhausted")
@@ -779,6 +785,29 @@ def test_startup_resume_refreshes_an_existing_waiters_timer() -> None:
 
         assert ended == PresenceEnd("absence")
         assert observer.events == ["start", "stop"]
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_startup_rearm_keeps_absence_after_an_early_unavailable_permit() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+        )
+        first = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer)
+        assert not isinstance(await first, PresenceEnd)
+
+        scheduler.resume_interrupted_visit()
+        assert not observer.active
+        assert await scheduler.attempt_finished(CandidateUnavailable()) is None
+        ended = await asyncio.wait_for(scheduler.wait_for_attempt(), timeout=1.0)
+
+        assert ended == PresenceEnd("absence")
         await scheduler.close()
 
     _run(scenario())

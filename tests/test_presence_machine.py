@@ -339,7 +339,14 @@ def test_retry_outcomes_schedule_backoff_and_durable_progress_resets_it() -> Non
         POLICY,
     )
 
-    assert interrupted == type(interrupted)(Searching(4, 110.0), EndVisit("recovery_exhausted"))
+    assert interrupted == type(interrupted)(RetryWaiting(4, 14.0, 110.0, 2, None, None, 20.0), Observe(14.0))
+    assert isinstance(interrupted.state, RetryWaiting)
+    exhausted = transition(
+        Attempting(RapidRetryTrigger(_advertisement(14.0)), interrupted.state),
+        AttemptFinished(at=14.0, outcome=ConnectedInterruption(durable_progress=False)),
+        POLICY,
+    )
+    assert exhausted == type(exhausted)(Searching(5, 114.0), EndVisit("recovery_exhausted"))
     assert after_progress == type(after_progress)(RetryWaiting(4, 12.0, 110.0, 0, None, None, 20.0), Observe(12.0))
 
 

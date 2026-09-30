@@ -154,8 +154,6 @@ class PresenceScheduler:
         """Arm startup absence recovery without starting a scanner or GATT attempt."""
         if isinstance(self._state, machine.Closed):
             raise RuntimeError("presence scheduler is closed")
-        if isinstance(self._state, machine.Attempting):
-            return
         self._apply(machine.ResumeInterruptedVisit(at=self._clock()))
 
     async def wait_for_attempt(self) -> PresenceWake | PresenceEnd:

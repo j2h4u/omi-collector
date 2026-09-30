@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.8](https://github.com/j2h4u/omi-collector/compare/v0.9.7...v0.9.8) (2026-09-30)
+
+
+### Fixes
+
+* **capture:** coordinate clock publication and foreground leases ([#163](https://github.com/j2h4u/omi-collector/issues/163)) ([dbc3f5d](https://github.com/j2h4u/omi-collector/commit/dbc3f5d77a0d78c92cd20dca928fd18f8c9fb8f4))
+
 ## [0.9.7](https://github.com/j2h4u/omi-collector/compare/v0.9.6...v0.9.7) (2026-09-30)
 
 

@@ -25,6 +25,7 @@ from .operational_telemetry import (
     ClockObservationSink,
     OperationalEmitter,
     TelemetryClock,
+    collect_battery_observation,
     collect_operational_telemetry,
     system_host_clock_synchronized,
 )
@@ -432,6 +433,8 @@ class SessionLifecycle:
                     phase.value = "read/reconcile"
                     outcome, current = await self.run.callbacks.connected_step(session, current, self._info, phase)
                     if outcome in ("drained", "collected"):
+                        if current is not None:
+                            await self._refresh_battery(session, current, phase)
                         break
             except asyncio.CancelledError as error:
                 primary = error
@@ -597,6 +600,25 @@ class SessionLifecycle:
         except Exception as error:  # noqa: BLE001 - optional telemetry
             await report_session_error(options.activity, "telemetry", error, self.run.runtime)
 
+    async def _refresh_battery(self, session: RingSession, info: RingInfo, phase: SessionPhaseState) -> None:
+        options = self.run.options
+        if options.operational is None:
+            return
+        emitter = _quality_aware_operational_emitter(
+            options.operational, phase.quality, options.quality_metrics, options.host_time
+        )
+        try:
+            await collect_battery_observation(
+                session,
+                info,
+                emitter,
+                operation_timeout=options.config.telemetry.optional_operation_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - battery refresh is optional
+            await report_session_error(options.activity, "telemetry", error, self.run.runtime)
+
 
 def _quality_aware_operational_emitter(
     emitter: OperationalEmitter,
@@ -607,12 +629,16 @@ def _quality_aware_operational_emitter(
     """Copy only the already-collected firmware dimension into session evidence."""
 
     def emit(event: Mapping[str, object]) -> object:
+        emitted_event = event
         if quality is not None and event.get("event") == "pendant_observation":
             firmware = event.get("firmware")
-            quality.firmware_version = firmware if isinstance(firmware, str) else None
+            if isinstance(firmware, str):
+                quality.firmware_version = firmware
+            elif quality.firmware_version is not None:
+                emitted_event = {**event, "firmware": quality.firmware_version}
         if quality is not None and metrics is not None:
-            _record_clock_correction(event, quality, metrics, host_time)
-        return emitter(event)
+            _record_clock_correction(emitted_event, quality, metrics, host_time)
+        return emitter(emitted_event)
 
     return emit
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.9](https://github.com/j2h4u/omi-collector/compare/v0.9.8...v0.9.9) (2026-09-30)
+
+
+### Tests
+
+* **capture:** bound durable resume checks without masking retries ([#165](https://github.com/j2h4u/omi-collector/issues/165)) ([ce23e41](https://github.com/j2h4u/omi-collector/commit/ce23e418fdad2c8d68cb3906b361baa14fa7e0a3))
+
 ## [0.9.8](https://github.com/j2h4u/omi-collector/compare/v0.9.7...v0.9.8) (2026-09-30)
 
 

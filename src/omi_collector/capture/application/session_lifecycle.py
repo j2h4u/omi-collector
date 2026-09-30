@@ -27,7 +27,6 @@ from .operational_telemetry import (
     TelemetryClock,
     collect_battery_observation,
     collect_operational_telemetry,
-    system_host_clock_synchronized,
 )
 from .ports import CaptureRuntimePort, ClockMembershipPort, PublicationAuthorityPort, StorageLeaseFactory
 from .presence import PresenceEnd, PresencePolicy, PresenceWake
@@ -577,9 +576,10 @@ class SessionLifecycle:
                         info,
                         emitter,
                         clock=TelemetryClock(
-                            options.host_time,
-                            options.host_clock_synchronized or system_host_clock_synchronized,
-                            operation_timeout,
+                            now=options.host_time,
+                            synchronized=options.host_clock_synchronized,
+                            operation_timeout=operation_timeout,
+                            host_clock_probe_timeout=options.config.telemetry.host_clock_probe_timeout_seconds,
                             info_reader=lambda: self._info(session),
                             status_reader=session.read_status if options.operational is not None else None,
                             correction_sink=options.clock_correction_sink,

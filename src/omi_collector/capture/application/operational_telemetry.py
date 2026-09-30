@@ -111,6 +111,8 @@ def system_host_clock_synchronized(timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SEC
             text=True,
             timeout=timeout,
         )
+    except subprocess.TimeoutExpired as error:
+        raise _OptionalOperationTimeoutError from error
     except (OSError, subprocess.SubprocessError):  # fmt: skip
         return False
     return result.returncode == 0 and result.stdout.strip().lower() == "yes"
@@ -165,6 +167,7 @@ async def collect_operational_telemetry(
         synchronized,
         clock_events.append,
         telemetry_clock.operation_timeout,
+        telemetry_clock.host_clock_probe_timeout,
         info,
         telemetry_clock.info_reader,
         telemetry_clock.correction_sink,
@@ -177,6 +180,8 @@ async def collect_operational_telemetry(
         telemetry_clock.publisher,
     )
     await _sync_clock_with_mutation_lease(sync, telemetry_clock.mutation_lease)
+    for event in clock_events:
+        await _emit_safe(emit, event, telemetry_clock.operation_timeout)
     if status is None and telemetry_clock.status_reader is not None:
         try:
             status = await _bounded_optional(telemetry_clock.status_reader(), telemetry_clock.operation_timeout)
@@ -196,8 +201,6 @@ async def collect_operational_telemetry(
     # The journal is a projection, not the clock-recovery authority.  Keep a
     # slow or failed emitter from suppressing the durable clock decision.
     await _emit_safe(emit, observation, telemetry_clock.operation_timeout)
-    for event in clock_events:
-        await _emit_safe(emit, event, telemetry_clock.operation_timeout)
 
 
 async def collect_battery_observation(
@@ -281,6 +284,7 @@ class _ClockSync:
     host_clock_synchronized: Callable[[], bool]
     emit: OperationalEmitter
     operation_timeout: float
+    host_clock_probe_timeout: float
     info_before: RingInfo
     info_reader: InfoReader | None
     correction_sink: ClockCorrectionSink | None
@@ -318,7 +322,7 @@ async def _sync_clock(sync: _ClockSync) -> None:
     sample = sync.sample
     host_clock_synchronized = sync.host_clock_synchronized
     emit = sync.emit
-    operation_timeout = sync.operation_timeout
+    host_clock_probe_timeout = sync.host_clock_probe_timeout
     if sample.epoch is None:
         emit(
             {
@@ -338,7 +342,11 @@ async def _sync_clock(sync: _ClockSync) -> None:
         "boundary_sequence_min": sync.info_before.write_sequence,
     }
     try:
-        trusted = await _run_host_clock_probe(host_clock_synchronized, operation_timeout)
+        trusted = await _run_host_clock_probe(host_clock_synchronized, host_clock_probe_timeout)
+    except _OptionalOperationTimeoutError:
+        event.update(action="none", outcome="host_probe_timeout")
+        sync.emit(event)
+        return
     except Exception:  # noqa: BLE001 - trust is best effort
         trusted = False
     event["host_ntp_synchronized"] = trusted

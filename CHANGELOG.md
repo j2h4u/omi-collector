@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/j2h4u/omi-collector/compare/v0.9.3...v0.9.4) (2026-09-30)
+
+
+### Fixes
+
+* **status:** preserve final info and bound battery refresh ([#154](https://github.com/j2h4u/omi-collector/issues/154)) ([628bcda](https://github.com/j2h4u/omi-collector/commit/628bcdae989ba8aa95db0bb198cfb89f3ff8432d))
+
 ## [0.9.3](https://github.com/j2h4u/omi-collector/compare/v0.9.2...v0.9.3) (2026-09-30)
 
 

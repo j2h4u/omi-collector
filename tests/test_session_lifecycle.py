@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Coroutine, Mapping
+from contextlib import AbstractAsyncContextManager
+from dataclasses import replace
+from pathlib import Path
 from typing import Never, cast
 
 import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.collector import CollectorTimeoutError, NoDataResult, TransferTimeouts
 from omi_collector.capture.application.operational_telemetry import ClockCorrectionSink, TelemetryClock
 from omi_collector.capture.application.ports import CaptureRuntimePort
@@ -26,6 +30,7 @@ from omi_collector.capture.application.presence_machine import (
     ConnectedInterruption,
     NotConnected,
 )
+from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.application.ring_transport import RingSession, RingTransportUnavailableError
 from omi_collector.capture.application.session_lifecycle import (
     InfoReader,
@@ -39,6 +44,7 @@ from omi_collector.capture.application.session_lifecycle import (
     presence_attempt_outcome,
     teardown_was_interrupted,
 )
+from omi_collector.capture.application.visit_machine import DrainConfirmed, RecoveryDisposition
 from omi_collector.capture.domain.ring_protocol import RingInfo
 from omi_collector.config import CollectorConfig, TelemetryConfig
 
@@ -49,6 +55,154 @@ def _run(coroutine: Coroutine[object, object, object]) -> object:
 
 def _unexpected_startup_recovery() -> None:
     raise AssertionError("startup recovery is outside this lifecycle check")
+
+
+def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    async def attempt(_self: SessionLifecycle, *, with_presence: bool) -> DrainConfirmed:
+        assert not with_presence
+        events.append("attempt")
+        return DrainConfirmed()
+
+    async def enter() -> None:
+        events.append("enter")
+
+    async def close(_reason: str) -> None:
+        events.append("close")
+        raise OSError("closure failed")
+
+    async def connected_step(
+        _session: RingSession, _current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        raise AssertionError("attempt was replaced")
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+        close_visit=close,
+        enter_capture_priority=enter,
+        exit_capture_priority=lambda: events.append("exit"),
+    )
+    with pytest.raises(ValueError, match="supplied together"):
+        replace(callbacks, exit_capture_priority=None)
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(stop_after_drained=True)),
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+    monkeypatch.setattr(SessionLifecycle, "_attempt_visit", attempt)
+    with pytest.raises(OSError, match="closure failed"):
+        _run(SessionLifecycle(run).run_direct())
+    assert events == ["enter", "attempt", "close", "exit"]
+
+
+def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        store = StagingStore(tmp_path, tmp_path / "captures")
+
+        def publish() -> None:
+            events.append("publish")
+
+        monkeypatch.setattr(store, "recover_and_publish", publish)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+
+        async def attempt(_self: SessionLifecycle, *, with_presence: bool) -> DrainConfirmed:
+            assert not with_presence
+            maintenance.schedule_publication_retry()
+            await asyncio.sleep(0)
+            events.append("attempt")
+            return DrainConfirmed()
+
+        async def close(_reason: str) -> None:
+            await asyncio.sleep(0)
+            events.append("closure")
+            assert "publish" not in events
+
+        async def connected_step(
+            _session: RingSession, _current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+        ) -> tuple[str, RingInfo | None]:
+            raise AssertionError("attempt was replaced")
+
+        callbacks = SessionLifecycleCallbacks(
+            before_direct_attempt=_noop,
+            wait_presence_attempt=_wait,
+            connected_step=connected_step,
+            post_session_checkpoint=_noop,
+            completed_batch_query=lambda: 0,
+            drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+            close_visit=close,
+            enter_capture_priority=maintenance.enter_capture_priority,
+            exit_capture_priority=maintenance.exit_capture_priority,
+        )
+        run = SessionLifecycleRun(
+            provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
+            options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(stop_after_drained=True)),
+            runtime=OpportunisticRuntime(),
+            callbacks=callbacks,
+        )
+        monkeypatch.setattr(SessionLifecycle, "_attempt_visit", attempt)
+        try:
+            await SessionLifecycle(run).run_direct()
+            for _ in range(20):
+                if "publish" in events:
+                    break
+                await asyncio.sleep(0.001)
+            assert events == ["attempt", "closure", "publish"]
+        finally:
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_restart_closure_keeps_priority_through_followup_inspection() -> None:
+    events: list[str] = []
+
+    async def load_recovery() -> RecoveryDisposition:
+        events.append("inspect")
+        return "needs_interrupted_close" if events.count("inspect") == 1 else "empty"
+
+    async def close(_reason: str) -> None:
+        events.append("closure")
+
+    async def enter() -> None:
+        events.append("enter")
+
+    async def stop() -> None:
+        raise RuntimeError("stop after restart inspection")
+
+    async def connected_step(
+        _session: RingSession, _current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        raise AssertionError("attempt must not start")
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=stop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+        close_visit=close,
+        load_recovery=load_recovery,
+        enter_capture_priority=enter,
+        exit_capture_priority=lambda: events.append("exit"),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
+        options=OpportunisticOptions(TransferTimeouts(1, 1)),
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+    with pytest.raises(RuntimeError, match="stop after restart inspection"):
+        _run(SessionLifecycle(run).run_direct())
+    assert events == ["inspect", "enter", "closure", "inspect", "exit"]
 
 
 class _Lease:

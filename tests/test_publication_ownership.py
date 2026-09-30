@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from struct import pack
 from threading import Event, Thread
@@ -124,6 +126,44 @@ def test_clock_mutation_lease_reuses_active_writer_storage_lease(tmp_path: Path)
         store.clock_mutation_lease() as clock_lease,
     ):
         assert clock_lease is writer_lease
+
+
+def test_clock_mutation_lease_binds_publication_and_falls_back_after_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    authority = store.create_publication_authority()
+    acquired: list[DeviceLock] = []
+    publication_leases: list[DeviceLock | None] = []
+    published = object()
+    original_device_lock = store.device_lock
+
+    @contextmanager
+    def tracked_device_lock(
+        *, recover_capture_temporaries: bool = True, operation: str = "unknown"
+    ) -> Iterator[DeviceLock]:
+        with original_device_lock(
+            recover_capture_temporaries=recover_capture_temporaries, operation=operation
+        ) as lease:
+            acquired.append(lease)
+            yield lease
+
+    def publish_unlocked() -> object:
+        publication_leases.append(store._filesystem._active_lease)
+        return published
+
+    monkeypatch.setattr(store, "device_lock", tracked_device_lock)
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish_unlocked)
+
+    with store.clock_mutation_lease() as lease:
+        assert authority.publish() is published
+        assert acquired == [lease]
+        assert publication_leases == [lease]
+
+    assert authority.publish() is published
+    assert len(acquired) == 2
+    assert publication_leases == [acquired[0], acquired[1]]
+    authority.close()
 
 
 def test_failed_sealed_publication_retains_capture_for_authorized_retry(

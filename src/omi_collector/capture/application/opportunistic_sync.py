@@ -227,6 +227,8 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         close_visit=close_visit,
         load_recovery=load_recovery,
         invalidate_recovery=invalidate_recovery,
+        enter_capture_priority=run.maintenance.enter_capture_priority,
+        exit_capture_priority=run.maintenance.exit_capture_priority,
     )
     return SessionLifecycle(SessionLifecycleRun(run.provider, run.options, run.runtime, callbacks))
 

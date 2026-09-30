@@ -689,6 +689,103 @@ def test_publication_shutdown_joins_mutation_after_repeated_cancellation(
     _run(scenario())
 
 
+def test_capture_priority_joins_running_retry_and_defers_new_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[int] = []
+        store = _store(tmp_path)
+
+        def publish() -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                started.set()
+                if not release.wait(2):
+                    raise TimeoutError("publication mutation was not released")
+                finished.set()
+
+        monkeypatch.setattr(store, "recover_and_publish", publish)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        maintenance.schedule_publication_retry()
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            entering = asyncio.create_task(maintenance.enter_capture_priority())
+            await asyncio.sleep(0)
+            maintenance.schedule_publication_retry()
+            assert not entering.done()
+            assert calls == [1]
+            release.set()
+            await entering
+            assert finished.is_set()
+            await asyncio.sleep(0)
+            assert calls == [1]
+            maintenance.exit_capture_priority()
+            for _ in range(20):
+                if len(calls) == 2:
+                    break
+                await asyncio.sleep(0.001)
+            assert calls == [1, 1]
+            await maintenance.close()
+            maintenance.schedule_publication_retry()
+            await asyncio.sleep(0)
+            assert calls == [1, 1]
+        finally:
+            release.set()
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_cancelled_capture_priority_entry_joins_retry_before_releasing_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        store = _store(tmp_path)
+
+        def publish() -> None:
+            started.set()
+            if not release.wait(2):
+                raise TimeoutError("publication mutation was not released")
+            finished.set()
+
+        monkeypatch.setattr(store, "recover_and_publish", publish)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        maintenance.schedule_publication_retry()
+        entering: asyncio.Task[None] | None = None
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+
+            async def enter() -> None:
+                try:
+                    await maintenance.enter_capture_priority()
+                finally:
+                    maintenance.exit_capture_priority()
+
+            entering = asyncio.create_task(enter())
+            await asyncio.sleep(0)
+            entering.cancel()
+            await asyncio.sleep(0)
+            assert not entering.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await entering
+            assert finished.is_set()
+            await maintenance.close()
+        finally:
+            release.set()
+            if entering is not None:
+                await asyncio.gather(entering, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
 def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

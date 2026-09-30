@@ -145,6 +145,133 @@ def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) 
     _run(scenario())
 
 
+def test_invalid_terminal_marker_is_reauthenticated_but_never_replaced_or_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    expected = _seed_streaming_partial(store, count=2)
+    attempt_id = next((tmp_path / "attempts").iterdir()).name
+    source = store.quarantine_attempt_source(attempt_id)
+    invalid_marker = source / "published.json"
+    invalid_marker.write_bytes(b"{invalid json")
+    original_marker = invalid_marker.read_bytes()
+
+    assert store.quarantined_attempts() == (source,)
+    _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).run_once(lambda: False))
+    bundles = tuple(store.capture_root.iterdir())
+    assert len(bundles) == 1
+    assert (bundles[0] / "records.bin").read_bytes() == expected
+    assert invalid_marker.read_bytes() == original_marker
+    assert source.is_dir()
+
+    restarted = StagingStore(tmp_path, store.capture_root)
+    _run(QuarantineMaintenance(restarted, None, OpportunisticRuntime()).run_once(lambda: False))
+    assert tuple(restarted.capture_root.iterdir()) == bundles
+    assert invalid_marker.read_bytes() == original_marker
+
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: 10**18)
+    assert restarted.sweep_terminal_quarantine() == ()
+    assert source.is_dir()
+
+
+def test_terminal_state_must_match_marker_filename_before_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    _seed_streaming_partial(store, count=1)
+    attempt_id = next((tmp_path / "attempts").iterdir()).name
+    source = store.quarantine_attempt_source(attempt_id)
+    marker = source / "published.json"
+    marker.write_text(
+        dumps(
+            {
+                "version": 1,
+                "state": "unprocessable",
+                "classified_at_unix_ns": 1,
+                "reason": "wrong marker file",
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_marker = marker.read_bytes()
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: 10**18)
+
+    assert store.sweep_terminal_quarantine() == ()
+    assert source.is_dir()
+    assert marker.read_bytes() == original_marker
+
+
+def test_sidecar_must_match_quarantined_entry_and_integer_version(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = tmp_path / "quarantine"
+    root.mkdir()
+    source = root / f"opaque-entry-{'a' * 32}"
+    source.mkdir()
+    sidecar = source.with_name(f"{source.name}.json")
+    sidecar.write_text(
+        dumps(
+            {
+                "version": True,
+                "state": "unprocessable",
+                "classified_at_unix_ns": 0,
+                "reason": "wrong source",
+                "original_name": "someone-elses-entry",
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_sidecar = sidecar.read_bytes()
+
+    assert store.sweep_terminal_quarantine() == ()
+    assert source.is_dir()
+    assert sidecar.read_bytes() == original_sidecar
+
+
+def test_directly_classified_unsafe_quarantine_entry_expires_after_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
+    store = StagingStore(
+        tmp_path,
+        tmp_path.parent / f"{tmp_path.name}-captures",
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
+    )
+    unsafe = tmp_path / "quarantine" / "unsafe-entry"
+    unsafe.parent.mkdir()
+    unsafe.write_bytes(b"preserve until terminal retention")
+    name_collision = tmp_path / "quarantine" / "published"
+    name_collision.write_bytes(b"same-name sidecar collision")
+
+    assert store.sweep_terminal_quarantine() == ()
+    assert unsafe.with_name("unsafe-entry.json").is_file()
+    assert name_collision.with_name("published.json").is_file()
+    now += 72_000_000_000
+
+    assert set(store.sweep_terminal_quarantine()) == {unsafe, name_collision}
+    assert not unsafe.exists()
+    assert not name_collision.exists()
+
+
+def test_terminal_marker_named_like_its_parent_is_not_mistaken_for_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
+    store = StagingStore(
+        tmp_path,
+        tmp_path.parent / f"{tmp_path.name}-captures",
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
+    )
+    source = tmp_path / "quarantine" / "published"
+    source.mkdir(parents=True)
+    store.mark_quarantine_published(source)
+    now += 72_000_000_000
+
+    assert store.sweep_terminal_quarantine() == (source,)
+    assert not source.exists()
+
+
 def test_pending_startup_hydration_streams_raw_evidence_for_lease_bound_promotion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

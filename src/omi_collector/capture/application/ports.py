@@ -9,6 +9,7 @@ from threading import Thread
 from typing import Literal, Protocol, runtime_checkable
 
 from ...config import FirmwareObservationConfig, WriterConfig
+from ..domain.quarantine_machine import QuarantineState
 from ..domain.ring_protocol import DoneNotification, ReadBeginNotification, RingInfo
 
 
@@ -363,6 +364,8 @@ class StagingPort(Protocol):
     def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]: ...
 
     def quarantined_attempts(self, *, should_defer: Callable[[], bool]) -> tuple[Path, ...]: ...
+
+    def quarantine_state(self, source: Path) -> QuarantineState: ...
 
     def mark_quarantine_unprocessable(self, source: Path, reason: str) -> None: ...
 

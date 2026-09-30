@@ -17,7 +17,7 @@ from typing import Never
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification, RingInfo
 from ..domain.transfer_arena import TransferArena
-from . import collector
+from . import batch_machine, collector
 from .operational_telemetry import OperationalEmitter
 from .ports import (
     AttemptDescriptorShape,
@@ -292,19 +292,19 @@ async def _run_connected_step(
         batch.info = current
 
     if batch.seal is None:
-        already_confirmed = await _read_and_seal(context, session, current, batch, phase)
-        if already_confirmed is None:
+        reconciled = await _read_and_seal(context, session, current, batch, phase)
+        if reconciled is None:
             phase.value = "info"
             fresh = await info(session)
             return await _run_connected_step(context, session, fresh, info=info, phase=phase)
-        if not run.options.policy.advance_enabled or already_confirmed:
+        if not run.options.policy.advance_enabled:
             await _complete_batch(
                 state,
                 batch,
                 run.options,
-                advance_confirmed=run.options.policy.advance_enabled,
+                advance_confirmed=False,
             )
-            return ("collected" if not run.options.policy.advance_enabled else None), current
+            return "collected", current
         phase.value = "advance"
         return await _advance_batch(context, session, current, batch, info=info)
 
@@ -447,6 +447,8 @@ async def _read_and_seal(
         raise CursorConsistencyError("writer checkpoint did not return a durable prefix")
     if prefix.next_sequence != batch.end:
         raise CursorConsistencyError("READ did not produce the bounded batch prefix")
+    seal_precondition = _batch_milestone(batch)
+    batch_machine.transition(seal_precondition, batch_machine.Event.SEAL_REQUEST)
     await _report_activity(run.options.activity, "sealing")
     try:
         sealed = await _bounded(
@@ -457,6 +459,7 @@ async def _read_and_seal(
         if run.runtime.is_writer_failed(error):
             _raise_writer_cause(batch.writer, error)
         raise
+    batch_machine.transition(seal_precondition, batch_machine.Event.SEAL)
     batch.seal = sealed
     return current.read_sequence == batch.end
 
@@ -478,32 +481,35 @@ async def _advance_batch(
     # the destructive command.
     current = await info(session)
     await _report_activity(run.options.activity, "advancing")
-    action = _advance_action(current, batch)
-    if action == "confirmed":
-        await _complete_batch(state, batch, run.options)
-        return None, current
-    if action in ("ahead", "regressed", "expired"):
+    action = batch_machine.CursorAction(_advance_action(current, batch))
+    decision = batch_machine.transition(_batch_milestone(batch), batch_machine.Event.FRESH_INFO, action)
+    if decision.command is batch_machine.Command.CLOSE:
         # The immutable bundle is already safe.  Do not issue an old ADVANCE
         # when fresh INFO proves another actor/firmware state has moved on;
         # release the lease and let the next step start at the live cursor.
-        await _complete_batch(state, batch, run.options, advance_confirmed=False)
+        await _complete_batch(
+            state, batch, run.options, advance_confirmed=action is batch_machine.CursorAction.CONFIRMED
+        )
         return None, current
-    await _bounded(
-        collector.advance_leg(session, batch.end, timeout=run.options.timeouts.info), run.options.timeouts.info
-    )
+    assert decision.command is batch_machine.Command.ADVANCE
+    try:
+        await _bounded(
+            collector.advance_leg(session, batch.end, timeout=run.options.timeouts.info), run.options.timeouts.info
+        )
+    except collector.AdvanceUncertainError, collector.CollectorTimeoutError:
+        batch_machine.transition(_batch_milestone(batch), batch_machine.Event.ADVANCE_UNCERTAIN)
+        raise
     confirmed = await info(session)
-    action = _advance_action(confirmed, batch)
-    if action == "confirmed":
-        await _complete_batch(state, batch, run.options)
-        return None, confirmed
-    if action in ("ahead", "regressed", "expired"):
-        # The acknowledgement was uncertain, but fresh INFO proves this
-        # sealed bundle is no longer the live cursor range.  Retire the
-        # immutable bundle without repeating its old ADVANCE.
-        await _complete_batch(state, batch, run.options, advance_confirmed=False)
+    action = batch_machine.CursorAction(_advance_action(confirmed, batch))
+    decision = batch_machine.transition(_batch_milestone(batch), batch_machine.Event.ADVANCE_ACK_INFO, action)
+    if decision.command is batch_machine.Command.CLOSE:
+        await _complete_batch(
+            state, batch, run.options, advance_confirmed=action is batch_machine.CursorAction.CONFIRMED
+        )
         return None, confirmed
     # Cursor below end means ADVANCE was not applied. The next connected step
     # does another fresh INFO and repeats only this idempotent command.
+    assert decision.command is batch_machine.Command.KEEP
     return None, confirmed
 
 
@@ -910,14 +916,22 @@ async def _complete_batch(
 ) -> None:
     assert batch.seal is not None
     assert batch.info is not None
+    await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
+    batch_machine.transition(_batch_milestone(batch), batch_machine.Event.WRITER_CLOSED)
     state.last_result = collector.CollectionResult(batch.info, batch.count, batch.seal, batch.end, advance_confirmed)
     if batch.count:
         state.visit_frontier = max(state.visit_frontier or batch.end, batch.end)
-    await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
     state.batch = None
     state.pending_descriptor = None
     state.pending_durable_next = None
     state.completed_batches += 1
+
+
+def _batch_milestone(batch: _Batch | None) -> batch_machine.Milestone:
+    if batch is None:
+        return batch_machine.Milestone.RETIRED
+    durable_next = None if batch.durable is None else batch.durable.next_sequence
+    return batch_machine.derive_milestone(batch.start, batch.end, durable_next, batch.seal is not None)
 
 
 def _drained_result(state: _State) -> collector.CollectResult:

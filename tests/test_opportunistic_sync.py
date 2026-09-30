@@ -943,7 +943,10 @@ async def test_malformed_resume_evidence_is_quarantined_before_provider(tmp_path
 @_async_test
 async def test_resumed_complete_prefix_at_device_end_seals_without_read_or_advance(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
-    session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(102, 102),)),))
+    # The second INFO is fresh after sealing and gates retirement even at end.
+    session = ScriptedRingSession(
+        _status(), (WriteStep(b"\x10", (_info(102, 102),)), WriteStep(b"\x10", (_info(102, 102),)))
+    )
 
     result = await run_opportunistic_collector(
         Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
@@ -951,7 +954,7 @@ async def test_resumed_complete_prefix_at_device_end_seals_without_read_or_advan
 
     assert isinstance(result, CollectionResult)
     assert isinstance(result.seal, SealResult)
-    assert session.writes == [b"\x10"]
+    assert session.writes == [b"\x10", b"\x10"]
     assert not result.seal.deduplicated
     assert result.seal.bundle_path.joinpath("records.bin").read_bytes() == records
 
@@ -1100,6 +1103,27 @@ async def test_post_seal_cursor_ahead_keeps_old_bundle_and_starts_at_fresh_curso
     bundles = tuple(path.name for path in (_capture_root(tmp_path)).iterdir() if path.is_dir())
     assert any(name.startswith("100-102-") for name in bundles)
     assert any(name.startswith("103-104-") for name in bundles)
+
+
+@_async_test
+async def test_acknowledged_advance_with_ahead_cursor_is_not_reported_confirmed(tmp_path: Path) -> None:
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_advance_command(11), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(12, 12),)),
+        ),
+    )
+
+    result = await run_opportunistic_collector(
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
+    )
+
+    assert isinstance(result, CollectionResult)
+    assert not result.advance_confirmed
 
 
 @_async_test
@@ -3127,6 +3151,44 @@ async def test_close_visit_empty_batch_closes_writer_without_creating_visit_clos
     assert reconciler._state.batch is None
     assert not writer.thread.is_alive()
     assert not store.ready_closures_path.exists()
+
+
+@_async_test
+async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    writer = await _real_batch_writer(store, 100, 1)
+    assert writer.publish(RECORD_SIZE)
+    seal = await writer.seal(DoneNotification(0, 101))
+    assert seal is not None
+    batch = batch_reconciliation._Batch(
+        RingInfo(100, 101, 10000, 0, RECORD_SIZE),
+        100,
+        101,
+        TransferArena(100, 1, max_bytes=RECORD_SIZE),
+        writer,
+        seal=seal,
+    )
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+    reconciler._state.batch = batch
+    close = writer.close
+
+    async def fail_close(*, timeout: float) -> None:
+        del timeout
+        raise TimeoutError("writer close did not complete")
+
+    monkeypatch.setattr(writer, "close", fail_close)
+    with pytest.raises(TimeoutError, match="writer close"):
+        await batch_reconciliation._complete_batch(reconciler._state, batch, _options())
+
+    assert reconciler._state.batch is batch
+    assert reconciler._state.last_result is None
+    assert reconciler.completed_batches == 0
+    monkeypatch.setattr(writer, "close", close)
+    await writer.close(timeout=2)
 
 
 @_async_test

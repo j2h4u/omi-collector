@@ -11,6 +11,14 @@ from contextlib import suppress
 from pathlib import Path
 from uuid import uuid4
 
+from ..domain.quarantine_machine import (
+    QuarantineAction,
+    QuarantineEvent,
+    QuarantineState,
+)
+from ..domain.quarantine_machine import (
+    transition as quarantine_transition,
+)
 from .publication import (
     PrefixPublicationEvidence,
     TerminalRetirementEvidence,
@@ -31,6 +39,7 @@ from .staging_contract import (
     _TERMINAL_RETIREMENT_VERSION,
     _UNPROCESSABLE_QUARANTINE_NAME,
     _UNPROCESSABLE_QUARANTINE_STATE,
+    _UUID_HEX_LENGTH,
     AttemptDescriptor,
     AttemptStateError,
     CollisionError,
@@ -243,14 +252,8 @@ def quarantined_attempts(
             raise StagingError("quarantine entry cannot be inspected") from error
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
             continue
-        # A transient publication marker is diagnostic only.  Its strict
-        # prefix must be retried automatically on the next lifecycle pass;
-        # only an authenticated terminal classification ends salvage.
-        if (
-            (entry / _PUBLISHED_QUARANTINE_NAME).exists()
-            or (entry / _UNPROCESSABLE_QUARANTINE_NAME).exists()
-            or _terminal_quarantine_at(entry) is not None
-        ):
+        action = quarantine_transition(_quarantine_state(entry), QuarantineEvent.INSPECT).action
+        if action not in {QuarantineAction.SALVAGE, QuarantineAction.REAUTHENTICATE}:
             continue
         result.append(entry)
     return tuple(result)
@@ -297,6 +300,11 @@ def _mark_quarantine(filesystem: StagingFilesystem, source: Path, marker_name: s
         if len(relative.parts) != 1:
             raise AttemptStateError("quarantine source is not an immediate child")
         _require_regular_directory(source)
+        if any(
+            os.path.lexists(source / existing_name)
+            for existing_name in (_PUBLISHED_QUARANTINE_NAME, _UNPROCESSABLE_QUARANTINE_NAME)
+        ):
+            raise AttemptStateError("quarantine terminal evidence already exists")
         filesystem._write_json_atomic(source / marker_name, payload)
 
 
@@ -324,18 +332,32 @@ def sweep_terminal_quarantine(
         for entry in tuple(root.iterdir()):
             if should_defer():
                 break
-            if _is_quarantine_sidecar(root, entry):
-                continue
-            terminalized_at = _terminal_quarantine_at(entry)
-            if terminalized_at is None:
-                _classify_unsafe_quarantine_entry(filesystem, entry, now_unix_ns)
-                continue
-            if now_unix_ns - terminalized_at < retention_ns:
-                continue
-            _remove_terminal_quarantine_entry(entry)
-            _sync_directory(root, filesystem._fsync)
-            removed.append(entry)
+            if _sweep_terminal_quarantine_entry(filesystem, root, entry, now_unix_ns, retention_ns):
+                removed.append(entry)
     return tuple(removed)
+
+
+def _sweep_terminal_quarantine_entry(
+    filesystem: StagingFilesystem,
+    root: Path,
+    entry: Path,
+    now_unix_ns: int,
+    retention_ns: int,
+) -> bool:
+    if _is_quarantine_sidecar(root, entry):
+        return False
+    state = _quarantine_state(entry)
+    if state not in {QuarantineState.PUBLISHED, QuarantineState.UNPROCESSABLE}:
+        _classify_unsafe_quarantine_entry(filesystem, entry, now_unix_ns)
+        return False
+    terminalized_at = _terminal_quarantine_at(entry)
+    if terminalized_at is None or now_unix_ns - terminalized_at < retention_ns:
+        return False
+    if quarantine_transition(state, QuarantineEvent.RETENTION_EXPIRED).action is not QuarantineAction.DELETE:
+        return False
+    _remove_terminal_quarantine_entry(entry)
+    _sync_directory(root, filesystem._fsync)
+    return True
 
 
 def _remove_terminal_quarantine_entry(entry: Path) -> None:
@@ -395,32 +417,123 @@ def _terminal_quarantine_at(entry: Path) -> int | None:
             entry.with_name(f"{entry.name}.json"),
         )
     for marker_path in marker_paths:
-        timestamp = _terminal_marker_at(marker_path)
+        if marker_path == entry / _PUBLISHED_QUARANTINE_NAME:
+            expected_state = _PUBLISHED_QUARANTINE_STATE
+        else:
+            expected_state = _UNPROCESSABLE_QUARANTINE_STATE
+        timestamp = _terminal_marker_at(
+            marker_path,
+            expected_state=expected_state,
+            sidecar_entry=entry if marker_path == entry.with_name(f"{entry.name}.json") else None,
+        )
         if timestamp is not None:
             return timestamp
     return None
 
 
-def _terminal_marker_at(path: Path) -> int | None:
+def _quarantine_state(entry: Path) -> QuarantineState:
+    """Classify marker evidence; malformed or contradictory markers stay live."""
+    try:
+        mode = entry.lstat().st_mode
+    except OSError:
+        return QuarantineState.INVALID_EVIDENCE
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        return _opaque_quarantine_state(entry)
+    return _directory_quarantine_state(entry)
+
+
+def _opaque_quarantine_state(entry: Path) -> QuarantineState:
+    marker = entry.with_name(f"{entry.name}.json")
+    valid = _terminal_marker_at(
+        marker,
+        expected_state=_UNPROCESSABLE_QUARANTINE_STATE,
+        sidecar_entry=entry,
+    )
+    if valid is not None:
+        return QuarantineState.UNPROCESSABLE
+    return QuarantineState.INVALID_EVIDENCE
+
+
+def _directory_quarantine_state(entry: Path) -> QuarantineState:
+    published_path = entry / _PUBLISHED_QUARANTINE_NAME
+    unprocessable_path = entry / _UNPROCESSABLE_QUARANTINE_NAME
+    sidecar_path = entry.with_name(f"{entry.name}.json")
+    published = _terminal_marker_at(published_path, expected_state=_PUBLISHED_QUARANTINE_STATE)
+    unprocessable = _terminal_marker_at(unprocessable_path, expected_state=_UNPROCESSABLE_QUARANTINE_STATE)
+    sidecar = _terminal_marker_at(
+        sidecar_path,
+        expected_state=_UNPROCESSABLE_QUARANTINE_STATE,
+        sidecar_entry=entry,
+    )
+    has_published = os.path.lexists(published_path)
+    has_unprocessable = os.path.lexists(unprocessable_path)
+    has_sidecar = os.path.lexists(sidecar_path)
+    if (has_sidecar and sidecar is None) or (sidecar is not None and (has_published or has_unprocessable)):
+        return QuarantineState.INVALID_EVIDENCE
+    if sidecar is not None:
+        return QuarantineState.UNPROCESSABLE
+    if published is not None and not has_unprocessable:
+        return QuarantineState.PUBLISHED
+    if unprocessable is not None and not has_published:
+        return QuarantineState.UNPROCESSABLE
+    if has_published or has_unprocessable:
+        return QuarantineState.INVALID_EVIDENCE
+    return QuarantineState.RETRYABLE
+
+
+def _terminal_marker_at(
+    path: Path,
+    *,
+    expected_state: str,
+    sidecar_entry: Path | None = None,
+) -> int | None:
     """Read a terminal marker only when it is a regular, non-symlink file."""
     try:
         _require_regular_file(path, "quarantine terminal marker")
         marker = _read_json(path)
     except OSError, StagingError:
         return None
-    if marker.get("version") != _TERMINAL_RETIREMENT_VERSION:
-        return None
+    version = marker.get("version")
+    valid = isinstance(version, int) and not isinstance(version, bool) and version == _TERMINAL_RETIREMENT_VERSION
     state = marker.get("state")
-    if state == _PUBLISHED_QUARANTINE_STATE:
-        timestamp_key = "published_at_unix_ns"
-    elif state == _UNPROCESSABLE_QUARANTINE_STATE:
-        timestamp_key = "classified_at_unix_ns"
-    else:
+    published_marker = state == expected_state == _PUBLISHED_QUARANTINE_STATE and set(marker) == {
+        "version",
+        "state",
+        "published_at_unix_ns",
+    }
+    unprocessable_marker = (
+        state == expected_state == _UNPROCESSABLE_QUARANTINE_STATE
+        and frozenset(marker)
+        in {
+            frozenset({"version", "state", "classified_at_unix_ns", "reason"}),
+            frozenset({"version", "state", "classified_at_unix_ns", "reason", "original_name"}),
+        }
+        and isinstance(marker.get("reason"), str)
+        and bool(marker["reason"])
+    )
+    if "original_name" in marker and not isinstance(marker["original_name"], str):
         return None
+    original_name = marker.get("original_name")
+    if original_name is not None and (not isinstance(original_name, str) or not original_name):
+        return None
+    if sidecar_entry is not None and not _sidecar_name_matches(sidecar_entry.name, original_name):
+        return None
+    if not valid or not (published_marker or unprocessable_marker):
+        return None
+    timestamp_key = "published_at_unix_ns" if published_marker else "classified_at_unix_ns"
     candidate = marker.get(timestamp_key)
-    if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
-        return candidate
-    return None
+    return candidate if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0 else None
+
+
+def _sidecar_name_matches(entry_name: str, original_name: object) -> bool:
+    if not isinstance(original_name, str) or not original_name:
+        return False
+    if entry_name == original_name:
+        return True
+    if not entry_name.startswith(f"{original_name}-"):
+        return False
+    suffix = entry_name[len(original_name) + 1 :]
+    return len(suffix) == _UUID_HEX_LENGTH and all(character in "0123456789abcdef" for character in suffix)
 
 
 def _terminal_retired_at(path: Path) -> int | None:

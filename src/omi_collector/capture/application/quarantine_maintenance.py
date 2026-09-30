@@ -12,6 +12,14 @@ from time import monotonic
 from typing import Protocol
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
+from ..domain.quarantine_machine import (
+    QuarantineAction,
+    QuarantineEvent,
+    QuarantineState,
+)
+from ..domain.quarantine_machine import (
+    transition as quarantine_transition,
+)
 from ..domain.ring_protocol import RECORD_SIZE
 from .ports import (
     AttemptDescriptorShape,
@@ -423,6 +431,14 @@ class QuarantineMaintenance:
             self._runtime.debug_event("terminal_retired_partial_deleted", attempt_id=path.name)
 
     async def _salvage_quarantined_prefix(self, source: Path, should_defer: Callable[[], bool]) -> bool:
+        source_state = await joined_to_thread(self._staging.quarantine_state, source)
+        if source_state in {QuarantineState.PUBLISHED, QuarantineState.UNPROCESSABLE}:
+            return True
+        recovery_event = {
+            QuarantineState.RETRYABLE: QuarantineEvent.RECOVERED_RETRYABLE,
+            QuarantineState.INVALID_EVIDENCE: QuarantineEvent.RECOVERED_INVALID,
+        }[source_state]
+        state = quarantine_transition(QuarantineState.RECOVERING, recovery_event).state
         try:
             result = await joined_to_thread(
                 self._runtime.publish_quarantined_prefix,
@@ -430,32 +446,23 @@ class QuarantineMaintenance:
                 self._staging,
                 should_defer=should_defer,
             )
-        except Exception as error:
-            kind = self._runtime.classify_quarantine_error(error)
-            if kind is None:
-                raise
-            if kind == "deferred":
-                return False
-            if kind == "unprocessable":
-                await self._mark_quarantine(
-                    source,
-                    self._staging.mark_quarantine_unprocessable,
-                    "quarantine_unprocessable",
-                    str(error),
-                )
-                return True
-            self._runtime.debug_exception("quarantine_prefix_publish_retryable", error, source=source.name)
-            backoff = self._config.retry.quarantine_publish_backoff_seconds
-            self._quarantine_retry_not_before = (
-                monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
-            )
-            self._quarantine_retry_number += 1
-            return False
+        except asyncio.CancelledError:
+            quarantine_transition(state, QuarantineEvent.CANCEL)
+            raise
+        except Exception as error:  # noqa: BLE001 - the runtime classifies supported salvage failures
+            return await self._handle_quarantine_publish_error(source, state, error)
+        published = quarantine_transition(state, QuarantineEvent.OUTPUT_COMMITTED)
+        if published.action is not QuarantineAction.MARK_PUBLISHED:
+            return True
         try:
             await joined_to_thread(self._staging.mark_quarantine_published, source)
         except Exception as error:  # noqa: BLE001 - retain source until a later lifecycle pass
+            retained = quarantine_transition(published.state, QuarantineEvent.MARK_FAILED)
+            assert retained.action is QuarantineAction.KEEP
             self._runtime.debug_exception("quarantine_terminal_mark_failed", error, source=source.name)
             return True
+        acknowledged = quarantine_transition(published.state, QuarantineEvent.MARK_COMMITTED)
+        assert acknowledged.state is QuarantineState.PUBLISHED
         publication = result
         self._quarantine_retry_number = 0
         self._quarantine_retry_not_before = 0.0
@@ -469,23 +476,61 @@ class QuarantineMaintenance:
         await self._recover_and_publish()
         return True
 
+    async def _handle_quarantine_publish_error(
+        self,
+        source: Path,
+        state: QuarantineState,
+        error: Exception,
+    ) -> bool:
+        kind = self._runtime.classify_quarantine_error(error)
+        if kind is None:
+            raise error
+        if kind == "deferred":
+            deferred = quarantine_transition(state, QuarantineEvent.DEFER)
+            return deferred.action is not QuarantineAction.WAIT
+        if kind == "unprocessable":
+            pending = quarantine_transition(state, QuarantineEvent.CLASSIFIED_UNPROCESSABLE)
+            if pending.action is not QuarantineAction.MARK_UNPROCESSABLE:
+                return True
+            marked = await self._mark_quarantine(
+                source,
+                self._staging.mark_quarantine_unprocessable,
+                "quarantine_unprocessable",
+                str(error),
+            )
+            quarantine_transition(
+                pending.state,
+                QuarantineEvent.MARK_COMMITTED if marked else QuarantineEvent.MARK_FAILED,
+            )
+            return True
+        retry = quarantine_transition(state, QuarantineEvent.RETRYABLE_FAILURE)
+        if retry.action is not QuarantineAction.KEEP:
+            return True
+        self._runtime.debug_exception("quarantine_prefix_publish_retryable", error, source=source.name)
+        backoff = self._config.retry.quarantine_publish_backoff_seconds
+        self._quarantine_retry_not_before = monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
+        self._quarantine_retry_number += 1
+        return False
+
     async def _mark_quarantine(
         self,
         source: Path,
         marker: Callable[[Path, str], None],
         event: str,
         reason: str,
-    ) -> None:
+    ) -> bool:
         try:
             await joined_to_thread(marker, source, reason)
         except Exception as marking_error:  # noqa: BLE001 - source remains safe
             self._runtime.debug_exception(
-                "quarantine_classification_failed",
+                "quarantine_invalid_marker_preserved",
                 marking_error,
                 source=source.name,
             )
+            return False
         else:
             self._runtime.debug_event(event, source=source.name)
+            return True
 
     async def _quarantine_pending(
         self,

@@ -49,7 +49,7 @@ from omi_collector.capture.application.collector import (
     TransferInterruptedError,
     TransferTimeouts,
 )
-from omi_collector.capture.application.operational_telemetry import TIME_READ_UUID
+from omi_collector.capture.application.operational_telemetry import BATTERY_UUID, TIME_READ_UUID
 from omi_collector.capture.application.opportunistic_sync import CollectionPreservedCancelledError
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
@@ -730,6 +730,59 @@ async def test_drained_info_reaches_observation_writer_and_writer_closes_once(
     assert isinstance(result, NoDataResult)
     assert observed == [RingInfo(100, 100, 10000, 0, RECORD_SIZE)]
     assert close_calls == [None]
+
+
+@pytest.mark.parametrize("hang_battery", (False, True))
+@_async_test
+async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hang_battery: bool
+) -> None:
+    class BatterySession(ScriptedRingSession):
+        def __init__(self) -> None:
+            super().__init__(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
+            self.battery_reads: list[str] = []
+
+        async def read_optional_characteristic(self, uuid: str) -> bytes:
+            self.battery_reads.append(uuid)
+            if hang_battery:
+                await asyncio.Future()
+            return bytes((74,))
+
+    async def skip_initial_telemetry(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omi_collector.capture.application.session_lifecycle.collect_operational_telemetry", skip_initial_telemetry
+    )
+    session = BatterySession()
+    observations: list[dict[str, object]] = []
+    config = CollectorConfig(retry=RetryConfig(presence_preflight_budget_seconds=0.05))
+    options = replace(
+        _options(),
+        operational=lambda event: observations.append(dict(event)),
+        config=config,
+    )
+    started_at = time.monotonic()
+
+    result = await run_opportunistic_collector(
+        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert isinstance(result, NoDataResult)
+    assert session.battery_reads == [BATTERY_UUID]
+    assert len(observations) == 1
+    assert observations[0]["event"] == "pendant_observation"
+    if hang_battery:
+        assert "battery_percent" not in observations[0]
+        outcomes = observations[0]["optional_outcomes"]
+        assert isinstance(outcomes, dict)
+        assert outcomes["battery"] == "timeout"
+        assert elapsed < 0.2
+    else:
+        assert observations[0]["battery_percent"] == 74
+    assert observations[0]["read_sequence"] == 100
+    assert observations[0]["write_sequence"] == 100
 
 
 @_async_test

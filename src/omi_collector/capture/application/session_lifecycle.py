@@ -612,7 +612,10 @@ class SessionLifecycle:
                 session,
                 info,
                 emitter,
-                operation_timeout=options.config.telemetry.optional_operation_timeout_seconds,
+                operation_timeout=min(
+                    options.config.telemetry.optional_operation_timeout_seconds,
+                    options.config.retry.presence_preflight_budget_seconds,
+                ),
             )
         except asyncio.CancelledError:
             raise

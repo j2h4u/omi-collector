@@ -284,7 +284,7 @@ async def _run_connected_step(
     state = context.state
     batch = await _ensure_batch(current, run, state)
     if batch is None:
-        return "drained", None
+        return "drained", current
     if batch.info is None:
         # A resumed attempt has no trusted historical INFO.  The first fresh
         # INFO observed in this presence session becomes its result metadata;

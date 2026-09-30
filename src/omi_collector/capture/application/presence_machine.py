@@ -440,7 +440,9 @@ def _retry_waiting(
 ) -> TransitionResult:
     previous_count = waiting.retry_index if isinstance(waiting, RetryWaiting) else 0
     retry_index = 0 if durable_progress else previous_count + 1
-    if not durable_progress and retry_index >= len(policy.rapid_backoff):
+    # The first interrupted encounter earns one reconnect confirmation. The
+    # configured backoff length counts retries after that initial failure.
+    if not durable_progress and previous_count >= len(policy.rapid_backoff):
         return _end_visit(waiting, at=at, reason="recovery_exhausted", policy=policy)
     delay_index = 0 if durable_progress else retry_index - 1
     delay = policy.rapid_backoff[min(delay_index, len(policy.rapid_backoff) - 1)]

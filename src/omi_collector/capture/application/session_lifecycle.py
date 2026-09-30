@@ -216,8 +216,6 @@ class SessionLifecycle:
                 wake = await self.run.callbacks.wait_presence_attempt()
                 if isinstance(wake, PresenceEnd):
                     await self._close_interrupted_visit(wake.reason)
-                    if self.run.options.policy.stop_after_drained:
-                        return self.run.callbacks.drained_result()
                     continue
                 outcome_submitted = False
                 try:
@@ -230,8 +228,6 @@ class SessionLifecycle:
                         outcome_submitted = True
                         if end is not None:
                             await self._close_interrupted_visit(end.reason)
-                            if self.run.options.policy.stop_after_drained:
-                                return self.run.callbacks.drained_result()
                             continue
                         continue
                     completed_before = self.run.callbacks.completed_batch_query()
@@ -252,8 +248,6 @@ class SessionLifecycle:
                     raise
                 if end is not None:
                     await self._close_interrupted_visit(end.reason)
-                    if self.run.options.policy.stop_after_drained:
-                        return self.run.callbacks.drained_result()
                     continue
                 if isinstance(attempt_outcome, CleanDrain):
                     await self._close_visit("drained")
@@ -342,7 +336,10 @@ class SessionLifecycle:
                     )
             await self.run.callbacks.post_session_checkpoint()
             if teardown_error:
-                return "connected_interrupted"
+                # INFO completed before context teardown failed. Give the
+                # presence scheduler one reconnect confirmation instead of
+                # treating this first encounter as exhausted no-progress.
+                return "teardown_interrupted"
             if outcome is not None:
                 return outcome
             raise RuntimeError("opportunistic session ended without an outcome")
@@ -626,6 +623,8 @@ def presence_attempt_outcome(outcome: str, durable_progress: bool) -> AttemptOut
         return CandidateUnavailable()
     if outcome == "connected_interrupted":
         return ConnectedInterruption(durable_progress)
+    if outcome == "teardown_interrupted":
+        return ConnectedInterruption(True)
     if outcome == "retry":
         return NotConnected(durable_progress)
     raise RuntimeError(f"unknown lifecycle attempt outcome: {outcome}")

@@ -71,7 +71,7 @@ class QuarantineMaintenance:
         self._publication_retry_handle: asyncio.TimerHandle | None = None
         self._publication_retry_task: asyncio.Task[bool] | None = None
 
-    async def prepare_pending_startup(self) -> PendingStartupState:
+    async def prepare_pending_startup(self) -> PendingStartupState:  # noqa: C901 - startup recovery ordering is explicit
         """Inspect and validate restart evidence exactly once."""
         if self._startup_state is not None:
             return self._startup_state
@@ -81,11 +81,16 @@ class QuarantineMaintenance:
         # A prefix marker is non-blocking only while its canonical draft is
         # present. Recreate and terminalize it before asking the normal
         # pending-attempt query whether an ordinary partial remains.
-        await asyncio.to_thread(
-            self._staging.close_pending_prefix,
-            "restart_interrupted",
-            include_unpublished=False,
-        )
+        try:
+            await asyncio.to_thread(
+                self._staging.close_pending_prefix,
+                "restart_interrupted",
+                include_unpublished=False,
+            )
+        except Exception as error:
+            if not self._runtime.is_device_busy_error(error):
+                raise
+            self._runtime.debug_exception("pending_prefix_recovery_blocked", error)
         await self._recover_and_publish()
 
         try:

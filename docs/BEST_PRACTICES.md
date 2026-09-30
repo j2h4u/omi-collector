@@ -120,6 +120,57 @@ logs. Keep the private diagnostic ring access-restricted.
 
 ## Observability
 
+### Pendant missing while nearby
+
+When the operator confirms the pendant is nearby and switched on, check host
+Bluetooth before asking them to power-cycle the pendant. First check
+`systemctl is-active bluetooth.service` and `bluetoothctl --timeout 5 show`:
+the service must be active and the controller powered. Start an inactive
+service with `sudo -n /usr/bin/systemctl start bluetooth.service`; enable a
+disabled controller with `bluetoothctl --timeout 5 power on`. Those flags, `Discovering: yes`,
+and cached devices do not confirm that fresh BLE advertisements arrive.
+
+Read `sudo -n /usr/local/sbin/omi-collector-status` first. If it shows fresh
+transfer progress, leave collection running; do not scan or restart Bluetooth.
+For an idle discovery investigation, stop the collector gracefully and count
+fresh BLE devices in a bounded independent scan from the maintainer checkout:
+
+```bash
+sudo -n /usr/bin/systemctl stop omi-collector.service
+timeout --signal=TERM --kill-after=5s 20s uv run --frozen python -c \
+  'import asyncio; from bleak import BleakScanner; print(len(asyncio.run(BleakScanner.discover(timeout=10))))'
+```
+
+If known nearby BLE devices should be advertising but the count is zero, or
+the probe errors or times out, investigate host Bluetooth. If other devices
+appear, investigate the pendant's power, current address and other connection
+instead. Restore the collector after the investigation in either case.
+After a successful stop, always run
+`sudo -n /usr/bin/systemctl start omi-collector.service` before leaving,
+including after probe or recovery failure, or if unrelated connections prevent
+recovery. Leave those unrelated connections intact.
+
+For a stalled discovery stack, check `bluetoothctl --timeout 5 devices Connected` for
+unrelated connections before restarting Bluetooth; the restart disconnects
+them. With no unrelated connections, recover the service and repeat the
+bounded scan before restarting the collector:
+
+```bash
+sudo -n /usr/bin/systemctl restart bluetooth.service
+bluetoothctl --timeout 5 power on
+# Repeat the bounded scan above, then restore normal collection.
+sudo -n /usr/bin/systemctl start omi-collector.service
+```
+
+Verify fresh discoveries and then new collector advertisements or transfer
+progress. A successful restart alone does not confirm recovery. If discovery
+still fails, inspect the Bluetooth and kernel journals before attributing the
+failure to the pendant. Bound reads with
+`sudo -n journalctl -u bluetooth.service -b -n 40 --no-pager` and
+`sudo -n journalctl -k -b -n 80 --no-pager`.
+
+### Status and logs
+
 Use the system journal for the small operational stream. The default `INFO`
 level shows readiness, transfer outcomes, failures, and recovery; it suppresses
 repeated `storage_wait` polling and detailed `ble_link_session` records. Use

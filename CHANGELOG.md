@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.7](https://github.com/j2h4u/omi-collector/compare/v0.9.6...v0.9.7) (2026-09-30)
+
+
+### Fixes
+
+* **capture:** enforce complete lifecycle transition contracts ([#161](https://github.com/j2h4u/omi-collector/issues/161)) ([28647a5](https://github.com/j2h4u/omi-collector/commit/28647a5d26971494ac9c2be111c572c202a0a958))
+
 ## [0.9.6](https://github.com/j2h4u/omi-collector/compare/v0.9.5...v0.9.6) (2026-09-30)
 
 

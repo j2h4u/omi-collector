@@ -108,7 +108,7 @@ class RetryConfig:
     rapid_backoff: tuple[float, ...] = _RAPID_BACKOFF
     storage_not_ready_backoff: tuple[float, ...] = (1.0, 2.0, 5.0)
     max_storage_not_ready_responses: int = 3
-    presence_preflight_budget_seconds: float = 1.0
+    presence_preflight_budget_seconds: float = 10.0
     maintenance_interval_seconds: float = 30.0
     quarantine_publish_backoff_seconds: tuple[float, ...] = (5.0, 30.0, 300.0)
 

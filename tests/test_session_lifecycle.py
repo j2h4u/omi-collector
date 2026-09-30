@@ -40,6 +40,7 @@ from omi_collector.capture.application.session_lifecycle import (
     teardown_was_interrupted,
 )
 from omi_collector.capture.domain.ring_protocol import RingInfo
+from omi_collector.config import CollectorConfig, TelemetryConfig
 
 
 def _run(coroutine: Coroutine[object, object, object]) -> object:
@@ -320,7 +321,7 @@ def test_clock_transport_fence_requires_error_free_context_close(monkeypatch: py
 def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     info = RingInfo(10, 10, 100, 0, 512)
     activity: list[object] = []
-    observed: list[object] = []
+    observed: list[tuple[object, float, object]] = []
     errors: list[BaseException] = []
 
     class Context:
@@ -340,7 +341,7 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
         return info
 
     async def telemetry(*_args: object, clock: TelemetryClock, **_kwargs: object) -> None:
-        observed.append(clock.mutation_lease)
+        observed.append((clock.mutation_lease, clock.host_clock_probe_timeout, clock.synchronized))
 
     async def observe_error(_activity: object, _phase: object, error: BaseException, _runtime: object) -> None:
         errors.append(error)
@@ -364,6 +365,7 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
         activity=activity.append,
         clock_correction_sink=cast(ClockCorrectionSink, CorrectionSink()),
         clock_lease=lambda: _Lease(),
+        config=CollectorConfig(telemetry=TelemetryConfig(host_clock_probe_timeout_seconds=0.25)),
     )
     run = SessionLifecycleRun(
         provider=lambda _candidate: Context(),
@@ -382,7 +384,7 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
 
     _run(scenario())
     assert activity == [], errors
-    assert observed == [options.clock_lease]
+    assert observed == [(options.clock_lease, 0.25, None)]
 
 
 def test_connected_step_cancellation_identity_reaches_context_exit(monkeypatch: pytest.MonkeyPatch) -> None:

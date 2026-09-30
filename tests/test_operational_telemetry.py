@@ -5,7 +5,7 @@ import json
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 from shutil import rmtree
@@ -18,7 +18,7 @@ import pytest
 import omi_collector.capture.application.operational_telemetry as operational_telemetry
 from fakes import ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
-from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+from omi_collector.capture.adapters.clock_corrections import ClockCorrection, ClockCorrectionStore
 from omi_collector.capture.adapters.clock_memberships import ClockMembershipStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -203,6 +203,14 @@ def _event_emitter(events: list[dict[str, object]]) -> OperationalEmitter:
     return emit
 
 
+def _clock_event(events: list[dict[str, object]]) -> dict[str, object]:
+    return next(event for event in events if event.get("event") == "pendant_clock_sync")
+
+
+def _observation_event(events: list[dict[str, object]]) -> dict[str, object]:
+    return next(event for event in events if event.get("event") == "pendant_observation")
+
+
 def _info() -> RingInfo:
     return RingInfo(10, 12, 100, 2, RECORD_SIZE)
 
@@ -282,6 +290,26 @@ def test_system_clock_check_uses_supported_timedatectl_show_arguments(monkeypatc
     ]
 
 
+def test_timedatectl_timeout_is_reported_as_host_probe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timeout_run(*_args: object, timeout: float, **_kwargs: object) -> SimpleNamespace:
+        raise operational_telemetry.subprocess.TimeoutExpired("timedatectl", timeout)
+
+    monkeypatch.setattr(operational_telemetry.subprocess, "run", timeout_run)
+    events: list[dict[str, object]] = []
+
+    asyncio.run(
+        collect_operational_telemetry(
+            FakeOperationalSession({TIME_READ_UUID: pack("<I", 1010)}),
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(synchronized=operational_telemetry.system_host_clock_synchronized),
+        )
+    )
+
+    assert _clock_event(events)["outcome"] == "host_probe_timeout"
+
+
 def test_boundary_drift_does_not_write_and_observation_is_safe() -> None:
     session = FakeOperationalSession(
         {
@@ -300,14 +328,14 @@ def test_boundary_drift_does_not_write_and_observation_is_safe() -> None:
     _run(session, events)
 
     assert session.writes == []
-    assert events[0]["event"] == "pendant_observation"
-    assert events[0]["used_bytes"] == 123
-    assert events[0]["rtc_valid"] is True
-    assert events[0]["read_sequence"] == 10
-    outcomes = events[0]["optional_outcomes"]
+    observation = _observation_event(events)
+    assert observation["used_bytes"] == 123
+    assert observation["rtc_valid"] is True
+    assert observation["read_sequence"] == 10
+    outcomes = observation["optional_outcomes"]
     assert isinstance(outcomes, dict)
     assert outcomes["battery"] == "malformed"
-    assert events[1]["outcome"] == "within_threshold"
+    assert _clock_event(events)["outcome"] == "within_threshold"
     assert "address" not in str(events)
     assert "audio" not in str(events)
 
@@ -338,7 +366,7 @@ def test_healthy_clock_visit_persists_observation(tmp_path: Path) -> None:
     assert len(observations) == 1
     assert observations[0].device_epoch == 1005
     assert observations[0].observation_role == "standalone"
-    assert events[-1]["outcome"] == "within_threshold"
+    assert _clock_event(events)["outcome"] == "within_threshold"
 
 
 def test_healthy_clock_visit_confirms_only_a_same_session_info_interval(tmp_path: Path) -> None:
@@ -373,7 +401,7 @@ def test_healthy_clock_visit_confirms_only_a_same_session_info_interval(tmp_path
     segments = memberships.segments(store.observation_store.records())
     assert segments.utc_for(100, 1000) == 1000.0
     assert segments.utc_for(110, 1000) is None
-    assert events[-1]["outcome"] == "within_threshold"
+    assert _clock_event(events)["outcome"] == "within_threshold"
 
 
 def test_disconnected_clock_visit_does_not_extend_membership(tmp_path: Path) -> None:
@@ -429,7 +457,7 @@ def test_unsynchronized_host_does_not_reconcile_near_zero_observation() -> None:
     )
 
     assert sink.reconcile_calls == 0
-    assert events[-1]["outcome"] == "host_unsynchronized"
+    assert _clock_event(events)["outcome"] == "host_unsynchronized"
 
 
 def test_drift_writes_then_reads_back_once_in_order() -> None:
@@ -464,10 +492,11 @@ def test_drift_writes_then_reads_back_once_in_order() -> None:
     time_reads = [index for index, uuid in enumerate(session.reads) if uuid == TIME_READ_UUID]
     assert len(time_reads) == 2
     assert time_reads[-1] < session.reads.index(MODEL_UUID)
-    assert events[-1]["outcome"] == "verified"
-    assert events[-1]["target_epoch"] == 1000
-    assert events[-1]["boundary_sequence_min"] == 12
-    assert events[-1]["boundary_sequence_max"] == 14
+    clock_event = _clock_event(events)
+    assert clock_event["outcome"] == "verified"
+    assert clock_event["target_epoch"] == 1000
+    assert clock_event["boundary_sequence_min"] == 12
+    assert clock_event["boundary_sequence_max"] == 14
 
 
 def test_clock_write_confirms_post_readback_same_session_interval(tmp_path: Path) -> None:
@@ -622,7 +651,7 @@ def test_clock_mutation_lease_guards_durable_sync_writes() -> None:
     )
 
     assert entries == ["entered", "exited"]
-    assert events[-1]["outcome"] == "verified"
+    assert _clock_event(events)["outcome"] == "verified"
 
 
 def test_busy_clock_mutation_lease_defers_clock_sync_without_a_session_error() -> None:
@@ -654,7 +683,7 @@ def test_busy_clock_mutation_lease_defers_clock_sync_without_a_session_error() -
     )
 
     assert session.writes == []
-    assert events[-1]["outcome"] == "storage_lease_unavailable"
+    assert _clock_event(events)["outcome"] == "storage_lease_unavailable"
 
 
 def test_verified_zero_width_boundary_is_resolved_immediately() -> None:
@@ -756,7 +785,7 @@ def test_incident_boundaries_use_trusted_near_zero_observation(tmp_path: Path) -
     correction = next(item for item in store.records() if item.operation_id == pending.operation_id)
     assert correction.state == "applied"
     assert correction.boundary_sequence_max == 7861464
-    assert events[-1]["outcome"] == "within_threshold"
+    assert _clock_event(events)["outcome"] == "within_threshold"
     later = next(item for item in store.observation_store.records() if item.observation_role == "later")
     assert later.parent_observation_id == initial.observation_id
     assert later.operation_id == pending.operation_id
@@ -799,7 +828,7 @@ def test_native_clock_handoff_43_to_72_at_incident_frontier(tmp_path: Path) -> N
     assert correction.state == "resolved"
     assert correction.verified_epoch == 72
     assert {"initial", "later"} <= {item.observation_role for item in store.observation_store.records()}
-    assert events[-1]["outcome"] == "verified"
+    assert _clock_event(events)["outcome"] == "verified"
 
 
 def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tmp_path: Path) -> None:
@@ -879,8 +908,8 @@ def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() ->
     _run(session, events, synchronized=False)
 
     assert session.writes == []
-    assert events[0]["rtc_valid"] is True
-    assert events[-1]["outcome"] == "host_unsynchronized"
+    assert _observation_event(events)["rtc_valid"] is True
+    assert _clock_event(events)["outcome"] == "host_unsynchronized"
 
 
 def test_write_and_verification_failures_are_classified_without_retry() -> None:
@@ -893,7 +922,7 @@ def test_write_and_verification_failures_are_classified_without_retry() -> None:
     write_fail = WriteFail({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
     _run(write_fail, write_events)
     assert len(write_fail.writes) == 1
-    assert write_events[-1]["outcome"] == "time_write_failed"
+    assert _clock_event(write_events)["outcome"] == "time_write_failed"
 
     verify_events: list[dict[str, object]] = []
     verify_fail = FakeOperationalSession(
@@ -902,7 +931,7 @@ def test_write_and_verification_failures_are_classified_without_retry() -> None:
     )
     _run(verify_fail, verify_events)
     assert len(verify_fail.writes) == 1
-    assert verify_events[-1]["outcome"] == "verification_failed"
+    assert _clock_event(verify_events)["outcome"] == "verification_failed"
 
 
 def test_verification_failure_keeps_unresolved_boundary_fields_empty(tmp_path: Path) -> None:
@@ -965,7 +994,7 @@ def test_real_clock_store_binds_initial_observation_to_unresolved_intent(tmp_pat
     initial = next(item for item in store.observation_store.records() if item.observation_role == "initial")
     assert correction.state == "unresolved"
     assert initial.operation_id == correction.operation_id
-    assert events[-1]["outcome"] == "verification_failed"
+    assert _clock_event(events)["outcome"] == "verification_failed"
 
 
 def test_successive_same_visit_corrections_get_independent_causal_observations(tmp_path: Path) -> None:
@@ -1105,9 +1134,10 @@ def test_missing_time_write_is_not_reported_as_performed() -> None:
     _run(session, events)
 
     assert len(session.writes) == 1
-    assert events[-1]["action"] == "none"
-    assert events[-1]["outcome"] == "time_write_missing"
-    assert "target_epoch" not in events[-1]
+    clock_event = _clock_event(events)
+    assert clock_event["action"] == "none"
+    assert clock_event["outcome"] == "time_write_missing"
+    assert "target_epoch" not in clock_event
 
 
 def test_optional_characteristic_failures_are_nonblocking() -> None:
@@ -1121,11 +1151,12 @@ def test_optional_characteristic_failures_are_nonblocking() -> None:
     events: list[dict[str, object]] = []
     _run(Failing({}), events)
 
-    assert events[0]["battery_percent"] == 42
-    outcomes = events[0]["optional_outcomes"]
+    observation = _observation_event(events)
+    assert observation["battery_percent"] == 42
+    outcomes = observation["optional_outcomes"]
     assert isinstance(outcomes, dict)
     assert outcomes["device_time"] == "read_failed"
-    assert events[-1]["outcome"] == "device_time_read_failed"
+    assert _clock_event(events)["outcome"] == "device_time_read_failed"
 
 
 def test_hanging_optional_reads_are_short_bounded_and_observation_still_emits() -> None:
@@ -1148,14 +1179,15 @@ def test_hanging_optional_reads_are_short_bounded_and_observation_still_emits() 
         )
     )
 
-    assert events[0]["battery_percent"] == 42
-    outcomes = events[0]["optional_outcomes"]
+    observation = _observation_event(events)
+    assert observation["battery_percent"] == 42
+    outcomes = observation["optional_outcomes"]
     assert isinstance(outcomes, dict)
     assert outcomes["model"] == "timeout"
     assert outcomes["device_time"] == "timeout"
 
 
-def test_hanging_host_clock_probe_uses_operation_timeout() -> None:
+def test_hanging_host_clock_probe_uses_configured_host_timeout() -> None:
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
     events: list[dict[str, object]] = []
 
@@ -1172,14 +1204,76 @@ def test_hanging_host_clock_probe_uses_operation_timeout() -> None:
             _event_emitter(events),
             clock=TelemetryClock(
                 synchronized=hanging_probe,
-                operation_timeout=0.01,
-                host_clock_probe_timeout=1.0,
+                operation_timeout=0.1,
+                host_clock_probe_timeout=0.02,
             ),
         )
     )
 
     assert time.monotonic() - started < 0.1
-    assert events[-1]["outcome"] == "host_unsynchronized"
+    assert _clock_event(events)["outcome"] == "host_probe_timeout"
+
+
+def test_slow_host_probe_and_large_ledger_finish_clock_stage_before_metadata(tmp_path: Path) -> None:
+    correction_root = tmp_path / "clock-corrections"
+    correction_root.mkdir()
+    for index in range(100):
+        correction = ClockCorrection(2, f"history-{index:03}", "not_written", 100, 100, 0.0, index)
+        (correction_root / f"{correction.operation_id}.json").write_text(
+            json.dumps(asdict(correction), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+    store = ClockCorrectionStore(tmp_path / "device.json")
+
+    class SlowMetadata(FakeOperationalSession):
+        async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+            if uuid == MODEL_UUID:
+                trace.append("metadata")
+                await asyncio.sleep(0.05)
+            return await super().read_optional_characteristic(uuid)
+
+    session = SlowMetadata(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 100)},
+        readback=pack("<I", 1000),
+    )
+    events: list[dict[str, object]] = []
+    trace: list[str] = []
+
+    def delayed_host_probe() -> bool:
+        time.sleep(0.65)
+        return True
+
+    async def later_info() -> RingInfo:
+        await asyncio.sleep(0.05)
+        return RingInfo(10, 13, 100, 2, RECORD_SIZE)
+
+    def emit(event: Mapping[str, object]) -> None:
+        if event.get("event") == "pendant_clock_sync":
+            trace.append("clock_event")
+        events.append(dict(event))
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            emit,
+            clock=TelemetryClock(
+                now=lambda: 1000.0,
+                synchronized=delayed_host_probe,
+                operation_timeout=0.5,
+                host_clock_probe_timeout=1.0,
+                info_reader=later_info,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+            ),
+        )
+    )
+
+    correction = next(item for item in store.records() if item.boundary_sequence_min == 12)
+    assert len(store.records()) == 101
+    assert correction.state == "applied"
+    assert _clock_event(events)["outcome"] == "verified"
+    assert trace.index("clock_event") < trace.index("metadata")
 
 
 def test_presence_telemetry_reuses_first_info_without_duplicate_info_read(tmp_path: Path) -> None:
@@ -1207,5 +1301,6 @@ def test_presence_telemetry_reuses_first_info_without_duplicate_info_read(tmp_pa
     )
 
     assert session.writes == [b"\x10"]
-    assert events[0]["read_sequence"] == 10
-    assert events[0]["write_sequence"] == 10
+    observation = _observation_event(events)
+    assert observation["read_sequence"] == 10
+    assert observation["write_sequence"] == 10

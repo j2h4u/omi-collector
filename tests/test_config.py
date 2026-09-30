@@ -34,6 +34,7 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.presence.scan_transition_seconds == 2.0
     assert DEFAULT_CONFIG.retry.rapid_backoff == (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
     assert DEFAULT_CONFIG.retry.storage_not_ready_backoff == (1.0, 2.0, 5.0)
+    assert DEFAULT_CONFIG.retry.presence_preflight_budget_seconds == 10.0
     assert DEFAULT_CONFIG.transfer.collect_timeout_seconds == 600.0
     assert DEFAULT_CONFIG.memory.arena_max_bytes == 512 * 1024 * 1024
     assert DEFAULT_CONFIG.durability.checkpoint_records == 1024

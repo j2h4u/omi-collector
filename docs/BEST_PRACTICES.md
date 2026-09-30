@@ -39,6 +39,10 @@ Serialize attempts per pendant and stop this collector's scanner before GATT
 work. Explicit probe, info, and confirmed collect commands remain direct
 operator paths.
 
+Keep the connected-session preflight budget long enough for the bounded host
+clock trust probe, clock ledger reconciliation, and optional BLE observations.
+The default is 10 seconds; an explicitly shorter budget still takes priority.
+
 Before `READ`, admit enough disk space for the bounded batch and ensure staging
 metadata is durable. Write record bytes and checkpoints with `fsync`; publish a
 sealed bundle with an atomic rename. On restart, accept only one authenticated

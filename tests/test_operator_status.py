@@ -232,13 +232,13 @@ def test_status_preserves_lock_context_from_session_error(monkeypatch: pytest.Mo
     assert error["lock_context"] == context
 
 
-def test_status_clears_ready_publication_block_after_successful_finalization(
+def test_status_clears_ready_publication_block_after_successful_noop_recovery(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
     rows = (
         {"event": "ready_publication_blocked", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
-        {"event": "ready_publication_published", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
+        {"event": "ready_publication_recovered", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
     )
     layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())

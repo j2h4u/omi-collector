@@ -320,7 +320,7 @@ def _update_runtime_attention(attention: dict[str, bool], row: dict[str, object]
         attention["quality_metrics_unavailable"] = False
     elif event == "ready_publication_blocked":
         attention["ready_publication_blocked"] = True
-    elif event == "ready_publication_published":
+    elif event in {"ready_publication_published", "ready_publication_recovered"}:
         attention["ready_publication_blocked"] = False
     if event != "sync_progress":
         return

@@ -78,6 +78,8 @@ class _StagingWriterAdapter:
             result = self._writer.publish_ready()
             if result is not None:
                 debug_event("ready_publication_published")
+            else:
+                debug_event("ready_publication_recovered")
         except Exception as error:  # noqa: BLE001 - capture remains authoritative while publication waits
             self._notify_publication_failure()
             debug_exception("ready_publication_blocked", error)

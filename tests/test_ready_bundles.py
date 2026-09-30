@@ -79,6 +79,39 @@ def test_contiguous_drafts_publish_on_captured_audio_target_and_keep_remainder(t
     assert remainder.exists()
 
 
+def test_closed_frontier_publishes_all_eligible_contiguous_drafts_and_keeps_future_drafts(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    first = _audio_draft(draft_root, sequence=10)
+    second = _audio_draft(draft_root, sequence=11)
+    future = _audio_draft(draft_root, sequence=12)
+
+    result = _finalize_drafts(
+        draft_root,
+        tmp_path / "ready",
+        tmp_path / "ledger.json",
+        ClockSegmentMap(()),
+        config=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=0.01),
+        frontier=12,
+    )
+
+    assert [(item.next_sequence - item.record_count, item.next_sequence) for item in result] == [(10, 12)]
+    assert not first.exists() and not second.exists()
+    assert future.exists()
+
+
+def test_closed_frontier_does_not_cleanup_replay_overlap_from_a_future_draft(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    _audio_draft(draft_root, sequence=10)
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "ledger.json"
+    _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()), frontier=11)
+    future = _audio_draft(draft_root, sequence=10)
+
+    _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()), frontier=10)
+
+    assert future.exists()
+
+
 def test_sequence_gap_splits_subtarget_drafts(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     first = _audio_draft(draft_root, sequence=10)

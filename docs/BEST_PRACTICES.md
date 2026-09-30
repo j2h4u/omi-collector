@@ -72,10 +72,11 @@ reviewed release as:
 sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
 ```
 
-The configuration is strict and contains `[pendant] address` and required
-`[ready]` sections, plus optional `[presence]`. `[ready]` accepts exactly
-`target_audio_seconds` and `max_wait_seconds`; maintenance publishes stale
-subtarget drafts even while the pendant is away.
+The configuration is strict and contains `[pendant] address`, plus optional
+`[presence]` and backwards-compatible `[ready]` sections. `[ready]` accepts
+exactly `target_audio_seconds` and `max_wait_seconds`; those legacy values do
+not trigger publication. Ready bundles are published after a durable physical
+visit closure, including closures recovered after restart.
 Its fixed parent `/srv/pipelines/omi` is the storage root; `collector`,
 `draft`, and `ready` are derived beneath it. The base unit grants the
 service write access to that root. Use filesystem ownership or ACLs on the

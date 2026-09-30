@@ -364,7 +364,7 @@ class ServiceConfig:
 
 @dataclass(frozen=True, slots=True)
 class ReadyConfig:
-    """Captured-audio batching limits for immutable ready bundles."""
+    """Legacy ready knobs retained for configuration compatibility."""
 
     target_audio_seconds: float = 3600.0
     max_wait_seconds: float = 86400.0

@@ -19,7 +19,7 @@ from .ports import (
     RecoveryShape,
     StagingPort,
 )
-from .presence import PresenceWake
+from .presence import PresenceEnd, PresenceWake
 from .session_lifecycle import (
     ActivityCallback,
     OpportunisticSyncError,
@@ -30,7 +30,7 @@ from .session_lifecycle import (
 class PresenceWaiterPort(Protocol):
     """The maintenance race owns only permit acquisition and fail-closed close."""
 
-    async def wait_for_attempt(self) -> PresenceWake: ...
+    async def wait_for_attempt(self) -> PresenceWake | PresenceEnd: ...
 
     async def close(self) -> None: ...
 
@@ -78,6 +78,16 @@ class QuarantineMaintenance:
 
         await self._recover_and_publish()
 
+        # A prefix marker is non-blocking only while its canonical draft is
+        # present. Recreate and terminalize it before asking the normal
+        # pending-attempt query whether an ordinary partial remains.
+        await asyncio.to_thread(
+            self._staging.close_pending_prefix,
+            "restart_interrupted",
+            include_unpublished=False,
+        )
+        await self._recover_and_publish()
+
         try:
             pending = await self._pending_descriptor()
         except OpportunisticSyncError as error:
@@ -90,6 +100,8 @@ class QuarantineMaintenance:
             pending = None
         if pending is None:
             state = PendingStartupState(None, None)
+            await asyncio.to_thread(self._staging.close_orphaned_drafts, "restart_interrupted")
+            await self._recover_and_publish()
         else:
             try:
                 durable_next = await self._validate_pending_evidence(pending)
@@ -243,7 +255,7 @@ class QuarantineMaintenance:
         self,
         presence: PresenceWaiterPort,
         bind_startup_state: Callable[[PendingStartupState], None],
-    ) -> PresenceWake:
+    ) -> PresenceWake | PresenceEnd:
         """Race scanning with maintenance while joining both scoped tasks.
 
         Startup inspection, validation, quarantine, and state binding are never

@@ -19,7 +19,7 @@ from . import collector
 from .batch_reconciliation import BatchReconciler
 from .operational_telemetry import OperationalEmitter
 from .ports import CaptureRuntimePort, ObservationWriterPort, PublicationAuthorityPort, StagingPort
-from .presence import PresenceWake
+from .presence import PresenceEnd, PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
 from .session_lifecycle import (
     OpportunisticOptions,
@@ -181,7 +181,7 @@ def _validate_composition(staging: object, runtime: object) -> None:
 def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLifecycle:
     """Bind coordinator-owned decisions to one physical-session lifecycle."""
 
-    async def wait_presence_attempt() -> PresenceWake:
+    async def wait_presence_attempt() -> PresenceWake | PresenceEnd:
         presence = run.options.presence
         assert presence is not None
         return await run.maintenance.wait_for_presence_attempt(
@@ -198,6 +198,10 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
     async def post_session_checkpoint() -> None:
         await reconciler.checkpoint_after_session()
 
+    async def close_visit(reason: str) -> None:
+        await reconciler.close_visit(reason)
+        await run.maintenance.ensure_publication_ready()
+
     async def before_direct_attempt() -> None:
         await run.maintenance.ensure_publication_ready()
         await run.maintenance.run_once(lambda: False)
@@ -208,8 +212,11 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         connected_step=reconciler.connected_step,
         post_session_checkpoint=post_session_checkpoint,
         completed_batch_query=lambda: reconciler.completed_batches,
+        durable_progress_query=reconciler.durable_progress,
         drained_result=reconciler.drained_result,
         observe_info=observe_info,
+        close_visit=close_visit,
+        close_interrupted_visit=close_visit,
     )
     return SessionLifecycle(SessionLifecycleRun(run.provider, run.options, run.runtime, callbacks))
 

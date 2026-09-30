@@ -29,7 +29,7 @@ from .operational_telemetry import (
     system_host_clock_synchronized,
 )
 from .ports import CaptureRuntimePort, ClockMembershipPort, PublicationAuthorityPort, StorageLeaseFactory
-from .presence import PresencePolicy, PresenceWake
+from .presence import PresenceEnd, PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
     AdvertisementMetric,
@@ -74,9 +74,9 @@ class PresenceSchedulerPort(Protocol):
     @property
     def drained_cooldown_remaining_seconds(self) -> float: ...
 
-    async def wait_for_attempt(self) -> PresenceWake: ...
+    async def wait_for_attempt(self) -> PresenceWake | PresenceEnd: ...
 
-    async def attempt_finished(self, outcome: AttemptOutcome) -> None: ...
+    async def attempt_finished(self, outcome: AttemptOutcome) -> PresenceEnd | None: ...
 
     async def close(self) -> None: ...
 
@@ -144,12 +144,15 @@ class SessionLifecycleCallbacks:
     """Coordinator closures used by the physical-session lifecycle."""
 
     before_direct_attempt: Callable[[], Awaitable[None]]
-    wait_presence_attempt: Callable[[], Awaitable[PresenceWake]]
+    wait_presence_attempt: Callable[[], Awaitable[PresenceWake | PresenceEnd]]
     connected_step: ConnectedStep
     post_session_checkpoint: Callable[[], Awaitable[None]]
     completed_batch_query: Callable[[], int]
     drained_result: Callable[[], collector.CollectResult]
     observe_info: Callable[[RingInfo], object] | None = None
+    durable_progress_query: Callable[[], int] | None = None
+    close_visit: Callable[[str], Awaitable[None]] | None = None
+    close_interrupted_visit: Callable[[str], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +186,7 @@ class SessionLifecycle:
             if context is not None:
                 outcome = await self.run_session(context)
             if outcome == "drained":
+                await self._close_visit("drained")
                 retry = 0
                 await report_activity(self.run.options.activity, "drained")
                 if self.run.options.policy.stop_after_drained:
@@ -195,6 +199,7 @@ class SessionLifecycle:
                 await sleep(self.run.options.sleep, self.run.options.policy.drain_cooldown_seconds)
                 continue
             if outcome == "collected":
+                await self._close_visit("drained")
                 return self.run.callbacks.drained_result()
             if self.run.callbacks.completed_batch_query() > completed_before:
                 retry = 0
@@ -203,12 +208,17 @@ class SessionLifecycle:
             await report_activity(self.run.options.activity, "away", delay)
             await sleep(self.run.options.sleep, delay)
 
-    async def run_with_presence(self) -> collector.CollectResult:
+    async def run_with_presence(self) -> collector.CollectResult:  # noqa: C901, PLR0912 - lifecycle ordering is explicit
         presence = self.run.options.presence
         assert presence is not None
         try:
             while True:
                 wake = await self.run.callbacks.wait_presence_attempt()
+                if isinstance(wake, PresenceEnd):
+                    await self._close_interrupted_visit(wake.reason)
+                    if self.run.options.policy.stop_after_drained:
+                        return self.run.callbacks.drained_result()
+                    continue
                 outcome_submitted = False
                 try:
                     if (
@@ -216,22 +226,37 @@ class SessionLifecycle:
                         or self.run.options.clock()
                         >= wake.observed_at + self.run.options.config.presence.arrival_max_gap_seconds
                     ):
-                        await presence.attempt_finished(CandidateUnavailable())
+                        end = await presence.attempt_finished(CandidateUnavailable())
                         outcome_submitted = True
+                        if end is not None:
+                            await self._close_interrupted_visit(end.reason)
+                            if self.run.options.policy.stop_after_drained:
+                                return self.run.callbacks.drained_result()
+                            continue
                         continue
                     completed_before = self.run.callbacks.completed_batch_query()
+                    progress_before = self._durable_progress()
                     context, outcome = await self._open_context(wake.candidate)
                     if context is not None:
                         outcome = await self.run_session(context, wake.advertisement_rssi_dbm)
-                    durable_progress = self.run.callbacks.completed_batch_query() > completed_before
+                    durable_progress = (
+                        self.run.callbacks.completed_batch_query() > completed_before
+                        or self._durable_progress() > progress_before
+                    )
                     attempt_outcome = presence_attempt_outcome(outcome, durable_progress)
-                    await presence.attempt_finished(attempt_outcome)
+                    end = await presence.attempt_finished(attempt_outcome)
                     outcome_submitted = True
                 except BaseException:
                     if not outcome_submitted:
                         await presence.close()
                     raise
+                if end is not None:
+                    await self._close_interrupted_visit(end.reason)
+                    if self.run.options.policy.stop_after_drained:
+                        return self.run.callbacks.drained_result()
+                    continue
                 if isinstance(attempt_outcome, CleanDrain):
+                    await self._close_visit("drained")
                     if outcome == "drained":
                         await report_activity(self.run.options.activity, "drained")
                         if self.run.options.policy.stop_after_drained:
@@ -248,6 +273,20 @@ class SessionLifecycle:
                 await report_activity(self.run.options.activity, "away")
         finally:
             await presence.close()
+
+    async def _close_visit(self, reason: str) -> None:
+        callback = self.run.callbacks.close_visit
+        if callback is not None:
+            await callback(reason)
+
+    def _durable_progress(self) -> int:
+        query = self.run.callbacks.durable_progress_query
+        return query() if query is not None else 0
+
+    async def _close_interrupted_visit(self, reason: str) -> None:
+        callback = self.run.callbacks.close_interrupted_visit or self.run.callbacks.close_visit
+        if callback is not None:
+            await callback(reason)
 
     async def _open_context(
         self, candidate: object | None

@@ -187,6 +187,26 @@ def test_pending_startup_establishes_aligned_tail_under_a_lease_before_binding(t
     assert (attempt.path / "records.bin").read_bytes() == raw
 
 
+def test_pending_startup_replays_unterminalized_prefix_without_device(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _seed_streaming_partial(store, count=2)
+    attempt = store.open_attempt(next((tmp_path / "attempts").iterdir()).name)
+    with store.device_lock() as lease:
+        attempt.activate_for_resume(lease)
+        publication = attempt.publish_prefix()
+        assert publication is not None
+        attempt.close(durable=True)
+    publication.bundle_path.rename(tmp_path / "interrupted-ready")
+
+    state = cast(
+        PendingStartupState, _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup())
+    )
+
+    assert state == PendingStartupState(None, None)
+    assert (attempt.path / "terminal-retired.json").is_file()
+    assert store.ready_closures_path.is_file()
+
+
 def test_presence_startup_state_binds_once_after_a_completed_attempt(tmp_path: Path) -> None:
     async def scenario() -> None:
         class Presence:

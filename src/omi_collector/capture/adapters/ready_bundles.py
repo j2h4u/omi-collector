@@ -84,13 +84,14 @@ _WINDMILL_CHECKPOINT_FIELDS = frozenset({"analysis_cursor", "vad_decisions", "op
 _WINDMILL_TAIL_FIELDS = frozenset({"entries", "opened_at", "outputs"})
 
 
-def finalize_drafts(
+def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publication boundary stay visible
     draft_root: Path,
     ready_root: Path,
     ledger_path: Path,
     clock_segments: ClockSegmentMap,
     *,
     config: ReadyConfig,
+    frontier: int | None = None,
 ) -> tuple[ReadyBundleResult, ...]:
     """Publish every authenticated draft once, then remove its raw source.
 
@@ -108,19 +109,43 @@ def finalize_drafts(
     ready = _ready_sources(ready_root)
     eligible: list[_Draft] = []
     for draft in drafts:
+        if frontier is not None and draft.manifest.next_sequence > frontier:
+            continue
         source = _unique_suffix(draft, ready)
         if source is None:
             _remove_draft(draft.path)
         else:
             eligible.append(source)
-    for group in _draft_groups(tuple(eligible), config.target_audio_seconds, config.max_wait_seconds):
+    for group in _draft_groups(
+        tuple(eligible),
+        config.target_audio_seconds,
+        config.max_wait_seconds,
+        close_frontier=frontier is not None,
+    ):
         result = _finalize_group(group, finalization)
         if result is not None:
             results.append(result)
     return tuple(results)
 
 
-def _draft_groups(drafts: tuple[_Draft, ...], target: float, max_wait: float) -> tuple[_DraftGroup, ...]:
+def has_drafts_at_or_below(draft_root: Path, frontier: int) -> bool:
+    """Return whether a closed frontier still owns an authenticated draft."""
+    if not draft_root.exists():
+        return False
+    return any(draft.manifest.next_sequence <= frontier for draft in _drafts(draft_root))
+
+
+def draft_frontier(draft_root: Path) -> int | None:
+    """Return the highest authenticated draft boundary, if any."""
+    if not draft_root.exists():
+        return None
+    drafts = _drafts(draft_root)
+    return max((draft.manifest.next_sequence for draft in drafts), default=None)
+
+
+def _draft_groups(
+    drafts: tuple[_Draft, ...], target: float, max_wait: float, *, close_frontier: bool = False
+) -> tuple[_DraftGroup, ...]:
     groups: list[_DraftGroup] = []
     segment: list[_Draft] = []
     packets = 0
@@ -128,14 +153,14 @@ def _draft_groups(drafts: tuple[_Draft, ...], target: float, max_wait: float) ->
 
     def flush_if_target() -> None:
         nonlocal packets
-        if segment and (target_packets == 0 or packets >= target_packets):
+        if not close_frontier and segment and (target_packets == 0 or packets >= target_packets):
             groups.append(_make_group(tuple(segment)))
             segment.clear()
             packets = 0
 
     def flush_if_stale() -> None:
         nonlocal packets
-        if segment:
+        if not close_frontier and segment:
             oldest = min((draft.path / _MANIFEST_NAME).stat().st_mtime for draft in segment)
             if time() - oldest >= max_wait:
                 groups.append(_make_group(tuple(segment)))
@@ -151,6 +176,8 @@ def _draft_groups(drafts: tuple[_Draft, ...], target: float, max_wait: float) ->
         if target_packets > 0:
             packets += _draft_audio_packets(draft)
         flush_if_target()
+    if close_frontier and segment:
+        groups.append(_make_group(tuple(segment)))
     flush_if_stale()
     return tuple(groups)
 

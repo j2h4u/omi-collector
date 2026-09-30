@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/j2h4u/omi-collector/compare/v0.9.1...v0.9.2) (2026-09-30)
+
+
+### Fixes
+
+* **clock:** recover automatic corrections and preserve audio order ([#150](https://github.com/j2h4u/omi-collector/issues/150)) ([69f70b3](https://github.com/j2h4u/omi-collector/commit/69f70b392f3fa2ae26c127965e88bd71c55a8697))
+
 ## [0.9.1](https://github.com/j2h4u/omi-collector/compare/v0.9.0...v0.9.1) (2026-09-30)
 
 

@@ -24,7 +24,12 @@ from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStor
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError, DurablePrefix, LockContext
+from omi_collector.capture.adapters.staging_contract import (
+    AttemptDescriptor,
+    DeviceAlreadyRunningError,
+    DurablePrefix,
+    LockContext,
+)
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application import batch_reconciliation
@@ -2929,6 +2934,41 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
     with pytest.raises(OSError) as raised:
         await reconciler.checkpoint_after_session()
     assert raised.value is latched
+
+
+def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) -> None:
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    reconciler = BatchReconciler(
+        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _options(),
+        _runtime(),
+        quarantine,
+    )
+    descriptor = AttemptDescriptor("a" * 32, 2, 100, 2)
+    reconciler.set_startup_state(descriptor, 100)
+    assert reconciler.durable_progress() == 0
+    reconciler.set_startup_state(descriptor, 101)
+    assert reconciler.durable_progress() == 101
+
+    empty_reconciler = BatchReconciler(
+        StagingStore(tmp_path / "empty", _capture_root(tmp_path / "empty")),
+        _options(),
+        _runtime(),
+        quarantine,
+    )
+    empty_reconciler._state.batch = batch_reconciliation._Batch(
+        RingInfo(100, 100, 10000, 0, RECORD_SIZE),
+        100,
+        100,
+        TransferArena(100, 1, max_bytes=RECORD_SIZE),
+        cast(BatchWriterPort, object()),
+        DurablePrefix(100, 100, 0, "a" * 64),
+    )
+    assert empty_reconciler.durable_progress() == 0
+    empty_reconciler._state.batch.durable = DurablePrefix(100, 101, 1, "b" * 64)
+    assert empty_reconciler.durable_progress() == 101
 
 
 @_async_test

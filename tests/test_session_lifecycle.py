@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from typing import Never, cast
 
 import pytest
@@ -110,6 +110,157 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
 
     _run(scenario())
     assert events == ["connected", "teardown", "checkpoint"]
+
+
+def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    info = RingInfo(10, 12, 100, 1, 512)
+    order: list[str] = []
+    observations: list[dict[str, object]] = []
+
+    class Session:
+        async def read_status(self) -> None:
+            return None
+
+        async def read_optional_characteristic(self, _uuid: str) -> bytes:
+            order.append("battery")
+            return bytes((74,))
+
+    session = Session()
+
+    class Context:
+        async def __aenter__(self) -> RingSession:
+            return cast(RingSession, session)
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            order.append("disconnect")
+
+    async def connected_step(
+        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        order.append("drained")
+        return "drained", current
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    async def telemetry(
+        _session: object,
+        _status: object,
+        _info: RingInfo,
+        emit: Callable[[Mapping[str, object]], object],
+        *,
+        clock: TelemetryClock,
+    ) -> None:
+        del clock
+        emit({"event": "pendant_observation", "firmware": "3.0.21", "battery_percent": 68})
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    options = OpportunisticOptions(
+        TransferTimeouts(1, 1),
+        RetryPolicy(backoff=(1,), stop_after_drained=True),
+        operational=lambda event: observations.append(dict(event)),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: Context(),
+        options=options,
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+
+    async def scenario() -> None:
+        monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+        monkeypatch.setattr(
+            "omi_collector.capture.application.session_lifecycle.collect_operational_telemetry", telemetry
+        )
+        await SessionLifecycle(run).run_session(Context())
+
+    _run(scenario())
+
+    assert order == ["drained", "battery", "disconnect"]
+    assert observations[0]["firmware"] == "3.0.21"
+    assert observations[-1] == {
+        "event": "pendant_observation",
+        "firmware": "3.0.21",
+        "battery_percent": 74,
+        "read_sequence": 10,
+        "write_sequence": 12,
+        "capacity_packets": 100,
+        "dropped_packets": 1,
+        "packet_size": 512,
+        "optional_outcomes": {"battery": "ok"},
+    }
+
+
+def test_battery_refresh_failure_does_not_interrupt_successful_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    info = RingInfo(10, 12, 100, 0, 512)
+    order: list[str] = []
+
+    class Session:
+        async def read_status(self) -> None:
+            return None
+
+        async def read_optional_characteristic(self, _uuid: str) -> bytes:
+            order.append("battery")
+            raise OSError("battery unavailable")
+
+    class Context:
+        async def __aenter__(self) -> RingSession:
+            return cast(RingSession, Session())
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            order.append("disconnect")
+
+    async def connected_step(
+        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        order.append("drained")
+        return "drained", current
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    async def telemetry(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    options = OpportunisticOptions(
+        TransferTimeouts(1, 1),
+        RetryPolicy(backoff=(1,), stop_after_drained=True),
+        operational=lambda _event: None,
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: Context(),
+        options=options,
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+
+    async def scenario() -> None:
+        monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+        monkeypatch.setattr(
+            "omi_collector.capture.application.session_lifecycle.collect_operational_telemetry", telemetry
+        )
+        result = await SessionLifecycle(run).run_session(Context())
+        assert result == "drained"
+
+    _run(scenario())
+    assert order == ["drained", "battery", "disconnect"]
 
 
 def test_clock_transport_fence_requires_error_free_context_close(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -200,6 +200,32 @@ async def collect_operational_telemetry(
         await _emit_safe(emit, event, telemetry_clock.operation_timeout)
 
 
+async def collect_battery_observation(
+    session: object,
+    info: RingInfo,
+    emit: OperationalEmitter,
+    *,
+    operation_timeout: float,
+) -> None:
+    """Emit one bounded battery refresh without repeating connection telemetry."""
+    if operation_timeout <= 0:
+        raise ValueError("optional operation timeout must be positive")
+    reader, _ = _optional_accessors(session)
+    battery, outcome = await _read_battery(reader, operation_timeout)
+    observation: dict[str, object] = {
+        "event": "pendant_observation",
+        "read_sequence": info.read_sequence,
+        "write_sequence": info.write_sequence,
+        "capacity_packets": info.capacity_packets,
+        "dropped_packets": info.dropped_packets,
+        "packet_size": info.packet_size,
+        "optional_outcomes": {"battery": outcome},
+    }
+    if battery is not None:
+        observation["battery_percent"] = battery
+    await _emit_safe(emit, observation, operation_timeout)
+
+
 async def _build_observation(  # noqa: PLR0913, PLR0917 - operation inputs mirror the typed clock seam
     reader: OptionalReader | None,
     status: RingStatus | None,

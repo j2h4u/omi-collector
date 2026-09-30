@@ -10,7 +10,7 @@ from typing import Never, cast
 import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.application.collector import NoDataResult, TransferTimeouts
+from omi_collector.capture.application.collector import CollectorTimeoutError, NoDataResult, TransferTimeouts
 from omi_collector.capture.application.operational_telemetry import ClockCorrectionSink, TelemetryClock
 from omi_collector.capture.application.ports import CaptureRuntimePort
 from omi_collector.capture.application.presence import (
@@ -111,6 +111,110 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
 
     _run(scenario())
     assert events == ["connected", "teardown", "checkpoint"]
+
+
+def test_missing_preflight_acknowledgement_blocks_read_and_still_tears_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    info = RingInfo(10, 10, 100, 0, 512)
+
+    class Context:
+        async def __aenter__(self) -> RingSession:
+            return cast(RingSession, object())
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            events.append("teardown")
+
+    async def connected_step(
+        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        events.append("read")
+        return "drained", current
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    async def omitted_preflight(*_args: object) -> None:
+        return None
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=lambda: _noop(),
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: Context(),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(backoff=(1,))),
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+
+    async def scenario() -> None:
+        monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+        monkeypatch.setattr(SessionLifecycle, "_collect_telemetry", omitted_preflight)
+        with pytest.raises(RuntimeError, match="unsupported preflight result"):
+            await SessionLifecycle(run).run_session(Context())
+
+    _run(scenario())
+    assert events == ["teardown"]
+
+
+def test_retryable_read_failure_is_torn_down_and_checkpoints_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    info = RingInfo(10, 10, 100, 0, 512)
+
+    class Session:
+        async def write_control(self, _command: bytes) -> None:
+            return None
+
+    class Context:
+        async def __aenter__(self) -> RingSession:
+            return cast(RingSession, Session())
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            events.append("teardown")
+
+    async def connected_step(
+        _session: RingSession, _current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        events.append("read")
+        raise CollectorTimeoutError("read timed out")
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    async def checkpoint() -> None:
+        events.append("checkpoint")
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=checkpoint,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: Context(),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(backoff=(1,))),
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+
+    async def scenario() -> None:
+        monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+        assert await SessionLifecycle(run).run_session(Context()) == "connected_interrupted"
+
+    _run(scenario())
+    assert events == ["read", "teardown", "checkpoint"]
 
 
 def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import fields
+from itertools import product
+from types import UnionType
+from typing import cast
+
 import pytest
 
 from omi_collector.capture.application.presence_machine import (
@@ -19,6 +24,7 @@ from omi_collector.capture.application.presence_machine import (
     Observe,
     PresenceEvent,
     PresenceMachinePolicy,
+    PresenceState,
     RapidRetryTrigger,
     ResumeInterruptedVisit,
     RetryWaiting,
@@ -31,6 +37,7 @@ from omi_collector.capture.application.presence_machine import (
     UnexpectedAttemptOutcomeError,
     armed_deadline,
     drained_cooldown_remaining_seconds,
+    initial_state,
     transition,
 )
 
@@ -437,3 +444,171 @@ def test_closed_absorbs_every_event_class(event: PresenceEvent) -> None:
     result = transition(Closed(), event, POLICY)
 
     assert result == type(result)(Closed(), NoOperation())
+
+
+def test_finite_model_is_exhaustive_reachable_and_rejects_invalid_outcomes() -> None:
+    states = _model_states()
+    events = _model_events(states)
+    assert {type(state) for state in states} == _type_alias_members(cast(object, PresenceState.__value__))
+    assert {type(event) for event in events} == _type_alias_members(cast(object, PresenceEvent.__value__))
+    assert (len(states), len(events)) == (10, 37)
+    assert len(states) == len(set(states))
+    assert len(events) == len(set(events))
+    assert {type(event.outcome) for event in events if isinstance(event, AttemptFinished)} == {
+        CleanDrain,
+        NotConnected,
+        ConnectedInterruption,
+        CandidateUnavailable,
+    }
+    assert {
+        event.outcome.durable_progress
+        for event in events
+        if isinstance(event, AttemptFinished) and isinstance(event.outcome, (NotConnected, ConnectedInterruption))
+    } == {False, True}
+    assert {event.processed_at for event in events if isinstance(event, AdvertisementObserved)} == {
+        None,
+        1.0,
+        0.0,
+        11.0,
+        6.0,
+    }
+    assert tuple(field.name for field in fields(TimerFired)) == ("at", "deadline", "timer_epoch")
+
+    rejected = 0
+    # Exercise every representative state/event pair, including invalid outcomes.
+    for state, event in product(states, events):
+        should_reject = isinstance(event, AttemptFinished) and not isinstance(state, (Attempting, Closed))
+        try:
+            result = transition(state, event, POLICY)
+        except UnexpectedAttemptOutcomeError as error:
+            assert should_reject
+            assert error.closed_state == Closed()
+            assert error.directive == Stop()
+            rejected += 1
+            continue
+        assert not should_reject
+        assert isinstance(result.state, (Searching, CoolingDown, RetryWaiting, Attempting, Closed))
+        assert isinstance(result.directive, (Observe, StopAndBeginAttempt, Stop, NoOperation, EndVisit))
+        if isinstance(state, Attempting) and not isinstance(event, (AttemptFinished, Shutdown, ResumeInterruptedVisit)):
+            assert result == type(result)(state, NoOperation())
+        if isinstance(state, Closed):
+            assert result == type(result)(state, NoOperation())
+
+    assert rejected == sum(1 for state in states if not isinstance(state, (Attempting, Closed))) * sum(
+        1 for event in events if isinstance(event, AttemptFinished)
+    )
+    _assert_reachable_state_types()
+
+
+def _model_states() -> tuple[PresenceState, ...]:
+    advertisement = _advertisement(1.0)
+    search = Searching(0, 100.0)
+    cooled = CoolingDown(1, 20.0, 100.0, None)
+    retry = RetryWaiting(2, 10.0, 100.0, 0, advertisement, 1.0, 50.0)
+    return (
+        search,
+        Searching(1, 100.0, advertisement, 1.0),
+        cooled,
+        CoolingDown(2, 20.0, 100.0, advertisement, 1.0),
+        RetryWaiting(3, None, 100.0, 0, None),
+        retry,
+        RetryWaiting(4, 10.0, 100.0, len(POLICY.rapid_backoff), None, None, 50.0),
+        Attempting(AdvertisementTrigger(advertisement), search),
+        Attempting(RapidRetryTrigger(advertisement), retry),
+        Closed(),
+    )
+
+
+def _model_events(states: tuple[PresenceState, ...]) -> tuple[PresenceEvent, ...]:
+    events: list[PresenceEvent] = [
+        AdvertisementObserved(_advertisement(1.0)),
+        AdvertisementObserved(_advertisement(1.0), processed_at=1.0),
+        AdvertisementObserved(_advertisement(1.0), processed_at=0.0),
+        AdvertisementObserved(_advertisement(1.0), processed_at=11.0),
+        AdvertisementObserved(_advertisement(1.0), processed_at=6.0),
+        AdvertisementObserved(_advertisement(6.0)),
+        AdvertisementObserved(_advertisement(6.0), processed_at=6.0),
+        ScannerInterrupted(1.0),
+        ResumeInterruptedVisit(20.0),
+        AttemptFinished(10.0, CleanDrain()),
+        AttemptFinished(10.0, NotConnected(False)),
+        AttemptFinished(10.0, NotConnected(True)),
+        AttemptFinished(10.0, ConnectedInterruption(False)),
+        AttemptFinished(10.0, ConnectedInterruption(True)),
+        AttemptFinished(10.0, CandidateUnavailable()),
+        Shutdown(20.0),
+    ]
+    for state in states:
+        if isinstance(state, (Searching, CoolingDown, RetryWaiting)):
+            deadline = armed_deadline(state)
+            events.extend(
+                (
+                    TimerFired(deadline, deadline, state.timer_epoch),
+                    TimerFired(deadline, deadline, state.timer_epoch + 1),
+                    TimerFired(deadline, deadline - 1.0, state.timer_epoch),
+                    TimerFired(deadline - 1.0, deadline, state.timer_epoch),
+                )
+            )
+    return tuple(dict.fromkeys(events))
+
+
+def _assert_reachable_state_types() -> None:
+    initial = initial_state(0.0, POLICY)
+    observed = transition(initial, AdvertisementObserved(_advertisement(1.0)), POLICY).state
+    attempting = transition(observed, AdvertisementObserved(_advertisement(6.0)), POLICY).state
+    assert isinstance(attempting, Attempting)
+    drained = transition(attempting, AttemptFinished(6.0, CleanDrain()), POLICY).state
+    interrupted = transition(attempting, AttemptFinished(6.0, ConnectedInterruption(False)), POLICY).state
+    closed = transition(interrupted, Shutdown(7.0), POLICY).state
+    assert {type(initial), type(attempting), type(drained), type(interrupted), type(closed)} == set(
+        _type_alias_members(cast(object, PresenceState.__value__))
+    )
+
+
+def _type_alias_members(value: object) -> set[type]:
+    if not isinstance(value, UnionType):
+        raise TypeError("expected a union type alias")
+    arguments = cast(tuple[object, ...], value.__args__)
+    return {member for member in arguments if isinstance(member, type)}
+
+
+def test_retry_failures_reach_a_bounded_terminal_path_under_timer_fairness() -> None:
+    state: Searching | RetryWaiting = Searching(0, 100.0)
+    elapsed = 0.0
+    for retry_number, delay in enumerate((*POLICY.rapid_backoff, 0.0)):
+        failed = transition(
+            Attempting(RapidRetryTrigger(_advertisement(elapsed)), state),
+            AttemptFinished(elapsed, ConnectedInterruption(durable_progress=False)),
+            POLICY,
+        )
+        if retry_number == len(POLICY.rapid_backoff):
+            assert failed.directive == EndVisit("recovery_exhausted")
+            assert isinstance(failed.state, Searching)
+            assert failed.state.scan_recheck_at == elapsed + POLICY.scan_recheck_seconds
+            break
+        assert isinstance(failed.state, RetryWaiting)
+        assert failed.state.retry_at == elapsed + delay
+        assert failed.state.retry_at is not None
+        timer = transition(failed.state, _timer(failed.state, failed.state.retry_at), POLICY)
+        assert isinstance(timer.state, RetryWaiting)
+        assert timer.state.retry_at is None
+        state = timer.state
+        elapsed += delay
+    assert elapsed == sum(POLICY.rapid_backoff)
+
+
+def test_unknown_event_is_rejected_even_after_shutdown() -> None:
+    for state in (Searching(0, 100.0), Closed()):
+        with pytest.raises(TypeError, match="unsupported presence event: object"):
+            transition(state, object(), POLICY)  # type: ignore[arg-type]
+
+
+def test_unknown_state_and_attempt_outcome_are_rejected() -> None:
+    with pytest.raises(TypeError, match="unsupported presence state: object"):
+        transition(object(), Shutdown(1.0), POLICY)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="unsupported attempt outcome: object"):
+        transition(
+            Attempting(AdvertisementTrigger(_advertisement(1.0)), Searching(0, 100.0)),
+            AttemptFinished(2.0, object()),  # type: ignore[arg-type]
+            POLICY,
+        )

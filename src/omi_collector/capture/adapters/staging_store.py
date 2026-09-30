@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
+from ..domain.quarantine_machine import QuarantineState
 from . import publication, quarantine, ready_closures
 from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionError, ClockCorrectionStore
@@ -395,6 +396,9 @@ class StagingStore:
             self._filesystem,
             should_defer=should_defer or _never_defer,
         )
+
+    def quarantine_state(self, source: Path) -> QuarantineState:
+        return quarantine._quarantine_state(source)
 
     def mark_quarantine_published(self, source: Path) -> None:
         quarantine.mark_quarantine_published(

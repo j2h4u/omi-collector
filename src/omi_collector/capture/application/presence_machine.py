@@ -101,6 +101,7 @@ class Closed:
 
 
 type PresenceState = Searching | CoolingDown | RetryWaiting | Attempting | Closed
+_PRESENCE_STATE_TYPES = (Searching, CoolingDown, RetryWaiting, Attempting, Closed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +160,7 @@ class CandidateUnavailable:
 
 
 type AttemptOutcome = CleanDrain | NotConnected | ConnectedInterruption | CandidateUnavailable
+_ATTEMPT_OUTCOME_TYPES = (CleanDrain, NotConnected, ConnectedInterruption, CandidateUnavailable)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +180,14 @@ class Shutdown:
 
 type PresenceEvent = (
     AdvertisementObserved | ScannerInterrupted | ResumeInterruptedVisit | TimerFired | AttemptFinished | Shutdown
+)
+_PRESENCE_EVENT_TYPES = (
+    AdvertisementObserved,
+    ScannerInterrupted,
+    ResumeInterruptedVisit,
+    TimerFired,
+    AttemptFinished,
+    Shutdown,
 )
 
 
@@ -271,6 +281,7 @@ def transition(
     policy: PresenceMachinePolicy,
 ) -> TransitionResult:
     """Apply one pure, closed-union transition."""
+    _validate_transition_input(state, event)
     if isinstance(state, Closed):
         result = TransitionResult(state, NoOperation())
     elif isinstance(event, Shutdown):
@@ -279,26 +290,41 @@ def transition(
         if not isinstance(state, Attempting):
             raise UnexpectedAttemptOutcomeError(state)
         result = _handle_attempting(state, event, policy)
-    elif isinstance(state, Attempting):
-        if isinstance(event, ResumeInterruptedVisit):
-            result = TransitionResult(
-                Attempting(
-                    trigger=state.trigger,
-                    waiting=_resume_waiting(state.waiting, event, policy),
-                ),
+    else:
+        result = _transition_active(state, event, policy)
+    return result
+
+
+def _validate_transition_input(state: PresenceState, event: PresenceEvent) -> None:
+    if not isinstance(state, _PRESENCE_STATE_TYPES):
+        raise TypeError(f"unsupported presence state: {type(state).__name__}")
+    if not isinstance(event, _PRESENCE_EVENT_TYPES):
+        raise TypeError(f"unsupported presence event: {type(event).__name__}")
+    if isinstance(event, AttemptFinished) and not isinstance(event.outcome, _ATTEMPT_OUTCOME_TYPES):
+        raise TypeError(f"unsupported attempt outcome: {type(event.outcome).__name__}")
+
+
+def _transition_active(
+    state: WaitingState | Attempting,
+    event: PresenceEvent,
+    policy: PresenceMachinePolicy,
+) -> TransitionResult:
+    if isinstance(event, ResumeInterruptedVisit):
+        if isinstance(state, Attempting):
+            return TransitionResult(
+                Attempting(state.trigger, _resume_waiting(state.waiting, event, policy)),
                 NoOperation(),
             )
-        else:
-            result = TransitionResult(state, NoOperation())
-    elif isinstance(event, ResumeInterruptedVisit):
-        result = _handle_resume_interrupted_visit(state, event, policy)
-    elif isinstance(event, ScannerInterrupted):
-        result = _handle_scanner_interrupted(state, event, policy)
-    elif isinstance(event, AdvertisementObserved):
-        result = _handle_advertisement(state, event, policy)
-    else:
-        result = _handle_timer(state, event, policy)
-    return result
+        return _handle_resume_interrupted_visit(state, event, policy)
+    if isinstance(state, Attempting):
+        return TransitionResult(state, NoOperation())
+    if isinstance(event, ScannerInterrupted):
+        return _handle_scanner_interrupted(state, event, policy)
+    if isinstance(event, AdvertisementObserved):
+        return _handle_advertisement(state, event, policy)
+    if isinstance(event, TimerFired):
+        return _handle_timer(state, event, policy)
+    raise TypeError(f"unsupported presence event: {type(event).__name__}")
 
 
 def _handle_advertisement(

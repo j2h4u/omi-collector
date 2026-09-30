@@ -31,6 +31,21 @@ Only a fresh final zero-unread INFO with settled reconciliation, successful
 teardown, and checkpoint can produce `DrainConfirmed`. Publication uses a
 separate durable FIFO; its retries do not change the current visit state.
 
+Model lifecycle decisions as finite typed states and events, with explicit
+rejection of invalid pairs. Keep effects outside pure transitions and advance
+only after their results are acknowledged. Reconstruct durable state from
+authenticated filesystem evidence after restart; an in-memory phase is not a
+durability receipt. Preserve audio when clock metadata or optional telemetry
+fails.
+
+For each lifecycle model, enumerate all representative state/event classes,
+check allowed and invalid transitions, reachability, and paths to completion.
+Also test the real driver at effect boundaries: failure, timeout, cancellation,
+and restart. Graph reachability alone does not guarantee progress: retry loops
+depend on explicit timer, availability, and fairness assumptions. No FSM
+library replaces these contracts; prefer the existing pure reducers unless a
+dependency removes concrete complexity.
+
 `INFO` is the source of truth for unread state. Automatic service and sync
 admission requires a current exact-address scanner candidate that has remained
 visible for the configured stable-arrival span; the default is 30 seconds with

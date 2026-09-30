@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.6](https://github.com/j2h4u/omi-collector/compare/v0.9.5...v0.9.6) (2026-09-30)
+
+
+### Fixes
+
+* **status:** clear publication warning after successful no-op recovery ([#159](https://github.com/j2h4u/omi-collector/issues/159)) ([3582a12](https://github.com/j2h4u/omi-collector/commit/3582a12df86e555ad6d943dd31944ad9d8e36474))
+
 ## [0.9.5](https://github.com/j2h4u/omi-collector/compare/v0.9.4...v0.9.5) (2026-09-30)
 
 

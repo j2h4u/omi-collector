@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.5](https://github.com/j2h4u/omi-collector/compare/v0.9.4...v0.9.5) (2026-09-30)
+
+
+### Fixes
+
+* **clock:** extend presence preflight budget ([#156](https://github.com/j2h4u/omi-collector/issues/156)) ([94493b2](https://github.com/j2h4u/omi-collector/commit/94493b21d6e1b3103e4191626cf0bf6de1c950d2))
+
 ## [0.9.4](https://github.com/j2h4u/omi-collector/compare/v0.9.3...v0.9.4) (2026-09-30)
 
 

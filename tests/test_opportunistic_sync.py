@@ -1578,9 +1578,17 @@ async def test_resume_cursor_matrix(
         assert provider.opened == 1
         return
 
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
-    )
+    activity: list[ActivityEvent] = []
+    try:
+        # Recovered writer seal/fsync is disk work, outside this cursor matrix's timing contract.
+        result = await run_opportunistic_collector(
+            Provider([session]),
+            StagingStore(tmp_path, _capture_root(tmp_path)),
+            replace(_options(activity=activity), timeouts=TransferTimeouts(info=1, transfer=5)),
+        )
+    except IndexError as cause:
+        failures = [event for event in activity if event.state == "session_error"]
+        raise AssertionError(f"unexpected retry after {failures!r}; writes={session.writes!r}") from cause
 
     assert isinstance(result, CollectionResult)
     if requested:

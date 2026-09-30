@@ -150,6 +150,8 @@ class ClockMembershipPort(Protocol):
 class ClockCorrectionPort(Protocol):
     """Durable clock-intent and reconciliation ledger."""
 
+    def note_transport_closed(self) -> None: ...
+
     def prepare(
         self, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
     ) -> ClockCorrectionShape: ...

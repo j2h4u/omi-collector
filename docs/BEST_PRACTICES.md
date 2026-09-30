@@ -209,4 +209,29 @@ Remove obsolete documents and host-specific observations rather than expanding
 this documentation set.
 # Audio time ownership
 
-Persist a clock-correction intent before writing the pendant clock, then record whether the write was confirmed or remains uncertain. Never write the clock when that intent cannot be made durable or while an interrupted audio attempt is pending. Apply only confirmed corrections to record timestamps before bundle publication so consumers receive one ordinary audio timeline. Keep unrecoverable packet loss in operational quality evidence; consumers cannot act on missing audio.
+Clock correction owns its complete lifecycle; publication must not finish it.
+The operational assumption is that uncontrolled clock changes happen only
+across pendant power-off/power-on. Our own clock writes have known sequence
+boundaries. Calendar timestamps are approximate; sequence, Opus packets and
+sample counts determine audio order and duration.
+
+| State | Meaning | Recovery/admission |
+|---|---|---|
+| `prepared` | Durable intent, no possible clock write yet | Restart finishes it as `not_written` |
+| `unresolved` | Clock write may have happened | Close the old BLE execution window, observe fresh RTC, then recover or supersede |
+| `applied` | Readback confirmed the write | Terminal, even if the old sequence boundary is approximate |
+| `not_applied`, `not_written`, `resolved`, `unknown` | Completed history | Does not block another correction; `unknown` preserves the old uncertainty |
+
+Persist intent and its own initial observation before each clock write. Never
+write without durable intent or while an interrupted audio attempt is pending.
+After interruption, do not replay an old target; use a fresh observation and
+the same transition policy as normal completion.
+
+Use the RTC-read midpoint to estimate the timestamp offset for backlog, and
+readback for records after our correction. Mark estimates as approximate;
+previous power cycles can make old calendar dates less accurate. Do not
+rewrite already published ready bundles. A clock-only fault or unrepresentable
+estimate must leave valid audio publishable with its original timestamp and
+unknown mapping. It must never change audio payloads, order, packet count,
+playback duration, speech boundaries, or ACK eligibility. Keep actual packet
+loss in operational quality evidence.

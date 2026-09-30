@@ -443,8 +443,14 @@ class SessionLifecycle:
                 )
             finally:
                 if session is not None:
+                    correction_sink = self.run.options.clock_correction_sink
                     teardown_error = await teardown_was_interrupted(
-                        context, primary, self.run.options.timeouts.info, self.run.options.activity, self.run.runtime
+                        context,
+                        primary,
+                        self.run.options.timeouts.info,
+                        self.run.options.activity,
+                        self.run.runtime,
+                        on_transport_closed=(correction_sink.note_transport_closed if correction_sink else None),
                     )
             await self.run.callbacks.post_session_checkpoint()
             if teardown_error:
@@ -682,12 +688,14 @@ async def recoverable_session_outcome(
     return outcome
 
 
-async def teardown_was_interrupted(
+async def teardown_was_interrupted(  # noqa: PLR0913 - close receipt belongs at the physical-session boundary
     context: AbstractAsyncContextManager[RingSession],
     primary: BaseException | None,
     timeout: float,
     activity: ActivityCallback | None,
     runtime: CaptureRuntimePort,
+    *,
+    on_transport_closed: Callable[[], None] | None = None,
 ) -> bool:
     secondary: list[BaseException] = []
     try:
@@ -703,6 +711,11 @@ async def teardown_was_interrupted(
         raise
     for error in secondary:
         await report_session_error(activity, "teardown", error, runtime)
+    if on_transport_closed is not None and not secondary:
+        try:
+            on_transport_closed()
+        except Exception as error:  # noqa: BLE001 - fencing failure keeps clock reconciliation conservative
+            await report_session_error(activity, "teardown", error, runtime)
     return False
 
 

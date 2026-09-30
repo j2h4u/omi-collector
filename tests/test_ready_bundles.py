@@ -321,19 +321,64 @@ def test_unknown_time_finalizes_without_changing_device_timestamps(tmp_path: Pat
     assert (result[0].path / "records.bin").read_bytes() == original
 
 
-def test_timestamp_overflow_keeps_draft_for_retry(tmp_path: Path) -> None:
-    draft = _draft(tmp_path / "draft", ((1 << 32) - 1,))
+def test_timestamp_overflow_publishes_unchanged_unknown_range(tmp_path: Path) -> None:
+    draft = _draft(tmp_path / "draft", ((1 << 32) - 1, 100))
+    original = (draft / "records.bin").read_bytes()
 
-    with pytest.raises(ready_bundles.ReadyBundleError, match="outside uint32"):
-        _finalize_drafts(
-            tmp_path / "draft",
-            tmp_path / "ready",
-            tmp_path / "ledger.json",
-            ClockSegmentMap((ClockSegment("observation", 10, 11, 1.0, 0.1),)),
-        )
+    result = _finalize_drafts(
+        tmp_path / "draft",
+        tmp_path / "ready",
+        tmp_path / "ledger.json",
+        ClockSegmentMap((ClockSegment("observation", 10, 12, 1.0, 0.1),)),
+    )
 
-    assert draft.exists()
-    assert not tuple((tmp_path / "ready").iterdir())
+    ready = result[0].path
+    assert (ready / "records.bin").read_bytes() == original
+    manifest = cast(dict[str, object], loads((ready / "manifest.json").read_text(encoding="utf-8")))
+    assert manifest["time_ranges"] == [{"start_sequence": 10, "next_sequence": 12, "utc": None}]
+    assert not draft.exists()
+
+
+def test_approximate_clock_range_is_marked_in_ready_manifest(tmp_path: Path) -> None:
+    _draft(tmp_path / "draft", (100,))
+    segments = ClockSegmentMap((ClockSegment("observation", 10, 11, 0.6, 0.1, "approximate"),))
+
+    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", segments)
+
+    manifest = cast(dict[str, object], loads((result[0].path / "manifest.json").read_text(encoding="utf-8")))
+    assert manifest["time_ranges"] == [
+        {
+            "start_sequence": 10,
+            "next_sequence": 11,
+            "utc": {
+                "observation_id": "observation",
+                "offset_seconds": 0.6,
+                "uncertainty_seconds": 0.1,
+                "confidence": "approximate",
+            },
+        }
+    ]
+
+
+def test_replayed_published_bundle_keeps_its_original_time_mapping(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "ledger.json"
+    _draft(draft_root, (100,), start_sequence=100)
+    first = _finalize_drafts(
+        draft_root, ready_root, ledger, ClockSegmentMap((ClockSegment("old", 100, 101, 1.0, 1.1),))
+    )[0]
+    original_manifest = (first.path / "manifest.json").read_bytes()
+    original_records = (first.path / "records.bin").read_bytes()
+    _draft(draft_root, (100,), start_sequence=100)
+
+    replay = _finalize_drafts(
+        draft_root, ready_root, ledger, ClockSegmentMap((ClockSegment("new", 100, 101, 50.0, 1.1),))
+    )
+
+    assert replay == ()
+    assert (first.path / "manifest.json").read_bytes() == original_manifest
+    assert (first.path / "records.bin").read_bytes() == original_records
 
 
 def test_contained_replay_uses_ready_payloads_without_creating_a_second_bundle(tmp_path: Path) -> None:

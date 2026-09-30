@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
 
 from omi_collector.capture.application.visit_machine import (
@@ -77,6 +79,15 @@ def test_drain_requires_closure_before_idle_or_stop() -> None:
     assert transition(closing.state, ClosureCommitted()) == TransitionResult(Idle(), FinishVisit("drained", False))
     assert transition(closing.state, ClosureCommitted(), stop_after_drained=True) == TransitionResult(
         Stopped(), FinishVisit("drained", True)
+    )
+
+
+@pytest.mark.parametrize("reason", ["absence", "recovery_exhausted"])
+def test_committed_non_drained_closure_never_stops(
+    reason: Literal["absence", "recovery_exhausted"],
+) -> None:
+    assert transition(Closing(reason), ClosureCommitted(), stop_after_drained=True) == TransitionResult(
+        Idle(), FinishVisit(reason, False)
     )
 
 

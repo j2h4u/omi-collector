@@ -177,22 +177,20 @@ class BatchReconciler:
             self._state.pending_durable_next = None
             self._state.visit_frontier = None
             return
-        if batch is not None:
-            if batch.seal is None and batch.writer.progress.submitted:
-                durable = await _checkpoint_for_finalization(batch, self._run.options, self._run.runtime)
-                self._state.pending_durable_next = durable.next_sequence
-                _retain_durable_frontier(self._state, durable)
-                if durable.record_count:
-                    await _bounded(batch.writer.publish_prefix(), self._run.options.timeouts.transfer)
-            elif batch.seal is not None:
-                if batch.count:
-                    self._state.visit_frontier = max(self._state.visit_frontier or batch.end, batch.end)
-            await _bounded(
-                batch.writer.close(timeout=self._run.options.timeouts.transfer), self._run.options.timeouts.transfer
-            )
-            self._state.batch = None
-            self._state.pending_descriptor = None
-            self._state.pending_durable_next = None
+        if batch.seal is None and batch.writer.progress.submitted:
+            durable = await _checkpoint_for_finalization(batch, self._run.options, self._run.runtime)
+            self._state.pending_durable_next = durable.next_sequence
+            _retain_durable_frontier(self._state, durable)
+            if durable.record_count:
+                await _bounded(batch.writer.publish_prefix(), self._run.options.timeouts.transfer)
+        elif batch.seal is not None and batch.count:
+            self._state.visit_frontier = max(self._state.visit_frontier or batch.end, batch.end)
+        await _bounded(
+            batch.writer.close(timeout=self._run.options.timeouts.transfer), self._run.options.timeouts.transfer
+        )
+        self._state.batch = None
+        self._state.pending_descriptor = None
+        self._state.pending_durable_next = None
         frontier = self._state.visit_frontier
         if frontier is None:
             return

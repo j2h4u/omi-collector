@@ -95,7 +95,8 @@ def test_startup_replays_ready_prefix_when_draft_was_already_consumed(tmp_path: 
         scanning = asyncio.Event()
 
         class Observer:
-            async def start(self, _callback: Callable[[object], object]) -> None:
+            async def start(self, callback: Callable[[object], object]) -> None:
+                del callback
                 scanning.set()
 
             async def stop(self) -> None:

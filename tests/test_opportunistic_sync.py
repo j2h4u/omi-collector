@@ -3243,7 +3243,8 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
     scanning = asyncio.Event()
 
     class Observer:
-        async def start(self, _callback: Callable[[object], object]) -> None:
+        async def start(self, callback: Callable[[object], object]) -> None:
+            del callback
             scanning.set()
 
         async def stop(self) -> None:

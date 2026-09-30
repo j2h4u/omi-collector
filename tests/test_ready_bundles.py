@@ -14,6 +14,7 @@ import pytest
 from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_segments import ClockSegment, ClockSegmentMap
+from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import ReadyConfig
 
@@ -450,6 +451,40 @@ def test_ack_retirement_records_ledger_before_unlink_and_recovers_after_each_bou
         ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
     monkeypatch.setattr(ready_bundles, "_remove_retired_ready", original_remove)
     assert ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)[0].bundle_id == published.bundle_id
+
+
+def test_new_closure_recovers_retirement_committed_before_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drafts = tmp_path / "draft"
+    ready = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(drafts, (100,), start_sequence=100)
+    old = _finalize_drafts(drafts, ready, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(old.bundle_id, old.records_sha256)])
+    original_remove = ready_bundles._remove_retired_ready
+
+    def interrupt_retirement(_path: Path) -> None:
+        raise OSError("after retirement ledger commit")
+
+    monkeypatch.setattr(ready_bundles, "_remove_retired_ready", interrupt_retirement)
+    with pytest.raises(OSError, match="after retirement ledger commit"):
+        ready_bundles.retire_acknowledged(ready, ledger, checkpoint)
+    monkeypatch.setattr(ready_bundles, "_remove_retired_ready", original_remove)
+    checkpoint.unlink()
+    _draft(drafts, (101,), start_sequence=101)
+    open_draft = _draft(drafts, (102,), start_sequence=102)
+    store = StagingStore.from_paths(StagingStore(tmp_path / "collector", drafts).paths, publication_root=ready)
+    store.append_ready_closure(102, "drained")
+
+    published = cast(tuple[ready_bundles.ReadyBundleResult, ...], store.recover_and_publish())
+
+    assert [item.next_sequence for item in published] == [102]
+    assert not old.path.exists()
+    assert open_draft.exists()
+    assert loads(ledger.read_text())["bundles"][old.bundle_id]["state"] == "retired"
+    assert store.recover_and_publish() is None
+    assert open_draft.exists()
 
 
 def test_forged_or_open_tail_ack_never_deletes_ready_bundle(tmp_path: Path) -> None:

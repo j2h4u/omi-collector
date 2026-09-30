@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import suppress
 from dataclasses import dataclass
+from itertools import pairwise
 from json import JSONDecodeError, dumps, loads
 from pathlib import Path
 from typing import cast
@@ -43,13 +44,18 @@ def load(path: Path) -> tuple[ReadyClosure, ...]:
     raw_closures = value.get("closures")
     if not isinstance(raw_closures, list):
         raise ReadyClosureError("ready closure queue schema is invalid")
-    return tuple(_parse_closure(item) for item in raw_closures)
+    closures = tuple(_parse_closure(item) for item in raw_closures)
+    if any(left.next_sequence > right.next_sequence for left, right in pairwise(closures)):
+        raise ReadyClosureError("ready closure queue is out of order")
+    return closures
 
 
 def append(path: Path, next_sequence: int, reason: str) -> ReadyClosure:
     """Append one frontier durably, coalescing a replay of the same frontier."""
     closure = _make_closure(next_sequence, reason)
     closures = load(path)
+    if closures and next_sequence < closures[-1].next_sequence:
+        raise ReadyClosureError("ready closure frontier regressed")
     if closures and closures[-1].next_sequence == next_sequence:
         return closures[-1]
     _write(path, (*closures, closure))

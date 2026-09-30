@@ -48,7 +48,15 @@ def test_closures_reject_malformed_state(tmp_path: Path) -> None:
     path = tmp_path / "ready-closures.json"
     path.write_text('{"closures":[{"next_sequence":20,"reason":"absence"}],"version":1}', encoding="utf-8")
 
-    assert append(path, 10, "absence").next_sequence == 10
+    with pytest.raises(ReadyClosureError, match="regressed"):
+        append(path, 10, "absence")
+
+    path.write_text(
+        '{"closures":[{"next_sequence":20,"reason":"absence"},{"next_sequence":10,"reason":"absence"}],"version":1}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ReadyClosureError, match="out of order"):
+        load(path)
 
     path.write_text('{"closures":[{"next_sequence":20}],"version":1}', encoding="utf-8")
     with pytest.raises(ReadyClosureError, match="entry schema"):
@@ -56,7 +64,11 @@ def test_closures_reject_malformed_state(tmp_path: Path) -> None:
 
 
 def test_startup_replays_ready_prefix_when_draft_was_already_consumed(tmp_path: Path) -> None:
-    store, attempt = _partial(tmp_path)
+    base, attempt = _partial(tmp_path)
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    store = StagingStore.from_paths(base.paths, publication_root=ready)
     with store.device_lock() as lease:
         resumed = store.resume_streaming_attempt(lease)
         assert resumed is not None
@@ -64,6 +76,11 @@ def test_startup_replays_ready_prefix_when_draft_was_already_consumed(tmp_path: 
         assert publication is not None
         resumed.close(durable=True)
     digest = publication.bundle_path.joinpath("records.bin").read_bytes()
+    # Recreate the legacy ordering: ready consumed the draft before retirement.
+    store.append_ready_closure(11, "legacy_prefix_publication")
+    store.recover_and_publish()
+    assert not publication.bundle_path.exists()
+    original_ready = {path.name: (path / "records.bin").read_bytes() for path in ready.iterdir()}
 
     async def prepare() -> None:
         state = await QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup()
@@ -71,7 +88,10 @@ def test_startup_replays_ready_prefix_when_draft_was_already_consumed(tmp_path: 
 
     asyncio.run(prepare())
 
-    assert publication.bundle_path.joinpath("records.bin").read_bytes() == digest
+    assert {path.name: (path / "records.bin").read_bytes() for path in ready.iterdir()} == original_ready
+    assert (attempt.path / "records.bin").read_bytes() == digest
+    assert not tuple(store.capture_root.iterdir())
+    assert loads(store.ready_closures_path.read_text())["closures"] == []
     assert (attempt.path / "terminal-retired.json").is_file()
     assert store.pending_attempts() == ()
 

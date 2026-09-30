@@ -18,7 +18,7 @@ from . import publication, quarantine, ready_closures
 from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionStore
 from .clock_memberships import ClockMembershipStore
-from .ready_bundles import draft_frontier, finalize_drafts, has_drafts_at_or_below, retire_acknowledged
+from .ready_bundles import draft_frontier, finalize_drafts, has_drafts_at_or_below, resume_retired, retire_acknowledged
 from .staging_contract import (
     _DESCRIPTOR_NAME,
     _PREFIX_PUBLICATION_NAME,
@@ -259,6 +259,7 @@ class StagingStore:
             near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
         )
         ledger_path = self.device_state_path.parent / "ready-publications.json"
+        resume_retired(publication_root, ledger_path)
         published: list[object] = []
         closures = ready_closures.load(self.ready_closures_path)
         while closures:

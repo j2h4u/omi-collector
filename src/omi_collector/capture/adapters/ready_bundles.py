@@ -653,6 +653,21 @@ def _reject_retired_overlap(ledger: Mapping[str, object], source: BundleManifest
             raise ReadyBundleError("draft overlaps a retired range without original payload evidence")
 
 
+def resume_retired(ready_root: Path, ledger_path: Path) -> None:
+    """Finish already committed retirements before reconciling new publication."""
+    _prepare_directory(ready_root)
+    bundles = _read_ledger(ledger_path)["bundles"]
+    assert isinstance(bundles, dict)
+    retired: list[Path] = []
+    for bundle_id, entry in bundles.items():
+        if isinstance(entry, dict) and entry.get("state") == "retired":
+            destination = ready_root / _sha256(bundle_id)
+            _resume_retirement(destination, entry)
+            retired.append(destination)
+    for destination in retired:
+        _remove_retired_ready(destination)
+
+
 def retire_acknowledged(ready_root: Path, ledger_path: Path, checkpoint_path: Path) -> tuple[ReadyBundleResult, ...]:
     """Retire only Windmill bundles durably ACKed outside an open speech tail."""
     _prepare_directory(ready_root)

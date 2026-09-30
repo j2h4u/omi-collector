@@ -183,6 +183,25 @@ class StagingStore:
         with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
             return self._recover_and_publish_unlocked()
 
+    def inspect_recovery(self) -> tuple[bool, bool]:
+        """Report prefix-marker and orphan-draft evidence under the device lease."""
+        with self.device_lock(recover_capture_temporaries=False, operation="inspect_recovery"):
+            recoverable_prefix = False
+            if self.attempts_root.exists():
+                _require_regular_directory(self.attempts_root)
+                for path in self.attempts_root.iterdir():
+                    if path.is_symlink() or not path.is_dir():
+                        raise AttemptStateError("partial staging root contains a non-directory entry")
+                    if (path / _TERMINAL_RETIRED_NAME).exists():
+                        continue
+                    if (path / _PREFIX_PUBLICATION_NAME).exists():
+                        recoverable_prefix = True
+                        break
+            frontier = draft_frontier(self.capture_root)
+            closures = ready_closures.load(self.ready_closures_path)
+            unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
+            return recoverable_prefix, unclosed_drafts
+
     @property
     def ready_closures_path(self) -> Path:
         return self.device_state_path.parent / "ready-closures.json"

@@ -139,6 +139,11 @@ def _capture_root(tmp_path: Path) -> Path:
     return root
 
 
+@pytest.fixture(autouse=True)
+def _isolate_capture_root(tmp_path: Path) -> None:
+    rmtree(_capture_root(tmp_path), ignore_errors=True)
+
+
 def _status() -> RingStatus:
     return RingStatus(0, 0, 0, 1)
 
@@ -3166,8 +3171,6 @@ async def test_default_arena_budget_admits_a_full_pendant_snapshot_without_alloc
 @_async_test
 async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_path: Path) -> None:
     entered = asyncio.Event()
-    busy_reported = asyncio.Event()
-    release_busy_retry = asyncio.Event()
 
     class BlockingReadSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -3193,42 +3196,29 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
             WriteStep(b"\x10", (_info(11, 11),)),
         ),
     )
-    activity: list[ActivityEvent] = []
-
-    async def report(event: ActivityEvent) -> None:
-        activity.append(event)
-        if (
-            event.state == "session_error"
-            and event.phase == "read/reconcile"
-            and event.error_type == "DeviceAlreadyRunningError"
-        ):
-            busy_reported.set()
-            await release_busy_retry.wait()
-
     task = asyncio.create_task(
         run_opportunistic_collector(
             Provider([first]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     )
     await entered.wait()
-    contender = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([second, recovered]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
-            replace(_options(batch_records=1), activity=report),
+    contender = Provider([second])
+    with pytest.raises(DeviceAlreadyRunningError) as raised:
+        await run_opportunistic_collector(
+            contender, StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
-    )
-    await busy_reported.wait()
-    assert second.writes == [b"\x10"]
-    busy_event = next(event for event in activity if event.state == "session_error")
-    assert busy_event.lock_context is not None
-    assert busy_event.lock_context["requested_operation"] == "capture_batch"
-    assert busy_event.lock_context["holder_operation"] == "capture_batch"
+    assert contender.opened == 0
+    assert second.writes == []
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.requested_operation == "inspect_recovery"
+    assert context.holder_operation == "capture_batch"
     task.cancel()
     with pytest.raises(CollectionPreservedCancelledError):
         await task
-    release_busy_retry.set()
-    result = await contender
+    result = await run_opportunistic_collector(
+        Provider([recovered]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
+    )
     assert isinstance(result, CollectionResult)
     assert recovered.writes == [
         b"\x10",
@@ -3237,6 +3227,43 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
         encode_advance_command(11),
         b"\x10",
     ]
+
+
+@_async_test
+async def test_machine_closes_published_restart_prefix_before_waiting_without_device(tmp_path: Path) -> None:
+    records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.open_attempt(next((tmp_path / "attempts").iterdir()).name)
+    with store.device_lock() as lease:
+        attempt.activate_for_resume(lease)
+        publication = attempt.publish_prefix()
+        assert publication is not None
+        attempt.close(durable=True)
+    publication.bundle_path.rename(tmp_path / "previously-published-prefix")
+    scanning = asyncio.Event()
+
+    class Observer:
+        async def start(self, _callback: Callable[[object], object]) -> None:
+            scanning.set()
+
+        async def stop(self) -> None:
+            return None
+
+    provider = Provider([])
+    presence = PresenceScheduler(Observer(), policy=PresencePolicy(rapid_backoff=(0.001,)))
+    task = asyncio.create_task(run_opportunistic_collector(provider, store, replace(_options(), presence=presence)))
+    try:
+        await asyncio.wait_for(scanning.wait(), 2)
+        assert not task.done()
+        assert provider.opened == 0
+        assert (attempt.path / "terminal-retired.json").is_file()
+        assert store.pending_attempts() == ()
+        assert (attempt.path / "records.bin").read_bytes() == records
+        assert not store.inspect_recovery()[1], "durable closure must cover retained drafts"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 @_async_test

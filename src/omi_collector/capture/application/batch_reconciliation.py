@@ -35,6 +35,7 @@ from .session_lifecycle import (
     OpportunisticSyncError,
     RetryPolicy,
     SessionPhaseState,
+    joined_to_thread,
 )
 from .session_lifecycle import bounded as _bounded
 from .session_lifecycle import report_activity as _report_activity
@@ -164,13 +165,18 @@ class BatchReconciler:
     async def close_visit(self, reason: str) -> None:
         """Close the physical visit and enqueue its durable publication frontier."""
         batch = self._state.batch
-        if batch is None and self._state.pending_descriptor is not None:
-            closed = await asyncio.to_thread(self._run.staging.close_pending_prefix, reason)
-            if closed is not None:
-                self._state.pending_descriptor = None
-                self._state.pending_durable_next = None
-                self._state.visit_frontier = None
-                return
+        if batch is None:
+            # Startup recovery may have found a published prefix marker or an
+            # authenticated draft without a live writer.  The storage adapter
+            # terminalizes it before appending its closure, under one lease.
+            await joined_to_thread(
+                self._run.staging.close_pending_prefix, reason, include_unpublished=reason != "restart_interrupted"
+            )
+            await joined_to_thread(self._run.staging.close_orphaned_drafts, reason)
+            self._state.pending_descriptor = None
+            self._state.pending_durable_next = None
+            self._state.visit_frontier = None
+            return
         if batch is not None:
             if batch.seal is None and batch.writer.progress.submitted:
                 durable = await _checkpoint_for_finalization(batch, self._run.options, self._run.runtime)
@@ -190,7 +196,7 @@ class BatchReconciler:
         frontier = self._state.visit_frontier
         if frontier is None:
             return
-        await asyncio.to_thread(self._run.staging.append_ready_closure, frontier, reason)
+        await joined_to_thread(self._run.staging.append_ready_closure, frontier, reason)
         self._state.visit_frontier = None
 
     async def connected_step(

@@ -45,6 +45,10 @@ def _run(coroutine: Coroutine[object, object, object]) -> object:
     return asyncio.run(coroutine)
 
 
+def _unexpected_startup_recovery() -> None:
+    raise AssertionError("startup recovery is outside this lifecycle check")
+
+
 class _Lease:
     def __enter__(self) -> _Lease:
         return self
@@ -270,6 +274,8 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
         policy = PresencePolicy(rapid_backoff=(1.0,))
         drained_cooldown_remaining_seconds = 0.0
 
+        resume_interrupted_visit = staticmethod(_unexpected_startup_recovery)
+
         async def wait_for_attempt(self) -> PresenceWake:
             return PresenceWake("test", candidate=object(), observed_at=time.monotonic())
 
@@ -315,7 +321,7 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
         events.append("propagated")
 
     _run(scenario())
-    assert events == ["close", "close", "propagated"]
+    assert events == ["close", "propagated"]
 
 
 def test_real_presence_setup_failure_closes_issued_permit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,6 +402,8 @@ def test_presence_outcome_follows_gatt_teardown_and_checkpoint(monkeypatch: pyte
     class Presence:
         policy = PresencePolicy(rapid_backoff=(1.0,))
         drained_cooldown_remaining_seconds = 1.0
+
+        resume_interrupted_visit = staticmethod(_unexpected_startup_recovery)
 
         async def wait_for_attempt(self) -> PresenceWake:
             return PresenceWake("test", candidate=object(), observed_at=time.monotonic())

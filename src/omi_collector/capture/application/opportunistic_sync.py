@@ -33,6 +33,7 @@ from .session_lifecycle import (
 from .session_lifecycle import (
     bounded as _bounded,
 )
+from .visit_machine import RecoveryDisposition
 
 # Cached status and optional characteristics are useful observations, but they
 # must never hold up the first audio operation for the 30-second INFO timeout.
@@ -109,8 +110,6 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
     try:
         if options.presence is not None:
             return await lifecycle.run_with_presence()
-        state = await maintenance.prepare_pending_startup()
-        _bind_startup_state(reconciler, state)
         return await lifecycle.run_direct()
     except BaseException as error:
         cancelled = isinstance(error, asyncio.CancelledError)
@@ -184,10 +183,19 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
     async def wait_presence_attempt() -> PresenceWake | PresenceEnd:
         presence = run.options.presence
         assert presence is not None
+
         return await run.maintenance.wait_for_presence_attempt(
             presence,
-            lambda state: _bind_startup_state(reconciler, state),
+            lambda _state: None,
         )
+
+    async def load_recovery() -> RecoveryDisposition:
+        state = await run.maintenance.prepare_pending_startup()
+        _bind_startup_state(reconciler, state)
+        return state.disposition
+
+    def invalidate_recovery() -> None:
+        run.maintenance.invalidate_startup_state()
 
     def observe_info(info: RingInfo) -> None:
         try:
@@ -200,7 +208,7 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
 
     async def close_visit(reason: str) -> None:
         await reconciler.close_visit(reason)
-        await run.maintenance.ensure_publication_ready()
+        run.maintenance.schedule_publication_retry()
 
     async def before_direct_attempt() -> None:
         await run.maintenance.ensure_publication_ready()
@@ -216,7 +224,8 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         drained_result=reconciler.drained_result,
         observe_info=observe_info,
         close_visit=close_visit,
-        close_interrupted_visit=close_visit,
+        load_recovery=load_recovery,
+        invalidate_recovery=invalidate_recovery,
     )
     return SessionLifecycle(SessionLifecycleRun(run.provider, run.options, run.runtime, callbacks))
 

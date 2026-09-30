@@ -27,6 +27,7 @@ from .session_lifecycle import (
     SessionLifecycleCallbacks,
     SessionLifecycleRun,
     SessionProvider,
+    joined_to_thread,
     validate_policy,
     validate_presence_policy,
 )
@@ -279,7 +280,7 @@ async def _close_observation_writer(run: _Run, *, unwinding: bool) -> None:
     """Close the run-scoped writer without changing collection outcomes."""
     timeout = run.options.config.firmware_observations.close_timeout_seconds
     try:
-        await _bounded(asyncio.to_thread(run.observation_writer.close), timeout)
+        await _bounded(joined_to_thread(run.observation_writer.close), timeout)
     except asyncio.CancelledError:
         if unwinding:
             # Preserve the cancellation or error already being unwound by the

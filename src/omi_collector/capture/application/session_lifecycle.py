@@ -822,7 +822,12 @@ async def exit_context(
 
 async def joined_to_thread[T](function: Callable[..., T], *args: object, **kwargs: object) -> T:
     """Join a storage mutation before propagating cancellation to its caller."""
-    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    return await join_owned(asyncio.to_thread(function, *args, **kwargs))
+
+
+async def join_owned[T](awaitable: Awaitable[T]) -> T:
+    """Keep ownership through repeated cancellation until the task settles."""
+    task = asyncio.ensure_future(awaitable)
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError as cancelled:
@@ -838,7 +843,7 @@ async def joined_to_thread[T](function: Callable[..., T], *args: object, **kwarg
 
 async def cancel_task[T](task: asyncio.Future[T]) -> None:
     task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    await join_owned(asyncio.gather(task, return_exceptions=True))
 
 
 async def report_activity(

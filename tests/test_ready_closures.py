@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from json import loads
 from pathlib import Path
 from struct import pack
+from typing import Never
 
 import pytest
 
@@ -13,7 +15,11 @@ from omi_collector.capture.adapters.attempts import StagedAttempt
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_closures import ReadyClosureError, append, load, remove
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.application.collector import TransferTimeouts
+from omi_collector.capture.application.opportunistic_sync import run_opportunistic_collector
+from omi_collector.capture.application.presence import PresenceScheduler
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
+from omi_collector.capture.application.session_lifecycle import OpportunisticOptions
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 
 
@@ -84,7 +90,29 @@ def test_startup_replays_ready_prefix_when_draft_was_already_consumed(tmp_path: 
 
     async def prepare() -> None:
         state = await QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup()
-        assert state.pending is None
+        assert state.disposition == "needs_interrupted_close"
+        assert not (attempt.path / "terminal-retired.json").exists()
+        scanning = asyncio.Event()
+
+        class Observer:
+            async def start(self, _callback: Callable[[object], object]) -> None:
+                scanning.set()
+
+            async def stop(self) -> None:
+                return None
+
+        def provider(_candidate: object | None) -> Never:
+            raise AssertionError("restart recovery must not open BLE without a pendant")
+
+        options = OpportunisticOptions(TransferTimeouts(1, 1), presence=PresenceScheduler(Observer()))
+        task = asyncio.create_task(run_opportunistic_collector(provider, store, options, OpportunisticRuntime()))
+        try:
+            await asyncio.wait_for(scanning.wait(), 2)
+            assert not task.done()
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
     asyncio.run(prepare())
 

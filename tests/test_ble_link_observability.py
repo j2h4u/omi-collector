@@ -367,6 +367,12 @@ def test_observer_sends_read_phy_tracks_transition_and_finishes_once() -> None:
     asyncio.run(observer.start())
     assert native_bind_calls == [(37, 31, 3, 0)]
     assert fake.options == [(0, 2, hci_filter_bytes())]
+    # This scenario drives packets and the fake clock synchronously.
+    observer._stop.set()
+    for worker in (observer._reader, observer._processor):
+        assert worker is not None
+        worker.join(1)
+        assert not worker.is_alive()
     observer.handle_packet(_connect())
     assert fake.sent == [b"\x01\x30\x20\x02\x42\x00", b"\x01\x05\x14\x02\x42\x00"]
     observer.handle_packet(_read_phy_complete(1, 1))

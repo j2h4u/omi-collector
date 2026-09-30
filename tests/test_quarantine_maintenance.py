@@ -527,8 +527,10 @@ def test_publication_shutdown_joins_mutation_after_repeated_cancellation(
         release = threading.Event()
         finished = threading.Event()
         store = _store(tmp_path)
+        publications: list[None] = []
 
         def publish() -> None:
+            publications.append(None)
             started.set()
             if not release.wait(2):
                 raise TimeoutError("publication mutation was not released")
@@ -542,6 +544,11 @@ def test_publication_shutdown_joins_mutation_after_repeated_cancellation(
             assert await asyncio.to_thread(started.wait, 1)
             publication = maintenance._publication_retry_task
             assert publication is not None
+            maintenance.schedule_publication_retry()
+            maintenance.schedule_publication_retry()
+            await asyncio.sleep(0.01)
+            assert maintenance._publication_retry_task is publication
+            assert publications == [None]
             closing = asyncio.create_task(maintenance.close())
             await asyncio.sleep(0.01)
             assert not closing.done()
@@ -551,10 +558,62 @@ def test_publication_shutdown_joins_mutation_after_repeated_cancellation(
             release.set()
             await closing
             assert finished.is_set()
+            assert publication.done()
+            assert publications == [None]
         finally:
             release.set()
             if closing is not None:
                 await closing
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        class Presence:
+            policy = PresencePolicy(rapid_backoff=(0.001,))
+
+            async def wait_for_attempt(self) -> PresenceWake:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                return None
+
+        def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+            del should_defer
+            started.set()
+            if not release.wait(2):
+                raise TimeoutError("maintenance mutation was not released")
+            finished.set()
+            return ()
+
+        store = _store(tmp_path)
+        monkeypatch.setattr(store, "sweep_terminal_retired", sweep)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            owner.cancel()
+            await asyncio.sleep(0.01)
+            owner.cancel()
+            await asyncio.sleep(0.01)
+            assert not owner.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            assert finished.is_set()
+        finally:
+            release.set()
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
             await maintenance.close()
 
     _run(scenario())

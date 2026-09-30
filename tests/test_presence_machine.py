@@ -104,14 +104,18 @@ def test_resume_interrupted_visit_arms_absence_without_erasing_arrival() -> None
     )
 
 
-def test_resume_interrupted_visit_preserves_an_outstanding_attempt() -> None:
-    waiting = Searching(timer_epoch=1, scan_recheck_at=100.0)
+@pytest.mark.parametrize(
+    "waiting",
+    [Searching(timer_epoch=1, scan_recheck_at=100.0), CoolingDown(1, 9.0, 100.0, None)],
+)
+def test_resume_interrupted_visit_preserves_an_outstanding_attempt(waiting: Searching | CoolingDown) -> None:
     attempting = Attempting(AdvertisementTrigger(_advertisement(10.0)), waiting)
 
     resumed = transition(attempting, ResumeInterruptedVisit(at=20.0), POLICY)
 
     assert isinstance(resumed.state, Attempting)
     assert isinstance(resumed.state.waiting, RetryWaiting)
+    assert resumed.state.waiting.scan_recheck_at == 100.0
     assert resumed.state.trigger is attempting.trigger
     assert isinstance(resumed.directive, NoOperation)
 

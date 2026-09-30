@@ -23,6 +23,7 @@ from .presence import PresenceEnd, PresenceWake
 from .session_lifecycle import (
     ActivityCallback,
     OpportunisticSyncError,
+    join_owned,
     joined_to_thread,
     report_activity,
 )
@@ -73,6 +74,7 @@ class QuarantineMaintenance:
         self._publication_retry_not_before = 0.0
         self._publication_retry_handle: asyncio.TimerHandle | None = None
         self._publication_retry_task: asyncio.Task[bool] | None = None
+        self._publication_retry_requested = False
 
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
@@ -157,6 +159,9 @@ class QuarantineMaintenance:
         self._schedule_publication_retry()
 
     def _schedule_publication_retry(self) -> None:
+        if self._publication_retry_task is not None and not self._publication_retry_task.done():
+            self._publication_retry_requested = True
+            return
         if self._publication_retry_handle is not None:
             return
         try:
@@ -168,6 +173,9 @@ class QuarantineMaintenance:
 
     def _start_publication_retry(self) -> None:
         self._publication_retry_handle = None
+        if self._publication_retry_task is not None and not self._publication_retry_task.done():
+            self._publication_retry_requested = True
+            return
         task = asyncio.create_task(self._recover_and_publish())
         self._publication_retry_task = task
         task.add_done_callback(self._consume_publication_retry)
@@ -175,11 +183,15 @@ class QuarantineMaintenance:
     def _consume_publication_retry(self, task: asyncio.Task[bool]) -> None:
         if self._publication_retry_task is task:
             self._publication_retry_task = None
+            if self._publication_retry_requested:
+                self._publication_retry_requested = False
+                self._schedule_publication_retry()
         with suppress(asyncio.CancelledError, Exception):
             task.result()
 
     async def close(self) -> None:
         """Cancel and join local publication retry work before loop shutdown."""
+        self._publication_retry_requested = False
         if self._publication_retry_handle is not None:
             self._publication_retry_handle.cancel()
             self._publication_retry_handle = None
@@ -187,7 +199,7 @@ class QuarantineMaintenance:
         self._publication_retry_task = None
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await join_owned(asyncio.gather(task, return_exceptions=True))
 
     async def run_once(self, should_defer: Callable[[], bool]) -> None:
         """Run one cooperative terminal sweep and quarantine salvage pass."""
@@ -281,31 +293,47 @@ class QuarantineMaintenance:
                 await self.ensure_publication_ready()
                 permit_returned = True
                 defer_requested.set()
-                await asyncio.shield(maintenance_task)
+                await join_owned(maintenance_task)
                 return wake
             maintenance_task.result()
             return await presence_task
         except BaseException as error:
             primary = error
             defer_requested.set()
-            if permit_returned:
-                await presence.close()
-            if not presence_task.done():
-                presence_task.cancel()
-            await asyncio.gather(presence_task, return_exceptions=True)
-            if maintenance_task is not None and not maintenance_task.done():
-                try:
-                    await asyncio.shield(maintenance_task)
-                except BaseException:
-                    if isinstance(error, asyncio.CancelledError):
-                        raise error from None
-                    raise
+            try:
+                await join_owned(
+                    self._join_presence_tasks(
+                        presence, presence_task, maintenance_task, permit_returned=permit_returned
+                    )
+                )
+            except BaseException:
+                if isinstance(error, asyncio.CancelledError):
+                    raise error from None
+                raise
             raise
         finally:
             # ``wait`` returns with one task complete, but always consume the
             # other result too. This keeps task identity scoped to this call.
             if primary is None and maintenance_task is not None:
                 await asyncio.gather(presence_task, maintenance_task, return_exceptions=True)
+
+    async def _join_presence_tasks(
+        self,
+        presence: PresenceWaiterPort,
+        presence_task: asyncio.Task[PresenceWake | PresenceEnd],
+        maintenance_task: asyncio.Task[None] | None,
+        *,
+        permit_returned: bool,
+    ) -> None:
+        if not presence_task.done():
+            presence_task.cancel()
+        try:
+            await asyncio.gather(presence_task, return_exceptions=True)
+            if maintenance_task is not None:
+                await maintenance_task
+        finally:
+            if permit_returned:
+                await presence.close()
 
     async def _prepare_and_run(
         self,

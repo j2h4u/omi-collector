@@ -177,12 +177,7 @@ class Shutdown:
 
 
 type PresenceEvent = (
-    AdvertisementObserved
-    | ScannerInterrupted
-    | ResumeInterruptedVisit
-    | TimerFired
-    | AttemptFinished
-    | Shutdown
+    AdvertisementObserved | ScannerInterrupted | ResumeInterruptedVisit | TimerFired | AttemptFinished | Shutdown
 )
 
 
@@ -612,7 +607,7 @@ def _resume_waiting(
     return RetryWaiting(
         timer_epoch=state.timer_epoch,
         retry_at=state.retry_at if isinstance(state, RetryWaiting) else None,
-        scan_recheck_at=state.scan_recheck_at,
+        scan_recheck_at=state.recheck_at if isinstance(state, CoolingDown) else state.scan_recheck_at,
         retry_index=state.retry_index if isinstance(state, RetryWaiting) else 0,
         advertisement=state.advertisement,
         arrival_started_at=state.arrival_started_at,

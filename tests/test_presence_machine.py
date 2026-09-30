@@ -162,13 +162,13 @@ def test_fresh_retry_advertisements_refresh_absence_and_reject_old_timer() -> No
     )
 
     refreshed = transition(state, AdvertisementObserved(_advertisement(15.0)), POLICY)
+    assert isinstance(refreshed.state, RetryWaiting)
     stale = transition(
         refreshed.state,
         TimerFired(at=20.0, deadline=20.0, timer_epoch=refreshed.state.timer_epoch),
         POLICY,
     )
 
-    assert isinstance(refreshed.state, RetryWaiting)
     assert refreshed.state.absence_at == 25.0
     assert refreshed.directive == Observe(25.0)
     assert stale.state is refreshed.state and isinstance(stale.directive, NoOperation)
@@ -300,19 +300,19 @@ def test_durable_progress_resets_exhaustion_counter_for_next_failure() -> None:
         AttemptFinished(10.0, NotConnected(durable_progress=False)),
         POLICY,
     )
+    assert isinstance(first.state, RetryWaiting)
     progress = transition(
         Attempting(RapidRetryTrigger(_advertisement(11.0)), first.state),
         AttemptFinished(11.0, ConnectedInterruption(durable_progress=True)),
         POLICY,
     )
+    assert isinstance(progress.state, RetryWaiting)
     next_failure = transition(
         Attempting(RapidRetryTrigger(_advertisement(12.0)), progress.state),
         AttemptFinished(12.0, ConnectedInterruption(durable_progress=False)),
         POLICY,
     )
 
-    assert isinstance(first.state, RetryWaiting)
-    assert isinstance(progress.state, RetryWaiting)
     assert progress.state.retry_index == 0
     assert isinstance(next_failure.state, RetryWaiting)
     assert next_failure.state.retry_index == 1

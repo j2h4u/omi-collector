@@ -150,6 +150,14 @@ class PresenceScheduler:
         """Return operator telemetry without exposing product state."""
         return machine.drained_cooldown_remaining_seconds(self._state, at=self._clock())
 
+    def resume_interrupted_visit(self) -> None:
+        """Arm startup absence recovery without starting a scanner or GATT attempt."""
+        if isinstance(self._state, machine.Closed):
+            raise RuntimeError("presence scheduler is closed")
+        if isinstance(self._state, machine.Attempting):
+            return
+        self._apply(machine.ResumeInterruptedVisit(at=self._clock()))
+
     async def wait_for_attempt(self) -> PresenceWake | PresenceEnd:
         """Return a permit or close an interrupted visit without a permit."""
         if isinstance(self._state, machine.Closed):

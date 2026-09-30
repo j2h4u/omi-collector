@@ -119,6 +119,13 @@ class ScannerInterrupted:
 
 
 @dataclass(frozen=True, slots=True)
+class ResumeInterruptedVisit:
+    """Arm absence recovery for a startup visit with unfinished durable work."""
+
+    at: float
+
+
+@dataclass(frozen=True, slots=True)
 class TimerFired:
     """A timer callback carrying both its original deadline and timer epoch."""
 
@@ -169,7 +176,14 @@ class Shutdown:
     at: float
 
 
-type PresenceEvent = AdvertisementObserved | ScannerInterrupted | TimerFired | AttemptFinished | Shutdown
+type PresenceEvent = (
+    AdvertisementObserved
+    | ScannerInterrupted
+    | ResumeInterruptedVisit
+    | TimerFired
+    | AttemptFinished
+    | Shutdown
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +286,8 @@ def transition(
         result = _handle_attempting(state, event, policy)
     elif isinstance(state, Attempting):
         result = TransitionResult(state, NoOperation())
+    elif isinstance(event, ResumeInterruptedVisit):
+        result = _handle_resume_interrupted_visit(state, event, policy)
     elif isinstance(event, ScannerInterrupted):
         result = _handle_scanner_interrupted(state, event, policy)
     elif isinstance(event, AdvertisementObserved):
@@ -557,6 +573,7 @@ def _clear_arrival(state: WaitingState) -> WaitingState:
         state.scan_recheck_at,
         state.retry_index,
         None,
+        None,
         state.absence_at,
     )
 
@@ -566,3 +583,22 @@ def _handle_scanner_interrupted(
 ) -> TransitionResult:
     del event, policy
     return _observe(_clear_arrival(state))
+
+
+def _handle_resume_interrupted_visit(
+    state: WaitingState,
+    event: ResumeInterruptedVisit,
+    policy: PresenceMachinePolicy,
+) -> TransitionResult:
+    if isinstance(state, CoolingDown):
+        return TransitionResult(state, NoOperation())
+    retry = RetryWaiting(
+        timer_epoch=state.timer_epoch,
+        retry_at=state.retry_at if isinstance(state, RetryWaiting) else None,
+        scan_recheck_at=state.scan_recheck_at,
+        retry_index=state.retry_index if isinstance(state, RetryWaiting) else 0,
+        advertisement=state.advertisement,
+        arrival_started_at=state.arrival_started_at,
+        absence_at=event.at + policy.absence_seconds,
+    )
+    return _observe(retry)

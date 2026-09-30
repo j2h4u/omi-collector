@@ -722,3 +722,63 @@ def test_recovery_exhaustion_returns_end_without_restarting_scanner() -> None:
         await scheduler.close()
 
     _run(scenario())
+
+
+def test_startup_interrupted_visit_ends_on_absence_without_a_permit() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+        )
+        scheduler.resume_interrupted_visit()
+
+        ended = await scheduler.wait_for_attempt()
+
+        assert ended == PresenceEnd("absence")
+        assert observer.events == ["start", "stop"]
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_startup_interrupted_visit_can_resume_from_a_fresh_advertisement() -> None:
+    async def scenario() -> None:
+        candidate = object()
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.05, scan_recheck_seconds=60.0),
+        )
+        scheduler.resume_interrupted_visit()
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer, candidate)
+
+        wake = await waiter
+
+        assert not isinstance(wake, PresenceEnd)
+        assert wake.candidate is candidate
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_startup_resume_refreshes_an_existing_waiters_timer() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+
+        scheduler.resume_interrupted_visit()
+        ended = await asyncio.wait_for(waiter, timeout=1.0)
+
+        assert ended == PresenceEnd("absence")
+        assert observer.events == ["start", "stop"]
+        await scheduler.close()
+
+    _run(scenario())

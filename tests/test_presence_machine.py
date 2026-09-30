@@ -20,6 +20,7 @@ from omi_collector.capture.application.presence_machine import (
     PresenceEvent,
     PresenceMachinePolicy,
     RapidRetryTrigger,
+    ResumeInterruptedVisit,
     RetryWaiting,
     ScannerInterrupted,
     Searching,
@@ -89,6 +90,28 @@ def test_scanner_interruption_clears_unfinished_arrival() -> None:
 
     assert interrupted.state == Searching(timer_epoch=0, scan_recheck_at=100.0)
     assert interrupted.directive == Observe(100.0)
+
+
+def test_resume_interrupted_visit_arms_absence_without_erasing_arrival() -> None:
+    advertisement = _advertisement(9.0)
+    state = Searching(timer_epoch=3, scan_recheck_at=100.0, advertisement=advertisement, arrival_started_at=9.0)
+
+    resumed = transition(state, ResumeInterruptedVisit(at=20.0), POLICY)
+
+    assert resumed == type(resumed)(
+        RetryWaiting(3, None, 100.0, 0, advertisement, 9.0, 30.0),
+        Observe(30.0),
+    )
+
+
+def test_resume_interrupted_visit_does_not_rearm_an_outstanding_attempt() -> None:
+    waiting = Searching(timer_epoch=1, scan_recheck_at=100.0)
+    attempting = Attempting(AdvertisementTrigger(_advertisement(10.0)), waiting)
+
+    resumed = transition(attempting, ResumeInterruptedVisit(at=20.0), POLICY)
+
+    assert resumed.state is attempting
+    assert isinstance(resumed.directive, NoOperation)
 
 
 def test_queued_stale_observation_requires_a_new_stable_encounter() -> None:

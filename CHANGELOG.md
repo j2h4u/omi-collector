@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/j2h4u/omi-collector/compare/v0.8.2...v0.9.0) (2026-09-30)
+
+
+### Features
+
+* **capture:** publish audio at complete pendant visit boundaries ([0c16742](https://github.com/j2h4u/omi-collector/commit/0c1674232674dd00e61b59cc9ef530afd103f364))
+
+
+### Fixes
+
+* **capture:** recover interrupted prefixes before waiting for advertisements ([0c16742](https://github.com/j2h4u/omi-collector/commit/0c1674232674dd00e61b59cc9ef530afd103f364))
+* **capture:** retain publication ownership through repeated cancellation ([0c16742](https://github.com/j2h4u/omi-collector/commit/0c1674232674dd00e61b59cc9ef530afd103f364))
+
 ## [0.8.2](https://github.com/j2h4u/omi-collector/compare/v0.8.1...v0.8.2) (2026-09-25)
 
 

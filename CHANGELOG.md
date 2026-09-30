@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/j2h4u/omi-collector/compare/v0.9.2...v0.9.3) (2026-09-30)
+
+
+### Fixes
+
+* **status:** refresh battery after successful drain ([#152](https://github.com/j2h4u/omi-collector/issues/152)) ([5a58e0f](https://github.com/j2h4u/omi-collector/commit/5a58e0ff04c55ae54380f06cf91401690675ce9c))
+
 ## [0.9.2](https://github.com/j2h4u/omi-collector/compare/v0.9.1...v0.9.2) (2026-09-30)
 
 

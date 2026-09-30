@@ -310,8 +310,15 @@ def test_failed_clock_publication_does_not_gate_ble_and_retries_locally(
     _run(scenario())
 
 
-def test_successful_recovery_after_device_contention_emits_publication_after_blocked_event(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("successful_result", "success_event"),
+    [(None, "ready_publication_recovered"), (("ready",), "ready_publication_published")],
+)
+def test_successful_recovery_after_device_contention_clears_blocked_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    successful_result: object | None,
+    success_event: str,
 ) -> None:
     async def scenario() -> None:
         store = _store(tmp_path)
@@ -323,7 +330,7 @@ def test_successful_recovery_after_device_contention_emits_publication_after_blo
             attempts += 1
             if attempts == 1:
                 raise DeviceAlreadyRunningError("recovery is already active")
-            return ("ready",)
+            return successful_result
 
         store.recover_and_publish = recover_and_publish  # type: ignore[method-assign]
         runtime = OpportunisticRuntime()
@@ -341,22 +348,8 @@ def test_successful_recovery_after_device_contention_emits_publication_after_blo
         assert attempts == 2
         assert events == [
             ("exception", "ready_publication_blocked"),
-            ("event", "ready_publication_published"),
+            ("event", success_event),
         ]
-
-    _run(scenario())
-
-
-def test_empty_recovery_does_not_claim_ready_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def scenario() -> None:
-        events: list[str] = []
-        runtime = OpportunisticRuntime()
-        monkeypatch.setattr(runtime, "debug_event", lambda event, **_fields: events.append(event))
-        maintenance = QuarantineMaintenance(_store(tmp_path), None, runtime)
-
-        await maintenance.ensure_publication_ready()
-
-        assert events == []
 
     _run(scenario())
 

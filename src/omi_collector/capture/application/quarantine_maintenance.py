@@ -135,6 +135,8 @@ class QuarantineMaintenance:
                 self._publication_retry_not_before = 0.0
                 if published is not None:
                     self._runtime.debug_event("ready_publication_published")
+                else:
+                    self._runtime.debug_event("ready_publication_recovered")
                 return True
             except Exception as error:  # noqa: BLE001 - publication cannot block capture
                 self._runtime.debug_exception("ready_publication_blocked", error, attempt=attempt + 1)

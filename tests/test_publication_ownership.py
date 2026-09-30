@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from struct import pack
 from threading import Event, Thread
+from typing import cast
 
 import pytest
 
@@ -12,6 +13,7 @@ from omi_collector.capture.adapters.staging_contract import AttemptStateError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
+from omi_collector.capture.application.ports import StagingWriterTargetPort
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
 
@@ -171,6 +173,23 @@ def test_writer_publication_failure_schedules_local_retry(tmp_path: Path, monkey
     assert tuple(store.capture_root.iterdir())
     writer.close()
     authority.close()
+
+
+def test_writer_noop_publication_emits_recovered_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoOpWriter:
+        def publish_ready(self) -> None:
+            return None
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        "omi_collector.capture.adapters.opportunistic_runtime.debug_event",
+        lambda event, **_fields: events.append(event),
+    )
+    writer = _StagingWriterAdapter(cast(StagingWriterTargetPort, NoOpWriter()), lambda: None, 0)
+
+    writer._publish_ready()
+
+    assert events == ["ready_publication_recovered"]
 
 
 def test_publication_authority_rejects_duplicate_transfer_and_use_after_release(tmp_path: Path) -> None:

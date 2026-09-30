@@ -574,7 +574,9 @@ def _bind_observation_operation(
     if sink is None:
         return
     source = next((item for item in sink.records() if item.observation_id == observation.observation_id), None)
-    if source is None or source.operation_id is not None:
+    if source is None:
+        return
+    if source.operation_id == correction.operation_id and source.observation_role == "initial":
         return
     sink.append(
         evidence_kind=source.evidence_kind,
@@ -589,6 +591,7 @@ def _bind_observation_operation(
         info_sequence_max=source.info_sequence_max,
         operation_id=correction.operation_id,
         observation_role="initial",
+        parent_observation_id=source.observation_id if source.operation_id is not None else None,
     )
 
 

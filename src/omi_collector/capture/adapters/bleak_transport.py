@@ -660,14 +660,8 @@ class BleakRingTransport:
     async def __aenter__(self) -> BleakRingSession:
         return await self.connect()
 
-    async def __aexit__(self, exc_type: object, _exc_value: object, traceback: object) -> None:
-        try:
-            await self.disconnect()
-        except asyncio.CancelledError:
-            raise
-        except RingTransportDisconnectedError, RingTransportUnavailableError:
-            if exc_type is None:
-                raise
+    async def __aexit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> None:
+        await self.disconnect()
 
     async def _select_device(self) -> Device:
         selector = self._device_selector

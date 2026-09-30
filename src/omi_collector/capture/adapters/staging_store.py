@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from hashlib import sha256
+from logging import getLogger
 from os import fsync, statvfs
 from pathlib import Path
 from threading import Lock
@@ -16,8 +17,10 @@ from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from . import publication, quarantine, ready_closures
 from .attempts import StagedAttempt
-from .clock_corrections import ClockCorrectionStore
-from .clock_memberships import ClockMembershipStore
+from .clock_corrections import ClockCorrectionError, ClockCorrectionStore
+from .clock_memberships import ClockMembershipError, ClockMembershipStore
+from .clock_observations import ClockObservationError
+from .clock_segments import ClockSegmentError, ClockSegmentMap, segments_with_estimates
 from .ready_bundles import draft_frontier, finalize_drafts, has_drafts_at_or_below, resume_retired, retire_acknowledged
 from .staging_contract import (
     _DESCRIPTOR_NAME,
@@ -46,6 +49,8 @@ from .staging_filesystem import (
 
 if TYPE_CHECKING:
     from .quarantine_publish import QuarantinePublication
+
+_LOGGER = getLogger(__name__)
 
 
 class _PublicationAuthority:
@@ -273,17 +278,26 @@ class StagingStore:
         if publication_root is None:
             return None
         corrections = ClockCorrectionStore(self.device_state_path)
-        corrections.recover_prepared()
-        corrections.reconcile_recovered_observations(
-            near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
-        )
+        try:
+            corrections.recover_prepared()
+            corrections.reconcile_recovered_observations(
+                near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
+            )
+            observations = corrections.observation_store.records()
+            verified_operations = frozenset(
+                item.operation_id for item in corrections.records() if item.state in {"applied", "resolved"}
+            )
+            confirmed = ClockMembershipStore(self.device_state_path).segments(observations)
+            segments = segments_with_estimates(observations, confirmed, verified_operations)
+        except (ClockCorrectionError, ClockObservationError, ClockMembershipError, ClockSegmentError) as error:
+            _LOGGER.warning("clock metadata unavailable; publishing ready audio without UTC normalization: %s", error)
+            segments = ClockSegmentMap(())
         ledger_path = self.device_state_path.parent / "ready-publications.json"
         resume_retired(publication_root, ledger_path)
         published: list[object] = []
         closures = ready_closures.load(self.ready_closures_path)
         while closures:
             closure = closures[0]
-            segments = ClockMembershipStore(self.device_state_path).segments(corrections.observation_store.records())
             published.extend(
                 finalize_drafts(
                     self.capture_root,

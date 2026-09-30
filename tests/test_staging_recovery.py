@@ -231,6 +231,29 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
     assert second_result is None
 
 
+def test_corrupt_clock_ledger_does_not_block_closed_audio_publication(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    drafts = _capture_root(tmp_path)
+    draft = _one_record_bundle(drafts, 100, 43)
+    original = (draft / "records.bin").read_bytes()
+    published = _shared_ready(tmp_path / "published")
+    store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published)
+    store.append_ready_closure(101, "visit_complete")
+    observations = tmp_path / "clock-observations"
+    observations.mkdir()
+    (observations / "broken.json").write_text("{", encoding="utf-8")
+
+    result = store.recover_and_publish()
+
+    ready = next(published.iterdir())
+    manifest = cast(dict[str, object], loads((ready / "manifest.json").read_text(encoding="utf-8")))
+    assert len(cast(tuple[object, ...], result)) == 1
+    assert (ready / "records.bin").read_bytes() == original
+    assert manifest["time_ranges"] == [{"start_sequence": 100, "next_sequence": 101, "utc": None}]
+    assert "clock metadata unavailable" in caplog.text
+
+
 def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path) -> None:
     drafts = _capture_root(tmp_path)
     published = _shared_ready(tmp_path / "ready")

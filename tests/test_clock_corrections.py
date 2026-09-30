@@ -10,6 +10,7 @@ from omi_collector.capture.adapters.clock_corrections import (
     ClockCorrectionError,
     ClockCorrectionStore,
 )
+from omi_collector.capture.adapters.clock_observations import ClockObservation
 
 
 def test_intent_is_durable_before_confirmation(tmp_path: Path) -> None:
@@ -108,7 +109,7 @@ def test_startup_replay_ignores_legacy_anchored_monotonic_observations(tmp_path:
     assert store.records()[0].state == "unresolved"
 
 
-@pytest.mark.parametrize("state", ["prepared", "unresolved", "applied"])
+@pytest.mark.parametrize("state", ["prepared", "unresolved"])
 def test_prepare_rejects_any_pending_correction(tmp_path: Path, state: str) -> None:
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
     intent = store.prepare(1100, 1000, 100.0, 20)
@@ -120,6 +121,148 @@ def test_prepare_rejects_any_pending_correction(tmp_path: Path, state: str) -> N
 
     with pytest.raises(ClockCorrectionError, match="pending correction"):
         store.prepare(1200, 1000, 200.0, 24)
+
+
+def test_applied_correction_is_terminal_and_does_not_block_a_new_operation(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1100, 1000, 100.0, 20))
+    store.finish(intent, state="applied", boundary_sequence_max=20, verified_epoch=1000)
+
+    with pytest.raises(ClockCorrectionError, match="durable state"):
+        store.finish(intent, state="resolved", boundary_sequence_max=20, verified_epoch=1000)
+
+    restarted_store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    assert restarted_store.prepare(1200, 1000, 200.0, 24).state == "prepared"
+
+
+def test_fresh_session_observation_retires_only_unclassifiable_uncertainty(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    correction = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    initial = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="old-session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1300,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=correction.operation_id,
+        observation_role="initial",
+    )
+    same_session = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="old-session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=2.0,
+        host_monotonic_end=2.0,
+        device_epoch=1320,
+        info_sequence_min=20,
+        info_sequence_max=24,
+        operation_id=correction.operation_id,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+    assert store.reconcile_causal_observation(same_session, near_zero_threshold=5.0) == ()
+    assert store.records()[0].state == "unresolved"
+
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    later = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="new-session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=3.0,
+        host_monotonic_end=3.0,
+        device_epoch=1320,
+        info_sequence_min=20,
+        info_sequence_max=24,
+        operation_id=correction.operation_id,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+    assert store.reconcile_causal_observation(later, near_zero_threshold=5.0) == ()
+    assert store.records()[0].state == "unresolved"
+    store.note_transport_closed()
+    assert store.reconcile_causal_observation(later, near_zero_threshold=5.0) == ()
+
+    later = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="next-session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=4.0,
+        host_monotonic_end=4.0,
+        device_epoch=1320,
+        info_sequence_min=20,
+        info_sequence_max=24,
+        operation_id=correction.operation_id,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+
+    reconciled = store.reconcile_causal_observation(later, near_zero_threshold=5.0)
+
+    assert reconciled[0].state == "unknown"
+    assert reconciled[0].boundary_sequence_max == 24
+    assert reconciled[0].verified_epoch is None
+    assert store.prepare(1320, 1000, 320.0, 24).state == "prepared"
+
+
+@pytest.mark.parametrize(("epoch", "expected_state"), [(1000, "applied"), (1300, "not_applied")])
+def test_cross_session_terminal_classification_requires_a_post_close_observation(
+    tmp_path: Path, epoch: int, expected_state: str
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    correction = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    initial = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="old-session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1300,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        operation_id=correction.operation_id,
+        observation_role="initial",
+    )
+
+    def later_observation(monotonic: float) -> ClockObservation:
+        return store.observation_store.append(
+            evidence_kind="native_trusted",
+            session_id="new-session",
+            host_boot_id="boot",
+            host_realtime_start=1000.0,
+            host_realtime_end=1000.0,
+            host_monotonic_start=monotonic,
+            host_monotonic_end=monotonic,
+            device_epoch=epoch,
+            info_sequence_min=20,
+            info_sequence_max=24,
+            operation_id=correction.operation_id,
+            observation_role="later",
+            parent_observation_id=initial.observation_id,
+        )
+
+    before_close = later_observation(2.0)
+    assert store.reconcile_causal_observation(before_close, near_zero_threshold=5.0) == ()
+    assert store.records()[0].state == "unresolved"
+
+    store.note_transport_closed()
+    after_close = later_observation(3.0)
+    reconciled = store.reconcile_causal_observation(after_close, near_zero_threshold=5.0)
+
+    assert reconciled[0].state == expected_state
+    assert store.prepare(1200, 1000, 200.0, 24).state == "prepared"
 
 
 def test_later_near_zero_observation_marks_unresolved_write_applied(tmp_path: Path) -> None:
@@ -240,13 +383,7 @@ def test_causal_observation_allows_ordered_successive_same_boundary_operation(tm
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
     first = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20, operation_id="first"))
     store.finish(first, state="applied", boundary_sequence_max=20, verified_epoch=1000)
-    applied = store.records()[0]
-    store.finish(
-        applied,
-        state="resolved",
-        boundary_sequence_max=applied.boundary_sequence_max,
-        verified_epoch=applied.verified_epoch,
-    )
+    assert store.records()[0].state == "applied"
     second = store.mark_unresolved(store.prepare(1301, 1000, 301.0, 20, operation_id="second"))
     initial = store.observation_store.append(
         evidence_kind="native_trusted",

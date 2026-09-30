@@ -153,6 +153,9 @@ class FakeClockCorrectionSink:
     def observation_store(self) -> ClockObservationPort:
         return self._observations
 
+    def note_transport_closed(self) -> None:
+        return None
+
     def prepare(
         self,
         observed_epoch: int,
@@ -733,6 +736,7 @@ def test_incident_boundaries_use_trusted_near_zero_observation(tmp_path: Path) -
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
     events: list[dict[str, object]] = []
     ticks = iter((1000.0,) * 8)
+    store.note_transport_closed()
 
     asyncio.run(
         collect_operational_telemetry(
@@ -962,6 +966,132 @@ def test_real_clock_store_binds_initial_observation_to_unresolved_intent(tmp_pat
     assert correction.state == "unresolved"
     assert initial.operation_id == correction.operation_id
     assert events[-1]["outcome"] == "verification_failed"
+
+
+def test_successive_same_visit_corrections_get_independent_causal_observations(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    events: list[dict[str, object]] = []
+
+    def collect(epoch: int, readback: int | None, session_id: str) -> None:
+        session = FakeOperationalSession(
+            {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", epoch)},
+            readback=pack("<I", readback) if readback is not None else None,
+        )
+        asyncio.run(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                _info(),
+                _event_emitter(events),
+                clock=TelemetryClock(
+                    lambda: 1000.0,
+                    lambda: True,
+                    0.5,
+                    correction_sink=cast(ClockCorrectionSink, store),
+                    observation_sink=store.observation_store,
+                    session_id=session_id,
+                ),
+            )
+        )
+
+    collect(1010, 1005, "visit-one")
+    first = store.records()[0]
+    assert first.state == "unresolved"
+
+    collect(1010, 1005, "visit-one")
+    corrections = store.records()
+    first = next(item for item in corrections if item.operation_id == first.operation_id)
+    second = next(item for item in corrections if item.operation_id != first.operation_id)
+    assert first.state == "not_applied"
+    assert second.state == "unresolved"
+    second_initial = next(
+        item
+        for item in store.observation_store.records()
+        if item.operation_id == second.operation_id and item.observation_role == "initial"
+    )
+    assert second_initial.parent_observation_id is not None
+
+    store.note_transport_closed()
+    collect(1000, None, "visit-two")
+    corrections = store.records()
+    second = next(item for item in corrections if item.operation_id == second.operation_id)
+    assert second.state == "applied"
+    later = next(
+        item
+        for item in store.observation_store.records()
+        if item.operation_id == second.operation_id and item.observation_role == "later"
+    )
+    assert later.parent_observation_id == second_initial.observation_id
+    assert all(event.get("reconciliation") != "no_causal_operation" for event in events)
+
+
+def test_closed_session_fence_allows_fresh_automatic_correction_after_restart(tmp_path: Path) -> None:
+    state_path = tmp_path / "device.json"
+    store = ClockCorrectionStore(state_path)
+    previous = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 12))
+    initial = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="before-restart",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1300,
+        info_sequence_min=12,
+        info_sequence_max=12,
+        operation_id=previous.operation_id,
+        observation_role="initial",
+    )
+    store = ClockCorrectionStore(state_path)
+
+    async def info_after() -> RingInfo:
+        return _info()
+
+    def collect(epoch: int, session_id: str, *, readback: int | None = None) -> FakeOperationalSession:
+        session = FakeOperationalSession(
+            {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", epoch)},
+            readback=pack("<I", readback) if readback is not None else None,
+        )
+        asyncio.run(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                _info(),
+                _event_emitter([]),
+                clock=TelemetryClock(
+                    lambda: 1000.0,
+                    lambda: True,
+                    0.5,
+                    info_reader=info_after,
+                    correction_sink=cast(ClockCorrectionSink, store),
+                    observation_sink=store.observation_store,
+                    session_id=session_id,
+                ),
+            )
+        )
+        return session
+
+    first_session = collect(1320, "restart-session-one")
+    assert first_session.writes == []
+    assert next(item for item in store.records() if item.operation_id == previous.operation_id).state == "unresolved"
+
+    store.note_transport_closed()
+    next_session = collect(1320, "restart-session-two", readback=1000)
+
+    corrections = store.records()
+    previous = next(item for item in corrections if item.operation_id == previous.operation_id)
+    current = next(item for item in corrections if item.operation_id != previous.operation_id)
+    assert previous.state == "unknown"
+    assert len(next_session.writes) == 1
+    assert next_session.writes[0][1] == pack("<I", 1000)
+    assert current.state == "resolved"
+    current_initial = next(
+        item
+        for item in store.observation_store.records()
+        if item.operation_id == current.operation_id and item.observation_role == "initial"
+    )
+    assert current_initial.parent_observation_id != initial.observation_id
 
 
 def test_missing_time_write_is_not_reported_as_performed() -> None:

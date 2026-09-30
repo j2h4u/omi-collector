@@ -12,7 +12,7 @@ from typing import TextIO, cast
 from uuid import uuid4
 
 from ..application.ports import ClockCorrectionShape
-from .clock_observations import ClockObservationStore
+from .clock_observations import ClockObservation, ClockObservationStore
 
 try:
     import fcntl
@@ -20,12 +20,11 @@ except ImportError:  # pragma: no cover - Windows is not a supported runtime.
     fcntl = None  # type: ignore[assignment]
 
 _SCHEMA_VERSION = 2
-_VALID_STATES = frozenset({"prepared", "not_written", "unresolved", "not_applied", "applied", "resolved"})
-_VALID_FINISH_STATES = frozenset({"not_written", "unresolved", "not_applied", "applied", "resolved"})
+_VALID_STATES = frozenset({"prepared", "not_written", "unresolved", "not_applied", "applied", "resolved", "unknown"})
+_VALID_FINISH_STATES = frozenset({"not_written", "unresolved", "not_applied", "applied", "resolved", "unknown"})
 _ALLOWED_TRANSITIONS = {
     "prepared": frozenset({"not_written", "unresolved"}),
-    "unresolved": frozenset({"unresolved", "not_applied", "applied", "resolved"}),
-    "applied": frozenset({"resolved"}),
+    "unresolved": frozenset({"unresolved", "not_applied", "applied", "resolved", "unknown"}),
 }
 
 
@@ -53,6 +52,14 @@ class ClockCorrectionStore:
         self._root = device_state_path.parent / "clock-corrections"
         self._pending_attempts = attempts_root or device_state_path.parent / "attempts"
         self._observations = ClockObservationStore(device_state_path)
+        self._transport_fenced = False
+        self._transport_fence_frontier = -1
+
+    def note_transport_closed(self) -> None:
+        """Fence later-session reconciliation behind a completed physical close."""
+        records = self._observations.records()
+        self._transport_fenced = True
+        self._transport_fence_frontier = records[-1].causal_order if records else -1
 
     def append(self, **values: object) -> object:
         """Expose the evidence sink beside correction operations."""
@@ -123,7 +130,7 @@ class ClockCorrectionStore:
             and current.verified_epoch == verified_epoch
         ):
             return current
-        if current != correction or correction.state not in {"prepared", "unresolved", "applied"}:
+        if current != correction or correction.state not in {"prepared", "unresolved"}:
             raise ClockCorrectionError("clock correction transition conflicts with durable state")
         _validate_finish_transition(correction, state, boundary_sequence_max, verified_epoch)
         completed = replace(
@@ -135,7 +142,7 @@ class ClockCorrectionStore:
         self._write_atomic(self._path(correction), completed)
         return completed
 
-    def reconcile_observation(  # noqa: PLR0913 - explicit causal reconciliation inputs
+    def reconcile_observation(  # noqa: PLR0911, PLR0913 - branch order enforces causal and persistence checks
         self,
         observed_epoch: int,
         drift_seconds: float,
@@ -167,13 +174,23 @@ class ClockCorrectionStore:
             return ()
         if observation_id is None and self._observations.records():
             return ()
+        observations = self._observations.records()
+        later = _cross_session_observation(observation_id, observations)
+        if later is not None and (not self._transport_fenced or later.causal_order <= self._transport_fence_frontier):
+            return ()
         records = self.records()
         current = _pending_correction(records, boundary_sequence_max, operation_id)
         if current is None:
             return ()
         if _confirmed_boundary_conflicts(records, current, boundary_sequence_max, operation_id):
             return ()
-        state, verified_epoch = _reconciliation_state(current, observed_epoch, drift_seconds, near_zero_threshold)
+        state, verified_epoch = _reconciliation_state(
+            current,
+            observed_epoch,
+            drift_seconds,
+            near_zero_threshold,
+            later is not None and later.evidence_kind == "native_trusted",
+        )
         if state is None:
             return ()
         completed = replace(
@@ -265,6 +282,8 @@ class ClockCorrectionStore:
             return current
         if current != correction or correction.state != "prepared":
             raise ClockCorrectionError("clock correction intent is not prepared")
+        self._transport_fenced = False
+        self._transport_fence_frontier = -1
         unresolved = replace(correction, state="unresolved")
         self._write_atomic(self._path(correction), unresolved)
         return unresolved
@@ -292,7 +311,7 @@ class ClockCorrectionStore:
         return any(path.is_dir() and not (path / "terminal-retired.json").exists() for path in root.iterdir())
 
     def _has_pending_correction(self) -> bool:
-        return any(correction.state in {"prepared", "unresolved", "applied"} for correction in self.records())
+        return any(correction.state in {"prepared", "unresolved"} for correction in self.records())
 
     @staticmethod
     def _payload(correction: ClockCorrection) -> bytes:
@@ -400,6 +419,10 @@ class ClockCorrectionStore:
                 raise ValueError("clock correction state fields are invalid")
             if correction.state == "not_applied" and correction.verified_epoch is not None:
                 raise ValueError("clock correction state fields are invalid")
+            if correction.state == "unknown" and (
+                correction.boundary_sequence_max is None or correction.verified_epoch is not None
+            ):
+                raise ValueError("unknown clock correction fields are invalid")
             if correction.state in {"applied", "resolved"} and (
                 correction.boundary_sequence_max is None or correction.verified_epoch is None
             ):
@@ -533,16 +556,35 @@ def _reconciliation_state(
     observed_epoch: int,
     drift_seconds: float,
     near_zero_threshold: float,
+    fresh_session: bool,
 ) -> tuple[str | None, int | None]:
     if abs(drift_seconds) <= near_zero_threshold:
         return "applied", observed_epoch
     if math.isclose(drift_seconds, correction.drift_seconds, rel_tol=0.0, abs_tol=near_zero_threshold):
         return "not_applied", None
+    if fresh_session:
+        return "unknown", None
     return None, None
 
 
+def _cross_session_observation(
+    observation_id: str | None, records: tuple[ClockObservation, ...]
+) -> ClockObservation | None:
+    if observation_id is None:
+        return None
+    observation = next((item for item in records if item.observation_id == observation_id), None)
+    if observation is None or observation.observation_role != "later":
+        return None
+    parent = next((item for item in records if item.observation_id == observation.parent_observation_id), None)
+    if parent is None or parent.observation_role != "initial" or parent.operation_id != observation.operation_id:
+        return None
+    if parent.causal_order >= observation.causal_order or parent.session_id == observation.session_id:
+        return None
+    return observation
+
+
 def _validate_finish_state(correction: ClockCorrection, state: str) -> None:
-    if state not in _ALLOWED_TRANSITIONS[correction.state]:
+    if state not in _ALLOWED_TRANSITIONS.get(correction.state, frozenset()):
         raise ClockCorrectionError("clock correction state transition is invalid")
 
 
@@ -557,6 +599,8 @@ def _validate_finish_fields(
         raise ClockCorrectionError("clock correction state fields are invalid")
     if state == "not_applied" and verified_epoch is not None:
         raise ClockCorrectionError("clock correction state fields are invalid")
+    if state == "unknown" and (boundary_sequence_max is None or verified_epoch is not None):
+        raise ClockCorrectionError("unknown clock correction fields are invalid")
     if state in {"applied", "resolved"} and (boundary_sequence_max is None or verified_epoch is None):
         raise ClockCorrectionError("confirmed clock correction has no verified evidence")
 

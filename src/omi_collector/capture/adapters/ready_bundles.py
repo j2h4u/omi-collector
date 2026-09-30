@@ -245,6 +245,7 @@ def _finalize_group(group: _DraftGroup, finalization: _Finalization) -> ReadyBun
             _remove_draft(draft.path)
         return result
     ranges = _time_ranges(manifest, finalization.clock_segments)
+    ranges = _clear_unrepresentable_ranges(group, ranges)
     result = _write_ready_group(group, destination, ranges)
     _record_ready(finalization.ledger_path, finalization.ledger, result, manifest)
     for draft in group.drafts:
@@ -396,11 +397,16 @@ def _validate_utc(value: object) -> None:
 def _validate_utc_mapping(value: object) -> None:
     if not isinstance(value, dict):
         raise ReadyBundleError("ready manifest UTC mapping is invalid")
-    if set(value) != {"observation_id", "offset_seconds", "uncertainty_seconds"}:
+    if set(value) not in (
+        {"observation_id", "offset_seconds", "uncertainty_seconds"},
+        {"observation_id", "offset_seconds", "uncertainty_seconds", "confidence"},
+    ):
         raise ReadyBundleError("ready manifest UTC mapping is invalid")
     _validate_observation_id(value["observation_id"])
     _finite_number(value["offset_seconds"])
     _validate_nonnegative(_finite_number(value["uncertainty_seconds"]))
+    if "confidence" in value and value["confidence"] not in ("approximate", "confirmed"):
+        raise ReadyBundleError("ready manifest UTC mapping is invalid")
 
 
 def _validate_observation_id(value: object) -> None:
@@ -522,6 +528,39 @@ def _write_ready_group(
     )
 
 
+def _clear_unrepresentable_ranges(
+    group: _DraftGroup, ranges: tuple[dict[str, object], ...]
+) -> tuple[dict[str, object], ...]:
+    """Keep every record intact when UTC normalization would exceed its uint32 header."""
+    invalid: set[int] = set()
+    range_index = 0
+    next_sequence = ranges[0]["next_sequence"]
+    assert isinstance(next_sequence, int)
+    for draft in group.drafts:
+        with (draft.path / _RAW_NAME).open("rb") as source:
+            source.seek(draft.byte_offset)
+            for index in range(draft.manifest.record_count):
+                record = source.read(RECORD_SIZE)
+                if len(record) != RECORD_SIZE:
+                    raise ReadyBundleError("draft records ended unexpectedly")
+                sequence = draft.manifest.start_sequence + index
+                while sequence >= next_sequence:
+                    range_index += 1
+                    next_sequence = ranges[range_index]["next_sequence"]
+                    assert isinstance(next_sequence, int)
+                utc = ranges[range_index]["utc"]
+                if utc is None:
+                    continue
+                assert isinstance(utc, Mapping)
+                timestamp = int.from_bytes(record[:TIMESTAMP_SIZE], "big")
+                offset = utc["offset_seconds"]
+                assert isinstance(offset, float)
+                normalized = math.floor(timestamp + offset + 0.5)
+                if not 0 <= normalized <= _UINT32_MAX:
+                    invalid.add(range_index)
+    return tuple({**item, "utc": None} if index in invalid else item for index, item in enumerate(ranges))
+
+
 def _convert_record(record: bytes, time_range: Mapping[str, object]) -> bytes:
     utc = time_range["utc"]
     if utc is None:
@@ -566,6 +605,7 @@ def _time_range(start_sequence: int, next_sequence: int, segments: ClockSegmentM
             "observation_id": segment.observation_id,
             "offset_seconds": segment.utc_offset_seconds,
             "uncertainty_seconds": segment.uncertainty_seconds,
+            **({"confidence": segment.confidence} if segment.confidence == "approximate" else {}),
         },
     }
 

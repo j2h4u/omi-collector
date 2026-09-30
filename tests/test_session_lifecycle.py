@@ -26,7 +26,7 @@ from omi_collector.capture.application.presence_machine import (
     ConnectedInterruption,
     NotConnected,
 )
-from omi_collector.capture.application.ring_transport import RingSession
+from omi_collector.capture.application.ring_transport import RingSession, RingTransportUnavailableError
 from omi_collector.capture.application.session_lifecycle import (
     InfoReader,
     OpportunisticOptions,
@@ -37,6 +37,7 @@ from omi_collector.capture.application.session_lifecycle import (
     SessionPhaseState,
     exit_context,
     presence_attempt_outcome,
+    teardown_was_interrupted,
 )
 from omi_collector.capture.domain.ring_protocol import RingInfo
 
@@ -111,6 +112,60 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
     assert events == ["connected", "teardown", "checkpoint"]
 
 
+def test_clock_transport_fence_requires_error_free_context_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    receipts: list[str] = []
+
+    class Context:
+        def __init__(self, *, fails_close: bool) -> None:
+            self.fails_close = fails_close
+
+        async def __aenter__(self) -> RingSession:
+            return cast(RingSession, object())
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            if self.fails_close:
+                raise RingTransportUnavailableError("disconnect failed")
+
+    async def ignore_session_error(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def scenario() -> None:
+        monkeypatch.setattr(
+            "omi_collector.capture.application.session_lifecycle.report_session_error", ignore_session_error
+        )
+        retryable_failed_close_interrupted = await teardown_was_interrupted(
+            Context(fails_close=True),
+            None,
+            1.0,
+            None,
+            OpportunisticRuntime(),
+            on_transport_closed=lambda: receipts.append("retryable-failed"),
+        )
+        failed_close_interrupted = await teardown_was_interrupted(
+            Context(fails_close=True),
+            RuntimeError("transfer already failed"),
+            1.0,
+            None,
+            OpportunisticRuntime(),
+            on_transport_closed=lambda: receipts.append("failed"),
+        )
+        successful_close_interrupted = await teardown_was_interrupted(
+            Context(fails_close=False),
+            None,
+            1.0,
+            None,
+            OpportunisticRuntime(),
+            on_transport_closed=lambda: receipts.append("closed"),
+        )
+
+        assert retryable_failed_close_interrupted is True
+        assert failed_close_interrupted is False
+        assert successful_close_interrupted is False
+
+    _run(scenario())
+    assert receipts == ["closed"]
+
+
 def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     info = RingInfo(10, 10, 100, 0, 512)
     activity: list[object] = []
@@ -139,6 +194,11 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
     async def observe_error(_activity: object, _phase: object, error: BaseException, _runtime: object) -> None:
         errors.append(error)
 
+    class CorrectionSink:
+        @staticmethod
+        def note_transport_closed() -> None:
+            return None
+
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=_noop,
         wait_presence_attempt=_wait,
@@ -151,7 +211,7 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
         TransferTimeouts(1, 1),
         RetryPolicy(backoff=(1,), stop_after_drained=True),
         activity=activity.append,
-        clock_correction_sink=cast(ClockCorrectionSink, object()),
+        clock_correction_sink=cast(ClockCorrectionSink, CorrectionSink()),
         clock_lease=lambda: _Lease(),
     )
     run = SessionLifecycleRun(

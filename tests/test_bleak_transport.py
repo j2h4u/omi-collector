@@ -36,6 +36,7 @@ from omi_collector.capture.application.ring_transport import (
     RingTransportDisconnectedError,
     RingTransportUnavailableError,
 )
+from omi_collector.capture.application.session_lifecycle import exit_context
 from omi_collector.capture.domain.ring_protocol import CMD_STOP, RECORD_SIZE, encode_info_command
 from omi_collector.config import DEFAULT_CONFIG
 
@@ -898,14 +899,17 @@ async def test_cancelling_hanging_stop_notify_still_attempts_disconnect() -> Non
 
 
 @_async_test
-async def test_session_context_cleanup_failure_does_not_mask_primary_or_cancellation() -> None:
+async def test_session_context_cleanup_failure_reaches_primary_preserving_outer_exit() -> None:
     for primary in (RingTransferError("range loss"), asyncio.CancelledError()):
         client = FakeClient([], fail_stop=True, fail_disconnect=True)
-        session = await BleakRingTransport("fake", client_factory=_factory_for(client)).connect()
+        transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+        await transport.connect()
+        secondary: list[BaseException] = []
 
-        with pytest.raises(type(primary)):
-            async with session:
-                raise primary
+        await exit_context(transport, primary, 1.0, secondary)
+
+        assert len(secondary) == 1
+        assert isinstance(secondary[0], RingTransportUnavailableError)
 
 
 @_async_test

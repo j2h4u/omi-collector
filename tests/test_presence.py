@@ -8,12 +8,18 @@ import pytest
 from omi_collector.capture.application import presence as presence_module
 from omi_collector.capture.application.presence import (
     PresenceAdvertisement,
+    PresenceEnd,
     PresencePolicy,
     PresenceScanStopError,
     PresenceScanTransitionError,
     PresenceScheduler,
 )
-from omi_collector.capture.application.presence_machine import CandidateUnavailable, CleanDrain, ConnectedInterruption
+from omi_collector.capture.application.presence_machine import (
+    CandidateUnavailable,
+    CleanDrain,
+    ConnectedInterruption,
+    NotConnected,
+)
 from omi_collector.config import PresenceConfig
 
 
@@ -673,6 +679,46 @@ def test_typed_outcome_restarts_observation_and_no_candidate_invalidation_api_re
 
         assert observer.active
         assert not hasattr(scheduler, "invalidate_candidate")
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_absence_end_returns_without_a_gatt_permit() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, rapid_backoff=(0.001, 0.002)),
+        )
+        first = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer)
+        assert not isinstance(await first, PresenceEnd)
+        assert await scheduler.attempt_finished(NotConnected(durable_progress=False)) is None
+
+        ended = await scheduler.wait_for_attempt()
+
+        assert ended == PresenceEnd("absence")
+        assert not observer.active
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_recovery_exhaustion_returns_end_without_restarting_scanner() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(observer, policy=_test_policy(rapid_backoff=(0.01,)))
+        first = asyncio.create_task(scheduler.wait_for_attempt())
+        await _wait_started(observer)
+        await _emit_stable(observer)
+        assert not isinstance(await first, PresenceEnd)
+
+        ended = await scheduler.attempt_finished(NotConnected(durable_progress=False))
+
+        assert ended == PresenceEnd("recovery_exhausted")
+        assert not observer.active
         await scheduler.close()
 
     _run(scenario())

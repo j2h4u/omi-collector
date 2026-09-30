@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+from dataclasses import fields
+from itertools import product
+from typing import Literal, Protocol, cast, get_args
 
 import pytest
 
@@ -9,6 +11,7 @@ from omi_collector.capture.application.visit_machine import (
     Attempting,
     CandidateUnavailable,
     CloseFailed,
+    CloseReason,
     Closing,
     ClosureCommitted,
     CommitClosure,
@@ -21,19 +24,207 @@ from omi_collector.capture.application.visit_machine import (
     OperatorBatchCompleted,
     PreserveAndStop,
     Recovering,
+    RecoveryDisposition,
     RecoveryEnded,
+    RecoveryEndReason,
     RecoveryLoaded,
     RunAttempt,
     SessionFinished,
+    SessionOutcome,
     Shutdown,
     Stopped,
     TransitionResult,
+    VisitCommand,
+    VisitEvent,
+    VisitState,
     VisitTransitionError,
     WaitForAttempt,
     Waiting,
     initial_transition,
     transition,
 )
+
+
+class _AliasWithValue(Protocol):
+    __value__: object
+
+
+def _alias_args(alias: object) -> tuple[object, ...]:
+    return cast(tuple[object, ...], get_args(cast(_AliasWithValue, alias).__value__))
+
+
+CLOSE_REASONS = cast(tuple[CloseReason, ...], _alias_args(CloseReason))
+RECOVERY_DISPOSITIONS = cast(tuple[RecoveryDisposition, ...], _alias_args(RecoveryDisposition))
+RECOVERY_END_REASONS = cast(tuple[RecoveryEndReason, ...], _alias_args(RecoveryEndReason))
+STOP_POLICIES = (False, True)
+COMMAND_TYPES = (InspectRecovery, WaitForAttempt, RunAttempt, CommitClosure, FinishVisit, PreserveAndStop, NoOp)
+STATES = (
+    Recovering(),
+    Idle(),
+    Waiting(),
+    Attempting(Idle()),
+    Attempting(Waiting()),
+    *(Closing(reason) for reason in CLOSE_REASONS),
+    Stopped(),
+)
+OUTCOMES = (
+    DrainConfirmed(),
+    *(Interrupted(connected, durable) for connected, durable in product((False, True), repeat=2)),
+    CandidateUnavailable(),
+    OperatorBatchCompleted(),
+)
+EVENTS: tuple[VisitEvent, ...] = (
+    *(RecoveryLoaded(disposition) for disposition in RECOVERY_DISPOSITIONS),
+    AttemptGranted(),
+    *(SessionFinished(outcome) for outcome in OUTCOMES),
+    *(RecoveryEnded(reason) for reason in RECOVERY_END_REASONS),
+    ClosureCommitted(),
+    CloseFailed(),
+    Shutdown(),
+)
+LEGAL_EVENT_TYPES: dict[type[object], frozenset[type[object]]] = {
+    Recovering: frozenset({RecoveryLoaded, Shutdown}),
+    Idle: frozenset({AttemptGranted, Shutdown}),
+    Waiting: frozenset({AttemptGranted, RecoveryEnded, Shutdown}),
+    Attempting: frozenset({SessionFinished, Shutdown}),
+    Closing: frozenset({ClosureCommitted, CloseFailed, Shutdown}),
+    Stopped: frozenset(type(event) for event in EVENTS),
+}
+
+EXPECTED_CLOSURE_RESULTS = {
+    "drained": {
+        False: TransitionResult(Idle(), FinishVisit("drained", False)),
+        True: TransitionResult(Stopped(), FinishVisit("drained", True)),
+    },
+    "absence": {
+        False: TransitionResult(Idle(), FinishVisit("absence", False)),
+        True: TransitionResult(Idle(), FinishVisit("absence", False)),
+    },
+    "recovery_exhausted": {
+        False: TransitionResult(Idle(), FinishVisit("recovery_exhausted", False)),
+        True: TransitionResult(Idle(), FinishVisit("recovery_exhausted", False)),
+    },
+    "restart_interrupted": {
+        False: TransitionResult(Recovering(), InspectRecovery()),
+        True: TransitionResult(Recovering(), InspectRecovery()),
+    },
+    "operator_limit": {
+        False: TransitionResult(Stopped(), FinishVisit("operator_limit", True)),
+        True: TransitionResult(Stopped(), FinishVisit("operator_limit", True)),
+    },
+}
+
+
+def _expected_transitions() -> dict[tuple[VisitState, VisitEvent, bool], TransitionResult]:
+    rows: dict[tuple[VisitState, VisitEvent, bool], TransitionResult] = {}
+    for stop_after_drained in STOP_POLICIES:
+        rows.update(
+            {
+                (Recovering(), RecoveryLoaded("empty"), stop_after_drained): TransitionResult(Idle(), WaitForAttempt()),
+                (Recovering(), RecoveryLoaded("resumable"), stop_after_drained): TransitionResult(
+                    Waiting(), WaitForAttempt(arm_restored=True)
+                ),
+                (
+                    Recovering(),
+                    RecoveryLoaded("needs_interrupted_close"),
+                    stop_after_drained,
+                ): TransitionResult(Closing("restart_interrupted"), CommitClosure("restart_interrupted")),
+                (Idle(), AttemptGranted(), stop_after_drained): TransitionResult(Attempting(Idle()), RunAttempt()),
+                (Waiting(), AttemptGranted(), stop_after_drained): TransitionResult(
+                    Attempting(Waiting()), RunAttempt()
+                ),
+                (Waiting(), RecoveryEnded("absence"), stop_after_drained): TransitionResult(
+                    Closing("absence"), CommitClosure("absence")
+                ),
+                (Waiting(), RecoveryEnded("recovery_exhausted"), stop_after_drained): TransitionResult(
+                    Closing("recovery_exhausted"), CommitClosure("recovery_exhausted")
+                ),
+                (Closing("drained"), ClosureCommitted(), stop_after_drained): EXPECTED_CLOSURE_RESULTS["drained"][
+                    stop_after_drained
+                ],
+                (Closing("absence"), ClosureCommitted(), stop_after_drained): EXPECTED_CLOSURE_RESULTS["absence"][
+                    stop_after_drained
+                ],
+                (
+                    Closing("recovery_exhausted"),
+                    ClosureCommitted(),
+                    stop_after_drained,
+                ): EXPECTED_CLOSURE_RESULTS["recovery_exhausted"][stop_after_drained],
+                (
+                    Closing("restart_interrupted"),
+                    ClosureCommitted(),
+                    stop_after_drained,
+                ): EXPECTED_CLOSURE_RESULTS["restart_interrupted"][stop_after_drained],
+                (
+                    Closing("operator_limit"),
+                    ClosureCommitted(),
+                    stop_after_drained,
+                ): EXPECTED_CLOSURE_RESULTS["operator_limit"][stop_after_drained],
+            }
+        )
+        for origin in (Idle(), Waiting()):
+            rows.update(
+                {
+                    (Attempting(origin), SessionFinished(DrainConfirmed()), stop_after_drained): TransitionResult(
+                        Closing("drained"), CommitClosure("drained")
+                    ),
+                    (
+                        Attempting(origin),
+                        SessionFinished(CandidateUnavailable()),
+                        stop_after_drained,
+                    ): TransitionResult(origin, WaitForAttempt(previous_outcome=CandidateUnavailable())),
+                    (
+                        Attempting(origin),
+                        SessionFinished(OperatorBatchCompleted()),
+                        stop_after_drained,
+                    ): TransitionResult(Closing("operator_limit"), CommitClosure("operator_limit")),
+                }
+            )
+            for outcome in OUTCOMES:
+                if isinstance(outcome, Interrupted):
+                    rows[(Attempting(origin), SessionFinished(outcome), stop_after_drained)] = TransitionResult(
+                        Waiting(), WaitForAttempt(previous_outcome=outcome)
+                    )
+        for state in STATES:
+            if not isinstance(state, Stopped):
+                rows[(state, Shutdown(), stop_after_drained)] = TransitionResult(Stopped(), PreserveAndStop())
+            else:
+                for event in EVENTS:
+                    rows[(state, event, stop_after_drained)] = TransitionResult(state, NoOp())
+        for state in (Closing(reason) for reason in CLOSE_REASONS):
+            rows[(state, CloseFailed(), stop_after_drained)] = TransitionResult(Stopped(), PreserveAndStop())
+    return rows
+
+
+EXPECTED_TRANSITIONS = _expected_transitions()
+
+FIELD_INVENTORY = {
+    Recovering: (),
+    Idle: (),
+    Waiting: (),
+    Attempting: ("origin",),
+    Closing: ("reason",),
+    Stopped: (),
+    DrainConfirmed: (),
+    Interrupted: ("connected", "durable_progress"),
+    CandidateUnavailable: (),
+    OperatorBatchCompleted: (),
+    RecoveryLoaded: ("disposition",),
+    AttemptGranted: (),
+    SessionFinished: ("outcome",),
+    RecoveryEnded: ("reason",),
+    ClosureCommitted: (),
+    CloseFailed: (),
+    Shutdown: (),
+    InspectRecovery: (),
+    WaitForAttempt: ("arm_restored", "previous_outcome"),
+    RunAttempt: (),
+    CommitClosure: ("reason",),
+    FinishVisit: ("reason", "stop"),
+    PreserveAndStop: (),
+    NoOp: (),
+    TransitionResult: ("state", "command"),
+}
 
 
 def test_startup_recovery_disposition_and_interrupted_close_loop() -> None:
@@ -138,3 +329,127 @@ def test_close_failure_shutdown_and_stopped_late_events_preserve_evidence() -> N
 def test_invalid_events_raise_visit_transition_error(state: object, event: object) -> None:
     with pytest.raises(VisitTransitionError):
         transition(state, event)  # type: ignore[arg-type]
+
+
+def test_finite_model_is_exhaustive_and_reachable() -> None:
+    assert set(_alias_args(VisitState)) == {Recovering, Idle, Waiting, Attempting, Closing, Stopped}
+    assert set(_alias_args(VisitEvent)) == {
+        RecoveryLoaded,
+        AttemptGranted,
+        SessionFinished,
+        RecoveryEnded,
+        ClosureCommitted,
+        CloseFailed,
+        Shutdown,
+    }
+    assert set(_alias_args(SessionOutcome)) == {
+        DrainConfirmed,
+        Interrupted,
+        CandidateUnavailable,
+        OperatorBatchCompleted,
+    }
+    assert set(_alias_args(VisitCommand)) == {
+        InspectRecovery,
+        WaitForAttempt,
+        RunAttempt,
+        CommitClosure,
+        FinishVisit,
+        PreserveAndStop,
+        NoOp,
+    }
+    assert {type(state) for state in STATES} == set(_alias_args(VisitState))
+    assert {type(event) for event in EVENTS} == set(_alias_args(VisitEvent))
+    assert {type(outcome) for outcome in OUTCOMES} == set(_alias_args(SessionOutcome))
+    for dataclass_type, field_names in FIELD_INVENTORY.items():
+        assert tuple(field.name for field in fields(dataclass_type)) == field_names
+    assert len(STATES) == 11
+    assert len(EVENTS) == 16
+    assert len(STATES) * len(EVENTS) * len(STOP_POLICIES) == 352
+    assert len(EXPECTED_TRANSITIONS) == 114
+    assert set(EXPECTED_TRANSITIONS) == {
+        (state, event, stop_after_drained)
+        for state, event, stop_after_drained in product(STATES, EVENTS, STOP_POLICIES)
+        if type(event) in LEGAL_EVENT_TYPES[type(state)]
+    }
+    assert {state.reason for state in STATES if isinstance(state, Closing)} == set(CLOSE_REASONS)
+    assert {event.disposition for event in EVENTS if isinstance(event, RecoveryLoaded)} == set(RECOVERY_DISPOSITIONS)
+    assert {event.reason for event in EVENTS if isinstance(event, RecoveryEnded)} == set(RECOVERY_END_REASONS)
+    assert {
+        (event.outcome.connected, event.outcome.durable_progress)
+        for event in EVENTS
+        if isinstance(event, SessionFinished) and isinstance(event.outcome, Interrupted)
+    } == set(product((False, True), repeat=2))
+
+    accepted = rejected = 0
+    for state, event, stop_after_drained in product(STATES, EVENTS, STOP_POLICIES):
+        legal = type(event) in LEGAL_EVENT_TYPES[type(state)]
+        try:
+            result = transition(state, event, stop_after_drained=stop_after_drained)
+        except VisitTransitionError as error:
+            assert type(error) is VisitTransitionError
+            assert not legal
+            rejected += 1
+            continue
+        assert legal
+        accepted += 1
+        assert result.state in STATES
+        assert isinstance(result.command, COMMAND_TYPES)
+        assert result == EXPECTED_TRANSITIONS[(state, event, stop_after_drained)]
+        _assert_finite_invariants(state, event, result, stop_after_drained)
+
+    assert (accepted, rejected) == (114, 238)
+    _assert_all_states_reachable()
+
+
+def _assert_finite_invariants(
+    state: VisitState,
+    event: VisitEvent,
+    result: TransitionResult,
+    stop_after_drained: bool,
+) -> None:
+    if isinstance(state, Stopped):
+        assert result == TransitionResult(state, NoOp())
+        return
+    if isinstance(result.command, CommitClosure):
+        assert isinstance(result.state, Closing)
+        assert result.command.reason == result.state.reason
+    if isinstance(result.command, RunAttempt):
+        assert isinstance(state, (Idle, Waiting))
+        assert isinstance(event, AttemptGranted)
+        assert result.state == Attempting(state)
+    if isinstance(result.command, FinishVisit):
+        assert isinstance(state, Closing)
+        assert isinstance(event, ClosureCommitted)
+        assert result.command.reason == state.reason
+        assert result.command.stop == (
+            state.reason == "operator_limit" or (state.reason == "drained" and stop_after_drained)
+        )
+        if state.reason in {"absence", "recovery_exhausted"}:
+            assert result.command.stop is False
+    if isinstance(event, SessionFinished) and isinstance(event.outcome, DrainConfirmed):
+        assert isinstance(state, Attempting)
+        assert result.state == Closing("drained")
+    if isinstance(event, SessionFinished) and isinstance(event.outcome, CandidateUnavailable):
+        assert isinstance(state, Attempting)
+        assert result.state == state.origin
+    if isinstance(event, (CloseFailed, Shutdown)):
+        assert isinstance(result.state, Stopped)
+        assert isinstance(result.command, PreserveAndStop)
+
+
+def _assert_all_states_reachable() -> None:
+    for stop_after_drained in STOP_POLICIES:
+        pending = [initial_transition().state]
+        reached = {pending[0]}
+        while pending:
+            state = pending.pop()
+            for event in EVENTS:
+                try:
+                    result = transition(state, event, stop_after_drained=stop_after_drained)
+                except VisitTransitionError:
+                    continue
+                assert result.state in STATES
+                if result.state not in reached:
+                    reached.add(result.state)
+                    pending.append(result.state)
+        assert reached == set(STATES)

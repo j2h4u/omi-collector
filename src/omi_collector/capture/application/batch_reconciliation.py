@@ -373,7 +373,7 @@ async def _read_and_seal(
     run = context.run
     reconciliation = await _read_or_reconcile(session, current, batch, run, phase)
     if isinstance(reconciliation, _PrefixPublished):
-        await _continue_after_prefix(context.state, batch, reconciliation, run.staging, run.options)
+        await _continue_after_prefix(context.state, batch, reconciliation, run.options)
         return None
     if isinstance(reconciliation, _ReconcileRestart):
         _continue_after_reconcile_restart(context.state)
@@ -781,7 +781,6 @@ async def _continue_after_prefix(
     state: _State,
     batch: _Batch,
     publication: _PrefixPublished,
-    staging: StagingPort,
     options: OpportunisticOptions,
 ) -> None:
     """Retire a prefix-publication attempt while keeping the session available for READ."""
@@ -801,9 +800,7 @@ async def _continue_after_prefix(
         state.last_result = collector.CollectionResult(
             batch.info, prefix.record_count, publication.seal, prefix.next_sequence, False
         )
-    attempt_id = batch.writer.attempt_id
     await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
-    await asyncio.to_thread(staging.terminalize_prefix_attempt, attempt_id)
     state.batch = None
     state.pending_descriptor = None
     state.pending_durable_next = None

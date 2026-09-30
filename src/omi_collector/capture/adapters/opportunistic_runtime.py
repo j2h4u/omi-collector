@@ -71,10 +71,7 @@ class _StagingWriterAdapter:
         return result
 
     def publish_prefix(self) -> SealResultShape | None:
-        result = self._writer.publish_prefix()
-        if result is not None:
-            self._publish_ready()
-        return result
+        return self._writer.publish_prefix()
 
     def _publish_ready(self) -> None:
         try:

@@ -274,6 +274,10 @@ class StagingStore:
             attempt_id,
         )
 
+    def terminalize_prefix_attempt_held(self, attempt_id: str, lease: DeviceLock) -> None:
+        """Terminalize a prefix under the writer's already-held device lease."""
+        quarantine.terminalize_prefix_attempt_held(self._filesystem, attempt_id, lease)
+
     def sweep_terminal_retired(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.sweep_terminal_retired(
             self._filesystem,

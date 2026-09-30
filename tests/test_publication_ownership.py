@@ -9,6 +9,7 @@ import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import _StagingWriterAdapter
 from omi_collector.capture.adapters.staging_contract import AttemptStateError
+from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
@@ -53,6 +54,42 @@ def test_sealed_writer_publishes_with_its_held_lease(tmp_path: Path) -> None:
     assert ready is not None
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     writer.close()
+    authority.close()
+
+
+def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    authority = store.create_publication_authority()
+    writer = StagingWriter(store, 100, 1)
+    writer.prepare()
+    writer.prepare_leg(100, 1)
+    writer.read_begin(ReadBeginNotification(100, 1))
+    writer.append_chunk(0, memoryview(_record(100)))
+    writer.checkpoint()
+    attempt_path = store.attempts_root / writer.attempt_id
+
+    retired: list[bool] = []
+    original = store.terminalize_prefix_attempt_held
+
+    def observe_terminalization(attempt_id: str, lease: DeviceLock) -> None:
+        lease.require_active()
+        retired.append((attempt_path / "prefix-publication.json").is_file())
+        original(attempt_id, lease)
+
+    monkeypatch.setattr(store, "terminalize_prefix_attempt_held", observe_terminalization)
+    assert writer.publish_prefix() is not None
+    assert tuple(store.capture_root.iterdir())
+
+    writer.close()
+
+    assert retired == [True]
+    assert (attempt_path / "terminal-retired.json").is_file()
+    writer.close()
+    assert authority.publish() is not None
+    assert not tuple(store.capture_root.iterdir())
+    assert store.sweep_terminal_retired() == ()
     authority.close()
 
 

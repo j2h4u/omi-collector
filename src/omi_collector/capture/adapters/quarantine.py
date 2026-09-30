@@ -113,9 +113,7 @@ def terminalize_prefix_attempt(filesystem: StagingFilesystem, attempt_id: str) -
         _terminalize_prefix_attempt_held(filesystem, attempt_id)
 
 
-def terminalize_prefix_attempt_held(
-    filesystem: StagingFilesystem, attempt_id: str, held_lease: DeviceLock
-) -> None:
+def terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: str, held_lease: DeviceLock) -> None:
     """Terminalize one prefix while the caller retains the active spool lease."""
     _validate_attempt_id(attempt_id)
     filesystem.require_device_lock(held_lease)

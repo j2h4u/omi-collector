@@ -48,6 +48,8 @@ def test_sealed_writer_publishes_with_its_held_lease(tmp_path: Path) -> None:
     store = _store(tmp_path)
     authority = store.create_publication_authority()
     writer = _seal_writer(store)
+    assert writer._lease is not None
+    store._append_ready_closure_unlocked(writer._lease, 101, "visit_complete")
 
     ready = writer.publish_ready()
 
@@ -87,6 +89,7 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     assert retired == [True]
     assert (attempt_path / "terminal-retired.json").is_file()
     writer.close()
+    store.append_ready_closure(101, "prefix_cursor_ahead")
     assert authority.publish() is not None
     assert not tuple(store.capture_root.iterdir())
     assert store.sweep_terminal_retired() == ()
@@ -98,6 +101,7 @@ def test_authorized_clock_child_task_publishes_after_writer_releases(tmp_path: P
     authority = store.create_publication_authority()
     writer = _seal_writer(store)
     writer.close()
+    store.append_ready_closure(101, "visit_complete")
 
     async def publish_from_child_task() -> object | None:
         async def publish() -> object | None:
@@ -139,6 +143,8 @@ def test_failed_sealed_publication_retains_capture_for_authorized_retry(
     assert not tuple((tmp_path / "ready").glob("*/manifest.json"))
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", original)
 
+    assert writer._lease is not None
+    store._append_ready_closure_unlocked(writer._lease, 101, "visit_complete")
     assert authority.publish() is not None
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     writer.close()

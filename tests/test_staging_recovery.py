@@ -211,12 +211,13 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
         publication_root=published,
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
+    store.append_ready_closure(_ACCEPTANCE_FRONTIER + 1, "restart_interrupted")
 
     result = store.recover_and_publish()
 
-    assert len(cast(tuple[object, ...], result)) == 72
+    assert len(cast(tuple[object, ...], result)) == 71
     ready_bundles = tuple(path for path in published.iterdir() if path.is_dir() and (path / "manifest.json").is_file())
-    assert len(ready_bundles) == 72
+    assert len(ready_bundles) == 71
     assert tuple(drafts.iterdir()) == ()
     assert sorted(item.boundary_sequence_min for item in corrections.records()) == [
         _ACCEPTANCE_FIRST_BOUNDARY,
@@ -239,6 +240,7 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
         publication_root=published,
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
+    store.append_ready_closure(101, "visit_complete")
     first = cast(tuple[object, ...], store.recover_and_publish())
     assert len(first) == 1
     bundle = next(published.iterdir())
@@ -275,18 +277,21 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
     assert bundles[bundle_id]["state"] == "retired"
 
 
-def test_scheduled_maintenance_flushes_stale_draft_without_pendant(tmp_path: Path) -> None:
+def test_scheduled_maintenance_publishes_closed_draft_without_pendant(tmp_path: Path) -> None:
     drafts = _capture_root(tmp_path)
     published = _shared_ready(tmp_path / "ready")
-    bundle = _one_record_bundle(drafts, 100, 43)
-    utime(bundle / "manifest.json", (1, 1))
+    closed_bundle = _one_record_bundle(drafts, 100, 43)
+    open_bundle = _one_record_bundle(drafts, 101, 44)
+    utime(closed_bundle / "manifest.json", (1, 1))
+    utime(open_bundle / "manifest.json", (1, 1))
     config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=60, max_wait_seconds=1))
     store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
+    store.append_ready_closure(101, "visit_complete")
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
 
     asyncio.run(maintenance.run_once(lambda: False))
 
-    assert not tuple(drafts.iterdir())
+    assert tuple(drafts.iterdir()) == (open_bundle,)
     ready = tuple(published.iterdir())
     assert len(ready) == 1
     assert (ready[0] / "records.bin").is_file()
@@ -301,6 +306,7 @@ def test_acknowledged_group_recovery_cleans_child_drafts_before_retirement(
     _one_record_bundle(drafts, 101, 44)
     config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.039))
     store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
+    store.append_ready_closure(102, "visit_complete")
     remove = ready_bundles._remove_draft
     monkeypatch.setattr(ready_bundles, "_remove_draft", lambda _: (_ for _ in ()).throw(OSError("crash")))
 

@@ -859,7 +859,8 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     assert later.device_epoch == 72
     assert later.parent_observation_id == initial.observation_id
 
-    assert staging.recover_and_publish() is None
+    staging.append_ready_closure(frontier.write_sequence + 1, "restart_interrupted")
+    assert staging.recover_and_publish() is not None
     ready = tuple(path for path in (tmp_path / "published").iterdir() if path.is_dir())
     assert len(ready) == 2
     assert tuple(capture_root.iterdir()) == ()

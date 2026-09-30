@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/j2h4u/omi-collector/compare/v0.9.0...v0.9.1) (2026-09-30)
+
+
+### Documentation
+
+* **ops:** check host BLE discovery before diagnosing pendant ([#147](https://github.com/j2h4u/omi-collector/issues/147)) ([79668c9](https://github.com/j2h4u/omi-collector/commit/79668c9bc00c94d886b2c22272ba0e886a76a8f0))
+
 ## [0.9.0](https://github.com/j2h4u/omi-collector/compare/v0.8.2...v0.9.0) (2026-09-30)
 
 

@@ -23,6 +23,14 @@ then run the full contract before release or handoff.
 
 ## Capture safety
 
+Keep physical-download policy in the pure `visit_machine`: it alone authorizes
+drained, interrupted, restart, or operator-limit closure. Session, presence, and
+storage code supply facts or execute its commands; they do not choose a second
+closure policy. Test event traces independently from BLE and filesystem tests.
+Only a fresh final zero-unread INFO with settled reconciliation, successful
+teardown, and checkpoint can produce `DrainConfirmed`. Publication uses a
+separate durable FIFO; its retries do not change the current visit state.
+
 `INFO` is the source of truth for unread state. Automatic service and sync
 admission requires a current exact-address scanner candidate that has remained
 visible for the configured stable-arrival span; the default is 30 seconds with

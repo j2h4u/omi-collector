@@ -128,9 +128,11 @@ def test_config_rejects_noncanonical_schema(tmp_path: Path, contents: str) -> No
         "[pendant]\naddress = 123\n[ready]\ntarget_audio_seconds = 3600.0\n",
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = "3600"\n',
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = true\n',
-        ('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[presence]\n'
-        "arrival_stability_seconds = true\narrival_max_gap_seconds = 4.0\n"
-        "[ready]\ntarget_audio_seconds = 3600.0\n"),
+        (
+            '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[presence]\n'
+            "arrival_stability_seconds = true\narrival_max_gap_seconds = 4.0\n"
+            "[ready]\ntarget_audio_seconds = 3600.0\n"
+        ),
     ],
 )
 def test_config_rejects_wrong_field_types(tmp_path: Path, contents: str) -> None:

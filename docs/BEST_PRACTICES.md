@@ -47,7 +47,12 @@ state/event matrices, effect-boundary scenarios or existing release gates.
 The command sets `COVERAGE_CORE=ctrace`: Gremlins uses dynamic test contexts,
 which require this coverage backend on our Python 3.14 stack. The pinned fork
 also selects a compatible tracer for its private coverage subprocess, so direct
-Gremlins invocations retain distinct test contexts. It runs separately
+Gremlins invocations retain distinct test contexts. Defaults, annotations, decorators
+and module/class initialization require the complete test suite because their
+effects outlive the test recorded by line coverage. Ordinary callable bodies
+retain coverage-guided selection. Parametrized node IDs must remain intact;
+an unmapped coverage name falls back to the complete suite instead of silently
+dropping a test. Coverage collection remains separate
 from the CRAP coverage gate. Each audit clears the cache first, so changed
 fixtures, helpers and dependencies cannot leave stale verdicts. Completed
 mutants are saved immediately; the command resumes after each 600-second

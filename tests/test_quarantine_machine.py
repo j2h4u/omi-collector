@@ -6,7 +6,6 @@ import pytest
 
 from omi_collector.capture.domain.quarantine_machine import (
     QuarantineAction,
-    QuarantineDecision,
     QuarantineEvent,
     QuarantineState,
     QuarantineTransitionError,
@@ -14,126 +13,121 @@ from omi_collector.capture.domain.quarantine_machine import (
 )
 
 EXPECTED = {
-    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_RETRYABLE): QuarantineDecision(
-        QuarantineState.RETRYABLE, QuarantineAction.SALVAGE
+    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_RETRYABLE): (
+        QuarantineState.RETRYABLE,
+        QuarantineAction.SALVAGE,
     ),
-    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_INVALID): QuarantineDecision(
-        QuarantineState.INVALID_EVIDENCE, QuarantineAction.REAUTHENTICATE
+    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_INVALID): (
+        QuarantineState.INVALID_EVIDENCE,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_OUTPUT_UNMARKED): QuarantineDecision(
-        QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineAction.REAUTHENTICATE
+    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_OUTPUT_UNMARKED): (
+        QuarantineState.OUTPUT_DURABLE_UNMARKED,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_UNPROCESSABLE): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE, QuarantineAction.SKIP
+    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_UNPROCESSABLE): (
+        QuarantineState.UNPROCESSABLE,
+        QuarantineAction.SKIP,
     ),
-    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_PUBLISHED): QuarantineDecision(
-        QuarantineState.PUBLISHED, QuarantineAction.SKIP
+    (QuarantineState.RECOVERING, QuarantineEvent.RECOVERED_PUBLISHED): (
+        QuarantineState.PUBLISHED,
+        QuarantineAction.SKIP,
     ),
-    (QuarantineState.RETRYABLE, QuarantineEvent.INSPECT): QuarantineDecision(
-        QuarantineState.RETRYABLE, QuarantineAction.SALVAGE
+    (QuarantineState.RETRYABLE, QuarantineEvent.INSPECT): (QuarantineState.RETRYABLE, QuarantineAction.SALVAGE),
+    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.INSPECT): (
+        QuarantineState.INVALID_EVIDENCE,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.INSPECT): QuarantineDecision(
-        QuarantineState.INVALID_EVIDENCE, QuarantineAction.REAUTHENTICATE
+    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.INSPECT): (
+        QuarantineState.OUTPUT_DURABLE_UNMARKED,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.INSPECT): QuarantineDecision(
-        QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineAction.REAUTHENTICATE
+    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.INSPECT): (
+        QuarantineState.UNPROCESSABLE_UNMARKED,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.INSPECT): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineAction.REAUTHENTICATE
+    (QuarantineState.PUBLISHED, QuarantineEvent.INSPECT): (QuarantineState.PUBLISHED, QuarantineAction.SKIP),
+    (QuarantineState.UNPROCESSABLE, QuarantineEvent.INSPECT): (QuarantineState.UNPROCESSABLE, QuarantineAction.SKIP),
+    (QuarantineState.RETRYABLE, QuarantineEvent.OUTPUT_COMMITTED): (
+        QuarantineState.OUTPUT_DURABLE_UNMARKED,
+        QuarantineAction.MARK_PUBLISHED,
     ),
-    (QuarantineState.PUBLISHED, QuarantineEvent.INSPECT): QuarantineDecision(
-        QuarantineState.PUBLISHED, QuarantineAction.SKIP
+    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.OUTPUT_COMMITTED): (
+        QuarantineState.OUTPUT_DURABLE_UNMARKED,
+        QuarantineAction.MARK_PUBLISHED,
     ),
-    (QuarantineState.UNPROCESSABLE, QuarantineEvent.INSPECT): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE, QuarantineAction.SKIP
+    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.MARK_COMMITTED): (
+        QuarantineState.PUBLISHED,
+        QuarantineAction.KEEP,
     ),
-    (QuarantineState.RETRYABLE, QuarantineEvent.OUTPUT_COMMITTED): QuarantineDecision(
-        QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineAction.MARK_PUBLISHED
+    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.MARK_FAILED): (
+        QuarantineState.OUTPUT_DURABLE_UNMARKED,
+        QuarantineAction.KEEP,
     ),
-    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.OUTPUT_COMMITTED): QuarantineDecision(
-        QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineAction.MARK_PUBLISHED
+    (QuarantineState.RETRYABLE, QuarantineEvent.CLASSIFIED_UNPROCESSABLE): (
+        QuarantineState.UNPROCESSABLE_UNMARKED,
+        QuarantineAction.MARK_UNPROCESSABLE,
     ),
-    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.MARK_COMMITTED): QuarantineDecision(
-        QuarantineState.PUBLISHED, QuarantineAction.KEEP
+    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.CLASSIFIED_UNPROCESSABLE): (
+        QuarantineState.UNPROCESSABLE_UNMARKED,
+        QuarantineAction.MARK_UNPROCESSABLE,
     ),
-    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.MARK_FAILED): QuarantineDecision(
-        QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineAction.KEEP
+    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.MARK_COMMITTED): (
+        QuarantineState.UNPROCESSABLE,
+        QuarantineAction.KEEP,
     ),
-    (QuarantineState.RETRYABLE, QuarantineEvent.CLASSIFIED_UNPROCESSABLE): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineAction.MARK_UNPROCESSABLE
+    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.MARK_FAILED): (
+        QuarantineState.UNPROCESSABLE_UNMARKED,
+        QuarantineAction.KEEP,
     ),
-    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.CLASSIFIED_UNPROCESSABLE): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineAction.MARK_UNPROCESSABLE
+    (QuarantineState.RETRYABLE, QuarantineEvent.RETRYABLE_FAILURE): (QuarantineState.RETRYABLE, QuarantineAction.KEEP),
+    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.RETRYABLE_FAILURE): (
+        QuarantineState.INVALID_EVIDENCE,
+        QuarantineAction.KEEP,
     ),
-    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.MARK_COMMITTED): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE, QuarantineAction.KEEP
+    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.RETRYABLE_FAILURE): (
+        QuarantineState.OUTPUT_DURABLE_UNMARKED,
+        QuarantineAction.KEEP,
     ),
-    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.MARK_FAILED): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineAction.KEEP
+    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.RETRYABLE_FAILURE): (
+        QuarantineState.UNPROCESSABLE_UNMARKED,
+        QuarantineAction.KEEP,
     ),
-    (QuarantineState.RETRYABLE, QuarantineEvent.RETRYABLE_FAILURE): QuarantineDecision(
-        QuarantineState.RETRYABLE, QuarantineAction.KEEP
+    (QuarantineState.PUBLISHED, QuarantineEvent.RETENTION_EXPIRED): (
+        QuarantineState.PUBLISHED,
+        QuarantineAction.DELETE,
     ),
-    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.RETRYABLE_FAILURE): QuarantineDecision(
-        QuarantineState.INVALID_EVIDENCE, QuarantineAction.KEEP
+    (QuarantineState.UNPROCESSABLE, QuarantineEvent.RETENTION_EXPIRED): (
+        QuarantineState.UNPROCESSABLE,
+        QuarantineAction.DELETE,
     ),
-    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.RETRYABLE_FAILURE): QuarantineDecision(
-        QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineAction.KEEP
+    (QuarantineState.RETRYABLE, QuarantineEvent.DEFER): (QuarantineState.DEFERRED, QuarantineAction.WAIT),
+    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.DEFER): (QuarantineState.DEFERRED, QuarantineAction.WAIT),
+    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.DEFER): (QuarantineState.DEFERRED, QuarantineAction.WAIT),
+    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.DEFER): (QuarantineState.DEFERRED, QuarantineAction.WAIT),
+    (QuarantineState.RETRYABLE, QuarantineEvent.CANCEL): (QuarantineState.DEFERRED, QuarantineAction.WAIT),
+    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.CANCEL): (QuarantineState.DEFERRED, QuarantineAction.WAIT),
+    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.CANCEL): (
+        QuarantineState.DEFERRED,
+        QuarantineAction.WAIT,
     ),
-    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.RETRYABLE_FAILURE): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineAction.KEEP
+    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.CANCEL): (QuarantineState.DEFERRED, QuarantineAction.WAIT),
+    (QuarantineState.DEFERRED, QuarantineEvent.RESTART): (QuarantineState.RECOVERING, QuarantineAction.REAUTHENTICATE),
+    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.RESTART): (
+        QuarantineState.RECOVERING,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.PUBLISHED, QuarantineEvent.RETENTION_EXPIRED): QuarantineDecision(
-        QuarantineState.PUBLISHED, QuarantineAction.DELETE
+    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.RESTART): (
+        QuarantineState.RECOVERING,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.UNPROCESSABLE, QuarantineEvent.RETENTION_EXPIRED): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE, QuarantineAction.DELETE
+    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.RESTART): (
+        QuarantineState.RECOVERING,
+        QuarantineAction.REAUTHENTICATE,
     ),
-    (QuarantineState.RETRYABLE, QuarantineEvent.DEFER): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.DEFER): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.DEFER): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.DEFER): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.RETRYABLE, QuarantineEvent.CANCEL): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.CANCEL): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.CANCEL): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.CANCEL): QuarantineDecision(
-        QuarantineState.DEFERRED, QuarantineAction.WAIT
-    ),
-    (QuarantineState.DEFERRED, QuarantineEvent.RESTART): QuarantineDecision(
-        QuarantineState.RECOVERING, QuarantineAction.REAUTHENTICATE
-    ),
-    (QuarantineState.OUTPUT_DURABLE_UNMARKED, QuarantineEvent.RESTART): QuarantineDecision(
-        QuarantineState.RECOVERING, QuarantineAction.REAUTHENTICATE
-    ),
-    (QuarantineState.UNPROCESSABLE_UNMARKED, QuarantineEvent.RESTART): QuarantineDecision(
-        QuarantineState.RECOVERING, QuarantineAction.REAUTHENTICATE
-    ),
-    (QuarantineState.INVALID_EVIDENCE, QuarantineEvent.RESTART): QuarantineDecision(
-        QuarantineState.RECOVERING, QuarantineAction.REAUTHENTICATE
-    ),
-    (QuarantineState.RETRYABLE, QuarantineEvent.RESTART): QuarantineDecision(
-        QuarantineState.RECOVERING, QuarantineAction.REAUTHENTICATE
-    ),
-    (QuarantineState.PUBLISHED, QuarantineEvent.RESTART): QuarantineDecision(
-        QuarantineState.PUBLISHED, QuarantineAction.SKIP
-    ),
-    (QuarantineState.UNPROCESSABLE, QuarantineEvent.RESTART): QuarantineDecision(
-        QuarantineState.UNPROCESSABLE, QuarantineAction.SKIP
-    ),
+    (QuarantineState.RETRYABLE, QuarantineEvent.RESTART): (QuarantineState.RECOVERING, QuarantineAction.REAUTHENTICATE),
+    (QuarantineState.PUBLISHED, QuarantineEvent.RESTART): (QuarantineState.PUBLISHED, QuarantineAction.SKIP),
+    (QuarantineState.UNPROCESSABLE, QuarantineEvent.RESTART): (QuarantineState.UNPROCESSABLE, QuarantineAction.SKIP),
 }
 
 STATES = (
@@ -174,7 +168,8 @@ def test_state_event_matrix_is_complete_and_rejects_impossible_cells() -> None:
     assert set(EXPECTED) | invalid == cells
     for state, event in cells:
         if (state, event) in EXPECTED:
-            assert transition(state, event) == EXPECTED[state, event]
+            decision = transition(state, event)
+            assert (decision.state, decision.action) == EXPECTED[state, event]
         else:
             with pytest.raises(QuarantineTransitionError):
                 transition(state, event)
@@ -183,16 +178,30 @@ def test_state_event_matrix_is_complete_and_rejects_impossible_cells() -> None:
 def test_every_declared_lifecycle_state_is_reachable() -> None:
     reachable = {QuarantineState.RECOVERING}
     while True:
-        advanced = reachable | {decision.state for (state, _event), decision in EXPECTED.items() if state in reachable}
+        advanced = reachable | {
+            next_state for (state, _event), (next_state, _action) in EXPECTED.items() if state in reachable
+        }
         if advanced == reachable:
             break
         reachable = advanced
     assert reachable == set(STATES)
 
 
+@pytest.mark.parametrize(
+    ("state", "event"),
+    [
+        ("retryable", QuarantineEvent.INSPECT),
+        (QuarantineState.RETRYABLE, "inspect"),
+    ],
+)
+def test_transition_rejects_invalid_state_or_event_type(state: object, event: object) -> None:
+    with pytest.raises(QuarantineTransitionError):
+        transition(state, event)  # type: ignore[arg-type]
+
+
 def test_publication_restart_and_retention_path_preserves_order() -> None:
     first = transition(QuarantineState.RETRYABLE, QuarantineEvent.OUTPUT_COMMITTED)
-    assert first == EXPECTED[QuarantineState.RETRYABLE, QuarantineEvent.OUTPUT_COMMITTED]
+    assert (first.state, first.action) == EXPECTED[QuarantineState.RETRYABLE, QuarantineEvent.OUTPUT_COMMITTED]
     failed_mark = transition(first.state, QuarantineEvent.MARK_FAILED)
     assert failed_mark.state is QuarantineState.OUTPUT_DURABLE_UNMARKED
     restarted = transition(failed_mark.state, QuarantineEvent.RESTART)

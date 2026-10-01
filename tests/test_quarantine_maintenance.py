@@ -91,6 +91,27 @@ def test_attributable_malformed_startup_evidence_is_quarantined_before_collectio
     assert (source / "records.bin").read_bytes() == b"preserve"
 
 
+def test_multiple_pending_partials_are_quarantined_without_losing_raw_records(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    expected_records = {
+        _seed_streaming_partial(store, count=1),
+        _seed_streaming_partial(store, count=2),
+    }
+
+    state = cast(
+        PendingStartupState,
+        _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup()),
+    )
+
+    assert state.pending is None
+    assert state.durable_next is None
+    assert state.disposition == "empty"
+    assert tuple(store.attempts_root.iterdir()) == ()
+    quarantined_sources = tuple(path for path in (tmp_path / "quarantine").iterdir() if path.is_dir())
+    assert len(quarantined_sources) == 2
+    assert {(source / "records.bin").read_bytes() for source in quarantined_sources} == expected_records
+
+
 def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: Path) -> None:
     store = _store(tmp_path)
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
@@ -143,6 +164,41 @@ def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) 
         assert (bundles[0] / "records.bin").read_bytes() == expected
 
     _run(scenario())
+
+
+def test_failed_quarantine_published_marker_is_retried_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    expected = _seed_streaming_partial(store, count=2)
+    store.quarantine_pending("restart recovery")
+    source = next(path for path in (tmp_path / "quarantine").iterdir() if path.is_dir())
+    original_mark = store.mark_quarantine_published
+    failures = 0
+
+    def fail_once(path: Path) -> None:
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise OSError("marker write failed")
+        original_mark(path)
+
+    monkeypatch.setattr(store, "mark_quarantine_published", fail_once)
+    _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).run_once(lambda: False))
+
+    assert failures == 1
+    assert source.is_dir()
+    assert not (source / "published.json").exists()
+    bundles = tuple(store.capture_root.iterdir())
+    assert len(bundles) == 1
+    assert (bundles[0] / "records.bin").read_bytes() == expected
+
+    restarted = StagingStore(tmp_path, store.capture_root)
+    _run(QuarantineMaintenance(restarted, None, OpportunisticRuntime()).run_once(lambda: False))
+
+    assert (source / "published.json").is_file()
+    assert tuple(restarted.capture_root.iterdir()) == bundles
+    assert (bundles[0] / "records.bin").read_bytes() == expected
 
 
 def test_invalid_terminal_marker_is_reauthenticated_but_never_replaced_or_expired(
@@ -400,10 +456,11 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
     monkeypatch.setattr(runtime, "publish_quarantined_prefix", fail_once)
     maintenance = QuarantineMaintenance(store, None, runtime, config=config)
     _run(maintenance.run_once(lambda: False))
+    now = 101.0
     _run(maintenance.run_once(lambda: False))
     assert failures == 1
     assert not (source / "published.json").exists()
-    now += 5.0
+    now = 105.0
     _run(maintenance.run_once(lambda: False))
     assert failures == 2
     assert (source / "published.json").is_file()
@@ -734,6 +791,35 @@ def test_capture_priority_joins_running_retry_and_defers_new_requests(
             assert calls == [1, 1]
         finally:
             release.set()
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_capture_priority_defers_pending_publication_timer_until_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        published = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        calls: list[None] = []
+
+        def publish() -> None:
+            calls.append(None)
+            loop.call_soon_threadsafe(published.set)
+
+        monkeypatch.setattr(store, "recover_and_publish", publish)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        maintenance.schedule_publication_retry()
+        try:
+            await maintenance.enter_capture_priority()
+            assert calls == []
+
+            maintenance.exit_capture_priority()
+            await asyncio.wait_for(published.wait(), timeout=1)
+            assert calls == [None]
+        finally:
             await maintenance.close()
 
     _run(scenario())

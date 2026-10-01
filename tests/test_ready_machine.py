@@ -1,5 +1,6 @@
 """Ready publication is a pure decision from durable facts."""
 
+from dataclasses import FrozenInstanceError
 from itertools import product
 
 import pytest
@@ -36,3 +37,10 @@ def test_ready_machine_complete_boolean_table() -> None:
         assert decision.command == (
             ReadyCommand.PUBLISH if expected == ReadyState.READY_TO_PUBLISH else ReadyCommand.WAIT
         )
+
+
+def test_ready_decision_cannot_change_after_derivation() -> None:
+    decision = decide_ready(drained=True, has_audio=True, threshold_met=True, contiguous=True)
+    with pytest.raises(FrozenInstanceError):
+        decision.__setattr__("command", ReadyCommand.WAIT)
+    assert decision.command == ReadyCommand.PUBLISH

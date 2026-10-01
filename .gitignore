@@ -7,6 +7,7 @@ __pycache__/
 .basedpyright/
 .import_linter_cache/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 
@@ -36,3 +37,7 @@ logs/
 .planning/research/.cache/
 graphify-out/
 .cross-ai-review-*/
+
+# Local mutation reports and cache
+coverage/gremlins/
+.gremlins_cache/

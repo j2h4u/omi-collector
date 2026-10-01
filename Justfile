@@ -71,23 +71,27 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 
 # Unit tests.
 unit:
-    timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
+    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
+
+# Diagnose lifecycle test gaps; keep mutation results separate from CRAP coverage.
+mutation:
+    COVERAGE_CORE=ctrace nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --gremlins tests/test_ready_machine.py tests/test_quarantine_machine.py tests/test_session_machine.py tests/test_quarantine_maintenance.py
 
 # Test coverage report.
 coverage:
-    uv run pytest --cov=src/omi_collector --cov-report=term-missing
+    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --cov=src/omi_collector --cov-report=term-missing
 
 # Human CRAP report over the full suite.
 crap:
-    uv run pytest --cov=src/omi_collector --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
+    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --cov=src/omi_collector --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
 
 # Hard CRAP gate: every function must stay at or below CRAP 30.
 crap-check:
     coverage_file="$(mktemp /tmp/omi-collector-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=src/omi_collector --cov-report=json:"$coverage_file"; pytest_status=$?; \
+    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --cov=src/omi_collector --cov-report=json:"$coverage_file"; pytest_status=$?; \
     if (( pytest_status != 0 )); then exit "$pytest_status"; fi; \
-    uv run python -m scripts.crap_gate --coverage "$coverage_file" --src src/omi_collector --threshold 30
+    nice -n 19 ionice -c 3 uv run python -m scripts.crap_gate --coverage "$coverage_file" --src src/omi_collector --threshold 30
 
 # Validate the collector package image and Compose file without running a service.
 docker-check:

@@ -161,7 +161,7 @@ forbidden_modules = ["omi_collector.capture.adapters", "bleak", "dbus_fast"]
 [tool.pytest-gremlins]
 paths = ["src/omi_collector", "scripts"]
 report = ["console", "html", "json"]
-workers = "auto"
+workers = 2
 timeout = 150
 cache = true
 lightweight_runner = false

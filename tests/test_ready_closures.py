@@ -3,24 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from json import loads
+from hashlib import sha256
+from json import dumps, loads
 from pathlib import Path
 from struct import pack
-from typing import Never
 
 import pytest
 
 from omi_collector.capture.adapters.attempts import StagedAttempt
+from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_closures import ReadyClosureError, append, load, remove
 from omi_collector.capture.adapters.staging_store import StagingStore
-from omi_collector.capture.application.collector import TransferTimeouts
-from omi_collector.capture.application.opportunistic_sync import run_opportunistic_collector
-from omi_collector.capture.application.presence import PresenceScheduler
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
-from omi_collector.capture.application.session_lifecycle import OpportunisticOptions
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from omi_collector.config import CollectorConfig, ReadyConfig
 
 
 def _record(sequence: int) -> bytes:
@@ -37,17 +34,72 @@ def _partial(tmp_path: Path) -> tuple[StagingStore, StagedAttempt]:
     return store, attempt
 
 
-def test_closures_are_fifo_and_replay_safe(tmp_path: Path) -> None:
+def test_closures_coalesce_to_latest_watermark_and_keep_equal_drain(tmp_path: Path) -> None:
     path = tmp_path / "ready-closures.json"
 
     first = append(path, 10, "absence")
     assert append(path, 10, "recovery_exhausted") == first
     second = append(path, 20, "restart_interrupted")
-
-    assert load(path) == (first, second)
-    remove(path, first)
     assert load(path) == (second,)
+    drained = append(path, 20, "drained")
+    assert drained.reason == "drained"
+    assert append(path, 20, "restart_interrupted") == drained
+    assert load(path) == (drained,)
+
+    remove(path, drained)
+    assert load(path) == ()
     assert loads(path.read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_new_visit_revokes_old_drain_through_clock_publication_and_restart(tmp_path: Path) -> None:
+    base = StagingStore(tmp_path / "spool", tmp_path / "draft")
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02))
+    store = StagingStore.from_paths(base.paths, publication_root=ready, config=config)
+    raw = bytes((0, 0, 0, 100, 2, 8, 0x55)) + bytes(RECORD_SIZE - 7)
+    digest = sha256(raw).hexdigest()
+    draft = store.capture_root / "one"
+    draft.mkdir(parents=True)
+    (draft / "records.bin").write_bytes(raw)
+    (draft / "manifest.json").write_text(
+        dumps(BundleManifest(2, 10, 11, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
+    )
+    (draft / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
+    store.append_ready_closure(11, "drained")
+    authority = store.create_publication_authority()
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+
+    async def visit() -> None:
+        await maintenance.enter_capture_priority()
+        try:
+            assert load(store.ready_closures_path)[0].reason == "collecting"
+            assert authority.publish() is None
+        finally:
+            maintenance.exit_capture_priority()
+            await maintenance.close()
+
+    asyncio.run(visit())
+    authority.close()
+    restarted = StagingStore.from_paths(base.paths, publication_root=ready, config=config)
+    assert restarted.recover_and_publish() is None
+    assert draft.exists()
+    assert not tuple(ready.iterdir())
+    restarted.append_ready_closure(11, "drained")
+    assert restarted.recover_and_publish() is not None
+    assert not draft.exists()
+
+
+def test_visit_begin_reuses_active_writer_lease_across_threads(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path / "spool", tmp_path / "draft")
+    store.append_ready_closure(11, "drained")
+
+    with store.device_lock(recover_capture_temporaries=False) as lease:
+        marker = asyncio.run(asyncio.to_thread(store.begin_ready_visit))
+        lease.require_active()
+
+    assert marker is not None and marker.reason == "collecting"
 
 
 def test_closures_reject_malformed_state(tmp_path: Path) -> None:
@@ -69,8 +121,8 @@ def test_closures_reject_malformed_state(tmp_path: Path) -> None:
         load(path)
 
 
-def test_startup_replays_ready_prefix_when_draft_was_already_consumed(tmp_path: Path) -> None:
-    base, attempt = _partial(tmp_path)
+def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_path: Path) -> None:
+    base, _attempt = _partial(tmp_path)
     ready = tmp_path / "ready"
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
@@ -81,48 +133,13 @@ def test_startup_replays_ready_prefix_when_draft_was_already_consumed(tmp_path: 
         publication = resumed.publish_prefix()
         assert publication is not None
         resumed.close(durable=True)
-    digest = publication.bundle_path.joinpath("records.bin").read_bytes()
-    # Recreate the legacy ordering: ready consumed the draft before retirement.
     store.append_ready_closure(11, "legacy_prefix_publication")
-    store.recover_and_publish()
-    assert not publication.bundle_path.exists()
-    original_ready = {path.name: (path / "records.bin").read_bytes() for path in ready.iterdir()}
-
-    async def prepare() -> None:
-        state = await QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup()
-        assert state.disposition == "needs_interrupted_close"
-        assert not (attempt.path / "terminal-retired.json").exists()
-        scanning = asyncio.Event()
-
-        class Observer:
-            async def start(self, callback: Callable[[object], object]) -> None:
-                del callback
-                scanning.set()
-
-            async def stop(self) -> None:
-                return None
-
-        def provider(_candidate: object | None) -> Never:
-            raise AssertionError("restart recovery must not open BLE without a pendant")
-
-        options = OpportunisticOptions(TransferTimeouts(1, 1), presence=PresenceScheduler(Observer()))
-        task = asyncio.create_task(run_opportunistic_collector(provider, store, options, OpportunisticRuntime()))
-        try:
-            await asyncio.wait_for(scanning.wait(), 2)
-            assert not task.done()
-        finally:
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-    asyncio.run(prepare())
-
-    assert {path.name: (path / "records.bin").read_bytes() for path in ready.iterdir()} == original_ready
-    assert (attempt.path / "records.bin").read_bytes() == digest
-    assert not tuple(store.capture_root.iterdir())
-    assert loads(store.ready_closures_path.read_text())["closures"] == []
-    assert (attempt.path / "terminal-retired.json").is_file()
-    assert store.pending_attempts() == ()
+    assert store.recover_and_publish() is None
+    assert publication.bundle_path.exists()
+    assert not tuple(ready.iterdir())
+    assert loads(store.ready_closures_path.read_text())["closures"] == [
+        {"next_sequence": 11, "reason": "legacy_prefix_publication"}
+    ]
 
 
 def test_interrupted_close_publishes_ordinary_pending_prefix(tmp_path: Path) -> None:

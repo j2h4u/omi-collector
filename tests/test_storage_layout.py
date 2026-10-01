@@ -43,24 +43,24 @@ def test_config_accepts_strict_optional_presence_section(tmp_path: Path) -> None
     assert loaded.config.presence.arrival_max_gap_seconds == 4.0
 
 
-def test_config_wires_strict_ready_section(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy_wait", ["", "max_wait_seconds = 43200.0\n"])
+def test_config_wires_strict_ready_section(tmp_path: Path, legacy_wait: str) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n'
-        "[ready]\ntarget_audio_seconds = 1200.0\nmax_wait_seconds = 43200.0\n",
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 1200.0\n' + legacy_wait,
         encoding="utf-8",
     )
 
     loaded = load_operator_config(path)
 
     assert loaded.config.ready.target_audio_seconds == 1200.0
-    assert loaded.config.ready.max_wait_seconds == 43200.0
+    assert loaded.config.ready.max_wait_seconds == (43200.0 if legacy_wait else 86400.0)
 
 
 @pytest.mark.parametrize(
     "section",
     [
-        "target_audio_seconds = 1200.0\n",
+        "max_wait_seconds = 43200.0\n",
         "target_audio_seconds = 1200.0\nmax_wait_seconds = 43200.0\nextra = 1\n",
         "target_audio_seconds = 0.0\nmax_wait_seconds = 43200.0\n",
     ],

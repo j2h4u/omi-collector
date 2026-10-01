@@ -786,6 +786,65 @@ def test_cancelled_capture_priority_entry_joins_retry_before_releasing_gate(
     _run(scenario())
 
 
+def test_visit_begin_failure_releases_capture_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        store.append_ready_closure(11, "drained")
+        original = store.begin_ready_visit
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        monkeypatch.setattr(store, "begin_ready_visit", lambda: (_ for _ in ()).throw(OSError("storage unavailable")))
+
+        with pytest.raises(OSError, match="storage unavailable"):
+            await maintenance.enter_capture_priority()
+        assert maintenance._publication_priority.name == "BACKGROUND_ALLOWED"
+        assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "drained"
+
+        monkeypatch.setattr(store, "begin_ready_visit", original)
+        await maintenance.enter_capture_priority()
+        assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "collecting"
+        maintenance.exit_capture_priority()
+        await maintenance.close()
+
+    _run(scenario())
+
+
+def test_cancelled_visit_begin_joins_storage_before_releasing_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        store.append_ready_closure(11, "drained")
+        started = threading.Event()
+        release = threading.Event()
+        original = store.begin_ready_visit
+
+        def blocked_begin() -> object:
+            started.set()
+            if not release.wait(2):
+                raise TimeoutError("visit begin was not released")
+            return original()
+
+        monkeypatch.setattr(store, "begin_ready_visit", blocked_begin)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        entering = asyncio.create_task(maintenance.enter_capture_priority())
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            entering.cancel()
+            await asyncio.sleep(0)
+            assert not entering.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await entering
+            assert maintenance._publication_priority.name == "BACKGROUND_ALLOWED"
+            assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "collecting"
+        finally:
+            release.set()
+            await asyncio.gather(entering, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
 def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

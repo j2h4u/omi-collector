@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 from json import dumps, loads
 from os import utime
@@ -11,18 +12,21 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters import ready_bundles
+from omi_collector.capture.adapters import ready_bundles, ready_closures
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_segments import ClockSegment, ClockSegmentMap
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
-from omi_collector.config import ReadyConfig
+from omi_collector.config import DEFAULT_CONFIG, ReadyConfig
 
 _finalize_impl = ready_bundles.finalize_drafts
 
 
 def _finalize_drafts(*args: object, **kwargs: object) -> tuple[ready_bundles.ReadyBundleResult, ...]:
     kwargs.setdefault("config", ReadyConfig(target_audio_seconds=0.02))
+    if "frontier" not in kwargs and args:
+        kwargs["frontier"] = ready_bundles.draft_frontier(args[0])  # type: ignore[arg-type]
+    kwargs.setdefault("drained", kwargs["frontier"] is not None)
     return _finalize_impl(*args, **kwargs)  # type: ignore[arg-type]
 
 
@@ -60,7 +64,7 @@ def _audio_draft(root: Path, *, sequence: int, timestamp: int = 100) -> Path:
     return path
 
 
-def test_contiguous_drafts_publish_on_captured_audio_target_and_keep_remainder(tmp_path: Path) -> None:
+def test_drained_frontier_publishes_all_accumulated_audio_in_one_bundle(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     first = _audio_draft(draft_root, sequence=10)
     second = _audio_draft(draft_root, sequence=11)
@@ -74,10 +78,43 @@ def test_contiguous_drafts_publish_on_captured_audio_target_and_keep_remainder(t
     assert len(first_result) == 1
     manifest = cast(dict[str, object], loads((first_result[0].path / "manifest.json").read_text()))
     assert manifest["start_sequence"] == 10
-    assert manifest["next_sequence"] == 12
+    assert manifest["next_sequence"] == 13
     assert first.exists() is False
     assert second.exists() is False
-    assert remainder.exists()
+    assert remainder.exists() is False
+
+
+def test_target_without_a_drained_frontier_never_publishes(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    draft = _audio_draft(draft_root, sequence=10)
+
+    result = _finalize_impl(
+        draft_root,
+        tmp_path / "ready",
+        tmp_path / "ledger.json",
+        ClockSegmentMap(()),
+        config=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=0.001),
+    )
+
+    assert result == ()
+    assert draft.exists()
+
+
+def test_drain_without_a_frontier_is_rejected_before_publication(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    draft = _audio_draft(draft_root, sequence=10)
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="requires its durable frontier"):
+        _finalize_impl(
+            draft_root,
+            tmp_path / "ready",
+            tmp_path / "ledger.json",
+            ClockSegmentMap(()),
+            config=ReadyConfig(target_audio_seconds=0.02),
+            drained=True,
+        )
+
+    assert draft.exists()
 
 
 def test_closed_frontier_publishes_all_eligible_contiguous_drafts_and_keeps_future_drafts(tmp_path: Path) -> None:
@@ -113,25 +150,24 @@ def test_closed_frontier_does_not_cleanup_replay_overlap_from_a_future_draft(tmp
     assert future.exists()
 
 
-def test_sequence_gap_splits_subtarget_drafts(tmp_path: Path) -> None:
+def test_sequence_gap_rejects_publication_without_consuming_drafts(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     first = _audio_draft(draft_root, sequence=10)
     second = _audio_draft(draft_root, sequence=12)
 
-    result = _finalize_drafts(
-        draft_root,
-        tmp_path / "ready",
-        tmp_path / "ledger.json",
-        ClockSegmentMap(()),
-        config=ReadyConfig(target_audio_seconds=60, max_wait_seconds=86400),
-    )
+    with pytest.raises(ready_bundles.ReadyBundleError, match="contains a gap"):
+        _finalize_drafts(
+            draft_root,
+            tmp_path / "ready",
+            tmp_path / "ledger.json",
+            ClockSegmentMap(()),
+            config=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=0.001),
+        )
 
-    assert len(result) == 1
-    assert not first.exists() and second.exists()
-    assert (result[0].next_sequence - result[0].record_count, result[0].next_sequence) == (10, 11)
+    assert first.exists() and second.exists()
 
 
-def test_max_wait_flushes_stale_group_and_clock_segments_are_preserved(tmp_path: Path) -> None:
+def test_max_wait_does_not_flush_below_threshold_and_clock_segments_are_preserved(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     first = _audio_draft(draft_root, sequence=10, timestamp=100)
     second = _audio_draft(draft_root, sequence=11, timestamp=200)
@@ -147,11 +183,54 @@ def test_max_wait_flushes_stale_group_and_clock_segments_are_preserved(tmp_path:
         config=ReadyConfig(target_audio_seconds=60, max_wait_seconds=1),
     )
 
+    assert result == ()
+    assert first.exists() and second.exists()
+
+
+def test_drafts_accumulate_across_drained_visits_and_publish_after_restart(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    ready_root = tmp_path / "ready"
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path / "collector", draft_root).paths,
+        publication_root=ready_root,
+        config=replace(DEFAULT_CONFIG, ready=ReadyConfig(target_audio_seconds=0.04, max_wait_seconds=0.001)),
+    )
+    first = _audio_draft(draft_root, sequence=10)
+    store.append_ready_closure(11, "drained")
+
+    assert store.recover_and_publish() is None
+    assert first.exists()
+
+    _audio_draft(draft_root, sequence=11)
+    store.append_ready_closure(12, "drained")
+    restarted = StagingStore.from_paths(
+        StagingStore(tmp_path / "collector", draft_root).paths,
+        publication_root=ready_root,
+        config=replace(DEFAULT_CONFIG, ready=ReadyConfig(target_audio_seconds=0.04, max_wait_seconds=0.001)),
+    )
+    result = cast(tuple[ready_bundles.ReadyBundleResult, ...], restarted.recover_and_publish())
+
     assert len(result) == 1
-    raw = (result[0].path / "records.bin").read_bytes()
-    assert int.from_bytes(raw[:4], "big") == 100
-    assert int.from_bytes(raw[RECORD_SIZE : RECORD_SIZE + 4], "big") == 201
-    assert not first.exists() and not second.exists()
+    assert result[0].record_count == 2
+    assert not first.exists()
+    assert loads(restarted.ready_closures_path.read_text())["closures"] == []
+
+
+def test_interrupted_new_nondrained_closure_blocks_older_drained_frontier(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    ready_root = tmp_path / "ready"
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path / "collector", draft_root).paths,
+        publication_root=ready_root,
+        config=replace(DEFAULT_CONFIG, ready=ReadyConfig(target_audio_seconds=0.02)),
+    )
+    _audio_draft(draft_root, sequence=10)
+    store.append_ready_closure(11, "drained")
+    store.append_ready_closure(12, "restart_interrupted")
+
+    assert store.recover_and_publish() is None
+    assert not tuple(ready_root.iterdir())
+    assert ready_closures.load(store.ready_closures_path) == (ready_closures.ReadyClosure(12, "restart_interrupted"),)
 
 
 def test_group_recovery_after_ledger_write_finishes_source_cleanup(
@@ -438,13 +517,15 @@ def test_sequence_reuse_without_stream_epoch_is_never_silently_suppressed(tmp_pa
     assert reset.exists()
 
 
-def test_many_distinct_draft_tails_are_all_finalized(tmp_path: Path) -> None:
+def test_sequence_gap_does_not_split_accumulated_audio(tmp_path: Path) -> None:
     for start in (100, 110, 120, 130):
         _draft(tmp_path / "draft", (start,), start_sequence=start)
 
-    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    with pytest.raises(ready_bundles.ReadyBundleError, match="contains a gap"):
+        _finalize_drafts(tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
 
-    assert [item.next_sequence for item in result] == [101, 111, 121, 131]
+    assert len(tuple((tmp_path / "draft").iterdir())) == 4
+    assert not tuple((tmp_path / "ready").iterdir())
 
 
 def test_retired_exact_replay_is_removed_but_partial_retired_overlap_fails_closed(tmp_path: Path) -> None:
@@ -519,7 +600,11 @@ def test_new_closure_recovers_retirement_committed_before_unlink(
     checkpoint.unlink()
     _draft(drafts, (101,), start_sequence=101)
     open_draft = _draft(drafts, (102,), start_sequence=102)
-    store = StagingStore.from_paths(StagingStore(tmp_path / "collector", drafts).paths, publication_root=ready)
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path / "collector", drafts).paths,
+        publication_root=ready,
+        config=replace(DEFAULT_CONFIG, ready=ReadyConfig(target_audio_seconds=0.02)),
+    )
     store.append_ready_closure(102, "drained")
 
     published = cast(tuple[ready_bundles.ReadyBundleResult, ...], store.recover_and_publish())

@@ -852,8 +852,8 @@ def test_native_clock_handoff_43_to_72_at_incident_frontier(tmp_path: Path) -> N
 
 def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tmp_path: Path) -> None:
     capture_root = _capture_root(tmp_path)
-    _clock_bundle(capture_root, 7_192_026, 43)
-    _clock_bundle(capture_root, 7_763_451, 72)
+    _clock_bundle(capture_root, 7_717_544, 43)
+    _clock_bundle(capture_root, 7_717_545, 72)
     (tmp_path / "timeline-repairs.json").write_text(json.dumps({"version": 1, "repairs": []}), encoding="utf-8")
     published = tmp_path / "published"
     published.mkdir(mode=0o2750)
@@ -913,10 +913,10 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     assert later.device_epoch == 72
     assert later.parent_observation_id == initial.observation_id
 
-    staging.append_ready_closure(frontier.write_sequence + 1, "restart_interrupted")
+    staging.append_ready_closure(frontier.write_sequence + 1, "drained")
     assert staging.recover_and_publish() is not None
     ready = tuple(path for path in (tmp_path / "published").iterdir() if path.is_dir())
-    assert len(ready) == 2
+    assert len(ready) == 1
     assert tuple(capture_root.iterdir()) == ()
     assert all(json.loads((path / "manifest.json").read_text(encoding="utf-8"))["time_ranges"] for path in ready)
     assert ClockCorrectionStore(staging.device_state_path).records()[0].state == "applied"

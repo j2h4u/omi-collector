@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/j2h4u/omi-collector/compare/v0.10.1...v0.10.2) (2026-10-01)
+
+
+### Fixes
+
+* **qa:** audit lifecycle behavior with reliable mutation tests ([#171](https://github.com/j2h4u/omi-collector/issues/171)) ([c8e3372](https://github.com/j2h4u/omi-collector/commit/c8e337222c4f84906672c9514cbddb95a3e6bfc3))
+
 ## [0.10.1](https://github.com/j2h4u/omi-collector/compare/v0.10.0...v0.10.1) (2026-10-01)
 
 

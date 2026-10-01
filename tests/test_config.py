@@ -155,9 +155,67 @@ def test_debug_log_config_rejects_unsafe_names_and_unknown_encoding() -> None:
         DebugLogConfig(file_name="../debug.jsonl")
     with pytest.raises(ValueError, match="encoding"):
         DebugLogConfig(encoding="not-an-encoding")
+    with pytest.raises(ValueError):
+        DebugLogConfig(encoding=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        DebugLogConfig(logger_name=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="positive"):
         DebugLogConfig(backup_count=0)
     with pytest.raises(ValueError, match="exceed"):
         DebugLogConfig(max_bytes=512, max_record_bytes=1024)
     with pytest.raises(ValueError, match="relative"):
         QualityMetricsConfig(file_name="../quality.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (RetryConfig, "rapid_backoff"),
+        (RetryConfig, "storage_not_ready_backoff"),
+        (RetryConfig, "quarantine_publish_backoff_seconds"),
+        (FirmwareObservationConfig, "retry_backoff_seconds"),
+    ],
+)
+def test_retry_schedules_must_be_nonempty_and_positive(factory: type[object], field: str) -> None:
+    for schedule in ((), (0.0,), (-1.0,)):
+        with pytest.raises(ValueError):
+            factory(**{field: schedule})  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0])
+def test_fraction_limits_accept_endpoints(fraction: float) -> None:
+    DurabilityConfig(staging_overhead_fraction=fraction)
+    PresenceConfig(scan_cancel_grace_fraction=fraction)
+
+
+@pytest.mark.parametrize("fraction", [-0.01, 1.01])
+def test_fraction_limits_reject_values_outside_unit_interval(fraction: float) -> None:
+    with pytest.raises(ValueError):
+        DurabilityConfig(staging_overhead_fraction=fraction)
+    with pytest.raises(ValueError):
+        PresenceConfig(scan_cancel_grace_fraction=fraction)
+
+
+def test_presence_cooldowns_must_stay_within_configured_maximum() -> None:
+    with pytest.raises(ValueError, match="maximum"):
+        PresenceConfig(drain_cooldown_seconds=11.0, max_drain_cooldown_seconds=10.0)
+    PresenceConfig(drain_cooldown_seconds=10.0, max_drain_cooldown_seconds=10.0)
+
+
+def test_scan_cancellation_bounds_allow_equal_endpoints_and_reject_reversal() -> None:
+    PresenceConfig(scan_cancel_grace_min_seconds=0.1, scan_cancel_grace_max_seconds=0.1)
+    with pytest.raises(ValueError, match="minimum"):
+        PresenceConfig(scan_cancel_grace_min_seconds=0.2, scan_cancel_grace_max_seconds=0.1)
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (BleConfig, "adapter_name"),
+        (DebugLogConfig, "file_name"),
+        (QualityMetricsConfig, "file_name"),
+    ],
+)
+def test_path_components_reject_surrounding_whitespace(factory: type[object], field: str) -> None:
+    with pytest.raises(ValueError):
+        factory(**{field: " safe-name "})  # type: ignore[operator]

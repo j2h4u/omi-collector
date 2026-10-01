@@ -28,7 +28,9 @@ Run `just mutation` for a separate full-project behavioral audit: mutate
 including slow tests. It uses pytest-gremlins with workers matching available
 CPUs and keeps strict
 pytest checks. The dependency is pinned to a reviewed fork commit containing
-upstream PR 522 plus configurable timeouts and durable partial caching.
+upstream PR 522 plus configurable timeouts, durable partial caching, coverage
+failure diagnostics and POSIX process-group cleanup. Timed-out test processes
+and their descendants must stop before the next mutation runs.
 `lightweight_runner = false` is required. The released
 lightweight runner can falsely kill mutations when fixtures or parametrization
 are involved. A regression canary checks that unrelated mutations survive. Mutation workers

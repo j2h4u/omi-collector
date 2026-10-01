@@ -5,7 +5,6 @@ from pathlib import Path
 
 from pytest import CaptureFixture, MonkeyPatch
 from scripts.validate_pr_commits import (
-    SCISSORS,
     commit_messages,
     editable_message,
     main,
@@ -43,7 +42,7 @@ def test_editable_message_discards_comments_and_scissors_but_keeps_body() -> Non
         "Keep the note with the captured audio.\n"
         "  - retain indented list items\n"
         "# editor comment\n"
-        f"{SCISSORS}\n"
+        "# ------------------------ >8 ------------------------\n"
         "ignored template text\n"
     )
 

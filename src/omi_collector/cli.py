@@ -107,7 +107,7 @@ def _decimal(value: str | None) -> int | None:
 
 def _capture_cli() -> _CaptureCli:
     """Load capture composition only when a device command is selected."""
-    from omi_collector.capture.entrypoint import cli
+    from omi_collector.capture import cli
 
     return cast(_CaptureCli, cli)
 

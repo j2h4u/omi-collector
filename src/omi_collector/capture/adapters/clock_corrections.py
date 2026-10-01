@@ -8,16 +8,11 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import TextIO, cast
+from typing import cast
 from uuid import uuid4
 
 from ..application.ports import ClockCorrectionShape
-from .clock_observations import ClockObservation, ClockObservationStore
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows is not a supported runtime.
-    fcntl = None  # type: ignore[assignment]
+from .clock_observations import ClockObservation, ClockObservationStore, _file_lock
 
 _SCHEMA_VERSION = 2
 _VALID_STATES = frozenset({"prepared", "not_written", "unresolved", "not_applied", "applied", "resolved", "unknown"})
@@ -640,24 +635,3 @@ def _number(value: dict[str, object], key: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{key} is not finite")
     return number
-
-
-class _file_lock:
-    """Advisory lock for one correction transition."""
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._stream: TextIO | None = None
-
-    def __enter__(self) -> _file_lock:
-        if fcntl is None:
-            return self
-        stream = self._path.open("a+", encoding="ascii")
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        self._stream = stream
-        return self
-
-    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
-        if self._stream is not None and fcntl is not None:
-            fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
-            self._stream.close()

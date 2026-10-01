@@ -14,12 +14,15 @@ from omi_collector import cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
 from omi_collector.capture.adapters.publication import SealResult
+from omi_collector.capture.adapters.staging_contract import StagingError
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
 from omi_collector.config import DebugLogConfig
 from omi_collector.core import package_version
+from omi_collector.operator_status import OperatorStatusError
+from omi_collector.spool_metrics import SpoolMetricsError
 from omi_collector.storage_layout import load_operator_config
 
 _CAPTURE_ROOTS: set[Path] = set()
@@ -200,6 +203,42 @@ def test_systemd_service_status_reports_execution_failure(
     }
 
 
+def test_systemd_service_status_parses_text_and_handles_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        'if [ "$2" = "failing.service" ]; then\n'
+        "  printf 'unit unavailable\\n' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "printf 'ActiveState=active\\nSubState=running\\nMainPID=42\\nNRestarts=0\\n'\n"
+        "printf 'ExecMainStatus=0\\nActiveEnterTimestamp=Sat 2026-09-12 10:00:00 +05\\n'\n",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    assert cli._systemd_service_status("healthy.service") == {
+        "active_enter_timestamp": "Sat 2026-09-12 10:00:00 +05",
+        "active_state": "active",
+        "available": True,
+        "exec_main_status": 0,
+        "main_pid": 42,
+        "restart_count": 0,
+        "sub_state": "running",
+        "unit": "healthy.service",
+    }
+    assert cli._systemd_service_status("failing.service") == {
+        "available": False,
+        "error": "unit unavailable",
+        "unit": "failing.service",
+    }
+
+
 def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, str]] = []
 
@@ -257,6 +296,43 @@ def test_device_operation_failure_is_reported_on_stderr(monkeypatch: pytest.Monk
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.strip() == "device operation failed: RuntimeError"
+
+
+def test_device_host_change_and_read_routes_refuse_without_confirmation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _layout(tmp_path)
+    calls: list[str] = []
+
+    async def fake_operation(*_args: object) -> None:
+        return
+
+    def must_not_run(operation: Coroutine[object, object, object]) -> object:
+        operation.close()
+        calls.append("device operation")
+        raise RuntimeError("confirmation guard was bypassed")
+
+    monkeypatch.setattr(device_cli, "phy_check", fake_operation)
+    monkeypatch.setattr(device_cli, "probe", fake_operation)
+    monkeypatch.setattr(device_cli, "info", fake_operation)
+    monkeypatch.setattr(device_cli, "collect", fake_operation)
+    monkeypatch.setattr(device_cli, "run", must_not_run)
+    monkeypatch.setattr(cli, "_staging", lambda _loaded: object())
+    monkeypatch.setattr(cli, "_preflight_storage", lambda _staging: None)
+    commands = (
+        (["device", "phy-check"], "--confirm-host-change"),
+        (["device", "probe", "--config", str(config_path)], "--confirm-host-change"),
+        (["device", "info", "--config", str(config_path)], "--confirm-host-change"),
+        (["device", "collect", "--config", str(config_path)], "--confirm-read"),
+    )
+
+    for arguments, required_flag in commands:
+        result = CliRunner().invoke(app, arguments)
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert result.stderr.strip() == f"refusing operation without {required_flag}"
+        assert calls == []
 
 
 def test_sync_requires_explicit_read_advance_confirmation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -353,6 +429,50 @@ def test_collect_reports_elapsed_time_in_final_metrics(monkeypatch: pytest.Monke
     payload = cast(dict[str, object], json.loads(result.stdout))
     assert payload["status"] == "no_data"
     assert payload["elapsed_seconds"] == 2.0
+
+
+def test_collect_preflight_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FailingStaging:
+        def preflight_storage(self) -> None:
+            raise StagingError("read-only filesystem")
+
+    async def must_not_collect(*_args: object) -> device_cli.collector.NoDataResult:
+        raise AssertionError("collect must not start after preflight failure")
+
+    monkeypatch.setattr(cli, "_staging", lambda _loaded: FailingStaging())
+    monkeypatch.setattr(device_cli, "collect", must_not_collect)
+    result = CliRunner().invoke(
+        app,
+        ["device", "collect", "--config", str(_layout(tmp_path)), "--confirm-read"],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "storage preflight failed: read-only filesystem"
+
+
+def test_device_metrics_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def failed(*_args: object, **_kwargs: object) -> object:
+        raise SpoolMetricsError("manifest is malformed")
+
+    monkeypatch.setattr(cli, "collect_spool_metrics", failed)
+    result = CliRunner().invoke(app, ["device", "metrics", "--config", str(_layout(tmp_path))])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "manifest is malformed"
+
+
+def test_device_status_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def failed(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise OperatorStatusError("status evidence is malformed")
+
+    monkeypatch.setattr(cli, "collect_operator_status", failed)
+    result = CliRunner().invoke(app, ["device", "status", "--config", str(_layout(tmp_path))])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "status evidence is malformed"
 
 
 def _sync_progress(  # noqa: PLR0913

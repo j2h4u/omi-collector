@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/j2h4u/omi-collector/compare/v0.10.0...v0.10.1) (2026-10-01)
+
+
+### Refactoring
+
+* **capture:** share clock ledger locking and remove CLI forwarding ([#169](https://github.com/j2h4u/omi-collector/issues/169)) ([389532c](https://github.com/j2h4u/omi-collector/commit/389532c4c28cc0e33e06ea07aedd4db3c9415489))
+
 ## [0.10.0](https://github.com/j2h4u/omi-collector/compare/v0.9.9...v0.10.0) (2026-10-01)
 
 

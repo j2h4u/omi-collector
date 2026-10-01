@@ -43,7 +43,9 @@ to add brittle assertions. Mutation testing does not replace complete
 state/event matrices, effect-boundary scenarios or existing release gates.
 
 The command sets `COVERAGE_CORE=ctrace`: Gremlins uses dynamic test contexts,
-which require this coverage backend on our Python 3.14 stack. It runs separately
+which require this coverage backend on our Python 3.14 stack. The pinned fork
+also selects a compatible tracer for its private coverage subprocess, so direct
+Gremlins invocations retain distinct test contexts. It runs separately
 from the CRAP coverage gate. Each audit clears the cache first, so changed
 fixtures, helpers and dependencies cannot leave stale verdicts. Completed
 mutants are saved immediately; the command resumes after each 600-second
@@ -57,6 +59,7 @@ Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
 `ionice` idle class; child test processes inherit both priorities. Ordinary
 test commands and each mutation process are bounded to 600 seconds. Individual mutants have
 150 seconds so full-suite fallback can complete without eight competing copies.
+The coverage pre-scan uses the same budget, with a 120-second minimum.
 The complete audit may take
 many process windows. There is no mutation score gate yet, and mutation testing remains separate from `just verify`.
 

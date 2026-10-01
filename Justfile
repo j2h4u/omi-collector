@@ -73,9 +73,33 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 unit:
     nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
 
-# Diagnose lifecycle test gaps; keep mutation results separate from CRAP coverage.
+# Audit all code against every test; resume completed mutants between bounded runs.
 mutation:
-    COVERAGE_CORE=ctrace nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --gremlins tests/test_ready_machine.py tests/test_quarantine_machine.py tests/test_session_machine.py tests/test_quarantine_maintenance.py
+    #!/usr/bin/env bash
+    set -uo pipefail
+    mkdir -p .gremlins_cache || exit 1
+    exec 9>.gremlins_cache/full-audit.lock || exit 1
+    if ! flock --nonblock 9; then
+        printf 'Another full mutation audit is running.\n' >&2
+        exit 1
+    fi
+    declare -a cache_flags=('--gremlin-clear-cache')
+    declare -i previous=0 completed=0 status=0
+    while true; do
+        status=0
+        PYTEST_ADDOPTS='' COVERAGE_CORE=ctrace nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --gremlins "${cache_flags[@]}" tests || status=$?
+        cache_flags=()
+        if (( status != 124 )); then
+            exit "$status"
+        fi
+        completed="$(nice -n 19 ionice -c 3 uv run python -c "import sqlite3; print(sqlite3.connect('.gremlins_cache/results.db').execute('SELECT COUNT(*) FROM results').fetchone()[0])")" || exit 1
+        if (( completed <= previous )); then
+            printf 'Mutation audit made no saved progress; stopping incomplete.\n' >&2
+            exit 124
+        fi
+        printf 'Resuming full mutation audit: %s results saved.\n' "$completed"
+        previous="$completed"
+    done
 
 # Test coverage report.
 coverage:

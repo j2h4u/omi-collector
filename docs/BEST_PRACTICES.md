@@ -28,14 +28,17 @@ Run `just mutation` for a separate full-project behavioral audit: mutate
 including slow tests. It uses two pytest-gremlins workers and keeps strict
 pytest checks. The dependency is pinned to a reviewed fork commit containing
 upstream PR 522 plus configurable timeouts, durable partial caching, coverage
-failure diagnostics and POSIX process-group cleanup. Timed-out test processes
+failure diagnostics, native module/package metadata preservation and POSIX process-group cleanup. Timed-out test processes
 and descendants in their process group must stop before the next mutation runs.
 `lightweight_runner = false` is required. The released
 lightweight runner can falsely kill mutations when fixtures or parametrization
 are involved. A regression canary checks that unrelated mutations survive. Mutation workers
 must run serial pytest: xdist workers do not inherit the import hook. The
 command clears `PYTEST_ADDOPTS` to prevent implicit parallelism or test filters.
-Console, HTML and JSON reports describe surviving mutations.
+Before trusting a new runner revision, run the complete instrumented suite with
+no active mutation; module metadata and imports must behave like the original
+code. A behavioral mutation must be killed and an equivalent mutation must
+survive. Console, HTML and JSON reports describe surviving mutations.
 Review them for missing observable behavior, not just a higher score. Equivalent
 mutations, cosmetic messages and implementation-only changes are not reasons
 to add brittle assertions. Mutation testing does not replace complete

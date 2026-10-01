@@ -148,13 +148,12 @@ def test_seal_file_rejects_descriptor_mismatches_before_changing_metadata(tmp_pa
     try:
         with pytest.raises(RuntimeError):
             _seal_file(descriptor, opened_stat, context, executable=False)
+        actual = target.stat()
+        assert stat.S_IMODE(actual.st_mode) == stat.S_IMODE(original.st_mode)
+        assert (actual.st_uid, actual.st_gid) == (original.st_uid, original.st_gid)
     finally:
         os.fchmod(descriptor, stat.S_IMODE(original.st_mode))
         os.close(descriptor)
-
-    actual = target.stat()
-    assert stat.S_IMODE(actual.st_mode) == stat.S_IMODE(original.st_mode)
-    assert (actual.st_uid, actual.st_gid) == (original.st_uid, original.st_gid)
 
 
 @pytest.mark.parametrize("case", ["non_directory_fd", "different_device", "different_inode"])
@@ -179,13 +178,12 @@ def test_seal_directory_rejects_descriptor_mismatches_before_changing_metadata(t
     try:
         with pytest.raises(RuntimeError):
             _seal_directory(descriptor, context, (), expected_stat)
+        actual = target.stat()
+        assert stat.S_IMODE(actual.st_mode) == stat.S_IMODE(original.st_mode)
+        assert (actual.st_uid, actual.st_gid) == (original.st_uid, original.st_gid)
     finally:
         os.fchmod(descriptor, stat.S_IMODE(original.st_mode))
         os.close(descriptor)
-
-    actual = target.stat()
-    assert stat.S_IMODE(actual.st_mode) == stat.S_IMODE(original.st_mode)
-    assert (actual.st_uid, actual.st_gid) == (original.st_uid, original.st_gid)
 
 
 def test_main_seals_absolute_tree_with_absolute_external_allowance(
@@ -248,12 +246,11 @@ def test_main_rejects_relative_paths_before_sealing(
     try:
         with pytest.raises(ValueError, match=message):
             main()
+        assert file.stat().st_mode & 0o777 == 0o600
+        assert root.stat().st_mode & 0o777 == 0o700
     finally:
         file.chmod(0o600)
         root.chmod(0o700)
-
-    assert file.stat().st_mode & 0o777 == 0o600
-    assert root.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.parametrize("missing_option", ["--root", "--owner"])

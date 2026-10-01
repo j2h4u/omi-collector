@@ -87,7 +87,7 @@ mutation:
     declare -i previous=0 completed=0 status=0
     while true; do
         status=0
-        PYTEST_ADDOPTS='' COVERAGE_CORE=ctrace nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -n auto --gremlins "${cache_flags[@]}" tests || status=$?
+        PYTEST_ADDOPTS='' COVERAGE_CORE=ctrace nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --gremlins "${cache_flags[@]}" tests || status=$?
         cache_flags=()
         if (( status != 124 )); then
             exit "$status"

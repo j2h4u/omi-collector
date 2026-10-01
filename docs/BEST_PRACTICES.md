@@ -33,8 +33,7 @@ and descendants in their process group must stop before the next mutation runs.
 `lightweight_runner = false` is required. The released
 lightweight runner can falsely kill mutations when fixtures or parametrization
 are involved. A regression canary checks that unrelated mutations survive. Mutation workers
-must run serial pytest: xdist workers do not inherit the import hook. Only the
-initial unmutated baseline uses xdist; mutation subprocesses remain serial. The
+must run serial pytest: xdist workers do not inherit the import hook. The
 command clears `PYTEST_ADDOPTS` to prevent implicit parallelism or test filters.
 Console, HTML and JSON reports describe surviving mutations.
 Review them for missing observable behavior, not just a higher score. Equivalent

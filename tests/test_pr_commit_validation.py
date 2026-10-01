@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
 from pytest import CaptureFixture, MonkeyPatch
 from scripts.validate_pr_commits import (
     commit_messages,
@@ -91,6 +92,22 @@ def test_main_message_file_routes_success_and_failure_to_expected_streams(
     invalid = tmp_path / "invalid.txt"
     invalid.write_text("bad subject", encoding="utf-8")
     assert main(["--message-file", str(invalid)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "not a Conventional Commit subject" in captured.err
+
+
+@pytest.mark.parametrize("contents", ["", "# editor comment\n"])
+def test_blank_message_is_rejected_by_validator_and_message_file(
+    contents: str, tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    ok, problems = validate_commit_messages([""])
+    assert not ok
+    assert any("not a Conventional Commit subject" in problem for problem in problems)
+
+    message_file = tmp_path / "blank-message.txt"
+    message_file.write_text(contents, encoding="utf-8")
+    assert main(["--message-file", str(message_file)]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "not a Conventional Commit subject" in captured.err

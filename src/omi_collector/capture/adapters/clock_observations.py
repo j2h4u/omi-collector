@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Final, TextIO, cast
+from typing import Final, cast
 from uuid import uuid4
 
 try:
@@ -387,22 +389,15 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-class _file_lock:
-    """Advisory lock for one append; readers can remain lock-free."""
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._stream: TextIO | None = None
-
-    def __enter__(self) -> _file_lock:
-        if fcntl is None:
-            return self
-        stream = self._path.open("a+", encoding="ascii")
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Take an advisory lock when fcntl is available."""
+    if fcntl is None:
+        yield
+        return
+    with path.open("a+", encoding="ascii") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        self._stream = stream
-        return self
-
-    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
-        if self._stream is not None and fcntl is not None:
-            fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
-            self._stream.close()
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from omi_collector.capture.adapters import clock_observations
 from omi_collector.capture.adapters.clock_observations import ClockObservationError, ClockObservationStore
 
 # Dynamic malformed-schema fixtures intentionally cross the JSON boundary.
@@ -24,6 +25,16 @@ def _values() -> dict[str, object]:
         "info_sequence_min": 10,
         "info_sequence_max": 12,
     }
+
+
+def test_file_lock_takes_and_releases_exclusive_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[int] = []
+    monkeypatch.setattr(clock_observations.fcntl, "flock", lambda _fd, operation: events.append(operation))
+
+    with pytest.raises(RuntimeError, match="check release"), clock_observations._file_lock(tmp_path / ".lock"):
+        raise RuntimeError("check release")
+
+    assert events == [clock_observations.fcntl.LOCK_EX, clock_observations.fcntl.LOCK_UN]
 
 
 def test_observation_store_is_causal_and_immutable(tmp_path: Path) -> None:

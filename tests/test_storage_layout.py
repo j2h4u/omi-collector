@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -121,10 +122,58 @@ def test_config_rejects_noncanonical_schema(tmp_path: Path, contents: str) -> No
         load_operator_config(path)
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "[pendant]\naddress = 123\n[ready]\ntarget_audio_seconds = 3600.0\n",
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = "3600"\n',
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = true\n',
+        ('[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[presence]\n'
+        "arrival_stability_seconds = true\narrival_max_gap_seconds = 4.0\n"
+        "[ready]\ntarget_audio_seconds = 3600.0\n"),
+    ],
+)
+def test_config_rejects_wrong_field_types(tmp_path: Path, contents: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(StorageLayoutError):
+        load_operator_config(path)
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        'pendant = ["address"]\n[ready]\ntarget_audio_seconds = 3600.0\n',
+        'ready = ["target_audio_seconds"]\n[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n',
+    ],
+)
+def test_config_rejects_sections_with_keys_but_wrong_container_type(tmp_path: Path, contents: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(StorageLayoutError):
+        load_operator_config(path)
+
+
 def test_config_rejects_symlink(tmp_path: Path) -> None:
     target = _config(tmp_path / "target.toml")
     path = tmp_path / "config.toml"
     path.symlink_to(target)
 
     with pytest.raises(StorageLayoutError, match="non-symlink"):
+        load_operator_config(path)
+
+
+def test_config_rejects_fifo_before_reading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "config.toml"
+    os.mkfifo(path)
+
+    def fail_if_read(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        del self, encoding, errors
+        raise AssertionError("FIFO must be rejected before reading")
+
+    monkeypatch.setattr(Path, "read_text", fail_if_read)
+
+    with pytest.raises(StorageLayoutError, match="regular non-symlink"):
         load_operator_config(path)

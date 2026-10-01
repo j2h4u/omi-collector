@@ -218,9 +218,11 @@ class OpportunisticRuntime(CaptureRuntimePort):
     def classify_quarantine_error(self, error: BaseException) -> QuarantineErrorKind | None:
         if isinstance(error, (QuarantinePublishError, QuarantineOutputCollisionError)):
             return "unprocessable"
-        if isinstance(error, QuarantineSalvageDeferredError):
+        if isinstance(error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError)):
             return "deferred"
-        if isinstance(error, (OSError, StagingError)):
+        if isinstance(error, OSError):
+            return "retryable"
+        if isinstance(error, StagingError):
             return "deferred"
         return None
 

@@ -145,6 +145,56 @@ def test_fatal_failure_and_cancellation_do_not_become_success() -> None:
     assert transition(state, TeardownResolved(False)).command is SessionCommand.CANCELLED
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_command", "continuation"),
+    [
+        (SessionCommand.CONNECT, SessionCommand.CANCELLED, None),
+        (SessionCommand.INFO, SessionCommand.TEARDOWN, AfterTeardown.CANCELLED),
+        (SessionCommand.PREFLIGHT, SessionCommand.TEARDOWN, AfterTeardown.CANCELLED),
+    ],
+)
+def test_cancellation_uses_session_aware_teardown(
+    command: SessionCommand,
+    expected_command: SessionCommand,
+    continuation: AfterTeardown | None,
+) -> None:
+    state = transition(SessionState(command), CancellationObserved())
+    assert state.command is expected_command
+    assert state.after_teardown is continuation
+    assert state.outcome is None
+    if continuation is AfterTeardown.CANCELLED:
+        cancelled = transition(state, TeardownResolved(False))
+        assert cancelled.command is SessionCommand.CANCELLED
+        assert cancelled.after_teardown is None
+        assert cancelled.outcome is None
+
+
+def test_pending_read_repeats_and_collected_result_survives_teardown_checkpoint() -> None:
+    reading = SessionState(SessionCommand.READ)
+    assert transition(reading, ReadResolved("pending")) == reading
+
+    teardown = transition(reading, ReadResolved("collected"))
+    assert teardown.command is SessionCommand.TEARDOWN
+    assert teardown.after_teardown is AfterTeardown.CHECKPOINT
+    assert teardown.outcome == "collected"
+
+    checkpoint = transition(teardown, TeardownResolved(False))
+    assert checkpoint.command is SessionCommand.CHECKPOINT
+    assert checkpoint.after_teardown is None
+    assert checkpoint.outcome == "collected"
+    assert checkpoint.teardown_interrupted is False
+    finished = transition(checkpoint, CheckpointResolved())
+    assert finished.command is SessionCommand.FINISHED
+    assert finished.outcome == "collected"
+
+
+def test_checkpoint_cancellation_is_terminal() -> None:
+    state = transition(SessionState(SessionCommand.CHECKPOINT, outcome="collected"), CancellationObserved())
+    assert state.command is SessionCommand.CANCELLED
+    assert state.after_teardown is None
+    assert state.outcome is None
+
+
 def test_retryable_teardown_failure_overrides_success_and_binds_outcome() -> None:
     state = transition(initial_state(), Connected())
     state = transition(state, InfoResolved())
@@ -172,5 +222,7 @@ def test_impossible_machine_metadata_is_rejected() -> None:
         SessionState(SessionCommand.TEARDOWN)
     with pytest.raises(ValueError, match="invalid outcome metadata"):
         SessionState(SessionCommand.CHECKPOINT)
+    with pytest.raises(ValueError, match="only interrupted outcomes"):
+        SessionState(SessionCommand.CHECKPOINT, outcome="drained", teardown_interrupted=True)
     with pytest.raises(ValueError, match="only teardown"):
         SessionState(SessionCommand.INFO, after_teardown=AfterTeardown.CHECKPOINT)

@@ -374,7 +374,7 @@ class StagingPort(Protocol):
     def mark_quarantine_published(self, source: Path) -> None: ...
 
 
-QuarantineErrorKind = Literal["unprocessable", "deferred"]
+QuarantineErrorKind = Literal["unprocessable", "deferred", "retryable"]
 
 
 @runtime_checkable

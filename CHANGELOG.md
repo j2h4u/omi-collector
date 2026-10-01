@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/j2h4u/omi-collector/compare/v0.9.9...v0.10.0) (2026-10-01)
+
+
+### Features
+
+* **capture:** accumulate audio across drained visits before packaging ([#167](https://github.com/j2h4u/omi-collector/issues/167)) ([7319a95](https://github.com/j2h4u/omi-collector/commit/7319a956650fbb16086c03bab12d2ef9e81cd4b6))
+
 ## [0.9.9](https://github.com/j2h4u/omi-collector/compare/v0.9.8...v0.9.9) (2026-09-30)
 
 

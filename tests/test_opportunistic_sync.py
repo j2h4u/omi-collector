@@ -32,7 +32,7 @@ from omi_collector.capture.adapters.staging_contract import (
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
-from omi_collector.capture.application import batch_reconciliation
+from omi_collector.capture.application import batch_reconciliation, session_lifecycle
 from omi_collector.capture.application.batch_reconciliation import (
     BatchReconciler,
     BatchUnavailableError,
@@ -741,11 +741,16 @@ async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
         def __init__(self) -> None:
             super().__init__(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
             self.battery_reads: list[str] = []
+            self.battery_cancelled = False
 
         async def read_optional_characteristic(self, uuid: str) -> bytes:
             self.battery_reads.append(uuid)
             if hang_battery:
-                await asyncio.Future()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.battery_cancelled = True
+                    raise
             return bytes((74,))
 
     async def skip_initial_telemetry(*_args: object, **_kwargs: object) -> None:
@@ -754,6 +759,20 @@ async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
     monkeypatch.setattr(
         "omi_collector.capture.application.session_lifecycle.collect_operational_telemetry", skip_initial_telemetry
     )
+    collect_battery_observation = session_lifecycle.collect_battery_observation
+    operation_timeouts: list[float] = []
+
+    async def record_battery_timeout(
+        battery_session: object,
+        info: RingInfo,
+        emit: Callable[[Mapping[str, object]], object],
+        *,
+        operation_timeout: float,
+    ) -> None:
+        operation_timeouts.append(operation_timeout)
+        await collect_battery_observation(battery_session, info, emit, operation_timeout=operation_timeout)
+
+    monkeypatch.setattr(session_lifecycle, "collect_battery_observation", record_battery_timeout)
     session = BatterySession()
     observations: list[dict[str, object]] = []
     config = CollectorConfig(retry=RetryConfig(presence_preflight_budget_seconds=0.05))
@@ -762,15 +781,14 @@ async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
         operational=lambda event: observations.append(dict(event)),
         config=config,
     )
-    started_at = time.monotonic()
-
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
+    result = await asyncio.wait_for(
+        run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options),
+        timeout=2.0,
     )
-    elapsed = time.monotonic() - started_at
 
     assert isinstance(result, NoDataResult)
     assert session.battery_reads == [BATTERY_UUID]
+    assert operation_timeouts == [0.05]
     assert len(observations) == 1
     assert observations[0]["event"] == "pendant_observation"
     if hang_battery:
@@ -778,9 +796,10 @@ async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
         outcomes = observations[0]["optional_outcomes"]
         assert isinstance(outcomes, dict)
         assert outcomes["battery"] == "timeout"
-        assert elapsed < 0.2
+        assert session.battery_cancelled
     else:
         assert observations[0]["battery_percent"] == 74
+        assert not session.battery_cancelled
     assert observations[0]["read_sequence"] == 100
     assert observations[0]["write_sequence"] == 100
 

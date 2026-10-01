@@ -23,13 +23,17 @@ then run the full contract before release or handoff.
 
 ## Mutation testing
 
-Run `just mutation` for a separate behavioral audit of ready-publication,
-quarantine transitions, session transitions, and asynchronous quarantine
-maintenance. It uses pytest-gremlins with two workers and keeps existing strict
-pytest checks. The dependency is pinned to upstream PR 522 until its full-pytest
-runner fix is released; `lightweight_runner = false` is required. The released
+Run `just mutation` for a separate full-project behavioral audit: mutate
+`src/omi_collector` and `scripts`, and collect the complete `tests` suite,
+including slow tests. It uses pytest-gremlins with workers matching available
+CPUs and keeps strict
+pytest checks. The dependency is pinned to a reviewed fork commit containing
+upstream PR 522 plus configurable timeouts and durable partial caching.
+`lightweight_runner = false` is required. The released
 lightweight runner can falsely kill mutations when fixtures or parametrization
-are involved. A regression canary checks that unrelated mutations survive.
+are involved. A regression canary checks that unrelated mutations survive. Mutation workers
+must run serial pytest: xdist workers do not inherit the import hook. The
+command clears `PYTEST_ADDOPTS` to prevent implicit parallelism or test filters.
 Console, HTML and JSON reports describe surviving mutations.
 Review them for missing observable behavior, not just a higher score. Equivalent
 mutations, cosmetic messages and implementation-only changes are not reasons
@@ -38,17 +42,20 @@ state/event matrices, effect-boundary scenarios or existing release gates.
 
 The command sets `COVERAGE_CORE=ctrace`: Gremlins uses dynamic test contexts,
 which require this coverage backend on our Python 3.14 stack. It runs separately
-from the CRAP coverage gate. Add source paths and their behavioral tests together
-when widening the scope. A timeout or an untested mutant needs investigation;
-it is not confirmation that the tests caught the intended behavior. Errors are
+from the CRAP coverage gate. Each audit clears the cache first, so changed
+fixtures, helpers and dependencies cannot leave stale verdicts. Completed
+mutants are saved immediately; the command resumes after each 600-second
+process budget while saved progress increases. A timeout or an untested mutant
+needs investigation; it is not confirmation that the tests caught the intended behavior. Errors are
 reported separately from killed mutants. AST operators do not replace enum
 references in transition tables; independent complete state/event expectations
 remain necessary for those decisions.
 
 Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
-`ionice` idle class; child test processes inherit both priorities. Test and
-mutation execution is bounded to 600 seconds. There is no mutation score gate
-yet, and mutation testing remains separate from `just verify`.
+`ionice` idle class; child test processes inherit both priorities. Ordinary
+test commands and each mutation process are bounded to 600 seconds. Individual mutants have
+150 seconds so full-suite fallback can complete. The complete audit may take
+many process windows. There is no mutation score gate yet, and mutation testing remains separate from `just verify`.
 
 ## Capture safety
 

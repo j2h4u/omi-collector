@@ -370,6 +370,35 @@ def test_pending_startup_establishes_aligned_tail_under_a_lease_before_binding(t
     assert (attempt.path / "records.bin").read_bytes() == raw
 
 
+def test_pending_startup_uses_authenticated_aligned_tail_when_promotion_lock_is_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    attempt = store.prepare_streaming_attempt(100, 3)
+    attempt.record_read_begin(ReadBeginNotification(100, 3))
+    first, second = _record(100), _record(101)
+    attempt.accept_chunk(100, first)
+    attempt.checkpoint()
+    attempt.accept_chunk(101, second)
+    attempt.close(durable=True)
+    checkpoint_before = (attempt.path / "checkpoint.json").read_bytes()
+    raw_before = (attempt.path / "records.bin").read_bytes()
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+
+    def activation_busy(_descriptor: object) -> int:
+        raise DeviceAlreadyRunningError("another writer owns the promotion lease")
+
+    monkeypatch.setattr(maintenance, "_activate_pending_frontier", activation_busy)
+    state = cast(PendingStartupState, _run(maintenance.prepare_pending_startup()))
+
+    assert state.pending is not None
+    assert type(state.durable_next) is int
+    assert state.durable_next == 102
+    assert (attempt.path / "records.bin").read_bytes() == raw_before == first + second
+    assert (attempt.path / "checkpoint.json").read_bytes() == checkpoint_before
+    assert loads(checkpoint_before.decode("utf-8"))["record_count"] == 1
+
+
 def test_pending_startup_requests_prefix_closure_without_mutating_visit(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _seed_streaming_partial(store, count=2)

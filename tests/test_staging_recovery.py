@@ -73,15 +73,7 @@ def _one_record_bundle(root: Path, sequence: int, timestamp: int) -> Path:
 
 
 def _acceptance_sequences() -> tuple[int, ...]:
-    before = [
-        _ACCEPTANCE_FIRST_BOUNDARY + (_ACCEPTANCE_SECOND_BOUNDARY - _ACCEPTANCE_FIRST_BOUNDARY - 1) * index // 42
-        for index in range(43)
-    ]
-    after = [
-        _ACCEPTANCE_SECOND_BOUNDARY + (_ACCEPTANCE_FRONTIER - _ACCEPTANCE_SECOND_BOUNDARY) * index // 28
-        for index in range(29)
-    ]
-    return tuple(before + after)
+    return tuple(range(_ACCEPTANCE_SECOND_BOUNDARY - 36, _ACCEPTANCE_SECOND_BOUNDARY + 36))
 
 
 def _bundle_bytes(root: Path) -> dict[str, bytes]:
@@ -211,13 +203,14 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
         publication_root=published,
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
-    store.append_ready_closure(_ACCEPTANCE_FRONTIER + 1, "restart_interrupted")
+    store.append_ready_closure(_ACCEPTANCE_FRONTIER + 1, "drained")
 
     result = store.recover_and_publish()
 
-    assert len(cast(tuple[object, ...], result)) == 71
+    assert len(cast(tuple[object, ...], result)) == 1
     ready_bundles = tuple(path for path in published.iterdir() if path.is_dir() and (path / "manifest.json").is_file())
-    assert len(ready_bundles) == 71
+    assert len(ready_bundles) == 1
+    assert loads((ready_bundles[0] / "manifest.json").read_text(encoding="utf-8"))["record_count"] == len(sequences)
     assert tuple(drafts.iterdir()) == ()
     assert sorted(item.boundary_sequence_min for item in corrections.records()) == [
         _ACCEPTANCE_FIRST_BOUNDARY,
@@ -238,8 +231,12 @@ def test_corrupt_clock_ledger_does_not_block_closed_audio_publication(
     draft = _one_record_bundle(drafts, 100, 43)
     original = (draft / "records.bin").read_bytes()
     published = _shared_ready(tmp_path / "published")
-    store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published)
-    store.append_ready_closure(101, "visit_complete")
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path, drafts).paths,
+        publication_root=published,
+        config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
+    )
+    store.append_ready_closure(101, "drained")
     observations = tmp_path / "clock-observations"
     observations.mkdir()
     (observations / "broken.json").write_text("{", encoding="utf-8")
@@ -263,7 +260,7 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
         publication_root=published,
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
-    store.append_ready_closure(101, "visit_complete")
+    store.append_ready_closure(101, "drained")
     first = cast(tuple[object, ...], store.recover_and_publish())
     assert len(first) == 1
     bundle = next(published.iterdir())
@@ -307,9 +304,9 @@ def test_scheduled_maintenance_publishes_closed_draft_without_pendant(tmp_path: 
     open_bundle = _one_record_bundle(drafts, 101, 44)
     utime(closed_bundle / "manifest.json", (1, 1))
     utime(open_bundle / "manifest.json", (1, 1))
-    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=60, max_wait_seconds=1))
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=1))
     store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
-    store.append_ready_closure(101, "visit_complete")
+    store.append_ready_closure(101, "drained")
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
 
     asyncio.run(maintenance.run_once(lambda: False))
@@ -329,7 +326,7 @@ def test_acknowledged_group_recovery_cleans_child_drafts_before_retirement(
     _one_record_bundle(drafts, 101, 44)
     config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.039))
     store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
-    store.append_ready_closure(102, "visit_complete")
+    store.append_ready_closure(102, "drained")
     remove = ready_bundles._remove_draft
     monkeypatch.setattr(ready_bundles, "_remove_draft", lambda _: (_ for _ in ()).throw(OSError("crash")))
 

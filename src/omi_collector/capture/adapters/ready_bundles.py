@@ -13,12 +13,12 @@ from hashlib import sha256
 from itertools import pairwise
 from math import ceil
 from pathlib import Path
-from time import time
 from typing import cast
 from uuid import uuid4
 
 from ...config import ReadyConfig
 from ..domain.opus_duration import count_20ms_packets
+from ..domain.ready_machine import ReadyCommand, ReadyState, decide_ready
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
 from .bundle_contract import BundleManifest, SealedReceipt
 from .clock_segments import ClockSegmentMap
@@ -92,12 +92,15 @@ def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publ
     *,
     config: ReadyConfig,
     frontier: int | None = None,
+    drained: bool = False,
 ) -> tuple[ReadyBundleResult, ...]:
     """Publish every authenticated draft once, then remove its raw source.
 
     A destination is durable before its ledger entry; on restart an existing
     validated destination completes the ledger and source cleanup.
     """
+    if drained and frontier is None:
+        raise ReadyBundleError("a drained publication requires its durable frontier")
     _prepare_directory(draft_root)
     _prepare_directory(ready_root)
     _require_shared_ready_directory(ready_root)
@@ -116,13 +119,20 @@ def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publ
             _remove_draft(draft.path)
         else:
             eligible.append(source)
-    for group in _draft_groups(
-        tuple(eligible),
-        config.target_audio_seconds,
-        config.max_wait_seconds,
-        close_frontier=frontier is not None,
-    ):
-        result = _finalize_group(group, finalization)
+    if not eligible:
+        return ()
+    packets = sum(_draft_audio_packets(draft) for draft in eligible)
+    contiguous = all(left.manifest.next_sequence == right.manifest.start_sequence for left, right in pairwise(eligible))
+    decision = decide_ready(
+        drained=drained,
+        has_audio=packets > 0,
+        threshold_met=packets >= ceil(config.target_audio_seconds * 50),
+        contiguous=contiguous,
+    )
+    if decision.state is ReadyState.INVALID_GAP:
+        raise ReadyBundleError("eligible draft sequence contains a gap")
+    if decision.command is ReadyCommand.PUBLISH:
+        result = _finalize_group(_make_group(tuple(eligible)), finalization)
         if result is not None:
             results.append(result)
     return tuple(results)
@@ -141,45 +151,6 @@ def draft_frontier(draft_root: Path) -> int | None:
         return None
     drafts = _drafts(draft_root)
     return max((draft.manifest.next_sequence for draft in drafts), default=None)
-
-
-def _draft_groups(
-    drafts: tuple[_Draft, ...], target: float, max_wait: float, *, close_frontier: bool = False
-) -> tuple[_DraftGroup, ...]:
-    groups: list[_DraftGroup] = []
-    segment: list[_Draft] = []
-    packets = 0
-    target_packets = ceil(target * 50) if target > 0 else 0
-
-    def flush_if_target() -> None:
-        nonlocal packets
-        if not close_frontier and segment and (target_packets == 0 or packets >= target_packets):
-            groups.append(_make_group(tuple(segment)))
-            segment.clear()
-            packets = 0
-
-    def flush_if_stale() -> None:
-        nonlocal packets
-        if not close_frontier and segment:
-            oldest = min((draft.path / _MANIFEST_NAME).stat().st_mtime for draft in segment)
-            if time() - oldest >= max_wait:
-                groups.append(_make_group(tuple(segment)))
-                segment.clear()
-                packets = 0
-
-    for draft in drafts:
-        if segment and segment[-1].manifest.next_sequence != draft.manifest.start_sequence:
-            groups.append(_make_group(tuple(segment)))
-            segment.clear()
-            packets = 0
-        segment.append(draft)
-        if target_packets > 0:
-            packets += _draft_audio_packets(draft)
-        flush_if_target()
-    if close_frontier and segment:
-        groups.append(_make_group(tuple(segment)))
-    flush_if_stale()
-    return tuple(groups)
 
 
 def _make_group(drafts: tuple[_Draft, ...]) -> _DraftGroup:

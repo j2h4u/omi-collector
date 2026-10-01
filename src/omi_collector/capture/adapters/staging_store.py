@@ -204,7 +204,7 @@ class StagingStore:
                         recoverable_prefix = True
                         break
             frontier = draft_frontier(self.capture_root)
-            closures = ready_closures.load(self.ready_closures_path)
+            closures = ready_closures.coalesce(self.ready_closures_path)
             unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
             return recoverable_prefix, unclosed_drafts
 
@@ -216,6 +216,15 @@ class StagingStore:
         """Durably close one physical visit before allowing ready publication."""
         with self.device_lock(recover_capture_temporaries=False, operation="ready_closure") as lease:
             return self._append_ready_closure_unlocked(lease, next_sequence, reason)
+
+    def begin_ready_visit(self) -> ready_closures.ReadyClosure | None:
+        """Fence an older drain permit before a new physical visit can run."""
+        active = self._filesystem._active_lease
+        if active is not None:
+            self._filesystem.require_device_lock(active)
+            return ready_closures.begin_visit(self.ready_closures_path)
+        with self.device_lock(recover_capture_temporaries=False, operation="ready_visit_begin"):
+            return ready_closures.begin_visit(self.ready_closures_path)
 
     def close_orphaned_drafts(self, reason: str) -> object | None:
         """Create a restart closure for authenticated drafts without a pending attempt."""
@@ -296,9 +305,9 @@ class StagingStore:
         ledger_path = self.device_state_path.parent / "ready-publications.json"
         resume_retired(publication_root, ledger_path)
         published: list[object] = []
-        closures = ready_closures.load(self.ready_closures_path)
-        while closures:
-            closure = closures[0]
+        closures = ready_closures.coalesce(self.ready_closures_path)
+        if closures:
+            closure = closures[-1]
             published.extend(
                 finalize_drafts(
                     self.capture_root,
@@ -307,12 +316,11 @@ class StagingStore:
                     segments,
                     config=self._filesystem._ready,
                     frontier=closure.next_sequence,
+                    drained=closure.reason == "drained",
                 )
             )
-            if has_drafts_at_or_below(self.capture_root, closure.next_sequence):
-                break
-            ready_closures.remove(self.ready_closures_path, closure)
-            closures = ready_closures.load(self.ready_closures_path)
+            if not has_drafts_at_or_below(self.capture_root, closure.next_sequence):
+                ready_closures.remove(self.ready_closures_path, closure)
         retire_acknowledged(
             publication_root,
             ledger_path,

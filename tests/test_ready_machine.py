@@ -1,0 +1,38 @@
+"""Ready publication is a pure decision from durable facts."""
+
+from itertools import product
+
+import pytest
+
+from omi_collector.capture.domain.ready_machine import ReadyCommand, ReadyState, decide_ready
+
+
+def test_ready_machine_complete_boolean_table() -> None:
+    for drained, has_audio, threshold_met, contiguous in product((False, True), repeat=4):
+        if threshold_met and not has_audio:
+            with pytest.raises(ValueError, match="empty audio"):
+                decide_ready(
+                    drained=drained,
+                    has_audio=has_audio,
+                    threshold_met=threshold_met,
+                    contiguous=contiguous,
+                )
+            continue
+        decision = decide_ready(
+            drained=drained,
+            has_audio=has_audio,
+            threshold_met=threshold_met,
+            contiguous=contiguous,
+        )
+        if not drained:
+            expected = ReadyState.WAITING_FOR_DRAIN
+        elif not has_audio or not threshold_met:
+            expected = ReadyState.WAITING_FOR_THRESHOLD
+        elif not contiguous:
+            expected = ReadyState.INVALID_GAP
+        else:
+            expected = ReadyState.READY_TO_PUBLISH
+        assert decision.state == expected
+        assert decision.command == (
+            ReadyCommand.PUBLISH if expected == ReadyState.READY_TO_PUBLISH else ReadyCommand.WAIT
+        )

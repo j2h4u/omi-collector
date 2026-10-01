@@ -11,4 +11,3 @@ arrival_max_gap_seconds = 10.0
 # closure; these values no longer trigger publication by size or age.
 [ready]
 target_audio_seconds = 3600.0
-max_wait_seconds = 86400.0

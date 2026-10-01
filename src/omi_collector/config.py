@@ -364,7 +364,7 @@ class ServiceConfig:
 
 @dataclass(frozen=True, slots=True)
 class ReadyConfig:
-    """Legacy ready knobs retained for configuration compatibility."""
+    """Minimum captured audio required after drain; legacy wait is inactive."""
 
     target_audio_seconds: float = 3600.0
     max_wait_seconds: float = 86400.0

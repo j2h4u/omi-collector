@@ -105,7 +105,7 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
 def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         events: list[str] = []
-        store = StagingStore(tmp_path, tmp_path / "captures")
+        store = StagingStore(tmp_path / "spool", tmp_path / "captures")
 
         def publish() -> None:
             events.append("publish")

@@ -223,19 +223,24 @@ class QuarantineMaintenance:
             task.result()
 
     async def enter_capture_priority(self) -> None:
-        """Admit capture only after a prior background mutation has stopped."""
+        """Stop background publication and revoke stale drain permission before capture."""
         if self._publication_priority is not _PublicationPriority.BACKGROUND_ALLOWED:
             raise RuntimeError("capture priority cannot be entered twice or after close")
         self._publication_priority = _PublicationPriority.CAPTURE
-        if self._publication_retry_handle is not None:
-            self._publication_retry_handle.cancel()
-            self._publication_retry_handle = None
-            self._publication_retry_requested = True
-        task = self._publication_retry_task
-        if task is not None and not task.done():
-            self._publication_retry_requested = True
-            task.cancel()
-            await join_owned(asyncio.gather(task, return_exceptions=True))
+        try:
+            if self._publication_retry_handle is not None:
+                self._publication_retry_handle.cancel()
+                self._publication_retry_handle = None
+                self._publication_retry_requested = True
+            task = self._publication_retry_task
+            if task is not None and not task.done():
+                self._publication_retry_requested = True
+                task.cancel()
+                await join_owned(asyncio.gather(task, return_exceptions=True))
+            await joined_to_thread(self._staging.begin_ready_visit)
+        except BaseException:
+            self.exit_capture_priority()
+            raise
 
     def exit_capture_priority(self) -> None:
         """Release foreground priority and resume one deferred publication."""

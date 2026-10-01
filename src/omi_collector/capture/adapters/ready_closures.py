@@ -51,15 +51,41 @@ def load(path: Path) -> tuple[ReadyClosure, ...]:
 
 
 def append(path: Path, next_sequence: int, reason: str) -> ReadyClosure:
-    """Append one frontier durably, coalescing a replay of the same frontier."""
+    """Keep only the newest durable watermark, upgrading an equal drain."""
     closure = _make_closure(next_sequence, reason)
     closures = load(path)
     if closures and next_sequence < closures[-1].next_sequence:
         raise ReadyClosureError("ready closure frontier regressed")
     if closures and closures[-1].next_sequence == next_sequence:
-        return closures[-1]
-    _write(path, (*closures, closure))
+        previous = closures[-1]
+        if previous.reason == "drained" or reason != "drained":
+            closure = previous
+        if closures == (closure,):
+            return closure
+    _write(path, (closure,))
     return closure
+
+
+def coalesce(path: Path) -> tuple[ReadyClosure, ...]:
+    """Persist only the latest watermark from a legacy FIFO queue."""
+    closures = load(path)
+    if len(closures) > 1:
+        _write(path, (closures[-1],))
+        return (closures[-1],)
+    return closures
+
+
+def begin_visit(path: Path) -> ReadyClosure | None:
+    """Durably revoke an earlier drain permit before another visit starts."""
+    closures = coalesce(path)
+    if not closures:
+        return None
+    previous = closures[-1]
+    if previous.reason != "drained":
+        return previous
+    collecting = ReadyClosure(previous.next_sequence, "collecting")
+    _write(path, (collecting,))
+    return collecting
 
 
 def remove(path: Path, closure: ReadyClosure) -> None:

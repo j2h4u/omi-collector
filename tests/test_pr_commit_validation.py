@@ -79,6 +79,32 @@ def test_commit_messages_reads_non_merge_commits_newest_first(tmp_path: Path, mo
     ]
 
 
+def test_main_git_mode_reports_valid_range_and_invalid_ref_fails(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-q", "-m", "chore: establish fixture")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    (repo / "file.txt").write_text("feature\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "fix(audio): retain recording metadata")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+    monkeypatch.chdir(repo)
+
+    assert main(["--base-sha", base_sha, "--head-sha", head_sha]) == 0
+    captured = capsys.readouterr()
+    assert "All 1 commit message(s) are releasable." in captured.out
+    assert captured.err == ""
+
+    with pytest.raises(subprocess.CalledProcessError):
+        commit_messages(base_sha, "missing-head-for-test")
+
+
 def test_main_message_file_routes_success_and_failure_to_expected_streams(
     tmp_path: Path, capsys: CaptureFixture[str]
 ) -> None:

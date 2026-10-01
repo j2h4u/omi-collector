@@ -98,6 +98,27 @@ def test_service_does_not_announce_readiness_for_invalid_config(tmp_path: Path) 
     assert "deployment_ready" not in result.output
 
 
+def test_device_status_only_flags_a_confirmed_inactive_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(cli, "collect_operator_status", lambda *_args, **_kwargs: {"status": "ok"})
+    service_statuses = (
+        ({"available": False, "error": "OSError", "unit": "omi-collector.service"}, "ok"),
+        ({"available": True, "active_state": "inactive", "unit": "omi-collector.service"}, "attention"),
+        ({"available": True, "active_state": "active", "unit": "omi-collector.service"}, "ok"),
+    )
+
+    for service_status, expected_status in service_statuses:
+        monkeypatch.setattr(cli, "_systemd_service_status", lambda service_status=service_status: service_status)
+        result = CliRunner().invoke(app, ["device", "status", "--config", str(_layout(tmp_path))])
+
+        assert result.exit_code == 0
+        payload = cast(dict[str, object], json.loads(result.output))
+        assert payload["status"] == expected_status
+        assert payload["service"] == service_status
+
+
 def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(tmp_path: Path) -> None:
     info_lines: list[str] = []
     debug_lines: list[str] = []

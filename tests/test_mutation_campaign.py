@@ -20,7 +20,9 @@ SCRIPT = Path(__file__).parents[1] / "scripts" / "mutation_campaign.py"
 def campaign_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     (tmp_path / ".gitignore").write_text(".gremlins_cache/\ncoverage/gremlins/\n", encoding="utf-8")
     (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'campaign-fixture'\nversion = '0.1.0'\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'campaign-fixture'\nversion = '0.1.0'\n", encoding="utf-8"
+    )
     (tmp_path / "src" / "omi_collector").mkdir(parents=True)
     (tmp_path / "src" / "omi_collector" / "demo.py").write_text("value = 1\n", encoding="utf-8")
     (tmp_path / "scripts").mkdir()
@@ -65,8 +67,19 @@ def _write_report(repo: Path, *, duplicate: bool = False) -> None:
     report.write_text(
         json.dumps(
             {
-                "scope": {"source_files": ["scripts/demo.py", "src/omi_collector/demo.py"], "gremlin_ids": ids, "generation_errors": []},
-                "summary": {"total": len(ids), "zapped": len(ids), "survived": 0, "timeout": 0, "error": 0, "pardoned": 0},
+                "scope": {
+                    "source_files": ["scripts/demo.py", "src/omi_collector/demo.py"],
+                    "gremlin_ids": ids,
+                    "generation_errors": [],
+                },
+                "summary": {
+                    "total": len(ids),
+                    "zapped": len(ids),
+                    "survived": 0,
+                    "timeout": 0,
+                    "error": 0,
+                    "pardoned": 0,
+                },
                 "files": files,
                 "results": results,
             }
@@ -153,7 +166,9 @@ def test_postflight_rejects_old_report_even_when_its_timestamp_is_future(
     assert "ended_at" in receipt
 
 
-def test_status_137_is_recorded_and_only_resumes_on_a_new_invocation(campaign_repo: tuple[Path, dict[str, str]]) -> None:
+def test_status_137_is_recorded_and_only_resumes_on_a_new_invocation(
+    campaign_repo: tuple[Path, dict[str, str]],
+) -> None:
     repo, env = campaign_repo
     assert _campaign(repo, env, "prepare").returncode == 0
     assert _campaign(repo, env, "finish", "--status", "137").returncode == 0

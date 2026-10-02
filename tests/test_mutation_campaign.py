@@ -103,6 +103,14 @@ def test_fresh_is_explicit_and_does_not_delete_cache_itself(campaign_repo: tuple
     assert (repo / ".gremlins_cache" / "results.db").read_text(encoding="utf-8") == "old"
 
 
+def test_inherited_coverage_file_is_rejected(campaign_repo: tuple[Path, dict[str, str]]) -> None:
+    repo, env = campaign_repo
+    env["COVERAGE_FILE"] = "/tmp/unrelated-coverage"
+    result = _campaign(repo, env, "prepare")
+    assert result.returncode != 0
+    assert "COVERAGE_FILE" in result.stderr
+
+
 def test_changed_committed_identity_refuses_resume(campaign_repo: tuple[Path, dict[str, str]]) -> None:
     repo, env = campaign_repo
     assert _campaign(repo, env, "prepare").returncode == 0
@@ -163,6 +171,23 @@ def test_resume_refuses_live_recorded_launcher(campaign_repo: tuple[Path, dict[s
     result = _campaign(repo, env, "prepare")
     assert result.returncode != 0
     assert "recorded campaign launcher" in result.stderr
+
+
+def test_postflight_subprocess_failure_records_terminal_receipt(
+    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, env = campaign_repo
+    assert _campaign(repo, env, "prepare").returncode == 0
+
+    def fail_identity() -> dict[str, object]:
+        raise subprocess.CalledProcessError(1, ["git", "status"])
+
+    monkeypatch.setattr(mutation_campaign, "_identity", fail_identity)
+    result = _campaign(repo, env, "finish", "--status", "0")
+    assert result.returncode != 0
+    receipt = json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8"))
+    assert receipt["state"] == "failed"
+    assert "returned non-zero exit status 1" in receipt["postflight_error"]
 
 
 def test_native_errors_and_timeouts_remain_unresolved(campaign_repo: tuple[Path, dict[str, str]]) -> None:

@@ -19,7 +19,7 @@ CACHE = Path(".gremlins_cache")
 RECEIPT = CACHE / "campaign.json"
 REPORT = Path("coverage/gremlins/gremlins.json")
 NATIVE_CACHE = (CACHE / "results.db", CACHE / "coverage.json", CACHE / "coverage.sqlite")
-FIXED_ENV = ("COVERAGE_CORE", "PYTEST_ADDOPTS", "UV_LINK_MODE")
+FIXED_ENV = ("COVERAGE_CORE", "COVERAGE_FILE", "PYTEST_ADDOPTS", "UV_LINK_MODE")
 PROC_STAT_START_TICKS = 19
 RELEVANT_ENV = (
     *FIXED_ENV,
@@ -50,9 +50,10 @@ def _identity() -> dict[str, object]:
     if dirty:
         raise ValueError("campaign inputs must be clean and committed")
     env = {key: os.environ.get(key, "") for key in RELEVANT_ENV}
-    expected = {"COVERAGE_CORE": "ctrace", "PYTEST_ADDOPTS": "", "UV_LINK_MODE": "hardlink"}
-    if any(env[key] != value for key, value in expected.items()):
-        raise ValueError("campaign environment must set ctrace, empty PYTEST_ADDOPTS, and hardlink mode")
+    expected = {"COVERAGE_CORE": "ctrace", "COVERAGE_FILE": "", "PYTEST_ADDOPTS": "", "UV_LINK_MODE": "hardlink"}
+    invalid = [key for key, value in expected.items() if env[key] != value]
+    if invalid:
+        raise ValueError("campaign environment has invalid values for: " + ", ".join(invalid))
     try:
         gremlins = distribution("pytest-gremlins")
         gremlins_version = gremlins.version
@@ -78,7 +79,7 @@ def _identity() -> dict[str, object]:
 def _read_receipt() -> dict[str, object] | None:
     if not RECEIPT.is_file():
         return None
-    value = json.loads(RECEIPT.read_text(encoding="utf-8"))
+    value = cast(object, json.loads(RECEIPT.read_text(encoding="utf-8")))
     if not isinstance(value, dict):
         raise ValueError("campaign receipt is not an object")
     return cast(dict[str, object], value)
@@ -202,9 +203,10 @@ def _finish(status: int) -> int:
         receipt["report"] = result["report"]
         print(f"Native campaign report reconciled: {result['mutant_count']} mutants across {result['source_file_count']} source files.")
         if result["state"] == "complete_unresolved":
-            counts = cast(dict[str, int], result["report"]["status_counts"])
+            report = cast(dict[str, object], result["report"])
+            counts = cast(dict[str, int], report["status_counts"])
             print(f"Unresolved native outcomes remain: timeout={counts['timeout']} error={counts['error']}; review required.", file=sys.stderr)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
         receipt["state"] = "failed"
         receipt["postflight_error"] = str(exc)
         _write_receipt(receipt)
@@ -275,7 +277,7 @@ def _load_report(started_at_ns: int) -> dict[str, object]:
         or REPORT.stat().st_mtime_ns == previous_mtime
     ):
         raise ValueError("no fresh native JSON report was written by this attempt")
-    value = json.loads(REPORT.read_text(encoding="utf-8"))
+    value = cast(object, json.loads(REPORT.read_text(encoding="utf-8")))
     if not isinstance(value, dict):
         raise ValueError("native JSON report is not an object")
     return cast(dict[str, object], value)
@@ -335,11 +337,15 @@ def main() -> int:
     finish = commands.add_parser("finish")
     finish.add_argument("--status", type=int, required=True)
     args = parser.parse_args()
+    command = cast(str, args.command)
+    fresh = cast(bool, getattr(args, "fresh", False))
+    launcher_pid = cast(int, getattr(args, "launcher_pid", 0))
+    status = cast(int, getattr(args, "status", 0))
     try:
-        if args.command == "prepare":
-            print(_prepare(args.fresh, args.launcher_pid))
+        if command == "prepare":
+            print(_prepare(fresh, launcher_pid))
         else:
-            return _finish(args.status)
+            return _finish(status)
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
         print(f"mutation campaign: {exc}", file=sys.stderr)
         return 1

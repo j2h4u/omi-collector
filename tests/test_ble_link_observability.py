@@ -3,6 +3,7 @@ import ctypes
 import errno
 import json
 import logging
+import queue
 import sys
 import threading
 import time
@@ -695,6 +696,50 @@ def test_observer_shutdown_drains_queued_disconnect_before_finalizing() -> None:
     observer._queue.put(_packet(0x05, b"\x00\x42\x00\x13"))
     asyncio.run(observer.close())
     assert records and records[0]["disconnect_reason_hex"] == "0x13"
+
+
+def test_reader_delivers_hci_timeline_to_terminal_callback() -> None:
+    class ReceivingSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.received: queue.Queue[bytes] = queue.Queue()
+
+        def recv(self, _size: int) -> bytes:
+            try:
+                return self.received.get_nowait()
+            except queue.Empty as error:
+                raise BlockingIOError from error
+
+    fake = ReceivingSocket()
+    callback_received = threading.Event()
+    records: list[dict[str, object]] = []
+
+    def terminal_callback(record: dict[str, object]) -> None:
+        records.append(record)
+        callback_received.set()
+
+    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001)
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=terminal_callback,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        try:
+            fake.received.put(_connect())
+            fake.received.put(_packet(0x05, b"\x00\x42\x00\x13"))
+            assert await asyncio.to_thread(callback_received.wait, 1.0)
+            assert len(records) == 1
+            assert records[0]["disconnect_reason_hex"] == "0x13"
+        finally:
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    asyncio.run(scenario())
+    assert fake.closed
 
 
 def test_observer_shutdown_deadline_does_not_block_loop_on_full_queue_and_stalled_callback() -> None:

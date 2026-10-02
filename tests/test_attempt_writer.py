@@ -37,6 +37,7 @@ class FakeTarget:
     release_append: threading.Event = field(default_factory=threading.Event)
     block_append: bool = False
     fail_append: bool = False
+    fail_append_after_block: bool = False
     block_read_begin: bool = False
     fail_read_begin: bool = False
     fail_read_begin_after_block: bool = False
@@ -51,6 +52,7 @@ class FakeTarget:
     block_close: bool = False
     fail_close: bool = False
     release_close: threading.Event = field(default_factory=threading.Event)
+    close_started: threading.Event = field(default_factory=threading.Event)
     seal_calls: int = 0
     close_calls: int = 0
     checkpoint_result: object = "checkpointed"
@@ -96,6 +98,8 @@ class FakeTarget:
             raise OSError("disk full")
         if self.block_append:
             self.release_append.wait(5)
+        if self.fail_append_after_block:
+            raise OSError("disk full after append barrier")
         return None
 
     def checkpoint(self) -> object:
@@ -117,6 +121,7 @@ class FakeTarget:
     def close(self) -> object:
         self._record("close")
         self.close_calls += 1
+        self.close_started.set()
         if self.block_close:
             self.release_close.wait(5)
         if self.fail_close:
@@ -867,6 +872,49 @@ def test_unlatchable_failure_result_completes_pending_future_and_preserves_worke
         monkeypatch.setattr(attempt_writer, "transition", original_transition)
         with pytest.raises(WriterFailedError, match="target failed"):
             await writer.close()
+        assert not writer.thread.is_alive()
+
+    asyncio.run(exercise())
+
+
+def test_failure_lifecycle_idle_append_error_keeps_close_owned_and_failed_state_visible() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(
+            block_append=True,
+            fail_append_after_block=True,
+            block_close=True,
+        )
+        writer = await _started(target, bytearray(RECORD_SIZE))
+        allow_close = asyncio.Event()
+
+        async def close_after_barrier() -> object:
+            await allow_close.wait()
+            return await writer.close(timeout=1)
+
+        closing = asyncio.create_task(close_after_barrier())
+        close_outcome: object | None = None
+        close_started = False
+        try:
+            writer.publish(RECORD_SIZE)
+            assert await asyncio.to_thread(target.append_started.wait, 1)
+            allow_close.set()
+            # Yield once so close is admitted while the append is still blocked.
+            await asyncio.sleep(0)
+            target.release_append.set()
+            close_started = await asyncio.to_thread(target.close_started.wait, 1)
+            assert close_started
+            assert isinstance(writer.failure, OSError)
+            assert writer.state is WriterState.FAILED
+        finally:
+            allow_close.set()
+            await asyncio.sleep(0)
+            target.release_append.set()
+            target.release_close.set()
+            close_outcome = (await asyncio.gather(closing, return_exceptions=True))[0]
+            await asyncio.to_thread(writer.thread.join, 1)
+
+        assert isinstance(close_outcome, WriterFailedError)
+        assert target.close_calls == 1
         assert not writer.thread.is_alive()
 
     asyncio.run(exercise())

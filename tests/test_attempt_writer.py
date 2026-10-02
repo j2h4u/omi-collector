@@ -56,6 +56,7 @@ class FakeTarget:
     checkpoint_result: object = "checkpointed"
     append_readonly: list[bool] = field(default_factory=list)
     append_offsets: list[int] = field(default_factory=list)
+    second_append_started: threading.Event = field(default_factory=threading.Event)
 
     def _record(self, name: str, value: bytes | object = None) -> None:
         self.thread_ids.add(threading.get_ident())
@@ -88,6 +89,8 @@ class FakeTarget:
         self.calls.append(("append", offset, bytes(chunk)))
         self.append_readonly.append(chunk.readonly)
         self.append_offsets.append(offset)
+        if len(self.append_offsets) == 2:
+            self.second_append_started.set()
         self.append_started.set()
         if self.fail_append:
             raise OSError("disk full")
@@ -386,6 +389,71 @@ async def _test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
     assert all(target.append_readonly)
     assert len([call for call in target.calls if call[0] == "append"]) == 4
     await writer.close()
+
+
+@pytest.mark.parametrize("operation", ("seal", "publish_prefix", "close"))
+def test_drain_integrity_finalizers_flush_the_submitted_high_water(operation: str) -> None:
+    asyncio.run(_test_drain_integrity_finalizers_flush_the_submitted_high_water(operation))
+
+
+async def _test_drain_integrity_finalizers_flush_the_submitted_high_water(operation: str) -> None:
+    target = FakeTarget(block_append=True)
+    writer = await _started(
+        target,
+        bytearray(RECORD_SIZE * 3),
+        chunk_records=1,
+    )
+    finalizer: asyncio.Task[object] | None = None
+    try:
+        assert writer.publish(RECORD_SIZE * 3)
+        assert await asyncio.to_thread(target.append_started.wait, 3)
+
+        if operation == "seal":
+            finalizer = asyncio.create_task(writer.seal("done"))
+            expected_state = WriterState.SEALING
+        elif operation == "publish_prefix":
+            finalizer = asyncio.create_task(writer.publish_prefix())
+            expected_state = WriterState.SEALING
+        else:
+            finalizer = asyncio.create_task(writer.close(timeout=1))
+            expected_state = WriterState.CLOSING
+
+        # Yield once so the public operation admits its command while append is
+        # still held at the first chunk; the state is the public admission signal.
+        await asyncio.sleep(0)
+        assert writer.state is expected_state
+        target.release_append.set()
+        await finalizer
+
+        assert target.append_offsets == [0, RECORD_SIZE, 2 * RECORD_SIZE]
+        names = [call[0] for call in target.calls]
+        terminal = {"seal": "seal", "publish_prefix": "publish_prefix", "close": "close"}[operation]
+        assert names[-1] == terminal
+    finally:
+        target.release_append.set()
+        if finalizer is not None and not finalizer.done():
+            await finalizer
+        if writer.thread.is_alive():
+            await writer.close(timeout=1)
+
+
+def test_drain_integrity_idle_writer_continues_after_first_chunk() -> None:
+    asyncio.run(_test_drain_integrity_idle_writer_continues_after_first_chunk())
+
+
+async def _test_drain_integrity_idle_writer_continues_after_first_chunk() -> None:
+    target = FakeTarget()
+    writer = await _started(
+        target,
+        bytearray(RECORD_SIZE * 3),
+        chunk_records=1,
+    )
+    try:
+        assert writer.publish(RECORD_SIZE * 3)
+        assert await asyncio.to_thread(target.second_append_started.wait, 3)
+        assert target.append_offsets[:2] == [0, RECORD_SIZE]
+    finally:
+        await writer.close(timeout=1)
 
 
 def test_snapshot_records_durable_checkpoint_ack_without_target_inspection() -> None:

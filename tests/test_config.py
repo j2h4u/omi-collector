@@ -120,6 +120,14 @@ def test_runtime_ranges_are_coherent() -> None:
         PresenceConfig(scan_cancel_grace_min_seconds=0.2, scan_cancel_grace_max_seconds=0.1)
 
 
+def test_runtime_ranges_allow_equal_limits() -> None:
+    quality = QualityMetricsConfig(max_bytes=64, max_record_bytes=64)
+    service = ServiceConfig(max_records=2, default_collect_records=2)
+
+    assert quality.max_bytes == quality.max_record_bytes == 64
+    assert service.max_records == service.default_collect_records == 2
+
+
 def test_config_defaults_use_tuples_for_schedules() -> None:
     assert isinstance(DEFAULT_CONFIG.retry.rapid_backoff, tuple)
     assert isinstance(DEFAULT_CONFIG.retry.storage_not_ready_backoff, tuple)

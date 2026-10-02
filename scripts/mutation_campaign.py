@@ -61,7 +61,9 @@ def _identity() -> dict[str, object]:
     except PackageNotFoundError as exc:
         raise ValueError("pytest-gremlins is not installed in this uv environment") from exc
     uv_path = shutil.which("uv")
-    uv_version = subprocess.run([uv_path or "uv", "--version"], check=True, capture_output=True, text=True).stdout.strip()
+    uv_version = subprocess.run(
+        [uv_path or "uv", "--version"], check=True, capture_output=True, text=True
+    ).stdout.strip()
     lock = Path("uv.lock").read_bytes()
     project = Path("pyproject.toml").read_bytes()
     return {
@@ -107,7 +109,9 @@ def _prepare(fresh: bool, launcher_pid: int) -> str:
             raise ValueError("campaign identity changed; preserve old evidence and use explicit fresh mode")
         state = old.get("state")
         if state == "complete_unresolved":
-            raise ValueError("completed report contains unresolved outcomes; adjudicate it before starting another audit")
+            raise ValueError(
+                "completed report contains unresolved outcomes; adjudicate it before starting another audit"
+            )
         if state == "complete":
             raise ValueError("campaign is already complete; preserve its report before explicit fresh mode")
         _assert_no_live_campaign_processes(
@@ -146,13 +150,15 @@ def _proc_parent_pid(pid: int) -> int | None:
     try:
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[-1].split()
         return int(fields[1])
-    except (OSError, IndexError, ValueError):
+    except OSError, IndexError, ValueError:
         return None
 
 
 def _assert_no_live_campaign_processes(started_at_ns: int, launcher: dict[str, object]) -> None:
     try:
-        boot_time = int(next(line.split()[1] for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime ")))
+        boot_time = int(
+            next(line.split()[1] for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime "))
+        )
     except (OSError, StopIteration, ValueError) as exc:
         raise ValueError("cannot verify Linux process ownership before campaign resume") from exc
     ticks_per_second = os.sysconf("SC_CLK_TCK")
@@ -179,9 +185,13 @@ def _assert_no_live_campaign_processes(started_at_ns: int, launcher: dict[str, o
             ticks = int(cast(str, _proc_start_ticks(int(proc.name))))
             command = proc.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
             cwd = proc.joinpath("cwd").resolve()
-        except (OSError, TypeError, ValueError):
+        except OSError, TypeError, ValueError:
             continue
-        if ticks >= first_tick and cwd == root and any(token in command for token in ("pytest", "forkserver", "spawn_main")):
+        if (
+            ticks >= first_tick
+            and cwd == root
+            and any(token in command for token in ("pytest", "forkserver", "spawn_main"))
+        ):
             active.append(f"{proc.name}:{ticks}:{command[:100]}")
     if active:
         raise ValueError("campaign-owned processes may remain; inspect PID/start-time receipts: " + "; ".join(active))
@@ -201,11 +211,16 @@ def _finish(status: int) -> int:
         result = _postflight(receipt)
         receipt["state"] = result["state"]
         receipt["report"] = result["report"]
-        print(f"Native campaign report reconciled: {result['mutant_count']} mutants across {result['source_file_count']} source files.")
+        print(
+            f"Native campaign report reconciled: {result['mutant_count']} mutants across {result['source_file_count']} source files."
+        )
         if result["state"] == "complete_unresolved":
             report = cast(dict[str, object], result["report"])
             counts = cast(dict[str, int], report["status_counts"])
-            print(f"Unresolved native outcomes remain: timeout={counts['timeout']} error={counts['error']}; review required.", file=sys.stderr)
+            print(
+                f"Unresolved native outcomes remain: timeout={counts['timeout']} error={counts['error']}; review required.",
+                file=sys.stderr,
+            )
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
         receipt["state"] = "failed"
         receipt["postflight_error"] = str(exc)
@@ -268,14 +283,11 @@ def _validate_report_counts(
     if summary.get("total") != len(ids) or any(summary.get(name, 0) != count for name, count in counts.items()):
         raise ValueError("native summary counts do not match generated scope and results")
 
+
 def _load_report(started_at_ns: int) -> dict[str, object]:
     receipt = _read_receipt()
     previous_mtime = receipt.get("report_mtime_before_ns") if receipt is not None else None
-    if (
-        not REPORT.is_file()
-        or REPORT.stat().st_mtime_ns < started_at_ns
-        or REPORT.stat().st_mtime_ns == previous_mtime
-    ):
+    if not REPORT.is_file() or REPORT.stat().st_mtime_ns < started_at_ns or REPORT.stat().st_mtime_ns == previous_mtime:
         raise ValueError("no fresh native JSON report was written by this attempt")
     value = cast(object, json.loads(REPORT.read_text(encoding="utf-8")))
     if not isinstance(value, dict):
@@ -292,7 +304,9 @@ def _validate_report_files(report: dict[str, object], source_paths: list[str], r
         if isinstance(item, dict):
             path = _relative_report_path(str(item.get("file_path")))
             result_counts[path] = result_counts.get(path, 0) + 1
-    file_counts = {_relative_report_path(str(path)): value.get("total") for path, value in files.items() if isinstance(value, dict)}
+    file_counts = {
+        _relative_report_path(str(path)): value.get("total") for path, value in files.items() if isinstance(value, dict)
+    }
     if len(file_counts) != len(files) or file_counts != result_counts:
         raise ValueError("native per-file results do not match unique report entries")
     if not set(file_counts) <= set(source_paths):
@@ -322,7 +336,10 @@ def _validate_source_scope(source_paths: list[str]) -> None:
     expected = {
         source
         for source in tracked
-        if source.endswith(".py") and not Path(source).name.startswith("test_") and not Path(source).name.endswith("_test.py") and Path(source).name != "conftest.py"
+        if source.endswith(".py")
+        and not Path(source).name.startswith("test_")
+        and not Path(source).name.endswith("_test.py")
+        and Path(source).name != "conftest.py"
     }
     if set(source_paths) != expected:
         raise ValueError("native discovered source-file scope does not match committed QA targets")

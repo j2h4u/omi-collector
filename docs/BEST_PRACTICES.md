@@ -76,7 +76,9 @@ Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
 `ionice` idle class; child test processes inherit both priorities. Ordinary
 test commands and each mutation process are bounded to 600 seconds. Individual mutants have
 150 seconds so full-suite fallback can complete without eight competing copies.
-The coverage pre-scan uses the same budget, with a 120-second minimum.
+The coverage pre-scan has its own fixed 600-second budget; successful prescan
+data is reused across timed windows only while its complete input fingerprint
+matches.
 The complete audit may take
 many process windows. There is no mutation score gate yet, and mutation testing remains separate from `just verify`.
 

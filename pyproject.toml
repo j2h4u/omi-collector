@@ -167,7 +167,7 @@ cache = true
 lightweight_runner = false
 
 [tool.uv.sources]
-pytest-gremlins = { git = "https://github.com/j2h4u/pytest-gremlins", rev = "355c43fdf24958b4be29f99174863fb67d269391" }
+pytest-gremlins = { git = "https://github.com/j2h4u/pytest-gremlins", rev = "ea22cc83700963307acf00e6fbe7d6c51d5ae0fb" }
 
 [dependency-groups]
 dev = [

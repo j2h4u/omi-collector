@@ -34,6 +34,8 @@ and descendants in their process group must stop before the next mutation runs.
 is saved with an input fingerprint so later timed windows can reuse the exact
 coverage map; the baseline test suite still runs on every window. Start a new
 audit with a cleared cache, then preserve that cache while resuming it. The released
+runner timeout uses a canonical cache-key form across integer TOML values and
+equivalent integral CLI floats, while fractional timeouts retain exact values.
 lightweight runner can falsely kill mutations when fixtures or parametrization
 are involved. A regression canary checks that unrelated mutations survive. Mutation workers
 must run serial pytest: xdist workers do not inherit the import hook. The

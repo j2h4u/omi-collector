@@ -34,8 +34,9 @@ and descendants in their process group must stop before the next mutation runs.
 is saved with an input fingerprint so later timed windows can reuse the exact
 coverage map; the full-suite prescan has a fixed 600-second budget independent
 of the per-mutant timeout, and the baseline test suite still runs on every
-window. Start a new audit with a cleared cache, then preserve that cache while
-resuming it. The released
+window. A failing baseline stops before coverage collection or mutation
+dispatch, preserving the original pytest failure. Start a new audit with a
+cleared cache, then preserve that cache while resuming it. The released
 runner timeout uses a canonical cache-key form across integer TOML values and
 equivalent integral CLI floats, while fractional timeouts retain exact values.
 lightweight runner can falsely kill mutations when fixtures or parametrization

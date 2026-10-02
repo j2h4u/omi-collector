@@ -334,7 +334,7 @@ dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-cov", specifier = ">=7" },
     { name = "pytest-crap", specifier = ">=0.3.0" },
-    { name = "pytest-gremlins", git = "https://github.com/j2h4u/pytest-gremlins?rev=355c43fdf24958b4be29f99174863fb67d269391" },
+    { name = "pytest-gremlins", git = "https://github.com/j2h4u/pytest-gremlins?rev=ea22cc83700963307acf00e6fbe7d6c51d5ae0fb" },
     { name = "pytest-timeout", specifier = ">=2.4,<2.5" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "radon", specifier = ">=6.0.1" },
@@ -476,7 +476,7 @@ wheels = [
 [[package]]
 name = "pytest-gremlins"
 version = "1.9.0"
-source = { git = "https://github.com/j2h4u/pytest-gremlins?rev=355c43fdf24958b4be29f99174863fb67d269391#355c43fdf24958b4be29f99174863fb67d269391" }
+source = { git = "https://github.com/j2h4u/pytest-gremlins?rev=ea22cc83700963307acf00e6fbe7d6c51d5ae0fb#ea22cc83700963307acf00e6fbe7d6c51d5ae0fb" }
 dependencies = [
     { name = "coverage" },
     { name = "pytest" },

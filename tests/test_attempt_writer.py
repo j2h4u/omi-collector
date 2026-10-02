@@ -324,6 +324,45 @@ def test_publish_high_water_is_record_aligned() -> None:
     asyncio.run(exercise())
 
 
+def test_publish_zero_and_repeated_high_water_are_noops() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        writer = await _started(target, bytearray(b"x" * RECORD_SIZE))
+        try:
+            assert not writer.publish(0)
+            assert writer.publish(RECORD_SIZE)
+            assert not writer.publish(RECORD_SIZE)
+            assert not writer.publish(0)
+            await writer.barrier()
+
+            assert [call for call in target.calls if call[0] == "append"] == [
+                ("append", 0, b"x" * RECORD_SIZE)
+            ]
+        finally:
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_contiguous_non_byte_memoryview_is_published_as_bytes() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        source = memoryview(b"x" * RECORD_SIZE).cast("I")
+        writer = AttemptWriter(target, source, config=WriterConfig(chunk_records=1))
+        try:
+            await writer.start()
+            await writer.read_begin("begin")
+
+            assert writer.publish(RECORD_SIZE)
+            await writer.barrier()
+
+            assert ("append", 0, b"x" * RECORD_SIZE) in target.calls
+        finally:
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
 def test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
     asyncio.run(_test_high_water_coalesces_data_and_barrier_orders_writes())
 
@@ -451,6 +490,62 @@ async def _test_close_timeout_is_reported_until_blocking_target_is_released() ->
     assert await writer.close(timeout=1) == "closed"
     assert writer.state is WriterState.CLOSED
     assert not writer.thread.is_alive()
+
+
+def test_cancelled_close_keeps_its_original_deadline() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_close=True)
+        writer = await _started(target, bytearray())
+        closing = asyncio.create_task(writer.close(timeout=0.03))
+        try:
+            for _ in range(100):
+                if target.close_calls == 1:
+                    break
+                await asyncio.sleep(0.001)
+            assert target.close_calls == 1
+
+            closing.cancel()
+            with pytest.raises(WriterShutdownTimeoutError):
+                await asyncio.wait_for(asyncio.shield(closing), timeout=0.2)
+        finally:
+            target.release_close.set()
+            await writer.close(timeout=1)
+            if not closing.done():
+                await closing
+
+    asyncio.run(exercise())
+
+
+def test_close_deadline_includes_writer_thread_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        writer = await _started(target, bytearray())
+        worker_paused = threading.Event()
+        release_worker = threading.Event()
+        complete = writer._complete
+
+        def pause_after_completion(
+            future: asyncio.Future[object],
+            result: object | None,
+            error: BaseException | None,
+        ) -> None:
+            complete(future, result, error)
+            worker_paused.set()
+            release_worker.wait(1)
+
+        monkeypatch.setattr(writer, "_complete", pause_after_completion)
+        closing = asyncio.create_task(writer.close(timeout=0.1))
+        try:
+            assert await asyncio.to_thread(worker_paused.wait, 1)
+            with pytest.raises(WriterShutdownTimeoutError):
+                await asyncio.wait_for(asyncio.shield(closing), timeout=0.3)
+        finally:
+            release_worker.set()
+            await writer.close(timeout=1)
+            if not closing.done():
+                await closing
+
+    asyncio.run(exercise())
 
 
 def test_bounded_close_survives_repeated_cancellation_until_target_release() -> None:

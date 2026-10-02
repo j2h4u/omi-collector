@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
@@ -112,6 +118,68 @@ def test_metrics_rejects_noncanonical_bundle_evidence(tmp_path: Path, kind: str)
 
     with pytest.raises(SpoolMetricsError):
         collect_spool_metrics(tmp_path)
+
+
+def test_metrics_rejects_fifo_records_file_without_blocking(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "10-11", (_record(1),))
+    records_path = bundle / "records.bin"
+    records_path.unlink()
+    os.mkfifo(records_path)
+    writer_stopped = threading.Event()
+    writer_errors: list[OSError] = []
+
+    def write_if_collector_opens_fifo() -> None:
+        deadline = time.monotonic() + 12
+        while not writer_stopped.is_set() and time.monotonic() < deadline:
+            try:
+                descriptor = os.open(records_path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    writer_errors.append(error)
+                    return
+                writer_stopped.wait(0.01)
+            else:
+                try:
+                    os.write(descriptor, _record(1))
+                except OSError as error:
+                    writer_errors.append(error)
+                finally:
+                    os.close(descriptor)
+                return
+
+    writer = threading.Thread(target=write_if_collector_opens_fifo)
+    writer.start()
+    script = """\
+from pathlib import Path
+import sys
+
+from omi_collector.spool_metrics import SpoolMetricsError, collect_spool_metrics
+
+try:
+    collect_spool_metrics(Path(sys.argv[1]))
+except SpoolMetricsError:
+    print("rejected")
+else:
+    print("accepted")
+    """
+    try:
+        # Keep a mutant that blocks opening a FIFO killable by the test.
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path)],
+            capture_output=True,
+            check=False,
+            cwd=Path.cwd(),
+            text=True,
+            timeout=10,
+        )
+    finally:
+        writer_stopped.set()
+        writer.join(timeout=1)
+
+    assert not writer.is_alive()
+    assert not writer_errors
+    assert result.returncode == 0
+    assert result.stdout.strip() == "rejected"
 
 
 def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path: Path) -> None:

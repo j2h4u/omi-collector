@@ -73,8 +73,8 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 unit:
     nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
 
-# Audit all code against every test; resume completed mutants between bounded runs.
-mutation:
+# Audit all code against every test; resume an identified native campaign.
+mutation mode='resume':
     #!/usr/bin/env bash
     set -uo pipefail
     mkdir -p .gremlins_cache || exit 1
@@ -83,23 +83,34 @@ mutation:
         printf 'Another full mutation audit is running.\n' >&2
         exit 1
     fi
-    declare -a cache_flags=('--gremlin-clear-cache')
-    declare -i previous=0 completed=0 status=0
-    while true; do
-        status=0
-        PYTEST_ADDOPTS='' COVERAGE_CORE=ctrace nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --gremlins "${cache_flags[@]}" tests || status=$?
-        cache_flags=()
-        if (( status != 124 )); then
-            exit "$status"
-        fi
-        completed="$(nice -n 19 ionice -c 3 uv run python -c "import sqlite3; print(sqlite3.connect('.gremlins_cache/results.db').execute('SELECT COUNT(*) FROM results').fetchone()[0])")" || exit 1
-        if (( completed <= previous )); then
-            printf 'Mutation audit made no saved progress; stopping incomplete.\n' >&2
-            exit 124
-        fi
-        printf 'Resuming full mutation audit: %s results saved.\n' "$completed"
-        previous="$completed"
-    done
+    unset COVERAGE_PROCESS_START COVERAGE_RCFILE PYTHONHOME PYTHONOPTIMIZE PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD PYTEST_PLUGINS PYTEST_TIMEOUT
+    export PYTEST_ADDOPTS='' COVERAGE_CORE=ctrace UV_LINK_MODE=hardlink LC_ALL=C.UTF-8 TZ=UTC
+    declare -a cache_flags=() prepare_flags=()
+    case "{{mode}}" in
+        resume) ;;
+        fresh)
+            cache_flags=(--gremlin-clear-cache)
+            prepare_flags=(--fresh)
+            ;;
+        *)
+            printf 'mutation mode must be resume or fresh.\n' >&2
+            exit 2
+            ;;
+    esac
+    run_id="$(uv run python scripts/mutation_campaign.py prepare --launcher-pid "$$" "${prepare_flags[@]}")" || exit 1
+    log_file=".gremlins_cache/mutation-${run_id}.log"
+    nice -n 19 ionice -c 3 timeout --verbose --signal=TERM --kill-after=5s 24h uv run pytest --gremlins "${cache_flags[@]}" tests |& tee "$log_file"
+    statuses=("${PIPESTATUS[@]}")
+    status="${statuses[0]}"
+    if (( ${statuses[1]:-1} != 0 )); then
+        printf 'Could not retain the mutation log.\n' >&2
+        if (( status == 0 )); then status=1; fi
+    fi
+    if [[ -f "$log_file" ]]; then
+        tail -c 2097152 "$log_file" > "${log_file}.tmp" && mv -- "${log_file}.tmp" "$log_file" || exit 1
+    fi
+    uv run python scripts/mutation_campaign.py finish --status "$status" || exit 1
+    exit "$status"
 
 # Test coverage report.
 coverage:

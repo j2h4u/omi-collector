@@ -33,11 +33,11 @@ and descendants in their process group must stop before the next mutation runs.
 `lightweight_runner = false` is required. A successful native coverage pre-scan
 is saved with an input fingerprint so later timed windows can reuse the exact
 coverage map; the full-suite prescan has a fixed 600-second budget independent
-of the per-mutant timeout, and the baseline test suite still runs on every
-window. A failing baseline stops before coverage collection or mutation
-dispatch, preserving the original pytest failure. Start a new audit with a
-cleared cache, then preserve that cache while resuming it. The released
-runner timeout uses a canonical cache-key form across integer TOML values and
+of the per-mutant timeout. A failing baseline stops before coverage collection
+or mutation dispatch, preserving the original pytest failure. Start a new
+audit with `just mutation fresh` after preserving prior evidence; ordinary
+`just mutation` resumes only a campaign with matching clean committed inputs.
+The released runner timeout uses a canonical cache-key form across integer TOML values and
 equivalent integral CLI floats, while fractional timeouts retain exact values.
 lightweight runner can falsely kill mutations when fixtures or parametrization
 are involved. A regression canary checks that unrelated mutations survive. Mutation workers
@@ -63,24 +63,29 @@ effects outlive the test recorded by line coverage. Ordinary callable bodies
 retain coverage-guided selection. Parametrized node IDs must remain intact;
 an unmapped coverage name falls back to the complete suite instead of silently
 dropping a test. Coverage collection remains separate
-from the CRAP coverage gate. Each audit clears the cache first, so changed
-fixtures, helpers and dependencies cannot leave stale verdicts. Completed
-mutants are saved immediately; the command resumes after each 600-second
-process budget while saved progress increases. A timeout or an untested mutant
-needs investigation; it is not confirmation that the tests caught the intended behavior. Errors are
-reported separately from killed mutants. AST operators do not replace enum
+from the CRAP coverage gate. A fresh audit clears the cache only when the
+operator explicitly chooses `just mutation fresh` after preserving prior
+evidence. Default `just mutation` resumes only a matching incomplete campaign
+after its recorded process IDs and start times are absent. Completed mutants
+are saved immediately. A timeout or untested mutant needs investigation; it is
+not confirmation that tests caught the intended behavior. Errors are reported
+separately from killed mutants. AST operators do not replace enum
 references in transition tables; independent complete state/event expectations
 remain necessary for those decisions.
 
 Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
 `ionice` idle class; child test processes inherit both priorities. Ordinary
-test commands and each mutation process are bounded to 600 seconds. Individual mutants have
-150 seconds so full-suite fallback can complete without eight competing copies.
-The coverage pre-scan has its own fixed 600-second budget; successful prescan
-data is reused across timed windows only while its complete input fingerprint
-matches.
-The complete audit may take
-many process windows. There is no mutation score gate yet, and mutation testing remains separate from `just verify`.
+pytest commands remain bounded to 600 seconds. The canonical full-project
+mutation campaign uses one finite 24-hour GNU timeout with TERM and a
+five-second KILL grace; this is an operating budget, not a completion promise.
+Individual mutants retain their 150-second budget and the independent coverage
+pre-scan retains 600 seconds. The recipe retains the final 2 MiB of timeout and
+runner output and records a small identity/start/end/report receipt, then reconciles native generated IDs
+against the fresh native JSON report. Missing or malformed report metadata,
+identity changes, nonzero exits, duplicate/missing/foreign IDs, and unresolved
+errors or timeouts cannot certify a clean audit. Status 137 is fail-stopped and
+is never retried automatically. There is no mutation score gate, and mutation
+testing remains separate from `just verify`.
 
 ## Capture safety
 

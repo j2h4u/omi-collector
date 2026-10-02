@@ -30,7 +30,10 @@ pytest checks. The dependency is pinned to a reviewed fork commit containing
 upstream PR 522 plus configurable timeouts, durable partial caching, coverage
 failure diagnostics, native module/package metadata preservation and POSIX process-group cleanup. Timed-out test processes
 and descendants in their process group must stop before the next mutation runs.
-`lightweight_runner = false` is required. The released
+`lightweight_runner = false` is required. A successful native coverage pre-scan
+is saved with an input fingerprint so later timed windows can reuse the exact
+coverage map; the baseline test suite still runs on every window. Start a new
+audit with a cleared cache, then preserve that cache while resuming it. The released
 lightweight runner can falsely kill mutations when fixtures or parametrization
 are involved. A regression canary checks that unrelated mutations survive. Mutation workers
 must run serial pytest: xdist workers do not inherit the import hook. The

@@ -18,6 +18,7 @@ from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
     RecordGapError,
     RecordMismatchError,
+    RecordRegressionError,
 )
 from omi_collector.capture.adapters.staging_contract import AttemptStateError, DiskSpaceError
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -167,6 +168,33 @@ def test_streaming_accept_chunk_replays_overlap_and_appends_one_suffix(tmp_path:
 
     attempt.accept_chunk(100, first + second + third)
     assert (attempt.path / "records.bin").read_bytes() == first + second + third
+
+
+def test_streaming_recovery_rejects_a_leg_beyond_the_original_range(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=3)
+    first, second = _record(1), _record(2)
+    attempt.accept_chunk(100, first + second)
+    attempt.checkpoint()
+
+    with pytest.raises(RecordRegressionError):
+        attempt.begin_recovery(102, 2)
+
+    assert (attempt.path / "records.bin").read_bytes() == first + second
+    attempt.close()
+
+
+def test_streaming_chunk_crossing_hash_boundary_persists_the_boundary_prefix(tmp_path: Path) -> None:
+    records = tuple(_record(index % 256) for index in range(1, 1026))
+    attempt = _started_streaming_attempt(tmp_path, count=len(records))
+    attempt.accept_chunk(100, b"".join(records[:1023]))
+    attempt.accept_chunk(1123, b"".join(records[1023:]))
+
+    checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+    assert checkpoint["record_count"] == 1024
+    assert checkpoint["raw_sha256"] == sha256(b"".join(records[:1024])).hexdigest()
+    assert attempt.durable_prefix.next_sequence == 1124
+    assert (attempt.path / "records.bin").read_bytes() == b"".join(records)
+    attempt.close()
 
 
 def test_streaming_accept_chunk_writes_the_appended_suffix_once(tmp_path: Path) -> None:

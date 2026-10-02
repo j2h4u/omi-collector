@@ -79,8 +79,8 @@ pytest commands remain bounded to 600 seconds. The canonical full-project
 mutation campaign uses one finite 24-hour GNU timeout with TERM and a
 five-second KILL grace; this is an operating budget, not a completion promise.
 Individual mutants retain their 150-second budget and the independent coverage
-pre-scan retains 600 seconds. The recipe retains the final 2 MiB of timeout and
-runner output and records a small identity/start/end/report receipt, then reconciles native generated IDs
+pre-scan retains 600 seconds. The recipe retains the complete timeout and runner
+log and records a small identity/start/end/report receipt, then reconciles native generated IDs
 against the fresh native JSON report. Missing or malformed report metadata,
 identity changes, nonzero exits, duplicate/missing/foreign IDs, and unresolved
 errors or timeouts cannot certify a clean audit. Status 137 is fail-stopped and

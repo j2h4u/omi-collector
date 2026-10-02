@@ -83,7 +83,7 @@ mutation mode='resume':
         printf 'Another full mutation audit is running.\n' >&2
         exit 1
     fi
-    unset COVERAGE_PROCESS_START COVERAGE_RCFILE PYTHONHOME PYTHONOPTIMIZE PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD PYTEST_PLUGINS PYTEST_TIMEOUT
+    unset COVERAGE_FILE COVERAGE_PROCESS_START COVERAGE_RCFILE PYTHONHOME PYTHONOPTIMIZE PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD PYTEST_PLUGINS PYTEST_TIMEOUT
     export PYTEST_ADDOPTS='' COVERAGE_CORE=ctrace UV_LINK_MODE=hardlink LC_ALL=C.UTF-8 TZ=UTC
     declare -a cache_flags=() prepare_flags=()
     case "{{mode}}" in
@@ -105,9 +105,6 @@ mutation mode='resume':
     if (( ${statuses[1]:-1} != 0 )); then
         printf 'Could not retain the mutation log.\n' >&2
         if (( status == 0 )); then status=1; fi
-    fi
-    if [[ -f "$log_file" ]]; then
-        tail -c 2097152 "$log_file" > "${log_file}.tmp" && mv -- "${log_file}.tmp" "$log_file" || exit 1
     fi
     uv run python scripts/mutation_campaign.py finish --status "$status" || exit 1
     exit "$status"

@@ -348,16 +348,19 @@ def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
     async def scenario() -> None:
         await observer.start()
         reader = observer._reader
-        assert reader is not None
         try:
+            assert reader is not None
             assert await asyncio.to_thread(fake.receive_entered.wait, 1.0)
             await asyncio.wait_for(observer.close(), timeout=1.0)
             assert not reader.is_alive()
             assert "ble_link_observer_reader_timeout" not in diagnostics
         finally:
+            with suppress(Exception):
+                await asyncio.wait_for(observer.close(), timeout=1.0)
             fake.release_receive.set()
-            reader.join(timeout=1.0)
-            assert not reader.is_alive()
+            if reader is not None:
+                await asyncio.to_thread(reader.join, 1.0)
+                assert not reader.is_alive()
 
     asyncio.run(scenario())
 

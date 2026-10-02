@@ -673,3 +673,108 @@ def test_accept_chunk_validates_sequence_and_count_overflow(tmp_path: Path) -> N
     attempt.accept_chunk(100, _record(1))
     with pytest.raises(AttemptStateError, match="exceeds READ_BEGIN"):
         attempt.accept_chunk(101, _record(2))
+
+
+class _PartialWriteStream:
+    def __init__(self, wrapped: object, *, write_then_raise: bool) -> None:
+        self._wrapped = wrapped
+        self._write_then_raise = write_then_raise
+        self.partial_size = RECORD_SIZE // 2
+
+    def write(self, payload: bytes) -> int:
+        written = self._wrapped.write(payload[: self.partial_size])  # type: ignore[attr-defined]
+        if self._write_then_raise:
+            raise OSError("simulated partial raw write")
+        return cast(int, written)
+
+    def flush(self) -> None:
+        self._wrapped.flush()  # type: ignore[attr-defined]
+
+    def fileno(self) -> int:
+        return cast(int, self._wrapped.fileno())  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self._wrapped.close()  # type: ignore[attr-defined]
+
+
+def test_failure_latch_rejects_followup_data_after_partial_write_error(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    payload = _record(1)
+    stream = _PartialWriteStream(cast(object, attempt._stream_raw), write_then_raise=True)
+    attempt._stream_raw = cast("BinaryIO", stream)
+
+    with pytest.raises(OSError, match="partial raw write"):
+        attempt.accept_chunk(100, payload)
+
+    preserved = (attempt.path / "records.bin").read_bytes()
+    assert preserved == payload[: stream.partial_size]
+    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
+        attempt.accept_chunk(100, payload)
+    assert (attempt.path / "records.bin").read_bytes() == preserved
+    recovery = attempt.recover()
+    assert recovery.clean is False
+    assert recovery.raw_bytes == len(preserved)
+    assert recovery.issue == "streaming attempt has preserved partial evidence"
+    attempt.close()
+
+
+def test_failure_latch_rejects_followup_data_after_short_write(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    payload = _record(1)
+    stream = _PartialWriteStream(cast(object, attempt._stream_raw), write_then_raise=False)
+    attempt._stream_raw = cast("BinaryIO", stream)
+
+    with pytest.raises(OSError, match="streaming raw write was short"):
+        attempt.accept_chunk(100, payload)
+
+    preserved = (attempt.path / "records.bin").read_bytes()
+    assert preserved == payload[: stream.partial_size]
+    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
+        attempt.accept_chunk(100, payload)
+    assert (attempt.path / "records.bin").read_bytes() == preserved
+    recovery = attempt.recover()
+    assert recovery.clean is False
+    assert recovery.raw_bytes == len(preserved)
+    assert recovery.issue == "streaming attempt has preserved partial evidence"
+    attempt.close()
+
+
+def test_failure_latch_rejects_followup_data_after_checkpoint_fsync_error(
+    tmp_path: Path,
+) -> None:
+    sync_state = {"armed": False, "calls": 0}
+
+    def fail_checkpoint_sync(fd: int) -> None:
+        if sync_state["armed"]:
+            sync_state["calls"] += 1
+            if sync_state["calls"] == 2:
+                raise OSError("simulated checkpoint fsync failure")
+        fsync(fd)
+
+    config = CollectorConfig(durability=DurabilityConfig(checkpoint_records=1))
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_checkpoint_sync, config=config)
+    attempt = store.prepare_streaming_attempt(100, 2)
+    attempt.record_read_begin(ReadBeginNotification(100, 2))
+    sync_state["armed"] = True
+
+    with pytest.raises(OSError, match="checkpoint fsync failure"):
+        attempt.accept_chunk(100, _record(1))
+
+    raw_path = attempt.path / "records.bin"
+    checkpoint_path = attempt.path / "checkpoint.json"
+    preserved = raw_path.read_bytes()
+    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
+    assert preserved == _record(1)
+    assert checkpoint["record_count"] == 0
+    # The raw fsync succeeded and the in-memory frontier advanced before the
+    # atomic checkpoint fsync failed; the persisted checkpoint remains the
+    # only restart authority, so this live attempt must stop consuming data.
+    assert attempt.durable_prefix.record_count == 1
+    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
+        attempt.accept_chunk(101, _record(2))
+    assert raw_path.read_bytes() == preserved
+    recovery = attempt.recover()
+    assert recovery.clean is False
+    assert recovery.raw_bytes == len(preserved)
+    assert recovery.issue == "streaming attempt has preserved partial evidence"
+    attempt.close()

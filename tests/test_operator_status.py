@@ -276,6 +276,21 @@ def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPat
         collect_operator_status(layout, hours=24)
 
 
+def test_status_accepts_quality_record_without_deployment_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    event = _advertisement("2026-09-08T09:00:00+00:00")
+    event["source_revision"] = None
+    (layout.collector.root / "quality.jsonl").write_text(f"{json.dumps(event)}\n", encoding="utf-8")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    quality = cast(dict[str, object], result["quality_window"])
+    assert quality["advertisements"] == 1
+
+
 def test_status_accepts_nul_prefix_before_valid_debug_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     row = {
@@ -536,6 +551,7 @@ def test_status_reports_fraction_only_for_positive_integer_totals(
         (_advertisement, "schema_version", 3),
         (_advertisement, "session_id", 42),
         (_advertisement, "advertisement_rssi_dbm", True),
+        (_advertisement, "source_revision", 42),
         (
             lambda timestamp: _transfer(
                 timestamp, outcome="collected", termination_class="completed", written_raw_bytes=1

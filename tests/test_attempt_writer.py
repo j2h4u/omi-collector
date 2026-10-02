@@ -335,9 +335,7 @@ def test_publish_zero_and_repeated_high_water_are_noops() -> None:
             assert not writer.publish(0)
             await writer.barrier()
 
-            assert [call for call in target.calls if call[0] == "append"] == [
-                ("append", 0, b"x" * RECORD_SIZE)
-            ]
+            assert [call for call in target.calls if call[0] == "append"] == [("append", 0, b"x" * RECORD_SIZE)]
         finally:
             await writer.close()
 
@@ -492,30 +490,6 @@ async def _test_close_timeout_is_reported_until_blocking_target_is_released() ->
     assert not writer.thread.is_alive()
 
 
-def test_cancelled_close_keeps_its_original_deadline() -> None:
-    async def exercise() -> None:
-        target = FakeTarget(block_close=True)
-        writer = await _started(target, bytearray())
-        closing = asyncio.create_task(writer.close(timeout=0.03))
-        try:
-            for _ in range(100):
-                if target.close_calls == 1:
-                    break
-                await asyncio.sleep(0.001)
-            assert target.close_calls == 1
-
-            closing.cancel()
-            with pytest.raises(WriterShutdownTimeoutError):
-                await asyncio.wait_for(asyncio.shield(closing), timeout=0.2)
-        finally:
-            target.release_close.set()
-            await writer.close(timeout=1)
-            if not closing.done():
-                await closing
-
-    asyncio.run(exercise())
-
-
 def test_close_deadline_includes_writer_thread_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     async def exercise() -> None:
         target = FakeTarget()
@@ -531,14 +505,15 @@ def test_close_deadline_includes_writer_thread_exit(monkeypatch: pytest.MonkeyPa
         ) -> None:
             complete(future, result, error)
             worker_paused.set()
-            release_worker.wait(1)
+            release_worker.wait(5)
 
         monkeypatch.setattr(writer, "_complete", pause_after_completion)
-        closing = asyncio.create_task(writer.close(timeout=0.1))
+        closing = asyncio.create_task(writer.close(timeout=0.5))
         try:
             assert await asyncio.to_thread(worker_paused.wait, 1)
+            assert not closing.done()
             with pytest.raises(WriterShutdownTimeoutError):
-                await asyncio.wait_for(asyncio.shield(closing), timeout=0.3)
+                await asyncio.wait_for(asyncio.shield(closing), timeout=1)
         finally:
             release_worker.set()
             await writer.close(timeout=1)

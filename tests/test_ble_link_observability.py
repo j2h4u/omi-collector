@@ -73,16 +73,24 @@ def _read_phy_failure(status: int = 0x1A) -> bytes:
     return _packet(0x0E, payload)
 
 
-def _read_rssi_complete(rssi_dbm: int = -47) -> bytes:
-    payload = b"\x01" + (0x1405).to_bytes(2, "little") + b"\x00" + (0x42).to_bytes(2, "little")
+def _read_rssi_complete(rssi_dbm: int = -47, *, status: int = 0) -> bytes:
+    payload = b"\x01" + (0x1405).to_bytes(2, "little") + bytes((status,)) + (0x42).to_bytes(2, "little")
     return _packet(0x0E, payload + rssi_dbm.to_bytes(1, "little", signed=True))
 
 
-def test_parser_treats_controller_rssi_sentinel_as_unavailable() -> None:
+def test_parser_preserves_controller_rssi_sentinel_context() -> None:
     event = parse_hci_packet(_read_rssi_complete(127))
 
     assert event is not None
-    assert event.rssi_dbm is None  # type: ignore[union-attr]
+    assert (event.handle, event.status, event.rssi_dbm) == (0x42, 0, None)  # type: ignore[union-attr]
+
+
+def test_parser_decodes_signed_controller_rssi_and_preserves_failed_status() -> None:
+    success = parse_hci_packet(_read_rssi_complete(-47))
+    failure = parse_hci_packet(_read_rssi_complete(status=1))
+
+    assert success is not None and (success.handle, success.status, success.rssi_dbm) == (0x42, 0, -47)  # type: ignore[union-attr]
+    assert failure is not None and (failure.handle, failure.status, failure.rssi_dbm) == (None, 1, None)  # type: ignore[union-attr]
 
 
 def _connection_update(
@@ -229,8 +237,23 @@ def test_parser_ignores_truncated_connection_parameter_events(packet: bytes) -> 
     assert parse_hci_packet(packet) is None
 
 
+@pytest.mark.parametrize(
+    "packet",
+    [
+        _packet(0x3E, b"\x0c\x00\x42\x00\x01"),
+        _packet(0x3E, b"\x01" + bytes(17)),
+        _packet(0x3E, b"\x0a" + bytes(29)),
+        _packet(0x05, b"\x00\x42\x00"),
+        _packet(0x0E, b"\x01\x05\x14\x00"),
+    ],
+)
+def test_parser_ignores_truncated_phy_connection_disconnect_and_read_results(packet: bytes) -> None:
+    assert parse_hci_packet(packet) is None
+
+
 def test_parser_ignores_acl_malformed_and_mismatched_packets() -> None:
     assert parse_hci_packet(b"\x02\x00\x00") is None
+    assert parse_hci_packet(b"\x02\x05\x04\x00\x42\x00\x13") is None
     assert parse_hci_packet(b"\x04\x3e\x10\x01") is None
     assert parse_hci_packet(_connect(address=b"\x10\x10\x10\x10\x10\x10")) is not None
 

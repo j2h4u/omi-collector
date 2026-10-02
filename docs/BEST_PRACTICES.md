@@ -43,6 +43,8 @@ Review them for missing observable behavior, not just a higher score. Equivalent
 mutations, cosmetic messages and implementation-only changes are not reasons
 to add brittle assertions. Mutation testing does not replace complete
 state/event matrices, effect-boundary scenarios or existing release gates.
+Baseline coverage failures retain their complete logs on disk while console
+output stays bounded.
 
 The command sets `COVERAGE_CORE=ctrace`: Gremlins uses dynamic test contexts,
 which require this coverage backend on our Python 3.14 stack. The pinned fork

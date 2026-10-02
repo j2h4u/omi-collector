@@ -312,6 +312,56 @@ class _FakeSocket:
         self.closed = True
 
 
+def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
+    class ModeAwareSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocking = False
+            self.receive_entered = threading.Event()
+            self.release_receive = threading.Event()
+
+        def setblocking(self, flag: bool) -> None:
+            self.blocking = flag
+
+        def recv(self, _size: int) -> bytes:
+            self.receive_entered.set()
+            if self.blocking:
+                self.release_receive.wait()
+                return b""
+            raise BlockingIOError
+
+    fake = ModeAwareSocket()
+    diagnostics: list[str] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+    )
+    observer._diagnostic = lambda event, **_fields: diagnostics.append(event)
+
+    async def scenario() -> None:
+        await observer.start()
+        reader = observer._reader
+        assert reader is not None
+        try:
+            assert await asyncio.to_thread(fake.receive_entered.wait, 1.0)
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+            assert not reader.is_alive()
+            assert "ble_link_observer_reader_timeout" not in diagnostics
+        finally:
+            fake.release_receive.set()
+            reader.join(timeout=1.0)
+            assert not reader.is_alive()
+
+    asyncio.run(scenario())
+
+
 def test_hci_filter_uses_exact_linux_filter_abi() -> None:
     value = hci_filter_bytes()
     assert len(value) == 16

@@ -251,6 +251,30 @@ def test_parser_ignores_truncated_phy_connection_disconnect_and_read_results(pac
     assert parse_hci_packet(packet) is None
 
 
+def test_parser_does_not_finish_session_from_truncated_disconnect_frame() -> None:
+    records: list[dict[str, object]] = []
+    observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)
+    observer.handle_packet(_connect())
+
+    # The event declares five parameter bytes but contains only four.
+    observer.handle_packet(b"\x04\x05\x05\x00\x42\x00\x13")
+
+    assert records == []
+
+
+@pytest.mark.parametrize("packet", [b"\x04\x05", b"\x04\x05\x00"])
+def test_parser_records_short_hci_frames_in_debug_log(packet: bytes, caplog: pytest.LogCaptureFixture) -> None:
+    debug_logger = logging.getLogger("tests.ble_link.malformed_packet")
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        assert parse_hci_packet(packet, logger=debug_logger) is None
+
+    assert any(
+        record.name == debug_logger.name and getattr(record, "debug_event", None) == "ble_link_malformed_packet"
+        for record in caplog.records
+    )
+
+
 def test_parser_ignores_acl_malformed_and_mismatched_packets() -> None:
     assert parse_hci_packet(b"\x02\x00\x00") is None
     assert parse_hci_packet(b"\x02\x05\x04\x00\x42\x00\x13") is None
@@ -318,8 +342,12 @@ def test_native_hci_bind_passes_exact_sockaddr_hci_layout(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(ble_link_observability.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
     _native_hci_bind(37, 31, 3, 7)
+    _native_hci_bind(37, 31, 0, 0)
 
-    assert calls == [(37, b"\x1f\x00\x03\x00\x07\x00", 6)]
+    assert calls == [
+        (37, b"\x1f\x00\x03\x00\x07\x00", 6),
+        (37, b"\x1f\x00\x00\x00\x00\x00", 6),
+    ]
 
 
 def test_native_hci_bind_preserves_errno(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -3,6 +3,7 @@ import ctypes
 import errno
 import json
 import logging
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -420,6 +421,19 @@ def test_native_hci_bind_preserves_errno(monkeypatch: pytest.MonkeyPatch) -> Non
         _native_hci_bind(37, 31, 3, 7)
 
     assert raised.value.errno == errno.EACCES
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="libc HCI bind errno behavior is Linux-specific")
+def test_native_hci_bind_preserves_real_libc_errno() -> None:
+    previous_errno = ctypes.get_errno()
+    try:
+        ctypes.set_errno(0)
+        with pytest.raises(OSError) as raised:
+            _native_hci_bind(-1, 31, 0, 0)
+    finally:
+        ctypes.set_errno(previous_errno)
+
+    assert raised.value.errno == errno.EBADF
 
 
 @pytest.mark.parametrize(

@@ -411,6 +411,34 @@ def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
                 assert not reader.is_alive()
 
     asyncio.run(scenario())
+class _RestartLifecycleSocket(_FakeSocket):
+    def __init__(self, *, late_packet: bytes | None = None, stall_first_receive: bool = False) -> None:
+        super().__init__()
+        self.receive_entered = threading.Event()
+        self.release_receive = threading.Event()
+        self.packet_returned = threading.Event()
+        self._late_packet = late_packet
+        self._stall_first_receive = stall_first_receive
+        self._packets: queue.Queue[bytes] = queue.Queue()
+
+    def recv(self, _size: int) -> bytes:
+        self.receive_entered.set()
+        if self._stall_first_receive:
+            self._stall_first_receive = False
+            # This barrier models a reader delayed across the bounded close deadline.
+            self.release_receive.wait()
+            if self._late_packet is not None:
+                self.packet_returned.set()
+                return self._late_packet
+        try:
+            packet = self._packets.get_nowait()
+        except queue.Empty as error:
+            raise BlockingIOError from error
+        self.packet_returned.set()
+        return packet
+
+    def feed(self, packet: bytes) -> None:
+        self._packets.put_nowait(packet)
 
 
 def test_hci_filter_uses_exact_linux_filter_abi() -> None:
@@ -678,6 +706,128 @@ def test_observer_start_failure_keeps_traceback_in_debug_ring_and_warning_separa
     warning_records = [record for record in caplog.records if record.name == warning_logger.name]
     assert [record.getMessage() for record in warning_records] == ["BLE link observer unavailable"]
     assert "raw HCI payload must stay private" not in caplog.text
+
+
+def test_observer_restart_refuses_a_live_reader_after_bounded_close() -> None:
+    sockets: list[_RestartLifecycleSocket] = []
+    factory_calls: list[_RestartLifecycleSocket] = []
+    workers: list[threading.Thread] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+
+    def socket_factory(*_args: object) -> _RestartLifecycleSocket:
+        sock = _RestartLifecycleSocket(stall_first_receive=True)
+        sockets.append(sock)
+        factory_calls.append(sock)
+        return sock
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=socket_factory,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+    )
+
+    async def scenario() -> None:
+        try:
+            await observer.start()
+            reader, processor = observer._reader, observer._processor
+            assert reader is not None and processor is not None
+            workers.extend((reader, processor))
+            assert await asyncio.to_thread(sockets[0].receive_entered.wait, 1)
+            await asyncio.wait_for(observer.close(), timeout=1)
+            assert reader.is_alive()
+            await asyncio.to_thread(processor.join, 1)
+            assert not processor.is_alive()
+
+            await observer.start()
+            reader = observer._reader
+            processor = observer._processor
+            workers.extend(worker for worker in (reader, processor) if worker is not None and worker not in workers)
+            assert len(factory_calls) == 1
+        finally:
+            for sock in sockets:
+                sock.release_receive.set()
+            for worker in (observer._reader, observer._processor):
+                if worker is not None and worker not in workers:
+                    workers.append(worker)
+            with suppress(Exception):
+                await asyncio.wait_for(observer.close(), timeout=1)
+            for worker in workers:
+                await asyncio.to_thread(worker.join, 1)
+                assert not worker.is_alive()
+
+    asyncio.run(scenario())
+
+
+def test_observer_restart_drops_late_packet_from_previous_session() -> None:
+    old_socket = _RestartLifecycleSocket(late_packet=_connect(), stall_first_receive=True)
+    new_socket = _RestartLifecycleSocket()
+    sockets = [old_socket, new_socket]
+    factory_calls: list[_RestartLifecycleSocket] = []
+    workers: list[threading.Thread] = []
+    records: list[dict[str, object]] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+
+    def socket_factory(*_args: object) -> _RestartLifecycleSocket:
+        sock = sockets[len(factory_calls)]
+        factory_calls.append(sock)
+        return sock
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=socket_factory,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=records.append,
+    )
+
+    async def scenario() -> None:
+        try:
+            await observer.start()
+            old_reader, old_processor = observer._reader, observer._processor
+            assert old_reader is not None and old_processor is not None
+            workers.extend((old_reader, old_processor))
+            assert await asyncio.to_thread(old_socket.receive_entered.wait, 1)
+            await asyncio.wait_for(observer.close(), timeout=1)
+            assert old_reader.is_alive()
+            await asyncio.to_thread(old_processor.join, 1)
+            assert not old_processor.is_alive()
+
+            old_socket.release_receive.set()
+            await asyncio.to_thread(old_reader.join, 1)
+            assert not old_reader.is_alive()
+            assert old_socket.packet_returned.is_set()
+
+            await observer.start()
+            new_reader, new_processor = observer._reader, observer._processor
+            assert new_reader is not None and new_processor is not None
+            workers.extend((new_reader, new_processor))
+            assert len(factory_calls) == 2
+            new_socket.feed(_packet(0x05, b"\x00\x42\x00\x13"))
+            assert await asyncio.to_thread(new_socket.packet_returned.wait, 1)
+            await asyncio.wait_for(observer.close(), timeout=1)
+            assert records == []
+        finally:
+            for sock in sockets:
+                sock.release_receive.set()
+            for worker in (observer._reader, observer._processor):
+                if worker is not None and worker not in workers:
+                    workers.append(worker)
+            with suppress(Exception):
+                await asyncio.wait_for(observer.close(), timeout=1)
+            for worker in workers:
+                await asyncio.to_thread(worker.join, 1)
+                assert not worker.is_alive()
+
+    asyncio.run(scenario())
 
 
 def test_observer_shutdown_drains_queued_disconnect_before_finalizing() -> None:

@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from subprocess import CompletedProcess
+from typing import cast
 
 import pytest
 from scripts import mutation_campaign
@@ -102,7 +103,10 @@ def test_timeout_resume_keeps_campaign_and_native_cache(campaign_repo: tuple[Pat
     resumed = _campaign(repo, env, "prepare")
     assert resumed.returncode == 0, resumed.stderr
     assert (repo / ".gremlins_cache" / "results.db").read_text(encoding="utf-8") == "persisted verdict"
-    receipt = json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8"))
+    receipt = cast(
+        dict[str, object],
+        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
+    )
     assert receipt["mode"] == "resume"
 
 
@@ -161,7 +165,10 @@ def test_postflight_rejects_old_report_even_when_its_timestamp_is_future(
     result = _campaign(repo, env, "finish", "--status", "0")
     assert result.returncode != 0
     assert "fresh native JSON report" in result.stderr
-    receipt = json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8"))
+    receipt = cast(
+        dict[str, object],
+        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
+    )
     assert receipt["state"] == "failed"
     assert "ended_at" in receipt
 
@@ -174,7 +181,10 @@ def test_status_137_is_recorded_and_only_resumes_on_a_new_invocation(
     assert _campaign(repo, env, "finish", "--status", "137").returncode == 0
     result = _campaign(repo, env, "prepare")
     assert result.returncode == 0, result.stderr
-    receipt = json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8"))
+    receipt = cast(
+        dict[str, object],
+        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
+    )
     assert receipt["mode"] == "resume"
     assert receipt["exit_status"] is None
 
@@ -200,9 +210,12 @@ def test_postflight_subprocess_failure_records_terminal_receipt(
     monkeypatch.setattr(mutation_campaign, "_identity", fail_identity)
     result = _campaign(repo, env, "finish", "--status", "0")
     assert result.returncode != 0
-    receipt = json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8"))
+    receipt = cast(
+        dict[str, object],
+        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
+    )
     assert receipt["state"] == "failed"
-    assert "returned non-zero exit status 1" in receipt["postflight_error"]
+    assert "returned non-zero exit status 1" in cast(str, receipt["postflight_error"])
 
 
 def test_native_errors_and_timeouts_remain_unresolved(campaign_repo: tuple[Path, dict[str, str]]) -> None:
@@ -210,14 +223,21 @@ def test_native_errors_and_timeouts_remain_unresolved(campaign_repo: tuple[Path,
     assert _campaign(repo, env, "prepare").returncode == 0
     _write_report(repo)
     report = repo / "coverage" / "gremlins" / "gremlins.json"
-    data = json.loads(report.read_text(encoding="utf-8"))
-    data["results"][0]["status"] = "timeout"
-    data["summary"]["zapped"] = 0
-    data["summary"]["timeout"] = 1
+    data = cast(dict[str, object], json.loads(report.read_text(encoding="utf-8")))
+    results = cast(list[dict[str, object]], data["results"])
+    summary = cast(dict[str, object], data["summary"])
+    results[0]["status"] = "timeout"
+    summary["zapped"] = 0
+    summary["timeout"] = 1
     report.write_text(json.dumps(data), encoding="utf-8")
     future = time.time_ns() + 1_000_000
     os.utime(report, ns=(future, future))
     assert _campaign(repo, env, "finish", "--status", "0").returncode == 3
-    receipt = json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8"))
+    receipt = cast(
+        dict[str, object],
+        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
+    )
     assert receipt["state"] == "complete_unresolved"
-    assert receipt["report"]["status_counts"]["timeout"] == 1
+    report_data = cast(dict[str, object], receipt["report"])
+    status_counts = cast(dict[str, int], report_data["status_counts"])
+    assert status_counts["timeout"] == 1

@@ -32,8 +32,10 @@ failure diagnostics, native module/package metadata preservation and POSIX proce
 and descendants in their process group must stop before the next mutation runs.
 `lightweight_runner = false` is required. A successful native coverage pre-scan
 is saved with an input fingerprint so later timed windows can reuse the exact
-coverage map; the baseline test suite still runs on every window. Start a new
-audit with a cleared cache, then preserve that cache while resuming it. The released
+coverage map; the full-suite prescan has a fixed 600-second budget independent
+of the per-mutant timeout, and the baseline test suite still runs on every
+window. Start a new audit with a cleared cache, then preserve that cache while
+resuming it. The released
 runner timeout uses a canonical cache-key form across integer TOML values and
 equivalent integral CLI floats, while fractional timeouts retain exact values.
 lightweight runner can falsely kill mutations when fixtures or parametrization

@@ -411,6 +411,8 @@ def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
                 assert not reader.is_alive()
 
     asyncio.run(scenario())
+
+
 class _RestartLifecycleSocket(_FakeSocket):
     def __init__(self, *, late_packet: bytes | None = None, stall_first_receive: bool = False) -> None:
         super().__init__()

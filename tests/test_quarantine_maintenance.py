@@ -124,6 +124,7 @@ def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: P
     )
     originals = {name: cast(Callable[..., object], getattr(store, name)) for name in methods}
     for name, original in originals.items():
+
         def spy(*args: object, _name: str = name, _original: object = original, **kwargs: object) -> object:
             calls.append(_name)
             return _original(*args, **kwargs)  # type: ignore[operator]
@@ -143,9 +144,7 @@ def test_maintenance_runs_again_at_exact_configured_monotonic_boundary(
     config = CollectorConfig(retry=RetryConfig(maintenance_interval_seconds=10.0))
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
     now = 100.0
-    monkeypatch.setattr(
-        "omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now
-    )
+    monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
     calls: list[str] = []
     methods = (
         "recover_and_publish",
@@ -456,14 +455,13 @@ def test_complete_pending_startup_keeps_authenticated_tail_at_packet_count_bound
     original_lock = store.device_lock
 
     if promotion_busy:
+
         def busy_only_during_pending_promotion(
             *, recover_capture_temporaries: bool = True, operation: str = "unknown"
         ) -> object:
             if operation == "resume_pending_attempt":
                 raise DeviceAlreadyRunningError("another writer owns the promotion lease")
-            return original_lock(
-                recover_capture_temporaries=recover_capture_temporaries, operation=operation
-            )
+            return original_lock(recover_capture_temporaries=recover_capture_temporaries, operation=operation)
 
         monkeypatch.setattr(store, "device_lock", busy_only_during_pending_promotion)
 

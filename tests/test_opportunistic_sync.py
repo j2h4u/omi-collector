@@ -398,7 +398,8 @@ class _SealResultBatchWriter:
         await self.writer.close(timeout=timeout)
 
 
-async def _real_batch_writer(store: StagingStore, start: int, count: int) -> BatchWriterPort:
+@asynccontextmanager
+async def _real_batch_writer(store: StagingStore, start: int, count: int) -> AsyncIterator[BatchWriterPort]:
     writer = _runtime().make_batch_writer(
         store,
         start,
@@ -407,10 +408,17 @@ async def _real_batch_writer(store: StagingStore, start: int, count: int) -> Bat
         source=memoryview(_records(start, count)),
         config=DEFAULT_CONFIG.writer,
     )
-    await writer.start()
-    await writer.prepare_leg(start, count)
-    await writer.read_begin(ReadBeginNotification(start, count))
-    return writer
+    try:
+        await writer.start()
+        await writer.prepare_leg(start, count)
+        await writer.read_begin(ReadBeginNotification(start, count))
+        yield writer
+    finally:
+        try:
+            await writer.close(timeout=2)
+        finally:
+            await asyncio.to_thread(writer.thread.join, 2)
+            assert not writer.thread.is_alive()
 
 
 @_async_test
@@ -3238,132 +3246,130 @@ def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) 
 @_async_test
 async def test_close_visit_absence_publishes_partial_prefix_before_terminal_closure(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    writer = await _real_batch_writer(store, 100, 2)
-    assert writer.publish(RECORD_SIZE)
-    attempt_path = store.attempts_root / writer.attempt_id
-    batch = batch_reconciliation._Batch(
-        RingInfo(100, 102, 10000, 0, RECORD_SIZE),
-        100,
-        102,
-        TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
-        writer,
-    )
+    async with _real_batch_writer(store, 100, 2) as writer:
+        assert writer.publish(RECORD_SIZE)
+        attempt_path = store.attempts_root / writer.attempt_id
+        batch = batch_reconciliation._Batch(
+            RingInfo(100, 102, 10000, 0, RECORD_SIZE),
+            100,
+            102,
+            TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
+            writer,
+        )
 
-    async def quarantine(_attempt_id: str) -> None:
-        return None
+        async def quarantine(_attempt_id: str) -> None:
+            return None
 
-    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
-    reconciler._state.batch = batch
-    await reconciler.close_visit("absence")
+        reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+        reconciler._state.batch = batch
+        await reconciler.close_visit("absence")
 
-    assert reconciler._state.batch is None
-    assert reconciler.durable_progress() == 0
-    assert not writer.thread.is_alive()
-    assert (attempt_path / "prefix-publication.json").is_file()
-    assert (attempt_path / "terminal-retired.json").is_file()
-    assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-        {"next_sequence": 101, "reason": "absence"}
-    ]
+        assert reconciler._state.batch is None
+        assert reconciler.durable_progress() == 0
+        assert not writer.thread.is_alive()
+        assert (attempt_path / "prefix-publication.json").is_file()
+        assert (attempt_path / "terminal-retired.json").is_file()
+        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+            {"next_sequence": 101, "reason": "absence"}
+        ]
 
 
 @_async_test
 async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_close(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    writer = await _real_batch_writer(store, 100, 2)
-    assert writer.publish(RECORD_SIZE * 2)
-    seal = await writer.seal(DoneNotification(0, 102))
-    assert seal is not None
-    batch = batch_reconciliation._Batch(
-        RingInfo(100, 102, 10000, 0, RECORD_SIZE),
-        100,
-        102,
-        TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
-        writer,
-        seal=seal,
-    )
+    async with _real_batch_writer(store, 100, 2) as writer:
+        assert writer.publish(RECORD_SIZE * 2)
+        seal = await writer.seal(DoneNotification(0, 102))
+        assert seal is not None
+        batch = batch_reconciliation._Batch(
+            RingInfo(100, 102, 10000, 0, RECORD_SIZE),
+            100,
+            102,
+            TransferArena(100, 2, max_bytes=RECORD_SIZE * 2),
+            writer,
+            seal=seal,
+        )
 
-    async def quarantine(_attempt_id: str) -> None:
-        return None
+        async def quarantine(_attempt_id: str) -> None:
+            return None
 
-    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
-    reconciler._state.batch = batch
-    await reconciler.close_visit("absence")
+        reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+        reconciler._state.batch = batch
+        await reconciler.close_visit("absence")
 
-    assert not writer.thread.is_alive()
-    assert seal.bundle_path.is_dir()
-    assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-        {"next_sequence": 102, "reason": "absence"}
-    ]
+        assert not writer.thread.is_alive()
+        assert seal.bundle_path.is_dir()
+        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+            {"next_sequence": 102, "reason": "absence"}
+        ]
 
 
 @_async_test
 async def test_close_visit_empty_batch_closes_writer_without_creating_visit_closure(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    writer = await _real_batch_writer(store, 100, 1)
-    batch = batch_reconciliation._Batch(
-        RingInfo(100, 100, 10000, 0, RECORD_SIZE),
-        100,
-        100,
-        TransferArena(100, 0, max_bytes=0),
-        writer,
-    )
+    async with _real_batch_writer(store, 100, 1) as writer:
+        batch = batch_reconciliation._Batch(
+            RingInfo(100, 100, 10000, 0, RECORD_SIZE),
+            100,
+            100,
+            TransferArena(100, 0, max_bytes=0),
+            writer,
+        )
 
-    async def quarantine(_attempt_id: str) -> None:
-        return None
+        async def quarantine(_attempt_id: str) -> None:
+            return None
 
-    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
-    reconciler._state.batch = batch
-    await reconciler.close_visit("absence")
+        reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+        reconciler._state.batch = batch
+        await reconciler.close_visit("absence")
 
-    assert reconciler._state.batch is None
-    assert not writer.thread.is_alive()
-    assert not store.ready_closures_path.exists()
+        assert reconciler._state.batch is None
+        assert not writer.thread.is_alive()
+        assert not store.ready_closures_path.exists()
 
 
 @_async_test
 async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
-    writer = await _real_batch_writer(store, 100, 1)
-    assert writer.publish(RECORD_SIZE)
-    seal = await writer.seal(DoneNotification(0, 101))
-    assert seal is not None
-    batch = batch_reconciliation._Batch(
-        RingInfo(100, 101, 10000, 0, RECORD_SIZE),
-        100,
-        101,
-        TransferArena(100, 1, max_bytes=RECORD_SIZE),
-        writer,
-        seal=seal,
-    )
+    async with _real_batch_writer(store, 100, 1) as writer:
+        assert writer.publish(RECORD_SIZE)
+        seal = await writer.seal(DoneNotification(0, 101))
+        assert seal is not None
+        batch = batch_reconciliation._Batch(
+            RingInfo(100, 101, 10000, 0, RECORD_SIZE),
+            100,
+            101,
+            TransferArena(100, 1, max_bytes=RECORD_SIZE),
+            writer,
+            seal=seal,
+        )
 
-    async def quarantine(_attempt_id: str) -> None:
-        return None
+        async def quarantine(_attempt_id: str) -> None:
+            return None
 
-    reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
-    reconciler._state.batch = batch
-    close = writer.close
+        reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
+        reconciler._state.batch = batch
 
-    async def fail_close(*, timeout: float) -> None:
-        del timeout
-        raise TimeoutError("writer close did not complete")
+        async def fail_close(*, timeout: float) -> None:
+            del timeout
+            raise TimeoutError("writer close did not complete")
 
-    monkeypatch.setattr(writer, "close", fail_close)
-    with pytest.raises(TimeoutError, match="writer close"):
-        await batch_reconciliation._complete_batch(reconciler._state, batch, _options())
+        with monkeypatch.context() as patch:
+            patch.setattr(writer, "close", fail_close)
+            with pytest.raises(TimeoutError, match="writer close"):
+                await batch_reconciliation._complete_batch(reconciler._state, batch, _options())
 
-    assert reconciler._state.batch is batch
-    assert reconciler._state.last_result is None
-    assert reconciler.completed_batches == 0
-    monkeypatch.setattr(writer, "close", close)
-    await writer.close(timeout=2)
+        assert reconciler._state.batch is batch
+        assert reconciler._state.last_result is None
+        assert reconciler.completed_batches == 0
 
 
 @_async_test
 async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_path: Path) -> None:
     target = _BlockingSealTarget(tmp_path / "sealed")
     writer = _SealResultBatchWriter(target)
-    await writer.writer.start()
     try:
+        await writer.writer.start()
         await writer.writer.read_begin(ReadBeginNotification(10, 1))
         assert writer.writer.publish(RECORD_SIZE)
         durable = await writer.checkpoint()
@@ -3439,8 +3445,8 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
 async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tmp_path: Path) -> None:
     target = _BlockingSealTarget(tmp_path / "sealed")
     writer = _SealResultBatchWriter(target)
-    await writer.writer.start()
     try:
+        await writer.writer.start()
         await writer.writer.read_begin(ReadBeginNotification(10, 1))
         assert writer.writer.publish(RECORD_SIZE)
         durable = await writer.checkpoint()

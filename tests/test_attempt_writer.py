@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import pytest
@@ -20,7 +22,7 @@ from omi_collector.capture.adapters.attempt_writer import (
 )
 from omi_collector.capture.application.session_lifecycle import bounded
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
-from omi_collector.config import WriterConfig
+from omi_collector.config import DEFAULT_CONFIG, WriterConfig
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class FakeTarget:
     release_append: threading.Event = field(default_factory=threading.Event)
     block_append: bool = False
     fail_append: bool = False
+    fail_append_after_block: bool = False
     block_read_begin: bool = False
     fail_read_begin: bool = False
     fail_read_begin_after_block: bool = False
@@ -51,11 +54,13 @@ class FakeTarget:
     block_close: bool = False
     fail_close: bool = False
     release_close: threading.Event = field(default_factory=threading.Event)
+    close_started: threading.Event = field(default_factory=threading.Event)
     seal_calls: int = 0
     close_calls: int = 0
     checkpoint_result: object = "checkpointed"
     append_readonly: list[bool] = field(default_factory=list)
     append_offsets: list[int] = field(default_factory=list)
+    second_append_started: threading.Event = field(default_factory=threading.Event)
 
     def _record(self, name: str, value: bytes | object = None) -> None:
         self.thread_ids.add(threading.get_ident())
@@ -88,11 +93,15 @@ class FakeTarget:
         self.calls.append(("append", offset, bytes(chunk)))
         self.append_readonly.append(chunk.readonly)
         self.append_offsets.append(offset)
+        if len(self.append_offsets) == 2:
+            self.second_append_started.set()
         self.append_started.set()
         if self.fail_append:
             raise OSError("disk full")
         if self.block_append:
             self.release_append.wait(5)
+        if self.fail_append_after_block:
+            raise OSError("disk full after append barrier")
         return None
 
     def checkpoint(self) -> object:
@@ -114,6 +123,7 @@ class FakeTarget:
     def close(self) -> object:
         self._record("close")
         self.close_calls += 1
+        self.close_started.set()
         if self.block_close:
             self.release_close.wait(5)
         if self.fail_close:
@@ -121,11 +131,53 @@ class FakeTarget:
         return "closed"
 
 
-async def _started(target: FakeTarget, source: bytes | bytearray, *, chunk_records: int = 1) -> AttemptWriter:
-    writer = AttemptWriter(target, source, config=WriterConfig(chunk_records=chunk_records))
-    await writer.start()
-    await writer.read_begin("begin")
-    return writer
+@asynccontextmanager
+async def _owned_writer(
+    target: FakeTarget,
+    source: bytes | bytearray | memoryview,
+    *,
+    config: WriterConfig = DEFAULT_CONFIG.writer,
+    expect_failure: bool = False,
+) -> AsyncIterator[AttemptWriter]:
+    writer = AttemptWriter(target, source, config=config)
+    try:
+        yield writer
+    finally:
+        for barrier in (
+            target.release_prepare,
+            target.release_read_begin,
+            target.release_append,
+            target.release_seal,
+            target.release_close,
+        ):
+            barrier.set()
+        try:
+            await writer.close(timeout=1)
+        except WriterFailedError:
+            if not expect_failure or writer.failure is None:
+                raise
+        finally:
+            await asyncio.to_thread(writer.thread.join, 1)
+            assert not writer.thread.is_alive()
+
+
+@asynccontextmanager
+async def _started(
+    target: FakeTarget,
+    source: bytes | bytearray,
+    *,
+    chunk_records: int = 1,
+    expect_failure: bool = False,
+) -> AsyncIterator[AttemptWriter]:
+    async with _owned_writer(
+        target,
+        source,
+        config=WriterConfig(chunk_records=chunk_records),
+        expect_failure=expect_failure,
+    ) as writer:
+        await writer.start()
+        await writer.read_begin("begin")
+        yield writer
 
 
 def test_arena_is_shared_and_data_waits_for_read_begin() -> None:
@@ -134,30 +186,29 @@ def test_arena_is_shared_and_data_waits_for_read_begin() -> None:
 
 def test_writer_config_controls_writer_settings() -> None:
     config = WriterConfig(chunk_records=2, max_control_commands=3, join_poll_seconds=0.123)
-    writer = AttemptWriter(FakeTarget(), bytearray(RECORD_SIZE * 5), config=config)
-    assert writer._config is config
-    assert writer._config.join_poll_seconds == 0.123
-    asyncio.run(writer.close())
+
+    async def exercise() -> None:
+        async with _owned_writer(FakeTarget(), bytearray(RECORD_SIZE * 5), config=config) as writer:
+            assert writer._config is config
+            assert writer._config.join_poll_seconds == 0.123
+
+    asyncio.run(exercise())
 
 
 def test_writer_config_controls_control_capacity() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_read_begin=True)
-        writer = AttemptWriter(
-            target,
-            bytearray(RECORD_SIZE),
-            config=WriterConfig(max_control_commands=1),
-        )
-        await writer.start()
-        first = writer.submit_read_begin("first")
-        assert await asyncio.to_thread(target.read_begin_started.wait, 1)
-        second = writer.submit_read_begin("second")
-        with pytest.raises(WriterQueueFullError):
-            writer.submit_read_begin("third")
-        target.release_read_begin.set()
-        assert await first == "first"
-        assert await second == "second"
-        await writer.close()
+        async with _owned_writer(target, bytearray(RECORD_SIZE), config=WriterConfig(max_control_commands=1)) as writer:
+            await writer.start()
+            first = writer.submit_read_begin("first")
+            assert await asyncio.to_thread(target.read_begin_started.wait, 1)
+            second = writer.submit_read_begin("second")
+            with pytest.raises(WriterQueueFullError):
+                writer.submit_read_begin("third")
+            target.release_read_begin.set()
+            assert await first == "first"
+            assert await second == "second"
+            await writer.close()
 
     asyncio.run(exercise())
 
@@ -166,15 +217,15 @@ def test_writer_config_controls_default_close_timeout() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_close=True)
         config = WriterConfig(close_timeout_seconds=0.01, join_poll_seconds=0.001)
-        writer = AttemptWriter(target, bytearray(), config=config)
-        await writer.start()
-        await writer.read_begin("begin")
+        async with _owned_writer(target, bytearray(), config=config) as writer:
+            await writer.start()
+            await writer.read_begin("begin")
 
-        with pytest.raises(WriterShutdownTimeoutError):
-            await writer.close()
-        assert target.close_calls == 1
-        target.release_close.set()
-        assert await writer.close(timeout=1) == "closed"
+            with pytest.raises(WriterShutdownTimeoutError):
+                await writer.close()
+            assert target.close_calls == 1
+            target.release_close.set()
+            assert await writer.close(timeout=1) == "closed"
 
     asyncio.run(exercise())
 
@@ -182,21 +233,21 @@ def test_writer_config_controls_default_close_timeout() -> None:
 async def _test_arena_is_shared_and_data_waits_for_read_begin() -> None:
     target = FakeTarget()
     arena = bytearray(RECORD_SIZE * 2)
-    writer = AttemptWriter(target, arena, config=WriterConfig(chunk_records=1))
-    assert writer.state is WriterState.CREATED
-    await writer.start()
-    assert writer.state is WriterState.STARTED
-    arena[:RECORD_SIZE] = b"x" * RECORD_SIZE
-    writer.publish(RECORD_SIZE)
-    await asyncio.sleep(0.02)
-    assert not [call for call in target.calls if call[0] == "append"]
+    async with _owned_writer(target, arena, config=WriterConfig(chunk_records=1)) as writer:
+        assert writer.state is WriterState.CREATED
+        await writer.start()
+        assert writer.state is WriterState.STARTED
+        arena[:RECORD_SIZE] = b"x" * RECORD_SIZE
+        writer.publish(RECORD_SIZE)
+        await asyncio.sleep(0.02)
+        assert not [call for call in target.calls if call[0] == "append"]
 
-    await writer.read_begin("begin")
-    await writer.barrier()
-    assert target.calls[2] == ("append", 0, b"x" * RECORD_SIZE)
-    assert writer.progress.submitted == RECORD_SIZE
-    assert writer.progress.written == RECORD_SIZE
-    await writer.close()
+        await writer.read_begin("begin")
+        await writer.barrier()
+        assert target.calls[2] == ("append", 0, b"x" * RECORD_SIZE)
+        assert writer.progress.submitted == RECORD_SIZE
+        assert writer.progress.written == RECORD_SIZE
+        await writer.close()
 
 
 def test_submit_read_begin_is_nonblocking_and_orders_data() -> None:
@@ -205,23 +256,27 @@ def test_submit_read_begin_is_nonblocking_and_orders_data() -> None:
 
 async def _test_submit_read_begin_is_nonblocking_and_orders_data() -> None:
     target = FakeTarget()
-    writer = AttemptWriter(target, bytearray(RECORD_SIZE), config=WriterConfig(chunk_records=1))
-    await writer.start()
-    target.block_read_begin = True
-    began = time.monotonic()
-    future = writer.submit_read_begin("queued")
-    elapsed = time.monotonic() - began
-    assert elapsed < 0.05
-    assert not future.done()
-    writer.publish(RECORD_SIZE)
-    await asyncio.sleep(0.01)
-    assert not [call for call in target.calls if call[0] == "append"]
-    target.release_read_begin.set()
-    assert await future == "queued"
-    await writer.barrier()
-    names = [call[0] for call in target.calls]
-    assert names.index("read_begin") < names.index("append")
-    await writer.close()
+    async with _owned_writer(
+        target,
+        bytearray(RECORD_SIZE),
+        config=WriterConfig(chunk_records=1),
+    ) as writer:
+        await writer.start()
+        target.block_read_begin = True
+        began = time.monotonic()
+        future = writer.submit_read_begin("queued")
+        elapsed = time.monotonic() - began
+        assert elapsed < 0.05
+        assert not future.done()
+        writer.publish(RECORD_SIZE)
+        await asyncio.sleep(0.01)
+        assert not [call for call in target.calls if call[0] == "append"]
+        target.release_read_begin.set()
+        assert await future == "queued"
+        await writer.barrier()
+        names = [call[0] for call in target.calls]
+        assert names.index("read_begin") < names.index("append")
+        await writer.close()
 
 
 def test_prefix_and_done_seal_are_worker_owned_and_ordered() -> None:
@@ -230,23 +285,23 @@ def test_prefix_and_done_seal_are_worker_owned_and_ordered() -> None:
 
 async def _test_prefix_and_done_seal_are_worker_owned_and_ordered() -> None:
     target = FakeTarget()
-    writer = AttemptWriter(target, bytearray(RECORD_SIZE * 2), config=WriterConfig(chunk_records=1))
-    await writer.start()
-    assert await writer.prepare_leg(100, 2) == "prepared"
-    await writer.read_begin("begin")
-    writer.publish(RECORD_SIZE)
-    assert await writer.publish_prefix() == "prefix"
-    assert [call[0] for call in target.calls] == [
-        "prepare",
-        "prepare_leg",
-        "read_begin",
-        "append",
-        "publish_prefix",
-    ]
-    assert target.calls[-1] == ("publish_prefix", 0, None)
-    assert len(target.thread_ids) == 1
-    assert writer.state is WriterState.SEALED
-    await writer.close()
+    async with _owned_writer(target, bytearray(RECORD_SIZE * 2), config=WriterConfig(chunk_records=1)) as writer:
+        await writer.start()
+        assert await writer.prepare_leg(100, 2) == "prepared"
+        await writer.read_begin("begin")
+        writer.publish(RECORD_SIZE)
+        assert await writer.publish_prefix() == "prefix"
+        assert [call[0] for call in target.calls] == [
+            "prepare",
+            "prepare_leg",
+            "read_begin",
+            "append",
+            "publish_prefix",
+        ]
+        assert target.calls[-1] == ("publish_prefix", 0, None)
+        assert len(target.thread_ids) == 1
+        assert writer.state is WriterState.SEALED
+        await writer.close()
 
 
 def test_sealing_state_is_visible_until_target_seal_completes() -> None:
@@ -255,14 +310,14 @@ def test_sealing_state_is_visible_until_target_seal_completes() -> None:
 
 async def _test_sealing_state_is_visible_until_target_seal_completes() -> None:
     target = FakeTarget(block_seal=True)
-    writer = await _started(target, bytearray(RECORD_SIZE))
-    seal_task = asyncio.create_task(writer.seal("done"))
-    assert await asyncio.to_thread(target.seal_started.wait, 1)
-    assert writer.state is WriterState.SEALING
-    target.release_seal.set()
-    assert await seal_task == "sealed"
-    assert writer.state is WriterState.SEALED
-    await writer.close()
+    async with _started(target, bytearray(RECORD_SIZE)) as writer:
+        seal_task = asyncio.create_task(writer.seal("done"))
+        assert await asyncio.to_thread(target.seal_started.wait, 1)
+        assert writer.state is WriterState.SEALING
+        target.release_seal.set()
+        assert await seal_task == "sealed"
+        assert writer.state is WriterState.SEALED
+        await writer.close()
 
 
 def test_read_begin_failure_latches_and_forbids_later_controls() -> None:
@@ -271,18 +326,23 @@ def test_read_begin_failure_latches_and_forbids_later_controls() -> None:
 
 async def _test_read_begin_failure_latches_and_forbids_later_controls() -> None:
     target = FakeTarget(fail_read_begin=True)
-    writer = AttemptWriter(target, bytearray(RECORD_SIZE), config=WriterConfig(chunk_records=1))
-    await writer.start()
-    future = writer.submit_read_begin("bad")
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await future
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await writer.checkpoint()
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await writer.seal("done")
-    assert not [call for call in target.calls if call[0] == "seal"]
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await writer.close()
+    async with _owned_writer(
+        target,
+        bytearray(RECORD_SIZE),
+        config=WriterConfig(chunk_records=1),
+        expect_failure=True,
+    ) as writer:
+        await writer.start()
+        future = writer.submit_read_begin("bad")
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await future
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await writer.checkpoint()
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await writer.seal("done")
+        assert not [call for call in target.calls if call[0] == "seal"]
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await writer.close()
 
 
 def test_publish_is_nonblocking_while_target_append_is_slow() -> None:
@@ -291,35 +351,72 @@ def test_publish_is_nonblocking_while_target_append_is_slow() -> None:
 
 async def _test_publish_is_nonblocking_while_target_append_is_slow() -> None:
     target = FakeTarget(block_append=True)
-    writer = await _started(target, bytearray(RECORD_SIZE * 10))
-    heartbeat = 0
+    async with _started(target, bytearray(RECORD_SIZE * 10)) as writer:
+        heartbeat = 0
 
-    async def tick() -> None:
-        nonlocal heartbeat
-        for _ in range(8):
-            await asyncio.sleep(0.005)
-            heartbeat += 1
+        async def tick() -> None:
+            nonlocal heartbeat
+            for _ in range(8):
+                await asyncio.sleep(0.005)
+                heartbeat += 1
 
-    task = asyncio.create_task(tick())
-    assert writer.publish(RECORD_SIZE)
-    assert target.append_started.wait(1)
-    began = time.monotonic()
-    for high_water in range(2, 11):
-        assert writer.publish(high_water * RECORD_SIZE)
-    elapsed = time.monotonic() - began
-    await task
-    assert elapsed < 0.05
-    assert heartbeat == 8
-    target.release_append.set()
-    await writer.close()
+        task = asyncio.create_task(tick())
+        assert writer.publish(RECORD_SIZE)
+        assert target.append_started.wait(1)
+        began = time.monotonic()
+        for high_water in range(2, 11):
+            assert writer.publish(high_water * RECORD_SIZE)
+        elapsed = time.monotonic() - began
+        await task
+        assert elapsed < 0.05
+        assert heartbeat == 8
+        target.release_append.set()
+        await writer.close()
 
 
 def test_publish_high_water_is_record_aligned() -> None:
     async def exercise() -> None:
-        writer = AttemptWriter(FakeTarget(), bytearray(RECORD_SIZE), config=WriterConfig(chunk_records=1))
-        with pytest.raises(ValueError, match="record-aligned"):
-            writer.publish(1)
-        await writer.close()
+        async with _owned_writer(FakeTarget(), bytearray(RECORD_SIZE), config=WriterConfig(chunk_records=1)) as writer:
+            with pytest.raises(ValueError, match="record-aligned"):
+                writer.publish(1)
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_publish_zero_and_repeated_high_water_are_noops() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray(b"x" * RECORD_SIZE)) as writer:
+            try:
+                assert not writer.publish(0)
+                assert writer.publish(RECORD_SIZE)
+                assert not writer.publish(RECORD_SIZE)
+                assert not writer.publish(0)
+                await writer.barrier()
+
+                assert [call for call in target.calls if call[0] == "append"] == [("append", 0, b"x" * RECORD_SIZE)]
+            finally:
+                await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_contiguous_non_byte_memoryview_is_published_as_bytes() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        source = memoryview(b"x" * RECORD_SIZE).cast("I")
+        async with _owned_writer(target, source, config=WriterConfig(chunk_records=1)) as writer:
+            try:
+                await writer.start()
+                await writer.read_begin("begin")
+
+                assert writer.publish(RECORD_SIZE)
+                await writer.barrier()
+
+                assert ("append", 0, b"x" * RECORD_SIZE) in target.calls
+            finally:
+                await writer.close()
 
     asyncio.run(exercise())
 
@@ -330,25 +427,81 @@ def test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
 
 async def _test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
     target = FakeTarget()
-    writer = await _started(target, bytearray(RECORD_SIZE * 10), chunk_records=3)
+    async with _started(target, bytearray(RECORD_SIZE * 10), chunk_records=3) as writer:
+        writer.publish(RECORD_SIZE * 2)
+        writer.publish(RECORD_SIZE * 7)
+        writer.publish(RECORD_SIZE * 10)
+        assert await writer.barrier() == "checkpointed"
 
-    writer.publish(RECORD_SIZE * 2)
-    writer.publish(RECORD_SIZE * 7)
-    writer.publish(RECORD_SIZE * 10)
-    assert await writer.barrier() == "checkpointed"
+        assert [(name, offset, value) for name, offset, value in target.calls] == [
+            ("prepare", 0, None),
+            ("read_begin", 0, "begin"),
+            ("append", 0, bytes(RECORD_SIZE * 3)),
+            ("append", RECORD_SIZE * 3, bytes(RECORD_SIZE * 3)),
+            ("append", RECORD_SIZE * 6, bytes(RECORD_SIZE * 3)),
+            ("append", RECORD_SIZE * 9, bytes(RECORD_SIZE)),
+            ("checkpoint", 0, None),
+        ]
+        assert all(target.append_readonly)
+        assert len([call for call in target.calls if call[0] == "append"]) == 4
+        await writer.close()
 
-    assert [(name, offset, value) for name, offset, value in target.calls] == [
-        ("prepare", 0, None),
-        ("read_begin", 0, "begin"),
-        ("append", 0, bytes(RECORD_SIZE * 3)),
-        ("append", RECORD_SIZE * 3, bytes(RECORD_SIZE * 3)),
-        ("append", RECORD_SIZE * 6, bytes(RECORD_SIZE * 3)),
-        ("append", RECORD_SIZE * 9, bytes(RECORD_SIZE)),
-        ("checkpoint", 0, None),
-    ]
-    assert all(target.append_readonly)
-    assert len([call for call in target.calls if call[0] == "append"]) == 4
-    await writer.close()
+
+@pytest.mark.parametrize("operation", ("seal", "publish_prefix", "close"))
+def test_drain_integrity_finalizers_flush_the_submitted_high_water(operation: str) -> None:
+    asyncio.run(_test_drain_integrity_finalizers_flush_the_submitted_high_water(operation))
+
+
+async def _test_drain_integrity_finalizers_flush_the_submitted_high_water(operation: str) -> None:
+    target = FakeTarget(block_append=True)
+    async with _started(target, bytearray(RECORD_SIZE * 3), chunk_records=1) as writer:
+        finalizer: asyncio.Task[object] | None = None
+        try:
+            assert writer.publish(RECORD_SIZE * 3)
+            assert await asyncio.to_thread(target.append_started.wait, 3)
+
+            if operation == "seal":
+                finalizer = asyncio.create_task(writer.seal("done"))
+                expected_state = WriterState.SEALING
+            elif operation == "publish_prefix":
+                finalizer = asyncio.create_task(writer.publish_prefix())
+                expected_state = WriterState.SEALING
+            else:
+                finalizer = asyncio.create_task(writer.close(timeout=1))
+                expected_state = WriterState.CLOSING
+
+            # Yield once so the public operation admits its command while append is
+            # still held at the first chunk; the state is the public admission signal.
+            await asyncio.sleep(0)
+            assert writer.state is expected_state
+            target.release_append.set()
+            await finalizer
+
+            assert target.append_offsets == [0, RECORD_SIZE, 2 * RECORD_SIZE]
+            names = [call[0] for call in target.calls]
+            terminal = {"seal": "seal", "publish_prefix": "publish_prefix", "close": "close"}[operation]
+            assert names[-1] == terminal
+        finally:
+            target.release_append.set()
+            if finalizer is not None and not finalizer.done():
+                await finalizer
+            if writer.thread.is_alive():
+                await writer.close(timeout=1)
+
+
+def test_drain_integrity_idle_writer_continues_after_first_chunk() -> None:
+    asyncio.run(_test_drain_integrity_idle_writer_continues_after_first_chunk())
+
+
+async def _test_drain_integrity_idle_writer_continues_after_first_chunk() -> None:
+    target = FakeTarget()
+    async with _started(target, bytearray(RECORD_SIZE * 3), chunk_records=1) as writer:
+        try:
+            assert writer.publish(RECORD_SIZE * 3)
+            assert await asyncio.to_thread(target.second_append_started.wait, 3)
+            assert target.append_offsets[:2] == [0, RECORD_SIZE]
+        finally:
+            await writer.close(timeout=1)
 
 
 def test_snapshot_records_durable_checkpoint_ack_without_target_inspection() -> None:
@@ -357,14 +510,14 @@ def test_snapshot_records_durable_checkpoint_ack_without_target_inspection() -> 
 
 async def _test_snapshot_records_durable_checkpoint_ack_without_target_inspection() -> None:
     target = FakeTarget(checkpoint_result=DurableMarker(102, 2))
-    writer = await _started(target, bytearray(RECORD_SIZE * 2))
-    writer.publish(RECORD_SIZE * 2)
-    await writer.checkpoint()
-    assert writer.snapshot.submitted == RECORD_SIZE * 2
-    assert writer.snapshot.written == RECORD_SIZE * 2
-    assert writer.snapshot.durable_next_sequence == 102
-    assert writer.snapshot.durable_record_count == 2
-    await writer.close()
+    async with _started(target, bytearray(RECORD_SIZE * 2)) as writer:
+        writer.publish(RECORD_SIZE * 2)
+        await writer.checkpoint()
+        assert writer.snapshot.submitted == RECORD_SIZE * 2
+        assert writer.snapshot.written == RECORD_SIZE * 2
+        assert writer.snapshot.durable_next_sequence == 102
+        assert writer.snapshot.durable_record_count == 2
+        await writer.close()
 
 
 def test_target_failure_latches_and_prevents_seal() -> None:
@@ -373,20 +526,20 @@ def test_target_failure_latches_and_prevents_seal() -> None:
 
 async def _test_target_failure_latches_and_prevents_seal() -> None:
     target = FakeTarget(fail_append=True)
-    writer = await _started(target, bytearray(RECORD_SIZE))
-    writer.publish(RECORD_SIZE)
+    async with _started(target, bytearray(RECORD_SIZE), expect_failure=True) as writer:
+        writer.publish(RECORD_SIZE)
 
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await writer.barrier()
-    assert writer.state is WriterState.FAILED
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await writer.seal("done")
-    assert target.seal_calls == 0
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await writer.close()
-    with pytest.raises(WriterFailedError, match="target failed"):
-        await writer.close()
-    assert target.close_calls == 1
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await writer.barrier()
+        assert writer.state is WriterState.FAILED
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await writer.seal("done")
+        assert target.seal_calls == 0
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await writer.close()
+        with pytest.raises(WriterFailedError, match="target failed"):
+            await writer.close()
+        assert target.close_calls == 1
 
 
 def test_writer_failure_sends_latched_raw_exception_to_debug_ring(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -398,12 +551,12 @@ def test_writer_failure_sends_latched_raw_exception_to_debug_ring(monkeypatch: p
     monkeypatch.setattr(attempt_writer, "debug_exception", record)
 
     async def exercise() -> None:
-        writer = await _started(FakeTarget(fail_append=True), bytearray(RECORD_SIZE))
-        writer.publish(RECORD_SIZE)
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await writer.barrier()
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await writer.close()
+        async with _started(FakeTarget(fail_append=True), bytearray(RECORD_SIZE), expect_failure=True) as writer:
+            writer.publish(RECORD_SIZE)
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await writer.barrier()
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await writer.close()
 
     asyncio.run(exercise())
 
@@ -423,15 +576,15 @@ def test_close_is_idempotent_and_target_calls_stay_on_one_thread() -> None:
 
 async def _test_close_is_idempotent_and_target_calls_stay_on_one_thread() -> None:
     target = FakeTarget()
-    writer = await _started(target, bytearray(RECORD_SIZE))
-    writer.publish(RECORD_SIZE)
+    async with _started(target, bytearray(RECORD_SIZE)) as writer:
+        writer.publish(RECORD_SIZE)
 
-    assert await writer.close() == "closed"
-    assert await writer.close() == "closed"
-    assert target.close_calls == 1
-    assert len(target.thread_ids) == 1
-    assert writer.thread.ident not in {None, threading.get_ident()}
-    assert not writer.thread.is_alive()
+        assert await writer.close() == "closed"
+        assert await writer.close() == "closed"
+        assert target.close_calls == 1
+        assert len(target.thread_ids) == 1
+        assert writer.thread.ident not in {None, threading.get_ident()}
+        assert not writer.thread.is_alive()
 
 
 def test_close_timeout_is_reported_until_blocking_target_is_released() -> None:
@@ -440,42 +593,75 @@ def test_close_timeout_is_reported_until_blocking_target_is_released() -> None:
 
 async def _test_close_timeout_is_reported_until_blocking_target_is_released() -> None:
     target = FakeTarget(block_close=True)
-    writer = await _started(target, bytearray())
+    async with _started(target, bytearray()) as writer:
+        with pytest.raises(WriterShutdownTimeoutError):
+            await writer.close(timeout=0.01)
+        assert target.close_calls == 1
+        assert writer.state is WriterState.CLOSING
+        assert writer.thread.is_alive()
+        target.release_close.set()
+        assert await writer.close(timeout=1) == "closed"
+        assert writer.state is WriterState.CLOSED
+        assert not writer.thread.is_alive()
 
-    with pytest.raises(WriterShutdownTimeoutError):
-        await writer.close(timeout=0.01)
-    assert target.close_calls == 1
-    assert writer.state is WriterState.CLOSING
-    assert writer.thread.is_alive()
-    target.release_close.set()
-    assert await writer.close(timeout=1) == "closed"
-    assert writer.state is WriterState.CLOSED
-    assert not writer.thread.is_alive()
+
+def test_close_deadline_includes_writer_thread_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray()) as writer:
+            worker_paused = threading.Event()
+            release_worker = threading.Event()
+            complete = writer._complete
+
+            def pause_after_completion(
+                future: asyncio.Future[object],
+                result: object | None,
+                error: BaseException | None,
+            ) -> None:
+                complete(future, result, error)
+                worker_paused.set()
+                release_worker.wait(5)
+
+            monkeypatch.setattr(writer, "_complete", pause_after_completion)
+            closing = asyncio.create_task(writer.close(timeout=0.5))
+            try:
+                assert await asyncio.to_thread(worker_paused.wait, 1)
+                assert not closing.done()
+                with pytest.raises(WriterShutdownTimeoutError):
+                    await asyncio.wait_for(asyncio.shield(closing), timeout=1)
+            finally:
+                release_worker.set()
+                monkeypatch.setattr(writer, "_complete", complete)
+                await writer.close(timeout=1)
+            if not closing.done():
+                await closing
+
+    asyncio.run(exercise())
 
 
 def test_bounded_close_survives_repeated_cancellation_until_target_release() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_close=True)
-        writer = await _started(target, bytearray())
-        owner = asyncio.create_task(bounded(writer.close(timeout=3), 3))
-        for _ in range(100):
-            if target.close_calls == 1:
-                break
-            await asyncio.sleep(0.001)
-        assert target.close_calls == 1
+        async with _started(target, bytearray()) as writer:
+            owner = asyncio.create_task(bounded(writer.close(timeout=3), 3))
+            for _ in range(100):
+                if target.close_calls == 1:
+                    break
+                await asyncio.sleep(0.001)
+            assert target.close_calls == 1
 
-        owner.cancel()
-        await asyncio.sleep(0)
-        owner.cancel()
-        await asyncio.sleep(0)
-        assert not owner.done()
-        assert writer.thread.is_alive()
+            owner.cancel()
+            await asyncio.sleep(0)
+            owner.cancel()
+            await asyncio.sleep(0)
+            assert not owner.done()
+            assert writer.thread.is_alive()
 
-        target.release_close.set()
-        with pytest.raises(asyncio.CancelledError):
-            await owner
-        assert not writer.thread.is_alive()
-        assert writer.state is WriterState.CLOSED
+            target.release_close.set()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            assert not writer.thread.is_alive()
+            assert writer.state is WriterState.CLOSED
 
     asyncio.run(exercise())
 
@@ -483,20 +669,20 @@ def test_bounded_close_survives_repeated_cancellation_until_target_release() -> 
 def test_cancelled_seal_remains_admitted_and_converges_to_one_target_call() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_seal=True)
-        writer = await _started(target, bytearray(RECORD_SIZE))
-        sealing = asyncio.create_task(writer.seal("done"))
-        assert await asyncio.to_thread(target.seal_started.wait, 1)
-        sealing.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await sealing
-        assert writer.state is WriterState.SEALING
-        with pytest.raises(WriterClosedError, match="seal is already pending"):
-            await writer.seal("again")
-        target.release_seal.set()
-        assert await writer.await_seal_result() == "sealed"
-        assert await writer.await_seal_result() == "sealed"
-        await writer.close()
-        assert target.seal_calls == 1
+        async with _started(target, bytearray(RECORD_SIZE)) as writer:
+            sealing = asyncio.create_task(writer.seal("done"))
+            assert await asyncio.to_thread(target.seal_started.wait, 1)
+            sealing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await sealing
+            assert writer.state is WriterState.SEALING
+            with pytest.raises(WriterClosedError, match="seal is already pending"):
+                await writer.seal("again")
+            target.release_seal.set()
+            assert await writer.await_seal_result() == "sealed"
+            assert await writer.await_seal_result() == "sealed"
+            await writer.close()
+            assert target.seal_calls == 1
 
     asyncio.run(exercise())
 
@@ -504,21 +690,21 @@ def test_cancelled_seal_remains_admitted_and_converges_to_one_target_call() -> N
 def test_cancelled_start_remains_admitted_and_second_start_is_idempotent() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_prepare=True)
-        writer = AttemptWriter(target, bytearray())
-        starting = asyncio.create_task(writer.start())
-        assert await asyncio.to_thread(target.prepare_started.wait, 1)
-        starting.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await starting
-        await writer.start()
-        target.release_prepare.set()
-        for _ in range(20):
-            if writer.state is WriterState.STARTED:
-                break
-            await asyncio.sleep(0.005)
-        assert writer.state is WriterState.STARTED
-        await writer.close()
-        assert [call[0] for call in target.calls].count("prepare") == 1
+        async with _owned_writer(target, bytearray()) as writer:
+            starting = asyncio.create_task(writer.start())
+            assert await asyncio.to_thread(target.prepare_started.wait, 1)
+            starting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await starting
+            await writer.start()
+            target.release_prepare.set()
+            for _ in range(20):
+                if writer.state is WriterState.STARTED:
+                    break
+                await asyncio.sleep(0.005)
+            assert writer.state is WriterState.STARTED
+            await writer.close()
+            assert [call[0] for call in target.calls].count("prepare") == 1
 
     asyncio.run(exercise())
 
@@ -526,17 +712,17 @@ def test_cancelled_start_remains_admitted_and_second_start_is_idempotent() -> No
 def test_close_after_queued_read_begin_drains_when_worker_reports_success() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_read_begin=True)
-        writer = AttemptWriter(target, bytearray(b"x" * RECORD_SIZE), config=WriterConfig(chunk_records=1))
-        await writer.start()
-        read_begin = writer.submit_read_begin("begin")
-        assert await asyncio.to_thread(target.read_begin_started.wait, 1)
-        writer.publish(RECORD_SIZE)
-        closing = asyncio.create_task(writer.close())
-        target.release_read_begin.set()
-        assert await read_begin == "begin"
-        assert await closing == "closed"
-        names = [call[0] for call in target.calls]
-        assert names.index("append") < names.index("close")
+        async with _owned_writer(target, bytearray(b"x" * RECORD_SIZE), config=WriterConfig(chunk_records=1)) as writer:
+            await writer.start()
+            read_begin = writer.submit_read_begin("begin")
+            assert await asyncio.to_thread(target.read_begin_started.wait, 1)
+            writer.publish(RECORD_SIZE)
+            closing = asyncio.create_task(writer.close())
+            target.release_read_begin.set()
+            assert await read_begin == "begin"
+            assert await closing == "closed"
+            names = [call[0] for call in target.calls]
+            assert names.index("append") < names.index("close")
 
     asyncio.run(exercise())
 
@@ -544,17 +730,17 @@ def test_close_after_queued_read_begin_drains_when_worker_reports_success() -> N
 def test_failed_submit_read_begin_returns_an_already_failed_future() -> None:
     async def exercise() -> None:
         target = FakeTarget(fail_read_begin=True)
-        writer = AttemptWriter(target, bytearray())
-        await writer.start()
-        first = writer.submit_read_begin("begin")
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await first
-        failed = writer.submit_read_begin("again")
-        assert failed.done()
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await failed
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await writer.close()
+        async with _owned_writer(target, bytearray(), expect_failure=True) as writer:
+            await writer.start()
+            first = writer.submit_read_begin("begin")
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await first
+            failed = writer.submit_read_begin("again")
+            assert failed.done()
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await failed
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await writer.close()
 
     asyncio.run(exercise())
 
@@ -562,19 +748,19 @@ def test_failed_submit_read_begin_returns_an_already_failed_future() -> None:
 def test_queue_rejection_does_not_commit_finalizing_state() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_append=True)
-        writer = AttemptWriter(target, bytearray(RECORD_SIZE), config=WriterConfig(max_control_commands=1))
-        await writer.start()
-        await writer.read_begin("begin")
-        writer.publish(RECORD_SIZE)
-        assert await asyncio.to_thread(target.append_started.wait, 1)
-        checkpoint = asyncio.create_task(writer.checkpoint())
-        await asyncio.sleep(0)
-        with pytest.raises(WriterQueueFullError):
-            await writer.seal("done")
-        assert writer.state is WriterState.STARTED
-        target.release_append.set()
-        await checkpoint
-        await writer.close()
+        async with _owned_writer(target, bytearray(RECORD_SIZE), config=WriterConfig(max_control_commands=1)) as writer:
+            await writer.start()
+            await writer.read_begin("begin")
+            writer.publish(RECORD_SIZE)
+            assert await asyncio.to_thread(target.append_started.wait, 1)
+            checkpoint = asyncio.create_task(writer.checkpoint())
+            await asyncio.sleep(0)
+            with pytest.raises(WriterQueueFullError):
+                await writer.seal("done")
+            assert writer.state is WriterState.STARTED
+            target.release_append.set()
+            await checkpoint
+            await writer.close()
 
     asyncio.run(exercise())
 
@@ -582,15 +768,15 @@ def test_queue_rejection_does_not_commit_finalizing_state() -> None:
 def test_pre_start_publication_waits_for_successful_read_begin() -> None:
     async def exercise() -> None:
         target = FakeTarget()
-        writer = AttemptWriter(target, bytearray(b"x" * RECORD_SIZE), config=WriterConfig(chunk_records=1))
-        assert writer.publish(RECORD_SIZE)
-        await writer.start()
-        await asyncio.sleep(0)
-        assert not [call for call in target.calls if call[0] == "append"]
-        await writer.read_begin("begin")
-        await writer.barrier()
-        assert ("append", 0, b"x" * RECORD_SIZE) in target.calls
-        await writer.close()
+        async with _owned_writer(target, bytearray(b"x" * RECORD_SIZE), config=WriterConfig(chunk_records=1)) as writer:
+            assert writer.publish(RECORD_SIZE)
+            await writer.start()
+            await asyncio.sleep(0)
+            assert not [call for call in target.calls if call[0] == "append"]
+            await writer.read_begin("begin")
+            await writer.barrier()
+            assert ("append", 0, b"x" * RECORD_SIZE) in target.calls
+            await writer.close()
 
     asyncio.run(exercise())
 
@@ -598,20 +784,20 @@ def test_pre_start_publication_waits_for_successful_read_begin() -> None:
 def test_finalizing_rejects_controls_and_data_before_they_reach_the_target() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_seal=True)
-        writer = await _started(target, bytearray(RECORD_SIZE))
-        sealing = asyncio.create_task(writer.seal("done"))
-        assert await asyncio.to_thread(target.seal_started.wait, 1)
-        with pytest.raises(WriterClosedError, match="sealing or sealed"):
-            writer.publish(RECORD_SIZE)
-        with pytest.raises(WriterClosedError, match="sealing or sealed"):
-            await writer.checkpoint()
-        with pytest.raises(WriterClosedError, match="sealing or sealed"):
-            await writer.prepare_leg(1, 1)
-        with pytest.raises(WriterClosedError, match="sealing or sealed"):
-            writer.submit_read_begin("again")
-        target.release_seal.set()
-        assert await sealing == "sealed"
-        await writer.close()
+        async with _started(target, bytearray(RECORD_SIZE)) as writer:
+            sealing = asyncio.create_task(writer.seal("done"))
+            assert await asyncio.to_thread(target.seal_started.wait, 1)
+            with pytest.raises(WriterClosedError, match="sealing or sealed"):
+                writer.publish(RECORD_SIZE)
+            with pytest.raises(WriterClosedError, match="sealing or sealed"):
+                await writer.checkpoint()
+            with pytest.raises(WriterClosedError, match="sealing or sealed"):
+                await writer.prepare_leg(1, 1)
+            with pytest.raises(WriterClosedError, match="sealing or sealed"):
+                writer.submit_read_begin("again")
+            target.release_seal.set()
+            assert await sealing == "sealed"
+            await writer.close()
 
     asyncio.run(exercise())
 
@@ -619,16 +805,16 @@ def test_finalizing_rejects_controls_and_data_before_they_reach_the_target() -> 
 def test_repeated_start_is_a_noop_through_finalization_and_normal_close() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_seal=True)
-        writer = await _started(target, bytearray())
-        sealing = asyncio.create_task(writer.seal("done"))
-        assert await asyncio.to_thread(target.seal_started.wait, 1)
-        await writer.start()
-        target.release_seal.set()
-        assert await sealing == "sealed"
-        await writer.start()
-        assert await writer.close() == "closed"
-        await writer.start()
-        assert [call[0] for call in target.calls].count("prepare") == 1
+        async with _started(target, bytearray()) as writer:
+            sealing = asyncio.create_task(writer.seal("done"))
+            assert await asyncio.to_thread(target.seal_started.wait, 1)
+            await writer.start()
+            target.release_seal.set()
+            assert await sealing == "sealed"
+            await writer.start()
+            assert await writer.close() == "closed"
+            await writer.start()
+            assert [call[0] for call in target.calls].count("prepare") == 1
 
     asyncio.run(exercise())
 
@@ -636,24 +822,24 @@ def test_repeated_start_is_a_noop_through_finalization_and_normal_close() -> Non
 def test_repeated_start_preserves_chained_failure_while_closing_and_closed() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_read_begin=True, block_close=True)
-        writer = AttemptWriter(target, bytearray())
-        await writer.start()
-        read_begin = writer.submit_read_begin("begin")
-        assert await asyncio.to_thread(target.read_begin_started.wait, 1)
-        closing = asyncio.create_task(writer.close())
-        target.fail_read_begin_after_block = True
-        target.release_read_begin.set()
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await read_begin
-        with pytest.raises(WriterFailedError, match="target failed") as closing_start:
+        async with _owned_writer(target, bytearray(), expect_failure=True) as writer:
             await writer.start()
-        assert isinstance(closing_start.value.__cause__, OSError)
-        target.release_close.set()
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await closing
-        with pytest.raises(WriterFailedError, match="target failed") as closed_start:
-            await writer.start()
-        assert isinstance(closed_start.value.__cause__, OSError)
+            read_begin = writer.submit_read_begin("begin")
+            assert await asyncio.to_thread(target.read_begin_started.wait, 1)
+            closing = asyncio.create_task(writer.close())
+            target.fail_read_begin_after_block = True
+            target.release_read_begin.set()
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await read_begin
+            with pytest.raises(WriterFailedError, match="target failed") as closing_start:
+                await writer.start()
+            assert isinstance(closing_start.value.__cause__, OSError)
+            target.release_close.set()
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await closing
+            with pytest.raises(WriterFailedError, match="target failed") as closed_start:
+                await writer.start()
+            assert isinstance(closed_start.value.__cause__, OSError)
 
     asyncio.run(exercise())
 
@@ -661,11 +847,11 @@ def test_repeated_start_preserves_chained_failure_while_closing_and_closed() -> 
 def test_start_after_close_before_admission_keeps_closed_error() -> None:
     async def exercise() -> None:
         target = FakeTarget()
-        writer = AttemptWriter(target, bytearray())
-        assert await writer.close() == "closed"
-        with pytest.raises(WriterClosedError, match="writer is closed"):
-            await writer.start()
-        assert not [call for call in target.calls if call[0] == "prepare"]
+        async with _owned_writer(target, bytearray()) as writer:
+            assert await writer.close() == "closed"
+            with pytest.raises(WriterClosedError, match="writer is closed"):
+                await writer.start()
+            assert not [call for call in target.calls if call[0] == "prepare"]
 
     asyncio.run(exercise())
 
@@ -673,32 +859,32 @@ def test_start_after_close_before_admission_keeps_closed_error() -> None:
 def test_start_after_failed_close_before_admission_keeps_closed_error() -> None:
     async def exercise() -> None:
         target = FakeTarget(fail_close=True)
-        writer = AttemptWriter(target, bytearray())
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await writer.close()
-        with pytest.raises(WriterClosedError, match="writer is closed"):
-            await writer.start()
-        assert not [call for call in target.calls if call[0] == "prepare"]
+        async with _owned_writer(target, bytearray(), expect_failure=True) as writer:
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await writer.close()
+            with pytest.raises(WriterClosedError, match="writer is closed"):
+                await writer.start()
+            assert not [call for call in target.calls if call[0] == "prepare"]
 
     asyncio.run(exercise())
 
 
 def test_worker_success_events_are_explicit_for_every_writer_command() -> None:
     async def exercise() -> None:
-        writer = AttemptWriter(FakeTarget(), bytearray())
-        command_events = (
-            (attempt_writer.PrepareCommand(), attempt_writer.PrepareSucceeded),
-            (attempt_writer.PrepareLegCommand(1, 1), attempt_writer.LegSucceeded),
-            (attempt_writer.ReadBeginCommand("begin"), attempt_writer.ReadBeginSucceeded),
-            (attempt_writer.CheckpointCommand(0), attempt_writer.CheckpointSucceeded),
-            (attempt_writer.SealCommand(0, "done"), attempt_writer.FinalizeSucceeded),
-            (attempt_writer.PublishPrefixCommand(0), attempt_writer.FinalizeSucceeded),
-            (attempt_writer.CloseCommand(0), attempt_writer.CloseSucceeded),
-        )
+        async with _owned_writer(FakeTarget(), bytearray()) as writer:
+            command_events = (
+                (attempt_writer.PrepareCommand(), attempt_writer.PrepareSucceeded),
+                (attempt_writer.PrepareLegCommand(1, 1), attempt_writer.LegSucceeded),
+                (attempt_writer.ReadBeginCommand("begin"), attempt_writer.ReadBeginSucceeded),
+                (attempt_writer.CheckpointCommand(0), attempt_writer.CheckpointSucceeded),
+                (attempt_writer.SealCommand(0, "done"), attempt_writer.FinalizeSucceeded),
+                (attempt_writer.PublishPrefixCommand(0), attempt_writer.FinalizeSucceeded),
+                (attempt_writer.CloseCommand(0), attempt_writer.CloseSucceeded),
+            )
 
-        for command, event_type in command_events:
-            assert isinstance(writer._success_event(command), event_type)
-        await writer.close()
+            for command, event_type in command_events:
+                assert isinstance(writer._success_event(command), event_type)
+            await writer.close()
 
     asyncio.run(exercise())
 
@@ -708,27 +894,69 @@ def test_unlatchable_failure_result_completes_pending_future_and_preserves_worke
 ) -> None:
     async def exercise() -> None:
         target = FakeTarget()
-        writer = AttemptWriter(target, bytearray())
-        error = OSError("impossible machine result")
+        async with _owned_writer(target, bytearray(), expect_failure=True) as writer:
+            error = OSError("impossible machine result")
 
-        def discard_failure(
-            state: attempt_writer_machine.AttemptWriterMachineState,
-            _event: attempt_writer_machine.AttemptWriterMachineEvent,
-        ) -> attempt_writer_machine.TransitionResult:
-            return attempt_writer_machine.TransitionResult(state, attempt_writer_machine.Ignore())
+            def discard_failure(
+                state: attempt_writer_machine.AttemptWriterMachineState,
+                _event: attempt_writer_machine.AttemptWriterMachineEvent,
+            ) -> attempt_writer_machine.TransitionResult:
+                return attempt_writer_machine.TransitionResult(state, attempt_writer_machine.Ignore())
 
-        original_transition = attempt_writer.transition
-        monkeypatch.setattr(attempt_writer, "transition", discard_failure)
-        with writer._lock:
-            pending = writer._new_future_locked()
-            writer._commands.append(attempt_writer._Pending(attempt_writer.PrepareCommand(), pending))
-        assert writer._record_failure(error) is error
-        assert writer.failure is error
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await pending
-        monkeypatch.setattr(attempt_writer, "transition", original_transition)
-        with pytest.raises(WriterFailedError, match="target failed"):
-            await writer.close()
-        assert not writer.thread.is_alive()
+            with monkeypatch.context() as patch:
+                patch.setattr(attempt_writer, "transition", discard_failure)
+                with writer._lock:
+                    pending = writer._new_future_locked()
+                    writer._commands.append(attempt_writer._Pending(attempt_writer.PrepareCommand(), pending))
+                assert writer._record_failure(error) is error
+                assert writer.failure is error
+                with pytest.raises(WriterFailedError, match="target failed"):
+                    await pending
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await writer.close()
+            assert not writer.thread.is_alive()
+
+    asyncio.run(exercise())
+
+
+def test_failure_lifecycle_idle_append_error_keeps_close_owned_and_failed_state_visible() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(
+            block_append=True,
+            fail_append_after_block=True,
+            block_close=True,
+        )
+        async with _started(target, bytearray(RECORD_SIZE), expect_failure=True) as writer:
+            allow_close = asyncio.Event()
+
+            async def close_after_barrier() -> object:
+                await allow_close.wait()
+                return await writer.close(timeout=1)
+
+            closing = asyncio.create_task(close_after_barrier())
+            close_outcome: object | None = None
+            close_started = False
+            try:
+                writer.publish(RECORD_SIZE)
+                assert await asyncio.to_thread(target.append_started.wait, 1)
+                allow_close.set()
+                # Yield once so close is admitted while the append is still blocked.
+                await asyncio.sleep(0)
+                target.release_append.set()
+                close_started = await asyncio.to_thread(target.close_started.wait, 1)
+                assert close_started
+                assert isinstance(writer.failure, OSError)
+                assert writer.state is WriterState.FAILED
+            finally:
+                allow_close.set()
+                await asyncio.sleep(0)
+                target.release_append.set()
+                target.release_close.set()
+                close_outcome = (await asyncio.gather(closing, return_exceptions=True))[0]
+                await asyncio.to_thread(writer.thread.join, 1)
+
+            assert isinstance(close_outcome, WriterFailedError)
+            assert target.close_calls == 1
+            assert not writer.thread.is_alive()
 
     asyncio.run(exercise())

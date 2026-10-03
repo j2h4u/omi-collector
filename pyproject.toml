@@ -159,18 +159,15 @@ source_modules = ["omi_collector.capture.application"]
 forbidden_modules = ["omi_collector.capture.adapters", "bleak", "dbus_fast"]
 
 [tool.pytest-gremlins]
-paths = [
-    "src/omi_collector/capture/domain/ready_machine.py",
-    "src/omi_collector/capture/domain/quarantine_machine.py",
-    "src/omi_collector/capture/application/session_machine.py",
-    "src/omi_collector/capture/application/quarantine_maintenance.py",
-]
+paths = ["src/omi_collector", "scripts"]
 report = ["console", "html", "json"]
 workers = 2
+timeout = 150
+cache = true
 lightweight_runner = false
 
 [tool.uv.sources]
-pytest-gremlins = { git = "https://github.com/fwilkerson-cn/pytest-gremlins", rev = "948e263f553d8df718a2c72b9c9860121abbcfe6" }
+pytest-gremlins = { git = "https://github.com/j2h4u/pytest-gremlins", rev = "fd6ab127798cb0b7b3dd886d11e6ee07ad8421da" }
 
 [dependency-groups]
 dev = [

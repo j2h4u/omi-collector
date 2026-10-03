@@ -185,6 +185,82 @@ def test_device_lock_rejects_same_pid_with_mismatched_process_start(tmp_path: Pa
     assert context.holder_pid is None
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("payload", b"{"),
+        ("payload", b"\xff"),
+        ("payload", b"[]"),
+        ("version", 2),
+        ("pid", True),
+        ("pid", 0),
+        ("thread_id", False),
+        ("thread_id", 0),
+        ("operation", None),
+        ("scope", 1),
+        ("acquired_monotonic_ns", True),
+        ("acquired_monotonic_ns", 0),
+    ],
+)
+def test_device_lock_contention_keeps_invalid_owner_metadata_unknown(tmp_path: Path, field: str, value: object) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(spool, capture_root)
+    lock_path = spool / "collector.lock"
+
+    with store.device_lock(operation="capture_batch"):
+        metadata = cast(dict[str, object], loads(lock_path.read_text(encoding="utf-8")))
+        if field == "payload":
+            lock_path.write_bytes(cast(bytes, value))
+        else:
+            metadata[field] = value
+            lock_path.write_text(dumps(metadata), encoding="utf-8")
+
+        with (
+            pytest.raises(DeviceAlreadyRunningError) as raised,
+            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
+        ):
+            pass
+
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.requested_operation == "resume_pending_attempt"
+    assert context.metadata_status == "invalid"
+    assert context.holder_scope == "unknown"
+    assert context.holder_operation is None
+    assert context.holder_pid is None
+    assert context.holder_thread_id is None
+    assert context.holder_age_seconds is None
+
+
+def test_device_lock_contention_reports_live_owner_and_exact_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(spool, capture_root)
+
+    with store.device_lock(operation="capture_batch"):
+        metadata = cast(dict[str, object], loads((spool / "collector.lock").read_text(encoding="utf-8")))
+        acquired_ns = cast(int, metadata["acquired_monotonic_ns"])
+        monkeypatch.setattr(staging_filesystem.time, "monotonic_ns", lambda: acquired_ns + 2_000_000_000)
+        with (
+            pytest.raises(DeviceAlreadyRunningError) as raised,
+            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
+        ):
+            pass
+
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.requested_operation == "resume_pending_attempt"
+    assert context.holder_operation == "capture_batch"
+    assert context.holder_pid == staging_filesystem.os.getpid()
+    assert context.holder_thread_id is not None
+    assert context.holder_scope == "current_process"
+    assert context.metadata_status == "valid"
+    assert context.holder_age_seconds == pytest.approx(2.0)
+
+
 class _RecordingStream:
     def __init__(self, wrapped: object) -> None:
         self.wrapped = wrapped

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
@@ -69,6 +75,13 @@ def _bundle(
     return path
 
 
+def _rewrite_manifest(bundle: Path, **updates: object) -> None:
+    manifest_path = bundle / "manifest.json"
+    manifest = cast(dict[str, object], json.loads(manifest_path.read_text(encoding="utf-8")))
+    manifest.update(updates)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
     result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
 
@@ -107,6 +120,68 @@ def test_metrics_rejects_noncanonical_bundle_evidence(tmp_path: Path, kind: str)
         collect_spool_metrics(tmp_path)
 
 
+def test_metrics_rejects_fifo_records_file_without_blocking(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "10-11", (_record(1),))
+    records_path = bundle / "records.bin"
+    records_path.unlink()
+    os.mkfifo(records_path)
+    writer_stopped = threading.Event()
+    writer_errors: list[OSError] = []
+
+    def write_if_collector_opens_fifo() -> None:
+        deadline = time.monotonic() + 12
+        while not writer_stopped.is_set() and time.monotonic() < deadline:
+            try:
+                descriptor = os.open(records_path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    writer_errors.append(error)
+                    return
+                writer_stopped.wait(0.01)
+            else:
+                try:
+                    os.write(descriptor, _record(1))
+                except OSError as error:
+                    writer_errors.append(error)
+                finally:
+                    os.close(descriptor)
+                return
+
+    writer = threading.Thread(target=write_if_collector_opens_fifo)
+    writer.start()
+    script = """\
+from pathlib import Path
+import sys
+
+from omi_collector.spool_metrics import SpoolMetricsError, collect_spool_metrics
+
+try:
+    collect_spool_metrics(Path(sys.argv[1]))
+except SpoolMetricsError:
+    print("rejected")
+else:
+    print("accepted")
+    """
+    try:
+        # Keep a mutant that blocks opening a FIFO killable by the test.
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path)],
+            capture_output=True,
+            check=False,
+            cwd=Path.cwd(),
+            text=True,
+            timeout=10,
+        )
+    finally:
+        writer_stopped.set()
+        writer.join(timeout=1)
+
+    assert not writer.is_alive()
+    assert not writer_errors
+    assert result.returncode == 0
+    assert result.stdout.strip() == "rejected"
+
+
 def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
@@ -123,11 +198,59 @@ def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path
 
 
 def test_ready_bundle_is_a_valid_device_spool(tmp_path: Path) -> None:
-    _bundle(tmp_path, "10-12-a", (_record(1000), _record(1001)))
+    _bundle(tmp_path, "0-2-a", (_record(1000), _record(1001)), start=0)
 
     result = collect_spool_metrics(tmp_path)
 
     assert result.current_window.bundle_count == 1
+    assert result.current_window.downloaded_records == 2
+    assert result.current_window.downloaded_raw_bytes == 2 * RECORD_SIZE
+
+
+@pytest.mark.parametrize(
+    ("start", "records", "record_size"),
+    [(-1, (_record(1),), RECORD_SIZE), (10, (), RECORD_SIZE), (10, (_record(1),), RECORD_SIZE + 1)],
+)
+def test_ready_bundle_rejects_invalid_dimensions(
+    tmp_path: Path, start: int, records: tuple[bytes, ...], record_size: int
+) -> None:
+    bundle = _bundle(tmp_path, "invalid", records, start=start)
+    _rewrite_manifest(bundle, record_size=record_size)
+
+    with pytest.raises(SpoolMetricsError, match="ready manifest is invalid"):
+        collect_spool_metrics(tmp_path)
+
+
+def test_ready_bundle_rejects_malformed_draft_hash_even_when_identity_matches(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "invalid", (_record(1),))
+    draft_hash = "not-a-sha256"
+    bundle_id = hashlib.sha256(f"10:11:{draft_hash}".encode()).hexdigest()
+    _rewrite_manifest(bundle, draft_raw_sha256=draft_hash, bundle_id=bundle_id)
+
+    with pytest.raises(SpoolMetricsError, match="ready manifest is invalid"):
+        collect_spool_metrics(tmp_path)
+
+
+@pytest.mark.parametrize("mismatch", ["size", "hash"])
+def test_ready_bundle_rejects_each_records_manifest_mismatch(tmp_path: Path, mismatch: str) -> None:
+    bundle = _bundle(tmp_path, "invalid", (_record(1),))
+    if mismatch == "size":
+        (bundle / "records.bin").write_bytes(b"short")
+        actual_hash = hashlib.sha256(b"short").hexdigest()
+        _rewrite_manifest(bundle, records_sha256=actual_hash)
+    else:
+        (bundle / "records.bin").write_bytes(_record(2))
+
+    with pytest.raises(SpoolMetricsError, match=r"records\.bin does not match manifest"):
+        collect_spool_metrics(tmp_path)
+
+
+def test_empty_ready_time_ranges_are_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "invalid", (_record(1),))
+    _rewrite_manifest(bundle, time_ranges=[])
+
+    with pytest.raises(SpoolMetricsError, match="ready manifest is invalid"):
+        collect_spool_metrics(tmp_path)
 
 
 def test_ready_bundle_symlink_is_not_counted(tmp_path: Path) -> None:
@@ -191,6 +314,18 @@ def test_sequence_discontinuity_is_aggregated_between_real_bundles(tmp_path: Pat
     assert result.current_window.lost_records == 1
     assert result.current_window.lost_raw_bytes == RECORD_SIZE
     assert result.current_window.loss_ratio == 0.2
+
+
+def test_adjacent_half_open_ranges_are_valid_and_have_no_loss(tmp_path: Path) -> None:
+    _bundle(tmp_path, "first", (_record(1), _record(2)), start=10)
+    _bundle(tmp_path, "next", (_record(3),), start=12)
+
+    current = collect_spool_metrics(tmp_path).current_window
+
+    assert current.bundle_count == 2
+    assert current.downloaded_records == 3
+    assert current.lost_records == 0
+    assert current.loss_ratio == 0.0
 
 
 def test_conflicting_overlapping_ranges_fail_closed(tmp_path: Path) -> None:

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 import re
+from io import StringIO
 from pathlib import Path
 
+import pytest
 from scripts.validate_pr_commits import validate_commit_messages
+from scripts.validate_pr_title import main as validate_title_main
 from scripts.validate_pr_title import validate_pr_title
+from scripts.validate_release_config import main as validate_config_main
 from scripts.validate_release_config import validate_release_config
 from scripts.validate_release_notes import _split_messages, validate_release_notes
+from scripts.validate_release_notes import main as validate_notes_main
 
 _ROOT = Path(__file__).parents[1]
 _CI_WORKFLOW = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -29,11 +35,158 @@ def test_releasable_pr_title_is_accepted() -> None:
     assert validate_pr_title("fix(capture): preserve sealed artifacts")[0]
 
 
+def test_invalid_pr_titles_have_stable_errors() -> None:
+    assert validate_pr_title("   ") == (False, "PR title is empty.")
+    ok, message = validate_pr_title("not conventional")
+    assert not ok
+    assert message.startswith("PR title must look like")
+    ok, message = validate_pr_title("wip: draft")
+    assert not ok
+    assert message.startswith("Unsupported Conventional Commit type 'wip'.")
+
+
+def test_pr_title_main_routes_messages_to_expected_streams(capsys: pytest.CaptureFixture[str]) -> None:
+    assert validate_title_main(["--title", "fix: repair capture"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "PR title is releasable.\n"
+    assert captured.err == ""
+
+    assert validate_title_main(["--title", "wip: draft"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("Unsupported Conventional Commit type 'wip'.")
+
+
+def _write_release_fixture(root: Path, *, package: dict[str, object] | None = None) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    release_package = (
+        package
+        if package is not None
+        else {
+            "release-type": "python",
+            "package-name": "omi-collector",
+            "include-component-in-tag": False,
+            "extra-files": [
+                {"type": "toml", "path": "uv.lock", "jsonpath": "$.package[?(@.name.value=='omi-collector')].version"}
+            ],
+        }
+    )
+    (root / "release-please-config.json").write_text(json.dumps({"packages": {".": release_package}}), encoding="utf-8")
+    (root / ".release-please-manifest.json").write_text(json.dumps({".": "1.2.3"}), encoding="utf-8")
+    (root / "pyproject.toml").write_text('[project]\nname = "omi-collector"\nversion = "1.2.3"\n', encoding="utf-8")
+    (root / "uv.lock").write_text('[[package]]\nname = "omi-collector"\nversion = "1.2.3"\n', encoding="utf-8")
+
+
+def test_release_config_aggregates_package_invariants(tmp_path: Path) -> None:
+    _write_release_fixture(
+        tmp_path,
+        package={
+            "release-type": "node",
+            "package-name": "wrong",
+            "include-component-in-tag": True,
+            "extra-files": [],
+        },
+    )
+
+    assert validate_release_config(tmp_path) == [
+        "release-please must use the python strategy so it updates pyproject.toml",
+        "release-please package-name must be 'omi-collector'",
+        "release-please root tags must not include a component prefix",
+        "release-please must update the omi-collector version in uv.lock",
+    ]
+
+
+def test_release_config_checks_manifest_project_and_lock_coherence(tmp_path: Path) -> None:
+    _write_release_fixture(tmp_path)
+    assert validate_release_config(tmp_path) == []
+    (tmp_path / ".release-please-manifest.json").write_text('{".": "9.9.9"}', encoding="utf-8")
+    (tmp_path / "uv.lock").write_text('[[package]]\nname = "omi-collector"\nversion = "8.8.8"\n', encoding="utf-8")
+    assert validate_release_config(tmp_path) == [
+        "release-please manifest version must match pyproject.toml",
+        "uv.lock project version must match pyproject.toml",
+    ]
+
+
+def test_release_config_reports_missing_project_version_and_lock_package_list(tmp_path: Path) -> None:
+    _write_release_fixture(tmp_path)
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "omi-collector"\n', encoding="utf-8")
+    (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    assert validate_release_config(tmp_path) == [
+        "pyproject.toml must declare [project].version",
+        "release-please manifest version must match pyproject.toml",
+        "uv.lock must contain a package list",
+    ]
+
+
+def test_release_config_main_reports_valid_and_invalid_root(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    assert validate_config_main(["--root", str(_ROOT)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "release-please configuration matches pyproject.toml and uv.lock\n"
+    assert captured.err == ""
+
+    _write_release_fixture(tmp_path, package={})
+    assert validate_config_main(["--root", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        captured.out
+        == "release configuration error: release-please must use the python strategy so it updates pyproject.toml\nrelease configuration error: release-please package-name must be 'omi-collector'\nrelease configuration error: release-please root tags must not include a component prefix\nrelease configuration error: release-please must update the omi-collector version in uv.lock\n"
+    )
+    assert captured.err == ""
+
+
 def test_multi_commit_pr_without_an_override_is_rejected() -> None:
     ok, messages = validate_release_notes("Just a description.", commit_count=2, require_above=1)
 
     assert not ok
     assert any("squashes 2 commits" in message for message in messages)
+
+
+def test_release_notes_override_threshold_and_empty_override() -> None:
+    assert validate_release_notes("body", commit_count=1, require_above=1)[0]
+    assert validate_release_notes("body", commit_count=0, require_above=0)[0]
+    assert validate_release_notes("BEGIN_COMMIT_OVERRIDE\n \nEND_COMMIT_OVERRIDE", 2, 1) == (
+        False,
+        ["The BEGIN_COMMIT_OVERRIDE block is empty."],
+    )
+
+
+def test_release_notes_reject_malformed_and_unsupported_subjects() -> None:
+    for subject, expected in (
+        ("plain text", "not a Conventional Commit subject"),
+        ("wip: draft", "uses unsupported type 'wip'"),
+    ):
+        ok, messages = validate_release_notes(f"BEGIN_COMMIT_OVERRIDE\n{subject}\nEND_COMMIT_OVERRIDE", 1, 1)
+        assert not ok
+        assert any(expected in message for message in messages)
+
+
+def test_breaking_change_bullets_immediately_follow_note() -> None:
+    body = """BEGIN_COMMIT_OVERRIDE
+refactor(cli)!: replace command syntax
+
+BREAKING CHANGE: old invocations no longer work.
+- Use the new command syntax.
+END_COMMIT_OVERRIDE"""
+
+    assert validate_release_notes(body, 2, 1)[0]
+
+
+def test_release_notes_main_file_stdin_and_failure_streams(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    body_file = tmp_path / "body.md"
+    body_file.write_text("fix: repair capture", encoding="utf-8")
+    assert validate_notes_main(["--body-file", str(body_file), "--commit-count", "1"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "No override block, and none owed for 1 commit(s).\n"
+    assert captured.err == ""
+
+    monkeypatch.setattr("sys.stdin", StringIO("body"))
+    assert validate_notes_main(["--body-file", "-", "--commit-count", "2"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "squashes 2 commits" in captured.err
+    assert "Add a BEGIN_COMMIT_OVERRIDE / END_COMMIT_OVERRIDE block" in captured.err
 
 
 def test_override_block_splits_into_one_entry_per_message() -> None:

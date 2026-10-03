@@ -25,3 +25,41 @@ def test_counts_actual_valid_20ms_packets_including_multiframe_opus() -> None:
 def test_rejects_malformed_opus_framing_instead_of_guessing_duration() -> None:
     with pytest.raises(ValueError, match="20 ms"):
         count_20ms_packets(_record(bytes((3, 0))))
+
+
+@pytest.mark.parametrize(
+    "packet",
+    (
+        bytes((1, 0x55, 0x66)),  # Two 10 ms SILK frames, code 1.
+        bytes((2, 1, 0x55, 0x66)),  # Two 10 ms SILK frames, code 2 VBR.
+        bytes((104, 0x55)),  # One 20 ms hybrid frame.
+        bytes((152, 0x55)),  # One 20 ms CELT frame.
+        bytes((131, 8, *range(8))),  # Eight 2.5 ms CELT frames, code 3 CBR.
+    ),
+)
+def test_counts_other_valid_20ms_opus_framings(packet: bytes) -> None:
+    assert count_20ms_packets(_record(packet)) == 1
+
+
+@pytest.mark.parametrize(
+    "packet",
+    (
+        bytes((0, 0x55)),  # 10 ms.
+        bytes((16, 0x55)),  # 40 ms.
+        bytes((24, 0x55)),  # 60 ms.
+        bytes((1, 0x55, 0x66, 0x77)),  # Odd code-1 frame body.
+        bytes((2, 2, 0x55, 0x66)),  # VBR first frame consumes the whole body.
+    ),
+)
+def test_rejects_wrong_duration_and_malformed_silk_framing(packet: bytes) -> None:
+    with pytest.raises(ValueError, match="20 ms"):
+        count_20ms_packets(_record(packet))
+
+
+def test_accepts_maximum_packet_size_and_rejects_one_byte_over() -> None:
+    maximum = bytes((8,)) + bytes(159)
+    oversized = bytes((8,)) + bytes(160)
+
+    assert count_20ms_packets(_record(maximum)) == 1
+    with pytest.raises(ValueError):
+        count_20ms_packets(_record(oversized))

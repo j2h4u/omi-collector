@@ -638,6 +638,100 @@ def test_forged_or_open_tail_ack_never_deletes_ready_bundle(tmp_path: Path) -> N
     assert published.path.exists()
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        {"entries": [], "opened_at": True, "outputs": []},
+        {"entries": [], "opened_at": "1", "outputs": []},
+        {"entries": [], "opened_at": 1, "outputs": None},
+        {"entries": None, "opened_at": 1, "outputs": []},
+    ],
+)
+def test_malformed_open_tail_never_mutates_acknowledged_bundle(tmp_path: Path, tail: dict[str, object]) -> None:
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(tmp_path / "draft", (100,), start_sequence=100)
+    published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
+    data = cast(dict[str, object], loads(checkpoint.read_text(encoding="utf-8")))
+    data["open_speech_tail"] = tail
+    checkpoint.write_text(dumps(data), encoding="utf-8")
+    before = {
+        "records": (published.path / "records.bin").read_bytes(),
+        "manifest": (published.path / "manifest.json").read_bytes(),
+        "ledger": ledger.read_bytes(),
+    }
+
+    with pytest.raises(ready_bundles.ReadyBundleError):
+        ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert published.path.exists()
+    assert (published.path / "records.bin").read_bytes() == before["records"]
+    assert (published.path / "manifest.json").read_bytes() == before["manifest"]
+    assert ledger.read_bytes() == before["ledger"]
+
+
+def test_valid_empty_open_tail_allows_acknowledged_bundle_retirement(tmp_path: Path) -> None:
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(tmp_path / "draft", (100,), start_sequence=100)
+    published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
+    data = cast(dict[str, object], loads(checkpoint.read_text(encoding="utf-8")))
+    data["open_speech_tail"] = {"entries": [], "opened_at": 1, "outputs": []}
+    checkpoint.write_text(dumps(data), encoding="utf-8")
+
+    retired = ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert [item.bundle_id for item in retired] == [published.bundle_id]
+    assert not published.path.exists()
+
+
+@pytest.mark.parametrize("extra_fields", [False, True])
+def test_matching_open_tail_identity_blocks_ack_even_with_extra_fields(tmp_path: Path, extra_fields: bool) -> None:
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(tmp_path / "draft", (100,), start_sequence=100)
+    published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
+    data = cast(dict[str, object], loads(checkpoint.read_text(encoding="utf-8")))
+    identity: dict[str, object] = {
+        "bundle_id": published.bundle_id,
+        "records_sha256": published.records_sha256,
+    }
+    if extra_fields:
+        identity["annotation"] = "allowed by the subset contract"
+    data["open_speech_tail"] = {"entries": [identity], "opened_at": 1, "outputs": []}
+    checkpoint.write_text(dumps(data), encoding="utf-8")
+    before = ledger.read_bytes()
+
+    with pytest.raises(ready_bundles.ReadyBundleError):
+        ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert published.path.exists()
+    assert ledger.read_bytes() == before
+
+
+def test_nonmatching_open_tail_identity_allows_ack_with_extra_fields(tmp_path: Path) -> None:
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(tmp_path / "draft", (100,), start_sequence=100)
+    published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
+    data = cast(dict[str, object], loads(checkpoint.read_text(encoding="utf-8")))
+    data["open_speech_tail"] = {
+        "entries": [{"bundle_id": "f" * 64, "records_sha256": "e" * 64, "annotation": "unrelated"}],
+        "opened_at": 1,
+        "outputs": [],
+    }
+    checkpoint.write_text(dumps(data), encoding="utf-8")
+
+    retired = ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert [item.bundle_id for item in retired] == [published.bundle_id]
+    assert not published.path.exists()
+
+
 def test_ack_identity_retires_exact_bundle_without_reading_decision_contents(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
     ledger = tmp_path / "collector" / "ready-publications.json"

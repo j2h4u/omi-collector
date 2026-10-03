@@ -20,6 +20,14 @@ make a change pass.
 - Use `uv` only. Keep `uv.lock` current and use hardlink mode outside Docker.
 - Bound direct `uv run pytest` commands with `timeout --signal=TERM --kill-after=5s 600s`.
   If a tool returns a running session, poll it to completion or terminate it before moving on.
+- The canonical full-project mutation campaign is the sole exception: run it
+  through `just mutation` with one finite 24-hour GNU timeout and a five-second
+  KILL grace. Its 120-second test timeout, 150-second mutant timeout,
+  independent 600-second coverage scan, 60-second integration canary, and two
+  workers remain unchanged. Default resume requires a matching clean committed
+  campaign receipt; use `just mutation fresh` only after preserving prior
+  evidence. Any incomplete campaign remains incomplete and must be inspected
+  before resuming.
 - Keep stable QA and runtime practices in `docs/BEST_PRACTICES.md`; keep this
   file compact.
 

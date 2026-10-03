@@ -424,6 +424,141 @@ def test_causal_observation_allows_ordered_successive_same_boundary_operation(tm
     assert result[0].state == "applied"
 
 
+@pytest.mark.parametrize(
+    ("frontier", "effective_boundary", "threshold", "drift"),
+    [
+        (0, 0, 5.0, 0.0),
+        (20, 20, 0.25, 0.0),
+        (24, 24, 5.0, 0.0),
+    ],
+)
+def test_reconcile_accepts_valid_boundary_and_threshold_edges(
+    tmp_path: Path, frontier: int, effective_boundary: int, threshold: float, drift: float
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, frontier))
+    initial = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1300,
+        info_sequence_min=frontier,
+        info_sequence_max=frontier,
+        operation_id=intent.operation_id,
+        observation_role="initial",
+    )
+    later = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=2.0,
+        host_monotonic_end=2.0,
+        device_epoch=1000,
+        info_sequence_min=frontier,
+        info_sequence_max=frontier,
+        operation_id=intent.operation_id,
+        effective_boundary_sequence=effective_boundary,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+    )
+
+    reconciled = store.reconcile_observation(
+        1000,
+        drift,
+        frontier,
+        near_zero_threshold=threshold,
+        effective_boundary_sequence=effective_boundary,
+        observation_id=later.observation_id,
+        operation_id=intent.operation_id,
+    )
+
+    expected = reconciled[0]
+    assert expected.state == "applied"
+    assert expected.boundary_sequence_min == frontier
+    assert expected.boundary_sequence_max == effective_boundary
+    assert expected.verified_epoch == 1000
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (expected,)
+
+
+@pytest.mark.parametrize(
+    ("frontier", "effective_boundary", "threshold"),
+    [(24, None, 0.0), (24, None, -0.25), (-1, None, 5.0), (24, -1, 5.0), (24, 25, 5.0)],
+)
+def test_reconcile_rejects_invalid_inputs_without_changing_durable_correction(
+    tmp_path: Path, frontier: int, effective_boundary: int | None, threshold: float
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    path = tmp_path / "clock-corrections" / f"{intent.operation_id}.json"
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        store.reconcile_observation(
+            1000,
+            0.0,
+            frontier,
+            near_zero_threshold=threshold,
+            effective_boundary_sequence=effective_boundary,
+        )
+
+    assert path.read_bytes() == original_bytes
+    assert store.records() == (intent,)
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (intent,)
+
+
+@pytest.mark.parametrize(("start", "drift"), [(0, 0.0), (-1, 0.0), (20, float("inf"))])
+def test_prepare_boundary_and_finite_drift_validation(tmp_path: Path, start: int, drift: float) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+
+    if start == 0 and drift == 0.0:
+        correction = store.prepare(1100, 1000, drift, start)
+        assert correction.boundary_sequence_min == 0
+        assert store.records() == (correction,)
+    else:
+        with pytest.raises(ClockCorrectionError):
+            store.prepare(1100, 1000, drift, start)
+        assert store.records() == ()
+
+
+def test_finish_is_idempotent_only_for_identical_durable_completion(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    correction = store.mark_unresolved(store.prepare(1100, 1000, 100.0, 20))
+    applied = store.finish(correction, state="applied", boundary_sequence_max=24, verified_epoch=1000)
+    path = tmp_path / "clock-corrections" / f"{correction.operation_id}.json"
+    applied_bytes = path.read_bytes()
+
+    assert store.finish(applied, state="applied", boundary_sequence_max=24, verified_epoch=1000) == applied
+    assert path.read_bytes() == applied_bytes
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (applied,)
+
+    with pytest.raises(ClockCorrectionError):
+        store.finish(applied, state="resolved", boundary_sequence_max=24, verified_epoch=1000)
+    assert path.read_bytes() == applied_bytes
+    assert store.records() == (applied,)
+
+
+@pytest.mark.parametrize(("boundary", "valid"), [(20, True), (19, False)])
+def test_unresolved_zero_width_resolved_boundary(tmp_path: Path, boundary: int, valid: bool) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    correction = store.mark_unresolved(store.prepare(1100, 1000, 100.0, 20))
+
+    if valid:
+        resolved = store.finish(correction, state="resolved", boundary_sequence_max=boundary, verified_epoch=1000)
+        assert resolved.state == "resolved"
+        assert resolved.boundary_sequence_min == resolved.boundary_sequence_max == boundary
+        assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (resolved,)
+    else:
+        with pytest.raises(ClockCorrectionError, match="boundary"):
+            store.finish(correction, state="resolved", boundary_sequence_max=boundary, verified_epoch=1000)
+        assert store.records() == (correction,)
+
+
 def test_clock_correction_schema_is_strict(tmp_path: Path) -> None:
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
     intent = store.prepare(1300, 1000, 300.0, 20)

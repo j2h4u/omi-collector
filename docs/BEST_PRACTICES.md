@@ -23,32 +23,79 @@ then run the full contract before release or handoff.
 
 ## Mutation testing
 
-Run `just mutation` for a separate behavioral audit of ready-publication,
-quarantine transitions, session transitions, and asynchronous quarantine
-maintenance. It uses pytest-gremlins with two workers and keeps existing strict
-pytest checks. The dependency is pinned to upstream PR 522 until its full-pytest
-runner fix is released; `lightweight_runner = false` is required. The released
+Run `just mutation` for a separate full-project behavioral audit: mutate
+`src/omi_collector` and `scripts`, and collect the complete `tests` suite,
+including slow tests. It uses two pytest-gremlins workers and keeps strict
+pytest checks. The dependency is pinned to a reviewed fork commit containing
+upstream PR 522 plus configurable timeouts, durable partial caching, coverage
+failure diagnostics, native module/package metadata preservation and POSIX process-group cleanup. Timed-out test processes
+and descendants in their process group must stop before the next mutation runs.
+`lightweight_runner = false` is required. A successful native coverage pre-scan
+is saved with an input fingerprint so later timed windows can reuse the exact
+coverage map; the full-suite prescan has a fixed 600-second budget independent
+of the per-mutant timeout. A failing baseline stops before coverage collection
+or mutation dispatch, preserving the original pytest failure. Start a new
+audit with `just mutation fresh` after preserving prior evidence; ordinary
+`just mutation` resumes only a campaign with matching clean committed inputs.
+The released runner timeout uses a canonical cache-key form across integer TOML values and
+equivalent integral CLI floats, while fractional timeouts retain exact values.
 lightweight runner can falsely kill mutations when fixtures or parametrization
-are involved. A regression canary checks that unrelated mutations survive.
-Console, HTML and JSON reports describe surviving mutations.
+are involved. A regression canary checks that unrelated mutations survive. Mutation workers
+must run serial pytest: xdist workers do not inherit the import hook. The
+command clears `PYTEST_ADDOPTS` to prevent implicit parallelism or test filters.
+Before trusting a new runner revision, run the complete instrumented suite with
+no active mutation; module metadata and imports must behave like the original
+code. A behavioral mutation must be killed and an equivalent mutation must
+survive. Console, HTML and JSON reports describe surviving mutations.
 Review them for missing observable behavior, not just a higher score. Equivalent
 mutations, cosmetic messages and implementation-only changes are not reasons
 to add brittle assertions. Mutation testing does not replace complete
 state/event matrices, effect-boundary scenarios or existing release gates.
+Baseline coverage failures retain their complete logs on disk while console
+output stays bounded.
 
 The command sets `COVERAGE_CORE=ctrace`: Gremlins uses dynamic test contexts,
-which require this coverage backend on our Python 3.14 stack. It runs separately
-from the CRAP coverage gate. Add source paths and their behavioral tests together
-when widening the scope. A timeout or an untested mutant needs investigation;
-it is not confirmation that the tests caught the intended behavior. Errors are
-reported separately from killed mutants. AST operators do not replace enum
+which require this coverage backend on our Python 3.14 stack. The pinned fork
+also selects a compatible tracer for its private coverage subprocess, so direct
+Gremlins invocations retain distinct test contexts. Defaults, annotations, decorators
+and module/class initialization require the complete test suite because their
+effects outlive the test recorded by line coverage. Ordinary callable bodies
+retain coverage-guided selection. Parametrized node IDs must remain intact;
+an unmapped coverage name falls back to the complete suite instead of silently
+dropping a test. Coverage collection remains separate
+from the CRAP coverage gate. A fresh audit clears the cache only when the
+operator explicitly chooses `just mutation fresh` after preserving prior
+evidence. Default `just mutation` resumes only a matching incomplete campaign
+after its recorded process IDs and start times are absent. Completed mutants
+are saved immediately. A timeout or untested mutant needs investigation; it is
+not confirmation that tests caught the intended behavior. Errors are reported
+separately from killed mutants. AST operators do not replace enum
 references in transition tables; independent complete state/event expectations
 remain necessary for those decisions.
 
 Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
-`ionice` idle class; child test processes inherit both priorities. Test and
-mutation execution is bounded to 600 seconds. There is no mutation score gate
-yet, and mutation testing remains separate from `just verify`.
+`ionice` idle class; child test processes inherit both priorities. Ordinary
+pytest commands remain bounded to 600 seconds. The canonical full-project
+mutation campaign uses one finite 24-hour GNU timeout with TERM and a
+five-second KILL grace; this is an operating budget, not a completion promise.
+Individual mutants retain their 150-second budget and the independent coverage
+pre-scan retains 600 seconds. The recipe retains the complete timeout and runner
+log and records a small identity/start/end/report receipt, then reconciles native generated IDs
+against the fresh native JSON report. Missing or malformed report metadata,
+identity changes, nonzero exits, duplicate/missing/foreign IDs, and unresolved
+errors or timeouts cannot certify a clean audit. Status 137 is fail-stopped and
+is never retried automatically. There is no mutation score gate, and mutation
+testing remains separate from `just verify`.
+
+For a controllable audit, run `just mutation-start` or
+`just mutation-fresh-start` in a persistent terminal such as tmux. Inspect it
+with `just mutation-status`, then use `just mutation-pause` and
+`just mutation-resume` from another shell to freeze and thaw its dedicated user
+scope. The scope runs at SCHED_IDLE CPU policy, ionice idle class, and nice 19.
+Freezing pauses processes, not their monotonic deadlines: GNU's 24-hour audit
+budget and the runner's 120-second test and 150-second mutant budgets continue
+to elapse. An in-flight test or mutant can time out immediately after resume.
+Keep the canonical `just mutation` recipe for foreground use.
 
 ## Capture safety
 

@@ -18,6 +18,7 @@ from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
     RecordGapError,
     RecordMismatchError,
+    RecordRegressionError,
 )
 from omi_collector.capture.adapters.staging_contract import AttemptStateError, DiskSpaceError
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -167,6 +168,33 @@ def test_streaming_accept_chunk_replays_overlap_and_appends_one_suffix(tmp_path:
 
     attempt.accept_chunk(100, first + second + third)
     assert (attempt.path / "records.bin").read_bytes() == first + second + third
+
+
+def test_streaming_recovery_rejects_a_leg_beyond_the_original_range(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=3)
+    first, second = _record(1), _record(2)
+    attempt.accept_chunk(100, first + second)
+    attempt.checkpoint()
+
+    with pytest.raises(RecordRegressionError):
+        attempt.begin_recovery(102, 2)
+
+    assert (attempt.path / "records.bin").read_bytes() == first + second
+    attempt.close()
+
+
+def test_streaming_chunk_crossing_hash_boundary_persists_the_boundary_prefix(tmp_path: Path) -> None:
+    records = tuple(_record(index % 256) for index in range(1, 1026))
+    attempt = _started_streaming_attempt(tmp_path, count=len(records))
+    attempt.accept_chunk(100, b"".join(records[:1023]))
+    attempt.accept_chunk(1123, b"".join(records[1023:]))
+
+    checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+    assert checkpoint["record_count"] == 1024
+    assert checkpoint["raw_sha256"] == sha256(b"".join(records[:1024])).hexdigest()
+    assert attempt.durable_prefix.next_sequence == 1124
+    assert (attempt.path / "records.bin").read_bytes() == b"".join(records)
+    attempt.close()
 
 
 def test_streaming_accept_chunk_writes_the_appended_suffix_once(tmp_path: Path) -> None:
@@ -645,3 +673,223 @@ def test_accept_chunk_validates_sequence_and_count_overflow(tmp_path: Path) -> N
     attempt.accept_chunk(100, _record(1))
     with pytest.raises(AttemptStateError, match="exceeds READ_BEGIN"):
         attempt.accept_chunk(101, _record(2))
+
+
+class _PartialWriteStream:
+    def __init__(self, wrapped: object, *, write_then_raise: bool) -> None:
+        self._wrapped = wrapped
+        self._write_then_raise = write_then_raise
+        self.partial_size = RECORD_SIZE // 2
+
+    def write(self, payload: bytes) -> int:
+        written = self._wrapped.write(payload[: self.partial_size])  # type: ignore[attr-defined]
+        if self._write_then_raise:
+            raise OSError("simulated partial raw write")
+        return cast(int, written)
+
+    def flush(self) -> None:
+        self._wrapped.flush()  # type: ignore[attr-defined]
+
+    def fileno(self) -> int:
+        return cast(int, self._wrapped.fileno())  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self._wrapped.close()  # type: ignore[attr-defined]
+
+
+def test_failure_latch_rejects_followup_data_after_partial_write_error(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    payload = _record(1)
+    stream = _PartialWriteStream(cast(object, attempt._stream_raw), write_then_raise=True)
+    attempt._stream_raw = cast("BinaryIO", stream)
+
+    with pytest.raises(OSError, match="partial raw write"):
+        attempt.accept_chunk(100, payload)
+
+    preserved = (attempt.path / "records.bin").read_bytes()
+    assert preserved == payload[: stream.partial_size]
+    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
+        attempt.accept_chunk(100, payload)
+    assert (attempt.path / "records.bin").read_bytes() == preserved
+    recovery = attempt.recover()
+    assert recovery.clean is False
+    assert recovery.raw_bytes == len(preserved)
+    assert recovery.issue == "streaming attempt has preserved partial evidence"
+    attempt.close()
+
+
+def test_failure_latch_rejects_followup_data_after_short_write(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    payload = _record(1)
+    stream = _PartialWriteStream(cast(object, attempt._stream_raw), write_then_raise=False)
+    attempt._stream_raw = cast("BinaryIO", stream)
+
+    with pytest.raises(OSError, match="streaming raw write was short"):
+        attempt.accept_chunk(100, payload)
+
+    preserved = (attempt.path / "records.bin").read_bytes()
+    assert preserved == payload[: stream.partial_size]
+    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
+        attempt.accept_chunk(100, payload)
+    assert (attempt.path / "records.bin").read_bytes() == preserved
+    recovery = attempt.recover()
+    assert recovery.clean is False
+    assert recovery.raw_bytes == len(preserved)
+    assert recovery.issue == "streaming attempt has preserved partial evidence"
+    attempt.close()
+
+
+def test_failure_latch_rejects_followup_data_after_checkpoint_fsync_error(
+    tmp_path: Path,
+) -> None:
+    sync_state = {"armed": False, "calls": 0}
+
+    def fail_checkpoint_sync(fd: int) -> None:
+        if sync_state["armed"]:
+            sync_state["calls"] += 1
+            if sync_state["calls"] == 2:
+                raise OSError("simulated checkpoint fsync failure")
+        fsync(fd)
+
+    config = CollectorConfig(durability=DurabilityConfig(checkpoint_records=1))
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_checkpoint_sync, config=config)
+    attempt = store.prepare_streaming_attempt(100, 2)
+    attempt.record_read_begin(ReadBeginNotification(100, 2))
+    sync_state["armed"] = True
+
+    with pytest.raises(OSError, match="checkpoint fsync failure"):
+        attempt.accept_chunk(100, _record(1))
+
+    raw_path = attempt.path / "records.bin"
+    checkpoint_path = attempt.path / "checkpoint.json"
+    preserved = raw_path.read_bytes()
+    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
+    assert preserved == _record(1)
+    assert checkpoint["record_count"] == 0
+    # The raw fsync succeeded and the in-memory frontier advanced before the
+    # atomic checkpoint fsync failed; the persisted checkpoint remains the
+    # only restart authority, so this live attempt must stop consuming data.
+    assert attempt.durable_prefix.record_count == 1
+    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
+        attempt.accept_chunk(101, _record(2))
+    assert raw_path.read_bytes() == preserved
+    recovery = attempt.recover()
+    assert recovery.clean is False
+    assert recovery.raw_bytes == len(preserved)
+    assert recovery.issue == "streaming attempt has preserved partial evidence"
+    attempt.close()
+
+
+def _recovery_result_attempt(tmp_path: Path, *, count: int, checkpoint_records: int):
+    config = CollectorConfig(durability=DurabilityConfig(checkpoint_records=checkpoint_records))
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path), config=config).prepare_streaming_attempt(100, count)
+    attempt.record_read_begin(ReadBeginNotification(100, count))
+    return attempt
+
+
+@pytest.mark.parametrize(("start_sequence", "packet_count"), [(99, 2), (102, 3)])
+def test_recovery_result_rejects_each_out_of_range_bound(
+    tmp_path: Path, start_sequence: int, packet_count: int
+) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=4)
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+
+    with pytest.raises(RecordRegressionError):
+        attempt.begin_recovery(start_sequence, packet_count)
+
+
+def test_recovery_result_allows_shorter_continuation_within_original_range(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=4)
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+
+    prefix = attempt.begin_recovery(101, 1)
+    attempt.accept_chunk(101, _record(2))
+
+    assert prefix.next_sequence == 101
+    assert (attempt.path / "records.bin").read_bytes() == _record(1) + _record(2)
+
+
+def test_recovery_result_rejects_empty_public_chunk(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    attempt.begin_recovery(100, 2)
+
+    with pytest.raises(AttemptStateError, match="positive multiple"):
+        attempt.accept_chunk(100, b"")
+
+    assert (attempt.path / "records.bin").read_bytes() == b""
+
+
+class _FailedRawWrite:
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+
+    def write(self, _payload: bytes) -> int:
+        raise OSError("injected raw write failure")
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+def test_recovery_result_reports_failed_stream_as_partial_evidence(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    assert attempt._stream_raw is not None
+    # Inject the storage failure at the raw-write boundary; accept_chunk remains
+    # the public operation that drives the attempt into its failed state.
+    attempt._stream_raw = cast(BinaryIO, _FailedRawWrite(attempt._stream_raw))
+    try:
+        with pytest.raises(OSError, match="injected raw write failure"):
+            attempt.accept_chunk(100, _record(1))
+
+        recovery = attempt.recover()
+        assert recovery is not None
+        assert recovery.clean is False
+        assert recovery.raw_bytes == 0
+        assert recovery.issue == "streaming attempt has preserved partial evidence"
+    finally:
+        attempt.close()
+
+
+def test_recovery_result_rejects_raw_evidence_without_read_begin(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt(100, 2)
+    attempt_id = attempt.attempt_id
+    attempt.close()
+    (attempt.path / "records.bin").write_bytes(_record(1))
+
+    recovery = StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id).recover()
+
+    assert recovery.clean is False
+    assert recovery.raw_bytes == RECORD_SIZE
+    assert recovery.issue == "READ_BEGIN is not persisted"
+
+
+def test_recovery_result_accepts_full_records_at_checkpoint_limit(tmp_path: Path) -> None:
+    attempt = _recovery_result_attempt(tmp_path, count=2, checkpoint_records=2)
+    attempt.accept_chunk(100, _record(1) + _record(2))
+
+    recovery = attempt.recover()
+
+    assert recovery.clean is True
+    assert recovery.valid_records == 2
+    assert recovery.raw_bytes == 2 * RECORD_SIZE
+    assert recovery.issue is None
+
+
+def test_recovery_result_accepts_complete_uncheckpointed_tail(tmp_path: Path) -> None:
+    attempt = _recovery_result_attempt(tmp_path, count=3, checkpoint_records=4)
+    attempt.accept_chunk(100, _record(1) + _record(2) + _record(3))
+
+    recovery = attempt.recover()
+
+    assert recovery.clean is True
+    assert recovery.valid_records == 0
+    assert recovery.raw_bytes == 3 * RECORD_SIZE
+    assert recovery.issue is None

@@ -175,6 +175,29 @@ def test_production_factories_construct_monkeypatched_dependencies(monkeypatch: 
     )
 
 
+def test_make_transport_preserves_device_selector_and_nondefault_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Transport:
+        def __init__(self, address: str, **kwargs: object) -> None:
+            self.address = address
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(device_cli, "BleakRingTransport", Transport)
+    selector = BLEDevice("AA:BB", "omi", object())
+
+    transport = cast(
+        Transport,
+        device_cli.make_transport("AA:BB", device_selector=selector, adapter="hci1", phy_policy="force_1m"),
+    )
+
+    assert transport.address == "AA:BB"
+    assert transport.kwargs == {
+        "device_selector": selector,
+        "adapter": "hci1",
+        "phy_policy": "force_1m",
+        "att_mtu_query_timeout_seconds": device_cli.DEFAULT_CONFIG.ble.att_mtu_query_timeout_seconds,
+    }
+
+
 def test_phy_check_and_recover_use_fake_guard_only(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     _install_fakes(monkeypatch, FakeSession(_status()), events)
@@ -744,6 +767,36 @@ def test_download_metrics_are_finite_for_no_data_and_zero_duration() -> None:
     }
 
 
+def test_download_metrics_count_records_and_remaining_work() -> None:
+    info = RingInfo(10, 15, 100, 0, RECORD_SIZE)
+    result = CollectionResult(info, 2, object())
+
+    metrics = device_cli.download_metrics(result, 1.0)
+
+    assert metrics.as_dict() == {
+        "bytes_per_second": 2 * RECORD_SIZE,
+        "elapsed_seconds": 1.0,
+        "eta_seconds": 1.5,
+        "payload_bytes": 2 * RECORD_SIZE,
+        "records_per_second": 2.0,
+        "remaining_bytes": 3 * RECORD_SIZE,
+        "remaining_packets": 3,
+        "total_bytes": 5 * RECORD_SIZE,
+    }
+
+    slower_metrics = device_cli.download_metrics(CollectionResult(info, 1, object()), 4.0)
+    assert slower_metrics.as_dict() == {
+        "bytes_per_second": round(RECORD_SIZE / 4.0, 2),
+        "elapsed_seconds": 4.0,
+        "eta_seconds": 16.0,
+        "payload_bytes": RECORD_SIZE,
+        "records_per_second": 0.25,
+        "remaining_bytes": 4 * RECORD_SIZE,
+        "remaining_packets": 4,
+        "total_bytes": 5 * RECORD_SIZE,
+    }
+
+
 def test_download_metric_serialization_rounds_float_fields_only() -> None:
     metrics = device_cli.DownloadMetrics(1.234, 444, 123.456, 7.891, 2, 0.126)
     progress = device_cli.DownloadProgress(2.345, 222, 98.765, 4.321, 3, 1.239, 1, 4)
@@ -795,6 +848,38 @@ def test_activity_error_serialization_exposes_phase_and_sanitizes_payload() -> N
     assert updates[0].as_dict()["phase"] == "read/reconcile"
     assert updates[0].as_dict()["error_type"] == "ValueError"
     assert updates[0].as_dict()["error_message"] == "session operation failed"
+
+
+def test_operational_callback_delivers_event_to_reporter() -> None:
+    updates: list[device_cli.DownloadProgress] = []
+    callback = device_cli._operational_callback(updates.append)
+    assert callback is not None
+    event = {"event": "phy_fallback", "from": "2m", "to": "1m"}
+
+    asyncio.run(cast(Coroutine[object, object, object], callback(event)))
+
+    assert len(updates) == 1
+    assert updates[0].state == "operational"
+    assert updates[0].operational_event == event
+
+
+def test_quality_metrics_factory_returns_configured_sink(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class MetricsSink:
+        def __init__(self, root: Path, **kwargs: object) -> None:
+            self.root = root
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(device_cli, "JsonlQualityMetrics", MetricsSink)
+    monkeypatch.setattr(device_cli, "package_version", lambda: "1.2.3")
+    monkeypatch.setattr(device_cli, "source_revision_from_release_metadata", lambda: "a" * 40)
+    staging = _store(tmp_path)
+
+    metrics = device_cli._quality_metrics(staging, device_cli.DEFAULT_CONFIG)
+
+    assert isinstance(metrics, MetricsSink)
+    assert metrics.root == staging.paths.root
+    assert metrics.kwargs["release_version"] == "1.2.3"
+    assert metrics.kwargs["source_revision"] == "a" * 40
 
 
 def test_collect_no_data_result_is_safe_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -959,6 +1044,14 @@ def test_collect_rejects_max_records_outside_bound(
 
     with pytest.raises(ValueError, match="max_records must be between"):
         asyncio.run(device_cli.collect("AA:BB", "hci0", _store(tmp_path), max_records))
+
+
+def test_max_records_accepts_upper_bound() -> None:
+    device_cli._validate_max_records(device_cli.MAX_RECORDS)
+
+
+def test_max_records_accepts_lower_bound() -> None:
+    device_cli._validate_max_records(1)
 
 
 def test_run_uses_windows_asyncio_path(monkeypatch: pytest.MonkeyPatch) -> None:

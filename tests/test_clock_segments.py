@@ -259,3 +259,60 @@ def test_membership_for_tail_does_not_discard_observation_backlog_estimate() -> 
         (10, 20, "approximate"),
         (20, 21, "confirmed"),
     ]
+
+
+def test_approximate_estimate_keeps_rtc_quantization_allowance() -> None:
+    observation = replace(_observation(), info_sequence_min=4, info_sequence_max=5)
+
+    segment = segments_with_estimates((observation,), ClockSegmentMap(())).segments[0]
+
+    assert segment.utc_offset_seconds == pytest.approx(-4.9)
+    assert segment.uncertainty_seconds == pytest.approx(1.1)
+    assert segment.confidence == "approximate"
+
+
+@pytest.mark.parametrize("start,next_sequence", [(-1, 1), (1, 1), (2, 1)])
+def test_clock_ranges_reject_negative_or_empty_or_reversed_boundaries(start: int, next_sequence: int) -> None:
+    with pytest.raises(ClockSegmentError):
+        ClockEpochMembership("observation", start, next_sequence)
+    with pytest.raises(ClockSegmentError):
+        ClockSegment("observation", start, next_sequence, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    "offset,uncertainty",
+    [(float("nan"), 0.0), (float("inf"), 0.0), (0.0, -1.0), (0.0, float("nan")), (0.0, float("inf"))],
+)
+def test_clock_segments_reject_nonfinite_offsets_and_invalid_uncertainty(offset: float, uncertainty: float) -> None:
+    with pytest.raises(ClockSegmentError):
+        ClockSegment("observation", 0, 1, offset, uncertainty)
+
+
+def test_clock_segment_owns_start_but_excludes_next_sequence_and_accepts_zero_uncertainty() -> None:
+    mapping = ClockSegmentMap((ClockSegment("observation", 0, 1, 0.0, 0.0),))
+
+    assert mapping.utc_for(0, 123) == 123
+    assert mapping.utc_for(1, 123) is None
+
+
+def test_later_same_range_observation_replaces_estimate_without_fragments() -> None:
+    first = replace(_observation(), info_sequence_min=10, info_sequence_max=20, device_epoch=10)
+    later = replace(first, observation_id="later", causal_order=1, device_epoch=30)
+
+    segment_map = segments_with_estimates((first, later), ClockSegmentMap(()))
+
+    assert [(segment.start_sequence, segment.next_sequence) for segment in segment_map.segments] == [(10, 20)]
+    assert segment_map.utc_for(10, 100) == pytest.approx(1070.1)
+    assert segment_map.utc_for(20, 100) is None
+
+
+def test_estimates_leave_gaps_outside_observed_ranges_unknown() -> None:
+    first = replace(_observation(), info_sequence_min=10, info_sequence_max=12)
+    second = replace(first, observation_id="later", causal_order=1, info_sequence_min=14, info_sequence_max=16)
+
+    segment_map = segments_with_estimates((first, second), ClockSegmentMap(()))
+
+    assert [(segment.start_sequence, segment.next_sequence) for segment in segment_map.segments] == [(10, 12), (14, 16)]
+    assert segment_map.utc_for(12, 100) is None
+    assert segment_map.utc_for(13, 100) is None
+    assert segment_map.utc_for(16, 100) is None

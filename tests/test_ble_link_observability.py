@@ -3,6 +3,8 @@ import ctypes
 import errno
 import json
 import logging
+import queue
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -73,16 +75,24 @@ def _read_phy_failure(status: int = 0x1A) -> bytes:
     return _packet(0x0E, payload)
 
 
-def _read_rssi_complete(rssi_dbm: int = -47) -> bytes:
-    payload = b"\x01" + (0x1405).to_bytes(2, "little") + b"\x00" + (0x42).to_bytes(2, "little")
+def _read_rssi_complete(rssi_dbm: int = -47, *, status: int = 0) -> bytes:
+    payload = b"\x01" + (0x1405).to_bytes(2, "little") + bytes((status,)) + (0x42).to_bytes(2, "little")
     return _packet(0x0E, payload + rssi_dbm.to_bytes(1, "little", signed=True))
 
 
-def test_parser_treats_controller_rssi_sentinel_as_unavailable() -> None:
+def test_parser_preserves_controller_rssi_sentinel_context() -> None:
     event = parse_hci_packet(_read_rssi_complete(127))
 
     assert event is not None
-    assert event.rssi_dbm is None  # type: ignore[union-attr]
+    assert (event.handle, event.status, event.rssi_dbm) == (0x42, 0, None)  # type: ignore[union-attr]
+
+
+def test_parser_decodes_signed_controller_rssi_and_preserves_failed_status() -> None:
+    success = parse_hci_packet(_read_rssi_complete(-47))
+    failure = parse_hci_packet(_read_rssi_complete(status=1))
+
+    assert success is not None and (success.handle, success.status, success.rssi_dbm) == (0x42, 0, -47)  # type: ignore[union-attr]
+    assert failure is not None and (failure.handle, failure.status, failure.rssi_dbm) == (None, 1, None)  # type: ignore[union-attr]
 
 
 def _connection_update(
@@ -166,6 +176,52 @@ def test_observer_records_phy_snapshot_separately_from_failed_update() -> None:
     assert record["disconnect_class"] == "remote_requested"
 
 
+def test_observer_keeps_current_phy_beyond_bounded_histories() -> None:
+    records: list[dict[str, object]] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_max_phy_transitions=2,
+        observer_max_phy_update_outcomes=2,
+    )
+    observer = BleLinkObserver("01:02:03:04:05:06", config=config, terminal_callback=records.append)
+    observer.handle_packet(_connect())
+    observer.handle_packet(_read_phy_complete(1, 1))
+    observer.handle_packet(_phy(1, 1))
+    observer.handle_packet(_phy(2, 1))
+    observer.handle_packet(_phy(2, 2))
+    observer.handle_packet(_phy(3, 3))
+    observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+
+    record = records[0]
+    assert (record["tx_phy"], record["rx_phy"]) == ("coded", "coded")
+    assert record["phy_transitions"] == (
+        {"tx_phy": "2M", "rx_phy": "1M"},
+        {"tx_phy": "2M", "rx_phy": "2M"},
+    )
+    assert record["phy_update_outcomes"] == (
+        {"status_hex": "0x00", "status_name": "success", "effective_phy": {"tx_phy": "1M", "rx_phy": "1M"}},
+        {"status_hex": "0x00", "status_name": "success", "effective_phy": {"tx_phy": "2M", "rx_phy": "1M"}},
+    )
+
+
+def test_observer_uses_injected_clock_for_terminal_session_duration() -> None:
+    records: list[dict[str, object]] = []
+    now = [10.0]
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        clock=lambda: now[0],
+        terminal_callback=records.append,
+    )
+    observer.handle_packet(_connect())
+    now[0] = 12.5
+    disconnect = _packet(0x05, b"\x00\x42\x00\x13")
+    observer.handle_packet(disconnect)
+    observer.handle_packet(disconnect)
+
+    assert len(records) == 1
+    assert records[0]["duration_seconds"] == 2.5
+
+
 def test_observer_records_failed_read_phy_snapshot_without_invalid_values() -> None:
     records: list[dict[str, object]] = []
     observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)
@@ -229,8 +285,47 @@ def test_parser_ignores_truncated_connection_parameter_events(packet: bytes) -> 
     assert parse_hci_packet(packet) is None
 
 
+@pytest.mark.parametrize(
+    "packet",
+    [
+        _packet(0x3E, b"\x0c\x00\x42\x00\x01"),
+        _packet(0x3E, b"\x01" + bytes(17)),
+        _packet(0x3E, b"\x0a" + bytes(29)),
+        _packet(0x05, b"\x00\x42\x00"),
+        _packet(0x0E, b"\x01\x05\x14\x00"),
+    ],
+)
+def test_parser_ignores_truncated_phy_connection_disconnect_and_read_results(packet: bytes) -> None:
+    assert parse_hci_packet(packet) is None
+
+
+def test_parser_does_not_finish_session_from_truncated_disconnect_frame() -> None:
+    records: list[dict[str, object]] = []
+    observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)
+    observer.handle_packet(_connect())
+
+    # The event declares five parameter bytes but contains only four.
+    observer.handle_packet(b"\x04\x05\x05\x00\x42\x00\x13")
+
+    assert records == []
+
+
+@pytest.mark.parametrize("packet", [b"\x04\x05", b"\x04\x05\x00"])
+def test_parser_records_short_hci_frames_in_debug_log(packet: bytes, caplog: pytest.LogCaptureFixture) -> None:
+    debug_logger = logging.getLogger("tests.ble_link.malformed_packet")
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        assert parse_hci_packet(packet, logger=debug_logger) is None
+
+    assert any(
+        record.name == debug_logger.name and getattr(record, "debug_event", None) == "ble_link_malformed_packet"
+        for record in caplog.records
+    )
+
+
 def test_parser_ignores_acl_malformed_and_mismatched_packets() -> None:
     assert parse_hci_packet(b"\x02\x00\x00") is None
+    assert parse_hci_packet(b"\x02\x05\x04\x00\x42\x00\x13") is None
     assert parse_hci_packet(b"\x04\x3e\x10\x01") is None
     assert parse_hci_packet(_connect(address=b"\x10\x10\x10\x10\x10\x10")) is not None
 
@@ -265,6 +360,89 @@ class _FakeSocket:
         self.closed = True
 
 
+def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
+    class ModeAwareSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocking = False
+            self.receive_entered = threading.Event()
+            self.release_receive = threading.Event()
+
+        def setblocking(self, flag: bool) -> None:
+            self.blocking = flag
+
+        def recv(self, _size: int) -> bytes:
+            self.receive_entered.set()
+            if self.blocking:
+                self.release_receive.wait()
+                return b""
+            raise BlockingIOError
+
+    fake = ModeAwareSocket()
+    diagnostics: list[str] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+    )
+    observer._diagnostic = lambda event, **_fields: diagnostics.append(event)
+
+    async def scenario() -> None:
+        await observer.start()
+        reader = observer._reader
+        try:
+            assert reader is not None
+            assert await asyncio.to_thread(fake.receive_entered.wait, 1.0)
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+            assert not reader.is_alive()
+            assert "ble_link_observer_reader_timeout" not in diagnostics
+        finally:
+            with suppress(Exception):
+                await asyncio.wait_for(observer.close(), timeout=1.0)
+            fake.release_receive.set()
+            if reader is not None:
+                await asyncio.to_thread(reader.join, 1.0)
+                assert not reader.is_alive()
+
+    asyncio.run(scenario())
+
+
+class _RestartLifecycleSocket(_FakeSocket):
+    def __init__(self, *, late_packet: bytes | None = None, stall_first_receive: bool = False) -> None:
+        super().__init__()
+        self.receive_entered = threading.Event()
+        self.release_receive = threading.Event()
+        self.packet_returned = threading.Event()
+        self._late_packet = late_packet
+        self._stall_first_receive = stall_first_receive
+        self._packets: queue.Queue[bytes] = queue.Queue()
+
+    def recv(self, _size: int) -> bytes:
+        self.receive_entered.set()
+        if self._stall_first_receive:
+            self._stall_first_receive = False
+            # This barrier models a reader delayed across the bounded close deadline.
+            self.release_receive.wait()
+            if self._late_packet is not None:
+                self.packet_returned.set()
+                return self._late_packet
+        try:
+            packet = self._packets.get_nowait()
+        except queue.Empty as error:
+            raise BlockingIOError from error
+        self.packet_returned.set()
+        return packet
+
+    def feed(self, packet: bytes) -> None:
+        self._packets.put_nowait(packet)
+
+
 def test_hci_filter_uses_exact_linux_filter_abi() -> None:
     value = hci_filter_bytes()
     assert len(value) == 16
@@ -295,8 +473,12 @@ def test_native_hci_bind_passes_exact_sockaddr_hci_layout(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(ble_link_observability.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
     _native_hci_bind(37, 31, 3, 7)
+    _native_hci_bind(37, 31, 0, 0)
 
-    assert calls == [(37, b"\x1f\x00\x03\x00\x07\x00", 6)]
+    assert calls == [
+        (37, b"\x1f\x00\x03\x00\x07\x00", 6),
+        (37, b"\x1f\x00\x00\x00\x00\x00", 6),
+    ]
 
 
 def test_native_hci_bind_preserves_errno(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -316,6 +498,19 @@ def test_native_hci_bind_preserves_errno(monkeypatch: pytest.MonkeyPatch) -> Non
         _native_hci_bind(37, 31, 3, 7)
 
     assert raised.value.errno == errno.EACCES
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="libc HCI bind errno behavior is Linux-specific")
+def test_native_hci_bind_preserves_real_libc_errno() -> None:
+    previous_errno = ctypes.get_errno()
+    try:
+        ctypes.set_errno(0)
+        with pytest.raises(OSError) as raised:
+            _native_hci_bind(-1, 31, 0, 0)
+    finally:
+        ctypes.set_errno(previous_errno)
+
+    assert raised.value.errno == errno.EBADF
 
 
 @pytest.mark.parametrize(
@@ -515,6 +710,128 @@ def test_observer_start_failure_keeps_traceback_in_debug_ring_and_warning_separa
     assert "raw HCI payload must stay private" not in caplog.text
 
 
+def test_observer_restart_refuses_a_live_reader_after_bounded_close() -> None:
+    sockets: list[_RestartLifecycleSocket] = []
+    factory_calls: list[_RestartLifecycleSocket] = []
+    workers: list[threading.Thread] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+
+    def socket_factory(*_args: object) -> _RestartLifecycleSocket:
+        sock = _RestartLifecycleSocket(stall_first_receive=True)
+        sockets.append(sock)
+        factory_calls.append(sock)
+        return sock
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=socket_factory,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+    )
+
+    async def scenario() -> None:
+        try:
+            await observer.start()
+            reader, processor = observer._reader, observer._processor
+            assert reader is not None and processor is not None
+            workers.extend((reader, processor))
+            assert await asyncio.to_thread(sockets[0].receive_entered.wait, 1)
+            await asyncio.wait_for(observer.close(), timeout=1)
+            assert reader.is_alive()
+            await asyncio.to_thread(processor.join, 1)
+            assert not processor.is_alive()
+
+            await observer.start()
+            reader = observer._reader
+            processor = observer._processor
+            workers.extend(worker for worker in (reader, processor) if worker is not None and worker not in workers)
+            assert len(factory_calls) == 1
+        finally:
+            for sock in sockets:
+                sock.release_receive.set()
+            for worker in (observer._reader, observer._processor):
+                if worker is not None and worker not in workers:
+                    workers.append(worker)
+            with suppress(Exception):
+                await asyncio.wait_for(observer.close(), timeout=1)
+            for worker in workers:
+                await asyncio.to_thread(worker.join, 1)
+                assert not worker.is_alive()
+
+    asyncio.run(scenario())
+
+
+def test_observer_restart_drops_late_packet_from_previous_session() -> None:
+    old_socket = _RestartLifecycleSocket(late_packet=_connect(), stall_first_receive=True)
+    new_socket = _RestartLifecycleSocket()
+    sockets = [old_socket, new_socket]
+    factory_calls: list[_RestartLifecycleSocket] = []
+    workers: list[threading.Thread] = []
+    records: list[dict[str, object]] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+
+    def socket_factory(*_args: object) -> _RestartLifecycleSocket:
+        sock = sockets[len(factory_calls)]
+        factory_calls.append(sock)
+        return sock
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=socket_factory,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=records.append,
+    )
+
+    async def scenario() -> None:
+        try:
+            await observer.start()
+            old_reader, old_processor = observer._reader, observer._processor
+            assert old_reader is not None and old_processor is not None
+            workers.extend((old_reader, old_processor))
+            assert await asyncio.to_thread(old_socket.receive_entered.wait, 1)
+            await asyncio.wait_for(observer.close(), timeout=1)
+            assert old_reader.is_alive()
+            await asyncio.to_thread(old_processor.join, 1)
+            assert not old_processor.is_alive()
+
+            old_socket.release_receive.set()
+            await asyncio.to_thread(old_reader.join, 1)
+            assert not old_reader.is_alive()
+            assert old_socket.packet_returned.is_set()
+
+            await observer.start()
+            new_reader, new_processor = observer._reader, observer._processor
+            assert new_reader is not None and new_processor is not None
+            workers.extend((new_reader, new_processor))
+            assert len(factory_calls) == 2
+            new_socket.feed(_packet(0x05, b"\x00\x42\x00\x13"))
+            assert await asyncio.to_thread(new_socket.packet_returned.wait, 1)
+            await asyncio.wait_for(observer.close(), timeout=1)
+            assert records == []
+        finally:
+            for sock in sockets:
+                sock.release_receive.set()
+            for worker in (observer._reader, observer._processor):
+                if worker is not None and worker not in workers:
+                    workers.append(worker)
+            with suppress(Exception):
+                await asyncio.wait_for(observer.close(), timeout=1)
+            for worker in workers:
+                await asyncio.to_thread(worker.join, 1)
+                assert not worker.is_alive()
+
+    asyncio.run(scenario())
+
+
 def test_observer_shutdown_drains_queued_disconnect_before_finalizing() -> None:
     fake = _FakeSocket()
     records: list[dict[str, object]] = []
@@ -531,6 +848,50 @@ def test_observer_shutdown_drains_queued_disconnect_before_finalizing() -> None:
     observer._queue.put(_packet(0x05, b"\x00\x42\x00\x13"))
     asyncio.run(observer.close())
     assert records and records[0]["disconnect_reason_hex"] == "0x13"
+
+
+def test_reader_delivers_hci_timeline_to_terminal_callback() -> None:
+    class ReceivingSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.received: queue.Queue[bytes] = queue.Queue()
+
+        def recv(self, _size: int) -> bytes:
+            try:
+                return self.received.get_nowait()
+            except queue.Empty as error:
+                raise BlockingIOError from error
+
+    fake = ReceivingSocket()
+    callback_received = threading.Event()
+    records: list[dict[str, object]] = []
+
+    def terminal_callback(record: dict[str, object]) -> None:
+        records.append(record)
+        callback_received.set()
+
+    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001)
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=terminal_callback,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        try:
+            fake.received.put(_connect())
+            fake.received.put(_packet(0x05, b"\x00\x42\x00\x13"))
+            assert await asyncio.to_thread(callback_received.wait, 1.0)
+            assert len(records) == 1
+            assert records[0]["disconnect_reason_hex"] == "0x13"
+        finally:
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    asyncio.run(scenario())
+    assert fake.closed
 
 
 def test_observer_shutdown_deadline_does_not_block_loop_on_full_queue_and_stalled_callback() -> None:

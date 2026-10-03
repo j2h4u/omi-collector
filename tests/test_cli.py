@@ -14,12 +14,15 @@ from omi_collector import cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
 from omi_collector.capture.adapters.publication import SealResult
+from omi_collector.capture.adapters.staging_contract import StagingError
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
 from omi_collector.config import DebugLogConfig
 from omi_collector.core import package_version
+from omi_collector.operator_status import OperatorStatusError
+from omi_collector.spool_metrics import SpoolMetricsError
 from omi_collector.storage_layout import load_operator_config
 
 _CAPTURE_ROOTS: set[Path] = set()
@@ -80,12 +83,19 @@ def test_config_check_reports_canonical_path(tmp_path: Path) -> None:
 
 def test_service_announces_readiness_after_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = _layout(tmp_path)
-    monkeypatch.setattr(cli, "_sync", lambda *_args, **_kwargs: None)
+    sync_options: list[dict[str, object]] = []
+
+    def fake_sync(*_args: object, **kwargs: object) -> None:
+        sync_options.append(kwargs)
+
+    monkeypatch.setattr(cli, "_sync", fake_sync)
 
     result = CliRunner().invoke(app, ["service", "--config", str(path)])
 
     assert result.exit_code == 0
-    assert json.loads(result.output) == {"config": str(path), "status": "deployment_ready"}
+    assert result.stdout == ""
+    assert json.loads(result.stderr) == {"config": str(path), "status": "deployment_ready"}
+    assert sync_options == [{"force_1m": False, "log_level": cli.SyncLogLevel.INFO}]
 
 
 def test_service_does_not_announce_readiness_for_invalid_config(tmp_path: Path) -> None:
@@ -95,7 +105,30 @@ def test_service_does_not_announce_readiness_for_invalid_config(tmp_path: Path) 
     result = CliRunner().invoke(app, ["service", "--config", str(path)])
 
     assert result.exit_code == 2
-    assert "deployment_ready" not in result.output
+    assert result.stdout == ""
+    assert "deployment_ready" not in result.stderr
+    assert "config TOML is unreadable or malformed" in result.stderr
+
+
+def test_device_status_only_flags_a_confirmed_inactive_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(cli, "collect_operator_status", lambda *_args, **_kwargs: {"status": "ok"})
+    service_statuses = (
+        ({"available": False, "error": "OSError", "unit": "omi-collector.service"}, "ok"),
+        ({"available": True, "active_state": "inactive", "unit": "omi-collector.service"}, "attention"),
+        ({"available": True, "active_state": "active", "unit": "omi-collector.service"}, "ok"),
+    )
+
+    for service_status, expected_status in service_statuses:
+        monkeypatch.setattr(cli, "_systemd_service_status", lambda service_status=service_status: service_status)
+        result = CliRunner().invoke(app, ["device", "status", "--config", str(_layout(tmp_path))])
+
+        assert result.exit_code == 0
+        payload = cast(dict[str, object], json.loads(result.output))
+        assert payload["status"] == expected_status
+        assert payload["service"] == service_status
 
 
 def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(tmp_path: Path) -> None:
@@ -170,6 +203,42 @@ def test_systemd_service_status_reports_execution_failure(
     }
 
 
+def test_systemd_service_status_parses_text_and_handles_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        'if [ "$2" = "failing.service" ]; then\n'
+        "  printf 'unit unavailable\\n' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "printf 'ActiveState=active\\nSubState=running\\nMainPID=42\\nNRestarts=0\\n'\n"
+        "printf 'ExecMainStatus=0\\nActiveEnterTimestamp=Sat 2026-09-12 10:00:00 +05\\n'\n",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    assert cli._systemd_service_status("healthy.service") == {
+        "active_enter_timestamp": "Sat 2026-09-12 10:00:00 +05",
+        "active_state": "active",
+        "available": True,
+        "exec_main_status": 0,
+        "main_pid": 42,
+        "restart_count": 0,
+        "sub_state": "running",
+        "unit": "healthy.service",
+    }
+    assert cli._systemd_service_status("failing.service") == {
+        "available": False,
+        "error": "unit unavailable",
+        "unit": "failing.service",
+    }
+
+
 def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, str]] = []
 
@@ -207,7 +276,63 @@ def test_device_operation_interruption_is_reported(monkeypatch: pytest.MonkeyPat
     result = CliRunner().invoke(app, ["device", "phy-check", "--confirm-host-change"])
 
     assert result.exit_code == 0
-    assert result.output.strip() == "interrupted safely"
+    assert result.stdout == ""
+    assert result.stderr.strip() == "interrupted safely"
+
+
+def test_device_operation_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_phy_check(_adapter: str) -> None:
+        return
+
+    def failed(operation: Coroutine[object, object, object]) -> object:
+        operation.close()
+        raise RuntimeError("private detail")
+
+    monkeypatch.setattr(device_cli, "phy_check", fake_phy_check)
+    monkeypatch.setattr(device_cli, "run", failed)
+
+    result = CliRunner().invoke(app, ["device", "phy-check", "--confirm-host-change"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "device operation failed: RuntimeError"
+
+
+def test_device_host_change_and_read_routes_refuse_without_confirmation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _layout(tmp_path)
+    calls: list[str] = []
+
+    async def fake_operation(*_args: object) -> None:
+        return
+
+    def must_not_run(operation: Coroutine[object, object, object]) -> object:
+        operation.close()
+        calls.append("device operation")
+        raise RuntimeError("confirmation guard was bypassed")
+
+    monkeypatch.setattr(device_cli, "phy_check", fake_operation)
+    monkeypatch.setattr(device_cli, "probe", fake_operation)
+    monkeypatch.setattr(device_cli, "info", fake_operation)
+    monkeypatch.setattr(device_cli, "collect", fake_operation)
+    monkeypatch.setattr(device_cli, "run", must_not_run)
+    monkeypatch.setattr(cli, "_staging", lambda _loaded: object())
+    monkeypatch.setattr(cli, "_preflight_storage", lambda _staging: None)
+    commands = (
+        (["device", "phy-check"], "--confirm-host-change"),
+        (["device", "probe", "--config", str(config_path)], "--confirm-host-change"),
+        (["device", "info", "--config", str(config_path)], "--confirm-host-change"),
+        (["device", "collect", "--config", str(config_path)], "--confirm-read"),
+    )
+
+    for arguments, required_flag in commands:
+        result = CliRunner().invoke(app, arguments)
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert result.stderr.strip() == f"refusing operation without {required_flag}"
+        assert calls == []
 
 
 def test_sync_requires_explicit_read_advance_confirmation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -221,10 +346,13 @@ def test_sync_requires_explicit_read_advance_confirmation(monkeypatch: pytest.Mo
     )
 
     assert result.exit_code == 2
-    assert "--confirm-sync" in result.output
+    assert result.stdout == ""
+    assert "--confirm-sync" in result.stderr
 
 
 def test_sync_reports_progress_on_stderr_and_metrics_on_stdout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    now = [100.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: now[0])
     bundle = tmp_path / "omi" / "10-11-deadbeef"
     bundle.mkdir(parents=True)
     (bundle / "manifest.json").write_text('{"raw_sha256":"abc123"}', encoding="utf-8")
@@ -255,6 +383,7 @@ def test_sync_reports_progress_on_stderr_and_metrics_on_stdout(monkeypatch: pyte
         assert callable(link_terminal_callback)
         assert debug_logger is not None
         progress(device_cli.DownloadProgress(0.0, RECORD_SIZE, 0.0, 0.0, 0, 0.0, 1, 1))
+        now[0] = 102.0
         return expected
 
     monkeypatch.setattr(device_cli, "sync", fake_sync)
@@ -270,14 +399,80 @@ def test_sync_reports_progress_on_stderr_and_metrics_on_stdout(monkeypatch: pyte
     )
 
     assert result.exit_code == 0
-    lines = result.output.splitlines()
+    assert result.stderr
+    lines = result.stderr.splitlines()
     assert any(json.loads(line)["status"] == "progress" for line in lines)
-    final = cast(dict[str, object], json.loads(lines[-1]))
+    final = cast(dict[str, object], json.loads(result.stdout))
     assert final["status"] == "synced"
     assert final["advance_confirmed"] is True
     assert final["payload_bytes"] == RECORD_SIZE
     assert final["remaining_packets"] == 0
+    assert final["elapsed_seconds"] == 2.0
     assert cast(float, final["bytes_per_second"]) >= 0
+
+
+def test_collect_reports_elapsed_time_in_final_metrics(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    now = [100.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: now[0])
+
+    async def fake_collect(*_args: object) -> device_cli.collector.NoDataResult:
+        now[0] = 102.0
+        return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
+
+    monkeypatch.setattr(device_cli, "collect", fake_collect)
+    result = CliRunner().invoke(
+        app,
+        ["device", "collect", "--config", str(_layout(tmp_path)), "--confirm-read"],
+    )
+
+    assert result.exit_code == 0
+    payload = cast(dict[str, object], json.loads(result.stdout))
+    assert payload["status"] == "no_data"
+    assert payload["elapsed_seconds"] == 2.0
+
+
+def test_collect_preflight_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FailingStaging:
+        def preflight_storage(self) -> None:
+            raise StagingError("read-only filesystem")
+
+    async def must_not_collect(*_args: object) -> device_cli.collector.NoDataResult:
+        raise AssertionError("collect must not start after preflight failure")
+
+    monkeypatch.setattr(cli, "_staging", lambda _loaded: FailingStaging())
+    monkeypatch.setattr(device_cli, "collect", must_not_collect)
+    result = CliRunner().invoke(
+        app,
+        ["device", "collect", "--config", str(_layout(tmp_path)), "--confirm-read"],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "storage preflight failed: read-only filesystem"
+
+
+def test_device_metrics_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def failed(*_args: object, **_kwargs: object) -> object:
+        raise SpoolMetricsError("manifest is malformed")
+
+    monkeypatch.setattr(cli, "collect_spool_metrics", failed)
+    result = CliRunner().invoke(app, ["device", "metrics", "--config", str(_layout(tmp_path))])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "manifest is malformed"
+
+
+def test_device_status_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def failed(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise OperatorStatusError("status evidence is malformed")
+
+    monkeypatch.setattr(cli, "collect_operator_status", failed)
+    result = CliRunner().invoke(app, ["device", "status", "--config", str(_layout(tmp_path))])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "status evidence is malformed"
 
 
 def _sync_progress(  # noqa: PLR0913
@@ -559,6 +754,45 @@ def test_sync_reporter_only_recovers_on_healthy_activity() -> None:
         "recovered",
         "progress",
     ]
+
+
+def test_sync_reporter_recovers_only_after_verified_clock_sync() -> None:
+    lines: list[str] = []
+    reporter = cli.SyncProgressReporter(emit=lines.append)
+    reporter(_sync_progress(state="session_error", error_type="UnexpectedError", error_message="failed"))
+    reporter(
+        _sync_progress(
+            state="operational",
+            operational_event={"event": "pendant_clock_sync", "outcome": "verification_failed"},
+        )
+    )
+
+    assert [json.loads(line)["status"] for line in lines] == ["session_error", "operational"]
+
+    reporter(
+        _sync_progress(
+            state="operational",
+            operational_event={"event": "pendant_clock_sync", "outcome": "verified"},
+        )
+    )
+
+    assert [json.loads(line)["status"] for line in lines] == [
+        "session_error",
+        "operational",
+        "recovered",
+        "operational",
+    ]
+
+
+def test_sync_reporter_uses_unknown_error_type_in_recovery_notice() -> None:
+    lines: list[str] = []
+    reporter = cli.SyncProgressReporter(emit=lines.append)
+    reporter(_sync_progress(state="session_error", error_message="missing type"))
+    reporter(_sync_progress(state="progress"))
+
+    payloads = [cast(dict[str, object], json.loads(line)) for line in lines]
+    recovery = next(payload for payload in payloads if payload["status"] == "recovered")
+    assert recovery == {"recovered_from": "unknown", "status": "recovered"}
 
 
 def test_sync_reporter_info_emits_first_and_changed_observation_health() -> None:

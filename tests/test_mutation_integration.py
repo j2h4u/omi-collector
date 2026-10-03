@@ -23,6 +23,7 @@ def test_runner_preserves_mutant_outcomes_with_fixture_and_parametrization(tmp_p
         "import os\n"
         "from pathlib import Path\n"
         "import pytest\n"
+        "import toy\n"
         "from toy import is_positive\n"
         "\n"
         "@pytest.fixture(params=('canary-a', 'canary-b'))\n"
@@ -34,7 +35,9 @@ def test_runner_preserves_mutant_outcomes_with_fixture_and_parametrization(tmp_p
         "    marker_dir = Path(os.environ['CANARY_MARKER_DIR'])\n"
         "    (marker_dir / f'{canary}-{marker}').touch()\n"
         "    assert canary.startswith('canary-')\n"
-        "    assert marker in (1, 2)\n",
+        "    assert marker in (1, 2)\n"
+        "    assert Path(toy.__file__).name == 'toy.py'\n"
+        "    assert toy.__spec__.origin == toy.__file__\n",
         encoding="utf-8",
     )
     (tmp_path / "pyproject.toml").write_text(

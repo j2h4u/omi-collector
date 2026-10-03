@@ -37,6 +37,7 @@ class FakeTarget:
     release_append: threading.Event = field(default_factory=threading.Event)
     block_append: bool = False
     fail_append: bool = False
+    fail_append_after_block: bool = False
     block_read_begin: bool = False
     fail_read_begin: bool = False
     fail_read_begin_after_block: bool = False
@@ -51,11 +52,13 @@ class FakeTarget:
     block_close: bool = False
     fail_close: bool = False
     release_close: threading.Event = field(default_factory=threading.Event)
+    close_started: threading.Event = field(default_factory=threading.Event)
     seal_calls: int = 0
     close_calls: int = 0
     checkpoint_result: object = "checkpointed"
     append_readonly: list[bool] = field(default_factory=list)
     append_offsets: list[int] = field(default_factory=list)
+    second_append_started: threading.Event = field(default_factory=threading.Event)
 
     def _record(self, name: str, value: bytes | object = None) -> None:
         self.thread_ids.add(threading.get_ident())
@@ -88,11 +91,15 @@ class FakeTarget:
         self.calls.append(("append", offset, bytes(chunk)))
         self.append_readonly.append(chunk.readonly)
         self.append_offsets.append(offset)
+        if len(self.append_offsets) == 2:
+            self.second_append_started.set()
         self.append_started.set()
         if self.fail_append:
             raise OSError("disk full")
         if self.block_append:
             self.release_append.wait(5)
+        if self.fail_append_after_block:
+            raise OSError("disk full after append barrier")
         return None
 
     def checkpoint(self) -> object:
@@ -114,6 +121,7 @@ class FakeTarget:
     def close(self) -> object:
         self._record("close")
         self.close_calls += 1
+        self.close_started.set()
         if self.block_close:
             self.release_close.wait(5)
         if self.fail_close:
@@ -324,6 +332,43 @@ def test_publish_high_water_is_record_aligned() -> None:
     asyncio.run(exercise())
 
 
+def test_publish_zero_and_repeated_high_water_are_noops() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        writer = await _started(target, bytearray(b"x" * RECORD_SIZE))
+        try:
+            assert not writer.publish(0)
+            assert writer.publish(RECORD_SIZE)
+            assert not writer.publish(RECORD_SIZE)
+            assert not writer.publish(0)
+            await writer.barrier()
+
+            assert [call for call in target.calls if call[0] == "append"] == [("append", 0, b"x" * RECORD_SIZE)]
+        finally:
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_contiguous_non_byte_memoryview_is_published_as_bytes() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        source = memoryview(b"x" * RECORD_SIZE).cast("I")
+        writer = AttemptWriter(target, source, config=WriterConfig(chunk_records=1))
+        try:
+            await writer.start()
+            await writer.read_begin("begin")
+
+            assert writer.publish(RECORD_SIZE)
+            await writer.barrier()
+
+            assert ("append", 0, b"x" * RECORD_SIZE) in target.calls
+        finally:
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
 def test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
     asyncio.run(_test_high_water_coalesces_data_and_barrier_orders_writes())
 
@@ -349,6 +394,71 @@ async def _test_high_water_coalesces_data_and_barrier_orders_writes() -> None:
     assert all(target.append_readonly)
     assert len([call for call in target.calls if call[0] == "append"]) == 4
     await writer.close()
+
+
+@pytest.mark.parametrize("operation", ("seal", "publish_prefix", "close"))
+def test_drain_integrity_finalizers_flush_the_submitted_high_water(operation: str) -> None:
+    asyncio.run(_test_drain_integrity_finalizers_flush_the_submitted_high_water(operation))
+
+
+async def _test_drain_integrity_finalizers_flush_the_submitted_high_water(operation: str) -> None:
+    target = FakeTarget(block_append=True)
+    writer = await _started(
+        target,
+        bytearray(RECORD_SIZE * 3),
+        chunk_records=1,
+    )
+    finalizer: asyncio.Task[object] | None = None
+    try:
+        assert writer.publish(RECORD_SIZE * 3)
+        assert await asyncio.to_thread(target.append_started.wait, 3)
+
+        if operation == "seal":
+            finalizer = asyncio.create_task(writer.seal("done"))
+            expected_state = WriterState.SEALING
+        elif operation == "publish_prefix":
+            finalizer = asyncio.create_task(writer.publish_prefix())
+            expected_state = WriterState.SEALING
+        else:
+            finalizer = asyncio.create_task(writer.close(timeout=1))
+            expected_state = WriterState.CLOSING
+
+        # Yield once so the public operation admits its command while append is
+        # still held at the first chunk; the state is the public admission signal.
+        await asyncio.sleep(0)
+        assert writer.state is expected_state
+        target.release_append.set()
+        await finalizer
+
+        assert target.append_offsets == [0, RECORD_SIZE, 2 * RECORD_SIZE]
+        names = [call[0] for call in target.calls]
+        terminal = {"seal": "seal", "publish_prefix": "publish_prefix", "close": "close"}[operation]
+        assert names[-1] == terminal
+    finally:
+        target.release_append.set()
+        if finalizer is not None and not finalizer.done():
+            await finalizer
+        if writer.thread.is_alive():
+            await writer.close(timeout=1)
+
+
+def test_drain_integrity_idle_writer_continues_after_first_chunk() -> None:
+    asyncio.run(_test_drain_integrity_idle_writer_continues_after_first_chunk())
+
+
+async def _test_drain_integrity_idle_writer_continues_after_first_chunk() -> None:
+    target = FakeTarget()
+    writer = await _started(
+        target,
+        bytearray(RECORD_SIZE * 3),
+        chunk_records=1,
+    )
+    try:
+        assert writer.publish(RECORD_SIZE * 3)
+        assert await asyncio.to_thread(target.second_append_started.wait, 3)
+        assert target.append_offsets[:2] == [0, RECORD_SIZE]
+    finally:
+        await writer.close(timeout=1)
 
 
 def test_snapshot_records_durable_checkpoint_ack_without_target_inspection() -> None:
@@ -451,6 +561,39 @@ async def _test_close_timeout_is_reported_until_blocking_target_is_released() ->
     assert await writer.close(timeout=1) == "closed"
     assert writer.state is WriterState.CLOSED
     assert not writer.thread.is_alive()
+
+
+def test_close_deadline_includes_writer_thread_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        writer = await _started(target, bytearray())
+        worker_paused = threading.Event()
+        release_worker = threading.Event()
+        complete = writer._complete
+
+        def pause_after_completion(
+            future: asyncio.Future[object],
+            result: object | None,
+            error: BaseException | None,
+        ) -> None:
+            complete(future, result, error)
+            worker_paused.set()
+            release_worker.wait(5)
+
+        monkeypatch.setattr(writer, "_complete", pause_after_completion)
+        closing = asyncio.create_task(writer.close(timeout=0.5))
+        try:
+            assert await asyncio.to_thread(worker_paused.wait, 1)
+            assert not closing.done()
+            with pytest.raises(WriterShutdownTimeoutError):
+                await asyncio.wait_for(asyncio.shield(closing), timeout=1)
+        finally:
+            release_worker.set()
+            await writer.close(timeout=1)
+            if not closing.done():
+                await closing
+
+    asyncio.run(exercise())
 
 
 def test_bounded_close_survives_repeated_cancellation_until_target_release() -> None:
@@ -729,6 +872,49 @@ def test_unlatchable_failure_result_completes_pending_future_and_preserves_worke
         monkeypatch.setattr(attempt_writer, "transition", original_transition)
         with pytest.raises(WriterFailedError, match="target failed"):
             await writer.close()
+        assert not writer.thread.is_alive()
+
+    asyncio.run(exercise())
+
+
+def test_failure_lifecycle_idle_append_error_keeps_close_owned_and_failed_state_visible() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(
+            block_append=True,
+            fail_append_after_block=True,
+            block_close=True,
+        )
+        writer = await _started(target, bytearray(RECORD_SIZE))
+        allow_close = asyncio.Event()
+
+        async def close_after_barrier() -> object:
+            await allow_close.wait()
+            return await writer.close(timeout=1)
+
+        closing = asyncio.create_task(close_after_barrier())
+        close_outcome: object | None = None
+        close_started = False
+        try:
+            writer.publish(RECORD_SIZE)
+            assert await asyncio.to_thread(target.append_started.wait, 1)
+            allow_close.set()
+            # Yield once so close is admitted while the append is still blocked.
+            await asyncio.sleep(0)
+            target.release_append.set()
+            close_started = await asyncio.to_thread(target.close_started.wait, 1)
+            assert close_started
+            assert isinstance(writer.failure, OSError)
+            assert writer.state is WriterState.FAILED
+        finally:
+            allow_close.set()
+            await asyncio.sleep(0)
+            target.release_append.set()
+            target.release_close.set()
+            close_outcome = (await asyncio.gather(closing, return_exceptions=True))[0]
+            await asyncio.to_thread(writer.thread.join, 1)
+
+        assert isinstance(close_outcome, WriterFailedError)
+        assert target.close_calls == 1
         assert not writer.thread.is_alive()
 
     asyncio.run(exercise())

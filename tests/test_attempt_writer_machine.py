@@ -142,6 +142,12 @@ def test_failure_results_are_first_wins_and_latch_in_unexpected_states() -> None
     assert transition(Constructed(), CloseFailed(CLOSE_ERROR)).state == Closed(CLOSE_ERROR, False)
 
 
+def test_close_after_failure_keeps_start_rejection_in_failed_category() -> None:
+    closing = transition(Failed(ERROR), CloseRequested()).state
+
+    assert transition(closing, StartRequested()).directive == Reject(RejectionKind.FAILED)
+
+
 @pytest.mark.parametrize(
     "state",
     (

@@ -29,7 +29,7 @@ def commit_messages(base_sha: str, head_sha: str) -> list[str]:
 def _validate_message(message: str) -> list[str]:
     problems: list[str] = []
     lines = message.splitlines()
-    subject = lines[0].strip()
+    subject = lines[0].strip() if lines else ""
 
     match = TITLE_PATTERN.fullmatch(subject)
     if match is None:

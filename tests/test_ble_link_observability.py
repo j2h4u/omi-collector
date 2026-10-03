@@ -3,6 +3,7 @@ import ctypes
 import errno
 import json
 import logging
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -73,16 +74,24 @@ def _read_phy_failure(status: int = 0x1A) -> bytes:
     return _packet(0x0E, payload)
 
 
-def _read_rssi_complete(rssi_dbm: int = -47) -> bytes:
-    payload = b"\x01" + (0x1405).to_bytes(2, "little") + b"\x00" + (0x42).to_bytes(2, "little")
+def _read_rssi_complete(rssi_dbm: int = -47, *, status: int = 0) -> bytes:
+    payload = b"\x01" + (0x1405).to_bytes(2, "little") + bytes((status,)) + (0x42).to_bytes(2, "little")
     return _packet(0x0E, payload + rssi_dbm.to_bytes(1, "little", signed=True))
 
 
-def test_parser_treats_controller_rssi_sentinel_as_unavailable() -> None:
+def test_parser_preserves_controller_rssi_sentinel_context() -> None:
     event = parse_hci_packet(_read_rssi_complete(127))
 
     assert event is not None
-    assert event.rssi_dbm is None  # type: ignore[union-attr]
+    assert (event.handle, event.status, event.rssi_dbm) == (0x42, 0, None)  # type: ignore[union-attr]
+
+
+def test_parser_decodes_signed_controller_rssi_and_preserves_failed_status() -> None:
+    success = parse_hci_packet(_read_rssi_complete(-47))
+    failure = parse_hci_packet(_read_rssi_complete(status=1))
+
+    assert success is not None and (success.handle, success.status, success.rssi_dbm) == (0x42, 0, -47)  # type: ignore[union-attr]
+    assert failure is not None and (failure.handle, failure.status, failure.rssi_dbm) == (None, 1, None)  # type: ignore[union-attr]
 
 
 def _connection_update(
@@ -229,8 +238,47 @@ def test_parser_ignores_truncated_connection_parameter_events(packet: bytes) -> 
     assert parse_hci_packet(packet) is None
 
 
+@pytest.mark.parametrize(
+    "packet",
+    [
+        _packet(0x3E, b"\x0c\x00\x42\x00\x01"),
+        _packet(0x3E, b"\x01" + bytes(17)),
+        _packet(0x3E, b"\x0a" + bytes(29)),
+        _packet(0x05, b"\x00\x42\x00"),
+        _packet(0x0E, b"\x01\x05\x14\x00"),
+    ],
+)
+def test_parser_ignores_truncated_phy_connection_disconnect_and_read_results(packet: bytes) -> None:
+    assert parse_hci_packet(packet) is None
+
+
+def test_parser_does_not_finish_session_from_truncated_disconnect_frame() -> None:
+    records: list[dict[str, object]] = []
+    observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)
+    observer.handle_packet(_connect())
+
+    # The event declares five parameter bytes but contains only four.
+    observer.handle_packet(b"\x04\x05\x05\x00\x42\x00\x13")
+
+    assert records == []
+
+
+@pytest.mark.parametrize("packet", [b"\x04\x05", b"\x04\x05\x00"])
+def test_parser_records_short_hci_frames_in_debug_log(packet: bytes, caplog: pytest.LogCaptureFixture) -> None:
+    debug_logger = logging.getLogger("tests.ble_link.malformed_packet")
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        assert parse_hci_packet(packet, logger=debug_logger) is None
+
+    assert any(
+        record.name == debug_logger.name and getattr(record, "debug_event", None) == "ble_link_malformed_packet"
+        for record in caplog.records
+    )
+
+
 def test_parser_ignores_acl_malformed_and_mismatched_packets() -> None:
     assert parse_hci_packet(b"\x02\x00\x00") is None
+    assert parse_hci_packet(b"\x02\x05\x04\x00\x42\x00\x13") is None
     assert parse_hci_packet(b"\x04\x3e\x10\x01") is None
     assert parse_hci_packet(_connect(address=b"\x10\x10\x10\x10\x10\x10")) is not None
 
@@ -265,6 +313,59 @@ class _FakeSocket:
         self.closed = True
 
 
+def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
+    class ModeAwareSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocking = False
+            self.receive_entered = threading.Event()
+            self.release_receive = threading.Event()
+
+        def setblocking(self, flag: bool) -> None:
+            self.blocking = flag
+
+        def recv(self, _size: int) -> bytes:
+            self.receive_entered.set()
+            if self.blocking:
+                self.release_receive.wait()
+                return b""
+            raise BlockingIOError
+
+    fake = ModeAwareSocket()
+    diagnostics: list[str] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_poll_seconds=0.001,
+        observer_join_timeout_seconds=0.03,
+    )
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+    )
+    observer._diagnostic = lambda event, **_fields: diagnostics.append(event)
+
+    async def scenario() -> None:
+        await observer.start()
+        reader = observer._reader
+        try:
+            assert reader is not None
+            assert await asyncio.to_thread(fake.receive_entered.wait, 1.0)
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+            assert not reader.is_alive()
+            assert "ble_link_observer_reader_timeout" not in diagnostics
+        finally:
+            with suppress(Exception):
+                await asyncio.wait_for(observer.close(), timeout=1.0)
+            fake.release_receive.set()
+            if reader is not None:
+                await asyncio.to_thread(reader.join, 1.0)
+                assert not reader.is_alive()
+
+    asyncio.run(scenario())
+
+
 def test_hci_filter_uses_exact_linux_filter_abi() -> None:
     value = hci_filter_bytes()
     assert len(value) == 16
@@ -295,8 +396,12 @@ def test_native_hci_bind_passes_exact_sockaddr_hci_layout(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(ble_link_observability.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
     _native_hci_bind(37, 31, 3, 7)
+    _native_hci_bind(37, 31, 0, 0)
 
-    assert calls == [(37, b"\x1f\x00\x03\x00\x07\x00", 6)]
+    assert calls == [
+        (37, b"\x1f\x00\x03\x00\x07\x00", 6),
+        (37, b"\x1f\x00\x00\x00\x00\x00", 6),
+    ]
 
 
 def test_native_hci_bind_preserves_errno(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -316,6 +421,19 @@ def test_native_hci_bind_preserves_errno(monkeypatch: pytest.MonkeyPatch) -> Non
         _native_hci_bind(37, 31, 3, 7)
 
     assert raised.value.errno == errno.EACCES
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="libc HCI bind errno behavior is Linux-specific")
+def test_native_hci_bind_preserves_real_libc_errno() -> None:
+    previous_errno = ctypes.get_errno()
+    try:
+        ctypes.set_errno(0)
+        with pytest.raises(OSError) as raised:
+            _native_hci_bind(-1, 31, 0, 0)
+    finally:
+        ctypes.set_errno(previous_errno)
+
+    assert raised.value.errno == errno.EBADF
 
 
 @pytest.mark.parametrize(

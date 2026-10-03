@@ -1,6 +1,25 @@
 from pathlib import Path
 
+import pytest
+import scripts.check_supply_chain_pins as supply_chain_pins
 from scripts.check_supply_chain_pins import _check_action_refs, _check_container_refs
+
+
+def test_workflows_require_full_commit_shas(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "valid.yml").write_text(
+        f"steps:\n  - uses: actions/checkout@{'a' * 40}\n",
+        encoding="utf-8",
+    )
+    (workflows / "invalid.yaml").write_text(
+        "steps:\n  - uses: actions/setup-python@v5.1.0\n",
+        encoding="utf-8",
+    )
+
+    assert _check_action_refs(tmp_path) == [
+        ".github/workflows/invalid.yaml uses actions/setup-python@v5.1.0; pin actions to a full 40-character SHA"
+    ]
 
 
 def test_remote_actions_require_full_commit_shas(tmp_path: Path) -> None:
@@ -11,9 +30,28 @@ def test_remote_actions_require_full_commit_shas(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    errors = _check_action_refs(tmp_path)
+    assert _check_action_refs(tmp_path) == [
+        ".github/workflows/ci.yml uses actions/checkout@v7.0.1; pin actions to a full 40-character SHA"
+    ]
 
-    assert errors == [".github/workflows/ci.yml uses actions/checkout@v7.0.1; pin actions to a full 40-character SHA"]
+
+def test_pinned_and_local_container_refs_pass(tmp_path: Path) -> None:
+    digest = "b" * 64
+    (tmp_path / "Dockerfile").write_text(
+        f"FROM python:3.14-slim@sha256:{digest}\n"
+        "FROM python:3.14-slim@sha256:" + "c" * 64 + " AS build\n"
+        "FROM app:local AS runtime\n"
+        "COPY --from=build /app /app\n"
+        "COPY --from=0 /bin/tool /bin/tool\n"
+        f"COPY --from=ghcr.io/example/tool@sha256:{'d' * 64} /tool /tool\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docker-compose.yml").write_text(
+        f"services:\n  app:\n    image: app:local\n  tool:\n    image: ghcr.io/example/tool@sha256:{'e' * 64}\n",
+        encoding="utf-8",
+    )
+
+    assert _check_container_refs(tmp_path) == []
 
 
 def test_digest_pinned_container_images_pass(tmp_path: Path) -> None:
@@ -26,6 +64,22 @@ def test_digest_pinned_container_images_pass(tmp_path: Path) -> None:
     assert _check_container_refs(tmp_path) == []
 
 
+def test_tagged_external_copy_and_compose_images_fail_with_sources(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text(
+        f"FROM python:3.14-slim@sha256:{'f' * 64}\nCOPY --from=busybox:1.36 /bin/tool /bin/tool\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  app:\n    image: redis:7.4\n",
+        encoding="utf-8",
+    )
+
+    assert _check_container_refs(tmp_path) == [
+        "Dockerfile uses busybox:1.36; pin container images to a sha256 digest",
+        "docker-compose.yml uses redis:7.4; pin container images to a sha256 digest",
+    ]
+
+
 def test_container_tags_and_missing_digests_fail(tmp_path: Path) -> None:
     (tmp_path / "Dockerfile").write_text(
         "FROM python:3.14-slim\n",
@@ -35,3 +89,28 @@ def test_container_tags_and_missing_digests_fail(tmp_path: Path) -> None:
     assert _check_container_refs(tmp_path) == [
         "Dockerfile uses python:3.14-slim; pin container images to a sha256 digest"
     ]
+
+
+@pytest.mark.parametrize(
+    ("action_errors", "container_errors"),
+    [([], []), (["workflow pin error"], []), ([], ["container pin error"])],
+)
+def test_main_reports_combined_check_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action_errors: list[str],
+    container_errors: list[str],
+) -> None:
+    monkeypatch.setattr(supply_chain_pins, "_check_action_refs", lambda _: action_errors)
+    monkeypatch.setattr(supply_chain_pins, "_check_container_refs", lambda _: container_errors)
+
+    errors = [*action_errors, *container_errors]
+    assert supply_chain_pins.main() == (1 if errors else 0)
+    captured = capsys.readouterr()
+    expected_stdout = (
+        "Supply-chain pin check failed:\n" + "".join(f"  {error}\n" for error in errors)
+        if errors
+        else "Supply-chain pin check passed\n"
+    )
+    assert captured.out == expected_stdout
+    assert captured.err == ""

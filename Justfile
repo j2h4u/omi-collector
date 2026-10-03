@@ -73,9 +73,59 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 unit:
     nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
 
-# Diagnose lifecycle test gaps; keep mutation results separate from CRAP coverage.
-mutation:
-    COVERAGE_CORE=ctrace nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --gremlins tests/test_ready_machine.py tests/test_quarantine_machine.py tests/test_session_machine.py tests/test_quarantine_maintenance.py
+# Audit all code against every test; resume an identified native campaign.
+mutation mode='resume':
+    #!/usr/bin/env bash
+    set -uo pipefail
+    mkdir -p .gremlins_cache || exit 1
+    exec 9>.gremlins_cache/full-audit.lock || exit 1
+    if ! flock --nonblock 9; then
+        printf 'Another full mutation audit is running.\n' >&2
+        exit 1
+    fi
+    unset COVERAGE_FILE COVERAGE_PROCESS_START COVERAGE_RCFILE PYTHONHOME PYTHONOPTIMIZE PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD PYTEST_PLUGINS PYTEST_TIMEOUT
+    export PYTEST_ADDOPTS='' COVERAGE_CORE=ctrace UV_LINK_MODE=hardlink LC_ALL=C.UTF-8 TZ=UTC
+    declare -a cache_flags=() prepare_flags=()
+    case "{{mode}}" in
+        resume) ;;
+        fresh)
+            cache_flags=(--gremlin-clear-cache)
+            prepare_flags=(--fresh)
+            ;;
+        *)
+            printf 'mutation mode must be resume or fresh.\n' >&2
+            exit 2
+            ;;
+    esac
+    run_id="$(uv run python scripts/mutation_campaign.py prepare --launcher-pid "$$" "${prepare_flags[@]}")" || exit 1
+    log_file=".gremlins_cache/mutation-${run_id}.log"
+    nice -n 19 ionice -c 3 timeout --verbose --signal=TERM --kill-after=5s 24h uv run pytest --gremlins "${cache_flags[@]}" tests |& tee "$log_file"
+    statuses=("${PIPESTATUS[@]}")
+    status="${statuses[0]}"
+    if (( ${statuses[1]:-1} != 0 )); then
+        printf 'Could not retain the mutation log.\n' >&2
+        if (( status == 0 )); then status=1; fi
+    fi
+    uv run python scripts/mutation_campaign.py finish --status "$status" || exit 1
+    exit "$status"
+
+# Launch the full audit in a dedicated, controllable user scope.
+mutation-start:
+    uv run python scripts/mutation_scope.py start
+
+# Clear prior evidence and launch a fresh audit in its dedicated user scope.
+mutation-fresh-start:
+    uv run python scripts/mutation_scope.py fresh-start
+
+# Freeze, resume, or inspect the sole managed mutation scope.
+mutation-pause:
+    uv run python scripts/mutation_scope.py pause
+
+mutation-resume:
+    uv run python scripts/mutation_scope.py resume
+
+mutation-status:
+    uv run python scripts/mutation_scope.py status
 
 # Test coverage report.
 coverage:

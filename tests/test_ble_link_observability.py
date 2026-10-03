@@ -175,6 +175,51 @@ def test_observer_records_phy_snapshot_separately_from_failed_update() -> None:
     assert record["disconnect_class"] == "remote_requested"
 
 
+def test_observer_keeps_current_phy_beyond_bounded_histories() -> None:
+    records: list[dict[str, object]] = []
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_max_phy_transitions=2,
+        observer_max_phy_update_outcomes=2,
+    )
+    observer = BleLinkObserver("01:02:03:04:05:06", config=config, terminal_callback=records.append)
+    observer.handle_packet(_connect())
+    observer.handle_packet(_read_phy_complete(1, 1))
+    observer.handle_packet(_phy(1, 1))
+    observer.handle_packet(_phy(2, 1))
+    observer.handle_packet(_phy(2, 2))
+    observer.handle_packet(_phy(3, 3))
+    observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+
+    record = records[0]
+    assert (record["tx_phy"], record["rx_phy"]) == ("coded", "coded")
+    assert record["phy_transitions"] == (
+        {"tx_phy": "2M", "rx_phy": "1M"},
+        {"tx_phy": "2M", "rx_phy": "2M"},
+    )
+    assert record["phy_update_outcomes"] == (
+        {"status_hex": "0x00", "status_name": "success", "effective_phy": {"tx_phy": "1M", "rx_phy": "1M"}},
+        {"status_hex": "0x00", "status_name": "success", "effective_phy": {"tx_phy": "2M", "rx_phy": "1M"}},
+    )
+
+
+def test_observer_uses_injected_clock_for_terminal_session_duration() -> None:
+    records: list[dict[str, object]] = []
+    times = iter((10.0, 10.0, 12.5))
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        clock=lambda: next(times),
+        terminal_callback=records.append,
+    )
+    observer.handle_packet(_connect())
+    disconnect = _packet(0x05, b"\x00\x42\x00\x13")
+    observer.handle_packet(disconnect)
+    observer.handle_packet(disconnect)
+
+    assert len(records) == 1
+    assert records[0]["duration_seconds"] == 2.5
+
+
 def test_observer_records_failed_read_phy_snapshot_without_invalid_values() -> None:
     records: list[dict[str, object]] = []
     observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)

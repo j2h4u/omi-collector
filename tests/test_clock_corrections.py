@@ -544,9 +544,7 @@ def test_finish_is_idempotent_only_for_identical_durable_completion(tmp_path: Pa
 
 
 @pytest.mark.parametrize(("boundary", "valid"), [(20, True), (19, False)])
-def test_unresolved_zero_width_resolved_boundary(
-    tmp_path: Path, boundary: int, valid: bool
-) -> None:
+def test_unresolved_zero_width_resolved_boundary(tmp_path: Path, boundary: int, valid: bool) -> None:
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
     correction = store.mark_unresolved(store.prepare(1100, 1000, 100.0, 20))
 

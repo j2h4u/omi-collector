@@ -344,7 +344,9 @@ def test_battery_observation_rejects_nonpositive_timeout_before_device_access(op
     session = FakeOperationalSession({BATTERY_UUID: b"\x32"})
 
     with pytest.raises(ValueError, match="timeout must be positive"):
-        asyncio.run(collect_battery_observation(session, _info(), _event_emitter([]), operation_timeout=operation_timeout))
+        asyncio.run(
+            collect_battery_observation(session, _info(), _event_emitter([]), operation_timeout=operation_timeout)
+        )
 
     assert session.reads == []
     assert session.writes == []

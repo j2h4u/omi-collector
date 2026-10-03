@@ -102,7 +102,7 @@ def test_raw_timestamp_and_hash_survive_reopen(tmp_path: Path, timestamp: int) -
     )
 
     reopened = ClockObservationStore(tmp_path / "device.json")
-    record, = reopened.records()
+    (record,) = reopened.records()
     assert record.raw_timestamp == timestamp
     assert record.raw_timestamp_hash == raw_hash
 

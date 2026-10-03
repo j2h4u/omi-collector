@@ -13,7 +13,14 @@ import pytest
 from omi_collector.capture.adapters.attempts import StagedAttempt
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.adapters.ready_closures import ReadyClosureError, append, load, remove
+from omi_collector.capture.adapters.ready_closures import (
+    ReadyClosure,
+    ReadyClosureError,
+    append,
+    coalesce,
+    load,
+    remove,
+)
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
@@ -119,6 +126,62 @@ def test_closures_reject_malformed_state(tmp_path: Path) -> None:
     path.write_text('{"closures":[{"next_sequence":20}],"version":1}', encoding="utf-8")
     with pytest.raises(ReadyClosureError, match="entry schema"):
         load(path)
+
+
+@pytest.mark.parametrize("next_sequence", [-1, True, 1.5, "1"])
+def test_append_rejects_invalid_frontier_without_changing_queue(tmp_path: Path, next_sequence: object) -> None:
+    path = tmp_path / "ready-closures.json"
+    original = append(path, 0, "absence")
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(ReadyClosureError, match="frontier is invalid"):
+        append(path, next_sequence, "restart_interrupted")  # type: ignore[arg-type]
+
+    assert path.read_bytes() == original_bytes
+    assert load(path) == (original,)
+
+
+@pytest.mark.parametrize("reason", ["", 1, None])
+def test_append_rejects_invalid_reason_without_changing_queue(tmp_path: Path, reason: object) -> None:
+    path = tmp_path / "ready-closures.json"
+    original = append(path, 0, "absence")
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(ReadyClosureError, match="reason is invalid"):
+        append(path, 1, reason)  # type: ignore[arg-type]
+
+    assert path.read_bytes() == original_bytes
+    assert load(path) == (original,)
+
+
+def test_coalesce_keeps_latest_legacy_closure_and_handles_missing_or_singleton(tmp_path: Path) -> None:
+    path = tmp_path / "ready-closures.json"
+    legacy = {
+        "version": 1,
+        "closures": [
+            {"next_sequence": 10, "reason": "absence"},
+            {"next_sequence": 20, "reason": "restart_interrupted"},
+        ],
+    }
+    path.write_text(dumps(legacy), encoding="utf-8")
+    newest = ReadyClosure(20, "restart_interrupted")
+
+    assert coalesce(path) == (newest,)
+    assert load(path) == (newest,)
+    assert loads(path.read_text(encoding="utf-8"))["closures"] == [
+        {"next_sequence": 20, "reason": "restart_interrupted"}
+    ]
+
+    missing = tmp_path / "missing.json"
+    assert coalesce(missing) == ()
+    assert not missing.exists()
+
+    singleton = tmp_path / "singleton.json"
+    only = append(singleton, 30, "absence")
+    singleton_bytes = singleton.read_bytes()
+    assert coalesce(singleton) == (only,)
+    assert load(singleton) == (only,)
+    assert singleton.read_bytes() == singleton_bytes
 
 
 def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_path: Path) -> None:

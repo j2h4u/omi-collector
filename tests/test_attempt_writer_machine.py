@@ -180,3 +180,38 @@ def test_start_rejects_with_failed_category_when_state_retains_failure(state: At
 )
 def test_start_after_close_before_admission_keeps_closed_category(state: AttemptWriterMachineState) -> None:
     assert transition(state, StartRequested()).directive == Reject(RejectionKind.CLOSED)
+
+
+def test_close_after_command_failure_disables_drain_and_reuses_close() -> None:
+    state = transition(Constructed(), StartRequested()).state
+    state = transition(state, PrepareSucceeded()).state
+    state = transition(state, ReadBeginSucceeded()).state
+    state = transition(state, CommandFailed(ERROR)).state
+
+    close = transition(state, CloseRequested())
+    assert close == type(close)(Closing(ERROR, False, True), Admit())
+    assert transition(close.state, CloseRequested()) == type(close)(close.state, ReuseClose())
+
+    healthy = transition(Reading(), CloseRequested())
+    assert healthy == type(healthy)(Closing(None, True, True), Admit())
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        PrepareSucceeded(),
+        LegSucceeded(),
+        ReadBeginSucceeded(),
+        CheckpointSucceeded(),
+        FinalizeSucceeded(),
+    ),
+)
+@pytest.mark.parametrize("state", (Failed(ERROR), Closed(ERROR, True)))
+def test_late_success_is_ignored_while_new_checkpoint_is_rejected(
+    state: AttemptWriterMachineState, event: AttemptWriterMachineEvent
+) -> None:
+    result = transition(state, event)
+
+    assert result == type(result)(state, Ignore())
+    rejection = RejectionKind.FAILED if isinstance(state, Failed) else RejectionKind.CLOSED
+    assert transition(state, CheckpointRequested()).directive == Reject(rejection)

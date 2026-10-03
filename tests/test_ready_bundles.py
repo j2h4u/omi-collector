@@ -712,6 +712,26 @@ def test_matching_open_tail_identity_blocks_ack_even_with_extra_fields(tmp_path:
     assert ledger.read_bytes() == before
 
 
+def test_nonmatching_open_tail_identity_allows_ack_with_extra_fields(tmp_path: Path) -> None:
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(tmp_path / "draft", (100,), start_sequence=100)
+    published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
+    checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
+    data = cast(dict[str, object], loads(checkpoint.read_text(encoding="utf-8")))
+    data["open_speech_tail"] = {
+        "entries": [{"bundle_id": "f" * 64, "records_sha256": "e" * 64, "annotation": "unrelated"}],
+        "opened_at": 1,
+        "outputs": [],
+    }
+    checkpoint.write_text(dumps(data), encoding="utf-8")
+
+    retired = ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert [item.bundle_id for item in retired] == [published.bundle_id]
+    assert not published.path.exists()
+
+
 def test_ack_identity_retires_exact_bundle_without_reading_decision_contents(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
     ledger = tmp_path / "collector" / "ready-publications.json"

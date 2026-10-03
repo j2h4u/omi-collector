@@ -903,16 +903,15 @@ def test_unlatchable_failure_result_completes_pending_future_and_preserves_worke
             ) -> attempt_writer_machine.TransitionResult:
                 return attempt_writer_machine.TransitionResult(state, attempt_writer_machine.Ignore())
 
-            original_transition = attempt_writer.transition
-            monkeypatch.setattr(attempt_writer, "transition", discard_failure)
-            with writer._lock:
-                pending = writer._new_future_locked()
-                writer._commands.append(attempt_writer._Pending(attempt_writer.PrepareCommand(), pending))
-            assert writer._record_failure(error) is error
-            assert writer.failure is error
-            with pytest.raises(WriterFailedError, match="target failed"):
-                await pending
-            monkeypatch.setattr(attempt_writer, "transition", original_transition)
+            with monkeypatch.context() as patch:
+                patch.setattr(attempt_writer, "transition", discard_failure)
+                with writer._lock:
+                    pending = writer._new_future_locked()
+                    writer._commands.append(attempt_writer._Pending(attempt_writer.PrepareCommand(), pending))
+                assert writer._record_failure(error) is error
+                assert writer.failure is error
+                with pytest.raises(WriterFailedError, match="target failed"):
+                    await pending
             with pytest.raises(WriterFailedError, match="target failed"):
                 await writer.close()
             assert not writer.thread.is_alive()

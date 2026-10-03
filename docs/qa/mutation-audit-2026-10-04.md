@@ -21,6 +21,8 @@ receipts, source map, and runtime-control evidence. The original native cache
 and report are preserved in the bundle. This record does not claim a clean
 full-project mutation audit.
 
-Final repository gates are recorded after running against the integrated
-committed tree. The Docker build already passed on unchanged production
-sources; it is not repeated for this test-only integration.
+On integrated commit `e05e9967a2d74a0aefd3925d893bb9734c0daa8e`, `just check`
+passed, `just unit` passed with 1,519 tests and 2 skips, and `just crap-check`
+passed for 1,483 functions at threshold 30. The Docker build passed earlier on
+unchanged production sources; it was not repeated for this test-only
+integration.

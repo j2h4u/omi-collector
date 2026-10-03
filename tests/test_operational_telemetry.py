@@ -34,6 +34,7 @@ from omi_collector.capture.application.operational_telemetry import (
     ClockCorrectionSink,
     OperationalEmitter,
     TelemetryClock,
+    collect_battery_observation,
     collect_operational_telemetry,
 )
 from omi_collector.capture.application.opportunistic_sync import run_opportunistic_collector
@@ -288,6 +289,121 @@ def test_system_clock_check_uses_supported_timedatectl_show_arguments(monkeypatc
             {"capture_output": True, "check": False, "text": True, "timeout": 1.0},
         )
     ]
+
+
+@pytest.mark.parametrize(("payload", "expected"), [(b"\x00", 0), (b"\x64", 100)])
+def test_battery_observation_reports_exact_percent_without_clock_access(payload: bytes, expected: int) -> None:
+    session = FakeOperationalSession({BATTERY_UUID: payload, TIME_READ_UUID: pack("<I", 1000)})
+    events: list[dict[str, object]] = []
+
+    asyncio.run(collect_battery_observation(session, _info(), _event_emitter(events), operation_timeout=0.1))
+
+    assert len(events) == 1
+    assert events[0]["battery_percent"] == expected
+    assert events[0]["optional_outcomes"] == {"battery": "ok"}
+    assert session.reads == [BATTERY_UUID]
+    assert session.writes == []
+
+
+@pytest.mark.parametrize("payload", [b"\x65", b"", b"\x01\x02"])
+def test_battery_observation_classifies_invalid_payload_without_value(payload: bytes) -> None:
+    session = FakeOperationalSession({BATTERY_UUID: payload})
+    events: list[dict[str, object]] = []
+
+    asyncio.run(collect_battery_observation(session, _info(), _event_emitter(events), operation_timeout=0.1))
+
+    assert len(events) == 1
+    assert events[0]["optional_outcomes"] == {"battery": "malformed"}
+    assert "battery_percent" not in events[0]
+
+
+def test_battery_observation_classifies_missing_unsupported_and_failed_reads() -> None:
+    class NoOptionalReader:
+        pass
+
+    class FailingReader(FakeOperationalSession):
+        async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+            self.reads.append(uuid)
+            raise OSError("private transport detail")
+
+    for session, expected in (
+        (FakeOperationalSession({BATTERY_UUID: None}), "missing"),
+        (NoOptionalReader(), "unsupported"),
+        (FailingReader({}), "read_failed"),
+    ):
+        events: list[dict[str, object]] = []
+        asyncio.run(collect_battery_observation(session, _info(), _event_emitter(events), operation_timeout=0.1))
+        assert len(events) == 1
+        assert events[0]["optional_outcomes"] == {"battery": expected}
+        assert "battery_percent" not in events[0]
+        assert "private transport detail" not in str(events)
+
+
+@pytest.mark.parametrize("operation_timeout", [0, -0.1])
+def test_battery_observation_rejects_nonpositive_timeout_before_device_access(operation_timeout: float) -> None:
+    session = FakeOperationalSession({BATTERY_UUID: b"\x32"})
+
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        asyncio.run(collect_battery_observation(session, _info(), _event_emitter([]), operation_timeout=operation_timeout))
+
+    assert session.reads == []
+    assert session.writes == []
+
+
+def test_battery_observation_accepts_small_positive_timeout() -> None:
+    session = FakeOperationalSession({BATTERY_UUID: b"\x32"})
+    events: list[dict[str, object]] = []
+
+    asyncio.run(collect_battery_observation(session, _info(), _event_emitter(events), operation_timeout=0.001))
+
+    assert events[0]["battery_percent"] == 50
+    assert events[0]["optional_outcomes"] == {"battery": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (SimpleNamespace(returncode=1, stdout="yes\n"), False),
+        (SimpleNamespace(returncode=0, stdout="no\n"), False),
+        (SimpleNamespace(returncode=0, stdout="  YeS \n"), True),
+    ],
+)
+def test_system_clock_trust_requires_success_and_normalizes_stdout(
+    monkeypatch: pytest.MonkeyPatch, result: SimpleNamespace, expected: bool
+) -> None:
+    monkeypatch.setattr(operational_telemetry.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    assert operational_telemetry.system_host_clock_synchronized() is expected
+
+
+def test_system_clock_trust_fails_closed_on_os_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        raise OSError("private process detail")
+
+    monkeypatch.setattr(operational_telemetry.subprocess, "run", fail_run)
+
+    assert operational_telemetry.system_host_clock_synchronized() is False
+
+
+def test_empty_firmware_is_malformed_and_nonempty_firmware_is_preserved() -> None:
+    for firmware, expected_value, expected_outcome in ((b"", None, "malformed"), (b" 1.2 ", " 1.2 ", "ok")):
+        events: list[dict[str, object]] = []
+        session = FakeOperationalSession({FIRMWARE_UUID: firmware})
+        asyncio.run(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                _info(),
+                _event_emitter(events),
+                clock=TelemetryClock(now=lambda: 1000.0, synchronized=lambda: False),
+            )
+        )
+        observation = _observation_event(events)
+        outcomes = observation["optional_outcomes"]
+        assert isinstance(outcomes, dict)
+        assert outcomes["firmware"] == expected_outcome
+        if expected_value is not None:
+            assert observation["firmware"] == expected_value
 
 
 def test_timedatectl_timeout_is_reported_as_host_probe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -115,19 +115,63 @@ def test_multiple_pending_partials_are_quarantined_without_losing_raw_records(tm
 def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: Path) -> None:
     store = _store(tmp_path)
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
-    calls = 0
-    original = store.sweep_terminal_retired
+    calls: list[str] = []
+    methods = (
+        "recover_and_publish",
+        "sweep_terminal_retired",
+        "sweep_terminal_quarantine",
+        "quarantined_attempts",
+    )
+    originals = {name: cast(Callable[..., object], getattr(store, name)) for name in methods}
+    for name, original in originals.items():
+        def spy(*args: object, _name: str = name, _original: object = original, **kwargs: object) -> object:
+            calls.append(_name)
+            return _original(*args, **kwargs)  # type: ignore[operator]
 
-    def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
-        nonlocal calls
-        calls += 1
-        return original(should_defer=should_defer)
+        setattr(store, name, spy)
 
-    store.sweep_terminal_retired = sweep  # type: ignore[method-assign]
     _run(maintenance.run_once(lambda: True))
-    assert calls == 0
+    assert calls == []
     _run(maintenance.run_once(lambda: False))
-    assert calls == 1
+    assert calls == list(methods)
+
+
+def test_maintenance_runs_again_at_exact_configured_monotonic_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    config = CollectorConfig(retry=RetryConfig(maintenance_interval_seconds=10.0))
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
+    now = 100.0
+    monkeypatch.setattr(
+        "omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now
+    )
+    calls: list[str] = []
+    methods = (
+        "recover_and_publish",
+        "sweep_terminal_retired",
+        "sweep_terminal_quarantine",
+        "quarantined_attempts",
+    )
+    for name in methods:
+        original = cast(Callable[..., object], getattr(store, name))
+
+        def spy(*args: object, _name: str = name, _original: object = original, **kwargs: object) -> object:
+            calls.append(_name)
+            return _original(*args, **kwargs)  # type: ignore[operator]
+
+        setattr(store, name, spy)
+
+    _run(maintenance.run_once(lambda: False))
+    assert calls == list(methods)
+    _run(maintenance.run_once(lambda: False))
+    assert calls == list(methods)
+    now = 109.999
+    _run(maintenance.run_once(lambda: False))
+    assert calls == list(methods)
+    now = 110.0
+    _run(maintenance.run_once(lambda: False))
+    assert calls == list(methods) * 2
 
 
 def test_writer_lock_defers_terminal_sweeps_without_reporting_failures(
@@ -397,6 +441,53 @@ def test_pending_startup_uses_authenticated_aligned_tail_when_promotion_lock_is_
     assert (attempt.path / "records.bin").read_bytes() == raw_before == first + second
     assert (attempt.path / "checkpoint.json").read_bytes() == checkpoint_before
     assert loads(checkpoint_before.decode("utf-8"))["record_count"] == 1
+
+
+@pytest.mark.parametrize("promotion_busy", [False, True])
+def test_complete_pending_startup_keeps_authenticated_tail_at_packet_count_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, promotion_busy: bool
+) -> None:
+    store = _store(tmp_path)
+    expected = _seed_streaming_partial(store, count=2)
+    attempt_id = next((tmp_path / "attempts").iterdir()).name
+    attempt_path = tmp_path / "attempts" / attempt_id
+    checkpoint_before = (attempt_path / "checkpoint.json").read_bytes()
+    raw_before = (attempt_path / "records.bin").read_bytes()
+    original_lock = store.device_lock
+
+    if promotion_busy:
+        def busy_only_during_pending_promotion(
+            *, recover_capture_temporaries: bool = True, operation: str = "unknown"
+        ) -> object:
+            if operation == "resume_pending_attempt":
+                raise DeviceAlreadyRunningError("another writer owns the promotion lease")
+            return original_lock(
+                recover_capture_temporaries=recover_capture_temporaries, operation=operation
+            )
+
+        monkeypatch.setattr(store, "device_lock", busy_only_during_pending_promotion)
+
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    try:
+        state = cast(PendingStartupState, _run(maintenance.prepare_pending_startup()))
+        assert state.pending is not None
+        assert state.pending.attempt_id == attempt_id
+        assert state.durable_next == state.pending.start_sequence + state.pending.packet_count
+        assert raw_before == expected
+        assert (attempt_path / "records.bin").read_bytes() == raw_before
+        if promotion_busy:
+            assert (attempt_path / "checkpoint.json").read_bytes() == checkpoint_before
+        else:
+            assert loads((attempt_path / "checkpoint.json").read_text(encoding="utf-8"))["record_count"] == 2
+        assert not (tmp_path / "quarantine").exists()
+
+        monkeypatch.setattr(store, "device_lock", original_lock)
+        with store.device_lock(operation="resume_pending_attempt") as lease:
+            resumed = store.resume_streaming_attempt(lease)
+            assert resumed is not None
+            resumed.close()
+    finally:
+        _run(maintenance.close())
 
 
 def test_pending_startup_requests_prefix_closure_without_mutating_visit(tmp_path: Path) -> None:

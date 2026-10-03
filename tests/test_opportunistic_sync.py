@@ -49,7 +49,15 @@ from omi_collector.capture.application.collector import (
     TransferInterruptedError,
     TransferTimeouts,
 )
-from omi_collector.capture.application.operational_telemetry import BATTERY_UUID, TIME_READ_UUID
+from omi_collector.capture.application.operational_telemetry import (
+    BATTERY_UUID,
+    TIME_READ_UUID,
+    OperationalEmitter,
+    TelemetryClock,
+)
+from omi_collector.capture.application.operational_telemetry import (
+    collect_operational_telemetry as _collect_operational_telemetry,
+)
 from omi_collector.capture.application.opportunistic_sync import CollectionPreservedCancelledError
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
@@ -2476,21 +2484,60 @@ async def test_default_preflight_skips_cached_status_without_telemetry(tmp_path:
 
 
 @_async_test
-async def test_presence_preflight_budget_covers_status_and_optional_reads(tmp_path: Path) -> None:
+async def test_presence_preflight_budget_covers_status_and_optional_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = CollectorConfig(retry=RetryConfig(presence_preflight_budget_seconds=0.05))
     order: list[str] = []
+    cancellation: list[str] = []
+    telemetry_awaitables: list[Awaitable[object]] = []
+    telemetry_timeouts: list[float] = []
+    timed_out_telemetry: list[Awaitable[object]] = []
+
+    def telemetry_factory(
+        session_arg: RingSession,
+        status: RingStatus | None,
+        info: RingInfo,
+        emit: OperationalEmitter | None,
+        *,
+        clock: TelemetryClock | None = None,
+    ) -> Awaitable[None]:
+        awaitable = _collect_operational_telemetry(session_arg, status, info, emit, clock=clock)
+        telemetry_awaitables.append(awaitable)
+        return awaitable
+
+    real_bounded = session_lifecycle.bounded
+
+    async def bounded_spy(awaitable: Awaitable[T], timeout: float) -> T:
+        if telemetry_awaitables and awaitable is telemetry_awaitables[0]:
+            telemetry_timeouts.append(timeout)
+            try:
+                return await real_bounded(awaitable, timeout)
+            except session_lifecycle.collector.CollectorTimeoutError:
+                timed_out_telemetry.append(awaitable)
+                raise
+        return await real_bounded(awaitable, timeout)
+
+    monkeypatch.setattr(session_lifecycle, "collect_operational_telemetry", telemetry_factory)
+    monkeypatch.setattr(session_lifecycle, "bounded", bounded_spy)
 
     class SlowPreflightSession(ScriptedRingSession):
         async def read_status(self) -> RingStatus:
             order.append("status")
-            await asyncio.sleep(config.retry.presence_preflight_budget_seconds * 0.75)
-            return self._status
+            try:
+                await asyncio.sleep(config.retry.presence_preflight_budget_seconds * 0.75)
+                return self._status
+            finally:
+                cancellation.append("status")
 
         async def read_optional_characteristic(self, uuid: str) -> bytes | None:
             del uuid
             order.append("optional")
-            await asyncio.Future()
-            return None
+            try:
+                await asyncio.Future()
+                return None
+            finally:
+                cancellation.append("optional")
 
         async def write_control(self, payload: bytes) -> None:
             if payload == b"\x10":
@@ -2502,7 +2549,6 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(tmp_pa
     def emit(_event: Mapping[str, object]) -> None:
         return None
 
-    started_at = time.monotonic()
     result = await asyncio.wait_for(
         run_opportunistic_collector(
             Provider([session]),
@@ -2517,12 +2563,16 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(tmp_pa
         ),
         timeout=0.5,
     )
-    elapsed = time.monotonic() - started_at
 
     assert isinstance(result, NoDataResult)
     assert order[:3] == ["info", "optional", "status"]
     assert "optional" in order
-    assert elapsed < 0.2
+    assert len(telemetry_awaitables) == len(telemetry_timeouts) == 1
+    assert telemetry_timeouts[0] > 0
+    assert telemetry_timeouts[0] <= config.retry.presence_preflight_budget_seconds
+    assert timed_out_telemetry == telemetry_awaitables
+    assert cancellation.count("status") == 1
+    assert cancellation.count("optional") >= 1
 
 
 @_async_test

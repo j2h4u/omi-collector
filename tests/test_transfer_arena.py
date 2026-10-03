@@ -9,6 +9,7 @@ from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.capture.domain.transfer_arena import (
     ArenaCapacityError,
     ArenaDataMismatchError,
+    ArenaLegError,
     ArenaOverrunError,
     ArenaPublicationError,
     ArenaSequenceError,
@@ -138,6 +139,74 @@ def test_submitted_prefix_is_read_only_and_cannot_move_backward() -> None:
         submitted[0] = 0
     with pytest.raises(ArenaPublicationError):
         arena.submit_prefix(3)
+
+
+def test_submission_accepts_only_received_prefix_and_repeats_idempotently() -> None:
+    arena = TransferArena(20, 3, max_bytes=3 * RECORD_SIZE)
+    empty = arena.submit_prefix(0)
+    assert empty.readonly
+    assert bytes(empty) == b""
+    assert (arena.received_bytes, arena.submitted_bytes) == (0, 0)
+
+    payload = _records(2, marker=31)
+    arena.append(payload[: RECORD_SIZE + 13])
+    submitted = arena.submit_prefix(1)
+    assert bytes(submitted) == payload[:RECORD_SIZE]
+    assert bytes(arena.submit_prefix(1)) == bytes(submitted)
+    assert arena.submitted_bytes == RECORD_SIZE
+
+    source_before = bytes(arena.readonly_source())
+    watermarks_before = (arena.received_bytes, arena.submitted_bytes)
+    with pytest.raises(ArenaPublicationError):
+        arena.submit_prefix(2)
+    with pytest.raises(ArenaPublicationError):
+        arena.submit_prefix(-1)
+    assert (arena.received_bytes, arena.submitted_bytes) == watermarks_before
+    assert bytes(arena.readonly_source()) == source_before
+
+
+def test_reconnect_leg_overrun_uses_remaining_leg_capacity() -> None:
+    first = _records(1, marker=41)
+    second = _records(1, marker=42)
+    arena = TransferArena(100, 4, max_bytes=4 * RECORD_SIZE)
+    arena.append(first)
+    arena.begin_leg(101, 1)
+    partial = 100
+    arena.append(second[:partial])
+
+    source = arena.readonly_source()
+    source_before = bytes(source)
+    watermarks_before = (
+        arena.leg_received_bytes,
+        arena.received_bytes,
+        arena.submitted_bytes,
+    )
+    # The byte beyond this leg still fits within the larger snapshot.
+    with pytest.raises(ArenaOverrunError):
+        arena.append(second[partial:] + b"x")
+    assert (
+        arena.leg_received_bytes,
+        arena.received_bytes,
+        arena.submitted_bytes,
+    ) == watermarks_before
+    assert bytes(source) == source_before
+
+    arena.append(second[partial:])
+    assert arena.leg_received_bytes == RECORD_SIZE
+    assert arena.received_bytes == 2 * RECORD_SIZE
+    assert bytes(source[: 2 * RECORD_SIZE]) == first + second
+
+
+def test_begin_leg_rejects_zero_records_and_accepts_one_record() -> None:
+    arena = TransferArena(100, 2, max_bytes=2 * RECORD_SIZE)
+    with pytest.raises(ArenaLegError):
+        arena.begin_leg(100, 0)
+    assert (arena.leg_received_bytes, arena.received_bytes) == (0, 0)
+
+    arena.begin_leg(100, 1)
+    arena.append(_records(1, marker=51))
+    assert arena.leg_received_bytes == RECORD_SIZE
+    assert arena.received_bytes == RECORD_SIZE
 
 
 def test_full_synthetic_burst_uses_one_backing_buffer() -> None:

@@ -87,6 +87,15 @@ errors or timeouts cannot certify a clean audit. Status 137 is fail-stopped and
 is never retried automatically. There is no mutation score gate, and mutation
 testing remains separate from `just verify`.
 
+For a controllable audit, run `just mutation-start` or
+`just mutation-fresh-start` in a persistent terminal such as tmux. Inspect it
+with `just mutation-status`, then use `just mutation-pause` and
+`just mutation-resume` from another shell to freeze and thaw its dedicated user
+scope. The scope runs at SCHED_IDLE CPU policy, ionice idle class, and nice 19.
+Freezing does not pause GNU timeout's wall-clock budget, so the 24-hour deadline
+continues to elapse while paused. Keep the canonical `just mutation` recipe for
+foreground use.
+
 ## Capture safety
 
 Keep physical-download policy in the pure `visit_machine`: it alone authorizes

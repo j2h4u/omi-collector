@@ -109,6 +109,24 @@ mutation mode='resume':
     uv run python scripts/mutation_campaign.py finish --status "$status" || exit 1
     exit "$status"
 
+# Launch the full audit in a dedicated, controllable user scope.
+mutation-start:
+    uv run python scripts/mutation_scope.py start
+
+# Clear prior evidence and launch a fresh audit in its dedicated user scope.
+mutation-fresh-start:
+    uv run python scripts/mutation_scope.py fresh-start
+
+# Freeze, resume, or inspect the sole managed mutation scope.
+mutation-pause:
+    uv run python scripts/mutation_scope.py pause
+
+mutation-resume:
+    uv run python scripts/mutation_scope.py resume
+
+mutation-status:
+    uv run python scripts/mutation_scope.py status
+
 # Test coverage report.
 coverage:
     nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --cov=src/omi_collector --cov-report=term-missing

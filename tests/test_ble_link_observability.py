@@ -205,13 +205,14 @@ def test_observer_keeps_current_phy_beyond_bounded_histories() -> None:
 
 def test_observer_uses_injected_clock_for_terminal_session_duration() -> None:
     records: list[dict[str, object]] = []
-    times = iter((10.0, 10.0, 12.5))
+    now = [10.0]
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
-        clock=lambda: next(times),
+        clock=lambda: now[0],
         terminal_callback=records.append,
     )
     observer.handle_packet(_connect())
+    now[0] = 12.5
     disconnect = _packet(0x05, b"\x00\x42\x00\x13")
     observer.handle_packet(disconnect)
     observer.handle_packet(disconnect)

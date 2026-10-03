@@ -92,9 +92,10 @@ For a controllable audit, run `just mutation-start` or
 with `just mutation-status`, then use `just mutation-pause` and
 `just mutation-resume` from another shell to freeze and thaw its dedicated user
 scope. The scope runs at SCHED_IDLE CPU policy, ionice idle class, and nice 19.
-Freezing does not pause GNU timeout's wall-clock budget, so the 24-hour deadline
-continues to elapse while paused. Keep the canonical `just mutation` recipe for
-foreground use.
+Freezing pauses processes, not their monotonic deadlines: GNU's 24-hour audit
+budget and the runner's 120-second test and 150-second mutant budgets continue
+to elapse. An in-flight test or mutant can time out immediately after resume.
+Keep the canonical `just mutation` recipe for foreground use.
 
 ## Capture safety
 

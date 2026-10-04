@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import replace
-from functools import wraps
+from functools import partial, wraps
 from hashlib import sha256
 from json import loads
 from pathlib import Path
@@ -62,7 +62,12 @@ from omi_collector.capture.application.opportunistic_sync import CollectionPrese
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
 )
-from omi_collector.capture.application.ports import BatchWriterPort, StagingPort, StorageLeaseContext
+from omi_collector.capture.application.ports import (
+    BatchWriterPort,
+    CaptureRuntimePort,
+    StagingPort,
+    StorageLeaseContext,
+)
 from omi_collector.capture.application.presence import (
     PresenceCallback,
     PresencePolicy,
@@ -118,6 +123,18 @@ async def run_opportunistic_collector(
 ) -> CollectionResult | NoDataResult:
     """Test helper that injects the concrete runtime at every call site."""
     return await _run_opportunistic_collector(provider, staging, options, runtime=_runtime())
+
+
+async def _finalize_with_short_transfer_timeout(
+    finalize: Callable[
+        [batch_reconciliation._Batch, OpportunisticOptions, CaptureRuntimePort],
+        Awaitable[tuple[BaseException | None, BaseException | None]],
+    ],
+    batch: batch_reconciliation._Batch,
+    options: OpportunisticOptions,
+    runtime: CaptureRuntimePort,
+) -> tuple[BaseException | None, BaseException | None]:
+    return await finalize(batch, replace(options, timeouts=TransferTimeouts(0.03, 0.03)), runtime)
 
 
 def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
@@ -550,27 +567,28 @@ async def test_progress_pump_coalesces_slow_callbacks_and_ignores_callback_failu
             await release.wait()
         active -= 1
 
-    pump = asyncio.create_task(batch_reconciliation._pump_progress(mailbox, slow_callback, 60.0))
-    mailbox.publish(event(1))
-    await entered.wait()
-    mailbox.publish(event(2))
-    mailbox.publish(event(3), terminal=True)
-    release.set()
-    await pump
+    async with asyncio.TaskGroup() as tasks:
+        pump = tasks.create_task(batch_reconciliation._pump_progress(mailbox, slow_callback, 60.0))
+        mailbox.publish(event(1))
+        await entered.wait()
+        mailbox.publish(event(2))
+        mailbox.publish(event(3), terminal=True)
+        release.set()
+        await pump
 
-    assert completed == [1, 3]
-    assert max_active == 1
-    mailbox.publish(event(3), terminal=True)
-    assert completed == [1, 3]
+        assert completed == [1, 3]
+        assert max_active == 1
+        mailbox.publish(event(3), terminal=True)
+        assert completed == [1, 3]
 
-    failing = ProgressMailbox()
+        failing = ProgressMailbox()
 
-    def broken_callback(_event: ProgressEvent) -> None:
-        raise OSError("progress sink unavailable")
+        def broken_callback(_event: ProgressEvent) -> None:
+            raise OSError("progress sink unavailable")
 
-    failure_pump = asyncio.create_task(batch_reconciliation._pump_progress(failing, broken_callback, 1.0))
-    failing.publish(event(3), terminal=True)
-    await failure_pump
+        failure_pump = tasks.create_task(batch_reconciliation._pump_progress(failing, broken_callback, 1.0))
+        failing.publish(event(3), terminal=True)
+        await failure_pump
 
 
 @_async_test
@@ -598,12 +616,13 @@ async def test_progress_pump_coalesces_arbitrary_revisions_before_cadence_releas
     def callback(progress: ProgressEvent) -> None:
         delivered.append(progress.records_completed)
 
-    pump = asyncio.create_task(batch_reconciliation._pump_progress(mailbox, callback, 0.2))
-    await asyncio.sleep(0)
-    assert delivered == [1]
+    async with asyncio.TaskGroup() as tasks:
+        pump = tasks.create_task(batch_reconciliation._pump_progress(mailbox, callback, 0.2))
+        await asyncio.sleep(0)
+        assert delivered == [1]
 
-    mailbox.release_terminal.set()
-    await pump
+        mailbox.release_terminal.set()
+        await pump
     assert delivered == [1, 3]
 
 
@@ -2050,19 +2069,25 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
         clock=clock,
         sleep=clock.sleep,
     )
-    with pytest.raises(StopAfterCooldownError):
-        await run_opportunistic_collector(
-            lambda _candidate: Context(),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
-            OpportunisticOptions(
-                TransferTimeouts(1, 1),
-                RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
-                activity=report_activity,
-                clock=clock,
-                sleep=clock.sleep,
-                presence=presence,
-            ),
-        )
+    watchdog = asyncio.timeout(5.0)
+    try:
+        with pytest.raises(StopAfterCooldownError):
+            async with watchdog:
+                await run_opportunistic_collector(
+                    lambda _candidate: Context(),
+                    StagingStore(tmp_path, _capture_root(tmp_path)),
+                    OpportunisticOptions(
+                        TransferTimeouts(1, 1),
+                        RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
+                        activity=report_activity,
+                        clock=clock,
+                        sleep=clock.sleep,
+                        presence=presence,
+                    ),
+                )
+        assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     cooldowns = [event for event in activity if event.state == "cooldown_started"]
     assert len(cooldowns) == 1
@@ -2194,15 +2219,20 @@ async def test_presence_coordinator_forwards_exact_wake_candidate(tmp_path: Path
             rapid_backoff=(1,),
         ),
     )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
-            presence=presence,
-        ),
-    )
+    try:
+        async with asyncio.timeout(5.0) as watchdog:
+            result = await run_opportunistic_collector(
+                provider,
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                OpportunisticOptions(
+                    TransferTimeouts(1, 1),
+                    RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
+                    presence=presence,
+                ),
+            )
+            assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     assert isinstance(result, NoDataResult)
     assert seen == [candidate]
@@ -2249,15 +2279,20 @@ async def test_stale_candidate_restarts_scan_for_next_stable_candidate(tmp_path:
             rapid_backoff=(1,),
         ),
     )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
-            presence=presence,
-        ),
-    )
+    try:
+        async with asyncio.timeout(5.0) as watchdog:
+            result = await run_opportunistic_collector(
+                provider,
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                OpportunisticOptions(
+                    TransferTimeouts(1, 1),
+                    RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
+                    presence=presence,
+                ),
+            )
+            assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     assert isinstance(result, NoDataResult)
     assert seen == [candidate_a, candidate_b]
@@ -2320,17 +2355,27 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
         clock=clock,
         sleep=clock.sleep,
     )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(0.0005,), batch_records=1, drain_cooldown_seconds=30, stop_after_drained=True),
-            clock=clock,
-            sleep=clock.sleep,
-            presence=presence,
-        ),
-    )
+    try:
+        async with asyncio.timeout(5.0) as watchdog:
+            result = await run_opportunistic_collector(
+                provider,
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                OpportunisticOptions(
+                    TransferTimeouts(1, 1),
+                    RetryPolicy(
+                        backoff=(0.0005,),
+                        batch_records=1,
+                        drain_cooldown_seconds=30,
+                        stop_after_drained=True,
+                    ),
+                    clock=clock,
+                    sleep=clock.sleep,
+                    presence=presence,
+                ),
+            )
+            assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     assert isinstance(result, (NoDataResult, CollectionResult))
     assert opened == 2
@@ -3764,6 +3809,11 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
     monkeypatch.setattr("omi_collector.capture.adapters.staging_writer.StagingWriter.close", observed_target_close)
     monkeypatch.setattr("omi_collector.capture.adapters.attempt_writer.AttemptWriter.close", observed_writer_close)
     monkeypatch.setattr("omi_collector.capture.adapters.attempt_writer.AttemptWriter.publish", observed_publish)
+    monkeypatch.setattr(
+        batch_reconciliation,
+        "_finalize_batch",
+        partial(_finalize_with_short_transfer_timeout, batch_reconciliation._finalize_batch),
+    )
 
     entered = asyncio.Event()
 
@@ -3780,29 +3830,35 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
             WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)))),
         ),
     )
-    task = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([session]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
-            replace(_options(batch_records=1, activity=activity), timeouts=TransferTimeouts(0.03, 0.03)),
+    async with asyncio.TaskGroup() as tasks:
+        task = tasks.create_task(
+            run_opportunistic_collector(
+                Provider([session]),
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                _options(batch_records=1, activity=activity),
+            )
         )
-    )
-    await entered.wait()
-    assert await asyncio.to_thread(data_submitted.wait, 1)
-    assert await asyncio.to_thread(read_begin_completed.wait, 1)
-    task.cancel()
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert await asyncio.to_thread(data_submitted.wait, 5)
+            assert await asyncio.to_thread(read_begin_completed.wait, 5)
+            task.cancel()
 
-    try:
-        assert await asyncio.to_thread(checkpoint_started.wait, 1)
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert close_attempted.is_set()
-        assert not target_closed.is_set()
-        errors = {event.state: event for event in activity}
-        assert errors["writer_checkpoint_error"].error_type == "CollectorTimeoutError"
-        assert errors["writer_close_error"].error_type == "CollectorTimeoutError"
-    finally:
-        release_checkpoint.set()
+            assert await asyncio.to_thread(checkpoint_started.wait, 5)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert close_attempted.is_set()
+            assert not target_closed.is_set()
+            errors = {event.state: event for event in activity}
+            assert errors["writer_checkpoint_error"].error_type == "CollectorTimeoutError"
+            assert errors["writer_close_error"].error_type == "CollectorTimeoutError"
+        finally:
+            task.cancel()
+            release_checkpoint.set()
+            await asyncio.gather(task, return_exceptions=True)
+            for writer in closed_writers:
+                await asyncio.to_thread(writer.thread.join, 5)
 
     assert await asyncio.to_thread(target_closed.wait, 1)
     assert len(closed_writers) == 1

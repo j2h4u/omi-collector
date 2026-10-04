@@ -22,6 +22,8 @@ from omi_collector.capture.application.presence_machine import (
 )
 from omi_collector.config import PresenceConfig
 
+_READINESS_TIMEOUT_SECONDS = 5.0
+
 
 def _run(coro: object) -> object:
     return asyncio.run(coro)  # type: ignore[arg-type]
@@ -65,9 +67,37 @@ async def _emit_stable(
         await asyncio.sleep(0)
 
 
-async def _wait_started(observer: FakeObserver, starts: int = 1) -> None:
-    while len(observer.callbacks) < starts:
-        await asyncio.sleep(0)
+async def _cancel_waiter_and_close[T](
+    scheduler: PresenceScheduler,
+    waiter: asyncio.Task[T],
+    closing: asyncio.Task[None] | None = None,
+) -> None:
+    if not waiter.done():
+        waiter.cancel()
+    if closing is not None and not closing.done():
+        closing.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+    if closing is not None:
+        await asyncio.gather(closing, return_exceptions=True)
+    await scheduler.close()
+
+
+async def _wait_started(
+    observer: FakeObserver,
+    scheduler: PresenceScheduler,
+    waiter: asyncio.Task[object],
+    starts: int = 1,
+) -> None:
+    try:
+        async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+            while len(observer.callbacks) < starts:
+                await asyncio.sleep(0)
+    except TimeoutError:
+        await _cancel_waiter_and_close(scheduler, waiter)
+        raise
+    except asyncio.CancelledError:
+        await _cancel_waiter_and_close(scheduler, waiter)
+        raise
 
 
 def test_bleak_observer_requests_duplicate_data_and_filters_exact_address() -> None:
@@ -218,12 +248,14 @@ def test_callback_during_scanner_start_is_buffered_and_redeemed_after_stop() -> 
 
         observer = StartCallback()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
-        wake = await scheduler.wait_for_attempt()
+        try:
+            wake = await asyncio.wait_for(scheduler.wait_for_attempt(), timeout=_READINESS_TIMEOUT_SECONDS)
 
-        assert wake.reason == "advertisement"
-        assert wake.candidate is candidate
-        assert observer.events == ["start", "stop"]
-        await scheduler.close()
+            assert wake.reason == "advertisement"
+            assert wake.candidate is candidate
+            assert observer.events == ["start", "stop"]
+        finally:
+            await scheduler.close()
 
     _run(scenario())
 
@@ -243,7 +275,7 @@ def test_scheduler_releases_only_after_stable_visibility() -> None:
             clock=lambda: now[0],
         )
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         candidate = object()
         for at in (0.0, 2.0, 4.0):
             now[0] = at
@@ -268,7 +300,7 @@ def test_old_scanner_generation_cannot_release_a_later_attempt() -> None:
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy(scan_recheck_seconds=60, drain_cooldown_seconds=60))
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         await _emit_stable(observer)
         await first
         stale_callback = observer.callbacks[0]
@@ -297,7 +329,7 @@ def test_stop_completes_before_permit_is_returned() -> None:
         observer = DelayedStop()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         await _emit_stable(observer)
         await asyncio.sleep(0)
         assert not waiter.done()
@@ -322,7 +354,7 @@ def test_close_during_redeem_does_not_return_a_stopped_permit() -> None:
         observer = BlockingStop()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         await _emit_stable(observer)
         await entered_stop.wait()
         closing = asyncio.create_task(scheduler.close())
@@ -346,7 +378,7 @@ def test_stop_failure_closes_machine_without_releasing_permit() -> None:
         observer = BrokenStop()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         await _emit_stable(observer)
         with pytest.raises(PresenceScanStopError):
             await waiter
@@ -361,7 +393,7 @@ def test_only_one_waiter_is_accepted() -> None:
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         with pytest.raises(RuntimeError, match="one presence waiter"):
             await scheduler.wait_for_attempt()
         await _emit_stable(observer)
@@ -376,7 +408,7 @@ def test_outstanding_permit_rejects_second_wait_without_scanner_effects() -> Non
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         await _emit_stable(observer)
         await first
         effects = tuple(observer.events)
@@ -470,7 +502,7 @@ def test_failed_start_is_replaced_by_a_new_scanner_that_can_wake() -> None:
             policy=_test_policy(scan_recheck_seconds=0.001, drain_cooldown_seconds=5),
         )
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         await _emit_stable(observer)
 
         assert (await waiter).reason == "advertisement"
@@ -498,13 +530,13 @@ def test_drained_quiet_recovery_wakes_after_a_soft_scanner_start_failure() -> No
             policy=_test_policy(absence_seconds=0.001, scan_recheck_seconds=0.001, drain_cooldown_seconds=0.001),
         )
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         await _emit_stable(observer)
         await asyncio.wait_for(first, timeout=1.0)
         await scheduler.attempt_finished(CleanDrain())
         await asyncio.sleep(0.005)
         second = asyncio.create_task(scheduler.wait_for_attempt())
-        await asyncio.wait_for(_wait_started(observer, starts=2), timeout=1.0)
+        await asyncio.wait_for(_wait_started(observer, scheduler, second, starts=2), timeout=1.0)
         await asyncio.sleep(0.005)
         await _emit_stable(observer)
 
@@ -536,14 +568,16 @@ def test_active_scanner_releases_after_stable_visibility() -> None:
             sleep=sleep,
         )
 
-        wake = await scheduler.wait_for_attempt()
+        try:
+            wake = await asyncio.wait_for(scheduler.wait_for_attempt(), timeout=_READINESS_TIMEOUT_SECONDS)
 
-        assert wake.reason == "advertisement"
-        assert wake.candidate is candidate
-        assert observer.events == ["start", "stop"]
-        with pytest.raises(RuntimeError, match="permit is already outstanding"):
-            await scheduler.wait_for_attempt()
-        await scheduler.close()
+            assert wake.reason == "advertisement"
+            assert wake.candidate is candidate
+            assert observer.events == ["start", "stop"]
+            with pytest.raises(RuntimeError, match="permit is already outstanding"):
+                await scheduler.wait_for_attempt()
+        finally:
+            await scheduler.close()
 
     _run(scenario())
 
@@ -553,13 +587,13 @@ def test_wait_cancellation_stops_scan_and_leaves_waiting_state_reusable() -> Non
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy(scan_recheck_seconds=60, drain_cooldown_seconds=60))
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
         assert not observer.active
         retry = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer, starts=2)
+        await _wait_started(observer, scheduler, retry, starts=2)
         await _emit_stable(observer)
         assert (await retry).reason == "advertisement"
         await scheduler.close()
@@ -579,7 +613,7 @@ def test_cancellation_while_redeeming_a_permit_fails_closed() -> None:
         observer = HangingStop()
         scheduler = PresenceScheduler(observer, policy=_test_policy(scan_transition_seconds=1.0))
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         await _emit_stable(observer)
         await entered_stop.wait()
         waiter.cancel()
@@ -607,13 +641,16 @@ def test_uncertain_start_cancellation_closes_before_propagating_failure() -> Non
 
         scheduler = PresenceScheduler(ResistantStart(), policy=PresencePolicy(scan_transition_seconds=0.01))
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await started.wait()
-        waiter.cancel()
-        with pytest.raises(PresenceScanTransitionError, match="uncertain"):
-            await waiter
-        with pytest.raises(RuntimeError, match="closed"):
-            await scheduler.wait_for_attempt()
-        release.set()
+        try:
+            await asyncio.wait_for(started.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            waiter.cancel()
+            with pytest.raises(PresenceScanTransitionError, match="uncertain"):
+                await waiter
+            with pytest.raises(RuntimeError, match="closed"):
+                await scheduler.wait_for_attempt()
+        finally:
+            release.set()
+            await _cancel_waiter_and_close(scheduler, waiter)
 
     _run(scenario())
 
@@ -623,7 +660,7 @@ def test_close_is_idempotent_and_wakes_a_waiter() -> None:
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
 
         await scheduler.close()
         await scheduler.close()
@@ -652,17 +689,22 @@ def test_close_racing_with_start_stops_the_completed_scanner() -> None:
         observer = BlockingStart()
         scheduler = PresenceScheduler(observer)
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await entered_start.wait()
-        closing = asyncio.create_task(scheduler.close())
-        await asyncio.sleep(0)
-        assert not closing.done()
-        release_start.set()
-        await closing
+        closing: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(entered_start.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            closing = asyncio.create_task(scheduler.close())
+            await asyncio.sleep(0)
+            assert not closing.done()
+            release_start.set()
+            await closing
 
-        with pytest.raises(RuntimeError, match="closed"):
-            await waiter
-        assert not observer.active
-        assert observer.events == ["start", "stop"]
+            with pytest.raises(RuntimeError, match="closed"):
+                await waiter
+            assert not observer.active
+            assert observer.events == ["start", "stop"]
+        finally:
+            release_start.set()
+            await _cancel_waiter_and_close(scheduler, waiter, closing)
 
     _run(scenario())
 
@@ -672,7 +714,7 @@ def test_typed_outcome_restarts_observation_and_no_candidate_invalidation_api_re
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy(scan_recheck_seconds=60, drain_cooldown_seconds=60))
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         await _emit_stable(observer)
         await first
         await scheduler.attempt_finished(ConnectedInterruption(durable_progress=False))
@@ -692,7 +734,7 @@ def test_absence_end_returns_without_a_gatt_permit() -> None:
             policy=_test_policy(absence_seconds=0.01, rapid_backoff=(0.001, 0.002)),
         )
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         await _emit_stable(observer)
         assert not isinstance(await first, PresenceEnd)
         assert await scheduler.attempt_finished(NotConnected(durable_progress=False)) is None
@@ -711,13 +753,13 @@ def test_recovery_exhaustion_returns_end_without_restarting_scanner() -> None:
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy(rapid_backoff=(0.01,)))
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         await _emit_stable(observer)
         assert not isinstance(await first, PresenceEnd)
 
         assert await scheduler.attempt_finished(NotConnected(durable_progress=False)) is None
         retry = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, retry)
         await asyncio.sleep(0.02)
         await _emit_stable(observer)
         assert not isinstance(await asyncio.wait_for(retry, 1.0), PresenceEnd)
@@ -758,7 +800,7 @@ def test_startup_interrupted_visit_can_resume_from_a_fresh_advertisement() -> No
         )
         scheduler.resume_interrupted_visit()
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
         await _emit_stable(observer, candidate)
 
         wake = await waiter
@@ -778,7 +820,7 @@ def test_startup_resume_refreshes_an_existing_waiters_timer() -> None:
             policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
         )
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, waiter)
 
         scheduler.resume_interrupted_visit()
         ended = await asyncio.wait_for(waiter, timeout=1.0)
@@ -798,7 +840,7 @@ def test_startup_rearm_keeps_absence_after_an_early_unavailable_permit() -> None
             policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
         )
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer)
+        await _wait_started(observer, scheduler, first)
         await _emit_stable(observer)
         assert not isinstance(await first, PresenceEnd)
 

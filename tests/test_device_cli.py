@@ -6,7 +6,7 @@ import os
 import signal
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from shutil import rmtree
@@ -20,6 +20,7 @@ from typer.testing import CliRunner
 from fakes import ScriptedRingSession, WriteStep
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.publication import SealResult
+from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.collector import CollectionResult, ProgressEvent
@@ -89,6 +90,23 @@ def _layout(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+@pytest.fixture
+def _cleanup_cli_quality_metrics(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    created: list[JsonlQualityMetrics] = []
+    factory = cast(Callable[..., JsonlQualityMetrics | None], device_cli._quality_metrics)
+
+    def track_factory(*args: object, **kwargs: object) -> JsonlQualityMetrics | None:
+        metrics = factory(*args, **kwargs)
+        if metrics is not None:
+            created.append(metrics)
+        return metrics
+
+    monkeypatch.setattr(device_cli, "_quality_metrics", track_factory)
+    yield
+    for metrics in created:
+        assert metrics.close()
 
 
 class FakeSession:
@@ -340,7 +358,7 @@ def test_collect_rejects_values_above_conservative_bound(monkeypatch: pytest.Mon
 
 
 def test_sync_uses_one_guard_and_transport_and_forwards_end_to_end_progress(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _cleanup_cli_quality_metrics: None
 ) -> None:
     events: list[str] = []
     session = FakeSession(_status())
@@ -393,7 +411,7 @@ def test_sync_uses_one_guard_and_transport_and_forwards_end_to_end_progress(
 
 
 def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _cleanup_cli_quality_metrics: None
 ) -> None:
     events: list[str] = []
     session = FakeSession(_status())
@@ -450,7 +468,9 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
     assert captured == [timeout_seconds]
 
 
-def test_sync_force_1m_enters_and_restores_phy_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_sync_force_1m_enters_and_restores_phy_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _cleanup_cli_quality_metrics: None
+) -> None:
     events: list[str] = []
     session = FakeSession(_status())
     _install_fakes(monkeypatch, session, events)
@@ -553,7 +573,7 @@ def test_sync_reconnects_with_overlap_and_enters_one_outer_guard(
 
 
 def test_sync_uses_injected_presence_scheduler_without_reconstruction(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _cleanup_cli_quality_metrics: None
 ) -> None:
     class Observer:
         async def start(self, callback: Callable[[object], object]) -> None:
@@ -586,7 +606,9 @@ def test_sync_uses_injected_presence_scheduler_without_reconstruction(
     assert captured[0].policy.drain_cooldown_seconds == injected.policy.drain_cooldown_seconds
 
 
-def test_presence_and_retry_policies_share_one_config_instance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_presence_and_retry_policies_share_one_config_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _cleanup_cli_quality_metrics: None
+) -> None:
     config = CollectorConfig(
         presence=PresenceConfig(
             scan_recheck_seconds=301.0,

@@ -448,6 +448,49 @@ def test_presence_policy_accepts_effective_config_maxima_above_defaults() -> Non
     assert policy.drain_cooldown_seconds == config.drain_cooldown_seconds
 
 
+@pytest.mark.parametrize("absence_seconds", (0.0, -0.5))
+def test_presence_policy_rejects_nonpositive_absence_bounds(absence_seconds: float) -> None:
+    with pytest.raises(ValueError, match=r"^presence policy bounds must be positive$"):
+        PresencePolicy(absence_seconds=absence_seconds)
+
+
+def test_presence_policy_accepts_equal_scan_cancel_grace_bounds() -> None:
+    policy = PresencePolicy(
+        scan_cancel_grace_min_seconds=0.1,
+        scan_cancel_grace_max_seconds=0.1,
+    )
+
+    assert policy.scan_cancel_grace_min_seconds == 0.1
+    assert policy.scan_cancel_grace_max_seconds == 0.1
+
+
+@pytest.mark.parametrize("fraction", (0.0, 1.0))
+def test_presence_policy_accepts_scan_cancel_grace_fraction_boundaries(fraction: float) -> None:
+    policy = PresencePolicy(scan_cancel_grace_fraction=fraction)
+
+    assert policy.scan_cancel_grace_fraction == fraction
+
+
+@pytest.mark.parametrize("fraction", (-0.5, 1.5))
+def test_presence_policy_rejects_scan_cancel_grace_fraction_outside_bounds(fraction: float) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^scan cancellation fraction must be between zero and one$",
+    ):
+        PresencePolicy(scan_cancel_grace_fraction=fraction)
+
+
+@pytest.mark.parametrize("rapid_backoff", ((0.0,), (-0.5,)))
+def test_presence_policy_rejects_nonpositive_rapid_backoff(rapid_backoff: tuple[float, ...]) -> None:
+    with pytest.raises(ValueError, match=r"^rapid retry delays must be positive$"):
+        PresencePolicy(rapid_backoff=rapid_backoff)
+
+
+def test_presence_policy_rejects_empty_rapid_backoff() -> None:
+    with pytest.raises(ValueError, match=r"^rapid retry delays must be positive$"):
+        PresencePolicy(rapid_backoff=())
+
+
 def test_scheduler_keeps_derived_timing_when_policy_assignment_is_rejected() -> None:
     async def scenario() -> None:
         now = [0.0]

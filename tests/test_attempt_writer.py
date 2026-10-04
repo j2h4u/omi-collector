@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 import pytest
@@ -266,6 +268,11 @@ async def _started(
         await writer.start()
         await writer.read_begin("begin")
         yield writer
+
+
+def _thread_cpu_ticks(native_id: int) -> int:
+    fields = Path(f"/proc/self/task/{native_id}/stat").read_text(encoding="ascii").rsplit(") ", maxsplit=1)[1].split()
+    return int(fields[11]) + int(fields[12])
 
 
 def test_arena_is_shared_and_data_waits_for_read_begin() -> None:
@@ -629,6 +636,24 @@ async def _test_drain_integrity_idle_writer_continues_after_first_chunk() -> Non
             assert target.append_offsets[:2] == [0, RECORD_SIZE]
         finally:
             await writer.close(timeout=1)
+
+
+def test_idle_writer_consumes_negligible_thread_cpu() -> None:
+    asyncio.run(_test_idle_writer_consumes_negligible_thread_cpu())
+
+
+async def _test_idle_writer_consumes_negligible_thread_cpu() -> None:
+    async with _owned_writer(FakeTarget(), bytes(RECORD_SIZE)) as writer:
+        await writer.start()
+        await writer.read_begin("begin")
+        native_id = writer.thread.native_id
+        assert native_id is not None
+        ticks_per_second = os.sysconf("SC_CLK_TCK")
+        before = _thread_cpu_ticks(native_id)
+        await asyncio.sleep(1.0)
+        elapsed_cpu = (_thread_cpu_ticks(native_id) - before) / ticks_per_second
+
+        assert elapsed_cpu <= 0.05, f"idle writer consumed {elapsed_cpu:.3f}s CPU"
 
 
 def test_snapshot_records_durable_checkpoint_ack_without_target_inspection() -> None:

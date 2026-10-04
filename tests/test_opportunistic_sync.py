@@ -760,7 +760,7 @@ def _patch_observation_writer(
     close_calls: list[None],
     *,
     observe_error: bool = False,
-    close_error: bool = False,
+    close_error: bool | BaseException = False,
 ) -> None:
     class FakeObservationWriter:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -773,6 +773,8 @@ def _patch_observation_writer(
 
         def close(self) -> None:
             close_calls.append(None)
+            if isinstance(close_error, BaseException):
+                raise close_error
             if close_error:
                 raise RuntimeError("observation close unavailable")
 
@@ -999,6 +1001,39 @@ async def test_observation_writer_failures_do_not_block_collection(
     assert close_calls == [None]
     assert debug_records[0][0] == "firmware_observation_writer_error"
     assert debug_records[0][2]["operation"] == failure
+
+
+@pytest.mark.parametrize("failure_stage", ("collection", "finalization"))
+@_async_test
+async def test_observation_close_cancellation_does_not_mask_primary_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    close_calls: list[None] = []
+    primary = RuntimeError(f"primary {failure_stage} failure")
+    _patch_observation_writer(monkeypatch, [], close_calls, close_error=asyncio.CancelledError())
+
+    if failure_stage == "collection":
+
+        def provider(_candidate: object | None = None) -> AbstractAsyncContextManager[RingSession]:
+            raise primary
+
+        call = run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
+    else:
+        session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
+
+        async def fail_finalization(_reconciler: BatchReconciler) -> object:
+            raise primary
+
+        monkeypatch.setattr(BatchReconciler, "finalize_active", fail_finalization)
+        call = run_opportunistic_collector(
+            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        )
+
+    with pytest.raises(RuntimeError) as raised:
+        await call
+
+    assert raised.value is primary
+    assert close_calls == [None]
 
 
 @_async_test
@@ -1596,6 +1631,7 @@ async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_an
     assert isinstance(result, CollectionResult)
     assert session.writes == [b"\x10", b"\x10"]
     assert encode_advance_command(102) not in session.writes
+    assert result.advance_confirmed is False
     prefix_bundles = tuple(path for path in (_capture_root(tmp_path)).iterdir() if path.name.startswith("100-101-"))
     assert len(prefix_bundles) == 1
     assert not (prefix_bundles[0] / "gap.json").exists()
@@ -2975,6 +3011,8 @@ async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -
     assert isinstance(result, CollectionResult)
     assert result.packet_count == 2
     assert [metric["requested_record_count"] for metric in metrics] == [2, 1]
+    assert [metric["outcome"] for metric in metrics] == ["connected_interrupted", "drained"]
+    assert [metric["termination_class"] for metric in metrics] == ["retryable_error", "completed"]
     assert [metric["received_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
     assert [metric["submitted_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
     assert [metric["written_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]

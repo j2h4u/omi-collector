@@ -550,27 +550,28 @@ async def test_progress_pump_coalesces_slow_callbacks_and_ignores_callback_failu
             await release.wait()
         active -= 1
 
-    pump = asyncio.create_task(batch_reconciliation._pump_progress(mailbox, slow_callback, 60.0))
-    mailbox.publish(event(1))
-    await entered.wait()
-    mailbox.publish(event(2))
-    mailbox.publish(event(3), terminal=True)
-    release.set()
-    await pump
+    async with asyncio.TaskGroup() as tasks:
+        pump = tasks.create_task(batch_reconciliation._pump_progress(mailbox, slow_callback, 60.0))
+        mailbox.publish(event(1))
+        await entered.wait()
+        mailbox.publish(event(2))
+        mailbox.publish(event(3), terminal=True)
+        release.set()
+        await pump
 
-    assert completed == [1, 3]
-    assert max_active == 1
-    mailbox.publish(event(3), terminal=True)
-    assert completed == [1, 3]
+        assert completed == [1, 3]
+        assert max_active == 1
+        mailbox.publish(event(3), terminal=True)
+        assert completed == [1, 3]
 
-    failing = ProgressMailbox()
+        failing = ProgressMailbox()
 
-    def broken_callback(_event: ProgressEvent) -> None:
-        raise OSError("progress sink unavailable")
+        def broken_callback(_event: ProgressEvent) -> None:
+            raise OSError("progress sink unavailable")
 
-    failure_pump = asyncio.create_task(batch_reconciliation._pump_progress(failing, broken_callback, 1.0))
-    failing.publish(event(3), terminal=True)
-    await failure_pump
+        failure_pump = tasks.create_task(batch_reconciliation._pump_progress(failing, broken_callback, 1.0))
+        failing.publish(event(3), terminal=True)
+        await failure_pump
 
 
 @_async_test
@@ -598,12 +599,13 @@ async def test_progress_pump_coalesces_arbitrary_revisions_before_cadence_releas
     def callback(progress: ProgressEvent) -> None:
         delivered.append(progress.records_completed)
 
-    pump = asyncio.create_task(batch_reconciliation._pump_progress(mailbox, callback, 0.2))
-    await asyncio.sleep(0)
-    assert delivered == [1]
+    async with asyncio.TaskGroup() as tasks:
+        pump = tasks.create_task(batch_reconciliation._pump_progress(mailbox, callback, 0.2))
+        await asyncio.sleep(0)
+        assert delivered == [1]
 
-    mailbox.release_terminal.set()
-    await pump
+        mailbox.release_terminal.set()
+        await pump
     assert delivered == [1, 3]
 
 

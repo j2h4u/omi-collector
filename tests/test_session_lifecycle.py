@@ -852,16 +852,22 @@ def test_real_presence_setup_failure_closes_issued_permit(monkeypatch: pytest.Mo
 
     async def scenario() -> None:
         running = asyncio.create_task(lifecycle.run_with_presence())
-        while observer.callback is None:
-            await asyncio.sleep(0)
-        observer.advertise()
-        await asyncio.sleep(0.002)
-        observer.advertise()
-        with pytest.raises(RuntimeError, match="provider setup failed"):
-            await running
-        assert not observer.active
-        with pytest.raises(RuntimeError, match="closed"):
-            await presence.wait_for_attempt()
+        try:
+            async with asyncio.timeout(5.0):
+                while observer.callback is None:
+                    await asyncio.sleep(0)
+            observer.advertise()
+            await asyncio.sleep(0.002)
+            observer.advertise()
+            with pytest.raises(RuntimeError, match="provider setup failed"):
+                await running
+            assert not observer.active
+            with pytest.raises(RuntimeError, match="closed"):
+                await presence.wait_for_attempt()
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+            await presence.close()
 
     _run(scenario())
 

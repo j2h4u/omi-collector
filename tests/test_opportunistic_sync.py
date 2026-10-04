@@ -2052,19 +2052,24 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
         clock=clock,
         sleep=clock.sleep,
     )
-    with pytest.raises(StopAfterCooldownError):
-        await run_opportunistic_collector(
-            lambda _candidate: Context(),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
-            OpportunisticOptions(
-                TransferTimeouts(1, 1),
-                RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
-                activity=report_activity,
-                clock=clock,
-                sleep=clock.sleep,
-                presence=presence,
-            ),
-        )
+    try:
+        with pytest.raises(StopAfterCooldownError):
+            async with asyncio.timeout(5.0) as watchdog:
+                await run_opportunistic_collector(
+                    lambda _candidate: Context(),
+                    StagingStore(tmp_path, _capture_root(tmp_path)),
+                    OpportunisticOptions(
+                        TransferTimeouts(1, 1),
+                        RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
+                        activity=report_activity,
+                        clock=clock,
+                        sleep=clock.sleep,
+                        presence=presence,
+                    ),
+                )
+        assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     cooldowns = [event for event in activity if event.state == "cooldown_started"]
     assert len(cooldowns) == 1
@@ -2196,15 +2201,20 @@ async def test_presence_coordinator_forwards_exact_wake_candidate(tmp_path: Path
             rapid_backoff=(1,),
         ),
     )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
-            presence=presence,
-        ),
-    )
+    try:
+        async with asyncio.timeout(5.0) as watchdog:
+            result = await run_opportunistic_collector(
+                provider,
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                OpportunisticOptions(
+                    TransferTimeouts(1, 1),
+                    RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
+                    presence=presence,
+                ),
+            )
+            assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     assert isinstance(result, NoDataResult)
     assert seen == [candidate]
@@ -2251,15 +2261,20 @@ async def test_stale_candidate_restarts_scan_for_next_stable_candidate(tmp_path:
             rapid_backoff=(1,),
         ),
     )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
-            presence=presence,
-        ),
-    )
+    try:
+        async with asyncio.timeout(5.0) as watchdog:
+            result = await run_opportunistic_collector(
+                provider,
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                OpportunisticOptions(
+                    TransferTimeouts(1, 1),
+                    RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
+                    presence=presence,
+                ),
+            )
+            assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     assert isinstance(result, NoDataResult)
     assert seen == [candidate_a, candidate_b]
@@ -2322,17 +2337,27 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
         clock=clock,
         sleep=clock.sleep,
     )
-    result = await run_opportunistic_collector(
-        provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
-        OpportunisticOptions(
-            TransferTimeouts(1, 1),
-            RetryPolicy(backoff=(0.0005,), batch_records=1, drain_cooldown_seconds=30, stop_after_drained=True),
-            clock=clock,
-            sleep=clock.sleep,
-            presence=presence,
-        ),
-    )
+    try:
+        async with asyncio.timeout(5.0) as watchdog:
+            result = await run_opportunistic_collector(
+                provider,
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                OpportunisticOptions(
+                    TransferTimeouts(1, 1),
+                    RetryPolicy(
+                        backoff=(0.0005,),
+                        batch_records=1,
+                        drain_cooldown_seconds=30,
+                        stop_after_drained=True,
+                    ),
+                    clock=clock,
+                    sleep=clock.sleep,
+                    presence=presence,
+                ),
+            )
+            assert not watchdog.expired()
+    finally:
+        await presence.close()
 
     assert isinstance(result, (NoDataResult, CollectionResult))
     assert opened == 2

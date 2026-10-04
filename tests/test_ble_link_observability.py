@@ -3,14 +3,16 @@ import ctypes
 import errno
 import json
 import logging
+import multiprocessing
 import queue
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
 
@@ -75,8 +77,8 @@ def _read_phy_failure(status: int = 0x1A) -> bytes:
     return _packet(0x0E, payload)
 
 
-def _read_rssi_complete(rssi_dbm: int = -47, *, status: int = 0) -> bytes:
-    payload = b"\x01" + (0x1405).to_bytes(2, "little") + bytes((status,)) + (0x42).to_bytes(2, "little")
+def _read_rssi_complete(rssi_dbm: int = -47, *, status: int = 0, handle: int = 0x42) -> bytes:
+    payload = b"\x01" + (0x1405).to_bytes(2, "little") + bytes((status,)) + handle.to_bytes(2, "little")
     return _packet(0x0E, payload + rssi_dbm.to_bytes(1, "little", signed=True))
 
 
@@ -93,6 +95,31 @@ def test_parser_decodes_signed_controller_rssi_and_preserves_failed_status() -> 
 
     assert success is not None and (success.handle, success.status, success.rssi_dbm) == (0x42, 0, -47)  # type: ignore[union-attr]
     assert failure is not None and (failure.handle, failure.status, failure.rssi_dbm) == (None, 1, None)  # type: ignore[union-attr]
+
+
+def test_observer_logs_only_matching_handle_rssi_observations(caplog: pytest.LogCaptureFixture) -> None:
+    debug_logger = logging.getLogger("tests.ble_link.matched_rssi")
+    observer = BleLinkObserver("01:02:03:04:05:06", debug_logger=debug_logger)
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        observer.handle_packet(_connect())
+        observer.handle_packet(_read_rssi_complete(-47, handle=0x42))
+        observer.handle_packet(_read_rssi_complete(-60, handle=0x43))
+        observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+
+    asyncio.run(observer.close())
+    events = [
+        record
+        for record in caplog.records
+        if record.name == debug_logger.name and getattr(record, "debug_event", None) == "ble_link_rssi_observed"
+    ]
+    assert len(events) == 1
+    assert events[0].__dict__["debug_fields"] == {
+        "handle": 0x42,
+        "rssi_dbm": -47,
+        "status_hex": "0x00",
+        "status_name": "success",
+    }
 
 
 def _connection_update(
@@ -262,22 +289,25 @@ def test_observer_records_data_length_effective_transitions_with_bound() -> None
 
 
 @pytest.mark.parametrize(
-    ("reason", "expected"),
+    ("reason", "expected", "reason_name"),
     [
-        (0x13, "remote_requested"),
-        (0x14, "remote_requested"),
-        (0x15, "remote_requested"),
-        (0x16, "local_host"),
-        (0x08, "timeout"),
-        (0x22, "unknown"),
+        (0x13, "remote_requested", "remote_user_terminated"),
+        (0x14, "remote_requested", "remote_low_resources"),
+        (0x15, "remote_requested", "remote_power_off"),
+        (0x16, "local_host", "local_host_terminated"),
+        (0x08, "timeout", "supervision_timeout"),
+        (0x22, "unknown", "unknown"),
     ],
 )
-def test_observer_disconnect_classifies_only_hci_reason_evidence(reason: int, expected: str) -> None:
+def test_observer_disconnect_classifies_only_hci_reason_evidence(
+    reason: int, expected: str, reason_name: str
+) -> None:
     records: list[dict[str, object]] = []
     observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)
     observer.handle_packet(_connect())
     observer.handle_packet(_packet(0x05, b"\x00\x42\x00" + bytes((reason,))))
     assert records[0]["disconnect_class"] == expected
+    assert records[0]["disconnect_reason_name"] == reason_name
 
 
 @pytest.mark.parametrize("packet", [_packet(0x3E, b"\x03" + b"\x00" * 8), _packet(0x3E, b"\x06" + b"\x00" * 9)])
@@ -323,6 +353,28 @@ def test_parser_records_short_hci_frames_in_debug_log(packet: bytes, caplog: pyt
     )
 
 
+def test_parser_silences_empty_unrelated_event_and_reports_truncated_header(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    debug_logger = logging.getLogger("tests.ble_link.unrelated_empty_event")
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        assert parse_hci_packet(b"\x04\xff\x00", logger=debug_logger) is None
+
+    assert not [record for record in caplog.records if record.name == debug_logger.name]
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        assert parse_hci_packet(b"\x04\xff", logger=debug_logger) is None
+
+    malformed = [
+        record
+        for record in caplog.records
+        if record.name == debug_logger.name and getattr(record, "debug_event", None) == "ble_link_malformed_packet"
+    ]
+    assert len(malformed) == 1
+    assert malformed[0].__dict__["debug_fields"]["detail"] == "truncated_hci_event"
+
+
 def test_parser_ignores_acl_malformed_and_mismatched_packets() -> None:
     assert parse_hci_packet(b"\x02\x00\x00") is None
     assert parse_hci_packet(b"\x02\x05\x04\x00\x42\x00\x13") is None
@@ -358,6 +410,40 @@ class _FakeSocket:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _FailingSendSocket(_FakeSocket):
+    def send(self, payload: bytes) -> int:
+        self.sent.append(payload)
+        raise OSError("command send failed")
+
+
+class _QueueShutdownSocket(_FakeSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.packets: queue.Queue[bytes] = queue.Queue()
+        self.extra_packet_returned = threading.Event()
+        self.connect_commands_sent = threading.Event()
+        self.close_called = threading.Event()
+
+    def recv(self, _size: int) -> bytes:
+        try:
+            packet = self.packets.get(timeout=0.005)
+        except queue.Empty as error:
+            raise BlockingIOError from error
+        if packet == b"\x04\xff\x00":
+            self.extra_packet_returned.set()
+        return packet
+
+    def send(self, payload: bytes) -> int:
+        self.sent.append(payload)
+        if len(self.sent) == 2:
+            self.connect_commands_sent.set()
+        return len(payload)
+
+    def close(self) -> None:
+        super().close()
+        self.close_called.set()
 
 
 def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
@@ -649,6 +735,34 @@ def test_observer_tracks_bounded_connection_parameter_handshake() -> None:
     assert record["disconnect_reason_hex"] == "0x08"
 
 
+def test_observer_stops_update_history_at_exact_cap_but_tracks_latest_parameters() -> None:
+    records: list[dict[str, object]] = []
+    config = replace(DEFAULT_CONFIG.ble, observer_max_connection_parameter_updates=1)
+    observer = BleLinkObserver("01:02:03:04:05:06", config=config, terminal_callback=records.append)
+    observer.handle_packet(_connect(interval=36, latency=3, supervision_timeout=42))
+    observer.handle_packet(_connection_update(interval=12, latency=0, supervision_timeout=400))
+    observer.handle_packet(_connection_update(interval=10, latency=1, supervision_timeout=320))
+    observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+
+    record = records[0]
+    assert record["connection_parameter_updates"] == (
+        {
+            "status_hex": "0x00",
+            "status_name": "success",
+            "effective_parameters": {
+                "interval_ms": 15.0,
+                "latency": 0,
+                "supervision_timeout_ms": 4000.0,
+            },
+        },
+    )
+    assert record["final_connection_parameters"] == {
+        "interval_ms": 12.5,
+        "latency": 1,
+        "supervision_timeout_ms": 3200.0,
+    }
+
+
 def test_observer_records_rejected_update_without_effective_parameters() -> None:
     records: list[dict[str, object]] = []
     observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)
@@ -676,6 +790,117 @@ def test_observer_permission_error_is_failure_open() -> None:
     )
     asyncio.run(observer.start())
     asyncio.run(observer.close())
+
+
+def test_observer_warns_once_when_initial_phy_and_rssi_commands_fail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _FailingSendSocket()
+    debug_logger = logging.getLogger("tests.ble_link.initial_send_failure_debug")
+    warning_logger = logging.getLogger("tests.ble_link.initial_send_failure_warning")
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        debug_logger=debug_logger,
+        warning_logger=warning_logger,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        try:
+            observer.handle_packet(_connect())
+            assert observer.observer_status == "degraded"
+            observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+        finally:
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name), caplog.at_level(
+        logging.WARNING, logger=warning_logger.name
+    ):
+        asyncio.run(scenario())
+
+    assert len(fake.sent) == 2
+    assert observer.observer_status == "degraded"
+    warnings = [record for record in caplog.records if record.name == warning_logger.name]
+    assert [record.getMessage() for record in warnings] == ["BLE link observer unavailable"]
+    assert fake.closed
+
+
+def test_observer_does_not_rearm_failure_warning_while_degraded_across_sessions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _FailingSendSocket()
+    warning_logger = logging.getLogger("tests.ble_link.repeated_send_failure_warning")
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        warning_logger=warning_logger,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        try:
+            for _ in range(2):
+                observer.handle_packet(_connect())
+                assert observer.observer_status == "degraded"
+                observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+        finally:
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    with caplog.at_level(logging.WARNING, logger=warning_logger.name):
+        asyncio.run(scenario())
+
+    warnings = [record for record in caplog.records if record.name == warning_logger.name]
+    assert [record.getMessage() for record in warnings] == ["BLE link observer unavailable"]
+    assert len(fake.sent) == 4
+    assert fake.closed
+
+
+def test_observer_receive_failure_degrades_and_warns_without_stopping_collection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingReceiveSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receive_attempted = threading.Event()
+
+        def recv(self, _size: int) -> bytes:
+            self.receive_attempted.set()
+            raise OSError("receive failed")
+
+    fake = FailingReceiveSocket()
+    debug_logger = logging.getLogger("tests.ble_link.receive_failure_debug")
+    warning_logger = logging.getLogger("tests.ble_link.receive_failure_warning")
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        debug_logger=debug_logger,
+        warning_logger=warning_logger,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        try:
+            assert await asyncio.to_thread(fake.receive_attempted.wait, 1.0)
+            for _ in range(100):
+                if observer.observer_status == "degraded" and "receive failed" in caplog.text:
+                    break
+                await asyncio.sleep(0.005)
+            assert observer.observer_status == "degraded"
+        finally:
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name), caplog.at_level(
+        logging.WARNING, logger=warning_logger.name
+    ):
+        asyncio.run(scenario())
+
+    warnings = [record for record in caplog.records if record.name == warning_logger.name]
+    assert [record.getMessage() for record in warnings] == ["BLE link observer unavailable"]
+    assert fake.closed
 
 
 def test_observer_start_failure_keeps_traceback_in_debug_ring_and_warning_separate(
@@ -894,6 +1119,108 @@ def test_reader_delivers_hci_timeline_to_terminal_callback() -> None:
     assert fake.closed
 
 
+def test_reader_failure_does_not_end_active_physical_session() -> None:
+    class ConnectThenFailSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failure_raised = threading.Event()
+            self.connection_commands_sent = threading.Event()
+            self._first_receive = True
+
+        def recv(self, _size: int) -> bytes:
+            if self._first_receive:
+                self._first_receive = False
+                return _connect()
+            self.failure_raised.set()
+            raise OSError("reader failed after connection")
+
+        def send(self, payload: bytes) -> int:
+            self.sent.append(payload)
+            if len(self.sent) == 2:
+                self.connection_commands_sent.set()
+            return len(payload)
+
+    fake = ConnectThenFailSocket()
+    records: list[dict[str, object]] = []
+    debug_logger = logging.getLogger("tests.ble_link.active_receive_failure")
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        terminal_callback=records.append,
+        debug_logger=debug_logger,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        try:
+            assert await asyncio.to_thread(fake.failure_raised.wait, 1.0)
+            assert await asyncio.to_thread(fake.connection_commands_sent.wait, 1.0)
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                assert records == []
+            assert observer.observer_status == "degraded"
+        finally:
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    asyncio.run(scenario())
+    assert len(records) == 1
+    assert records[0]["disconnect_reason_hex"] is None
+    assert records[0]["observer_status"] == "degraded"
+    assert fake.closed
+
+
+def test_rssi_worker_polls_at_thirty_seconds_and_not_before_each_deadline() -> None:
+    class PollingSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rssi_requests = 0
+            self.second_rssi_request = threading.Event()
+            self.third_rssi_request = threading.Event()
+
+        def send(self, payload: bytes) -> int:
+            self.sent.append(payload)
+            if payload[1:3] == b"\x05\x14":
+                self.rssi_requests += 1
+                if self.rssi_requests == 2:
+                    self.second_rssi_request.set()
+                elif self.rssi_requests == 3:
+                    self.third_rssi_request.set()
+            return len(payload)
+
+    fake = PollingSocket()
+    clock_value = [0.0]
+    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.002)
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        clock=lambda: clock_value[0],
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        try:
+            observer.handle_packet(_connect())
+            assert fake.rssi_requests == 1
+            clock_value[0] = 29.999
+            await asyncio.sleep(0.03)
+            assert fake.rssi_requests == 1
+            clock_value[0] = 30.0
+            assert await asyncio.to_thread(fake.second_rssi_request.wait, 1.0)
+            assert fake.rssi_requests == 2
+            clock_value[0] = 59.999
+            await asyncio.sleep(0.03)
+            assert fake.rssi_requests == 2
+            assert not fake.third_rssi_request.is_set()
+        finally:
+            await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    asyncio.run(scenario())
+    assert fake.closed
+
+
 def test_observer_shutdown_deadline_does_not_block_loop_on_full_queue_and_stalled_callback() -> None:
     fake = _FakeSocket()
     callback_entered = threading.Event()
@@ -1009,6 +1336,223 @@ def test_observer_shutdown_finalizer_is_bounded_off_loop_without_processor() -> 
     assert not watchdog.is_alive()
     assert not finalizer.is_alive()
     assert len(records) == 1
+
+
+class _ProcessSignal(Protocol):
+    def set(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> bool: ...
+
+
+def _assert_child_module_path(expected_module_path: str) -> None:
+    assert Path(ble_link_observability.__file__).resolve() == Path(expected_module_path)
+
+
+def _blocked_reader_child(
+    entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str
+) -> None:
+    _assert_child_module_path(expected_module_path)
+    blocked = threading.Event()
+
+    class BlockedSocket(_FakeSocket):
+        def recv(self, _size: int) -> bytes:
+            entered.set()
+            blocked.wait()
+            return b""
+
+        def close(self) -> None:
+            self.closed = True
+
+    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001, observer_join_timeout_seconds=0.02)
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: BlockedSocket(),  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        if not entered.wait(1.0):
+            raise RuntimeError("reader did not enter blocked receive")
+        await observer.close()
+        close_returned.set()
+
+    asyncio.run(scenario())
+
+
+def _blocked_parser_child(
+    entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str
+) -> None:
+    _assert_child_module_path(expected_module_path)
+    packets: queue.Queue[bytes] = queue.Queue()
+    blocked = threading.Event()
+
+    class PacketSocket(_FakeSocket):
+        def recv(self, _size: int) -> bytes:
+            try:
+                return packets.get(timeout=0.005)
+            except queue.Empty as error:
+                raise BlockingIOError from error
+
+        def close(self) -> None:
+            self.closed = True
+
+    def terminal_callback(_record: dict[str, object]) -> None:
+        entered.set()
+        blocked.wait()
+
+    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001, observer_join_timeout_seconds=0.02)
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: PacketSocket(),  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=terminal_callback,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        packets.put(_connect())
+        packets.put(_packet(0x05, b"\x00\x42\x00\x13"))
+        if not entered.wait(1.0):
+            raise RuntimeError("parser callback did not enter blocked state")
+        await observer.close()
+        close_returned.set()
+
+    asyncio.run(scenario())
+
+
+def _blocked_finalizer_child(
+    entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str
+) -> None:
+    _assert_child_module_path(expected_module_path)
+    blocked = threading.Event()
+
+    def terminal_callback(_record: dict[str, object]) -> None:
+        entered.set()
+        blocked.wait()
+
+    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001, observer_join_timeout_seconds=0.02)
+    observer = BleLinkObserver("01:02:03:04:05:06", config=config, terminal_callback=terminal_callback)
+    observer.handle_packet(_connect())
+
+    async def scenario() -> None:
+        await observer.close()
+        close_returned.set()
+
+    asyncio.run(scenario())
+
+
+def _assert_blocked_worker_does_not_hold_process_open(
+    target: Callable[[_ProcessSignal, _ProcessSignal, str], None],
+) -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("public observer process-exit check requires fork")
+    context = multiprocessing.get_context("fork")
+    entered = context.Event()
+    close_returned = context.Event()
+    module_path = str(Path(ble_link_observability.__file__).resolve())
+    process = context.Process(target=target, args=(entered, close_returned, module_path))
+    started = False
+    try:
+        process.start()
+        started = True
+        assert entered.wait(1.0), "worker did not enter its blocked public callback"
+        assert close_returned.wait(1.0), "public close did not return within its bound"
+        process.join(timeout=1.0)
+        assert process.exitcode == 0, "blocked daemon worker kept the child process alive"
+    finally:
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=1.0)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        if started:
+            process.close()
+
+
+def test_blocked_reader_does_not_hold_child_process_open() -> None:
+    _assert_blocked_worker_does_not_hold_process_open(_blocked_reader_child)
+
+
+def test_blocked_parser_callback_does_not_hold_child_process_open() -> None:
+    _assert_blocked_worker_does_not_hold_process_open(_blocked_parser_child)
+
+
+def test_blocked_shutdown_finalizer_does_not_hold_child_process_open() -> None:
+    _assert_blocked_worker_does_not_hold_process_open(_blocked_finalizer_child)
+
+
+def test_close_drains_a_full_public_packet_queue_after_callback_releases(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _QueueShutdownSocket()
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    records: list[dict[str, object]] = []
+    debug_logger = logging.getLogger("tests.ble_link.public_queue_shutdown")
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_queue_max_packets=1,
+        observer_poll_seconds=0.005,
+        observer_join_timeout_seconds=0.5,
+    )
+
+    def terminal_callback(record: dict[str, object]) -> None:
+        records.append(record)
+        callback_entered.set()
+        callback_release.wait()
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=terminal_callback,
+        debug_logger=debug_logger,
+    )
+
+    async def scenario() -> None:
+        closing: asyncio.Task[None] | None = None
+        try:
+            await observer.start()
+            fake.packets.put(_connect())
+            assert await asyncio.to_thread(fake.connect_commands_sent.wait, 1.0)
+            fake.packets.put(_packet(0x05, b"\x00\x42\x00\x13"))
+            assert await asyncio.to_thread(callback_entered.wait, 1.0)
+            fake.packets.put(b"\x04\xff\x00")
+            assert await asyncio.to_thread(fake.extra_packet_returned.wait, 1.0)
+            await asyncio.sleep(0.02)
+            closing = asyncio.create_task(observer.close())
+            assert await asyncio.to_thread(fake.close_called.wait, 1.0)
+            await asyncio.sleep(0.04)
+            assert not closing.done()
+            callback_release.set()
+            await asyncio.wait_for(closing, timeout=0.4)
+        finally:
+            callback_release.set()
+            if closing is None:
+                closing = asyncio.create_task(observer.close())
+            await asyncio.wait_for(closing, timeout=1.0)
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        asyncio.run(scenario())
+
+    assert len(records) == 1
+    shutdown_errors = {
+        "ble_link_observer_processor_stopped",
+        "ble_link_observer_processor_timeout",
+        "ble_link_observer_finalizer_timeout",
+    }
+    observed = {
+        getattr(record, "debug_event", None)
+        for record in caplog.records
+        if record.name == debug_logger.name
+    }
+    assert not shutdown_errors.intersection(observed)
+    assert fake.closed
 
 
 def _release_after_timeout(close_returned: threading.Event, callback_release: threading.Event) -> None:

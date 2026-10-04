@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
@@ -17,6 +18,7 @@ from omi_collector.capture.adapters.ready_closures import (
     ReadyClosure,
     ReadyClosureError,
     append,
+    begin_visit,
     coalesce,
     load,
     remove,
@@ -182,6 +184,72 @@ def test_coalesce_keeps_latest_legacy_closure_and_handles_missing_or_singleton(t
     assert coalesce(singleton) == (only,)
     assert load(singleton) == (only,)
     assert singleton.read_bytes() == singleton_bytes
+
+
+def test_coalesce_accepts_legacy_fifo_with_equal_frontiers(tmp_path: Path) -> None:
+    path = tmp_path / "equal-frontiers.json"
+    path.write_text(
+        dumps(
+            {
+                "version": 1,
+                "closures": [
+                    {"next_sequence": 30, "reason": "absence"},
+                    {"next_sequence": 30, "reason": "recovery_exhausted"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    first = ReadyClosure(30, "absence")
+    newest = ReadyClosure(30, "recovery_exhausted")
+
+    assert load(path) == (first, newest)
+    assert coalesce(path) == (newest,)
+    assert load(path) == (newest,)
+
+
+def test_singleton_coalesce_succeeds_when_durable_rewrite_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "ready-closures.json"
+    only = append(path, 30, "absence")
+    original_bytes = path.read_bytes()
+
+    def reject_fsync(_fd: int) -> None:
+        raise OSError("unexpected rewrite")
+
+    monkeypatch.setattr(os, "fsync", reject_fsync)
+
+    assert coalesce(path) == (only,)
+    assert path.read_bytes() == original_bytes
+
+
+def test_begin_visit_returns_existing_non_drained_closure_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "ready-closures.json"
+    previous = append(path, 30, "absence")
+    original_bytes = path.read_bytes()
+
+    assert begin_visit(path) == previous
+    assert path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("queue_state", ["empty", "mismatched_head"])
+def test_remove_rejects_empty_or_mismatched_queue_without_changing_bytes(
+    tmp_path: Path, queue_state: str
+) -> None:
+    path = tmp_path / "ready-closures.json"
+    queued = append(path, 30, "absence")
+    if queue_state == "empty":
+        remove(path, queued)
+        rejected = queued
+    else:
+        rejected = ReadyClosure(31, "absence")
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(ReadyClosureError):
+        remove(path, rejected)
+
+    assert path.read_bytes() == original_bytes
 
 
 def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_path: Path) -> None:

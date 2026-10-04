@@ -5,6 +5,8 @@ import os
 import stat
 import threading
 import time
+from multiprocessing import get_context
+from multiprocessing.connection import Connection
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -40,6 +42,54 @@ def _is_journal_fd(descriptor: int, journal: JsonlQualityMetrics) -> bool:
         return Path(f"/proc/self/fd/{descriptor}").samefile(journal.path)
     except OSError:
         return False
+
+
+def _quality_close_child(root: str, sender: Connection) -> None:
+    journal = JsonlQualityMetrics(Path(root), release_version="1.2.3", source_revision="a" * 40)
+    entered_fsync = threading.Event()
+    never_release = threading.Event()
+    original_fsync = os.fsync
+
+    def block_journal_fsync(descriptor: int) -> None:
+        if _is_journal_fd(descriptor, journal):
+            entered_fsync.set()
+            never_release.wait()
+        else:
+            original_fsync(descriptor)
+
+    os.fsync = block_journal_fsync
+    try:
+        journal.record_sequence_loss(_loss_metric("process-exit"))
+        if not entered_fsync.wait(timeout=2):
+            raise AssertionError("quality writer did not reach fsync")
+        sender.send(journal.close(timeout_seconds=0.01))
+    finally:
+        os.fsync = original_fsync
+        sender.close()
+
+
+def test_bounded_close_does_not_leave_quality_writer_pinning_process_exit(tmp_path: Path) -> None:
+    context = get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_quality_close_child, args=(str(tmp_path), sender))
+    try:
+        process.start()
+        sender.close()
+        assert receiver.poll(5), "child did not report the bounded close result"
+        assert receiver.recv() is False
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    finally:
+        sender.close()
+        receiver.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        if process.pid is not None and not process.is_alive():
+            process.close()
 
 
 def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Path) -> None:

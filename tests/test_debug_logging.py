@@ -18,6 +18,7 @@ from omi_collector.capture.adapters.debug_logging import (
     configure_debug_logging,
     debug_event,
     debug_exception,
+    debug_log_path,
 )
 from omi_collector.capture.application.collector import CollectorTimeoutError
 from omi_collector.config import DebugLogConfig
@@ -199,22 +200,186 @@ def test_debug_ring_drops_full_queue_and_bounds_shutdown(monkeypatch: pytest.Mon
     monkeypatch.setattr(debug_logging._SafeRotatingFileHandler, "handle", blocked_handle)
     config = DebugLogConfig(queue_max_records=1, shutdown_join_seconds=0.01, logger_name="tests.debug.stalled")
     logger = configure_debug_logging(tmp_path, config)
-    handler = next(handler for handler in logger.handlers if hasattr(handler, "_omi_collector_debug_sink"))
-    sink = cast(debug_logging._RingSink, object.__getattribute__(handler, "_omi_collector_debug_sink"))
-    debug_event("first", logger=logger)
-    assert entered.wait(1)
-    debug_event("queued", logger=logger)
-    debug_event("dropped", logger=logger)
+    try:
+        debug_event("first", logger=logger)
+        assert entered.wait(1)
+        debug_event("queued", logger=logger)
+        debug_event("dropped", logger=logger)
 
-    started = time.monotonic()
-    dropped = close_debug_logging(logger)
+        started = time.monotonic()
+        dropped = close_debug_logging(logger)
 
-    assert time.monotonic() - started < 0.1
-    assert dropped >= 1
-    assert configure_debug_logging(tmp_path, config) is logger
-    assert logger.handlers == []
-    release.set()
-    deadline = time.monotonic() + 1
-    while sink.listener.is_alive() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert not sink.listener.is_alive()
+        assert time.monotonic() - started < 0.1
+        assert dropped >= 1
+        assert configure_debug_logging(tmp_path, config) is logger
+        assert logger.handlers == []
+        release.set()
+        deadline = time.monotonic() + 1
+        while not logger.handlers and time.monotonic() < deadline:
+            configure_debug_logging(tmp_path, config)
+            time.sleep(0.01)
+        assert logger.handlers
+        debug_event("after_resume", logger=logger, phase="ready")
+        deadline = time.monotonic() + 1
+        path = tmp_path / "debug.jsonl"
+        while time.monotonic() < deadline and (
+            not path.exists() or "after_resume" not in path.read_text(encoding="utf-8")
+        ):
+            time.sleep(0.01)
+        close_debug_logging(logger)
+    finally:
+        release.set()
+        close_debug_logging(logger)
+
+    events = [
+        cast(Mapping[str, object], json.loads(line))["event"]
+        for line in (tmp_path / "debug.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events.count("after_resume") == 1
+
+
+def test_utf16_ring_rotation_counts_encoded_bytes_and_keeps_jsonl_complete(tmp_path: Path) -> None:
+    config = DebugLogConfig(
+        max_bytes=2048,
+        backup_count=2,
+        max_record_bytes=1024,
+        encoding="utf-16",
+        logger_name="tests.debug.utf16",
+    )
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        for index in range(18):
+            debug_event("utf16_event", "ordinary diagnostic text " * 6, logger=logger, attempt=index)
+    finally:
+        close_debug_logging(logger)
+
+    paths = sorted(tmp_path.glob("debug.jsonl*"))
+
+    assert 1 < len(paths) <= config.backup_count + 1
+    for path in paths:
+        assert path.stat().st_size <= config.max_bytes
+        entries = [
+            cast(Mapping[str, object], json.loads(line)) for line in path.read_text(encoding="utf-16").splitlines()
+        ]
+        assert entries
+        assert all(entry["event"] == "utf16_event" for entry in entries)
+
+
+def test_debug_log_path_uses_default_name_and_explicit_override(tmp_path: Path) -> None:
+    config = DebugLogConfig(file_name="collector-debug.jsonl", logger_name="tests.debug.path")
+    logger = configure_debug_logging(tmp_path, config, file_name="override.jsonl")
+    try:
+        debug_event("path_check", logger=logger)
+    finally:
+        close_debug_logging(logger)
+
+    assert debug_log_path(tmp_path, config) == tmp_path / "collector-debug.jsonl"
+    assert debug_log_path(tmp_path, config, file_name="override.jsonl") == tmp_path / "override.jsonl"
+    assert (tmp_path / "override.jsonl").is_file()
+    assert not (tmp_path / "collector-debug.jsonl").exists()
+
+
+def test_debug_event_sanitizes_nested_values_and_mixed_case_secrets(tmp_path: Path) -> None:
+    sentinel = "nested-secret-value"
+    config = DebugLogConfig(logger_name="tests.debug.nested")
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        debug_event(
+            "nested_values",
+            logger=logger,
+            number=17,
+            enabled=False,
+            missing=None,
+            location=tmp_path / "capture.bin",
+            values=["ordinary", b"private bytes", {"AcCeSs-ToKeN": sentinel, "note": "ordinary text"}],
+            nested={"SeCrEtName": sentinel, "path": tmp_path / "nested.bin"},
+            query=f"https://example.test/?X-GoOg-SiGnAtUrE={sentinel}",
+        )
+    finally:
+        close_debug_logging(logger)
+
+    content = (tmp_path / "debug.jsonl").read_text(encoding="utf-8")
+    entry = cast(Mapping[str, object], json.loads(content))
+    fields = cast(Mapping[str, object], entry["fields"])
+    values = cast(list[object], fields["values"])
+    nested = cast(Mapping[str, object], fields["nested"])
+
+    assert sentinel not in content
+    assert fields["number"] == 17
+    assert fields["enabled"] is False
+    assert fields["missing"] is None
+    assert fields["location"] == str(tmp_path / "capture.bin")
+    assert values[0] == "ordinary"
+    assert values[1] == "<redacted>"
+    assert cast(Mapping[str, object], values[2])["AcCeSs-ToKeN"] == "<redacted>"
+    assert cast(Mapping[str, object], values[2])["note"] == "ordinary text"
+    assert nested["SeCrEtName"] == "<redacted>"
+    assert nested["path"] == str(tmp_path / "nested.bin")
+    assert "<redacted>" in cast(str, fields["query"])
+
+
+def test_debug_event_survives_a_message_whose_string_conversion_raises(tmp_path: Path) -> None:
+    class BrokenMessage:
+        def __str__(self) -> str:
+            raise RuntimeError("message rendering failed")
+
+    config = DebugLogConfig(logger_name="tests.debug.broken_message")
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        logger.debug(
+            BrokenMessage(),
+            extra={"debug_event": "broken_message", "debug_fields": {"phase": "capture"}},
+        )
+    finally:
+        close_debug_logging(logger)
+
+    entry = cast(Mapping[str, object], json.loads((tmp_path / "debug.jsonl").read_text(encoding="utf-8")))
+    fields = cast(Mapping[str, object], entry["fields"])
+
+    assert entry["event"] == "broken_message"
+    assert entry["message"] == "<message unavailable>"
+    assert fields["phase"] == "capture"
+
+
+def test_long_ordinary_event_stays_bounded_without_traceback(tmp_path: Path) -> None:
+    config = DebugLogConfig(max_bytes=512, max_record_bytes=512, logger_name="tests.debug.long_event")
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        debug_event("large_ordinary_event", "ordinary " * 10_000, logger=logger, phase="connect")
+    finally:
+        close_debug_logging(logger)
+
+    written = (tmp_path / "debug.jsonl").read_bytes()
+    entry = cast(Mapping[str, object], json.loads(written))
+
+    assert written.endswith(b"\n")
+    assert len(written) <= 512
+    assert entry["event"]
+    assert len(cast(str, entry["event"])) < 100
+    assert entry["message"]
+    assert len(cast(str, entry["message"])) < 100
+    assert entry["truncated"] is True
+    assert "traceback" not in entry
+
+
+def test_long_exception_keeps_a_bounded_traceback_marker(tmp_path: Path) -> None:
+    config = DebugLogConfig(max_bytes=512, max_record_bytes=512, logger_name="tests.debug.long_traceback")
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        try:
+            raise RuntimeError("trace detail " * 10_000)
+        except RuntimeError as error:
+            debug_exception("long_exception", error, logger=logger, phase="capture")
+    finally:
+        close_debug_logging(logger)
+
+    written = (tmp_path / "debug.jsonl").read_bytes()
+    entry = cast(Mapping[str, object], json.loads(written))
+    traceback = cast(str, entry["traceback"])
+
+    assert written.endswith(b"\n")
+    assert len(written) <= 512
+    assert entry["truncated"] is True
+    assert traceback
+    assert len(traceback) < 100
+    assert "…" in traceback

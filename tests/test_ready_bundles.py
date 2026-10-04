@@ -300,6 +300,42 @@ def _checkpoint(
     return path
 
 
+def _published_bundle_with_valid_ack(
+    root: Path, *, timestamps: tuple[int, ...] = (100,)
+) -> tuple[Path, Path, Path, ready_bundles.ReadyBundleResult]:
+    draft_root = root / "draft"
+    ready_root = root / "ready"
+    ledger = root / "collector" / "ready-publications.json"
+    _draft(draft_root, timestamps, start_sequence=100)
+    (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
+    checkpoint = _checkpoint(root, [(published.bundle_id, published.records_sha256)])
+    return ready_root, ledger, checkpoint, published
+
+
+def _retirement_snapshot(published: ready_bundles.ReadyBundleResult, ledger: Path) -> dict[str, bytes]:
+    return {
+        "records": (published.path / "records.bin").read_bytes(),
+        "manifest": (published.path / "manifest.json").read_bytes(),
+        "ledger": ledger.read_bytes(),
+    }
+
+
+def _assert_invalid_utc_mapping_is_not_retired(root: Path, utc: object) -> None:
+    ready_root, ledger, checkpoint, published = _published_bundle_with_valid_ack(root)
+    manifest_path = published.path / "manifest.json"
+    manifest = cast(dict[str, object], loads(manifest_path.read_text(encoding="utf-8")))
+    ranges = cast(list[dict[str, object]], manifest["time_ranges"])
+    ranges[0]["utc"] = utc
+    manifest_path.write_text(dumps(manifest), encoding="utf-8")
+    before = _retirement_snapshot(published, ledger)
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="UTC mapping"):
+        ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert published.path.exists()
+    assert _retirement_snapshot(published, ledger) == before
+
+
 def test_finalization_rewrites_only_confirmed_timestamp_ranges(tmp_path: Path) -> None:
     draft = _draft(tmp_path / "draft", (100, 200, 300))
     original = (draft / "records.bin").read_bytes()
@@ -645,6 +681,7 @@ def test_forged_or_open_tail_ack_never_deletes_ready_bundle(tmp_path: Path) -> N
         {"entries": [], "opened_at": "1", "outputs": []},
         {"entries": [], "opened_at": 1, "outputs": None},
         {"entries": None, "opened_at": 1, "outputs": []},
+        {"entries": [None], "opened_at": 1, "outputs": []},
     ],
 )
 def test_malformed_open_tail_never_mutates_acknowledged_bundle(tmp_path: Path, tail: dict[str, object]) -> None:
@@ -770,23 +807,160 @@ def test_mixed_ack_batch_preflights_every_identity_before_retiring_any_bundle(tm
 
 
 def test_nonfinite_ready_utc_mapping_blocks_ack_retirement_without_mutation(tmp_path: Path) -> None:
-    ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
-    _draft(tmp_path / "draft", (100,), start_sequence=100)
-    published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
-    manifest_path = published.path / "manifest.json"
-    manifest = cast(dict[str, object], loads(manifest_path.read_text(encoding="utf-8")))
-    ranges = cast(list[dict[str, object]], manifest["time_ranges"])
-    ranges[0]["utc"] = {"observation_id": "observation", "offset_seconds": float("nan"), "uncertainty_seconds": 0.5}
-    manifest_path.write_text(dumps(manifest), encoding="utf-8")
-    checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
-    before = ledger.read_bytes()
+    _assert_invalid_utc_mapping_is_not_retired(
+        tmp_path,
+        {"observation_id": "observation", "offset_seconds": float("nan"), "uncertainty_seconds": 0.5},
+    )
 
-    with pytest.raises(ready_bundles.ReadyBundleError, match="UTC mapping"):
+
+@pytest.mark.parametrize(
+    "utc",
+    [
+        [],
+        {},
+        {"observation_id": "", "offset_seconds": 0.0, "uncertainty_seconds": 0.0},
+        {"observation_id": 1, "offset_seconds": 0.0, "uncertainty_seconds": 0.0},
+        {"observation_id": "observation", "offset_seconds": True, "uncertainty_seconds": 0.0},
+        {"observation_id": "observation", "offset_seconds": float("inf"), "uncertainty_seconds": 0.0},
+        {"observation_id": "observation", "offset_seconds": 0.0, "uncertainty_seconds": -0.1},
+        {"observation_id": "observation", "offset_seconds": 0.0, "uncertainty_seconds": True},
+        {
+            "observation_id": "observation",
+            "offset_seconds": 0.0,
+            "uncertainty_seconds": 0.0,
+            "confidence": "certain",
+        },
+    ],
+)
+def test_invalid_ready_utc_mapping_blocks_ack_retirement_without_mutation(tmp_path: Path, utc: object) -> None:
+    _assert_invalid_utc_mapping_is_not_retired(tmp_path, utc)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "frontier-bool",
+        "frontier-string",
+        "frontier-negative",
+        "bundles-nonobject",
+        "entry-schema",
+        "entry-range",
+        "entry-range-conflict",
+        "entry-records-digest",
+        "entry-draft-digest",
+    ],
+)
+def test_invalid_ready_ledger_blocks_ack_retirement_without_mutation(tmp_path: Path, damage: str) -> None:
+    ready_root, ledger, checkpoint, published = _published_bundle_with_valid_ack(tmp_path)
+    document = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    if damage == "frontier-bool":
+        document["frontier"] = True
+    elif damage == "frontier-string":
+        document["frontier"] = "101"
+    elif damage == "frontier-negative":
+        document["frontier"] = -1
+    elif damage == "bundles-nonobject":
+        document["bundles"] = []
+    else:
+        bundles = cast(dict[str, object], document["bundles"])
+        entry = cast(dict[str, object], bundles[published.bundle_id])
+        if damage == "entry-schema":
+            entry["annotation"] = "unexpected"
+        elif damage == "entry-range":
+            entry["next_sequence"] = entry["start_sequence"]
+        elif damage == "entry-range-conflict":
+            entry["start_sequence"] = 101
+            entry["next_sequence"] = 102
+        elif damage == "entry-records-digest":
+            entry["records_sha256"] = "z" * 64
+        else:
+            entry["draft_raw_sha256"] = "z" * 64
+    ledger.write_text(dumps(document), encoding="utf-8")
+    before = _retirement_snapshot(published, ledger)
+
+    with pytest.raises(ready_bundles.ReadyBundleError):
         ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
 
-    assert ledger.read_bytes() == before
     assert published.path.exists()
+    assert _retirement_snapshot(published, ledger) == before
+
+
+@pytest.mark.parametrize(
+    "time_ranges",
+    [
+        None,
+        [None],
+        [{"start_sequence": 100, "next_sequence": 102, "utc": None, "annotation": "unexpected"}],
+        [],
+        [{"start_sequence": 100, "next_sequence": 100, "utc": None}],
+        [{"start_sequence": 101, "next_sequence": 100, "utc": None}],
+        [{"start_sequence": 101, "next_sequence": 102, "utc": None}],
+        [{"start_sequence": 100, "next_sequence": 101, "utc": None}],
+    ],
+)
+def test_invalid_ready_time_ranges_block_ack_retirement_without_mutation(tmp_path: Path, time_ranges: object) -> None:
+    ready_root, ledger, checkpoint, published = _published_bundle_with_valid_ack(tmp_path, timestamps=(100, 101))
+    manifest_path = published.path / "manifest.json"
+    manifest = cast(dict[str, object], loads(manifest_path.read_text(encoding="utf-8")))
+    manifest["time_ranges"] = time_ranges
+    manifest_path.write_text(dumps(manifest), encoding="utf-8")
+    before = _retirement_snapshot(published, ledger)
+
+    with pytest.raises(ready_bundles.ReadyBundleError):
+        ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert published.path.exists()
+    assert _retirement_snapshot(published, ledger) == before
+
+
+def test_empty_zero_frontier_ledger_allows_empty_acknowledgement(tmp_path: Path) -> None:
+    ready_root = tmp_path / "ready"
+    ready_root.mkdir()
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger.parent.mkdir()
+    ledger.write_text(dumps({"bundles": {}, "frontier": 0}), encoding="utf-8")
+    checkpoint = _checkpoint(tmp_path, [])
+
+    assert ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint) == ()
+    assert loads(ledger.read_text(encoding="utf-8")) == {"bundles": {}, "frontier": 0}
+
+
+def test_contiguous_utc_ranges_with_zero_values_allow_ack_retirement(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    ready_root = tmp_path / "ready"
+    ledger = tmp_path / "collector" / "ready-publications.json"
+    _draft(draft_root, (100, 101), start_sequence=100)
+    segments = ClockSegmentMap(
+        (
+            ClockSegment("first", 100, 101, 0.0, 0.0),
+            ClockSegment("second", 101, 102, 0.0, 0.0, "approximate"),
+        )
+    )
+    (published,) = _finalize_drafts(draft_root, ready_root, ledger, segments)
+    manifest = cast(dict[str, object], loads((published.path / "manifest.json").read_text(encoding="utf-8")))
+    checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
+
+    retired = ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
+
+    assert [item.bundle_id for item in retired] == [published.bundle_id]
+    assert manifest["time_ranges"] == [
+        {
+            "start_sequence": 100,
+            "next_sequence": 101,
+            "utc": {"observation_id": "first", "offset_seconds": 0.0, "uncertainty_seconds": 0.0},
+        },
+        {
+            "start_sequence": 101,
+            "next_sequence": 102,
+            "utc": {
+                "observation_id": "second",
+                "offset_seconds": 0.0,
+                "uncertainty_seconds": 0.0,
+                "confidence": "approximate",
+            },
+        },
+    ]
+    assert not published.path.exists()
 
 
 def test_checkpoint_without_ack_does_not_delete_ready_bundle(tmp_path: Path) -> None:

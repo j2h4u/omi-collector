@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Never
 
 import pytest
 from pytest import CaptureFixture, MonkeyPatch
@@ -121,6 +122,26 @@ def test_main_message_file_routes_success_and_failure_to_expected_streams(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "not a Conventional Commit subject" in captured.err
+
+
+def test_main_requires_a_commit_source_before_file_or_git_io(
+    monkeypatch: MonkeyPatch, capsys: CaptureFixture[str]
+) -> None:
+    def unexpected_io(*_args: object, **_kwargs: object) -> Never:
+        raise AssertionError("missing CLI arguments must fail before input IO")
+
+    monkeypatch.setattr(Path, "read_text", unexpected_io)
+    monkeypatch.setattr(subprocess, "run", unexpected_io)
+
+    with pytest.raises(SystemExit) as missing_source:
+        main([])
+    assert missing_source.value.code == 2
+    assert "one of the arguments --base-sha --message-file is required" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as missing_head:
+        main(["--base-sha", "base"])
+    assert missing_head.value.code == 2
+    assert "--head-sha is required with --base-sha" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("contents", ["", "# editor comment\n"])

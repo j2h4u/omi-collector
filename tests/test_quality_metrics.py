@@ -6,6 +6,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -28,6 +29,17 @@ from omi_collector.config import QualityMetricsConfig
 
 def _journal(tmp_path: Path) -> JsonlQualityMetrics:
     return JsonlQualityMetrics(tmp_path, release_version="1.2.3", source_revision="a" * 40)
+
+
+def _loss_metric(session_id: str = "s", *, reason: str = "reason") -> SequenceLossMetric:
+    return SequenceLossMetric("2026-09-02T01:02:04.456+00:00", session_id, 1, 444, reason, "1", None, None)
+
+
+def _is_journal_fd(descriptor: int, journal: JsonlQualityMetrics) -> bool:
+    try:
+        return Path(f"/proc/self/fd/{descriptor}").samefile(journal.path)
+    except OSError:
+        return False
 
 
 def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Path) -> None:
@@ -164,20 +176,58 @@ def test_source_revision_is_read_from_release_metadata(tmp_path: Path) -> None:
     assert source_revision_from_release_metadata(tmp_path / "missing.json") is None
 
 
+def test_source_revision_defaults_to_release_metadata_under_python_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prefix = tmp_path / "injected-prefix"
+    metadata = prefix / "share" / "omi-collector" / "release.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(json.dumps({"source_revision": "b" * 40}), encoding="utf-8")
+    monkeypatch.setattr(quality_metrics_module, "sys", SimpleNamespace(prefix=str(prefix)))
+
+    assert source_revision_from_release_metadata() == "b" * 40
+
+
+def test_release_metadata_rejects_extra_keys_with_valid_revision(tmp_path: Path) -> None:
+    path = tmp_path / "release.json"
+    path.write_text(json.dumps({"source_revision": "a" * 40, "channel": "stable"}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema is invalid"):
+        source_revision_from_release_metadata(path)
+
+
+def test_empty_release_version_is_rejected_before_writer_thread_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def reject_thread_start(_thread: threading.Thread) -> None:
+        raise AssertionError("quality writer started before constructor validation")
+
+    monkeypatch.setattr(quality_metrics_module.Thread, "start", reject_thread_start)
+
+    with pytest.raises(ValueError, match="release version must be a non-empty string"):
+        JsonlQualityMetrics(tmp_path, release_version="")
+
+
 def test_journal_write_failure_is_reported_as_a_visible_diagnostic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     journal = _journal(tmp_path)
+    real_open = os.open
 
-    def fail_open(*_args: object, **_kwargs: object) -> int:
-        raise OSError("full")
+    def fail_journal_open(path: str | os.PathLike[str], flags: int, mode: int | None = None) -> int:
+        if Path(path).resolve() == journal.path.resolve():
+            raise OSError("full")
+        if mode is None:
+            return real_open(path, flags)
+        return real_open(path, flags, mode)
 
-    monkeypatch.setattr(os, "open", fail_open)
-    journal.record_sequence_loss(
-        SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
-    )
-    assert journal.close()
-    assert "quality metrics write_failed" in caplog.text
+    monkeypatch.setattr(os, "open", fail_journal_open)
+    try:
+        journal.record_sequence_loss(_loss_metric())
+        assert journal.close()
+        assert "quality metrics write_failed" in caplog.text
+    finally:
+        assert journal.close()
 
 
 def test_journal_rotates_complete_records_with_bounded_retention(tmp_path: Path) -> None:
@@ -201,6 +251,53 @@ def test_journal_rotates_complete_records_with_bounded_retention(tmp_path: Path)
         json.loads(lines[0])
 
 
+def test_rotation_caps_real_serialized_bytes_and_preserves_retained_event_order(tmp_path: Path) -> None:
+    def line_for(index: int) -> tuple[SequenceLossMetric, bytes]:
+        metric = _loss_metric(f"event-{index:02}", reason="reason é")
+        line = (
+            json.dumps(metric.as_dict(), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            + b"\n"
+        )
+        return metric, line
+
+    first_metric, first_line = line_for(0)
+    record_bytes = len(first_line)
+    journal = JsonlQualityMetrics(
+        tmp_path,
+        release_version="1.2.3",
+        config=QualityMetricsConfig(max_bytes=2 * record_bytes, backup_count=2, max_record_bytes=record_bytes),
+    )
+    try:
+        journal.record_sequence_loss(first_metric)
+        journal.record_sequence_loss(line_for(1)[0])
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and (
+            not journal.path.exists() or journal.path.stat().st_size != 2 * record_bytes
+        ):
+            time.sleep(0.01)
+        assert journal.path.stat().st_size == 2 * record_bytes
+        assert not journal.path.with_name(f"{journal.path.name}.1").exists()
+
+        for index in range(2, 6):
+            journal.record_sequence_loss(line_for(index)[0])
+        assert journal.close(timeout_seconds=1)
+    finally:
+        assert journal.close(timeout_seconds=1)
+
+    retained = (
+        journal.path.with_name(f"{journal.path.name}.2"),
+        journal.path.with_name(f"{journal.path.name}.1"),
+        journal.path,
+    )
+    assert all(path.stat().st_size <= 2 * record_bytes for path in retained)
+    retained_ids: list[str] = []
+    for path in retained:
+        records = [cast(dict[str, object], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 2
+        retained_ids.extend(cast(str, record["session_id"]) for record in records)
+    assert retained_ids == [f"event-{index:02}" for index in range(6)]
+
+
 def test_journal_rejects_oversized_record_before_opening_file(tmp_path: Path) -> None:
     journal = JsonlQualityMetrics(
         tmp_path,
@@ -213,6 +310,71 @@ def test_journal_rejects_oversized_record_before_opening_file(tmp_path: Path) ->
         )
     assert not journal.path.exists()
     assert journal.close()
+
+
+def test_journal_creates_missing_collector_parents_and_appends_jsonl(tmp_path: Path) -> None:
+    root = tmp_path / "missing" / "collector" / "nested"
+    journal = JsonlQualityMetrics(root, release_version="1.2.3", source_revision="a" * 40)
+    metric = _loss_metric("nested-parent")
+    expected = (
+        json.dumps(metric.as_dict(), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+    )
+    try:
+        journal.record_sequence_loss(metric)
+        assert journal.close(timeout_seconds=1)
+    finally:
+        assert journal.close(timeout_seconds=1)
+
+    assert journal.path.parent.is_dir()
+    assert journal.path.read_bytes() == expected
+
+
+def test_short_journal_writes_complete_the_exact_jsonl_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    real_write = os.write
+
+    def short_journal_write(descriptor: int, payload: bytes) -> int:
+        if _is_journal_fd(descriptor, journal) and payload:
+            return real_write(descriptor, payload[:1])
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(os, "write", short_journal_write)
+    metric = _loss_metric("short-write")
+    expected = (
+        json.dumps(metric.as_dict(), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+    )
+    try:
+        journal.record_sequence_loss(metric)
+        assert journal.close(timeout_seconds=1)
+    finally:
+        assert journal.close(timeout_seconds=1)
+
+    assert journal.path.read_bytes() == expected
+
+
+def test_zero_progress_write_is_reported_without_hanging_or_writing_a_partial_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    journal = _journal(tmp_path)
+    real_write = os.write
+    first_journal_write = True
+
+    def zero_then_write(descriptor: int, payload: bytes) -> int:
+        nonlocal first_journal_write
+        if _is_journal_fd(descriptor, journal) and first_journal_write:
+            first_journal_write = False
+            return 0
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(os, "write", zero_then_write)
+    try:
+        journal.record_sequence_loss(_loss_metric("zero-write"))
+        assert journal.close(timeout_seconds=1)
+    finally:
+        assert journal.close(timeout_seconds=1)
+
+    assert "quality metrics write_failed" in caplog.text
+    assert journal.path.read_bytes() == b""
 
 
 def test_first_journal_creation_fsyncs_parent_after_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,27 +396,63 @@ def test_first_journal_creation_fsyncs_parent_after_file(tmp_path: Path, monkeyp
     assert events == ["file", "parent"]
 
 
-def test_record_does_not_wait_for_a_blocked_filesystem_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    journal = _journal(tmp_path)
+def test_record_does_not_wait_for_blocked_writer_and_repeated_close_preserves_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    journal = JsonlQualityMetrics(
+        tmp_path,
+        release_version="1.2.3",
+        source_revision="a" * 40,
+        config=QualityMetricsConfig(queue_max_records=1),
+    )
     started = threading.Event()
     release = threading.Event()
-    original_append = journal._append
+    real_write = os.write
 
-    def blocked_append(line: bytes) -> None:
-        started.set()
-        release.wait(5)
-        original_append(line)
+    def blocked_write(descriptor: int, payload: bytes) -> int:
+        if _is_journal_fd(descriptor, journal) and not started.is_set():
+            started.set()
+            assert release.wait(5)
+        return real_write(descriptor, payload)
 
-    monkeypatch.setattr(journal, "_append", blocked_append)
-    metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
-    start = time.monotonic()
-    journal.record_sequence_loss(metric)
-    elapsed = time.monotonic() - start
-    assert elapsed < 0.1
-    assert started.wait(1)
-    assert not journal.close(timeout_seconds=0.01)
-    release.set()
-    assert journal.close(timeout_seconds=1)
+    monkeypatch.setattr(os, "write", blocked_write)
+    try:
+        start = time.monotonic()
+        journal.record_sequence_loss(_loss_metric("blocked-write"))
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.1
+        assert started.wait(1)
+        assert not journal.close(timeout_seconds=0.01)
+        assert journal.dropped_records == 0
+        assert "quality metrics shutdown_timeout" in caplog.text
+        assert not journal.close(timeout_seconds=0.01)
+        assert journal.dropped_records == 0
+    finally:
+        release.set()
+        assert journal.close(timeout_seconds=1)
+
+    assert len(journal.path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_unblocked_close_does_not_warn_and_post_close_records_are_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    journal = _journal(tmp_path)
+    metric = _loss_metric("after-close")
+    try:
+        journal.record_sequence_loss(metric)
+        assert journal.close(timeout_seconds=1)
+        durable_bytes = journal.path.read_bytes()
+        assert "quality metrics shutdown_timeout" not in caplog.text
+
+        journal.record_sequence_loss(metric)
+        assert journal.dropped_records == 1
+        assert "quality metrics writer_closed" in caplog.text
+        assert journal.path.read_bytes() == durable_bytes
+    finally:
+        assert journal.close(timeout_seconds=1)
 
 
 def test_close_races_with_enqueue_without_losing_the_ordered_stop(
@@ -335,12 +533,14 @@ def test_full_queue_drops_auxiliary_event_without_blocking(
 
     monkeypatch.setattr(journal, "_append", blocked_append)
     metric = SequenceLossMetric("2026-09-02T01:02:04.456+00:00", "s", 1, 444, "reason", "1", None, None)
-    journal.record_sequence_loss(metric)
-    assert started.wait(1)
-    journal.record_sequence_loss(metric)
-    journal.record_sequence_loss(metric)
-    assert journal.dropped_records == 1
-    assert "quality metrics queue_full" in caplog.text
-    assert not journal.close(timeout_seconds=0.01)
-    release.set()
-    assert journal.close(timeout_seconds=1)
+    try:
+        journal.record_sequence_loss(metric)
+        assert started.wait(1)
+        journal.record_sequence_loss(metric)
+        journal.record_sequence_loss(metric)
+        assert journal.dropped_records == 1
+        assert "quality metrics queue_full" in caplog.text
+        assert not journal.close(timeout_seconds=0.01)
+    finally:
+        release.set()
+        assert journal.close(timeout_seconds=1)

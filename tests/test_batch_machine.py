@@ -50,6 +50,9 @@ def test_receipts_derive_all_batch_milestones() -> None:
         derive_milestone(10, 12, 11, True)
     with pytest.raises(ValueError):
         derive_milestone(None, None, 10, False)
+    for start, end in ((None, 12), (10, None)):
+        with pytest.raises(ValueError, match="retired batch cannot retain writer receipts"):
+            derive_milestone(start, end, None, False)
 
 
 def test_transition_matrix_rejects_every_unlisted_pair() -> None:

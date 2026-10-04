@@ -112,8 +112,16 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
 
         monkeypatch.setattr(store, "recover_and_publish", publish)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        attempt_calls = 0
+
+        async def unexpected_cooldown_sleep(_seconds: float) -> None:
+            raise AssertionError("stop_after_drained must not sleep for cooldown")
 
         async def attempt(_self: SessionLifecycle, *, with_presence: bool) -> DrainConfirmed:
+            nonlocal attempt_calls
+            attempt_calls += 1
+            if attempt_calls > 1:
+                raise AssertionError("stop_after_drained must prevent a second attempt")
             assert not with_presence
             maintenance.schedule_publication_retry()
             await asyncio.sleep(0)
@@ -143,7 +151,9 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
         )
         run = SessionLifecycleRun(
             provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
-            options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(stop_after_drained=True)),
+            options=OpportunisticOptions(
+                TransferTimeouts(1, 1), RetryPolicy(stop_after_drained=True), sleep=unexpected_cooldown_sleep
+            ),
             runtime=OpportunisticRuntime(),
             callbacks=callbacks,
         )
@@ -744,10 +754,14 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
     class Presence:
         policy = PresencePolicy(rapid_backoff=(1.0,))
         drained_cooldown_remaining_seconds = 0.0
+        wake_calls = 0
 
         resume_interrupted_visit = staticmethod(_unexpected_startup_recovery)
 
         async def wait_for_attempt(self) -> PresenceWake:
+            self.wake_calls += 1
+            if self.wake_calls > 1:
+                raise AssertionError("setup failure must propagate before a second permit")
             return PresenceWake("test", candidate=object(), observed_at=time.monotonic())
 
         async def attempt_finished(self, outcome: AttemptOutcome) -> None:

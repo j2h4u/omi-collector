@@ -6,6 +6,7 @@ import subprocess
 import sys
 from json import dumps, loads
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -41,6 +42,10 @@ def _store(tmp_path: Path) -> StagingStore:
     return StagingStore(tmp_path, tmp_path.parent / f"{tmp_path.name}-captures")
 
 
+def _ample_statvfs(_: str | Path) -> object:
+    return SimpleNamespace(f_bavail=10**15, f_frsize=1)
+
+
 def test_open_persisted_attempt_accepts_protocol_maximum_without_capacity_preflight(tmp_path: Path) -> None:
     attempt = _attempt(tmp_path)
     attempt.close()
@@ -53,6 +58,19 @@ def test_open_persisted_attempt_accepts_protocol_maximum_without_capacity_prefli
 
     assert reopened.descriptor.packet_count == (1 << 32) - 1
     reopened.close()
+
+
+def test_prepare_accepts_uint32_maximum_with_injected_capacity_without_allocation(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, tmp_path.parent / f"{tmp_path.name}-captures", statvfs_fn=_ample_statvfs)
+
+    attempt = store.prepare_streaming_attempt(0, (1 << 32) - 1)
+    try:
+        assert attempt.descriptor.packet_count == (1 << 32) - 1
+        assert (attempt.path / "records.bin").stat().st_size == 0
+        with pytest.raises(AttemptStateError):
+            store.prepare_streaming_attempt(0, 1 << 32)
+    finally:
+        attempt.close()
 
 
 @pytest.mark.parametrize("invalid_count", [0, (1 << 32), True])
@@ -108,15 +126,21 @@ def test_open_rejects_invalid_persisted_descriptor_id_without_rewriting_evidence
     attempt = _attempt(tmp_path)
     attempt.close()
     descriptor_path = attempt.path / "attempt.json"
+    invalid_path = attempt.path.with_name(persisted_id)
     descriptor = cast(dict[str, object], loads(descriptor_path.read_text(encoding="utf-8")))
     descriptor["attempt_id"] = persisted_id
     descriptor_path.write_text(dumps(descriptor), encoding="utf-8")
-    evidence = {path.name: path.read_bytes() for path in attempt.path.iterdir()}
+    checkpoint_path = attempt.path / "checkpoint.json"
+    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
+    checkpoint["attempt_id"] = persisted_id
+    checkpoint_path.write_text(dumps(checkpoint), encoding="utf-8")
+    attempt.path.rename(invalid_path)
+    evidence = {path.name: path.read_bytes() for path in invalid_path.iterdir()}
 
     with pytest.raises(AttemptStateError):
-        _store(tmp_path).open_attempt(attempt.attempt_id)
+        _store(tmp_path).open_attempt(persisted_id)
 
-    assert {path.name: path.read_bytes() for path in attempt.path.iterdir()} == evidence
+    assert {path.name: path.read_bytes() for path in invalid_path.iterdir()} == evidence
 
 
 def test_open_rejects_negative_checkpoint_count_with_valid_empty_hash_and_raw_record(tmp_path: Path) -> None:

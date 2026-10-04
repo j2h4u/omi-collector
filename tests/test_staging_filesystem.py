@@ -5,17 +5,23 @@ from __future__ import annotations
 from collections.abc import Callable
 from errno import EXDEV
 from json import dumps, loads
-from multiprocessing import Event, Process
+from multiprocessing import Event, Process, get_context
+from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event as EventType
-from os import PathLike, fsync
+from os import PathLike, fsync, mkfifo
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters import staging_filesystem
-from omi_collector.capture.adapters.staging_contract import AttemptStateError, DeviceAlreadyRunningError, StagingError
+from omi_collector.capture.adapters import staging_filesystem, staging_store
+from omi_collector.capture.adapters.staging_contract import (
+    AttemptStateError,
+    CollisionError,
+    DeviceAlreadyRunningError,
+    StagingError,
+)
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 
@@ -87,6 +93,27 @@ def _hold_device_lock(spool: str, capture_root: str, ready: EventType, release: 
     with StagingStore(Path(spool), Path(capture_root)).device_lock(operation="capture_batch"):
         ready.set()
         release.wait(10)
+
+
+def _open_attempt_in_child(
+    spool: str,
+    capture_root: str,
+    attempt_id: str,
+    expected_module_path: str,
+    results: Queue[tuple[str, str]],
+) -> None:
+    from omi_collector.capture.adapters.staging_store import StagingStore as ChildStagingStore
+
+    module_path = str(Path(staging_store.__file__).resolve())
+    if module_path != expected_module_path:
+        results.put(("wrong-source", module_path))
+        return
+    try:
+        ChildStagingStore(Path(spool), Path(capture_root)).open_attempt(attempt_id)
+    except AttemptStateError:
+        results.put(("AttemptStateError", module_path))
+    else:
+        results.put(("accepted", module_path))
 
 
 def test_device_lock_contention_attributes_process_holder_and_reacquires(tmp_path: Path) -> None:
@@ -294,7 +321,15 @@ def test_device_lock_contention_uses_live_pid_one_metadata(tmp_path: Path) -> No
     assert context.holder_scope == "other_process"
 
 
-def test_device_lock_contender_preserves_live_owner_metadata(tmp_path: Path) -> None:
+def test_device_lock_contender_preserves_live_owner_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        staging_filesystem,
+        "debug_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
     store = StagingStore(spool, capture_root)
@@ -308,9 +343,43 @@ def test_device_lock_contender_preserves_live_owner_metadata(tmp_path: Path) -> 
         ):
             pass
         assert lock_path.read_bytes() == before
+        contender_events = tuple(events)
+        assert not any(
+            name == "device_lock_released" and fields["operation"] == "resume_pending_attempt"
+            for name, fields in contender_events
+        )
 
     with StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"):
         pass
+    released_operations = [
+        fields["operation"] for name, fields in events if name == "device_lock_released"
+    ]
+    assert released_operations == ["capture_batch", "resume_pending_attempt"]
+
+
+@pytest.mark.parametrize("process_start", [None, "float"])
+def test_device_lock_rejects_noncanonical_process_start_as_stale(
+    tmp_path: Path, process_start: object
+) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(spool, capture_root)
+    with store.device_lock(operation="capture_batch"):
+        lock_path = spool / "collector.lock"
+        metadata = cast(dict[str, object], loads(lock_path.read_text(encoding="utf-8")))
+        actual_start = metadata["process_start"]
+        metadata["process_start"] = None if process_start is None else float(cast(int, actual_start))
+        lock_path.write_text(dumps(metadata), encoding="utf-8")
+        with (
+            pytest.raises(DeviceAlreadyRunningError) as raised,
+            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
+        ):
+            pass
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.metadata_status == "stale"
+    assert context.holder_scope == "unknown"
+    assert context.holder_pid is None
 
 
 def test_device_lock_diagnostics_report_bounded_lease_duration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -331,9 +400,42 @@ def test_device_lock_diagnostics_report_bounded_lease_duration(tmp_path: Path, m
     released = next(fields for name, fields in events if name == "device_lock_released")
     assert acquired["operation"] == "capture_batch"
     assert released["operation"] == "capture_batch"
+    assert acquired["metadata_status"] == released["metadata_status"] == "valid"
     duration = released["duration_seconds"]
     assert isinstance(duration, float)
     assert 0 <= duration <= elapsed + 0.1
+
+
+@pytest.mark.parametrize("fault", ["short", "error"])
+def test_device_lock_metadata_write_failure_is_diagnostic_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        staging_filesystem,
+        "debug_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    lock_path = tmp_path / "spool" / "collector.lock"
+    real_pwrite = staging_filesystem.os.pwrite
+
+    def injected_pwrite(fd: int, payload: bytes, offset: int) -> int:
+        if Path(f"/proc/self/fd/{fd}").resolve() == lock_path.resolve():
+            if fault == "error":
+                raise OSError("injected diagnostic metadata failure")
+            return 0
+        return real_pwrite(fd, payload, offset)
+
+    monkeypatch.setattr(staging_filesystem.os, "pwrite", injected_pwrite)
+    store = StagingStore(tmp_path / "spool", _capture_root(tmp_path))
+    with store.device_lock(operation="capture_batch"):
+        pass
+
+    acquired = next(fields for name, fields in events if name == "device_lock_acquired")
+    released = next(fields for name, fields in events if name == "device_lock_released")
+    assert acquired["metadata_status"] == released["metadata_status"] == "write_failed"
+    with store.device_lock(operation="retry"):
+        pass
 
 
 def test_public_checkpoint_rejects_missing_checkpoint_without_creating_it(tmp_path: Path) -> None:
@@ -343,12 +445,14 @@ def test_public_checkpoint_rejects_missing_checkpoint_without_creating_it(tmp_pa
     checkpoint.unlink()
     raw_before = (attempt.path / "records.bin").read_bytes()
 
-    with pytest.raises(AttemptStateError, match="checkpoint is missing"):
-        attempt.checkpoint()
+    try:
+        with pytest.raises(AttemptStateError, match="checkpoint is missing"):
+            attempt.checkpoint()
 
-    assert not checkpoint.exists()
-    assert (attempt.path / "records.bin").read_bytes() == raw_before
-    attempt.close()
+        assert not checkpoint.exists()
+        assert (attempt.path / "records.bin").read_bytes() == raw_before
+    finally:
+        attempt.close()
 
 
 def test_open_rejects_checkpoint_with_nonhex_hash_without_rewriting_raw(tmp_path: Path) -> None:
@@ -367,6 +471,64 @@ def test_open_rejects_checkpoint_with_nonhex_hash_without_rewriting_raw(tmp_path
     assert checkpoint.read_bytes() == checkpoint_before
 
 
+@pytest.mark.parametrize("fifo_name", ["records.bin", "attempt.json"])
+def test_open_attempt_rejects_fifo_without_blocking(tmp_path: Path, fifo_name: str) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    attempt.close()
+    fifo_path = attempt.path / fifo_name
+    fifo_path.unlink()
+    mkfifo(fifo_path)
+    module_path = Path(staging_store.__file__).resolve()
+    context = get_context("fork")
+    results = context.Queue()
+    child = context.Process(
+        target=_open_attempt_in_child,
+        args=(str(tmp_path), str(_capture_root(tmp_path)), attempt.attempt_id, str(module_path), results),
+    )
+    child.start()
+    child.join(3)
+    timed_out = child.is_alive()
+    try:
+        if timed_out:
+            child.terminate()
+            child.join(3)
+        if child.is_alive():
+            child.kill()
+            child.join()
+        assert not timed_out, "open_attempt blocked on a FIFO"
+        assert child.exitcode == 0
+        assert results.get(timeout=1) == ("AttemptStateError", str(module_path))
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join()
+        child.close()
+        results.close()
+        results.join_thread()
+
+
+def test_prefix_collision_preserves_longer_destination_and_source(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    result = attempt.publish_prefix()
+    assert result is not None
+    destination = result.bundle_path
+    raw_destination = destination / "records.bin"
+    raw_destination.write_bytes(raw_destination.read_bytes() + b"x")
+    destination_before = {path.name: path.read_bytes() for path in destination.iterdir() if path.is_file()}
+    source_before = {path.name: path.read_bytes() for path in attempt.path.iterdir() if path.is_file()}
+
+    try:
+        with pytest.raises(CollisionError, match="prefix collision"):
+            attempt.publish_prefix()
+
+        assert {path.name: path.read_bytes() for path in destination.iterdir() if path.is_file()} == destination_before
+        assert {path.name: path.read_bytes() for path in attempt.path.iterdir() if path.is_file()} == source_before
+    finally:
+        attempt.close()
+
+
 def test_public_checkpoint_rejects_corrupt_hash_after_append_without_rewriting_evidence(
     tmp_path: Path,
 ) -> None:
@@ -377,12 +539,14 @@ def test_public_checkpoint_rejects_corrupt_hash_after_append_without_rewriting_e
     checkpoint_before = checkpoint.read_bytes()
     raw_before = (attempt.path / "records.bin").read_bytes()
 
-    with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
-        attempt.checkpoint()
+    try:
+        with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
+            attempt.checkpoint()
 
-    assert checkpoint.read_bytes() == checkpoint_before
-    assert (attempt.path / "records.bin").read_bytes() == raw_before
-    attempt.close()
+        assert checkpoint.read_bytes() == checkpoint_before
+        assert (attempt.path / "records.bin").read_bytes() == raw_before
+    finally:
+        attempt.close()
 
 
 class _RecordingStream:

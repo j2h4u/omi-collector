@@ -3709,6 +3709,7 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
     tmp_path: Path, phase: str, expected_kind: str
 ) -> None:
     entered = asyncio.Event()
+    release_advance = asyncio.Event()
 
     class GatedSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -3717,6 +3718,7 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
                 entered.set()
             if phase == "advance" and payload == encode_advance_command(12):
                 entered.set()
+                await release_advance.wait()
             if phase == "confirm" and payload == b"\x10" and len(self.writes) == 5:
                 entered.set()
 
@@ -3748,19 +3750,24 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
     task = asyncio.create_task(
         run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options())
     )
-    await entered.wait()
-    for _ in range(3):
-        await asyncio.sleep(0)
-    task.cancel()
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        task.cancel()
 
-    with pytest.raises(CollectionPreservedCancelledError) as raised:
-        await task
-    assert raised.value.kind == expected_kind
-    assert raised.value.preserved_path.exists()
-    if phase == "read":
-        assert raised.value.preserved_path == tmp_path / "attempts"
-    else:
-        assert raised.value.preserved_path.parent == _capture_root(tmp_path)
+        with pytest.raises(CollectionPreservedCancelledError) as raised:
+            await task
+        assert raised.value.kind == expected_kind
+        assert raised.value.preserved_path.exists()
+        if phase == "read":
+            assert raised.value.preserved_path == tmp_path / "attempts"
+        else:
+            assert raised.value.preserved_path.parent == _capture_root(tmp_path)
+    finally:
+        release_advance.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @_async_test

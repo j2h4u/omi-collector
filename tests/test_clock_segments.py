@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -293,6 +293,48 @@ def test_clock_segment_owns_start_but_excludes_next_sequence_and_accepts_zero_un
 
     assert mapping.utc_for(0, 123) == 123
     assert mapping.utc_for(1, 123) is None
+
+
+def test_retained_epoch_membership_keeps_its_validated_range() -> None:
+    observation = _observation()
+    membership = ClockEpochMembership("observation", 12, 15)
+
+    field = "next_sequence"
+    with pytest.raises(FrozenInstanceError):
+        setattr(membership, field, 13)
+
+    segment = ClockSegment.from_confirmed_membership(observation, membership)
+    mapping = ClockSegmentMap((segment,))
+    assert (segment.start_sequence, segment.next_sequence) == (12, 15)
+    assert mapping.utc_for(14, 105) == pytest.approx(100.1)
+    assert mapping.utc_for(15, 105) is None
+
+
+def test_clock_segment_map_keeps_its_validated_segment_set() -> None:
+    segment = ClockSegment("observation", 10, 20, -4.9, 1.1)
+    mapping = ClockSegmentMap((segment,))
+
+    field = "segments"
+    with pytest.raises(FrozenInstanceError):
+        setattr(mapping, field, ())
+
+    assert mapping.utc_for(10, 105) == pytest.approx(100.1)
+    assert mapping.utc_for(20, 105) is None
+
+
+def test_clock_segment_keeps_its_validated_time_range_and_offset() -> None:
+    segment = ClockSegment("observation", 10, 20, -4.9, 1.1)
+    mapping = ClockSegmentMap((segment,))
+
+    offset_field = "utc_offset_seconds"
+    with pytest.raises(FrozenInstanceError):
+        setattr(segment, offset_field, 1000.0)
+    end_field = "next_sequence"
+    with pytest.raises(FrozenInstanceError):
+        setattr(segment, end_field, 21)
+
+    assert mapping.utc_for(10, 105) == pytest.approx(100.1)
+    assert mapping.utc_for(20, 105) is None
 
 
 def test_later_same_range_observation_replaces_estimate_without_fragments() -> None:

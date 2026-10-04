@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 
 import pytest
@@ -115,3 +116,44 @@ def test_membership_does_not_cross_a_ble_session(tmp_path: Path) -> None:
 
     with pytest.raises(ClockMembershipError, match="no durable observation"):
         store.segments((_observation(),))
+
+
+def test_recorded_membership_keeps_its_validated_interval(tmp_path: Path) -> None:
+    store = ClockMembershipStore(tmp_path / "device.json")
+    membership = ClockMembership("anchor", "session-a", 0, 10)
+    store.record(membership)
+
+    field = "start_sequence"
+    with pytest.raises(FrozenInstanceError):
+        setattr(membership, field, 2)
+
+    assert store.record(membership) == membership
+    assert store.records() == (membership,)
+    segments = store.segments((_observation(),))
+    assert segments.utc_for(0, 1005) == 1000.1
+    assert segments.utc_for(9, 1005) == 1000.1
+    assert segments.utc_for(10, 1005) is None
+
+
+def test_record_creates_nested_missing_storage_parents(tmp_path: Path) -> None:
+    device_state_path = tmp_path / "missing-a" / "missing-b" / "device.json"
+    membership = ClockMembership("anchor", "session-a", 0, 1)
+
+    ClockMembershipStore(device_state_path).record(membership)
+
+    assert ClockMembershipStore(device_state_path).records() == (membership,)
+
+
+def test_record_accepts_existing_canonical_sorted_membership_file(tmp_path: Path) -> None:
+    store = ClockMembershipStore(tmp_path / "device.json")
+    membership = ClockMembership("anchor", "session-a", 0, 10)
+    store.record(membership)
+    (membership_path,) = (tmp_path / "clock-memberships").glob("*.json")
+    canonical_fixture = json.dumps(asdict(membership), separators=(",", ":"), sort_keys=True).encode()
+    membership_path.write_bytes(canonical_fixture)
+    reopened = ClockMembershipStore(tmp_path / "device.json")
+
+    assert reopened.records() == (membership,)
+    assert reopened.record(membership) == membership
+    assert membership_path.read_bytes() == canonical_fixture
+    assert store.records() == (membership,)

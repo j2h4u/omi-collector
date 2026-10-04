@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 from omi_collector.capture.adapters import clock_observations
 from omi_collector.capture.adapters.clock_observations import ClockObservationError, ClockObservationStore
+from omi_collector.capture.adapters.clock_segments import ClockSegmentMap, segments_with_estimates
 
 # Dynamic malformed-schema fixtures intentionally cross the JSON boundary.
 # pyright: reportAny=false, reportArgumentType=false
@@ -58,6 +60,19 @@ def test_observation_store_is_causal_and_immutable(tmp_path: Path) -> None:
     assert established.observation_role == "initial"
     assert store.records()[0].effective_boundary_sequence is None
     assert second.causal_order == 1
+
+
+def test_observation_keeps_its_validated_epoch_for_estimation(tmp_path: Path) -> None:
+    observation = ClockObservationStore(tmp_path / "device.json").append(evidence_kind="native_trusted", **_values())
+
+    field = "device_epoch"
+    with pytest.raises(FrozenInstanceError):
+        setattr(observation, field, observation.device_epoch + 1)
+
+    mapping = segments_with_estimates((observation,), ClockSegmentMap(()))
+
+    assert mapping.utc_for(observation.info_sequence_min, 1789749500) == pytest.approx(1789749500.1)
+    assert mapping.utc_for(observation.info_sequence_max, 1789749500) is None
 
 
 @pytest.mark.parametrize(

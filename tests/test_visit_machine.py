@@ -115,88 +115,101 @@ EXPECTED_CLOSURE_RESULTS = {
 }
 
 
-def _expected_transitions() -> dict[tuple[VisitState, VisitEvent, bool], TransitionResult]:
-    rows: dict[tuple[VisitState, VisitEvent, bool], TransitionResult] = {}
+def _expected_transitions() -> list[tuple[tuple[VisitState, VisitEvent, bool], TransitionResult]]:
+    rows: list[tuple[tuple[VisitState, VisitEvent, bool], TransitionResult]] = []
     for stop_after_drained in STOP_POLICIES:
-        rows.update(
-            {
-                (Recovering(), RecoveryLoaded("empty"), stop_after_drained): TransitionResult(Idle(), WaitForAttempt()),
-                (Recovering(), RecoveryLoaded("resumable"), stop_after_drained): TransitionResult(
-                    Waiting(), WaitForAttempt(arm_restored=True)
+        rows.extend(
+            [
+                (
+                    (Recovering(), RecoveryLoaded("empty"), stop_after_drained),
+                    TransitionResult(Idle(), WaitForAttempt()),
                 ),
                 (
-                    Recovering(),
-                    RecoveryLoaded("needs_interrupted_close"),
-                    stop_after_drained,
-                ): TransitionResult(Closing("restart_interrupted"), CommitClosure("restart_interrupted")),
-                (Idle(), AttemptGranted(), stop_after_drained): TransitionResult(Attempting(Idle()), RunAttempt()),
-                (Waiting(), AttemptGranted(), stop_after_drained): TransitionResult(
-                    Attempting(Waiting()), RunAttempt()
+                    (Recovering(), RecoveryLoaded("resumable"), stop_after_drained),
+                    TransitionResult(Waiting(), WaitForAttempt(arm_restored=True)),
                 ),
-                (Waiting(), RecoveryEnded("absence"), stop_after_drained): TransitionResult(
-                    Closing("absence"), CommitClosure("absence")
+                (
+                    (Recovering(), RecoveryLoaded("needs_interrupted_close"), stop_after_drained),
+                    TransitionResult(Closing("restart_interrupted"), CommitClosure("restart_interrupted")),
                 ),
-                (Waiting(), RecoveryEnded("recovery_exhausted"), stop_after_drained): TransitionResult(
-                    Closing("recovery_exhausted"), CommitClosure("recovery_exhausted")
+                ((Idle(), AttemptGranted(), stop_after_drained), TransitionResult(Attempting(Idle()), RunAttempt())),
+                (
+                    (Waiting(), AttemptGranted(), stop_after_drained),
+                    TransitionResult(Attempting(Waiting()), RunAttempt()),
                 ),
-                (Closing("drained"), ClosureCommitted(), stop_after_drained): EXPECTED_CLOSURE_RESULTS["drained"][
-                    stop_after_drained
-                ],
-                (Closing("absence"), ClosureCommitted(), stop_after_drained): EXPECTED_CLOSURE_RESULTS["absence"][
-                    stop_after_drained
-                ],
                 (
-                    Closing("recovery_exhausted"),
-                    ClosureCommitted(),
-                    stop_after_drained,
-                ): EXPECTED_CLOSURE_RESULTS["recovery_exhausted"][stop_after_drained],
+                    (Waiting(), RecoveryEnded("absence"), stop_after_drained),
+                    TransitionResult(Closing("absence"), CommitClosure("absence")),
+                ),
                 (
-                    Closing("restart_interrupted"),
-                    ClosureCommitted(),
-                    stop_after_drained,
-                ): EXPECTED_CLOSURE_RESULTS["restart_interrupted"][stop_after_drained],
+                    (Waiting(), RecoveryEnded("recovery_exhausted"), stop_after_drained),
+                    TransitionResult(Closing("recovery_exhausted"), CommitClosure("recovery_exhausted")),
+                ),
                 (
-                    Closing("operator_limit"),
-                    ClosureCommitted(),
-                    stop_after_drained,
-                ): EXPECTED_CLOSURE_RESULTS["operator_limit"][stop_after_drained],
-            }
+                    (Closing("drained"), ClosureCommitted(), stop_after_drained),
+                    EXPECTED_CLOSURE_RESULTS["drained"][stop_after_drained],
+                ),
+                (
+                    (Closing("absence"), ClosureCommitted(), stop_after_drained),
+                    EXPECTED_CLOSURE_RESULTS["absence"][stop_after_drained],
+                ),
+                (
+                    (Closing("recovery_exhausted"), ClosureCommitted(), stop_after_drained),
+                    EXPECTED_CLOSURE_RESULTS["recovery_exhausted"][stop_after_drained],
+                ),
+                (
+                    (Closing("restart_interrupted"), ClosureCommitted(), stop_after_drained),
+                    EXPECTED_CLOSURE_RESULTS["restart_interrupted"][stop_after_drained],
+                ),
+                (
+                    (Closing("operator_limit"), ClosureCommitted(), stop_after_drained),
+                    EXPECTED_CLOSURE_RESULTS["operator_limit"][stop_after_drained],
+                ),
+            ]
         )
         for origin in (Idle(), Waiting()):
-            rows.update(
-                {
-                    (Attempting(origin), SessionFinished(DrainConfirmed()), stop_after_drained): TransitionResult(
-                        Closing("drained"), CommitClosure("drained")
+            rows.extend(
+                [
+                    (
+                        (Attempting(origin), SessionFinished(DrainConfirmed()), stop_after_drained),
+                        TransitionResult(Closing("drained"), CommitClosure("drained")),
                     ),
                     (
-                        Attempting(origin),
-                        SessionFinished(CandidateUnavailable()),
-                        stop_after_drained,
-                    ): TransitionResult(origin, WaitForAttempt(previous_outcome=CandidateUnavailable())),
+                        (
+                            Attempting(origin),
+                            SessionFinished(CandidateUnavailable()),
+                            stop_after_drained,
+                        ),
+                        TransitionResult(origin, WaitForAttempt(previous_outcome=CandidateUnavailable())),
+                    ),
                     (
-                        Attempting(origin),
-                        SessionFinished(OperatorBatchCompleted()),
-                        stop_after_drained,
-                    ): TransitionResult(Closing("operator_limit"), CommitClosure("operator_limit")),
-                }
+                        (
+                            Attempting(origin),
+                            SessionFinished(OperatorBatchCompleted()),
+                            stop_after_drained,
+                        ),
+                        TransitionResult(Closing("operator_limit"), CommitClosure("operator_limit")),
+                    ),
+                ]
             )
             for outcome in OUTCOMES:
                 if isinstance(outcome, Interrupted):
-                    rows[(Attempting(origin), SessionFinished(outcome), stop_after_drained)] = TransitionResult(
-                        Waiting(), WaitForAttempt(previous_outcome=outcome)
+                    rows.append(
+                        (
+                            (Attempting(origin), SessionFinished(outcome), stop_after_drained),
+                            TransitionResult(Waiting(), WaitForAttempt(previous_outcome=outcome)),
+                        )
                     )
         for state in STATES:
             if not isinstance(state, Stopped):
-                rows[(state, Shutdown(), stop_after_drained)] = TransitionResult(Stopped(), PreserveAndStop())
+                rows.append(((state, Shutdown(), stop_after_drained), TransitionResult(Stopped(), PreserveAndStop())))
             else:
                 for event in EVENTS:
-                    rows[(state, event, stop_after_drained)] = TransitionResult(state, NoOp())
+                    rows.append(((state, event, stop_after_drained), TransitionResult(state, NoOp())))
         for state in (Closing(reason) for reason in CLOSE_REASONS):
-            rows[(state, CloseFailed(), stop_after_drained)] = TransitionResult(Stopped(), PreserveAndStop())
+            rows.append(((state, CloseFailed(), stop_after_drained), TransitionResult(Stopped(), PreserveAndStop())))
     return rows
 
-
-EXPECTED_TRANSITIONS = _expected_transitions()
 
 FIELD_INVENTORY = {
     Recovering: (),
@@ -332,6 +345,7 @@ def test_invalid_events_raise_visit_transition_error(state: object, event: objec
 
 
 def test_finite_model_is_exhaustive_and_reachable() -> None:
+    expected_transitions = _expected_transitions()
     assert set(_alias_args(VisitState)) == {Recovering, Idle, Waiting, Attempting, Closing, Stopped}
     assert set(_alias_args(VisitEvent)) == {
         RecoveryLoaded,
@@ -365,12 +379,16 @@ def test_finite_model_is_exhaustive_and_reachable() -> None:
     assert len(STATES) == 11
     assert len(EVENTS) == 16
     assert len(STATES) * len(EVENTS) * len(STOP_POLICIES) == 352
-    assert len(EXPECTED_TRANSITIONS) == 114
-    assert set(EXPECTED_TRANSITIONS) == {
+    assert len(expected_transitions) == 114
+    legal_keys = [
         (state, event, stop_after_drained)
         for state, event, stop_after_drained in product(STATES, EVENTS, STOP_POLICIES)
         if type(event) in LEGAL_EVENT_TYPES[type(state)]
-    }
+    ]
+    assert len(legal_keys) == 114
+    assert all(
+        sum(expected_key == legal_key for expected_key, _ in expected_transitions) == 1 for legal_key in legal_keys
+    )
     assert {state.reason for state in STATES if isinstance(state, Closing)} == set(CLOSE_REASONS)
     assert {event.disposition for event in EVENTS if isinstance(event, RecoveryLoaded)} == set(RECOVERY_DISPOSITIONS)
     assert {event.reason for event in EVENTS if isinstance(event, RecoveryEnded)} == set(RECOVERY_END_REASONS)
@@ -394,7 +412,13 @@ def test_finite_model_is_exhaustive_and_reachable() -> None:
         accepted += 1
         assert result.state in STATES
         assert isinstance(result.command, COMMAND_TYPES)
-        assert result == EXPECTED_TRANSITIONS[(state, event, stop_after_drained)]
+        expected_matches = [
+            expected
+            for expected_key, expected in expected_transitions
+            if expected_key == (state, event, stop_after_drained)
+        ]
+        assert len(expected_matches) == 1
+        assert result == expected_matches[0]
         _assert_finite_invariants(state, event, result, stop_after_drained)
 
     assert (accepted, rejected) == (114, 238)
@@ -440,7 +464,7 @@ def _assert_finite_invariants(
 def _assert_all_states_reachable() -> None:
     for stop_after_drained in STOP_POLICIES:
         pending = [initial_transition().state]
-        reached = {pending[0]}
+        reached = [pending[0]]
         while pending:
             state = pending.pop()
             for event in EVENTS:
@@ -450,6 +474,7 @@ def _assert_all_states_reachable() -> None:
                     continue
                 assert result.state in STATES
                 if result.state not in reached:
-                    reached.add(result.state)
+                    reached.append(result.state)
                     pending.append(result.state)
-        assert reached == set(STATES)
+        assert len(reached) == len(STATES)
+        assert all(state in reached for state in STATES)

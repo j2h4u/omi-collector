@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from json import dumps, loads
 from pathlib import Path
 from struct import pack
@@ -19,6 +20,7 @@ from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.ports import StagingPort
 from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
 from omi_collector.capture.application.quarantine_maintenance import (
+    OpportunisticSyncError,
     PendingStartupState,
     QuarantineMaintenance,
 )
@@ -38,12 +40,12 @@ def _record(value: int) -> bytes:
     return pack(">I", value) + bytes((value % 256,)) * (RECORD_SIZE - 4)
 
 
-def _seed_streaming_partial(store: StagingStore, count: int) -> bytes:
-    attempt = store.prepare_streaming_attempt(100, count)
-    records = b"".join(_record(sequence) for sequence in range(100, 100 + count))
-    attempt.record_read_begin(ReadBeginNotification(100, count))
+def _seed_streaming_partial(store: StagingStore, count: int, *, start_sequence: int = 100) -> bytes:
+    attempt = store.prepare_streaming_attempt(start_sequence, count)
+    records = b"".join(_record(sequence) for sequence in range(start_sequence, start_sequence + count))
+    attempt.record_read_begin(ReadBeginNotification(start_sequence, count))
     for index in range(count):
-        attempt.accept_chunk(100 + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
+        attempt.accept_chunk(start_sequence + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
     attempt.checkpoint()
     attempt.close(durable=True)
     return records
@@ -863,7 +865,7 @@ def test_successful_recovery_after_device_contention_clears_blocked_state(
     async def scenario() -> None:
         store = _store(tmp_path)
         attempts = 0
-        events: list[tuple[str, str]] = []
+        events: list[tuple[str, str, int | None]] = []
 
         def recover_and_publish() -> object | None:
             nonlocal attempts
@@ -877,9 +879,11 @@ def test_successful_recovery_after_device_contention_clears_blocked_state(
         monkeypatch.setattr(
             runtime,
             "debug_exception",
-            lambda event, _error, **_fields: events.append(("exception", event)),
+            lambda event, _error, **fields: events.append(
+                ("exception", event, cast(int | None, fields.get("attempt")))
+            ),
         )
-        monkeypatch.setattr(runtime, "debug_event", lambda event, **_fields: events.append(("event", event)))
+        monkeypatch.setattr(runtime, "debug_event", lambda event, **_fields: events.append(("event", event, None)))
         config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.001,)))
         maintenance = QuarantineMaintenance(store, None, runtime, config=config)
 
@@ -887,8 +891,8 @@ def test_successful_recovery_after_device_contention_clears_blocked_state(
 
         assert attempts == 2
         assert events == [
-            ("exception", "ready_publication_blocked"),
-            ("event", success_event),
+            ("exception", "ready_publication_blocked", 1),
+            ("event", success_event, None),
         ]
 
     _run(scenario())
@@ -1428,5 +1432,582 @@ def test_cancellation_after_internal_permit_closes_presence(tmp_path: Path) -> N
         with pytest.raises(asyncio.CancelledError):
             await task
         assert presence.closed
+
+    _run(scenario())
+
+
+def test_invalidated_startup_state_rebinds_new_authenticated_pending_attempt(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                return None
+
+        store = _store(tmp_path)
+        _seed_streaming_partial(store, 1)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        bound: list[PendingStartupState] = []
+        await maintenance.wait_for_presence_attempt(Presence(), bound.append)
+        first = bound[0].pending
+        assert first is not None
+
+        with store.device_lock() as lease:
+            completed = store.resume_streaming_attempt(lease)
+            assert completed is not None
+            assert completed.publish_prefix() is not None
+            completed.close(durable=True)
+        store.terminalize_prefix_attempt(first.attempt_id)
+        _seed_streaming_partial(store, 1)
+        second_expected = store.pending_attempts()[0]
+
+        maintenance.invalidate_startup_state()
+        await maintenance.wait_for_presence_attempt(Presence(), bound.append)
+        await maintenance.close()
+
+        assert len(bound) == 2
+        assert bound[0].pending is not None and bound[0].pending.attempt_id == first.attempt_id
+        assert bound[1].pending is not None and bound[1].pending.attempt_id == second_expected.attempt_id
+        assert bound[1].pending.attempt_id != bound[0].pending.attempt_id
+
+    _run(scenario())
+
+
+def test_two_pending_startup_sources_remain_blocked_while_promotion_lease_is_busy(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        _seed_streaming_partial(store, 1)
+        _seed_streaming_partial(store, 2)
+        before = {path.name: _source_snapshot(path) for path in store.attempts_root.iterdir()}
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        try:
+            with (
+                store.device_lock(operation="competing-promotion"),
+                pytest.raises(DeviceAlreadyRunningError),
+            ):
+                await maintenance.prepare_pending_startup()
+        finally:
+            await maintenance.close()
+
+        assert {path.name: _source_snapshot(path) for path in store.attempts_root.iterdir()} == before
+        assert len(store.pending_attempts()) == 2
+        assert tuple(store.quarantined_attempts()) == ()
+
+    _run(scenario())
+
+
+def test_pending_descriptor_disappearance_between_inspection_and_open_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    records = _seed_streaming_partial(store, 1)
+    descriptor = store.pending_attempts()[0]
+    original_lock = store.device_lock
+    moved: list[Path] = []
+
+    @contextmanager
+    def move_before_resume(*, recover_capture_temporaries: bool = True, operation: str = "unknown") -> Iterator[object]:
+        if operation == "resume_pending_attempt":
+            moved.append(store.quarantine_attempt_source(descriptor.attempt_id))
+        with original_lock(recover_capture_temporaries=recover_capture_temporaries, operation=operation) as lease:
+            yield lease
+
+    monkeypatch.setattr(store, "device_lock", move_before_resume)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+
+    with pytest.raises(OpportunisticSyncError, match="pending attempt disappeared"):
+        _run(maintenance.prepare_pending_startup())
+
+    assert len(moved) == 1
+    assert not (store.attempts_root / descriptor.attempt_id).exists()
+    assert moved[0].is_dir()
+    assert (moved[0] / "records.bin").read_bytes() == records
+    assert store.pending_attempts() == ()
+    _run(maintenance.close())
+
+
+@pytest.mark.parametrize("terminal_marker", ["published", "unprocessable"])
+def test_salvage_skips_source_made_terminal_after_inventory_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_marker: str
+) -> None:
+    store, first, second = _prepare_terminal_salvage_sources(tmp_path)
+    first_before = _source_snapshot(first)
+    original_inventory = store.quarantined_attempts
+    original_mark_unprocessable = store.mark_quarantine_unprocessable
+    unprocessable_marks: list[tuple[Path, str]] = []
+    marked: list[Path] = []
+
+    def record_unprocessable(source: Path, reason: str) -> None:
+        unprocessable_marks.append((source, reason))
+        original_mark_unprocessable(source, reason)
+
+    monkeypatch.setattr(store, "mark_quarantine_unprocessable", record_unprocessable)
+
+    def mark_terminal_after_inventory(*, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
+        sources = original_inventory(should_defer=should_defer)
+        if first not in marked:
+            marked.append(first)
+            if terminal_marker == "published":
+                store.mark_quarantine_published(first)
+            else:
+                store.mark_quarantine_unprocessable(first, "concurrent terminal classification")
+        return sources
+
+    monkeypatch.setattr(store, "quarantined_attempts", mark_terminal_after_inventory)
+    runtime = OpportunisticRuntime()
+    original_publish = runtime.publish_quarantined_prefix
+    publish_calls: list[Path] = []
+
+    def record_publish(source: Path, staging: StagingPort, *, should_defer: Callable[[], bool]) -> object:
+        publish_calls.append(source)
+        return original_publish(source, staging, should_defer=should_defer)
+
+    monkeypatch.setattr(runtime, "publish_quarantined_prefix", record_publish)
+    maintenance = QuarantineMaintenance(store, None, runtime)
+    _run(maintenance.run_once(lambda: False))
+    _run(maintenance.close())
+
+    assert marked == [first]
+    assert store.quarantine_state(first).name.upper() == terminal_marker.upper()
+    assert _source_snapshot(first) == first_before | {
+        "published.json" if terminal_marker == "published" else "unprocessable.json": (
+            first / ("published.json" if terminal_marker == "published" else "unprocessable.json")
+        ).read_bytes()
+    }
+    assert publish_calls == [second]
+    assert unprocessable_marks == (
+        [(first, "concurrent terminal classification")] if terminal_marker == "unprocessable" else []
+    )
+    assert (second / "published.json").is_file()
+    assert len(tuple(store.capture_root.iterdir())) >= 1
+
+
+def _prepare_terminal_salvage_sources(tmp_path: Path) -> tuple[StagingStore, Path, Path]:
+    store = StagingStore(tmp_path / "spool", tmp_path / "captures")
+    for count, start_sequence in ((1, 100), (2, 200)):
+        _seed_streaming_partial(store, count, start_sequence=start_sequence)
+        pending = store.pending_attempts()
+        assert len(pending) == 1
+        store.quarantine_attempt_source(pending[0].attempt_id)
+        assert tuple(store.capture_root.iterdir()) == ()
+    sources = store.quarantined_attempts()
+    first, second = sources
+    assert all(store.quarantine_state(source).name.upper() == "RETRYABLE" for source in sources)
+    return store, first, second
+
+
+def test_published_marker_failure_keeps_first_bundle_and_still_processes_second_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    sources = _quarantine_sources(store, (1, 2))
+    before = {source: _source_snapshot(source) for source in sources}
+    original_mark = store.mark_quarantine_published
+    failed: list[Path] = []
+
+    def fail_first_marker(source: Path) -> None:
+        if source == sources[0] and not failed:
+            failed.append(source)
+            raise OSError("published marker unavailable")
+        original_mark(source)
+
+    monkeypatch.setattr(store, "mark_quarantine_published", fail_first_marker)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    _run(maintenance.run_once(lambda: False))
+    _run(maintenance.close())
+
+    assert failed == [sources[0]]
+    assert _source_snapshot(sources[0]) == before[sources[0]]
+    assert not (sources[0] / "published.json").exists()
+    assert (sources[1] / "published.json").is_file()
+    bundles = tuple(store.capture_root.iterdir())
+    assert len(bundles) == 2
+    assert {bundle.joinpath("records.bin").read_bytes() for bundle in bundles} == {
+        before[source]["records.bin"] for source in sources
+    }
+
+
+def test_quarantine_retry_backoff_stays_at_last_delay_after_repeated_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    sources = _quarantine_sources(store, (1, 2))
+    now = 100.0
+    monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
+    backoff = (1.0, 3.0)
+    config = CollectorConfig(
+        retry=RetryConfig(maintenance_interval_seconds=0.1, quarantine_publish_backoff_seconds=backoff)
+    )
+    calls: list[Path] = []
+    runtime = OpportunisticRuntime()
+
+    def keep_retryable_failure(
+        source: Path,
+        _staging: StagingPort,
+        *,
+        should_defer: Callable[[], bool],
+    ) -> object:
+        assert not should_defer()
+        calls.append(source)
+        raise OSError("persistent temporary publication failure")
+
+    monkeypatch.setattr(runtime, "publish_quarantined_prefix", keep_retryable_failure)
+    maintenance = QuarantineMaintenance(store, None, runtime, config=config)
+    total_attempts = len(backoff) + 3
+    try:
+        for attempt in range(total_attempts):
+            if attempt:
+                now += backoff[min(attempt - 1, len(backoff) - 1)] + 0.01
+            _run(maintenance.run_once(lambda: False))
+    finally:
+        _run(maintenance.close())
+
+    assert calls == [sources[0]] * total_attempts
+    assert all(not (source / "published.json").exists() for source in sources)
+    assert all(not (source / "unprocessable.json").exists() for source in sources)
+    assert tuple(store.capture_root.iterdir()) == ()
+
+
+def test_startup_failure_before_presence_permit_leaves_presence_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        inspection_started = threading.Event()
+        release_inspection = threading.Event()
+        waiter_cancelled = asyncio.Event()
+
+        class Presence:
+            closed = False
+
+            async def wait_for_attempt(self) -> PresenceWake:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    waiter_cancelled.set()
+                    raise
+                raise AssertionError("presence waiter should remain blocked")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        store = _store(tmp_path)
+        original_pending = store.pending_attempts
+
+        def fail_public_startup_inspection() -> object:
+            inspection_started.set()
+            if not release_inspection.wait(2):
+                raise TimeoutError("startup inspection was not released")
+            raise RuntimeError("startup inspection failed")
+
+        monkeypatch.setattr(store, "pending_attempts", fail_public_startup_inspection)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        presence = Presence()
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(presence, lambda _: None))
+        try:
+            assert await asyncio.to_thread(inspection_started.wait, 1)
+            release_inspection.set()
+            with pytest.raises(RuntimeError, match="startup inspection failed"):
+                await owner
+            assert waiter_cancelled.is_set()
+            assert not presence.closed
+            assert store.pending_attempts is fail_public_startup_inspection
+        finally:
+            release_inspection.set()
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+            monkeypatch.setattr(store, "pending_attempts", original_pending)
+
+    _run(scenario())
+
+
+def test_presence_wake_waits_until_public_maintenance_scan_finishes(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        scan_finished = threading.Event()
+        release_wake = asyncio.Event()
+        bind_finished = asyncio.Event()
+
+        class Presence:
+            closed = False
+
+            async def wait_for_attempt(self) -> PresenceWake:
+                await release_wake.wait()
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        store = _store(tmp_path)
+        original_scan = store.quarantined_attempts
+
+        def record_final_public_scan(*, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
+            sources = original_scan(should_defer=should_defer)
+            scan_finished.set()
+            return sources
+
+        store.quarantined_attempts = record_final_public_scan  # type: ignore[method-assign]
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        bound: list[PendingStartupState] = []
+
+        def bind(state: PendingStartupState) -> None:
+            bound.append(state)
+            bind_finished.set()
+
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), bind))
+        try:
+            assert await asyncio.to_thread(scan_finished.wait, 2)
+            assert bind_finished.is_set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not owner.done()
+            release_wake.set()
+            wake = await asyncio.wait_for(owner, timeout=2)
+            assert wake == PresenceWake("advertisement")
+            assert bound == [PendingStartupState(None, None, "empty")]
+        finally:
+            release_wake.set()
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_repeated_owner_cancellation_during_startup_failure_cleanup_preserves_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        inspection_started = threading.Event()
+        release_inspection = threading.Event()
+        cancellation_cleanup_started = asyncio.Event()
+        failure = RuntimeError("authoritative startup failure")
+        owner: asyncio.Task[object] | None = None
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_cleanup_started.set()
+                    current = asyncio.current_task()
+                    assert current is not None
+                    current.get_loop().call_soon(owner.cancel)  # type: ignore[union-attr]
+                    current.get_loop().call_soon(owner.cancel)  # type: ignore[union-attr]
+                    raise
+                raise AssertionError("presence waiter should remain blocked")
+
+            async def close(self) -> None:
+                return None
+
+        store = _store(tmp_path)
+
+        def fail_after_gate() -> object:
+            inspection_started.set()
+            if not release_inspection.wait(2):
+                raise TimeoutError("startup inspection was not released")
+            raise failure
+
+        monkeypatch.setattr(store, "pending_attempts", fail_after_gate)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
+        try:
+            assert await asyncio.to_thread(inspection_started.wait, 1)
+            release_inspection.set()
+            with pytest.raises(asyncio.CancelledError) as error:
+                await owner
+            assert error.value.__cause__ is failure
+            assert cancellation_cleanup_started.is_set()
+            assert owner.done()
+        finally:
+            release_inspection.set()
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_successful_publication_retry_schedule_finishes_without_a_second_invocation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        started = threading.Event()
+        calls: list[None] = []
+
+        def recovered() -> None:
+            calls.append(None)
+            started.set()
+
+        store.recover_and_publish = recovered  # type: ignore[method-assign]
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        try:
+            maintenance.schedule_publication_retry()
+            assert await asyncio.to_thread(started.wait, 1)
+            await asyncio.sleep(0.02)
+            assert calls == [None]
+        finally:
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_publication_retry_timer_observes_exact_deadline_and_saturates_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        now = 100.0
+        calls = 0
+        six_calls = threading.Event()
+        monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
+        real_sleep = asyncio.sleep
+
+        async def skip_local_retry_delay(_delay: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr(
+            "omi_collector.capture.application.quarantine_maintenance.asyncio.sleep", skip_local_retry_delay
+        )
+        loop = asyncio.get_running_loop()
+        original_call_later = loop.call_later
+        scheduled: list[tuple[float, Callable[..., object], tuple[object, ...], asyncio.TimerHandle]] = []
+
+        def controlled_call_later(delay: float, callback: Callable[..., object], *args: object) -> asyncio.TimerHandle:
+            handle = original_call_later(3600.0, callback, *args)
+            scheduled.append((now + delay, callback, args, handle))
+            return handle
+
+        monkeypatch.setattr(loop, "call_later", controlled_call_later)
+
+        def keep_failing() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 6:
+                six_calls.set()
+            raise OSError("local publication remains blocked")
+
+        store.recover_and_publish = keep_failing  # type: ignore[method-assign]
+        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.1, 0.2)))
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
+        try:
+            await maintenance.ensure_publication_ready()
+            assert calls == len(config.retry.rapid_backoff) + 1
+            assert len(scheduled) == 1
+            deadline, callback, args, handle = scheduled[0]
+            assert deadline == 100.2
+            now = deadline - 0.001
+            await real_sleep(0)
+            assert calls == 3
+            handle.cancel()
+            now = deadline
+            callback(*args)
+            assert await asyncio.to_thread(six_calls.wait, 1)
+            for _ in range(10):
+                await real_sleep(0)
+            assert calls == 6
+            assert len(scheduled) == 2
+            assert scheduled[1][0] == now + config.retry.rapid_backoff[-1]
+        finally:
+            await maintenance.close()
+
+    _run(scenario())
+
+
+class _TwoBlockedRecoveries:
+    def __init__(self, recover: Callable[[], object | None]) -> None:
+        self.recover = recover
+        self.started = (threading.Event(), threading.Event())
+        self.release = (threading.Event(), threading.Event())
+        self.finished = (threading.Event(), threading.Event())
+        self.lock = threading.Lock()
+        self.calls = 0
+        self.active = 0
+        self.maximum_active = 0
+
+    def __call__(self) -> object | None:
+        with self.lock:
+            self.calls += 1
+            index = self.calls - 1
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+        try:
+            if index < 2:
+                self.started[index].set()
+                if not self.release[index].wait(2):
+                    raise TimeoutError("publication recovery was not released")
+            return self.recover()
+        finally:
+            if index < 2:
+                self.finished[index].set()
+            with self.lock:
+                self.active -= 1
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    assert await asyncio.to_thread(event.wait, 1)
+
+
+async def _exercise_background_coalescing(maintenance: QuarantineMaintenance, recovery: _TwoBlockedRecoveries) -> None:
+    try:
+        maintenance.schedule_publication_retry()
+        await _wait_for_thread_event(recovery.started[0])
+        maintenance.schedule_publication_retry()
+        maintenance.schedule_publication_retry()
+        recovery.release[0].set()
+        await _wait_for_thread_event(recovery.started[1])
+        recovery.release[1].set()
+        await _wait_for_thread_event(recovery.finished[1])
+        await asyncio.sleep(0.02)
+        assert recovery.calls == 2
+        assert recovery.maximum_active == 1
+    finally:
+        recovery.release[0].set()
+        recovery.release[1].set()
+        await maintenance.close()
+
+
+async def _exercise_capture_priority_coalescing(
+    maintenance: QuarantineMaintenance, recovery: _TwoBlockedRecoveries
+) -> None:
+    entering: asyncio.Task[None] | None = None
+    try:
+        maintenance.schedule_publication_retry()
+        await _wait_for_thread_event(recovery.started[0])
+        entering = asyncio.create_task(maintenance.enter_capture_priority())
+        await asyncio.sleep(0)
+        maintenance.schedule_publication_retry()
+        assert recovery.calls == 1
+        recovery.release[0].set()
+        await entering
+        maintenance.exit_capture_priority()
+        await _wait_for_thread_event(recovery.started[1])
+        recovery.release[1].set()
+        await _wait_for_thread_event(recovery.finished[1])
+        await asyncio.sleep(0.02)
+        assert recovery.calls == 2
+        assert recovery.maximum_active == 1
+    finally:
+        recovery.release[0].set()
+        recovery.release[1].set()
+        if entering is not None:
+            await asyncio.gather(entering, return_exceptions=True)
+        await maintenance.close()
+
+
+def test_background_publication_requests_coalesce_to_one_follow_up_in_both_priorities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path / "background")
+        recovery = _TwoBlockedRecoveries(store.recover_and_publish)
+        monkeypatch.setattr(store, "recover_and_publish", recovery)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        await _exercise_background_coalescing(maintenance, recovery)
+
+        capture_store = _store(tmp_path / "capture")
+        capture_recovery = _TwoBlockedRecoveries(capture_store.recover_and_publish)
+        monkeypatch.setattr(capture_store, "recover_and_publish", capture_recovery)
+        capture_maintenance = QuarantineMaintenance(capture_store, None, OpportunisticRuntime())
+        await _exercise_capture_priority_coalescing(capture_maintenance, capture_recovery)
 
     _run(scenario())

@@ -2052,9 +2052,10 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
         clock=clock,
         sleep=clock.sleep,
     )
+    watchdog = asyncio.timeout(5.0)
     try:
         with pytest.raises(StopAfterCooldownError):
-            async with asyncio.timeout(5.0) as watchdog:
+            async with watchdog:
                 await run_opportunistic_collector(
                     lambda _candidate: Context(),
                     StagingStore(tmp_path, _capture_root(tmp_path)),

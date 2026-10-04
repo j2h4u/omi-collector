@@ -31,6 +31,12 @@ class DurableMarker:
     record_count: int
 
 
+@dataclass(frozen=True)
+class UnvalidatedMarker:
+    next_sequence: object
+    record_count: object
+
+
 @dataclass
 class FakeTarget:
     calls: list[tuple[str, int, bytes | object]] = field(default_factory=list)
@@ -58,6 +64,7 @@ class FakeTarget:
     seal_calls: int = 0
     close_calls: int = 0
     checkpoint_result: object = "checkpointed"
+    prepare_leg_result: object = "prepared"
     append_readonly: list[bool] = field(default_factory=list)
     append_offsets: list[int] = field(default_factory=list)
     second_append_started: threading.Event = field(default_factory=threading.Event)
@@ -75,7 +82,7 @@ class FakeTarget:
 
     def prepare_leg(self, start_sequence: int, record_count: int) -> object:
         self._record("prepare_leg", (start_sequence, record_count))
-        return "prepared"
+        return self.prepare_leg_result
 
     def read_begin(self, notice: object) -> object:
         self._record("read_begin", notice)
@@ -518,6 +525,131 @@ async def _test_snapshot_records_durable_checkpoint_ack_without_target_inspectio
         assert writer.snapshot.durable_next_sequence == 102
         assert writer.snapshot.durable_record_count == 2
         await writer.close()
+
+
+def test_prepare_leg_accepts_zero_count_and_forwards_target_receipt() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _owned_writer(target, bytearray()) as writer:
+            await writer.start()
+
+            result = await writer.prepare_leg(0, 0)
+
+            assert result == "prepared"
+            assert target.calls[-1] == ("prepare_leg", 0, (0, 0))
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("start_sequence,record_count", [(-1, 0), (0, -1)])
+def test_prepare_leg_rejects_negative_values_before_target_call(start_sequence: int, record_count: int) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray()) as writer:
+            calls_before = tuple(target.calls)
+
+            with pytest.raises(ValueError):
+                await writer.prepare_leg(start_sequence, record_count)
+
+            assert tuple(target.calls) == calls_before
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("timeout", [0, -0.5])
+def test_invalid_close_timeout_leaves_writer_usable(timeout: float) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray(RECORD_SIZE)) as writer:
+            with pytest.raises(ValueError, match="timeout must be positive"):
+                await writer.close(timeout=timeout)
+
+            assert target.close_calls == 0
+            assert writer.publish(RECORD_SIZE)
+            assert await writer.barrier() == "checkpointed"
+            assert writer.written_bytes == RECORD_SIZE
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_progress_byte_properties_track_snapshot_around_blocked_append() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_append=True)
+        async with _started(target, bytearray(RECORD_SIZE)) as writer:
+            before = writer.snapshot
+            assert (writer.submitted_bytes, writer.written_bytes) == (before.submitted, before.written) == (0, 0)
+            assert writer.publish(RECORD_SIZE)
+            assert await asyncio.to_thread(target.append_started.wait, 1)
+
+            blocked = writer.snapshot
+            assert (writer.submitted_bytes, writer.written_bytes) == (blocked.submitted, blocked.written)
+            assert (blocked.submitted, blocked.written) == (RECORD_SIZE, 0)
+
+            target.release_append.set()
+            await writer.barrier()
+            completed = writer.snapshot
+            assert (writer.submitted_bytes, writer.written_bytes) == (completed.submitted, completed.written)
+            assert (completed.submitted, completed.written) == (RECORD_SIZE, RECORD_SIZE)
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        DurableMarker(-1, 2),
+        DurableMarker(102, -1),
+        UnvalidatedMarker("102", 2),
+        UnvalidatedMarker(102, "2"),
+    ],
+)
+def test_invalid_checkpoint_receipt_preserves_last_valid_snapshot(receipt: object) -> None:
+    async def exercise() -> None:
+        target = FakeTarget(checkpoint_result=DurableMarker(102, 2))
+        async with _started(target, bytearray()) as writer:
+            await writer.checkpoint()
+            acknowledged = writer.snapshot
+            assert (acknowledged.durable_next_sequence, acknowledged.durable_record_count) == (102, 2)
+
+            target.checkpoint_result = receipt
+            assert await writer.checkpoint() == receipt
+            assert writer.snapshot == acknowledged
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_zero_checkpoint_receipt_replaces_previous_acknowledgment() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(checkpoint_result=DurableMarker(102, 2))
+        async with _started(target, bytearray()) as writer:
+            await writer.checkpoint()
+            target.checkpoint_result = DurableMarker(0, 0)
+
+            assert await writer.checkpoint() == DurableMarker(0, 0)
+            assert (writer.snapshot.durable_next_sequence, writer.snapshot.durable_record_count) == (0, 0)
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_prepare_leg_receipt_does_not_replace_checkpoint_acknowledgment() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(checkpoint_result=DurableMarker(102, 2))
+        target.prepare_leg_result = DurableMarker(103, 3)
+        async with _started(target, bytearray()) as writer:
+            await writer.checkpoint()
+            acknowledged = writer.snapshot
+
+            assert await writer.prepare_leg(100, 3) == DurableMarker(103, 3)
+            assert writer.snapshot == acknowledged
+            await writer.close()
+
+    asyncio.run(exercise())
 
 
 def test_target_failure_latches_and_prevents_seal() -> None:

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from errno import ENOSPC, EXDEV
+from errno import EEXIST, ENOSPC, EXDEV
 from hashlib import sha256
 from json import dumps, loads
-from os import PathLike, fsync
+from os import PathLike, fsdecode, fsync
 from pathlib import Path
 from shutil import rmtree
 from stat import S_IMODE
-from typing import cast
+from typing import BinaryIO, TextIO, cast
 
 import pytest
 
@@ -24,6 +24,7 @@ from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
     CollisionError,
     DiskSpaceError,
+    PendingAttemptError,
     StagingError,
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -90,6 +91,44 @@ def _write_capture_temporary(
 
 def _bundle_bytes(path: Path) -> dict[str, bytes]:
     return {entry.name: entry.read_bytes() for entry in path.iterdir() if entry.is_file()}
+
+
+def _race_capture_temporary_rename(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    temporary: Path,
+    destination: Path,
+    conflicting_raw: bytes | None = None,
+) -> tuple[dict[str, bytes], list[bool]]:
+    real_rename = publication.os.rename
+    temporary_bytes = _bundle_bytes(temporary)
+    reached: list[bool] = []
+
+    def racing_rename(
+        source: str | bytes | PathLike[str] | PathLike[bytes],
+        target: str | bytes | PathLike[str] | PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        if (
+            not reached
+            and Path(fsdecode(source)).name == temporary.name
+            and Path(fsdecode(target)).name == destination.name
+            and src_dir_fd is not None
+            and src_dir_fd == dst_dir_fd
+        ):
+            reached.append(True)
+            destination.mkdir()
+            for name, payload in temporary_bytes.items():
+                if name == "records.bin" and conflicting_raw is not None:
+                    payload = conflicting_raw
+                (destination / name).write_bytes(payload)
+            raise FileExistsError(EEXIST, "simulated canonical destination race", destination)
+        real_rename(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(publication.os, "rename", racing_rename)
+    return temporary_bytes, reached
 
 
 def _publish_one_record_bundle(tmp_path: Path, raw: bytes) -> Path:
@@ -859,3 +898,270 @@ def test_collision_detects_different_raw_size_and_invalid_receipt_hash(
     (bundle / "records.bin").write_bytes(b"short")
     with pytest.raises(CollisionError):
         duplicate.seal(DoneNotification(0, 101))
+
+
+def test_full_seal_rejects_symlink_raw_source_after_rename(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    attempt.accept_chunk(100, _record(1))
+    raw_path = attempt.path / "records.bin"
+    original_raw = raw_path.read_bytes()
+    original_inode = raw_path.stat().st_ino
+    external_raw = tmp_path / "external-records.bin"
+
+    try:
+        raw_path.rename(external_raw)
+        raw_path.symlink_to(external_raw)
+        assert raw_path.is_symlink()
+        assert raw_path.stat().st_ino == original_inode
+
+        with pytest.raises(StagingError, match="regular file"):
+            attempt.seal(DoneNotification(0, 101))
+
+        assert attempt.path.is_dir()
+        assert external_raw.read_bytes() == original_raw
+        assert not tuple(capture_root.glob("100-101-*"))
+        assert not tuple(capture_root.glob(".*.tmp"))
+    finally:
+        attempt.close()
+
+
+def test_capture_recovery_ignores_unowned_dot_and_tmp_directories(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    capture_root.mkdir(parents=True)
+    dot_note = capture_root / ".operator-note"
+    suffix_note = capture_root / "operator-note.tmp"
+    dot_note.mkdir()
+    suffix_note.mkdir()
+    (dot_note / "sentinel").write_bytes(b"dot-owned-by-operator")
+    (suffix_note / "sentinel").write_bytes(b"suffix-owned-by-operator")
+    raw = _record(1)
+    temporary = _write_capture_temporary(capture_root, raw)
+    store = StagingStore(tmp_path, capture_root)
+
+    with store.device_lock():
+        pass
+
+    canonical = capture_root / f"100-101-{sha256(raw).hexdigest()[:16]}"
+    assert dot_note.joinpath("sentinel").read_bytes() == b"dot-owned-by-operator"
+    assert suffix_note.joinpath("sentinel").read_bytes() == b"suffix-owned-by-operator"
+    assert not temporary.exists()
+    assert (canonical / "records.bin").read_bytes() == raw
+    assert not store.paths.quarantine.exists() or not tuple(store.paths.quarantine.iterdir())
+
+
+def test_capture_recovery_quarantines_temporary_with_noncanonical_nonce(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    capture_root.mkdir(parents=True)
+    temporary = _write_capture_temporary(capture_root, _record(1))
+    malformed = temporary.with_name(temporary.name.removesuffix(".tmp") + ".abc.tmp")
+    temporary.rename(malformed)
+    before = _bundle_bytes(malformed)
+    store = StagingStore(tmp_path, capture_root)
+
+    with store.device_lock():
+        pass
+
+    quarantined = tuple(store.paths.quarantine.iterdir())
+    assert len(quarantined) == 1
+    quarantined_bytes = _bundle_bytes(quarantined[0])
+    assert {name: quarantined_bytes[name] for name in before} == before
+    assert (quarantined[0] / "unprocessable.json").is_file()
+    assert not tuple(capture_root.glob("100-101-*"))
+
+
+def test_capture_recovery_quarantines_same_length_raw_hash_mismatch(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    capture_root.mkdir(parents=True)
+    expected_raw = _record(1)
+    temporary = _write_capture_temporary(capture_root, expected_raw)
+    corrupted_raw = _record(9)
+    (temporary / "records.bin").write_bytes(corrupted_raw)
+    before = _bundle_bytes(temporary)
+    store = StagingStore(tmp_path, capture_root)
+    assert len(corrupted_raw) == len(expected_raw)
+
+    with store.device_lock():
+        pass
+
+    quarantined = tuple(store.paths.quarantine.iterdir())
+    assert len(quarantined) == 1
+    quarantined_bytes = _bundle_bytes(quarantined[0])
+    assert {name: quarantined_bytes[name] for name in before} == before
+    assert (quarantined[0] / "unprocessable.json").is_file()
+    assert not tuple(capture_root.glob("100-101-*"))
+
+
+@pytest.mark.parametrize("conflict", [False, True], ids=["identical-destination", "conflicting-destination"])
+def test_capture_recovery_resolves_destination_created_during_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conflict: bool
+) -> None:
+    capture_root = _capture_root(tmp_path)
+    capture_root.mkdir(parents=True)
+    raw = _record(1)
+    temporary = _write_capture_temporary(capture_root, raw)
+    destination = capture_root / f"100-101-{sha256(raw).hexdigest()[:16]}"
+    conflict_raw = _record(9) if conflict else None
+    temporary_bytes, race_reached = _race_capture_temporary_rename(
+        monkeypatch,
+        temporary=temporary,
+        destination=destination,
+        conflicting_raw=conflict_raw,
+    )
+    assert not destination.exists()
+    store = StagingStore(tmp_path, capture_root)
+
+    with store.device_lock():
+        pass
+
+    assert race_reached == [True]
+    assert destination.is_dir()
+    expected_destination = dict(temporary_bytes)
+    if conflict_raw is not None:
+        expected_destination["records.bin"] = conflict_raw
+    assert _bundle_bytes(destination) == expected_destination
+    if conflict:
+        assert not temporary.exists()
+        quarantined = tuple(store.paths.quarantine.iterdir())
+        assert len(quarantined) == 1
+        quarantined_bytes = _bundle_bytes(quarantined[0])
+        assert {name: quarantined_bytes[name] for name in temporary_bytes} == temporary_bytes
+        assert (quarantined[0] / "unprocessable.json").is_file()
+    else:
+        assert not temporary.exists()
+        assert not store.paths.quarantine.exists() or not tuple(store.paths.quarantine.iterdir())
+
+
+def test_pending_admission_blocks_published_shape_without_read_begin(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(tmp_path, capture_root)
+    attempt = store.prepare_streaming_attempt(100, 1)
+    raw = _record(1)
+    raw_hash = sha256(raw).hexdigest()
+    descriptor = attempt.descriptor
+    attempt.close()
+    (attempt.path / "records.bin").write_bytes(raw)
+    (attempt.path / "manifest.json").write_text(
+        dumps(BundleManifest(2, 100, 101, 1, RECORD_SIZE, raw_hash).as_dict()), encoding="utf-8"
+    )
+    (attempt.path / "receipt.json").write_text(
+        dumps(SealedReceipt(descriptor.attempt_id, raw_hash).as_dict()), encoding="utf-8"
+    )
+
+    assert descriptor.read_begin_start is None
+    assert descriptor.read_begin_count is None
+    assert store.pending_attempts() == (descriptor,)
+    with pytest.raises(PendingAttemptError, match="partial staging evidence blocks"):
+        store.assert_no_pending()
+    assert attempt.path.joinpath("records.bin").read_bytes() == raw
+
+
+def test_pending_keeps_sealed_duplicate_when_source_raw_cannot_be_authenticated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _record(1)
+    first = _started_streaming_attempt(tmp_path, count=1)
+    first.accept_chunk(100, raw)
+    canonical = first.seal(DoneNotification(0, 101)).bundle_path
+    duplicate = _started_streaming_attempt(tmp_path, count=1)
+    duplicate.accept_chunk(100, raw)
+    assert duplicate.seal(DoneNotification(0, 101)).deduplicated
+    source_files = _bundle_bytes(duplicate.path)
+    canonical_files = _bundle_bytes(canonical)
+
+    original_open = cast(Callable[..., BinaryIO | TextIO], Path.open)
+
+    def fail_source_raw_open(
+        path: Path,
+        mode: str = "r",
+        *args: object,
+        **kwargs: object,
+    ) -> BinaryIO | TextIO:
+        if path == duplicate.path / "records.bin" and mode == "rb":
+            raise OSError("simulated raw authentication read failure")
+        return original_open(path, mode, *args, **kwargs)
+
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+
+    with monkeypatch.context() as path_io:
+        path_io.setattr(Path, "open", fail_source_raw_open)
+        assert store.pending_attempts() == (duplicate.descriptor,)
+    assert _bundle_bytes(duplicate.path) == source_files
+    assert _bundle_bytes(canonical) == canonical_files
+
+
+def test_pending_rejects_prefix_marker_after_destination_raw_corruption(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(tmp_path, capture_root)
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    source_raw = _record(1)
+    attempt.accept_chunk(100, source_raw)
+    attempt.checkpoint()
+    published = attempt.publish_prefix()
+    assert published is not None
+    attempt.close()
+    destination_files = _bundle_bytes(published.bundle_path)
+    source_marker = (attempt.path / "prefix-publication.json").read_bytes()
+    destination_raw = _record(9)
+    (published.bundle_path / "records.bin").write_bytes(destination_raw)
+
+    assert store.pending_attempts() == (attempt.descriptor,)
+    with pytest.raises(AttemptStateError, match="marker is invalid"):
+        store.terminalize_prefix_attempt(attempt.attempt_id)
+    assert not (attempt.path / "terminal-retired.json").exists()
+    assert (attempt.path / "prefix-publication.json").read_bytes() == source_marker
+    assert (attempt.path / "records.bin").read_bytes() == source_raw
+    expected_destination = dict(destination_files)
+    expected_destination["records.bin"] = destination_raw
+    assert _bundle_bytes(published.bundle_path) == expected_destination
+
+
+def test_prefix_collision_rejects_symlink_destination(tmp_path: Path) -> None:
+    _capture_root(tmp_path)
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    raw = _record(1)
+    attempt.accept_chunk(100, raw)
+    attempt.checkpoint()
+    published = attempt.publish_prefix()
+    assert published is not None
+    source_raw = (attempt.path / "records.bin").read_bytes()
+    source_marker = (attempt.path / "prefix-publication.json").read_bytes()
+    external = tmp_path / "moved-canonical"
+    published.bundle_path.rename(external)
+    published.bundle_path.symlink_to(external, target_is_directory=True)
+
+    try:
+        with pytest.raises(CollisionError):
+            attempt.publish_prefix()
+
+        assert (attempt.path / "records.bin").read_bytes() == source_raw
+        assert (attempt.path / "prefix-publication.json").read_bytes() == source_marker
+        assert published.bundle_path.is_symlink()
+        assert _bundle_bytes(external)["records.bin"] == raw
+    finally:
+        attempt.close()
+
+
+def test_prefix_collision_rejects_malformed_destination_manifest(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    raw = _record(1)
+    attempt.accept_chunk(100, raw)
+    attempt.checkpoint()
+    published = attempt.publish_prefix()
+    assert published is not None
+    source_raw = (attempt.path / "records.bin").read_bytes()
+    source_marker = (attempt.path / "prefix-publication.json").read_bytes()
+    destination_receipt = (published.bundle_path / "receipt.json").read_bytes()
+    (published.bundle_path / "manifest.json").write_text("{", encoding="utf-8")
+
+    try:
+        with pytest.raises(CollisionError):
+            attempt.publish_prefix()
+
+        assert (attempt.path / "records.bin").read_bytes() == source_raw
+        assert (attempt.path / "prefix-publication.json").read_bytes() == source_marker
+        assert (published.bundle_path / "manifest.json").read_bytes() == b"{"
+        assert (published.bundle_path / "receipt.json").read_bytes() == destination_receipt
+        assert (published.bundle_path / "records.bin").read_bytes() == raw
+    finally:
+        attempt.close()

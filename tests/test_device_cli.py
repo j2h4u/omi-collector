@@ -105,8 +105,8 @@ def _cleanup_cli_quality_metrics(monkeypatch: pytest.MonkeyPatch) -> Iterator[No
 
     monkeypatch.setattr(device_cli, "_quality_metrics", track_factory)
     yield
-    for metrics in created:
-        assert metrics.close()
+    closed = [metrics.close() for metrics in created]
+    assert all(closed)
 
 
 class FakeSession:

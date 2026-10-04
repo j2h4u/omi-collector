@@ -577,13 +577,13 @@ async def test_notification_callback_copies_mutable_payload() -> None:
     def factory(_device: str | object, _callback: Callable[[object], None]) -> FakeClient:
         return client
 
-    session = await BleakRingTransport("fake", client_factory=cast(ClientFactory, factory)).connect()
-    assert client.callback is not None
-    payload = bytearray(b"before")
-    client.callback(object(), payload)
-    payload[:] = b"after!"
+    async with BleakRingTransport("fake", client_factory=cast(ClientFactory, factory)) as session:
+        assert client.callback is not None
+        payload = bytearray(b"before")
+        client.callback(object(), payload)
+        payload[:] = b"after!"
 
-    assert await session.notifications().__anext__() == b"before"
+        assert await session.notifications().__anext__() == b"before"
 
 
 @_async_test
@@ -593,16 +593,16 @@ async def test_notification_queue_overflow_is_fatal() -> None:
     def factory(_device: str | object, _callback: Callable[[object], None]) -> FakeClient:
         return client
 
-    session = await BleakRingTransport(
+    async with BleakRingTransport(
         "fake", client_factory=cast(ClientFactory, factory), notification_buffer_bytes=3
-    ).connect()
-    assert client.callback is not None
-    client.callback(object(), bytearray(b"one"))
-    client.callback(object(), bytearray(b"two"))
+    ) as session:
+        assert client.callback is not None
+        client.callback(object(), bytearray(b"one"))
+        client.callback(object(), bytearray(b"two"))
 
-    assert await session.notifications().__anext__() == b"one"
-    with pytest.raises(NotificationOverflowError, match="overflowed"):
-        await session.notifications().__anext__()
+        assert await session.notifications().__anext__() == b"one"
+        with pytest.raises(NotificationOverflowError, match="overflowed"):
+            await session.notifications().__anext__()
 
 
 @_async_test
@@ -613,14 +613,14 @@ async def test_disconnect_callback_wakes_notification_consumer() -> None:
         client.disconnect_callback = callback
         return client
 
-    session = await BleakRingTransport("fake", client_factory=cast(ClientFactory, factory)).connect()
-    pending = asyncio.create_task(cast(Coroutine[object, object, bytes], session.notifications().__anext__()))
-    await asyncio.sleep(0)
-    assert client.disconnect_callback is not None
-    client.disconnect_callback(client)
+    async with BleakRingTransport("fake", client_factory=cast(ClientFactory, factory)) as session:
+        pending = asyncio.create_task(cast(Coroutine[object, object, bytes], session.notifications().__anext__()))
+        await asyncio.sleep(0)
+        assert client.disconnect_callback is not None
+        client.disconnect_callback(client)
 
-    with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
-        await pending
+        with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
+            await pending
 
 
 @_async_test
@@ -712,11 +712,11 @@ async def test_destructive_clear_command_is_not_exposed() -> None:
     def factory(_device: str | object, _callback: Callable[[object], None]) -> FakeClient:
         return client
 
-    session = await BleakRingTransport("fake", client_factory=cast(ClientFactory, factory)).connect()
-    with pytest.raises(ValueError, match="must not be empty"):
-        await session.write_control(b"")
-    with pytest.raises(ValueError, match="unsupported or destructive"):
-        await session.write_control(b"\x13")
+    async with BleakRingTransport("fake", client_factory=cast(ClientFactory, factory)) as session:
+        with pytest.raises(ValueError, match="must not be empty"):
+            await session.write_control(b"")
+        with pytest.raises(ValueError, match="unsupported or destructive"):
+            await session.write_control(b"\x13")
 
 
 @_async_test
@@ -847,14 +847,16 @@ async def test_session_context_and_close_are_idempotent() -> None:
     events: list[tuple[object, ...]] = []
     client = FakeClient(events)
     transport = BleakRingTransport("fake", client_factory=_factory_for(client))
-    session = await transport.connect()
-
-    async with session as entered:
-        assert entered is session
-    await session.close()
-    with pytest.raises(RingTransportDisconnectedError, match="closed"):
-        await session.read_status()
-    session.handle_disconnect()
+    try:
+        session = await transport.connect()
+        async with session as entered:
+            assert entered is session
+        await session.close()
+        with pytest.raises(RingTransportDisconnectedError, match="closed"):
+            await session.read_status()
+        session.handle_disconnect()
+    finally:
+        await transport.disconnect()
 
     assert [event[0] for event in events].count("stop_notify") == 1
     assert [event[0] for event in events].count("disconnect") == 1
@@ -869,11 +871,14 @@ async def test_session_close_reports_cleanup_failures_but_attempts_both_steps() 
     ]:
         events: list[tuple[object, ...]] = []
         client = FakeClient(events, fail_stop=fail_stop, fail_disconnect=fail_disconnect)
-        session = await BleakRingTransport("fake", client_factory=_factory_for(client)).connect()
-
-        with pytest.raises(RingTransportUnavailableError, match="closing ring session"):
-            await session.close()
-        assert [event[0] for event in events][-2:] == ["stop_notify", "disconnect"]
+        transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+        try:
+            session = await transport.connect()
+            with pytest.raises(RingTransportUnavailableError, match="closing ring session"):
+                await session.close()
+            assert [event[0] for event in events][-2:] == ["stop_notify", "disconnect"]
+        finally:
+            await transport.disconnect()
 
 
 @_async_test
@@ -887,15 +892,21 @@ async def test_cancelling_hanging_stop_notify_still_attempts_disconnect() -> Non
         stop_started.set()
         await asyncio.Future()
 
+    original_stop_notify = client.stop_notify
     client.stop_notify = hang_stop  # type: ignore[method-assign]
-    session = await BleakRingTransport("fake", client_factory=_factory_for(client)).connect()
-    closing = asyncio.create_task(session.close())
-    await stop_started.wait()
-    closing.cancel()
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+    try:
+        session = await transport.connect()
+        closing = asyncio.create_task(session.close())
+        await stop_started.wait()
+        closing.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await closing
-    assert [event[0] for event in events][-1] == "disconnect"
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert [event[0] for event in events][-1] == "disconnect"
+    finally:
+        client.stop_notify = original_stop_notify  # type: ignore[method-assign]
+        await transport.disconnect()
 
 
 @_async_test
@@ -1338,6 +1349,8 @@ async def test_cancelled_disconnect_timeout_keeps_late_callback_local() -> None:
     async def hang_disconnect() -> None:
         await asyncio.Future()
 
+    original_stop_notify = client.stop_notify
+    original_disconnect = client.disconnect
     client.stop_notify = hang_stop  # type: ignore[method-assign]
     client.disconnect = hang_disconnect  # type: ignore[method-assign]
     bleak_transport.DEFAULT_CONFIG = replace(
@@ -1346,8 +1359,8 @@ async def test_cancelled_disconnect_timeout_keeps_late_callback_local() -> None:
     )
     original_debug_event = bleak_transport.debug_event
     bleak_transport.debug_event = record
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client))
     try:
-        transport = BleakRingTransport("fake", client_factory=_factory_for(client))
         session = await transport.connect()
         closing = asyncio.create_task(session.close())
         await stop_started.wait()
@@ -1357,8 +1370,11 @@ async def test_cancelled_disconnect_timeout_keeps_late_callback_local() -> None:
         assert client.disconnect_callback is not None
         client.disconnect_callback(client)
     finally:
+        client.stop_notify = original_stop_notify  # type: ignore[method-assign]
+        client.disconnect = original_disconnect  # type: ignore[method-assign]
         bleak_transport.debug_event = original_debug_event
         bleak_transport.DEFAULT_CONFIG = original_config
+        await transport.disconnect()
 
     assert debug_events.count("ble_gatt_local_disconnect_intent") == 1
     assert "ble_gatt_unexpected_disconnect" not in debug_events

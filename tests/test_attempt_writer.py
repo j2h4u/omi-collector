@@ -8,8 +8,9 @@ import os
 import threading
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Protocol
 
@@ -148,6 +149,12 @@ class _ProcessEvent(Protocol):
     def wait(self, timeout: float | None = None) -> bool: ...
 
 
+class _ProcessRelease(Protocol):
+    def poll(self, timeout: float | None = None) -> bool: ...
+
+    def recv(self) -> object: ...
+
+
 class _ProcessFlags(Protocol):
     def __getitem__(self, index: int) -> int: ...
 
@@ -155,7 +162,7 @@ class _ProcessFlags(Protocol):
 
 
 class ProcessLifetimeTarget:
-    def __init__(self, entered: _ProcessEvent, release: _ProcessEvent, flags: _ProcessFlags) -> None:
+    def __init__(self, entered: _ProcessEvent, release: _ProcessRelease, flags: _ProcessFlags) -> None:
         self.entered = entered
         self.release = release
         self.flags = flags
@@ -175,8 +182,9 @@ class ProcessLifetimeTarget:
     def append_chunk(self, offset: int, chunk: memoryview) -> object:
         del offset, chunk
         self.entered.set()
-        if not self.release.wait(15):
+        if not self.release.poll(15):
             raise TimeoutError("parent did not release the writer target")
+        self.release.recv()
         return None
 
     def checkpoint(self) -> object:
@@ -195,7 +203,9 @@ class ProcessLifetimeTarget:
         return None
 
 
-def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: _ProcessEvent, flags: _ProcessFlags) -> None:
+def _run_writer_lifecycle_in_daemon_owner(
+    entered: _ProcessEvent, release: Connection, flags: _ProcessFlags
+) -> None:
     async def lifecycle() -> None:
         writer = AttemptWriter(ProcessLifetimeTarget(entered, release, flags), bytes(RECORD_SIZE))
         try:
@@ -293,14 +303,16 @@ def test_writer_config_controls_writer_settings() -> None:
 def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() -> None:
     context = multiprocessing.get_context("fork")
     entered = context.Event()
-    release = context.Event()
+    release_reader, release_writer = context.Pipe(duplex=False)
     flags = context.Array("i", [0, 0, 0, 0])
-    process = context.Process(target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release, flags))
+    process = context.Process(target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release_reader, flags))
     started = False
+    released = False
 
     try:
         process.start()
         started = True
+        release_reader.close()
         assert entered.wait(5), "writer did not enter its blocked append"
         process.join(timeout=1)
         assert process.is_alive(), "process exited while writer-owned work was blocked"
@@ -308,7 +320,8 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
         assert flags[1] == 0
         assert flags[2] == 0
 
-        release.set()
+        release_writer.send(None)
+        released = True
         process.join(timeout=5)
         assert not process.is_alive(), "writer workflow did not finish after target release"
         assert process.exitcode == 0
@@ -316,7 +329,9 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
         assert flags[2] == 1
         assert flags[3] == 0
     finally:
-        release.set()
+        if not released:
+            with suppress(BrokenPipeError, EOFError, OSError):
+                release_writer.send(None)
         if started and process.is_alive():
             process.join(timeout=2)
         if started and process.is_alive():
@@ -325,6 +340,8 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
         if started and process.is_alive():
             process.kill()
             process.join(timeout=2)
+        release_reader.close()
+        release_writer.close()
         if started and not process.is_alive():
             process.close()
 

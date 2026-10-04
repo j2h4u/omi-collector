@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +29,57 @@ def test_intent_is_durable_before_confirmation(tmp_path: Path) -> None:
     intent = store.mark_unresolved(intent)
     store.finish(intent, state="applied", boundary_sequence_max=22, verified_epoch=1001)
     assert store.confirmed()[0].state == "applied"
+
+
+def test_observation_store_append_returns_the_persisted_observation(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+
+    appended = store.append(
+        evidence_kind="native_trusted",
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1000,
+        info_sequence_min=20,
+        info_sequence_max=20,
+    )
+
+    assert isinstance(appended, ClockObservation)
+    assert store.observation_store.records() == (appended,)
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").observation_store.records() == (
+        appended,
+    )
+
+
+def test_mark_unresolved_is_idempotent_and_rejects_conflicting_or_terminal_intents(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    prepared = store.prepare(1100, 1000, 100.0, 20)
+    path = tmp_path / "clock-corrections" / f"{prepared.operation_id}.json"
+    prepared_bytes = path.read_bytes()
+    conflicting = replace(prepared, drift_seconds=101.0)
+
+    with pytest.raises(ClockCorrectionError, match="not prepared"):
+        store.mark_unresolved(conflicting)
+
+    assert path.read_bytes() == prepared_bytes
+    unresolved = store.mark_unresolved(prepared)
+    unresolved_bytes = path.read_bytes()
+
+    assert store.mark_unresolved(unresolved) == unresolved
+    assert path.read_bytes() == unresolved_bytes
+    assert store.mark_unresolved(prepared) == unresolved
+    assert path.read_bytes() == unresolved_bytes
+
+    applied = store.finish(unresolved, state="applied", boundary_sequence_max=24, verified_epoch=1000)
+    applied_bytes = path.read_bytes()
+    with pytest.raises(ClockCorrectionError, match="not prepared"):
+        store.mark_unresolved(unresolved)
+
+    assert path.read_bytes() == applied_bytes
+    assert store.records() == (applied,)
 
 
 def test_active_attempt_prevents_clock_write_but_retired_attempt_does_not(tmp_path: Path) -> None:
@@ -275,6 +327,85 @@ def test_later_near_zero_observation_marks_unresolved_write_applied(tmp_path: Pa
     assert reconciled[0].state == "applied"
     assert reconciled[0].boundary_sequence_max == 24
     assert reconciled[0].verified_epoch == 1001
+
+
+@pytest.mark.parametrize("has_observation_record", [False, True])
+def test_reconcile_without_a_durable_observation_reference_is_a_noop(
+    tmp_path: Path, has_observation_record: bool
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    correction_path = tmp_path / "clock-corrections" / f"{intent.operation_id}.json"
+    correction_bytes = correction_path.read_bytes()
+    if has_observation_record:
+        store.observation_store.append(
+            evidence_kind="native_trusted",
+            session_id="session",
+            host_boot_id="boot",
+            host_realtime_start=1000.0,
+            host_realtime_end=1000.0,
+            host_monotonic_start=1.0,
+            host_monotonic_end=1.0,
+            device_epoch=1001,
+            info_sequence_min=20,
+            info_sequence_max=24,
+            operation_id=intent.operation_id,
+        )
+        assert store.observation_store.records()
+
+    assert (
+        store.reconcile_observation(
+            1001,
+            0.5,
+            24,
+            near_zero_threshold=5.0,
+            operation_id=intent.operation_id,
+        )
+        == ()
+    )
+    assert correction_path.read_bytes() == correction_bytes
+    if has_observation_record:
+        assert store.reconcile_observation(1001, 0.5, 24, near_zero_threshold=5.0) == ()
+        assert correction_path.read_bytes() == correction_bytes
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (intent,)
+
+
+@pytest.mark.parametrize("mismatch", ["epoch", "frontier"])
+def test_reconcile_rejects_observation_reference_mismatch_without_mutating_correction(
+    tmp_path: Path, mismatch: str
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    evidence = store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id="session",
+        host_boot_id="boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=1001,
+        info_sequence_min=20,
+        info_sequence_max=24,
+        operation_id=intent.operation_id,
+    )
+    correction_path = tmp_path / "clock-corrections" / f"{intent.operation_id}.json"
+    correction_bytes = correction_path.read_bytes()
+    observed_epoch = 1002 if mismatch == "epoch" else evidence.device_epoch
+    boundary_sequence_max = 25 if mismatch == "frontier" else evidence.info_sequence_max
+
+    with pytest.raises(ClockCorrectionError, match="reference conflicts"):
+        store.reconcile_observation(
+            observed_epoch,
+            0.5,
+            boundary_sequence_max,
+            near_zero_threshold=5.0,
+            observation_id=evidence.observation_id,
+            operation_id=intent.operation_id,
+        )
+
+    assert correction_path.read_bytes() == correction_bytes
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (intent,)
 
 
 def test_reconcile_waits_until_observation_reaches_pending_boundary(tmp_path: Path) -> None:
@@ -569,6 +700,78 @@ def test_clock_correction_schema_is_strict(tmp_path: Path) -> None:
 
     with pytest.raises(ClockCorrectionError, match="invalid"):
         store.records()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"boundary_sequence_min": -1}, id="negative-boundary-min"),
+        pytest.param({"observed_epoch": True}, id="boolean-epoch"),
+        pytest.param({"operation_id": ""}, id="empty-operation-id"),
+        pytest.param({"drift_seconds": True}, id="boolean-drift"),
+        pytest.param({"state": "mystery"}, id="unknown-state"),
+        pytest.param({"state": "unknown"}, id="unknown-missing-boundary"),
+        pytest.param(
+            {"state": "unknown", "boundary_sequence_max": 20, "verified_epoch": 1000},
+            id="unknown-with-verified-epoch",
+        ),
+    ],
+)
+def test_malformed_durable_correction_fails_closed_without_rewriting_bytes(
+    tmp_path: Path, changes: dict[str, object]
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    correction = store.prepare(1300, 1000, 300.0, 20)
+    path = tmp_path / "clock-corrections" / f"{correction.operation_id}.json"
+    value = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    value.update(changes)
+    path.write_text(json.dumps(value), encoding="utf-8")
+    corrupted_bytes = path.read_bytes()
+
+    with pytest.raises(ClockCorrectionError, match="invalid"):
+        store.records()
+
+    assert path.read_bytes() == corrupted_bytes
+
+
+def test_zero_minimum_boundary_can_finish_as_not_written(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    prepared = store.prepare(1100, 1000, 100.0, 0)
+    completed = store.finish(prepared, state="not_written", boundary_sequence_max=None, verified_epoch=None)
+
+    assert completed.state == "not_written"
+    assert completed.boundary_sequence_min == 0
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (completed,)
+
+
+@pytest.mark.parametrize(
+    ("state", "boundary_sequence_max", "verified_epoch"),
+    [
+        ("applied", 24, None),
+        ("applied", None, 1000),
+        ("unresolved", 24, None),
+        ("unknown", None, None),
+        ("not_applied", 24, 1000),
+    ],
+)
+def test_finish_rejects_each_invalid_completion_field_without_mutating_intent(
+    tmp_path: Path, state: str, boundary_sequence_max: int | None, verified_epoch: int | None
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20))
+    path = tmp_path / "clock-corrections" / f"{intent.operation_id}.json"
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(ClockCorrectionError):
+        store.finish(
+            intent,
+            state=state,
+            boundary_sequence_max=boundary_sequence_max,
+            verified_epoch=verified_epoch,
+        )
+
+    assert path.read_bytes() == original_bytes
+    assert ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts").records() == (intent,)
 
 
 @pytest.mark.parametrize(

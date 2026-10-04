@@ -269,6 +269,8 @@ def test_retry_backoff_returns_to_scanning_with_retained_recheck() -> None:
 @pytest.mark.parametrize(
     "state",
     (
+        Searching(timer_epoch=3, scan_recheck_at=50.0),
+        CoolingDown(timer_epoch=3, cooldown_at=20.0, recheck_at=50.0, advertisement=None),
         RetryWaiting(
             timer_epoch=3,
             retry_at=50.0,
@@ -278,7 +280,7 @@ def test_retry_backoff_returns_to_scanning_with_retained_recheck() -> None:
         ),
     ),
 )
-def test_timer_epoch_and_scheduled_deadline_must_both_match(state: CoolingDown | RetryWaiting) -> None:
+def test_timer_epoch_and_scheduled_deadline_must_both_match(state: Searching | CoolingDown | RetryWaiting) -> None:
     stale_epoch = transition(
         state, TimerFired(at=50.0, deadline=armed_deadline(state), timer_epoch=state.timer_epoch - 1), POLICY
     )
@@ -286,6 +288,53 @@ def test_timer_epoch_and_scheduled_deadline_must_both_match(state: CoolingDown |
 
     assert stale_epoch.state is state and isinstance(stale_epoch.directive, NoOperation)
     assert stale_deadline.state is state and isinstance(stale_deadline.directive, NoOperation)
+
+
+def test_late_search_timer_refreshes_the_recheck_from_callback_time() -> None:
+    state = Searching(timer_epoch=4, scan_recheck_at=100.0)
+
+    result = transition(state, TimerFired(at=101.0, deadline=100.0, timer_epoch=4), POLICY)
+
+    assert result == type(result)(Searching(5, 201.0), Observe(201.0))
+
+
+def test_late_cooldown_timer_returns_to_searching_from_callback_time() -> None:
+    state = CoolingDown(timer_epoch=6, cooldown_at=50.0, recheck_at=50.0, advertisement=None)
+
+    result = transition(state, TimerFired(at=51.0, deadline=50.0, timer_epoch=6), POLICY)
+
+    assert result == type(result)(Searching(7, 151.0), Observe(151.0))
+
+
+def test_late_retry_absence_timer_ends_visit_without_a_permit() -> None:
+    state = RetryWaiting(
+        timer_epoch=8,
+        retry_at=None,
+        scan_recheck_at=100.0,
+        retry_index=1,
+        advertisement=None,
+        absence_at=20.0,
+    )
+
+    result = transition(state, TimerFired(at=21.0, deadline=20.0, timer_epoch=8), POLICY)
+
+    assert result == type(result)(Searching(9, 121.0), EndVisit("absence"))
+
+
+def test_delayed_search_observations_within_gap_retain_the_trigger_candidate() -> None:
+    state = Searching(timer_epoch=2, scan_recheck_at=100.0)
+    first = _advertisement(1.0)
+    candidate = object()
+    second = _advertisement(6.0, candidate=candidate)
+
+    waiting = transition(state, AdvertisementObserved(first, processed_at=2.0), POLICY)
+    released = transition(waiting.state, AdvertisementObserved(second, processed_at=7.0), POLICY)
+
+    assert waiting.directive == Observe(100.0)
+    assert isinstance(released.directive, StopAndBeginAttempt)
+    assert isinstance(released.directive.trigger, AdvertisementTrigger)
+    assert released.directive.trigger.advertisement is second
+    assert released.directive.trigger.advertisement.candidate is candidate
 
 
 def test_deadline_projection_and_noop_transition_do_not_mutate_waiting_state() -> None:

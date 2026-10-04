@@ -90,3 +90,54 @@ def test_ignores_maximum_sized_packet_when_it_reaches_the_record_end() -> None:
 
     assert len(record) == RECORD_SIZE
     assert count_20ms_packets(record) == 0
+@pytest.mark.parametrize(
+    "packet",
+    (
+        bytes((147, 0x42, 0, 0x55, 0x66)),  # CBR with an explicit zero-length padding field.
+        bytes((147, 0x42, 1, 0x55, 0x66, 0x99)),  # CBR with one padding byte.
+        bytes((147, 0xC2, 0, 1, 0x55, 0x66)),  # VBR with an explicit zero-length padding field.
+        bytes((147, 0xC2, 1, 1, 0x55, 0x66, 0x99)),  # VBR with one padding byte.
+    ),
+)
+def test_counts_valid_code3_packets_with_explicit_padding(packet: bytes) -> None:
+    assert count_20ms_packets(_record(packet)) == 1
+
+
+@pytest.mark.parametrize(
+    "packet",
+    (
+        bytes((152,)),  # Empty code-0 frame body.
+        bytes((145,)),  # Empty code-1 frame bodies.
+        bytes((147, 0x02)),  # Empty code-3 CBR frame bodies.
+        bytes((147, 0x42, 255)),  # Padding continuation has no terminating length.
+        bytes((147, 0x42, 2, 0x55, 0x66)),  # Padding consumes all frame bytes.
+        bytes((146,)),  # Truncated code-2 length.
+        bytes((146, 252)),  # Truncated extended code-2 length.
+        bytes((146, 252, 1, 0x55, 0x66)),  # Extended length exceeds its remaining body.
+        bytes((146, 0, 0x55)),  # Code-2 first VBR frame has zero size.
+        bytes((146, 1, 0x55)),  # Code-2 final VBR frame has zero size.
+        bytes((147, 0xC2, 0, 0, 0x55)),  # Code-3 first VBR frame has zero size.
+        bytes((147, 0xC2, 0, 1, 0x55)),  # Code-3 final VBR frame has zero size.
+        bytes((2, 253, 63, 0x55, 0x66)),  # Valid length encoding, impossible within the packet.
+    ),
+)
+def test_rejects_empty_frames_and_truncated_or_impossible_framing(packet: bytes) -> None:
+    with pytest.raises(ValueError):
+        count_20ms_packets(_record(packet))
+
+
+def test_record_end_accepts_packet_ending_before_nonzero_overflow_sentinel() -> None:
+    record = bytearray(RECORD_SIZE)
+    payload_start = 4
+    record[payload_start + 436 : payload_start + 439] = bytes((2, 8, 0x55))
+    record[payload_start + 439] = 0xA5
+
+    assert count_20ms_packets(bytes(record)) == 1
+
+
+def test_record_end_does_not_count_packet_crossing_into_overflow_byte() -> None:
+    record = bytearray(RECORD_SIZE)
+    payload_start = 4
+    record[payload_start + 437 : payload_start + 440] = bytes((2, 8, 0xA5))
+
+    assert count_20ms_packets(bytes(record)) == 0

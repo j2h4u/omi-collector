@@ -261,6 +261,130 @@ def test_device_lock_contention_reports_live_owner_and_exact_age(
     assert context.holder_age_seconds == pytest.approx(2.0)
 
 
+def test_device_lock_contention_uses_live_pid_one_metadata(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(spool, capture_root)
+    with store.device_lock(operation="capture_batch"):
+        stat_fields = Path("/proc/1/stat").read_text(encoding="ascii").split()
+        lock_path = spool / "collector.lock"
+        lock_path.write_text(
+            dumps(
+                {
+                    "version": 1,
+                    "pid": 1,
+                    "process_start": int(stat_fields[21]),
+                    "thread_id": 1,
+                    "operation": "init",
+                    "scope": "collector_lock",
+                    "acquired_monotonic_ns": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with (
+            pytest.raises(DeviceAlreadyRunningError) as raised,
+            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
+        ):
+            pass
+    context = raised.value.lock_context
+    assert context is not None
+    assert context.metadata_status == "valid"
+    assert context.holder_pid == 1
+    assert context.holder_scope == "other_process"
+
+
+def test_device_lock_contender_preserves_live_owner_metadata(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    capture_root = _capture_root(tmp_path)
+    store = StagingStore(spool, capture_root)
+    lock_path = spool / "collector.lock"
+
+    with store.device_lock(operation="capture_batch"):
+        before = lock_path.read_bytes()
+        with (
+            pytest.raises(DeviceAlreadyRunningError),
+            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
+        ):
+            pass
+        assert lock_path.read_bytes() == before
+
+    with StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"):
+        pass
+
+
+def test_device_lock_diagnostics_report_bounded_lease_duration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        staging_filesystem,
+        "debug_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    store = StagingStore(tmp_path / "spool", _capture_root(tmp_path))
+    started = staging_filesystem.time.monotonic_ns()
+
+    with store.device_lock(operation="capture_batch"):
+        pass
+
+    elapsed = (staging_filesystem.time.monotonic_ns() - started) / 1_000_000_000
+    acquired = next(fields for name, fields in events if name == "device_lock_acquired")
+    released = next(fields for name, fields in events if name == "device_lock_released")
+    assert acquired["operation"] == "capture_batch"
+    assert released["operation"] == "capture_batch"
+    duration = released["duration_seconds"]
+    assert isinstance(duration, float)
+    assert 0 <= duration <= elapsed + 0.1
+
+
+def test_public_checkpoint_rejects_missing_checkpoint_without_creating_it(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    attempt.accept_chunk(100, _record(1))
+    checkpoint = attempt.path / "checkpoint.json"
+    checkpoint.unlink()
+    raw_before = (attempt.path / "records.bin").read_bytes()
+
+    with pytest.raises(AttemptStateError, match="checkpoint is missing"):
+        attempt.checkpoint()
+
+    assert not checkpoint.exists()
+    assert (attempt.path / "records.bin").read_bytes() == raw_before
+    attempt.close()
+
+
+def test_open_rejects_checkpoint_with_nonhex_hash_without_rewriting_raw(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    attempt.accept_chunk(100, _record(1))
+    attempt.close()
+    checkpoint = attempt.path / "checkpoint.json"
+    _rewrite_checkpoint(checkpoint, "raw_sha256", "z" * 64)
+    raw_before = (attempt.path / "records.bin").read_bytes()
+    checkpoint_before = checkpoint.read_bytes()
+
+    with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
+
+    assert (attempt.path / "records.bin").read_bytes() == raw_before
+    assert checkpoint.read_bytes() == checkpoint_before
+
+
+def test_public_checkpoint_rejects_corrupt_hash_after_append_without_rewriting_evidence(
+    tmp_path: Path,
+) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    attempt.accept_chunk(100, _record(1))
+    checkpoint = attempt.path / "checkpoint.json"
+    _rewrite_checkpoint(checkpoint, "raw_sha256", "z" * 64)
+    checkpoint_before = checkpoint.read_bytes()
+    raw_before = (attempt.path / "records.bin").read_bytes()
+
+    with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
+        attempt.checkpoint()
+
+    assert checkpoint.read_bytes() == checkpoint_before
+    assert (attempt.path / "records.bin").read_bytes() == raw_before
+    attempt.close()
+
+
 class _RecordingStream:
     def __init__(self, wrapped: object) -> None:
         self.wrapped = wrapped

@@ -13,6 +13,7 @@ import pytest
 from omi_collector.capture.adapters.attempts import StagedAttempt
 from omi_collector.capture.adapters.staging_contract import AttemptStateError
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 
 
 def test_contract_validation_is_filesystem_independent() -> None:
@@ -98,6 +99,46 @@ def test_open_rejects_descriptor_identity_mismatch_without_rewriting_evidence(tm
         _store(tmp_path).open_attempt(attempt.attempt_id)
 
     assert {path.name: path.read_bytes() for path in attempt.path.iterdir()} == evidence
+
+
+@pytest.mark.parametrize("persisted_id", ["g" * 32, "a" * 31])
+def test_open_rejects_invalid_persisted_descriptor_id_without_rewriting_evidence(
+    tmp_path: Path, persisted_id: str
+) -> None:
+    attempt = _attempt(tmp_path)
+    attempt.close()
+    descriptor_path = attempt.path / "attempt.json"
+    descriptor = cast(dict[str, object], loads(descriptor_path.read_text(encoding="utf-8")))
+    descriptor["attempt_id"] = persisted_id
+    descriptor_path.write_text(dumps(descriptor), encoding="utf-8")
+    evidence = {path.name: path.read_bytes() for path in attempt.path.iterdir()}
+
+    with pytest.raises(AttemptStateError):
+        _store(tmp_path).open_attempt(attempt.attempt_id)
+
+    assert {path.name: path.read_bytes() for path in attempt.path.iterdir()} == evidence
+
+
+def test_open_rejects_negative_checkpoint_count_with_valid_empty_hash_and_raw_record(tmp_path: Path) -> None:
+    from hashlib import sha256
+
+    attempt = _attempt(tmp_path)
+    attempt.record_read_begin(ReadBeginNotification(10, 2))
+    attempt.accept_chunk(10, b"x" * RECORD_SIZE)
+    attempt.close()
+    checkpoint_path = attempt.path / "checkpoint.json"
+    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
+    checkpoint["record_count"] = -1
+    checkpoint["raw_sha256"] = sha256(b"").hexdigest()
+    checkpoint_path.write_text(dumps(checkpoint), encoding="utf-8")
+    raw_before = (attempt.path / "records.bin").read_bytes()
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
+        _store(tmp_path).open_attempt(attempt.attempt_id)
+
+    assert (attempt.path / "records.bin").read_bytes() == raw_before
+    assert checkpoint_path.read_bytes() == checkpoint_before
 
 
 @pytest.mark.parametrize("field,value", [("record_count", -1), ("raw_sha256", "x" * 64)])

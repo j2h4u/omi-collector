@@ -570,7 +570,7 @@ async def test_progress_pump_coalesces_slow_callbacks_and_ignores_callback_failu
     async with asyncio.TaskGroup() as tasks:
         pump = tasks.create_task(batch_reconciliation._pump_progress(mailbox, slow_callback, 60.0))
         mailbox.publish(event(1))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
         mailbox.publish(event(2))
         mailbox.publish(event(3), terminal=True)
         release.set()

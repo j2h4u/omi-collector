@@ -14,6 +14,7 @@ from typing import BinaryIO, cast
 
 import pytest
 
+from omi_collector.capture.adapters import attempts as attempts_adapter
 from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
     RecordGapError,
@@ -195,6 +196,56 @@ def test_streaming_chunk_crossing_hash_boundary_persists_the_boundary_prefix(tmp
     assert attempt.durable_prefix.next_sequence == 1124
     assert (attempt.path / "records.bin").read_bytes() == b"".join(records)
     attempt.close()
+
+
+def test_streaming_chunk_hash_advances_once_across_checkpoint_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_sha256 = sha256
+    records = _record(1) + _record(2) + _record(3)
+    updates: list[bytes] = []
+
+    class DelegatingDigest:
+        def __init__(self, initial_data: bytes = b"") -> None:
+            self._digest = real_sha256(initial_data)
+
+        def update(self, data: bytes) -> None:
+            offset = sum(len(part) for part in updates)
+            assert data
+            assert offset + len(data) <= len(records)
+            assert data == records[offset : offset + len(data)]
+            updates.append(bytes(data))
+            self._digest.update(data)
+
+        def hexdigest(self) -> str:
+            return self._digest.hexdigest()
+
+    def observed_sha256(initial_data: bytes = b"") -> DelegatingDigest:
+        return DelegatingDigest(initial_data)
+
+    monkeypatch.setattr(attempts_adapter, "sha256", observed_sha256)
+    store = StagingStore(
+        tmp_path,
+        _capture_root(tmp_path),
+        config=CollectorConfig(durability=DurabilityConfig(checkpoint_records=2)),
+    )
+    attempt = store.prepare_streaming_attempt(100, 3)
+    try:
+        attempt.record_read_begin(ReadBeginNotification(100, 3))
+        attempt.accept_chunk(100, records)
+
+        checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+        boundary_bytes = 2 * RECORD_SIZE
+        assert checkpoint["record_count"] == 2
+        assert checkpoint["raw_sha256"] == real_sha256(records[:boundary_bytes]).hexdigest()
+        assert updates
+        assert all(updates)
+        assert b"".join(updates) == records
+        raw_bytes = (attempt.path / "records.bin").read_bytes()
+        assert raw_bytes == records
+        assert len(raw_bytes) == 3 * RECORD_SIZE
+    finally:
+        attempt.close()
 
 
 def test_streaming_accept_chunk_writes_the_appended_suffix_once(tmp_path: Path) -> None:

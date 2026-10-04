@@ -94,3 +94,47 @@ On the final integrated test tree, `just check` passed, `just unit` passed with
 skips, and 1,483 functions under the threshold 30. `just docker-build` passed
 after using a task-specific Docker configuration directory because the
 default Docker configuration path is read-only in this environment.
+
+## CI timeout investigation and readiness repair
+
+PR check `crap` later timed out at pytest's 120-second per-test deadline on
+head `7dcea407061fdac2a8795bcdd00293383c587af9`. The CI traceback did not
+name an active test or report its original exception. Its module progress was
+39 dots and then 60 more in `tests/test_opportunistic_sync.py`. The recorded
+collection order has 101 tests in that module, which makes item 100,
+`test_stalled_final_checkpoint_still_attempts_close_and_releases_lease`, the
+ordered-node candidate after 99 completed items. This is an inference; CI did
+not explicitly identify that node, and no CRAP score was produced.
+
+A bounded diagnostic delayed the test's second writer `prepare_leg` by 100 ms
+while its original 30 ms timeout covered setup and READ. The collector retried
+into the test's exhausted one-session provider and ended before READ; the
+outer test then remained blocked on its unbounded readiness event. The task
+dump showed the test waiting on `Event.wait()` while the collector task was
+already done. This reproduces a possible fixture hang, not the unknown
+original CI exception or trigger.
+
+The accepted test-only repair keeps normal timeouts through setup and READ,
+and applies the 30 ms timeout only to the existing finalization call. A
+`TaskGroup` owns the collector, readiness waits are bounded at five seconds,
+and cleanup cancels and gathers the collector, releases the blocked checkpoint
+in `finally`, and joins observed writers. The checkpoint/close timeout,
+target-close, writer-join, and lease-reacquisition assertions remain. The same
+100 ms second-prepare injection passed naturally after the change, as did the
+ordinary exact-node coverage control.
+
+On candidate `dd5781ede8829e02e83fc58c5346b5d25a7142e2`, `just check` passed;
+`just unit` passed with 1,519 tests and 2 skips; `just crap-check` passed with
+the same test counts and all 1,483 functions below CRAP 30; and
+`just docker-build` passed. Fresh PR checks for this candidate had not yet
+completed when this record was updated.
+
+The CI failure log, collection order, diagnostic and fixed controls, unique
+triage inventory, review notes, final test snapshot, patch, and gate receipts
+are preserved in
+`/srv/omi-collector-mutation-audit/20261004/mutation-audit-ci-remediation-20261004.tar.gz`
+(552,393 bytes; SHA-256
+`3d538dcdebc8c32b1fa3a17c20b4d3132b24715abbe1030135c9ab8119e8e10d`). Its
+sidecar, gzip integrity, and all internal file hashes were verified. The
+immutable full mutation campaigns and their unresolved totals above remain
+unchanged.

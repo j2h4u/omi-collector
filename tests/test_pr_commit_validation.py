@@ -143,6 +143,11 @@ def test_main_requires_a_commit_source_before_file_or_git_io(
     assert missing_head.value.code == 2
     assert "--head-sha is required with --base-sha" in capsys.readouterr().err
 
+    with pytest.raises(SystemExit) as missing_base:
+        main(["--head-sha", "HEAD"])
+    assert missing_base.value.code == 2
+    assert "one of the arguments --base-sha --message-file is required" in capsys.readouterr().err
+
 
 @pytest.mark.parametrize("contents", ["", "# editor comment\n"])
 def test_blank_message_is_rejected_by_validator_and_message_file(

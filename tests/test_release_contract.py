@@ -117,13 +117,14 @@ def test_release_config_checks_manifest_project_and_lock_coherence(tmp_path: Pat
 @pytest.mark.parametrize(
     "lock_text",
     [
+        '[[package]]\nname = "another-package"\nversion = "1.2.3"\n',
         '[[package]]\nname = "omi-collector"\nversion = 123\n',
         (
             '[[package]]\nname = "omi-collector"\nversion = "1.2.3"\n'
             '[[package]]\nname = "omi-collector"\nversion = "1.2.3"\n'
         ),
     ],
-    ids=("non-string-version", "duplicate-root-package"),
+    ids=("missing-root-package", "non-string-version", "duplicate-root-package"),
 )
 def test_release_config_requires_one_string_root_package_version(tmp_path: Path, lock_text: str) -> None:
     _write_release_fixture(tmp_path)
@@ -138,6 +139,18 @@ def test_release_config_requires_root_package_configuration(tmp_path: Path) -> N
     (tmp_path / "release-please-config.json").write_text(json.dumps({"packages": {"other": {}}}), encoding="utf-8")
 
     assert validate_release_config(tmp_path) == ["release-please-config.json must configure the root package"]
+
+
+def test_release_config_main_fails_when_root_package_configuration_is_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_release_fixture(tmp_path)
+    (tmp_path / "release-please-config.json").write_text(json.dumps({"packages": {"other": {}}}), encoding="utf-8")
+
+    assert validate_config_main(["--root", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "release configuration error: release-please-config.json must configure the root package\n"
+    assert captured.err == ""
 
 
 def test_release_config_reports_missing_project_version_and_lock_package_list(tmp_path: Path) -> None:

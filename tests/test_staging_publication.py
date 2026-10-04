@@ -18,6 +18,7 @@ from omi_collector.capture.adapters import publication, quarantine
 from omi_collector.capture.adapters.attempts import (
     StagedAttempt,
 )
+from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.publication import PrefixPublicationEvidence, TerminalRetirementEvidence
 from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
@@ -59,6 +60,45 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
     attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
+
+
+def _write_capture_temporary(
+    capture_root: Path,
+    raw: bytes,
+    *,
+    attempt_id: str = "b" * 32,
+    manifest_changes: dict[str, object] | None = None,
+    receipt_changes: dict[str, object] | None = None,
+) -> Path:
+    raw_hash = sha256(raw).hexdigest()
+    manifest = BundleManifest(
+        2, 100, 100 + len(raw) // RECORD_SIZE, len(raw) // RECORD_SIZE, RECORD_SIZE, raw_hash
+    ).as_dict()
+    receipt = SealedReceipt(attempt_id, raw_hash).as_dict()
+    if manifest_changes is not None:
+        manifest.update(manifest_changes)
+    if receipt_changes is not None:
+        receipt.update(receipt_changes)
+    destination_name = f"100-{100 + len(raw) // RECORD_SIZE}-{raw_hash[:16]}"
+    temporary = capture_root / f".{destination_name}.{'a' * 32}.tmp"
+    temporary.mkdir(parents=True)
+    (temporary / "records.bin").write_bytes(raw)
+    (temporary / "manifest.json").write_text(dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    (temporary / "receipt.json").write_text(dumps(receipt, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    return temporary
+
+
+def _bundle_bytes(path: Path) -> dict[str, bytes]:
+    return {entry.name: entry.read_bytes() for entry in path.iterdir() if entry.is_file()}
+
+
+def _publish_one_record_bundle(tmp_path: Path, raw: bytes) -> Path:
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    try:
+        attempt.accept_chunk(100, raw)
+        return attempt.seal(DoneNotification(0, 101)).bundle_path
+    finally:
+        attempt.close()
 
 
 def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:
@@ -103,6 +143,49 @@ def test_publication_evidence_rejects_extra_marker_keys() -> None:
                 "extra": True,
             }
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        [],
+        {},
+        {"version": 1},
+        {"state": "published"},
+        {"version": True, "state": "published"},
+        {"version": "1", "state": "published"},
+        {"version": 2, "state": "published"},
+        {"version": 1, "state": "other"},
+    ],
+)
+def test_prefix_publication_evidence_rejects_noncanonical_values(value: object) -> None:
+    with pytest.raises(AttemptStateError):
+        PrefixPublicationEvidence.from_json(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        [],
+        {},
+        {"version": 1, "state": "terminal-retired"},
+        {"version": 1, "terminalized_at_unix_ns": 1},
+        {"state": "terminal-retired", "terminalized_at_unix_ns": 1},
+        {"version": True, "state": "terminal-retired", "terminalized_at_unix_ns": 1},
+        {"version": "1", "state": "terminal-retired", "terminalized_at_unix_ns": 1},
+        {"version": 2, "state": "terminal-retired", "terminalized_at_unix_ns": 1},
+        {"version": 1, "state": "other", "terminalized_at_unix_ns": 1},
+        {"version": 1, "state": "terminal-retired", "terminalized_at_unix_ns": True},
+        {"version": 1, "state": "terminal-retired", "terminalized_at_unix_ns": "1"},
+        {"version": 1, "state": "terminal-retired", "terminalized_at_unix_ns": 0},
+        {"version": 1, "state": "terminal-retired", "terminalized_at_unix_ns": -1},
+    ],
+)
+def test_terminal_retirement_evidence_rejects_noncanonical_values(value: object) -> None:
+    with pytest.raises(AttemptStateError):
+        TerminalRetirementEvidence.from_json(value)
 
 
 def test_publication_evidence_canonical_json_preserves_marker_bytes() -> None:
@@ -189,30 +272,30 @@ def test_split_roots_publish_only_completed_bundles_to_capture_root(tmp_path: Pa
     assert not tuple(capture_root.glob(".*.tmp"))
 
 
-def test_recovery_quarantines_capture_temporary_with_malformed_manifest_scalar(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    [
+        ("manifest", "schema_version", True),
+        ("manifest", "start_sequence", True),
+        ("manifest", "next_sequence", "101"),
+        ("manifest", "record_count", True),
+        ("manifest", "record_size", True),
+        ("receipt", "attempt_id", True),
+        ("receipt", "raw_sha256", True),
+        ("receipt", "status", True),
+    ],
+)
+def test_recovery_quarantines_capture_temporary_with_malformed_scalar(
+    tmp_path: Path, target: str, field: str, value: object
+) -> None:
     capture_root = _capture_root(tmp_path)
     capture_root.mkdir(parents=True)
     raw = _record(1)
-    raw_hash = sha256(raw).hexdigest()
-    temporary = capture_root / f".100-101-{raw_hash[:16]}.{'a' * 32}.tmp"
-    temporary.mkdir()
-    (temporary / "records.bin").write_bytes(raw)
-    (temporary / "manifest.json").write_text(
-        dumps(
-            {
-                "schema_version": 2,
-                "start_sequence": True,
-                "next_sequence": 101,
-                "record_count": 1,
-                "record_size": RECORD_SIZE,
-                "raw_sha256": raw_hash,
-            }
-        ),
-        encoding="utf-8",
-    )
-    (temporary / "receipt.json").write_text(
-        dumps({"attempt_id": "b" * 32, "raw_sha256": raw_hash, "status": "sealed"}),
-        encoding="utf-8",
+    temporary = _write_capture_temporary(
+        capture_root,
+        raw,
+        manifest_changes={field: value} if target == "manifest" else None,
+        receipt_changes={field: value} if target == "receipt" else None,
     )
 
     with StagingStore(tmp_path / "spool", capture_root).device_lock():
@@ -222,6 +305,70 @@ def test_recovery_quarantines_capture_temporary_with_malformed_manifest_scalar(t
     quarantined = tuple((tmp_path / "spool" / "quarantine").iterdir())
     assert len(quarantined) == 1
     assert (quarantined[0] / "unprocessable.json").is_file()
+
+
+def test_recovery_discards_identical_capture_temporary_and_preserves_bundle_bytes(tmp_path: Path) -> None:
+    raw = _record(1)
+    bundle = _publish_one_record_bundle(tmp_path, raw)
+    before = _bundle_bytes(bundle)
+    attempt_id = cast(str, loads(before["receipt.json"])["attempt_id"])
+    temporary = _write_capture_temporary(_capture_root(tmp_path), raw, attempt_id=attempt_id)
+    assert _bundle_bytes(temporary) == before
+
+    with StagingStore(tmp_path, _capture_root(tmp_path)).device_lock():
+        pass
+
+    assert not temporary.exists()
+    assert _bundle_bytes(bundle) == before
+
+
+def test_recovery_quarantines_temp_with_different_receipt_and_preserves_destination(tmp_path: Path) -> None:
+    raw = _record(1)
+    bundle = _publish_one_record_bundle(tmp_path, raw)
+    temporary = _write_capture_temporary(_capture_root(tmp_path), raw, attempt_id="c" * 32)
+    before = _bundle_bytes(bundle)
+    assert loads((bundle / "receipt.json").read_text(encoding="utf-8"))["attempt_id"] != "c" * 32
+
+    with StagingStore(tmp_path, _capture_root(tmp_path)).device_lock():
+        pass
+
+    assert not temporary.exists()
+    assert _bundle_bytes(bundle) == before
+    quarantined = tuple((tmp_path / "quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "unprocessable.json").is_file()
+
+
+def test_recovery_quarantines_temp_when_destination_raw_differs_at_same_length(tmp_path: Path) -> None:
+    raw = _record(1)
+    bundle = _publish_one_record_bundle(tmp_path, raw)
+    attempt_id = cast(str, loads((bundle / "receipt.json").read_text(encoding="utf-8"))["attempt_id"])
+    temporary = _write_capture_temporary(_capture_root(tmp_path), raw, attempt_id=attempt_id)
+    (bundle / "records.bin").write_bytes(_record(9))
+    before = _bundle_bytes(bundle)
+    assert len((bundle / "records.bin").read_bytes()) == len(raw)
+
+    with StagingStore(tmp_path, _capture_root(tmp_path)).device_lock():
+        pass
+
+    assert not temporary.exists()
+    assert _bundle_bytes(bundle) == before
+    quarantined = tuple((tmp_path / "quarantine").iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "unprocessable.json").is_file()
+
+
+def test_recovery_keeps_temp_when_destination_cannot_be_compared(tmp_path: Path) -> None:
+    raw = _record(1)
+    bundle = _publish_one_record_bundle(tmp_path, raw)
+    temporary = _write_capture_temporary(_capture_root(tmp_path), raw)
+    (bundle / "receipt.json").unlink()
+
+    with StagingStore(tmp_path, _capture_root(tmp_path)).device_lock():
+        pass
+
+    assert temporary.exists()
+    assert _bundle_bytes(temporary)["records.bin"] == raw
 
 
 def test_prefix_publication_uses_capture_local_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -404,48 +551,84 @@ def test_streaming_seal_is_the_raw_durability_boundary(tmp_path: Path) -> None:
 
 def test_cursor_ahead_publishes_ordinary_prefix_and_preserves_source_raw(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=4)
-    first = _record(1)
-    tail = _record(2)
-    attempt.accept_chunk(100, first)
-    attempt.checkpoint()
-    attempt.accept_chunk(101, tail)
-    source_raw = (attempt.path / "records.bin").read_bytes()
+    try:
+        first = _record(1)
+        tail = _record(2)
+        attempt.accept_chunk(100, first)
+        attempt.checkpoint()
+        attempt.accept_chunk(101, tail)
+        source_raw = (attempt.path / "records.bin").read_bytes()
 
-    result = attempt.publish_prefix()
+        result = attempt.publish_prefix()
 
-    assert result is not None
-    assert result.bundle_path.joinpath("records.bin").read_bytes() == first
-    assert loads(result.bundle_path.joinpath("manifest.json").read_text()) == {
-        "schema_version": 2,
-        "start_sequence": 100,
-        "next_sequence": 101,
-        "record_count": 1,
-        "record_size": RECORD_SIZE,
-        "raw_sha256": sha256(first).hexdigest(),
-    }
-    assert not result.bundle_path.joinpath("gap.json").exists()
-    assert "gap_sha256" not in loads(result.bundle_path.joinpath("receipt.json").read_text())
-    assert (attempt.path / "records.bin").read_bytes() == source_raw
-    assert not tuple(_capture_root(tmp_path).glob(".*.tmp"))
-    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts() == ()
-    marker = cast(dict[str, object], loads((attempt.path / "prefix-publication.json").read_text()))
-    assert marker == {"version": 1, "state": "published"}
-    duplicate = attempt.publish_prefix()
-    assert duplicate is not None
-    assert duplicate.deduplicated
+        assert result is not None
+        assert result.bundle_path.joinpath("records.bin").read_bytes() == first
+        assert loads(result.bundle_path.joinpath("manifest.json").read_text()) == {
+            "schema_version": 2,
+            "start_sequence": 100,
+            "next_sequence": 101,
+            "record_count": 1,
+            "record_size": RECORD_SIZE,
+            "raw_sha256": sha256(first).hexdigest(),
+        }
+        assert not result.bundle_path.joinpath("gap.json").exists()
+        assert "gap_sha256" not in loads(result.bundle_path.joinpath("receipt.json").read_text())
+        assert (attempt.path / "records.bin").read_bytes() == source_raw
+        assert not tuple(_capture_root(tmp_path).glob(".*.tmp"))
+        assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts() == ()
+        marker = cast(dict[str, object], loads((attempt.path / "prefix-publication.json").read_text()))
+        assert marker == {"version": 1, "state": "published"}
+        duplicate = attempt.publish_prefix()
+        assert duplicate is not None
+        assert duplicate.deduplicated
+    finally:
+        attempt.close()
 
 
 def test_cursor_ahead_publication_uses_only_checkpoint_prefix(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
+    try:
+        attempt.accept_chunk(100, _record(1))
+        attempt.checkpoint()
 
-    result = attempt.publish_prefix()
+        result = attempt.publish_prefix()
 
-    assert result is not None
-    assert result.bundle_path.joinpath("records.bin").read_bytes() == _record(1)
-    assert not (result.bundle_path / "gap.json").exists()
-    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts() == ()
+        assert result is not None
+        assert result.bundle_path.joinpath("records.bin").read_bytes() == _record(1)
+        assert not (result.bundle_path / "gap.json").exists()
+        assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts() == ()
+    finally:
+        attempt.close()
+
+
+def test_prefix_publication_conflict_preserves_authenticated_source_evidence(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=3)
+    try:
+        prefix = _record(1)
+        tail = _record(2)
+        attempt.accept_chunk(100, prefix)
+        attempt.checkpoint()
+        attempt.accept_chunk(101, tail)
+        source_raw = (attempt.path / "records.bin").read_bytes()
+        result = attempt.publish_prefix()
+        assert result is not None
+        marker = (attempt.path / "prefix-publication.json").read_bytes()
+
+        result.bundle_path.joinpath("records.bin").write_bytes(_record(9))
+        destination_raw = (result.bundle_path / "records.bin").read_bytes()
+        destination_manifest = (result.bundle_path / "manifest.json").read_bytes()
+        destination_receipt = (result.bundle_path / "receipt.json").read_bytes()
+
+        with pytest.raises(CollisionError):
+            attempt.publish_prefix()
+
+        assert (attempt.path / "records.bin").read_bytes() == source_raw
+        assert (attempt.path / "prefix-publication.json").read_bytes() == marker
+        assert (result.bundle_path / "records.bin").read_bytes() == destination_raw
+        assert (result.bundle_path / "manifest.json").read_bytes() == destination_manifest
+        assert (result.bundle_path / "receipt.json").read_bytes() == destination_receipt
+    finally:
+        attempt.close()
 
 
 def test_zero_prefix_publication_waits_for_terminalization_without_audio_artifact(

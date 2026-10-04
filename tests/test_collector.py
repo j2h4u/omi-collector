@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Coroutine, Iterable
 from dataclasses import FrozenInstanceError, dataclass, field
 from struct import pack
+from typing import cast
 
 import pytest
 
@@ -400,6 +402,107 @@ def test_read_mailbox_preserves_intermediate_and_terminal_progress_on_success_an
         assert interrupted.snapshot.terminal
         assert interrupted.snapshot.event is not None
         assert interrupted.snapshot.event.records_completed == 1
+
+    asyncio.run(scenario())
+
+
+def test_mailbox_wait_observes_terminal_revision_after_immediate_publish_and_finish() -> None:
+    async def scenario() -> None:
+        mailbox = ProgressMailbox()
+        event = ProgressEvent(1, 2, RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), 1.0)
+        mailbox.publish(event)
+        mailbox.finish()
+
+        snapshot = await asyncio.wait_for(mailbox.wait_for_change(0), 1)
+
+        assert snapshot.revision == 2
+        assert snapshot.terminal
+        assert snapshot.event is event
+
+    asyncio.run(scenario())
+
+
+def test_read_ack_before_begin_data_done_completes_the_full_leg() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        session = BurstSession((b"\x01\x00", _begin(10, 2), _data(record), _data(record), _done(12)))
+        writer = FakeWriter()
+        result = await read_leg(
+            session,
+            TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+            writer,
+            10,
+            2,
+            ReadLegOptions(1),
+        )
+
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert session.consumed == 5
+        assert session.writes == [encode_read_command(10, 2)]
+        assert writer.calls == [
+            "start",
+            "prepare",
+            "read_begin",
+            f"publish:{RECORD_SIZE}",
+            f"publish:{2 * RECORD_SIZE}",
+            "barrier",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_async_read_begin_failure_after_done_surfaces_and_is_retrieved() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        read_begin_error = OSError("READ_BEGIN persistence failed")
+        read_begin_tasks: list[asyncio.Task[None] | None] = []
+        read_begin_coroutines: list[Coroutine[object, object, None]] = []
+
+        class AsyncFailingReadBeginWriter(FakeWriter):
+            def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
+                del notice
+
+                async def fail() -> None:
+                    read_begin_tasks.append(asyncio.current_task())
+                    await asyncio.sleep(0)
+                    raise read_begin_error
+
+                self.calls.append("read_begin")
+                awaitable = fail()
+                read_begin_coroutines.append(cast(Coroutine[object, object, None], awaitable))
+                return cast(asyncio.Future[object], awaitable)
+
+        session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
+        writer = AsyncFailingReadBeginWriter()
+        with pytest.raises(TransferInterruptedError, match="writer failed after READ terminal") as caught:
+            try:
+                await read_leg(
+                    session,
+                    TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                    writer,
+                    10,
+                    2,
+                    ReadLegOptions(1),
+                )
+            finally:
+                await asyncio.sleep(0)
+                tasks = [task for task in read_begin_tasks if task is not None]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                for coroutine in read_begin_coroutines:
+                    if inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
+                        coroutine.close()
+
+        assert caught.value.__cause__ is read_begin_error
+        assert len(read_begin_tasks) == 1
+        task = read_begin_tasks[0]
+        assert task is not None and task.done()
+        assert task.exception() is read_begin_error
+        assert session.consumed == 4
+        assert session.writes == [encode_read_command(10, 2)]
+        assert "barrier" not in writer.calls
 
     asyncio.run(scenario())
 

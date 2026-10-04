@@ -14,7 +14,12 @@ import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_store import StagingStore
-from omi_collector.capture.application.collector import CollectorTimeoutError, NoDataResult, TransferTimeouts
+from omi_collector.capture.application.collector import (
+    AdvanceUncertainError,
+    CollectorTimeoutError,
+    NoDataResult,
+    TransferTimeouts,
+)
 from omi_collector.capture.application.operational_telemetry import ClockCorrectionSink, TelemetryClock
 from omi_collector.capture.application.ports import CaptureRuntimePort
 from omi_collector.capture.application.presence import (
@@ -31,8 +36,14 @@ from omi_collector.capture.application.presence_machine import (
     NotConnected,
 )
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
-from omi_collector.capture.application.ring_transport import RingSession, RingTransportUnavailableError
+from omi_collector.capture.application.ring_transport import (
+    NotificationOverflowError,
+    RingSession,
+    RingTransportDisconnectedError,
+    RingTransportUnavailableError,
+)
 from omi_collector.capture.application.session_lifecycle import (
+    ActivityEvent,
     InfoReader,
     OpportunisticOptions,
     RetryPolicy,
@@ -42,11 +53,13 @@ from omi_collector.capture.application.session_lifecycle import (
     SessionPhaseState,
     exit_context,
     presence_attempt_outcome,
+    report_session_error,
     teardown_was_interrupted,
+    validate_policy,
 )
 from omi_collector.capture.application.visit_machine import DrainConfirmed, RecoveryDisposition
-from omi_collector.capture.domain.ring_protocol import RingInfo
-from omi_collector.config import CollectorConfig, TelemetryConfig
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
+from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, TelemetryConfig
 
 
 def _run(coroutine: Coroutine[object, object, object]) -> object:
@@ -102,6 +115,95 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
     with pytest.raises(OSError, match="closure failed"):
         _run(SessionLifecycle(run).run_direct())
     assert events == ["enter", "attempt", "close", "exit"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (CollectorTimeoutError("timeout"), "operation timed out"),
+        (AdvanceUncertainError("unknown advance"), "advance acknowledgement uncertain"),
+        (NotificationOverflowError("queue full"), "notification queue overflow"),
+    ],
+)
+def test_report_session_error_keeps_stable_operator_message(error: Exception, expected: str) -> None:
+    async def scenario() -> None:
+        activity: list[ActivityEvent] = []
+        await report_session_error(activity.append, "read/reconcile", error, OpportunisticRuntime())
+        assert len(activity) == 1
+        event = activity[0]
+        assert event.state == "session_error"
+        assert event.error_message == expected
+
+    _run(scenario())
+
+
+def test_report_session_error_bounds_distinct_transport_cause_chain() -> None:
+    async def scenario() -> None:
+        max_entries = DEFAULT_CONFIG.observability.max_error_chain_entries
+        root = RingTransportDisconnectedError("link to AA:BB:CC:DD:EE:FF lost")
+        previous: BaseException = root
+        for index in range(max_entries):
+            cause = RuntimeError(f"cause-{index}")
+            previous.__cause__ = cause
+            previous = cause
+
+        activity: list[ActivityEvent] = []
+        await report_session_error(activity.append, "read/reconcile", root, OpportunisticRuntime())
+        event = activity[0]
+        assert event.error_message is not None
+        assert event.error_message.split(" <- ") == [
+            "RingTransportDisconnectedError: link to [BLE address] lost",
+            *(f"RuntimeError: cause-{index}" for index in range(max_entries - 1)),
+        ]
+
+    _run(scenario())
+
+
+def test_report_session_error_bounds_long_type_name_at_operator_boundary() -> None:
+    async def scenario() -> None:
+        max_chars = DEFAULT_CONFIG.observability.max_error_entry_chars
+        long_type = cast(type[Exception], type("E" * (max_chars + 10), (Exception,), {}))
+        cause: Exception = long_type("details")
+        transport = RingTransportDisconnectedError("device link lost")
+        transport.__cause__ = cause
+        activity: list[ActivityEvent] = []
+
+        await report_session_error(activity.append, "connect", transport, OpportunisticRuntime())
+
+        event = activity[0]
+        assert event.error_message is not None
+        _, bounded_cause = event.error_message.split(" <- ")
+        assert bounded_cause == f"{'E' * (max_chars - 2)}: "
+        assert len(bounded_cause) == max_chars
+
+    _run(scenario())
+
+
+def test_report_session_error_truncates_long_redacted_message_to_entry_limit() -> None:
+    async def scenario() -> None:
+        max_chars = DEFAULT_CONFIG.observability.max_error_entry_chars
+        address = "AA:BB:CC:DD:EE:FF"
+        cause = RuntimeError(f"device {address} failed: " + "x" * (max_chars * 2))
+        transport = RingTransportDisconnectedError("device link lost")
+        transport.__cause__ = cause
+        activity: list[ActivityEvent] = []
+
+        await report_session_error(activity.append, "connect", transport, OpportunisticRuntime())
+
+        event = activity[0]
+        assert event.error_message is not None
+        _, bounded_cause = event.error_message.split(" <- ")
+        expected_prefix = "RuntimeError: device [BLE address] failed: "
+        assert bounded_cause == expected_prefix + "x" * (max_chars - len(expected_prefix))
+        assert len(bounded_cause) == max_chars
+        assert address not in event.error_message
+
+    _run(scenario())
+
+
+def test_validate_policy_accepts_exact_fit_large_integer_capacity() -> None:
+    records = 2**53 + 1
+    validate_policy(RetryPolicy(batch_records=records, arena_max_bytes=records * RECORD_SIZE))
 
 
 def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

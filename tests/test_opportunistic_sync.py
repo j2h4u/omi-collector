@@ -24,11 +24,13 @@ from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStor
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
+from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
 from omi_collector.capture.adapters.staging_contract import (
     AttemptDescriptor,
     DeviceAlreadyRunningError,
     DurablePrefix,
     LockContext,
+    StagingError,
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
@@ -416,7 +418,9 @@ class _SealResultBatchWriter:
 
 
 @asynccontextmanager
-async def _real_batch_writer(store: StagingStore, start: int, count: int) -> AsyncIterator[BatchWriterPort]:
+async def _real_batch_writer(
+    store: StagingStore, start: int, count: int, *, prepared: bool = True
+) -> AsyncIterator[BatchWriterPort]:
     writer = _runtime().make_batch_writer(
         store,
         start,
@@ -427,8 +431,9 @@ async def _real_batch_writer(store: StagingStore, start: int, count: int) -> Asy
     )
     try:
         await writer.start()
-        await writer.prepare_leg(start, count)
-        await writer.read_begin(ReadBeginNotification(start, count))
+        if prepared:
+            await writer.prepare_leg(start, count)
+            await writer.read_begin(ReadBeginNotification(start, count))
         yield writer
     finally:
         try:
@@ -436,6 +441,67 @@ async def _real_batch_writer(store: StagingStore, start: int, count: int) -> Asy
         finally:
             await asyncio.to_thread(writer.thread.join, 2)
             assert not writer.thread.is_alive()
+
+
+@_async_test
+async def test_real_runtime_writer_start_persists_pending_attempt_before_leg_work(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    async with _real_batch_writer(store, 100, 2, prepared=False) as writer:
+        pending = store.pending_attempts()
+        assert len(pending) == 1
+        assert pending[0].attempt_id == writer.attempt_id
+        assert pending[0].start_sequence == 100
+        assert pending[0].packet_count == 2
+        assert pending[0].read_begin_start is None
+        assert pending[0].read_begin_count is None
+
+
+@_async_test
+async def test_real_runtime_writer_barrier_returns_persisted_durable_prefix(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    record = _record(100)
+    async with _real_batch_writer(store, 100, 2) as writer:
+        assert writer.publish(RECORD_SIZE)
+        durable = await writer.barrier()
+
+        assert durable.start_sequence == 100
+        assert durable.next_sequence == 101
+        assert durable.record_count == 1
+        attempt_path = store.attempts_root / writer.attempt_id
+        assert (attempt_path / "records.bin").read_bytes() == record
+        checkpoint = cast(dict[str, object], loads((attempt_path / "checkpoint.json").read_text(encoding="utf-8")))
+        assert checkpoint["record_count"] == 1
+        assert checkpoint["raw_sha256"] == sha256(record).hexdigest()
+        assert durable.raw_sha256 == checkpoint["raw_sha256"]
+
+
+@_async_test
+async def test_real_runtime_writer_retains_seal_bundle_result(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    records = _records(100, 2)
+    async with _real_batch_writer(store, 100, 2) as writer:
+        assert writer.publish(len(records))
+        sealed = await writer.seal(DoneNotification(0, 102))
+        retained = await writer.await_seal_result()
+
+        assert retained == sealed
+        assert sealed.bundle_path.is_dir()
+        assert (sealed.bundle_path / "records.bin").read_bytes() == records
+        manifest = cast(dict[str, object], loads((sealed.bundle_path / "manifest.json").read_text(encoding="utf-8")))
+        assert manifest["start_sequence"] == 100
+        assert manifest["next_sequence"] == 102
+        assert manifest["record_count"] == 2
+
+
+@_async_test
+async def test_real_runtime_classifies_deferred_quarantine_failures() -> None:
+    runtime = _runtime()
+    errors: tuple[BaseException, ...] = (
+        QuarantineSalvageDeferredError("publication should wait"),
+        DeviceAlreadyRunningError(),
+        StagingError("local staging is temporarily unavailable"),
+    )
+    assert tuple(runtime.classify_quarantine_error(error) for error in errors) == ("deferred",) * len(errors)
 
 
 @_async_test

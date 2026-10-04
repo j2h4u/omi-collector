@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from itertools import product
 
 import pytest
@@ -98,6 +99,17 @@ def test_legal_lifecycle_reaches_retired_only_after_close() -> None:
     assert transition(sealed, Event.ADVANCE_ACK_INFO, CursorAction.REPEAT).command is Command.KEEP
     assert transition(sealed, Event.ADVANCE_ACK_INFO, CursorAction.CONFIRMED).command is Command.CLOSE
     assert transition(sealed, Event.WRITER_CLOSED).milestone is Milestone.RETIRED
+
+
+def test_returned_transition_is_immutable_and_shared_transition_stays_sealed() -> None:
+    result = transition(Milestone.FULL_DURABLE, Event.SEAL)
+
+    assert (result.milestone, result.command) == (Milestone.SEALED, Command.NONE)
+    with pytest.raises(FrozenInstanceError):
+        result.__setattr__("command", Command.ADVANCE)
+
+    repeated = transition(Milestone.FULL_DURABLE, Event.SEAL)
+    assert (repeated.milestone, repeated.command) == (Milestone.SEALED, Command.NONE)
 
 
 def test_unknown_tags_are_rejected() -> None:

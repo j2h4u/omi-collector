@@ -251,6 +251,20 @@ def test_startup_recovery_disposition_and_interrupted_close_loop() -> None:
     assert transition(closing.state, ClosureCommitted()) == TransitionResult(Recovering(), InspectRecovery())
 
 
+def test_restored_startup_arms_waiting_but_empty_and_interrupted_visits_do_not() -> None:
+    empty = transition(Recovering(), RecoveryLoaded("empty"))
+    restored = transition(Recovering(), RecoveryLoaded("resumable"))
+    interrupted_outcome = Interrupted(connected=True, durable_progress=False)
+    interrupted = transition(Attempting(Waiting()), SessionFinished(interrupted_outcome))
+
+    assert empty == TransitionResult(Idle(), WaitForAttempt(arm_restored=False, previous_outcome=None))
+    assert restored == TransitionResult(Waiting(), WaitForAttempt(arm_restored=True, previous_outcome=None))
+    assert interrupted == TransitionResult(
+        Waiting(),
+        WaitForAttempt(arm_restored=False, previous_outcome=interrupted_outcome),
+    )
+
+
 @pytest.mark.parametrize("reason", ["absence", "recovery_exhausted"])
 def test_waiting_recovery_end_commits_closure(reason: str) -> None:
     result = transition(Waiting(), RecoveryEnded(reason))  # type: ignore[arg-type]

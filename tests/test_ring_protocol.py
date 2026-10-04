@@ -1,8 +1,11 @@
-from collections.abc import Callable
+import asyncio
+from collections.abc import Callable, Iterable
 from struct import pack
+from typing import Literal, TypeVar, cast
 
 import pytest
 
+from omi_collector.capture.application.ring_transport import ControlNotificationStream, RingTransportDisconnectedError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     AckNotification,
@@ -18,6 +21,28 @@ from omi_collector.capture.domain.ring_protocol import (
     parse_read_begin_notification,
     parse_status,
 )
+
+_T = TypeVar("_T")
+
+
+def _observe_stream_wait(monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, list[asyncio.Future[object]]]:
+    readiness = asyncio.Event()
+    children: list[asyncio.Future[object]] = []
+    original_wait = asyncio.wait
+
+    async def observed_wait(
+        tasks: Iterable[asyncio.Task[_T]],
+        *,
+        timeout: float | None = None,
+        return_when: Literal["FIRST_COMPLETED", "FIRST_EXCEPTION", "ALL_COMPLETED"] = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[asyncio.Task[_T]], set[asyncio.Task[_T]]]:
+        pending = tuple(tasks)
+        readiness.set()
+        children.extend(cast(Iterable[asyncio.Future[object]], pending))
+        return await original_wait(pending, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(asyncio, "wait", observed_wait)
+    return readiness, children
 
 
 def test_parse_status_uses_little_endian_fields() -> None:
@@ -142,3 +167,77 @@ def test_command_encoders_preserve_wire_endianness_and_optional_count() -> None:
 def test_command_encoders_reject_out_of_range_values(call: Callable[[], bytes], match: str) -> None:
     with pytest.raises(RingProtocolError, match=match):
         call()
+
+
+def test_control_notification_stream_accepts_one_byte_with_one_byte_budget() -> None:
+    async def run() -> None:
+        stream = ControlNotificationStream(buffer_bytes=1)
+        stream.feed(b"x")
+        try:
+            async with asyncio.timeout(5):
+                assert await stream.__anext__() == b"x"
+        finally:
+            stream.close()
+
+    asyncio.run(run())
+
+
+def test_control_notification_stream_wakes_waiting_consumer_on_feed(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        stream = ControlNotificationStream(buffer_bytes=1)
+        readiness, children = _observe_stream_wait(monkeypatch)
+        consumer = asyncio.create_task(stream.__anext__())
+        try:
+            async with asyncio.timeout(5):
+                await readiness.wait()
+            stream.feed(b"x")
+            async with asyncio.timeout(5):
+                assert await consumer == b"x"
+        finally:
+            if not consumer.done():
+                consumer.cancel()
+            await asyncio.gather(consumer, *children, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_control_notification_stream_wakes_waiting_consumer_on_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        stream = ControlNotificationStream()
+        readiness, children = _observe_stream_wait(monkeypatch)
+        consumer = asyncio.create_task(stream.__anext__())
+        try:
+            async with asyncio.timeout(5):
+                await readiness.wait()
+            stream.fail_disconnected()
+            with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
+                async with asyncio.timeout(5):
+                    await consumer
+        finally:
+            if not consumer.done():
+                consumer.cancel()
+            await asyncio.gather(consumer, *children, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_control_notification_stream_cancellation_joins_owned_waiters(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        stream = ControlNotificationStream()
+        readiness, children = _observe_stream_wait(monkeypatch)
+        consumer = asyncio.create_task(stream.__anext__())
+        try:
+            async with asyncio.timeout(5):
+                await readiness.wait()
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                async with asyncio.timeout(5):
+                    await consumer
+            assert len(children) == 2
+            assert all(task.done() for task in children)
+        finally:
+            if not consumer.done():
+                consumer.cancel()
+            await asyncio.gather(consumer, *children, return_exceptions=True)
+
+    asyncio.run(run())

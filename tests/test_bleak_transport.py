@@ -391,9 +391,9 @@ async def test_notification_stream_disconnect_drains_queued_data_in_order() -> N
     stream.fail_disconnected()
 
     for payload in payloads:
-        assert await stream.__anext__() == payload
+        assert await asyncio.wait_for(stream.__anext__(), timeout=5.0) == payload
     with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
-        await stream.__anext__()
+        await asyncio.wait_for(stream.__anext__(), timeout=5.0)
 
 
 @_async_test
@@ -427,10 +427,10 @@ async def test_notification_stream_accepts_exact_byte_boundary_and_accounts_dequ
     stream = ControlNotificationStream(buffer_bytes=8)
     stream.feed(b"1234")
     stream.feed(b"5678")
-    assert await stream.__anext__() == b"1234"
+    assert await asyncio.wait_for(stream.__anext__(), timeout=5.0) == b"1234"
     stream.feed(b"abcd")
-    assert await stream.__anext__() == b"5678"
-    assert await stream.__anext__() == b"abcd"
+    assert await asyncio.wait_for(stream.__anext__(), timeout=5.0) == b"5678"
+    assert await asyncio.wait_for(stream.__anext__(), timeout=5.0) == b"abcd"
 
 
 @_async_test
@@ -1364,16 +1364,20 @@ async def test_cancelled_disconnect_timeout_keeps_late_callback_local() -> None:
     original_debug_event = bleak_transport.debug_event
     bleak_transport.debug_event = record
     transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+    closing: asyncio.Task[None] | None = None
     try:
         session = await transport.connect()
         closing = asyncio.create_task(session.close())
-        await stop_started.wait()
+        await asyncio.wait_for(stop_started.wait(), timeout=5.0)
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await closing
         assert client.disconnect_callback is not None
         client.disconnect_callback(client)
     finally:
+        if closing is not None:
+            closing.cancel()
+            await asyncio.gather(closing, return_exceptions=True)
         client.stop_notify = original_stop_notify  # type: ignore[method-assign]
         client.disconnect = original_disconnect  # type: ignore[method-assign]
         bleak_transport.debug_event = original_debug_event

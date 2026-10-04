@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import json
+import os
+import select
+import signal
 import threading
 import time
 from pathlib import Path
@@ -16,6 +21,7 @@ from omi_collector.capture.adapters.firmware_observations import (
 )
 from omi_collector.capture.domain.ring_protocol import RingInfo
 from omi_collector.config import FirmwareObservationConfig
+from omi_collector.spool_metrics import SpoolMetricsError, collect_spool_metrics
 
 
 def _info(dropped: int) -> RingInfo:
@@ -379,3 +385,178 @@ def test_writer_close_is_bounded_when_store_stalls(tmp_path: Path) -> None:
     finally:
         release.set()
         writer.close()
+
+
+def test_reader_rejects_valid_json_with_noncanonical_top_level_order(tmp_path: Path) -> None:
+    path = tmp_path / "device.json"
+    FirmwareObservationStore(path).record(_info(1))
+    document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    reordered = {
+        "schema_version": document["schema_version"],
+        "latest": document["latest"],
+        "metrics": document["metrics"],
+    }
+    raw = json.dumps(reordered, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    canonical = json.dumps(reordered, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert raw != canonical
+    path.write_bytes(raw)
+
+    with pytest.raises(FirmwareObservationError, match="canonical"):
+        read_firmware_observations(path)
+
+    assert path.read_bytes() == raw
+
+
+def test_reader_rejects_negative_persisted_firmware_metric_without_rewriting_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "device.json"
+    FirmwareObservationStore(path).record(_info(1))
+    document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    metrics = cast(dict[str, object], document["metrics"])
+    metrics["observed_increase"] = -1
+    raw = json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(raw)
+
+    with pytest.raises(FirmwareObservationError, match="observed_increase"):
+        read_firmware_observations(path)
+
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("malformed_section", ["latest", "metrics"])
+def test_reader_and_spool_metrics_wrap_malformed_firmware_sections(
+    tmp_path: Path, malformed_section: str
+) -> None:
+    path = tmp_path / "device.json"
+    FirmwareObservationStore(path).record(_info(1))
+    document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    document[malformed_section] = None
+    raw = json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(raw)
+
+    with pytest.raises(FirmwareObservationError):
+        read_firmware_observations(path)
+    publication_root = tmp_path / "published"
+    publication_root.mkdir()
+    with pytest.raises(SpoolMetricsError, match="firmware observations are invalid") as raised:
+        collect_spool_metrics(publication_root, observation_root=path)
+
+    assert isinstance(raised.value.__cause__, FirmwareObservationError)
+    assert path.read_bytes() == raw
+
+
+def _collect_forked_child_result(read_fd: int, process_id: int, timeout_seconds: float) -> tuple[bytes, bool, int]:
+    deadline = time.monotonic() + timeout_seconds
+    result = bytearray()
+    eof = False
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([read_fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                eof = True
+                break
+            result.extend(chunk)
+    finally:
+        os.close(read_fd)
+        if not eof:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(process_id, signal.SIGKILL)
+        _, status = os.waitpid(process_id, 0)
+    return bytes(result), eof, status
+
+
+def test_reader_rejects_fifo_without_blocking_a_forked_caller(tmp_path: Path) -> None:
+    fifo = tmp_path / "device.json"
+    os.mkfifo(fifo)
+    read_fd, write_fd = os.pipe()
+    expected_module = Path(read_firmware_observations.__code__.co_filename).resolve()
+    process_id = os.fork()
+    if process_id == 0:
+        os.close(read_fd)
+        try:
+            try:
+                read_firmware_observations(fifo)
+            except FirmwareObservationError as error:
+                outcome = f"typed-error:{error}"
+            except (TypeError, OSError, ValueError) as error:
+                outcome = f"wrong-error:{type(error).__name__}"
+            else:
+                outcome = "returned"
+            module = Path(read_firmware_observations.__code__.co_filename).resolve().as_posix()
+            os.write(write_fd, json.dumps({"outcome": outcome, "module": module}).encode())
+            os._exit(0)
+        finally:
+            os._exit(1)
+    os.close(write_fd)
+
+    payload, eof, status = _collect_forked_child_result(read_fd, process_id, 2.0)
+
+    assert eof, "reader child stayed blocked on the FIFO"
+    assert os.waitstatus_to_exitcode(status) == 0
+    result = cast(dict[str, str], json.loads(payload))
+    assert result["outcome"].startswith("typed-error:")
+    assert Path(result["module"]).resolve() == expected_module
+
+
+def test_nested_firmware_state_parent_is_created_by_public_store(tmp_path: Path) -> None:
+    path = tmp_path / "a" / "b" / "device.json"
+    info = _info(7)
+
+    assert FirmwareObservationStore(path).record(info)
+
+    (observation,) = read_firmware_observations(path)
+    assert observation.info == info
+    assert observation.observation_count == 1
+    assert path.is_file()
+
+
+def test_blocked_writer_does_not_hold_forked_interpreter_shutdown(tmp_path: Path) -> None:
+    read_fd, write_fd = os.pipe()
+    expected_module = Path(FirmwareObservationWriter.__init__.__code__.co_filename).resolve()
+    process_id = os.fork()
+    if process_id == 0:
+        os.close(read_fd)
+        try:
+            class BlockingStore(FirmwareObservationStore):
+                def __init__(self) -> None:
+                    super().__init__(tmp_path / "blocked-device.json")
+                    self.record_started = threading.Event()
+                    self.release = threading.Event()
+
+                def record(self, info: RingInfo) -> bool:
+                    assert info == _info(1)
+                    self.record_started.set()
+                    self.release.wait()
+                    return True
+
+            store = BlockingStore()
+            writer = FirmwareObservationWriter(
+                store,
+                config=FirmwareObservationConfig(retry_backoff_seconds=(0.01,), close_timeout_seconds=0.05),
+            )
+            writer.observe(_info(1))
+            if not store.record_started.wait(1):
+                os.write(write_fd, b"record-not-started\n")
+                os._exit(2)
+            writer.close()
+            module = Path(FirmwareObservationWriter.__init__.__code__.co_filename).resolve().as_posix()
+            os.write(write_fd, f"record-started\nclose-returned\nmodule:{module}\n".encode())
+            exit_process = ctypes.pythonapi.Py_Exit
+            exit_process.argtypes = [ctypes.c_int]
+            exit_process.restype = None
+            exit_process(0)
+            os._exit(3)
+        finally:
+            os._exit(1)
+    os.close(write_fd)
+
+    payload, eof, status = _collect_forked_child_result(read_fd, process_id, 2.0)
+
+    assert eof, "blocked writer prevented child interpreter shutdown after bounded close"
+    assert os.waitstatus_to_exitcode(status) == 0
+    lines = payload.decode("utf-8").splitlines()
+    assert lines[:2] == ["record-started", "close-returned"]
+    assert lines[2].startswith("module:")
+    assert Path(lines[2].removeprefix("module:")).resolve() == expected_module

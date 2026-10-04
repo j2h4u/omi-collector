@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import omi_collector.capture.adapters.clock_corrections as clock_corrections_module
 from omi_collector.capture.adapters.clock_corrections import (
     ClockCorrectionError,
     ClockCorrectionStore,
@@ -795,3 +800,191 @@ def test_clock_correction_state_fields_are_strict(
 
     with pytest.raises(ClockCorrectionError, match="invalid"):
         store.records()
+
+
+def test_concurrent_identical_prepare_returns_the_same_durable_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    correction_root = tmp_path / "clock-corrections"
+    correction_root.mkdir()
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    lock_open_barrier = threading.Barrier(2)
+    original_open = Path.open
+
+    def wait_until_both_prepares_reach_the_lock(path: Path, *args: object, **kwargs: object) -> object:
+        if path == correction_root / ".lock":
+            lock_open_barrier.wait(timeout=2)
+        return cast(Callable[..., object], original_open)(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", wait_until_both_prepares_reach_the_lock)
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        futures = [
+            callers.submit(store.prepare, 1300, 1000, 300.0, 20, operation_id="same-operation")
+            for _ in range(2)
+        ]
+        try:
+            results = [future.result(timeout=3) for future in futures]
+        finally:
+            lock_open_barrier.abort()
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert len(store.records()) == 1
+    assert store.records()[0] == results[0]
+
+
+def _fail_clock_correction_directory_fsync(
+    monkeypatch: pytest.MonkeyPatch, correction_root: Path
+) -> OSError:
+    original_open = os.open
+    original_fsync = os.fsync
+    correction_directory_descriptors: set[int] = set()
+    sentinel = OSError("clock correction directory fsync sentinel")
+
+    def track_directory_open(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        descriptor = original_open(path, flags, *args)
+        if Path(path) == correction_root:
+            correction_directory_descriptors.add(descriptor)
+        return descriptor
+
+    def fail_only_for_correction_directory(descriptor: int) -> None:
+        if descriptor in correction_directory_descriptors:
+            raise sentinel
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(clock_corrections_module.os, "open", track_directory_open)
+    monkeypatch.setattr(clock_corrections_module.os, "fsync", fail_only_for_correction_directory)
+    return sentinel
+
+
+def test_prepare_preserves_directory_fsync_error_after_atomic_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    correction_root = tmp_path / "clock-corrections"
+    correction_root.mkdir()
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    sentinel = _fail_clock_correction_directory_fsync(monkeypatch, correction_root)
+
+    with pytest.raises(ClockCorrectionError, match="intent is not durable") as raised:
+        store.prepare(1300, 1000, 300.0, 20, operation_id="prepare-fsync")
+
+    assert raised.value.__cause__ is sentinel
+    path = correction_root / "prepare-fsync.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == "prepared"
+    assert list(correction_root.glob(".*.tmp")) == []
+    assert store.records()[0].operation_id == "prepare-fsync"
+
+
+def test_finish_preserves_directory_fsync_error_after_atomic_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    intent = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20, operation_id="finish-fsync"))
+    correction_root = tmp_path / "clock-corrections"
+    sentinel = _fail_clock_correction_directory_fsync(monkeypatch, correction_root)
+
+    with pytest.raises(ClockCorrectionError, match="result is not durable") as raised:
+        store.finish(intent, state="applied", boundary_sequence_max=24, verified_epoch=1000)
+
+    assert raised.value.__cause__ is sentinel
+    path = correction_root / "finish-fsync.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == "applied"
+    assert list(correction_root.glob(".*.tmp")) == []
+    assert store.records()[0].state == "applied"
+
+
+def _append_native_observation(store: ClockCorrectionStore, values: dict[str, object]) -> ClockObservation:
+    return store.observation_store.append(
+        evidence_kind="native_trusted",
+        session_id=cast(str, values["session_id"]),
+        host_boot_id="host-boot",
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        host_monotonic_start=1.0,
+        host_monotonic_end=1.0,
+        device_epoch=cast(int, values["device_epoch"]),
+        info_sequence_min=20,
+        info_sequence_max=cast(int, values["info_sequence_max"]),
+        operation_id=cast(str | None, values.get("operation_id")),
+        observation_role=cast(str, values.get("observation_role", "standalone")),
+        parent_observation_id=cast(str | None, values.get("parent_observation_id")),
+    )
+
+
+@pytest.mark.parametrize(
+    ("other_operation_sequence", "should_settle_current"),
+    [(20, False), (22, False), (24, False), (25, True)],
+    ids=("lower-boundary", "interior", "upper-boundary", "outside-range"),
+)
+def test_causal_reconcile_preserves_another_valid_unresolved_operation(
+    tmp_path: Path, other_operation_sequence: int, should_settle_current: bool
+) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    current = store.mark_unresolved(store.prepare(1300, 1000, 300.0, 20, operation_id="current-operation"))
+
+    other_root = tmp_path / "other"
+    other_store = ClockCorrectionStore(other_root / "device.json", other_root / "attempts")
+    other = other_store.mark_unresolved(
+        other_store.prepare(
+            1300,
+            1000,
+            300.0,
+            other_operation_sequence,
+            operation_id="other-operation",
+        )
+    )
+    assert other.state == "unresolved"
+    other_record = other_root / "clock-corrections" / "other-operation.json"
+    (tmp_path / "clock-corrections" / "other-operation.json").write_bytes(other_record.read_bytes())
+    initial = _append_native_observation(store, {
+        "session_id": "same-session",
+        "device_epoch": 1300,
+        "info_sequence_max": 20,
+        "operation_id": current.operation_id,
+        "observation_role": "initial",
+    })
+    later = _append_native_observation(store, {
+        "session_id": "same-session",
+        "device_epoch": 1000,
+        "info_sequence_max": 24,
+        "operation_id": current.operation_id,
+        "observation_role": "later",
+        "parent_observation_id": initial.observation_id,
+    })
+    current_bytes = (tmp_path / "clock-corrections" / "current-operation.json").read_bytes()
+    other_bytes = (tmp_path / "clock-corrections" / "other-operation.json").read_bytes()
+
+    reconciled = store.reconcile_causal_observation(later, near_zero_threshold=5.0)
+
+    states = {item.operation_id: item.state for item in store.records()}
+    if should_settle_current:
+        assert tuple(item.operation_id for item in reconciled) == ("current-operation",)
+        assert states == {"current-operation": "applied", "other-operation": "unresolved"}
+    else:
+        assert reconciled == ()
+        assert states == {"current-operation": "unresolved", "other-operation": "unresolved"}
+        assert (tmp_path / "clock-corrections" / "current-operation.json").read_bytes() == current_bytes
+        assert (tmp_path / "clock-corrections" / "other-operation.json").read_bytes() == other_bytes
+
+
+def test_standalone_native_parent_can_support_cross_session_reconciliation(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
+    parent = _append_native_observation(store, {
+        "session_id": "parent-session",
+        "device_epoch": 1000,
+        "info_sequence_max": 20,
+    })
+    current = store.mark_unresolved(store.prepare(1100, 1000, 100.0, 20, operation_id="current-operation"))
+    later = _append_native_observation(store, {
+        "session_id": "later-session",
+        "device_epoch": 1000,
+        "info_sequence_max": 24,
+        "operation_id": current.operation_id,
+        "observation_role": "later",
+        "parent_observation_id": parent.observation_id,
+    })
+
+    reconciled = store.reconcile_causal_observation(later, near_zero_threshold=5.0)
+
+    assert tuple(item.operation_id for item in reconciled) == ("current-operation",)
+    assert reconciled[0].state == "applied"
+    assert reconciled[0].boundary_sequence_max == 24

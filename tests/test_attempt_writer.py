@@ -203,9 +203,7 @@ class ProcessLifetimeTarget:
         return None
 
 
-def _run_writer_lifecycle_in_daemon_owner(
-    entered: _ProcessEvent, release: Connection, flags: _ProcessFlags
-) -> None:
+def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Connection, flags: _ProcessFlags) -> None:
     async def lifecycle() -> None:
         writer = AttemptWriter(ProcessLifetimeTarget(entered, release, flags), bytes(RECORD_SIZE))
         try:

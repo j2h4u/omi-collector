@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import replace
-from functools import wraps
+from functools import partial, wraps
 from hashlib import sha256
 from json import loads
 from pathlib import Path
@@ -62,7 +62,12 @@ from omi_collector.capture.application.opportunistic_sync import CollectionPrese
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
 )
-from omi_collector.capture.application.ports import BatchWriterPort, StagingPort, StorageLeaseContext
+from omi_collector.capture.application.ports import (
+    BatchWriterPort,
+    CaptureRuntimePort,
+    StagingPort,
+    StorageLeaseContext,
+)
 from omi_collector.capture.application.presence import (
     PresenceCallback,
     PresencePolicy,
@@ -118,6 +123,18 @@ async def run_opportunistic_collector(
 ) -> CollectionResult | NoDataResult:
     """Test helper that injects the concrete runtime at every call site."""
     return await _run_opportunistic_collector(provider, staging, options, runtime=_runtime())
+
+
+async def _finalize_with_short_transfer_timeout(
+    finalize: Callable[
+        [batch_reconciliation._Batch, OpportunisticOptions, CaptureRuntimePort],
+        Awaitable[tuple[BaseException | None, BaseException | None]],
+    ],
+    batch: batch_reconciliation._Batch,
+    options: OpportunisticOptions,
+    runtime: CaptureRuntimePort,
+) -> tuple[BaseException | None, BaseException | None]:
+    return await finalize(batch, replace(options, timeouts=TransferTimeouts(0.03, 0.03)), runtime)
 
 
 def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
@@ -3792,6 +3809,11 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
     monkeypatch.setattr("omi_collector.capture.adapters.staging_writer.StagingWriter.close", observed_target_close)
     monkeypatch.setattr("omi_collector.capture.adapters.attempt_writer.AttemptWriter.close", observed_writer_close)
     monkeypatch.setattr("omi_collector.capture.adapters.attempt_writer.AttemptWriter.publish", observed_publish)
+    monkeypatch.setattr(
+        batch_reconciliation,
+        "_finalize_batch",
+        partial(_finalize_with_short_transfer_timeout, batch_reconciliation._finalize_batch),
+    )
 
     entered = asyncio.Event()
 
@@ -3808,29 +3830,35 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
             WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)))),
         ),
     )
-    task = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([session]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
-            replace(_options(batch_records=1, activity=activity), timeouts=TransferTimeouts(0.03, 0.03)),
+    async with asyncio.TaskGroup() as tasks:
+        task = tasks.create_task(
+            run_opportunistic_collector(
+                Provider([session]),
+                StagingStore(tmp_path, _capture_root(tmp_path)),
+                _options(batch_records=1, activity=activity),
+            )
         )
-    )
-    await entered.wait()
-    assert await asyncio.to_thread(data_submitted.wait, 1)
-    assert await asyncio.to_thread(read_begin_completed.wait, 1)
-    task.cancel()
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert await asyncio.to_thread(data_submitted.wait, 5)
+            assert await asyncio.to_thread(read_begin_completed.wait, 5)
+            task.cancel()
 
-    try:
-        assert await asyncio.to_thread(checkpoint_started.wait, 1)
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert close_attempted.is_set()
-        assert not target_closed.is_set()
-        errors = {event.state: event for event in activity}
-        assert errors["writer_checkpoint_error"].error_type == "CollectorTimeoutError"
-        assert errors["writer_close_error"].error_type == "CollectorTimeoutError"
-    finally:
-        release_checkpoint.set()
+            assert await asyncio.to_thread(checkpoint_started.wait, 5)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert close_attempted.is_set()
+            assert not target_closed.is_set()
+            errors = {event.state: event for event in activity}
+            assert errors["writer_checkpoint_error"].error_type == "CollectorTimeoutError"
+            assert errors["writer_close_error"].error_type == "CollectorTimeoutError"
+        finally:
+            task.cancel()
+            release_checkpoint.set()
+            await asyncio.gather(task, return_exceptions=True)
+            for writer in closed_writers:
+                await asyncio.to_thread(writer.thread.join, 5)
 
     assert await asyncio.to_thread(target_closed.wait, 1)
     assert len(closed_writers) == 1

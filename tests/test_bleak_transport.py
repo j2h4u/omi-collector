@@ -615,12 +615,16 @@ async def test_disconnect_callback_wakes_notification_consumer() -> None:
 
     async with BleakRingTransport("fake", client_factory=cast(ClientFactory, factory)) as session:
         pending = asyncio.create_task(cast(Coroutine[object, object, bytes], session.notifications().__anext__()))
-        await asyncio.sleep(0)
-        assert client.disconnect_callback is not None
-        client.disconnect_callback(client)
+        try:
+            await asyncio.sleep(0)
+            assert client.disconnect_callback is not None
+            client.disconnect_callback(client)
 
-        with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
-            await pending
+            with pytest.raises(RingTransportDisconnectedError, match="disconnected"):
+                await asyncio.wait_for(pending, timeout=5.0)
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 @_async_test

@@ -37,6 +37,7 @@ def test_rejects_malformed_opus_framing_instead_of_guessing_duration() -> None:
         bytes((131, 8, *range(8))),  # Eight 2.5 ms CELT frames, code 3 CBR.
         bytes((0x0B, 0x01, 0x55)),  # One 20 ms SILK frame, code 3 CBR.
         bytes((0x0B, 0x81, 0x55)),  # One 20 ms SILK frame, code 3 VBR.
+        bytes((0x0B, 0x41, 1, 0x55, 0)),  # One 20 ms SILK frame with padding.
     ),
 )
 def test_counts_other_valid_20ms_opus_framings(packet: bytes) -> None:
@@ -51,6 +52,14 @@ def test_counts_other_valid_20ms_opus_framings(packet: bytes) -> None:
         bytes((24, 0x55)),  # 60 ms.
         bytes((1, 0x55, 0x66, 0x77)),  # Odd code-1 frame body.
         bytes((2, 2, 0x55, 0x66)),  # VBR first frame consumes the whole body.
+        bytes((8,)),  # Code 0 with no frame body.
+        bytes((2, 0, 0x55)),  # Code 2 with an empty first VBR frame.
+        bytes((3, 0x82, 0, 0x55)),  # Code 3 VBR with an empty first frame.
+        bytes((3, 2)),  # Code 3 CBR with no frame body.
+        bytes((3, 0x82, 1, 0x55)),  # Code 3 VBR with an empty last frame.
+        bytes((2,)),  # Truncated code 2 VBR size.
+        bytes((2, 252)),  # Truncated extended code 2 VBR size.
+        bytes((0x0B, 0x41, 3, 0x55, 0)),  # Padding exceeds packet data.
     ),
 )
 def test_rejects_wrong_duration_and_malformed_silk_framing(packet: bytes) -> None:
@@ -141,3 +150,10 @@ def test_record_end_does_not_count_packet_crossing_into_overflow_byte() -> None:
     record[payload_start + 437 : payload_start + 440] = bytes((2, 8, 0xA5))
 
     assert count_20ms_packets(bytes(record)) == 0
+
+
+def test_ignores_payload_byte_at_fixed_record_data_limit() -> None:
+    record = bytes(4) + bytes(439) + bytes((255,))
+
+    assert len(record) == RECORD_SIZE
+    assert count_20ms_packets(record) == 0

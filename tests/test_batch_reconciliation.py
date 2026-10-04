@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from functools import wraps
 from json import loads
 from pathlib import Path
@@ -13,14 +15,19 @@ from typing import cast, override
 
 import pytest
 
-from fakes import ScriptedRingSession, WriteStep
+from fakes import DelayedNotification, ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.attempt_writer import WriterError, WriterFailedError
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.staging_contract import AttemptDescriptor, StagingError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.batch_reconciliation import BatchReconciler, CursorConsistencyError
-from omi_collector.capture.application.collector import CollectionResult, CollectorTimeoutError, TransferTimeouts
+from omi_collector.capture.application.collector import (
+    CollectionResult,
+    CollectorTimeoutError,
+    ProgressEvent,
+    TransferTimeouts,
+)
 from omi_collector.capture.application.ports import (
     BatchWriterPort,
     DurablePrefixShape,
@@ -28,6 +35,7 @@ from omi_collector.capture.application.ports import (
     StagingPort,
     WriterProgressShape,
 )
+from omi_collector.capture.application.quality_metrics import SessionQuality
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy, SessionPhaseState
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
@@ -36,11 +44,19 @@ from omi_collector.capture.domain.ring_protocol import (
     RingInfo,
     RingStatus,
 )
-from omi_collector.config import WriterConfig
+from omi_collector.config import DEFAULT_CONFIG, WriterConfig
 
 
 def _record(value: int) -> bytes:
     return pack(">I", value) + bytes((value % 256,)) * (RECORD_SIZE - 4)
+
+
+def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
+    @wraps(function)
+    def run(*args: P.args, **kwargs: P.kwargs) -> T:
+        return asyncio.run(function(*args, **kwargs))
+
+    return run
 
 
 def _seed_partial(spool: Path, capture_root: Path) -> tuple[StagingStore, Path, bytes, bytes]:
@@ -62,6 +78,94 @@ def _seed_partial(spool: Path, capture_root: Path) -> tuple[StagingStore, Path, 
     )
 
 
+@_async_test
+async def test_regressed_pending_prefix_keeps_authenticated_visit_frontier(tmp_path: Path) -> None:
+    store, _attempt_path, _raw, _checkpoint = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    descriptor = store.pending_attempts()[0]
+    durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
+    assert durable_next == 101
+    runtime = _Runtime()
+    options = _options()
+
+    async def quarantine(attempt_id: str) -> None:
+        await asyncio.to_thread(store.quarantine_attempt_source, attempt_id)
+
+    reconciler = BatchReconciler(store, options, runtime, quarantine)
+    reconciler.set_startup_state(descriptor, durable_next)
+    current = RingInfo(99, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            WriteStep(b"\x11" + (99).to_bytes(8, "big") + (2).to_bytes(4, "big"), (_wire_begin(99, 2),)),
+            WriteStep(b"\x13"),
+        ),
+    )
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    task = asyncio.create_task(reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")))
+    try:
+        async with asyncio.timeout(5):
+            while not runtime.proxies or not runtime.proxies[0].read_begin_complete.is_set():
+                await asyncio.sleep(0)
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        assert reconciler.pending_descriptor is None
+        assert reconciler.durable_progress() == 101
+        await reconciler.close_visit("absence")
+        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+            {"next_sequence": 101, "reason": "absence"}
+        ]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_cursor_ahead_with_metrics_disabled_has_no_metrics_error_event(tmp_path: Path) -> None:
+    store, _path, _raw, _checkpoint = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    descriptor = store.pending_attempts()[0]
+    durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
+    runtime = _Runtime()
+
+    async def quarantine(_attempt_id: str) -> None:
+        return None
+
+    operational_events: list[dict[str, object]] = []
+
+    def emit_operational(event: dict[str, object]) -> None:
+        operational_events.append(event)
+
+    options = replace(_options(), operational=emit_operational)
+    reconciler = BatchReconciler(store, options, runtime, quarantine)
+    reconciler.set_startup_state(descriptor, durable_next)
+    current = RingInfo(103, 103, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1))
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        disposition, _ = await reconciler.connected_step(
+            session, current, info, SessionPhaseState("read/reconcile", SessionQuality(None, "test"))
+        )
+        assert disposition == "drained"
+        result = reconciler.drained_result()
+        assert isinstance(result, CollectionResult)
+        assert result.packet_count == 1
+        assert [event.get("event") for event in operational_events] == ["loss_detected"]
+        assert all(event != "quality_metrics_write_error" for event, _error, _fields in runtime.debug_errors)
+        assert len(tuple(store.capture_root.glob("100-101-*"))) == 1
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
 def _reconciler(store: StagingStore, descriptor: AttemptDescriptor, durable_next: int) -> BatchReconciler:
     async def quarantine(_attempt_id: str) -> None:
         return None
@@ -77,14 +181,6 @@ def _reconciler(store: StagingStore, descriptor: AttemptDescriptor, durable_next
     )
     reconciler.set_startup_state(descriptor, durable_next)
     return reconciler
-
-
-def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
-    @wraps(function)
-    def run(*args: P.args, **kwargs: P.kwargs) -> T:
-        return asyncio.run(function(*args, **kwargs))
-
-    return run
 
 
 def test_restart_interrupted_preserves_unpublished_partial_and_clears_visit(tmp_path: Path) -> None:
@@ -183,6 +279,9 @@ class _WriterProxy:
         self.checkpoint_fault: BaseException | None = None
         self.late_seal_fault: BaseException | None = None
         self.seal_result_calls = 0
+        self.checkpoint_calls = 0
+        self.checkpoint_hook: Callable[[], None] | None = None
+        self.restore_clock: Callable[[], None] | None = None
         self.read_begin_complete = asyncio.Event()
 
     @property
@@ -223,8 +322,13 @@ class _WriterProxy:
         return result
 
     async def checkpoint(self) -> DurablePrefixShape:
+        self.checkpoint_calls += 1
         if self.checkpoint_fault is not None:
-            raise self.checkpoint_fault
+            error, self.checkpoint_fault = self.checkpoint_fault, None
+            if self.checkpoint_hook is not None:
+                hook, self.checkpoint_hook = self.checkpoint_hook, None
+                hook()
+            raise error
         return await self.writer.checkpoint()
 
     async def barrier(self) -> DurablePrefixShape:
@@ -247,6 +351,9 @@ class _WriterProxy:
         return await self.writer.publish_prefix()
 
     async def close(self, *, timeout: float) -> None:
+        if self.restore_clock is not None:
+            restore, self.restore_clock = self.restore_clock, None
+            restore()
         await self.writer.close(timeout=timeout)
         if self.close_fault is not None:
             raise self.close_fault
@@ -263,12 +370,15 @@ class _WriterProxy:
 class _Runtime(OpportunisticRuntime):
     def __init__(self) -> None:
         self.proxies: list[_WriterProxy] = []
+        self.debug_errors: list[tuple[str, BaseException, dict[str, object]]] = []
         self.seal_fault: BaseException | None = None
         self.prepare_fault: BaseException | None = None
         self.close_fault: BaseException | None = None
         self.failure_fault: BaseException | None = None
         self.checkpoint_fault: BaseException | None = None
         self.late_seal_fault: BaseException | None = None
+        self.checkpoint_hook: Callable[[], None] | None = None
+        self.restore_clock: Callable[[], None] | None = None
 
     @override
     def make_batch_writer(
@@ -291,8 +401,14 @@ class _Runtime(OpportunisticRuntime):
         proxy.failure_fault = self.failure_fault
         proxy.checkpoint_fault = self.checkpoint_fault
         proxy.late_seal_fault = self.late_seal_fault
+        proxy.checkpoint_hook = self.checkpoint_hook
+        proxy.restore_clock = self.restore_clock
         self.proxies.append(proxy)
         return proxy
+
+    @override
+    def debug_exception(self, event: str, error: BaseException, **fields: object) -> None:
+        self.debug_errors.append((event, error, fields))
 
 
 async def _close_real_writers(runtime: _Runtime) -> None:
@@ -332,6 +448,25 @@ def _real_batch_steps() -> tuple[WriteStep, ...]:
             (_wire_begin(100, 2), _wire_record(100), _wire_record(101), _wire_done(102)),
         ),
     )
+
+
+@dataclass
+class _CadenceRecorder:
+    events: list[ProgressEvent]
+    first_reported: asyncio.Event
+    loop: asyncio.AbstractEventLoop
+    original_time: Callable[[], float]
+    fake_now: list[float]
+    monkeypatch: pytest.MonkeyPatch
+
+    def __call__(self, event: ProgressEvent) -> None:
+        self.events.append(event)
+        if len(self.events) == 1:
+            self.fake_now[0] = self.original_time()
+            self.monkeypatch.setattr(self.loop, "time", lambda: self.fake_now[0])
+            self.first_reported.set()
+        elif len(self.events) == 2:
+            self.monkeypatch.setattr(self.loop, "time", self.original_time)
 
 
 def _make_reconciler(
@@ -412,6 +547,165 @@ async def test_fresh_info_regression_keeps_sealed_batch_without_advance(tmp_path
         assert seal.bundle_path.is_dir()
         assert (seal.bundle_path / "records.bin").read_bytes() == _record(100) + _record(101)
     finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_acknowledged_advance_with_old_cursor_repeats_without_reread(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    end = 102
+    current = RingInfo(100, end, 100, 0, RECORD_SIZE)
+    old_info = RingInfo(100, end, 100, 0, RECORD_SIZE)
+    confirmed_info = RingInfo(end, end, 100, 0, RECORD_SIZE)
+    info_values = iter((old_info, old_info, old_info, confirmed_info))
+
+    async def info(_session: object) -> RingInfo:
+        return next(info_values)
+
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            _real_batch_steps()[0],
+            WriteStep(b"\x12" + end.to_bytes(8, "big"), (b"\x01\x00",)),
+            WriteStep(b"\x12" + end.to_bytes(8, "big"), (b"\x01\x00",)),
+        ),
+    )
+    try:
+        first = await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
+        assert first == (None, old_info)
+        assert reconciler.completed_batches == 0
+        second = await reconciler.connected_step(session, old_info, info, SessionPhaseState("read/reconcile"))
+        assert second == (None, confirmed_info)
+        result = reconciler.drained_result()
+        assert isinstance(result, CollectionResult)
+        assert result.advance_confirmed is True
+        assert sum(command[0] == 0x11 for command in session.writes) == 1
+        assert sum(command[0] == 0x12 for command in session.writes) == 2
+        assert len(runtime.proxies) == 1
+        assert not runtime.proxies[0].thread.is_alive()
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_connected_read_emits_second_nonterminal_progress_after_cadence(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    events: list[ProgressEvent] = []
+    config = replace(
+        DEFAULT_CONFIG,
+        transfer=replace(DEFAULT_CONFIG.transfer, progress_interval_seconds=0.02),
+    )
+    options = replace(
+        _options(advance=False),
+        policy=replace(_options(advance=False).policy, batch_records=3),
+        config=config,
+        progress=events.append,
+    )
+    _store, reconciler = _make_reconciler(tmp_path, runtime, options)
+    current = RingInfo(100, 103, 100, 0, RECORD_SIZE)
+    end = 103
+    read = WriteStep(
+        b"\x11" + (100).to_bytes(8, "big") + (3).to_bytes(4, "big"),
+        (
+            _wire_begin(100, 3),
+            _wire_record(100),
+            DelayedNotification(0.05, _wire_record(101)),
+            DelayedNotification(0.05, _wire_record(102)),
+            DelayedNotification(0.05, _wire_done(end)),
+        ),
+    )
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1), (read,))
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        disposition, _ = await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
+        assert disposition == "collected"
+        assert len(events) >= 3
+        nonterminal = [event for event in events if event.records_completed < event.records_total]
+        assert [event.records_completed for event in nonterminal] == [1, 2]
+        assert events[-1].records_completed == 3
+        assert not runtime.proxies[0].thread.is_alive()
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@pytest.mark.parametrize("overshoot", [0.0, 0.01], ids=["exact-cadence", "past-cadence"])
+@_async_test
+async def test_progress_due_snapshot_precedes_competing_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overshoot: float
+) -> None:
+    runtime = _Runtime()
+    interval = 0.02
+    config = replace(DEFAULT_CONFIG, transfer=replace(DEFAULT_CONFIG.transfer, progress_interval_seconds=interval))
+    events: list[ProgressEvent] = []
+    first_reported = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_time = loop.time
+    fake_now = [original_time()]
+
+    progress = _CadenceRecorder(events, first_reported, loop, original_time, fake_now, monkeypatch)
+
+    options = replace(
+        _options(advance=False),
+        policy=replace(_options(advance=False).policy, batch_records=4),
+        config=config,
+        progress=progress,
+    )
+    _store, reconciler = _make_reconciler(tmp_path, runtime, options)
+
+    class InterleavedSession:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.closed = False
+
+        async def read_status(self) -> RingStatus:
+            return RingStatus(0, 0, 0, 1)
+
+        def notifications(self) -> AsyncIterator[bytes]:
+            return self._notifications()
+
+        async def write_control(self, payload: bytes) -> None:
+            expected = b"\x11" + (100).to_bytes(8, "big") + (4).to_bytes(4, "big")
+            assert payload == expected
+            self.writes.append(payload)
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def _notifications(self) -> AsyncIterator[bytes]:
+            yield _wire_begin(100, 4)
+            yield _wire_record(100)
+            await first_reported.wait()
+            fake_now[0] += interval + overshoot
+            yield _wire_record(101)
+            await asyncio.sleep(0)
+            yield _wire_record(102)
+            await asyncio.sleep(0)
+            yield _wire_record(103)
+            await asyncio.sleep(0)
+            yield _wire_done(104)
+
+    session = InterleavedSession()
+    current = RingInfo(100, 104, 100, 0, RECORD_SIZE)
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    monkeypatch.setattr(loop, "time", lambda: fake_now[0])
+    try:
+        disposition, _ = await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
+        assert disposition == "collected"
+        assert [event.records_completed for event in events[:2]] == [1, 2]
+        assert events[-1].records_completed == 4
+        assert not runtime.proxies[0].thread.is_alive()
+    finally:
+        monkeypatch.setattr(loop, "time", original_time)
         await _close_real_writers(runtime)
         await session.close()
 
@@ -572,5 +866,175 @@ async def test_finalize_propagates_unexpected_late_error_after_releasing_writer(
             raise AssertionError("unexpected late error should propagate")
         assert not runtime.proxies[0].thread.is_alive()
     finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_finalize_does_not_checkpoint_empty_positive_admission(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            WriteStep(b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big"), (_wire_begin(100, 2),)),
+            WriteStep(b"\x13"),
+        ),
+    )
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    task = asyncio.create_task(reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")))
+    try:
+        async with asyncio.timeout(5):
+            while not runtime.proxies or not runtime.proxies[0].read_begin_complete.is_set():
+                await asyncio.sleep(0)
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        result = await reconciler.finalize_active()
+        proxy = runtime.proxies[0]
+        assert result.checkpoint_error is None
+        assert result.close_error is None
+        assert proxy.checkpoint_calls == 0
+        assert proxy.seal_result_calls == 2
+        assert not store.ready_closures_path.exists()
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_finalize_sealed_batch_skips_checkpoint_and_second_seal_adoption(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    close_error = OSError("close failed after seal")
+    runtime.seal_fault = CollectorTimeoutError("lost seal acknowledgement")
+    runtime.close_fault = close_error
+    runtime.late_seal_fault = RuntimeError("must not adopt after failed close")
+    _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1), _real_batch_steps())
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        with pytest.raises(CollectorTimeoutError):
+            await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
+        await reconciler.checkpoint_after_session()
+        proxy = runtime.proxies[0]
+        checkpoint_calls = proxy.checkpoint_calls
+        result = await reconciler.finalize_active()
+        assert result.checkpoint_error is None
+        assert result.close_error is close_error
+        assert result.preserved_kind == "sealed bundle"
+        assert proxy.checkpoint_calls == checkpoint_calls
+        assert proxy.seal_result_calls == 1
+        assert not proxy.thread.is_alive()
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [OSError("close failed"), CollectorTimeoutError("close timed out"), WriterError("writer close failed")],
+    ids=["oserror", "timeout", "writer"],
+)
+@_async_test
+async def test_failed_close_does_not_adopt_seal_again(tmp_path: Path, close_error: BaseException) -> None:
+    runtime = _Runtime()
+    checkpoint_error = OSError("checkpoint failed")
+    runtime.checkpoint_fault = checkpoint_error
+    runtime.close_fault = close_error
+    runtime.late_seal_fault = RuntimeError("late adoption is forbidden after failed close")
+    _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    try:
+        result = await reconciler.finalize_active()
+        proxy = runtime.proxies[0]
+        assert result.checkpoint_error is checkpoint_error
+        assert result.close_error is close_error
+        assert proxy.seal_result_calls == 1
+        assert not proxy.thread.is_alive()
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_checkpoint_after_session_times_out_at_exact_writer_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _Runtime()
+    timeout = 0.05
+    sleep_calls: list[float] = []
+
+    async def forbidden_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        raise AssertionError("checkpoint retried after its exact deadline")
+
+    options = replace(_options(), timeouts=TransferTimeouts(1, timeout), sleep=forbidden_sleep)
+    _store, reconciler = _make_reconciler(tmp_path, runtime, options)
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    loop = asyncio.get_running_loop()
+    original_time = loop.time
+    fake_now = [original_time()]
+    proxy = runtime.proxies[0]
+    not_ready = WriterError("READ_BEGIN not ready")
+    proxy.checkpoint_fault = not_ready
+    proxy.checkpoint_hook = lambda: fake_now.__setitem__(0, fake_now[0] + timeout)
+    monkeypatch.setattr(loop, "time", lambda: fake_now[0])
+    try:
+        with pytest.raises(CollectorTimeoutError) as caught:
+            await reconciler.checkpoint_after_session()
+        assert caught.value.__cause__ is not_ready
+        assert sleep_calls == []
+        assert proxy.checkpoint_calls == 1
+        assert proxy.thread.is_alive()
+    finally:
+        monkeypatch.setattr(loop, "time", original_time)
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_finalize_times_out_at_exact_writer_deadline_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _Runtime()
+    timeout = 0.05
+    sleep_calls: list[float] = []
+
+    async def forbidden_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        raise AssertionError("final checkpoint retried after its exact deadline")
+
+    options = replace(_options(), timeouts=TransferTimeouts(1, timeout), sleep=forbidden_sleep)
+    _store, reconciler = _make_reconciler(tmp_path, runtime, options)
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    loop = asyncio.get_running_loop()
+    original_time = loop.time
+    fake_now = [original_time()]
+    proxy = runtime.proxies[0]
+    not_ready = WriterError("READ_BEGIN not ready")
+    proxy.checkpoint_fault = not_ready
+    proxy.checkpoint_hook = lambda: fake_now.__setitem__(0, fake_now[0] + timeout)
+    proxy.restore_clock = lambda: monkeypatch.setattr(loop, "time", original_time)
+    monkeypatch.setattr(loop, "time", lambda: fake_now[0])
+    try:
+        result = await reconciler.finalize_active()
+        assert isinstance(result.checkpoint_error, CollectorTimeoutError)
+        assert result.checkpoint_error.__cause__ is not_ready
+        assert result.close_error is None
+        assert sleep_calls == []
+        assert not proxy.thread.is_alive()
+    finally:
+        monkeypatch.setattr(loop, "time", original_time)
         await _close_real_writers(runtime)
         await session.close()

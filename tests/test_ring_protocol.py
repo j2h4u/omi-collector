@@ -27,6 +27,14 @@ def test_parse_status_uses_little_endian_fields() -> None:
     assert status.has_valid_rtc
 
 
+@pytest.mark.parametrize(("rtc_field", "expected"), [(0, False), (1, True), (2, True)])
+def test_parse_status_reports_zero_as_invalid_rtc_and_nonzero_as_valid(rtc_field: int, expected: bool) -> None:
+    status = parse_status(pack("<IIII", 0, 0, 0, rtc_field))
+
+    assert status.rtc_valid == rtc_field
+    assert status.has_valid_rtc is expected
+
+
 @pytest.mark.parametrize("size", [0, 15, 17])
 def test_parse_status_rejects_noncanonical_lengths(size: int) -> None:
     with pytest.raises(RingProtocolError, match="exactly 16 bytes"):

@@ -220,3 +220,114 @@ def test_full_synthetic_burst_uses_one_backing_buffer() -> None:
     assert isinstance(arena._buffer, bytearray)
     assert len(arena._buffer) == len(payload)
     assert tuple(value for value in arena.__dict__ if value == "_buffer") == ("_buffer",)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [("start_sequence", 99), ("total_records", 99)],
+)
+def test_snapshot_bounds_are_immutable_and_keep_live_arena_bounds(field: str, replacement: int) -> None:
+    arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+    snapshot = arena.snapshot
+    original = {
+        "start_sequence": snapshot.start_sequence,
+        "total_records": snapshot.total_records,
+        "record_size": snapshot.record_size,
+        "total_bytes": snapshot.total_bytes,
+        "end_sequence": snapshot.end_sequence,
+    }
+    assert original == {
+        "start_sequence": 10,
+        "total_records": 2,
+        "record_size": RECORD_SIZE,
+        "total_bytes": 2 * RECORD_SIZE,
+        "end_sequence": 12,
+    }
+    expected_live_bounds = (arena.next_sequence, arena.total_bytes)
+
+    try:
+        setattr(snapshot, field, replacement)
+    except AttributeError:
+        mutation_rejected = True
+    else:
+        mutation_rejected = False
+    bounds_after_attempt = (arena.next_sequence, arena.total_bytes)
+    if not mutation_rejected:
+        setattr(snapshot, field, original[field])
+
+    assert mutation_rejected
+    assert bounds_after_attempt == expected_live_bounds
+    assert (arena.next_sequence, arena.total_bytes) == expected_live_bounds
+
+
+@pytest.mark.parametrize(
+    ("start_sequence", "total_records", "max_bytes"),
+    [
+        (False, 1, RECORD_SIZE),
+        (-1, 1, RECORD_SIZE),
+        (0, True, RECORD_SIZE),
+        (0, -1, RECORD_SIZE),
+        (0, 1, False),
+        (0, 1, -1),
+    ],
+)
+def test_invalid_arena_bounds_fail_before_allocation(
+    monkeypatch: pytest.MonkeyPatch, start_sequence: int, total_records: int, max_bytes: int
+) -> None:
+    calls = 0
+
+    def track_allocation(size: int) -> bytearray:
+        nonlocal calls
+        calls += 1
+        return bytearray(size)
+
+    monkeypatch.setattr(transfer_arena, "bytearray", track_allocation, raising=False)
+    with pytest.raises(ValueError):
+        TransferArena(start_sequence, total_records, max_bytes=max_bytes)
+
+    assert calls == 0
+
+
+def test_partial_leg_counts_only_complete_records_and_submitted_records_are_integer() -> None:
+    arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+    arena.append(_records(1) + b"x" * 13)
+
+    assert arena.leg_received_bytes == RECORD_SIZE + 13
+    assert arena.leg_complete_records == 1
+    assert arena.complete_records == 1
+    assert arena.next_sequence == 11
+    arena.submit_prefix()
+    assert arena.submitted_records == 1
+    assert isinstance(arena.submitted_records, int)
+
+
+def test_begin_leg_beyond_snapshot_preserves_source_and_counters() -> None:
+    arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+    first = _records(1, marker=71)
+    arena.append(first)
+    arena.submit_prefix(1)
+    source = arena.readonly_source()
+    source_before = bytes(source)
+    counters_before = (
+        arena.next_sequence,
+        arena.total_bytes,
+        arena.leg_received_bytes,
+        arena.received_bytes,
+        arena.submitted_bytes,
+    )
+
+    with pytest.raises(ArenaOverrunError):
+        arena.begin_leg(11, 2)
+
+    assert bytes(source) == source_before
+    assert (
+        arena.next_sequence,
+        arena.total_bytes,
+        arena.leg_received_bytes,
+        arena.received_bytes,
+        arena.submitted_bytes,
+    ) == counters_before
+
+    arena.begin_leg(11, 1)
+    arena.append(_records(1, marker=72))
+    assert bytes(source[: 2 * RECORD_SIZE]) == first + _records(1, marker=72)

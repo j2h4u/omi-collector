@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from errno import EXDEV
+from gc import collect
 from hashlib import sha256
 from json import dumps, loads
 from os import PathLike, fsync, utime
 from pathlib import Path
 from shutil import rmtree
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread
 from typing import cast
+from uuid import uuid4
+from weakref import ref
 
 import pytest
 
@@ -24,7 +27,11 @@ from omi_collector.capture.adapters.attempts import (
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.adapters.staging_contract import AttemptStateError, DeviceAlreadyRunningError
+from omi_collector.capture.adapters.staging_contract import (
+    AttemptStateError,
+    DeviceAlreadyRunningError,
+    PendingAttemptError,
+)
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
@@ -509,6 +516,273 @@ def test_authority_can_acquire_two_sequential_publication_leases(
 
     assert first is not second
     authority.close()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "publish_ready",
+        "recover_and_publish",
+        "inspect_recovery",
+        "append_ready_closure",
+        "begin_ready_visit",
+        "close_orphaned_drafts",
+        "close_pending_prefix",
+        "clock_mutation_lease",
+    ],
+)
+def test_public_store_operations_leave_authenticated_capture_temporary_for_device_lock(
+    tmp_path: Path, operation: str
+) -> None:
+    store = _publication_store(tmp_path)
+    capture_root = _capture_root(tmp_path)
+    bundle = next(path for path in capture_root.iterdir() if path.is_dir())
+    temporary = bundle.with_name(f".{bundle.name}.{uuid4().hex}.tmp")
+    bundle.rename(temporary)
+    evidence = {entry.name: entry.read_bytes() for entry in temporary.iterdir()}
+
+    if operation == "publish_ready":
+        store.publish_ready()
+    elif operation == "recover_and_publish":
+        store.recover_and_publish()
+    elif operation == "inspect_recovery":
+        store.inspect_recovery()
+    elif operation == "append_ready_closure":
+        store.append_ready_closure(101, "public gap check")
+    elif operation == "begin_ready_visit":
+        store.begin_ready_visit()
+    elif operation == "close_orphaned_drafts":
+        store.close_orphaned_drafts("public gap check")
+    elif operation == "close_pending_prefix":
+        store.close_pending_prefix("public gap check")
+    elif operation == "clock_mutation_lease":
+        with store.clock_mutation_lease():
+            pass
+    else:
+        pytest.fail(f"unknown public storage operation: {operation}")
+
+    assert temporary.is_dir()
+    assert {entry.name: entry.read_bytes() for entry in temporary.iterdir()} == evidence
+    assert not bundle.exists()
+
+    with store.device_lock():
+        pass
+
+    assert bundle.is_dir()
+    assert not temporary.exists()
+    assert {entry.name: entry.read_bytes() for entry in bundle.iterdir()} == evidence
+
+
+def test_inspect_recovery_rejects_symlinked_attempt_entry(tmp_path: Path) -> None:
+    store = _publication_store(tmp_path)
+    external = tmp_path / "external-attempt"
+    external.mkdir()
+    marker = external / "prefix-publication.json"
+    marker.write_text("{}", encoding="utf-8")
+    store.attempts_root.mkdir(parents=True, exist_ok=True)
+    entry = store.attempts_root / ("a" * 32)
+    entry.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(AttemptStateError):
+        store.inspect_recovery()
+
+    assert entry.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "{}"
+
+
+def test_recovery_reports_drafts_beyond_the_latest_ready_closure(tmp_path: Path) -> None:
+    store = _publication_store(tmp_path)
+    store.append_ready_closure(100, "partial visit")
+
+    assert store.inspect_recovery() == (False, True)
+
+    store.append_ready_closure(101, "closed visit")
+    assert store.inspect_recovery() == (False, False)
+
+
+def test_close_pending_prefix_rejects_symlinked_attempt_even_when_unpublished_is_excluded(
+    tmp_path: Path,
+) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    external = tmp_path / "external-attempt"
+    external.mkdir()
+    (external / "terminal-retired.json").write_text('{"terminalized_at_unix_ns": 1}', encoding="utf-8")
+    store.attempts_root.mkdir(parents=True)
+    entry = store.attempts_root / ("a" * 32)
+    entry.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(AttemptStateError):
+        store.close_pending_prefix("cleanup only", include_unpublished=False)
+
+    assert entry.is_symlink()
+    assert (external / "terminal-retired.json").is_file()
+
+
+def test_close_pending_prefix_preserves_source_if_durable_close_fails(tmp_path: Path) -> None:
+    raw_sync_count = 0
+    armed = False
+
+    def fail_at_boundary(fd: int) -> None:
+        nonlocal raw_sync_count
+        path = Path(f"/proc/self/fd/{fd}").resolve()
+        if armed and path.name == "records.bin":
+            raw_sync_count += 1
+            if raw_sync_count == 2:
+                raise OSError("durable_close raw sync failed")
+        fsync(fd)
+
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_at_boundary)
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    assert attempt.publish_prefix() is not None
+    attempt.close(durable=True)
+    armed = True
+
+    with pytest.raises(OSError, match="durable_close"):
+        store.close_pending_prefix("recovery")
+
+    assert (attempt.path / "prefix-publication.json").is_file()
+    assert not (attempt.path / "terminal-retired.json").exists()
+    assert attempt.path.is_dir()
+
+
+def test_close_pending_prefix_retries_durable_cleanup_after_publication_sync_failure(tmp_path: Path) -> None:
+    raw_sync_count = 0
+    armed = False
+
+    def fail_once(fd: int) -> None:
+        nonlocal raw_sync_count, armed
+        path = Path(f"/proc/self/fd/{fd}").resolve()
+        if armed and path.name == "records.bin":
+            raw_sync_count += 1
+            if raw_sync_count == 1:
+                raise OSError("prefix publication raw sync failed")
+        fsync(fd)
+
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_once)
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    attempt.close(durable=True)
+    armed = True
+
+    with pytest.raises(OSError, match="prefix publication raw sync failed"):
+        store.close_pending_prefix("recovery")
+
+    assert raw_sync_count == 2
+    assert attempt.path.is_dir()
+    assert not (attempt.path / "terminal-retired.json").exists()
+
+
+def test_public_quarantine_gc_releases_hydrated_retained_attempt(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    attempt.close(durable=True)
+
+    assert store.inspect_recovery() == (False, False)
+    hydrated = store.open_attempt(attempt.attempt_id)
+    retained = ref(hydrated)
+    store.retain_validated_attempt(attempt.attempt_id, hydrated)
+    del hydrated
+
+    moved = store.quarantine_pending("test release")
+    collect()
+
+    assert len(moved) == 1
+    assert retained() is None
+
+
+def test_resume_rejects_multiple_public_pending_attempts_without_changing_evidence(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempts = [store.prepare_streaming_attempt(100 + offset, 1) for offset in (0, 1)]
+    for index, attempt in enumerate(attempts, start=1):
+        attempt.record_read_begin(ReadBeginNotification(100 + index - 1, 1))
+        attempt.accept_chunk(100 + index - 1, _record(index))
+        attempt.checkpoint()
+        attempt.close(durable=True)
+    before = {
+        attempt.attempt_id: {
+            name: (attempt.path / name).read_bytes() for name in ("attempt.json", "records.bin", "checkpoint.json")
+        }
+        for attempt in attempts
+    }
+
+    with store.device_lock() as lease, pytest.raises(PendingAttemptError):
+        store.resume_streaming_attempt(lease)
+
+    after = {
+        attempt.attempt_id: {
+            name: (attempt.path / name).read_bytes() for name in ("attempt.json", "records.bin", "checkpoint.json")
+        }
+        for attempt in attempts
+    }
+    assert after == before
+
+
+def test_concurrent_publish_ready_rejects_promptly_while_publication_is_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture_root = _capture_root(tmp_path)
+    first_bundle = _one_record_bundle(capture_root, 100, 43)
+    second_bundle = _one_record_bundle(capture_root, 101, 44)
+    utime(first_bundle / "manifest.json", (1, 1))
+    utime(second_bundle / "manifest.json", (1, 1))
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=1))
+    bootstrap = StagingStore(tmp_path, capture_root, config=config)
+    store = StagingStore.from_paths(
+        bootstrap.paths,
+        publication_root=_shared_ready(tmp_path / "published"),
+        config=config,
+    )
+    store.append_ready_closure(102, "drained")
+    entered = Event()
+    release = Event()
+    outcome: list[BaseException | object | None] = []
+    original_fsync = fsync
+
+    def block_publication_ledger(fd: int) -> None:
+        try:
+            path = Path(f"/proc/self/fd/{fd}").resolve()
+        except OSError:
+            path = Path()
+        if path.name.startswith(".ready-publications.json."):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("publication test barrier was not released")
+        original_fsync(fd)
+
+    monkeypatch.setattr(staging_filesystem.os, "fsync", block_publication_ledger)
+
+    def publish() -> None:
+        try:
+            outcome.append(store.publish_ready())
+        except AttemptStateError as error:
+            outcome.append(error)
+
+    first = Thread(target=publish)
+    first.start()
+    second: Thread | None = None
+    try:
+        assert entered.wait(5), f"first publication did not reach ledger durability: {outcome!r}"
+        second = Thread(target=publish)
+        second.start()
+        second.join(1)
+        assert not second.is_alive(), "concurrent publication waited for the active publisher"
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], AttemptStateError)
+    finally:
+        release.set()
+        first.join(5)
+        assert not first.is_alive(), "first publication did not leave its durability barrier"
+        if second is not None:
+            second.join(5)
+            assert not second.is_alive(), "concurrent publication did not leave the active-call boundary"
 
 
 def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:

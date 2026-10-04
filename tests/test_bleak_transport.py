@@ -4,6 +4,7 @@ from collections.abc import Callable, Coroutine, Iterator, Mapping
 from dataclasses import replace
 from functools import wraps
 from struct import pack
+from types import SimpleNamespace
 from typing import cast
 from uuid import UUID
 
@@ -126,6 +127,7 @@ class FakeClient:
         self.fail_preflight = options.get("fail_preflight", False)
         self.disconnect_on_preflight = options.get("disconnect_on_preflight", False)
         self.fail_disconnect = options.get("fail_disconnect", False)
+        self._backend: object | None = None
         self.disconnect_callback: Callable[[object], None] | None = None
         self.disconnected = False
         self.preflight_callback_states: list[bool] = []
@@ -302,6 +304,67 @@ def test_validate_ring_characteristics_accepts_typed_service_getter() -> None:
     service = _ring_service()
 
     assert validate_ring_characteristics(TypedGetterServices(service)).service is service
+
+
+@pytest.mark.parametrize(
+    ("services", "message"),
+    [
+        (lambda: GetterServices(FakeService("wrong-service", _ring_service().characteristics)), "missing ring service"),
+        (lambda: [_service_returning_wrong_characteristic("wrong-control")], "missing ring control characteristic"),
+        (lambda: [_service_returning_wrong_characteristic("wrong-status")], "missing ring status characteristic"),
+    ],
+)
+def test_validate_ring_characteristics_rejects_getter_results_with_wrong_uuid(
+    services: Callable[[], object], message: str
+) -> None:
+    with pytest.raises(RingGattValidationError, match=message):
+        validate_ring_characteristics(services())
+
+
+def _service_returning_wrong_characteristic(uuid: str) -> object:
+    class ServiceWithGetter:
+        def __init__(self) -> None:
+            self.uuid = RING_SERVICE_UUID
+            self.characteristics: list[FakeCharacteristic] = []
+            control_uuid = uuid if uuid == "wrong-control" else CONTROL_CHARACTERISTIC_UUID
+            status_uuid = uuid if uuid == "wrong-status" else STATUS_CHARACTERISTIC_UUID
+            self.control = FakeCharacteristic(control_uuid, ["write", "notify"])
+            self.status = FakeCharacteristic(status_uuid, ["read"])
+
+        def get_characteristic(self, requested: object) -> FakeCharacteristic:
+            expected = str(requested).lower()
+            return self.control if expected == CONTROL_CHARACTERISTIC_UUID else self.status
+
+    return ServiceWithGetter()
+
+
+@_async_test
+async def test_presence_observer_forwards_only_matching_device_with_integer_rssi() -> None:
+    scanner_options: dict[str, object] = {}
+
+    class Scanner:
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    def scanner_factory(**kwargs: object) -> Scanner:
+        scanner_options.update(kwargs)
+        return Scanner()
+
+    observed: list[bleak_transport.PresenceAdvertisement] = []
+    observer = bleak_transport.BleakPresenceObserver("aa:bb", scanner_factory=scanner_factory)
+    await observer.start(
+        lambda advertisement: observed.append(cast(bleak_transport.PresenceAdvertisement, advertisement))
+    )
+    detect = cast(Callable[[BLEDevice, object], None], scanner_options["detection_callback"])
+    target = BLEDevice("AA:BB", "omi", object())
+    detect(target, SimpleNamespace(rssi=-42))
+    detect(BLEDevice("AA:BC", "other", object()), SimpleNamespace(rssi=-1))
+    detect(target, SimpleNamespace(rssi=True))
+    assert [(entry.candidate, entry.rssi_dbm) for entry in observed] == [(target, -42), (target, None)]
+    await observer.stop()
 
 
 @_async_test
@@ -629,16 +692,14 @@ async def test_disconnect_callback_wakes_notification_consumer() -> None:
 
 @_async_test
 async def test_connect_failure_disconnects_client() -> None:
-    client = FakeClient([], fail_notify=True)
-
-    def factory(_device: str | object, _callback: Callable[[object], None]) -> FakeClient:
-        return client
-
-    transport = BleakRingTransport("fake", client_factory=cast(ClientFactory, factory))
+    events: list[tuple[object, ...]] = []
+    client = FakeClient(events, fail_notify=True)
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client))
     with pytest.raises(RuntimeError, match="subscribe failed"):
         await transport.connect()
 
     assert client.disconnected
+    assert [event[0] for event in events].count("disconnect") == 1
 
 
 @_async_test
@@ -651,6 +712,7 @@ async def test_preflight_write_failure_disconnects_before_subscribe() -> None:
 
     assert client.disconnected
     assert not any(event[0] == "notify" for event in client.events)
+    assert not any(event[0] == "stop_notify" for event in client.events)
 
 
 @_async_test
@@ -752,7 +814,27 @@ async def test_optional_time_write_reports_absence_and_performed_write() -> None
 
     assert await session.write_optional_characteristic(TIME_WRITE_UUID, b"\x01" * 4) is True
     assert events[-1][0] == "write"
+    assert events[-1][3] is True
     await transport.disconnect()
+
+
+@_async_test
+async def test_optional_time_write_returns_false_without_write_permission() -> None:
+    events: list[tuple[object, ...]] = []
+    client = FakeClient(events)
+    client.services = [
+        _ring_service(),
+        FakeService(TIME_SERVICE_UUID, [FakeCharacteristic(TIME_WRITE_UUID, ["read"])]),
+    ]
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+    session = await transport.connect()
+    try:
+        assert await session.write_optional_characteristic(TIME_WRITE_UUID, b"\x01" * 4) is False
+        assert [event for event in events if event[0] == "write"] == [
+            event for event in events if event[0] == "write" and event[2] == bytes((CMD_STOP,))
+        ]
+    finally:
+        await transport.disconnect()
 
 
 @_async_test
@@ -914,6 +996,43 @@ async def test_cancelling_hanging_stop_notify_still_attempts_disconnect() -> Non
 
 
 @_async_test
+async def test_cancelling_disconnect_during_normal_close_propagates_and_preserves_local_intent() -> None:
+    client = FakeClient([])
+    disconnect_started = asyncio.Event()
+    debug_events: list[str] = []
+
+    def record(event: str, *args: object, **fields: object) -> None:
+        del args, fields
+        debug_events.append(event)
+
+    async def hang_disconnect() -> None:
+        disconnect_started.set()
+        await asyncio.Future()
+
+    client.disconnect = hang_disconnect  # type: ignore[method-assign]
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+    original_debug_event = bleak_transport.debug_event
+    bleak_transport.debug_event = record
+    closing: asyncio.Task[None] | None = None
+    try:
+        session = await transport.connect()
+        closing = asyncio.create_task(session.close())
+        await asyncio.wait_for(disconnect_started.wait(), timeout=5.0)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert client.disconnect_callback is not None
+        client.disconnect_callback(client)
+    finally:
+        if closing is not None:
+            closing.cancel()
+            await asyncio.gather(closing, return_exceptions=True)
+        bleak_transport.debug_event = original_debug_event
+        await transport.disconnect()
+    assert "ble_gatt_unexpected_disconnect" not in debug_events
+
+
+@_async_test
 async def test_session_context_cleanup_failure_reaches_primary_preserving_outer_exit() -> None:
     for primary in (RingTransferError("range loss"), asyncio.CancelledError()):
         client = FakeClient([], fail_stop=True, fail_disconnect=True)
@@ -942,6 +1061,33 @@ async def test_transport_reuses_session_and_disconnect_is_idempotent() -> None:
 
 
 @_async_test
+async def test_presence_observer_cleans_failed_start_before_retry() -> None:
+    class Scanner:
+        starts = 0
+        stops = 0
+
+        async def start(self) -> None:
+            self.starts += 1
+            if self.starts == 1:
+                raise RuntimeError("scanner start failed")
+
+        async def stop(self) -> None:
+            self.stops += 1
+
+    scanner = Scanner()
+    observer = bleak_transport.BleakPresenceObserver("aa:bb", scanner_factory=lambda **_kwargs: scanner)
+    with pytest.raises(RuntimeError, match="scanner start failed"):
+        await observer.start(lambda _advertisement: None)
+    assert scanner.stops == 1
+    await observer.start(lambda _advertisement: None)
+    with pytest.raises(RuntimeError, match="already active"):
+        await observer.start(lambda _advertisement: None)
+    assert scanner.starts == 2
+    await observer.stop()
+    assert scanner.stops == 2
+
+
+@_async_test
 async def test_transport_rejects_invalid_queue_and_disconnects_unstarted_client() -> None:
     with pytest.raises(ValueError, match="buffer byte budget must be positive"):
         BleakRingTransport("fake", notification_buffer_bytes=0)
@@ -953,6 +1099,19 @@ async def test_transport_rejects_invalid_queue_and_disconnects_unstarted_client(
     await transport.disconnect()
 
     assert events == [("disconnect",)]
+
+
+@_async_test
+async def test_transport_accepts_one_byte_notification_buffer_at_lower_boundary() -> None:
+    client = FakeClient([])
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client), notification_buffer_bytes=1)
+    try:
+        session = await transport.connect()
+        assert client.callback is not None
+        client.callback(client, bytearray((CMD_STOP,)))
+        assert await anext(session.notifications()) == bytes((CMD_STOP,))
+    finally:
+        await transport.disconnect()
 
 
 @_async_test
@@ -991,13 +1150,32 @@ async def test_disconnect_callback_during_startup_cleans_session() -> None:
 
 @_async_test
 async def test_failed_validation_suppresses_disconnect_cleanup_error() -> None:
-    client = FakeClient([], fail_disconnect=True)
+    events: list[tuple[object, ...]] = []
+    client = FakeClient(events, fail_disconnect=True)
     client.services = []
     transport = BleakRingTransport("fake", client_factory=_factory_for(client))
 
     with pytest.raises(RingGattValidationError, match="missing ring service"):
         await transport.connect()
     assert client.disconnected
+    assert [event[0] for event in events].count("disconnect") == 1
+
+
+@_async_test
+async def test_session_close_preserves_disconnected_cleanup_error_identity() -> None:
+    error = RingTransportDisconnectedError("already disconnected")
+    client = FakeClient([])
+
+    async def disconnected() -> None:
+        raise error
+
+    client.disconnect = disconnected  # type: ignore[method-assign]
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+    session = await transport.connect()
+    with pytest.raises(RingTransportDisconnectedError) as raised:
+        await session.close()
+    assert raised.value is error
+    await transport.disconnect()
 
 
 def test_default_client_factory_is_constructed_without_real_bleak(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1053,6 +1231,112 @@ async def test_stale_scanner_candidate_is_distinguished_from_address_fallback() 
     with pytest.raises(CandidateUnavailableError):
         await transport.connect()
     assert client.disconnected
+
+
+@_async_test
+async def test_address_fallback_is_passed_to_client_factory() -> None:
+    client = FakeClient([])
+    selected: list[object] = []
+
+    def factory(device: str | object, callback: Callable[[object], None]) -> FakeClient:
+        selected.append(device)
+        client.disconnect_callback = callback
+        return client
+
+    transport = BleakRingTransport("AA:BB", client_factory=cast(ClientFactory, factory))
+    await transport.connect()
+    await transport.disconnect()
+    assert selected == ["AA:BB"]
+
+
+@_async_test
+async def test_nonstale_candidate_connect_error_remains_transport_unavailable() -> None:
+    client = FakeClient([])
+
+    async def fail_connect() -> None:
+        raise BleakError("characteristic not found")
+
+    client.connect = fail_connect  # type: ignore[method-assign]
+    candidate = BLEDevice("AA:BB", "omi", object())
+    transport = BleakRingTransport("AA:BB", client_factory=_factory_for(client), device_selector=candidate)
+    with pytest.raises(RingTransportUnavailableError, match="connecting to Omi") as raised:
+        await transport.connect()
+    assert not isinstance(raised.value, CandidateUnavailableError)
+    assert client.disconnected
+
+
+@_async_test
+async def test_failed_connect_cleanup_callback_is_local_and_attempted_once() -> None:
+    client = FakeClient([])
+    events: list[str] = []
+
+    def record(event: str, *args: object, **fields: object) -> None:
+        del args, fields
+        events.append(event)
+
+    async def fail_connect() -> None:
+        raise BleakError("radio unavailable")
+
+    async def disconnect_with_callback() -> None:
+        if client.disconnect_callback is not None:
+            client.disconnect_callback(client)
+
+    client.connect = fail_connect  # type: ignore[method-assign]
+    client.disconnect = disconnect_with_callback  # type: ignore[method-assign]
+    original_debug_event = bleak_transport.debug_event
+    bleak_transport.debug_event = record
+    try:
+        transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+        with pytest.raises(RingTransportUnavailableError):
+            await transport.connect()
+    finally:
+        bleak_transport.debug_event = original_debug_event
+
+    assert events.count("ble_gatt_local_disconnect_intent") == 1
+    assert "ble_gatt_unexpected_disconnect" not in events
+
+
+@_async_test
+async def test_disconnect_during_connect_marks_callback_local_and_cleans_once() -> None:
+    client = FakeClient([])
+    connect_started = asyncio.Event()
+    finish_connect = asyncio.Event()
+    debug_events: list[str] = []
+
+    async def blocked_connect() -> None:
+        connect_started.set()
+        await finish_connect.wait()
+
+    async def disconnect_with_callback() -> None:
+        client.events.append(("disconnect",))
+        client.disconnected = True
+        if client.disconnect_callback is not None:
+            client.disconnect_callback(client)
+
+    def record(event: str, *args: object, **fields: object) -> None:
+        del args, fields
+        debug_events.append(event)
+
+    client.connect = blocked_connect  # type: ignore[method-assign]
+    client.disconnect = disconnect_with_callback  # type: ignore[method-assign]
+    original_debug_event = bleak_transport.debug_event
+    bleak_transport.debug_event = record
+    transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+    connecting = asyncio.create_task(transport.connect())
+    try:
+        await asyncio.wait_for(connect_started.wait(), timeout=5.0)
+        await transport.disconnect()
+        finish_connect.set()
+        with pytest.raises(RingTransportUnavailableError, match="while connecting"):
+            await connecting
+    finally:
+        finish_connect.set()
+        await asyncio.gather(connecting, return_exceptions=True)
+        bleak_transport.debug_event = original_debug_event
+        await transport.disconnect()
+
+    assert [event[0] for event in client.events].count("disconnect") == 1
+    assert "ble_gatt_unexpected_disconnect" not in debug_events
 
 
 @_async_test
@@ -1216,6 +1500,80 @@ async def test_bluez_att_mtu_query_failures_are_nonfatal_without_warnings() -> N
                 is None
             )
         assert not caught
+
+
+@_async_test
+async def test_bluez_att_mtu_accepts_protocol_boundary_values() -> None:
+    for mtu in (23, 517):
+        events: list[tuple[str, Mapping[str, object]]] = []
+        client = FakeClient([])
+        client.services = [_ring_service(control_obj=("/org/bluez/path", {}))]
+        reply = Message(
+            message_type=MessageType.METHOD_RETURN,
+            reply_serial=1,
+            signature="v",
+            body=[Variant("q", mtu)],
+        )
+        client._backend = FakeBackend(FakeBus(reply))  # type: ignore[attr-defined]
+
+        def record(
+            event: str, *args: object, _events: list[tuple[str, Mapping[str, object]]] = events, **fields: object
+        ) -> None:
+            del args
+            _events.append((event, fields))
+
+        original_debug_event = bleak_transport.debug_event
+        bleak_transport.debug_event = record
+        try:
+            transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+            await transport.connect()
+            await transport.disconnect()
+        finally:
+            bleak_transport.debug_event = original_debug_event
+
+        observed = next(fields for name, fields in events if name == "ble_gatt_att_mtu_observed")
+        assert observed["att_mtu"] == mtu
+
+
+@_async_test
+async def test_bluez_error_name_diagnostic_accepts_standard_and_128_char_names_and_rejects_129() -> None:
+    names = (
+        ("org.bluez.Error.NoSuchProperty", "org.bluez.Error.NoSuchProperty"),
+        ("a." + "b" * 126, "a." + "b" * 126),
+        ("a." + "b" * 127, "<invalid>"),
+    )
+    for name, expected in names:
+        events: list[tuple[str, Mapping[str, object]]] = []
+        client = FakeClient([])
+        client.services = [_ring_service(control_obj=("/org/bluez/path", {}))]
+        client._backend = FakeBackend(
+            FakeBus(
+                Message(
+                    message_type=MessageType.ERROR,
+                    error_name=name,
+                    reply_serial=1,
+                    signature="s",
+                    body=["MTU"],
+                )
+            )
+        )
+
+        def record(
+            event: str, *args: object, _events: list[tuple[str, Mapping[str, object]]] = events, **fields: object
+        ) -> None:
+            del args
+            _events.append((event, fields))
+
+        original_debug_event = bleak_transport.debug_event
+        bleak_transport.debug_event = record
+        try:
+            transport = BleakRingTransport("fake", client_factory=_factory_for(client))
+            await transport.connect()
+            await transport.disconnect()
+        finally:
+            bleak_transport.debug_event = original_debug_event
+        event = next(fields for event_name, fields in events if event_name == "ble_gatt_att_mtu_query_failed")
+        assert event["error_name"] == expected
 
 
 @_async_test

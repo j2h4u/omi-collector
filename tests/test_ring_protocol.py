@@ -229,10 +229,11 @@ def test_control_notification_stream_cancellation_joins_owned_waiters(monkeypatc
         try:
             async with asyncio.timeout(5):
                 await readiness.wait()
-            consumer.cancel()
-            with pytest.raises(asyncio.CancelledError):
+            consumer.cancel("operator stop")
+            with pytest.raises(asyncio.CancelledError) as caught:
                 async with asyncio.timeout(5):
                     await consumer
+            assert caught.value.args == ("operator stop",)
             assert len(children) == 2
             assert all(task.done() for task in children)
         finally:

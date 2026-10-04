@@ -113,6 +113,29 @@ def test_debug_exception_does_not_call_broken_str_and_redacts_traceback_secrets(
     assert "<redacted>" in content
 
 
+def test_debug_exception_uses_custom_detail_or_exception_class_name(tmp_path: Path) -> None:
+    config = DebugLogConfig(logger_name="tests.debug.exception_message")
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        try:
+            raise RuntimeError("implementation detail")
+        except RuntimeError as error:
+            debug_exception("custom_failure", error, message="safe operator detail", logger=logger)
+        try:
+            raise LookupError("another implementation detail")
+        except LookupError as error:
+            debug_exception("default_failure", error, logger=logger)
+    finally:
+        close_debug_logging(logger)
+
+    entries = [
+        cast(Mapping[str, object], json.loads(line))
+        for line in (tmp_path / "debug.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert [entry["message"] for entry in entries] == ["safe operator detail", "LookupError"]
+
+
 def test_connect_timeout_is_a_concise_debug_event_without_traceback(tmp_path: Path) -> None:
     config = DebugLogConfig(logger_name="tests.debug.connect_timeout")
     logger = configure_debug_logging(tmp_path, config)
@@ -185,6 +208,60 @@ def test_debug_ring_enforces_minimum_record_budget_at_logging_boundary(tmp_path:
 
     with pytest.raises(ValueError, match="at least 512"):
         configure_debug_logging(tmp_path, config)
+
+
+def test_configure_creates_nested_collector_root_and_writes_jsonl(tmp_path: Path) -> None:
+    root = tmp_path / "state" / "collector" / "nested"
+    config = DebugLogConfig(logger_name="tests.debug.nested_root")
+    logger = configure_debug_logging(root, config)
+    try:
+        debug_event("nested_root_ready", logger=logger, phase="startup")
+    finally:
+        close_debug_logging(logger)
+
+    entry = cast(Mapping[str, object], json.loads((root / config.file_name).read_text(encoding="utf-8")))
+    assert entry["event"] == "nested_root_ready"
+    assert entry["logger"] == config.logger_name
+
+
+def test_ascii_encoded_debug_json_round_trips_unicode_message_and_field(tmp_path: Path) -> None:
+    config = DebugLogConfig(encoding="ascii", logger_name="tests.debug.ascii_unicode")
+    logger = configure_debug_logging(tmp_path, config)
+    message = "Привет, мир 🐾"
+    try:
+        debug_event("unicode_roundtrip", message, logger=logger, greeting=message)
+    finally:
+        close_debug_logging(logger)
+
+    raw_line = (tmp_path / "debug.jsonl").read_bytes()
+    entry = cast(Mapping[str, object], json.loads(raw_line.decode("ascii")))
+    fields = cast(Mapping[str, object], entry["fields"])
+
+    assert entry["message"] == message
+    assert fields["greeting"] == message
+
+
+def test_logger_normalizes_malformed_and_recursive_public_debug_fields(tmp_path: Path) -> None:
+    config = DebugLogConfig(logger_name="tests.debug.fields_fallback")
+    logger = configure_debug_logging(tmp_path, config)
+    recursive_fields: dict[str, object] = {}
+    recursive_fields["self"] = recursive_fields
+    try:
+        logger.debug("non-mapping fields", extra={"debug_event": "non_mapping", "debug_fields": None})
+        logger.debug(
+            "recursive fields",
+            extra={"debug_event": "recursive_mapping", "debug_fields": recursive_fields},
+        )
+    finally:
+        close_debug_logging(logger)
+
+    entries = [
+        cast(Mapping[str, object], json.loads(line))
+        for line in (tmp_path / "debug.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert cast(Mapping[str, object], entries[0]["fields"]) == {}
+    assert cast(Mapping[str, object], entries[1]["fields"]) == {"unavailable": True}
 
 
 def test_debug_ring_drops_full_queue_and_bounds_shutdown(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -344,20 +421,22 @@ def test_debug_event_survives_a_message_whose_string_conversion_raises(tmp_path:
 def test_long_ordinary_event_stays_bounded_without_traceback(tmp_path: Path) -> None:
     config = DebugLogConfig(max_bytes=512, max_record_bytes=512, logger_name="tests.debug.long_event")
     logger = configure_debug_logging(tmp_path, config)
+    message = "0123456789abcde" + "Z" * 10_000
     try:
-        debug_event("large_ordinary_event", "ordinary " * 10_000, logger=logger, phase="connect")
+        debug_event("large_event_name", message, logger=logger, phase="connect")
     finally:
         close_debug_logging(logger)
 
     written = (tmp_path / "debug.jsonl").read_bytes()
     entry = cast(Mapping[str, object], json.loads(written))
+    fields = cast(Mapping[str, object], entry["fields"])
 
     assert written.endswith(b"\n")
     assert len(written) <= 512
-    assert entry["event"]
-    assert len(cast(str, entry["event"])) < 100
-    assert entry["message"]
-    assert len(cast(str, entry["message"])) < 100
+    assert entry["level"] == "DEBUG"
+    assert entry["event"] == "large_event_name"
+    assert entry["message"] == "0123456789abcde…"
+    assert fields == {"truncated": True}
     assert entry["truncated"] is True
     assert "traceback" not in entry
 

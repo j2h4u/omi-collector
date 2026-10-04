@@ -667,12 +667,31 @@ def test_sync_cancellation_exits_transport_and_restores_one_outer_guard(
     )
 
     async def cancel() -> None:
+        connected = asyncio.Event()
+
+        class SignallingTransport(FakeTransport):
+            async def __aenter__(self) -> RingSession:
+                session = await super().__aenter__()
+                connected.set()
+                return session
+
+        monkeypatch.setattr(
+            device_cli, "make_transport", lambda _address, **_kwargs: SignallingTransport("AA:BB", hanging, events)
+        )
         task = asyncio.create_task(device_cli.sync("AA:BB", "hci0", _store(tmp_path), force_1m=True))
-        while len(events) < 2:
-            await asyncio.sleep(0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        ready = asyncio.create_task(connected.wait())
+        try:
+            done, _pending = await asyncio.wait((task, ready), timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            assert ready in done, "sync did not connect before the readiness deadline"
+            assert not task.done(), "sync exited before cancellation was requested"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            ready.cancel()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(ready, task, return_exceptions=True)
 
     asyncio.run(cancel())
     assert events == ["guard-enter", "connect:AA:BB", "disconnect", "guard-exit"]
@@ -939,6 +958,43 @@ def test_collect_no_data_result_is_safe_json(monkeypatch: pytest.MonkeyPatch, tm
         "write_sequence": 10,
     }
     assert session.writes == [b"\x10"]
+
+
+def test_collect_cli_wires_bounded_policy_and_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _cleanup_cli_quality_metrics: None
+) -> None:
+    events: list[str] = []
+    session = FakeSession(_status())
+    _install_fakes(monkeypatch, session, events)
+    captured: list[
+        tuple[Callable[[object | None], AbstractAsyncContextManager[RingSession]], OpportunisticOptions]
+    ] = []
+
+    async def fake_run(
+        provider: Callable[[object | None], AbstractAsyncContextManager[RingSession]],
+        _staging: object,
+        options: OpportunisticOptions,
+        *,
+        runtime: object,
+    ) -> object:
+        del runtime
+        captured.append((provider, options))
+        async with provider(None) as connected:
+            assert connected is session
+        return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
+
+    monkeypatch.setattr(device_cli, "run_opportunistic_collector", fake_run)
+    result = CliRunner().invoke(
+        app,
+        ["device", "collect", "--config", str(_layout(tmp_path)), "--max-records", "1", "--confirm-read"],
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+    _provider, options = captured[0]
+    assert options.policy.stop_after_drained is True
+    assert events == ["guard-enter", "connect:AA:BB:CC:DD:EE:FF", "disconnect", "guard-exit"]
+    assert json.loads(result.output)["status"] == "no_data"
 
 
 def test_collect_seals_one_bounded_read_without_advance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

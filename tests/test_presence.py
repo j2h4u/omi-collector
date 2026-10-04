@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -438,6 +439,33 @@ def test_presence_policy_accepts_effective_config_maxima_above_defaults() -> Non
 
     assert policy.scan_recheck_seconds == config.scan_recheck_seconds
     assert policy.drain_cooldown_seconds == config.drain_cooldown_seconds
+
+
+def test_scheduler_keeps_derived_timing_when_policy_assignment_is_rejected() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        delays: list[float] = []
+
+        async def sleep(delay: float) -> None:
+            delays.append(delay)
+            now[0] += delay
+
+        policy = _test_policy(absence_seconds=7.0, scan_recheck_seconds=30.0)
+        scheduler = PresenceScheduler(FakeObserver(), policy=policy, clock=lambda: now[0], sleep=sleep)
+        with pytest.raises(FrozenInstanceError):
+            scheduler.policy.absence_seconds = 700.0  # type: ignore[reportAttributeAccessIssue]
+        assert scheduler.policy is policy
+
+        scheduler.resume_interrupted_visit()
+        try:
+            end = await scheduler.wait_for_attempt()
+            assert isinstance(end, PresenceEnd)
+            assert end.reason == "absence"
+            assert delays == [7.0]
+        finally:
+            await scheduler.close()
+
+    _run(scenario())
 
 
 def test_effective_grace_values_bound_resistant_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:

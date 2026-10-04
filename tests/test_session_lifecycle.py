@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from contextlib import AbstractAsyncContextManager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Never, cast
 
@@ -88,6 +88,8 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
         enter_capture_priority=enter,
         exit_capture_priority=lambda: events.append("exit"),
     )
+    with pytest.raises(FrozenInstanceError):
+        callbacks.exit_capture_priority = None  # type: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValueError, match="supplied together"):
         replace(callbacks, exit_capture_priority=None)
     run = SessionLifecycleRun(

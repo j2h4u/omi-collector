@@ -5,7 +5,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from functools import partial, wraps
 from hashlib import sha256
 from json import loads
@@ -493,6 +493,26 @@ async def test_coordinator_wires_real_clock_observation_store(tmp_path: Path, mo
     correction, observation = observed
     assert isinstance(correction, ClockCorrectionStore)
     assert observation is correction.observation_store
+
+
+@_async_test
+async def test_empty_pending_startup_disposition_cannot_be_rewritten(tmp_path: Path) -> None:
+    staging = StagingStore(tmp_path / "spool", tmp_path / "captures")
+    maintenance = QuarantineMaintenance(staging, None, _runtime())
+    try:
+        initial = await maintenance.prepare_pending_startup()
+
+        assert initial.pending is None
+        assert initial.durable_next is None
+        assert initial.disposition == "empty"
+        with pytest.raises(FrozenInstanceError):
+            initial.disposition = "needs_interrupted_close"  # type: ignore[reportAttributeAccessIssue]
+
+        repeated = await maintenance.prepare_pending_startup()
+        assert repeated is initial
+        assert repeated.disposition == "empty"
+    finally:
+        await maintenance.close()
 
 
 @_async_test

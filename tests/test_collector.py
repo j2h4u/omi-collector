@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field
 from struct import pack
 
 import pytest
@@ -295,6 +295,29 @@ def test_read_mailbox_preserves_intermediate_and_terminal_progress_on_success_an
         assert interrupted.snapshot.event.records_completed == 1
 
     asyncio.run(scenario())
+
+
+def test_progress_mailbox_retains_immutable_snapshot_and_event() -> None:
+    mailbox = ProgressMailbox()
+    first_event = ProgressEvent(1, 2, RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), 1.0)
+    mailbox.publish(first_event)
+    first_snapshot = mailbox.snapshot
+
+    with pytest.raises(FrozenInstanceError):
+        first_snapshot.revision = 99  # type: ignore[reportAttributeAccessIssue]
+    with pytest.raises(FrozenInstanceError):
+        first_event.records_completed = 99  # type: ignore[reportAttributeAccessIssue]
+
+    assert mailbox.snapshot is first_snapshot
+    assert mailbox.snapshot.event is first_event
+    mailbox.finish()
+    terminal_snapshot = mailbox.snapshot
+    assert terminal_snapshot.revision == first_snapshot.revision + 1
+    assert terminal_snapshot.event is first_event
+    assert terminal_snapshot.terminal
+
+    mailbox.publish(ProgressEvent(2, 2, 2 * RECORD_SIZE, 2.0, 1.0, float(RECORD_SIZE), 0.0), terminal=True)
+    assert mailbox.snapshot is terminal_snapshot
 
 
 def test_read_leg_timeout_is_reset_by_continuous_notifications() -> None:

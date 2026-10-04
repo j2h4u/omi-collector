@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from pathlib import Path
@@ -144,6 +145,14 @@ async def test_run_bluetoothctl_returns_normal_result(monkeypatch: pytest.Monkey
 
 
 @_async_test
+async def test_run_bluetoothctl_preserves_nonzero_exit_status() -> None:
+    result = await run_bluetoothctl((sys.executable, "-c", "raise SystemExit(17)"))
+
+    assert result.returncode == 17
+    assert result.stdout == ""
+
+
+@_async_test
 async def test_run_bluetoothctl_cancellation_terminates_and_reaps(monkeypatch: pytest.MonkeyPatch) -> None:
     process = FakeProcess(cancel_communicate=True)
     _patch_process_factory(monkeypatch, process)
@@ -206,6 +215,20 @@ async def test_happy_path_sets_only_1m_and_restores_exact_snapshot(tmp_path: Pat
     assert runner.selected == ORIGINAL
     assert not _paths(tmp_path).marker_path.exists()
     assert [call[6:] for call in runner.calls if len(call) > 6] == [TEMPORARY, ORIGINAL]
+
+
+@_async_test
+async def test_guard_creates_nested_missing_storage_parents(tmp_path: Path) -> None:
+    directory = tmp_path / "one" / "two" / "three"
+    paths = PhyGuardPaths(directory / "hci0.lock", directory / "hci0.marker")
+    runner = FakeRunner()
+
+    async with ScopedPhyGuard("hci0", paths=paths, runner=runner):
+        assert paths.marker_path.is_file()
+
+    assert directory.is_dir()
+    assert not paths.marker_path.exists()
+    assert runner.selected == ORIGINAL
 
 
 @_async_test
@@ -415,6 +438,45 @@ def test_path_and_adapter_validation(tmp_path: Path) -> None:
         PhyGuardPaths(tmp_path / ".." / "lock", tmp_path / "marker")
     with pytest.raises(ValueError, match="hci<number>"):
         ScopedPhyGuard("hci-nope", paths=_paths(tmp_path), runner=FakeRunner())
+
+
+@_async_test
+async def test_owner_stat_io_error_propagates_and_guard_remains_reusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = FakeRunner()
+    paths = _paths(tmp_path)
+    guard = ScopedPhyGuard("hci0", paths=paths, runner=runner)
+    process_stat = Path(f"/proc/{os.getpid()}/stat")
+    original_read_text = Path.read_text
+    injected = PermissionError("owned proc stat denied")
+
+    def fail_owned_proc_stat(
+        self: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+        *,
+        newline: str | None = None,
+    ) -> str:
+        if self == process_stat:
+            raise injected
+        return original_read_text(self, encoding=encoding, errors=errors, newline=newline)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "read_text", fail_owned_proc_stat)
+        with pytest.raises(PermissionError) as caught:
+            async with guard:
+                pytest.fail("guard body must not run")
+
+    assert caught.value is injected
+    assert runner.selected == ORIGINAL
+    assert not paths.marker_path.exists()
+
+    async with guard:
+        assert runner.selected == TEMPORARY
+
+    assert runner.selected == ORIGINAL
+    assert not paths.marker_path.exists()
 
 
 def test_default_phy_guard_paths_uses_state_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -652,6 +714,47 @@ def test_process_start_time_rejects_malformed_proc_stat(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(Path, "read_text", fake_read_text)
     assert phy_guard._process_start_time(123) is None
+
+
+@_async_test
+async def test_stale_pid_marker_with_mismatched_start_time_is_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = FakeRunner(TEMPORARY)
+    paths = _paths(tmp_path)
+    paths.marker_path.parent.mkdir(mode=0o700)
+    paths.marker_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "adapter": "hci0",
+                "selected_phys": list(ORIGINAL),
+                "owner": {"pid": 1, "start_time": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    process_stat = Path("/proc/1/stat")
+    original_read_text = Path.read_text
+    stat_fields = ["S", *(["0"] * 18), "1"]
+
+    def fake_pid_one_stat(
+        self: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+        *,
+        newline: str | None = None,
+    ) -> str:
+        if self == process_stat:
+            return f"1 (init) {' '.join(stat_fields)}"
+        return original_read_text(self, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "read_text", fake_pid_one_stat)
+
+    await ScopedPhyGuard("hci0", paths=paths, runner=runner).recover()
+
+    assert runner.selected == ORIGINAL
+    assert not paths.marker_path.exists()
 
 
 @pytest.mark.parametrize(

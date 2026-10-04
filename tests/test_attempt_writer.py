@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import pytest
 
@@ -138,6 +140,85 @@ class FakeTarget:
         return "closed"
 
 
+class _ProcessEvent(Protocol):
+    def set(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> bool: ...
+
+
+class _ProcessFlags(Protocol):
+    def __getitem__(self, index: int) -> int: ...
+
+    def __setitem__(self, index: int, value: int) -> None: ...
+
+
+class ProcessLifetimeTarget:
+    def __init__(self, entered: _ProcessEvent, release: _ProcessEvent, flags: _ProcessFlags) -> None:
+        self.entered = entered
+        self.release = release
+        self.flags = flags
+
+    def prepare(self) -> object:
+        return None
+
+    def prepare_leg(self, start_sequence: int, record_count: int) -> object:
+        del start_sequence, record_count
+        return None
+
+    def read_begin(self, notice: object) -> object:
+        del notice
+        self.flags[0] = 1
+        return None
+
+    def append_chunk(self, offset: int, chunk: memoryview) -> object:
+        del offset, chunk
+        self.entered.set()
+        if not self.release.wait(15):
+            raise TimeoutError("parent did not release the writer target")
+        return None
+
+    def checkpoint(self) -> object:
+        self.flags[1] = 1
+        return None
+
+    def seal(self, done_notice: object) -> object:
+        del done_notice
+        return None
+
+    def publish_prefix(self) -> object:
+        return None
+
+    def close(self) -> object:
+        self.flags[2] = 1
+        return None
+
+
+def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: _ProcessEvent, flags: _ProcessFlags) -> None:
+    async def lifecycle() -> None:
+        writer = AttemptWriter(ProcessLifetimeTarget(entered, release, flags), bytes(RECORD_SIZE))
+        try:
+            await writer.start()
+            await writer.prepare_leg(10, 1)
+            await writer.read_begin("begin")
+            writer.publish(RECORD_SIZE)
+            await writer.checkpoint()
+            await writer.close(timeout=5)
+        finally:
+            if writer.state is not WriterState.CLOSED:
+                await writer.close(timeout=5)
+
+    def owner() -> None:
+        try:
+            asyncio.run(lifecycle())
+        except Exception:  # noqa: BLE001 - the child reports owner-thread failures through shared state
+            flags[3] = 1
+
+    owner_thread = threading.Thread(target=owner, name="test-writer-owner", daemon=True)
+    owner_thread.start()
+    if not entered.wait(10):
+        flags[3] = 1
+
+
 @asynccontextmanager
 async def _owned_writer(
     target: FakeTarget,
@@ -200,6 +281,45 @@ def test_writer_config_controls_writer_settings() -> None:
             assert writer._config.join_poll_seconds == 0.123
 
     asyncio.run(exercise())
+
+
+def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() -> None:
+    context = multiprocessing.get_context("fork")
+    entered = context.Event()
+    release = context.Event()
+    flags = context.Array("i", [0, 0, 0, 0])
+    process = context.Process(target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release, flags))
+    started = False
+
+    try:
+        process.start()
+        started = True
+        assert entered.wait(5), "writer did not enter its blocked append"
+        process.join(timeout=1)
+        assert process.is_alive(), "process exited while writer-owned work was blocked"
+        assert flags[0] == 1
+        assert flags[1] == 0
+        assert flags[2] == 0
+
+        release.set()
+        process.join(timeout=5)
+        assert not process.is_alive(), "writer workflow did not finish after target release"
+        assert process.exitcode == 0
+        assert flags[1] == 1
+        assert flags[2] == 1
+        assert flags[3] == 0
+    finally:
+        release.set()
+        if started and process.is_alive():
+            process.join(timeout=2)
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+        if started and not process.is_alive():
+            process.close()
 
 
 def test_writer_config_controls_control_capacity() -> None:

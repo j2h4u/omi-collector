@@ -24,7 +24,7 @@ from omi_collector.capture.adapters.attempts import (
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
+from omi_collector.capture.adapters.staging_contract import AttemptStateError, DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
@@ -144,6 +144,50 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
     attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
+
+
+def test_open_attempt_reports_only_checkpointed_prefix_and_preserves_uncheckpointed_tail(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=3)
+    checkpointed = _record(1)
+    uncheckpointed = _record(2)
+    attempt.accept_chunk(100, checkpointed)
+    attempt.checkpoint()
+    attempt.close(durable=True)
+    raw_path = attempt.path / "records.bin"
+    raw_path.write_bytes(checkpointed + uncheckpointed)
+    raw_before = raw_path.read_bytes()
+    checkpoint_path = attempt.path / "checkpoint.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    recovered = StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
+    state = recovered.recover()
+
+    assert (state.valid_records, state.raw_bytes, state.clean) == (1, 2 * RECORD_SIZE, False)
+    assert raw_path.read_bytes() == raw_before
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    recovered.close()
+
+
+@pytest.mark.parametrize("damage", ["truncate", "change"])
+def test_open_rejects_checkpointed_prefix_damage_without_rewriting_evidence(tmp_path: Path, damage: str) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=2)
+    original = _record(1)
+    attempt.accept_chunk(100, original)
+    attempt.checkpoint()
+    attempt.close(durable=True)
+    raw_path = attempt.path / "records.bin"
+    raw_path.write_bytes(b"" if damage == "truncate" else _record(3))
+    damaged_raw = raw_path.read_bytes()
+    checkpoint_path = attempt.path / "checkpoint.json"
+    checkpoint = checkpoint_path.read_bytes()
+    descriptor = (attempt.path / "attempt.json").read_bytes()
+
+    with pytest.raises(AttemptStateError, match=r"shorter than its checkpoint|hash does not match"):
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
+
+    assert raw_path.read_bytes() == damaged_raw
+    assert checkpoint_path.read_bytes() == checkpoint
+    assert (attempt.path / "attempt.json").read_bytes() == descriptor
 
 
 def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_path: Path) -> None:

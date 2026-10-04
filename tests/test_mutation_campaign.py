@@ -381,6 +381,45 @@ def test_native_errors_and_timeouts_remain_unresolved(campaign_repo: tuple[Path,
     assert status_counts["timeout"] == 1
 
 
+def test_finish_reports_exact_unresolved_counts_on_stderr(campaign_repo: tuple[Path, dict[str, str]]) -> None:
+    repo, env = campaign_repo
+    assert _campaign(repo, env, "prepare").returncode == 0
+    _write_status_report(repo, ["zapped", "timeout", "error"])
+
+    result = _campaign(repo, env, "finish", "--status", "0")
+
+    assert result.returncode == 3
+    assert result.stderr == "Unresolved native outcomes remain: timeout=1 error=1; review required.\n"
+
+
+def test_finish_accepts_report_written_at_start_boundary(
+    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, env = campaign_repo
+    _write_report(repo)
+    report_path = repo / "coverage" / "gremlins" / "gremlins.json"
+    started_at_ns = 1_800_000_000_000_000_000
+    previous_mtime_ns = started_at_ns - 1
+    os.utime(report_path, ns=(previous_mtime_ns, previous_mtime_ns))
+    monkeypatch.setattr(mutation_campaign.time, "time_ns", lambda: started_at_ns)
+
+    prepared = _campaign(repo, env, "prepare")
+
+    assert prepared.returncode == 0, prepared.stderr
+    receipt_path = repo / ".gremlins_cache" / "campaign.json"
+    receipt = cast(dict[str, object], json.loads(receipt_path.read_text(encoding="utf-8")))
+    assert receipt["started_at_ns"] == started_at_ns
+    assert receipt["report_mtime_before_ns"] == previous_mtime_ns
+    assert previous_mtime_ns != started_at_ns
+    os.utime(report_path, ns=(started_at_ns, started_at_ns))
+
+    result = _campaign(repo, env, "finish", "--status", "0")
+
+    assert result.returncode == 0, result.stderr
+    finished = cast(dict[str, object], json.loads(receipt_path.read_text(encoding="utf-8")))
+    assert finished["state"] == "complete"
+
+
 def test_finish_accepts_all_zapped_results(campaign_repo: tuple[Path, dict[str, str]]) -> None:
     repo, env = campaign_repo
     assert _campaign(repo, env, "prepare").returncode == 0

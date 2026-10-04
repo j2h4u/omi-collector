@@ -73,6 +73,98 @@ def test_status_reports_freezer_state(monkeypatch: pytest.MonkeyPatch, capsys: p
     assert "active=active, freezer=frozen" in capsys.readouterr().out
 
 
+def test_public_status_resolves_account_and_targets_its_systemd_manager(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    resolved_uids: list[int] = []
+
+    def get_account(uid: int) -> object:
+        resolved_uids.append(uid)
+        return type("Account", (), {"pw_name": "operator"})()
+
+    monkeypatch.setattr(mutation_scope.pwd, "getpwuid", get_account)
+    monkeypatch.setattr(mutation_scope.os, "getuid", lambda: 4242)
+    calls: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        assert kwargs == {"check": True, "capture_output": True, "text": True}
+        calls.append(args)
+        if args[-1] == "list-units":
+            stdout = "omi-mutation-audit.scope loaded active running audit\n"
+        elif "--property=FreezerState" in args:
+            stdout = "frozen\n"
+        else:
+            stdout = "active\n"
+        return CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(mutation_scope.subprocess, "run", run)
+
+    assert mutation_scope.main(["status"]) == 0
+
+    assert capsys.readouterr().out == "omi-mutation-audit.scope: active=active, freezer=frozen\n"
+    assert resolved_uids == [4242]
+    assert calls
+    assert all("--machine=operator@.host" in args for args in calls)
+
+
+def test_public_status_requires_checked_captured_text_command_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(mutation_scope, "_machine", lambda: "operator@.host")
+    listing = "omi-mutation-audit.scope loaded active running audit\n"
+
+    def run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        if args[-1] == "list-units":
+            return CompletedProcess(args, 0, listing, "")
+        if kwargs.get("check") is not True:
+            return CompletedProcess(args, 1, "unchecked failure", "")
+        if kwargs.get("capture_output") is not True:
+            raise mutation_scope.subprocess.CalledProcessError(1, args)
+        diagnostic: str | bytes = "systemctl unavailable"
+        if kwargs.get("text") is not True:
+            diagnostic = diagnostic.encode()
+        raise mutation_scope.subprocess.CalledProcessError(1, args, output="", stderr=diagnostic)
+
+    monkeypatch.setattr(mutation_scope.subprocess, "run", run)
+
+    assert mutation_scope.main(["status"]) == 1
+    assert capsys.readouterr().err == "mutation scope: systemctl unavailable\n"
+
+
+@pytest.mark.parametrize(
+    ("listing", "diagnostic"),
+    [
+        ("", "found none"),
+        (
+            (
+                "omi-mutation-audit.scope loaded active running audit\n"
+                "omi-mutation-pause-old.scope loaded active running paused audit\n"
+            ),
+            "found omi-mutation-audit.scope, omi-mutation-pause-old.scope",
+        ),
+    ],
+)
+def test_public_pause_reports_zero_or_multiple_managed_units(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    listing: str,
+    diagnostic: str,
+) -> None:
+    monkeypatch.setattr(mutation_scope, "_machine", lambda: "operator@.host")
+
+    def run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        assert args[-1] == "list-units"
+        assert kwargs == {"check": True, "capture_output": True, "text": True}
+        return CompletedProcess(args, 0, listing, "")
+
+    monkeypatch.setattr(mutation_scope.subprocess, "run", run)
+
+    assert mutation_scope.main(["pause"]) == 1
+    assert capsys.readouterr().err == (
+        "mutation scope: expected exactly one managed mutation scope; " + diagnostic + "\n"
+    )
+
+
 @pytest.mark.parametrize("action, suffix", [("start", []), ("fresh-start", ["fresh"])])
 @pytest.mark.parametrize("status", [0, 17])
 def test_start_passes_through_child_status_and_fresh_argument(

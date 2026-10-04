@@ -78,6 +78,23 @@ def _emit_pair(
     callback(PresenceAdvertisement(candidate, -72))
 
 
+def _emit_at(callback: Callable[[object], object], candidate: object, now: list[float], at: float) -> None:
+    now[0] = at
+    callback(PresenceAdvertisement(candidate, -72))
+
+
+def _after_loop_turns(turns: int, callback: Callable[[], None]) -> None:
+    loop = asyncio.get_running_loop()
+
+    def hop(remaining: int) -> None:
+        if remaining == 0:
+            callback()
+        else:
+            loop.call_soon(hop, remaining - 1)
+
+    loop.call_soon(hop, turns - 1)
+
+
 async def _cancel_waiter_and_close[T](
     scheduler: PresenceScheduler,
     waiter: asyncio.Task[T],
@@ -1266,6 +1283,150 @@ def test_stop_failure_retries_cleanup_and_fails_closed_before_returning() -> Non
     _run(scenario())
 
 
+def test_timer_winner_drains_current_stable_advertisement_after_getter_cancellation() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        timer_started = [asyncio.Event(), asyncio.Event()]
+        sleep_calls = 0
+        candidate = object()
+
+        async def controlled_sleep(delay: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            timer_started[min(sleep_calls - 1, 1)].set()
+            if sleep_calls == 1:
+                await asyncio.Future()
+                return
+            now[0] = delay
+            callback = observer.callback
+            assert callback is not None
+
+            def deliver() -> None:
+                now[0] = delay + 0.02
+                callback(PresenceAdvertisement(candidate, -72))
+
+            _after_loop_turns(3, deliver)
+
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(scan_recheck_seconds=0.01),
+            clock=lambda: now[0],
+            sleep=controlled_sleep,
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await timer_started[0].wait()
+            observer.emit(candidate)
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await timer_started[1].wait()
+                wake = await waiter
+
+            assert isinstance(wake, PresenceWake)
+            assert wake.candidate is candidate
+            assert observer.events == ["start", "stop"]
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_expired_absence_wins_over_advertisement_during_wait_cleanup() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        candidate = object()
+
+        def schedule_pair(delay: float) -> None:
+            callback = observer.callback
+            assert callback is not None
+
+            def deliver() -> None:
+                now[0] = delay + 0.01
+                callback(PresenceAdvertisement(candidate, -72))
+                now[0] = delay + 0.03
+                callback(PresenceAdvertisement(candidate, -72))
+
+            _after_loop_turns(5, deliver)
+
+        async def expire_absence(delay: float) -> None:
+            now[0] = delay
+            schedule_pair(delay)
+
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+            clock=lambda: now[0],
+            sleep=expire_absence,
+        )
+        scheduler.resume_interrupted_visit()
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                result = await waiter
+
+            assert result == PresenceEnd("absence")
+            assert observer.events == ["start", "stop"]
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_expired_resumed_absence_preserves_partial_scanner_cleanup_for_close() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        stop_attempts = 0
+
+        class PartialObserver(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                self.callback = callback
+                self.callbacks.append(callback)
+                self.events.append("start")
+                self.active = True
+                raise RuntimeError("partial start")
+
+            async def stop(self) -> None:
+                nonlocal stop_attempts
+                stop_attempts += 1
+                self.events.append("stop")
+                if stop_attempts == 1:
+                    raise OSError("partial stop")
+                self.active = False
+
+        async def expire(delay: float) -> None:
+            now[0] = delay
+
+        observer = PartialObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+            clock=lambda: now[0],
+            sleep=expire,
+        )
+        scheduler.resume_interrupted_visit()
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                result = await scheduler.wait_for_attempt()
+
+            assert result == PresenceEnd("absence")
+            assert observer.active
+            await scheduler.close()
+            assert not observer.active
+            assert observer.events == ["start", "stop", "stop"]
+        finally:
+            await scheduler.close()
+
+    _run(scenario())
+
+
 def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None:
     async def scenario() -> None:
         now = [0.0]
@@ -1315,8 +1476,14 @@ def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                 await waiting_for_advertisement.wait()
 
-            _emit_pair(stale_callback, stale_candidate, now, 0.1, 0.12)
-            _emit_pair(observer.callbacks[1], fresh_candidate, now, 0.2, 0.22)
+            current_callback = observer.callbacks[1]
+            _emit_at(current_callback, fresh_candidate, now, 0.1)
+            waiting_for_advertisement.clear()
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await waiting_for_advertisement.wait()
+
+            _emit_pair(stale_callback, stale_candidate, now, 0.2, 0.22)
+            _emit_at(current_callback, fresh_candidate, now, 0.3)
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                 second_wake = await second
 

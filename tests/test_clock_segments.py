@@ -316,3 +316,229 @@ def test_estimates_leave_gaps_outside_observed_ranges_unknown() -> None:
     assert segment_map.utc_for(12, 100) is None
     assert segment_map.utc_for(13, 100) is None
     assert segment_map.utc_for(16, 100) is None
+
+
+@pytest.mark.parametrize(
+    ("parent_kind", "verified", "expected_ranges"),
+    [
+        ("initial", False, [(10, 30)]),
+        ("missing", True, [(10, 30)]),
+        ("noninitial", True, [(10, 30)]),
+        ("initial", True, [(10, 20), (20, 30)]),
+    ],
+)
+def test_verified_settime_boundary_alone_preserves_prior_backlog(
+    parent_kind: str, verified: bool, expected_ranges: list[tuple[int, int]]
+) -> None:
+    initial_order = int(parent_kind == "noninitial")
+    initial = replace(
+        _observation(),
+        causal_order=initial_order,
+        info_sequence_min=10,
+        info_sequence_max=20,
+        device_epoch=1600,
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        operation_id="operation",
+        observation_role="initial",
+    )
+    readback_parent = {
+        "initial": initial.observation_id,
+        "missing": None,
+        "noninitial": "other",
+    }[parent_kind]
+    readback = replace(
+        initial,
+        observation_id="readback",
+        causal_order=initial_order + 1,
+        info_sequence_min=20,
+        info_sequence_max=20,
+        device_epoch=2000,
+        host_realtime_start=2000.0,
+        host_realtime_end=2000.0,
+        observation_role="later",
+        parent_observation_id=readback_parent,
+        effective_boundary_sequence=20,
+    )
+    next_visit = replace(
+        initial,
+        observation_id="next-visit",
+        causal_order=initial_order + 2,
+        session_id="next-session",
+        info_sequence_min=10,
+        info_sequence_max=30,
+        device_epoch=3000,
+        host_realtime_start=3000.0,
+        host_realtime_end=3000.0,
+        operation_id=None,
+        observation_role="standalone",
+        parent_observation_id=None,
+        effective_boundary_sequence=None,
+    )
+    observations = (initial, readback, next_visit)
+    if parent_kind == "noninitial":
+        other = replace(
+            initial,
+            observation_id="other",
+            causal_order=0,
+            evidence_kind="anchored_monotonic",
+            info_sequence_min=0,
+            info_sequence_max=1,
+            operation_id=None,
+            observation_role="standalone",
+        )
+        observations = (other, initial, readback, next_visit)
+
+    mapping = segments_with_estimates(
+        observations,
+        ClockSegmentMap(()),
+        frozenset({"operation"}) if verified else frozenset(),
+    )
+
+    assert [(item.start_sequence, item.next_sequence) for item in mapping.segments] == expected_ranges
+    keeps_backlog = len(expected_ranges) == 2
+    assert mapping.utc_for(10, 100) == pytest.approx(-500.0 if keeps_backlog else 100.0)
+    assert mapping.utc_for(20, 100) == pytest.approx(100.0)
+
+
+@pytest.mark.parametrize(
+    ("later_operation", "later_parent", "preserves_initial_tail"),
+    [
+        ("operation", "initial", False),
+        ("other-operation", "initial", True),
+        ("operation", "missing", True),
+    ],
+)
+def test_only_matching_later_observation_clips_initial_estimate(
+    later_operation: str, later_parent: str, preserves_initial_tail: bool
+) -> None:
+    initial = replace(
+        _observation(),
+        info_sequence_min=10,
+        info_sequence_max=30,
+        device_epoch=1600,
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        operation_id="operation",
+        observation_role="initial",
+    )
+    later = replace(
+        initial,
+        observation_id="later",
+        causal_order=1,
+        info_sequence_min=20,
+        info_sequence_max=25,
+        device_epoch=2000,
+        host_realtime_start=2000.0,
+        host_realtime_end=2000.0,
+        operation_id=later_operation,
+        observation_role="later",
+        parent_observation_id=initial.observation_id if later_parent == "initial" else "missing",
+        effective_boundary_sequence=20,
+    )
+
+    mapping = segments_with_estimates((initial, later), ClockSegmentMap(()))
+
+    assert [(item.start_sequence, item.next_sequence, item.confidence) for item in mapping.segments] == (
+        [(10, 20, "approximate"), (20, 25, "approximate"), (25, 30, "approximate")]
+        if preserves_initial_tail
+        else [(10, 20, "approximate"), (20, 25, "approximate")]
+    )
+    assert mapping.utc_for(20, 100) == pytest.approx(100.0)
+    assert mapping.utc_for(25, 100) == (pytest.approx(-500.0) if preserves_initial_tail else None)
+
+
+def test_later_estimate_starts_after_parent_max_and_leaves_gap_unknown() -> None:
+    initial = replace(
+        _observation(),
+        info_sequence_min=10,
+        info_sequence_max=20,
+        device_epoch=1600,
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        operation_id="operation",
+        observation_role="initial",
+    )
+    later = replace(
+        initial,
+        observation_id="later",
+        causal_order=1,
+        info_sequence_min=25,
+        info_sequence_max=30,
+        device_epoch=2000,
+        host_realtime_start=2000.0,
+        host_realtime_end=2000.0,
+        observation_role="later",
+        parent_observation_id=initial.observation_id,
+        effective_boundary_sequence=None,
+    )
+
+    mapping = segments_with_estimates((initial, later), ClockSegmentMap(()))
+
+    assert [(item.start_sequence, item.next_sequence) for item in mapping.segments] == [(10, 20), (25, 30)]
+    assert mapping.utc_for(20, 100) is None
+    assert mapping.utc_for(24, 100) is None
+    assert mapping.utc_for(25, 100) == pytest.approx(100.0)
+
+
+def test_later_without_parent_uses_its_own_start_without_inventing_a_gap_owner() -> None:
+    initial = replace(
+        _observation(),
+        info_sequence_min=10,
+        info_sequence_max=20,
+        device_epoch=1600,
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        observation_role="standalone",
+    )
+    later = replace(
+        initial,
+        observation_id="later",
+        causal_order=1,
+        info_sequence_min=15,
+        info_sequence_max=30,
+        device_epoch=2000,
+        host_realtime_start=2000.0,
+        host_realtime_end=2000.0,
+        observation_role="later",
+        parent_observation_id="missing",
+    )
+
+    mapping = segments_with_estimates((initial, later), ClockSegmentMap(()))
+
+    assert [(item.start_sequence, item.next_sequence) for item in mapping.segments] == [(10, 15), (15, 30)]
+    assert mapping.utc_for(14, 100) == pytest.approx(-500.0)
+    assert mapping.utc_for(15, 100) == pytest.approx(100.0)
+
+
+def test_anchored_monotonic_observations_do_not_create_or_replace_estimates() -> None:
+    native = replace(
+        _observation(),
+        info_sequence_min=10,
+        info_sequence_max=20,
+        device_epoch=1600,
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+    )
+    monotonic = replace(
+        native,
+        observation_id="monotonic",
+        causal_order=1,
+        evidence_kind="anchored_monotonic",
+        device_epoch=3000,
+        host_realtime_start=3000.0,
+        host_realtime_end=3000.0,
+    )
+    confirmed = ClockSegmentMap((ClockSegment("confirmed", 12, 14, 77.0, 0.5),))
+
+    assert segments_with_estimates((monotonic,), ClockSegmentMap(())).segments == ()
+    mapping = segments_with_estimates((native, monotonic), confirmed)
+
+    assert [(item.start_sequence, item.next_sequence, item.confidence) for item in mapping.segments] == [
+        (10, 12, "approximate"),
+        (12, 14, "confirmed"),
+        (14, 20, "approximate"),
+    ]
+    assert mapping.utc_for(10, 100) == pytest.approx(-500.0)
+    assert mapping.utc_for(12, 100) == pytest.approx(177.0)
+    assert mapping.utc_for(14, 100) == pytest.approx(-500.0)

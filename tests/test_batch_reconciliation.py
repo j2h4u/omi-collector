@@ -26,6 +26,8 @@ from omi_collector.capture.application.collector import (
     CollectionResult,
     CollectorTimeoutError,
     ProgressEvent,
+    RingTransferError,
+    TransferInterruptedError,
     TransferTimeouts,
 )
 from omi_collector.capture.application.ports import (
@@ -706,6 +708,51 @@ async def test_progress_due_snapshot_precedes_competing_data(
         assert not runtime.proxies[0].thread.is_alive()
     finally:
         monkeypatch.setattr(loop, "time", original_time)
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_read_failure_preserves_transfer_error_while_progress_callback_is_pending(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def hold_progress(_event: ProgressEvent) -> None:
+        callback_started.set()
+        await release_callback.wait()
+
+    options = replace(_options(advance=False), progress=hold_progress)
+    _store, reconciler = _make_reconciler(tmp_path, runtime, options)
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            WriteStep(
+                b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big"),
+                (_wire_begin(100, 2), _wire_record(100)),
+            ),
+        ),
+    )
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    task = asyncio.create_task(reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")))
+    try:
+        await asyncio.wait_for(callback_started.wait(), timeout=5)
+        session.emit(b"\xff")
+        with pytest.raises(TransferInterruptedError) as caught:
+            await task
+        error = caught.value
+        assert isinstance(error.__cause__, RingTransferError)
+        assert str(error.__cause__) == "unexpected notification during READ"
+        assert error.received_records == 1
+    finally:
+        release_callback.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await _close_real_writers(runtime)
         await session.close()
 

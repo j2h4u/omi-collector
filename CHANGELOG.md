@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.1](https://github.com/j2h4u/omi-collector/compare/v0.11.0...v0.11.1) (2026-10-05)
+
+
+### Fixes
+
+* **mutation:** ignore Gremlins coverage scratch file ([e7b3ef8](https://github.com/j2h4u/omi-collector/commit/e7b3ef8659203e9acb9b34df031d00a2dddc9562))
+* **mutation:** repair public audit launch entrypoints ([e7b3ef8](https://github.com/j2h4u/omi-collector/commit/e7b3ef8659203e9acb9b34df031d00a2dddc9562))
+
 ## [0.11.0](https://github.com/j2h4u/omi-collector/compare/v0.10.2...v0.11.0) (2026-10-05)
 
 

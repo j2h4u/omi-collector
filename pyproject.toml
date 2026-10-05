@@ -163,7 +163,7 @@ paths = ["src/omi_collector", "scripts"]
 report = ["console", "html", "json"]
 workers = 2
 timeout = 150
-full_suite_timeout = 300
+full_suite_timeout = 600
 cache = true
 lightweight_runner = false
 

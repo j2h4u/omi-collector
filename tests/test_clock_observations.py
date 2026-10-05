@@ -459,6 +459,19 @@ def test_records_rejects_noncanonical_bytes_with_valid_causal_order(tmp_path: Pa
         store.records()
 
 
+def test_records_rejects_json_with_noncanonical_key_order(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    item = store.append(evidence_kind="native_trusted", **_values())
+    path = tmp_path / "clock-observations" / f"{item.observation_id}.json"
+    document = json.loads(path.read_text())
+    reversed_document = dict(reversed(tuple(document.items())))
+    assert list(reversed_document) != sorted(reversed_document)
+    path.write_text(json.dumps(reversed_document, ensure_ascii=True, sort_keys=False, separators=(",", ":")) + "\n")
+
+    with pytest.raises(ClockObservationError, match="ledger is invalid"):
+        store.records()
+
+
 def test_identity_text_at_maximum_length_survives_reopen(tmp_path: Path) -> None:
     session_id = "s" * 256
     store = ClockObservationStore(tmp_path / "device.json")

@@ -958,6 +958,30 @@ def test_bounded_close_survives_repeated_cancellation_until_target_release() -> 
     asyncio.run(exercise())
 
 
+def test_cancelled_close_keeps_positive_remaining_shutdown_budget() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_close=True)
+        async with _started(target, bytearray()) as writer:
+            closing = asyncio.create_task(writer.close(timeout=0.9))
+            try:
+                assert await asyncio.to_thread(target.close_started.wait, 1)
+                closing.cancel()
+                target.release_close.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, timeout=1)
+                assert target.close_calls == 1
+                assert not writer.thread.is_alive()
+                assert writer.state is WriterState.CLOSED
+            finally:
+                target.release_close.set()
+                if not closing.done():
+                    closing.cancel()
+                await asyncio.gather(closing, return_exceptions=True)
+                await asyncio.to_thread(writer.thread.join, 1)
+
+    asyncio.run(exercise())
+
+
 def test_cancelled_seal_remains_admitted_and_converges_to_one_target_call() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_seal=True)

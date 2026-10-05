@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from json import dumps, loads
 from pathlib import Path
@@ -17,8 +17,9 @@ from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRu
 from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.application import quarantine_maintenance
 from omi_collector.capture.application.ports import StagingPort
-from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
+from omi_collector.capture.application.presence import PresenceEnd, PresencePolicy, PresenceWake
 from omi_collector.capture.application.quarantine_maintenance import (
     OpportunisticSyncError,
     PendingStartupState,
@@ -1920,6 +1921,50 @@ def test_repeated_owner_cancellation_during_startup_failure_cleanup_preserves_fa
         finally:
             release_inspection.set()
             owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_presence_failure_survives_completed_task_cleanup_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        failure = RuntimeError("presence wait failed")
+        loop = asyncio.get_running_loop()
+        owner: asyncio.Task[PresenceWake | PresenceEnd] | None = None
+        joins = 0
+        original_join_owned = quarantine_maintenance.join_owned
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                await asyncio.sleep(0)
+                raise failure
+
+            async def close(self) -> None:
+                return None
+
+        async def cancel_after_real_join[T](awaitable: Awaitable[T]) -> T:
+            nonlocal joins
+            result = await original_join_owned(awaitable)
+            joins += 1
+            current_owner = owner
+            assert current_owner is not None
+            loop.call_soon(current_owner.cancel)
+            return result
+
+        monkeypatch.setattr(quarantine_maintenance, "join_owned", cancel_after_real_join)
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
+        try:
+            with pytest.raises(RuntimeError, match="presence wait failed") as error:
+                await asyncio.wait_for(owner, timeout=1)
+            assert error.value is failure
+            assert joins == 1
+        finally:
+            if not owner.done():
+                owner.cancel()
             await asyncio.gather(owner, return_exceptions=True)
             await maintenance.close()
 

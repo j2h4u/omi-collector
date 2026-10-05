@@ -86,16 +86,18 @@ pytest commands remain bounded to 600 seconds. The canonical full-project
 mutation campaign uses one finite 24-hour GNU timeout with TERM and a
 five-second KILL grace; this is an operating budget, not a completion promise.
 Targeted mutants retain their 150-second budget and the independent coverage
-pre-scan retains 600 seconds. Full-suite declaration-time mutants use a separate
-600-second budget. A retained clean baseline collected 2,298 tests (2,296
+pre-scan retains 600 seconds. Declaration-time mutants and any mutant whose
+actual selection is the complete suite use a separate 600-second budget. A
+retained clean baseline collected 2,298 tests (2,296
 passed, 2 skipped) in 287.25 seconds at nice 19/idle I/O; doubling that measured
 duration for two workers leaves about 25 seconds of margin. This diagnostic
 baseline is not a native mutation result. Earlier serial g082 benchmarks took
 103.67–104.88 seconds with different diagnostic flags, and the cause of the
 timing difference is unconfirmed. A native two-worker attempt timed out at
 150.57 seconds after pytest had run 148.85 seconds. Selecting `tests/` instead
-of all 2,294 IDs saved only 1.21 seconds in that older run. This budget applies only to mutants
-whose behavior is evaluated outside a callable body. The recipe retains the complete timeout and runner
+of all 2,294 IDs saved only 1.21 seconds in that older run. The full-suite
+budget applies when behavior is evaluated outside a callable body or coverage
+selection falls back to all collected tests. The recipe retains the complete timeout and runner
 log and records a small identity/start/end/report receipt, then reconciles native generated IDs
 against the fresh native JSON report. Missing or malformed report metadata,
 identity changes, nonzero exits, duplicate/missing/foreign IDs, and unresolved

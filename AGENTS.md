@@ -24,8 +24,9 @@ make a change pass.
   through `just mutation` with one finite 24-hour GNU timeout and a five-second
   KILL grace. Keep the 120-second test timeout, 150-second targeted-mutant
   timeout, independent 600-second coverage scan, 60-second integration
-  canary, and two workers. Full-suite declaration-time mutants use a separate
-  600-second timeout: a retained clean baseline collected 2,298 tests (2,296
+  canary, and two workers. Declaration-time mutants and any mutant whose
+  actual selection is the complete suite use a separate 600-second timeout:
+  a retained clean baseline collected 2,298 tests (2,296
   passed, 2 skipped) in 287.25 seconds at nice 19/idle I/O; doubling that
   measured duration for two workers leaves about 25 seconds of margin. This
   diagnostic baseline is not a native mutation result. Earlier serial g082

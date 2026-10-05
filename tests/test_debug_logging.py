@@ -267,9 +267,11 @@ def test_logger_normalizes_malformed_and_recursive_public_debug_fields(tmp_path:
 def test_debug_ring_drops_full_queue_and_bounds_shutdown(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
+    listener_threads: list[threading.Thread] = []
     original_handle = debug_logging._SafeRotatingFileHandler.handle
 
     def blocked_handle(self: debug_logging._SafeRotatingFileHandler, record: logging.LogRecord) -> bool:
+        listener_threads.append(threading.current_thread())
         entered.set()
         release.wait(1)
         return original_handle(self, record)
@@ -291,10 +293,10 @@ def test_debug_ring_drops_full_queue_and_bounds_shutdown(monkeypatch: pytest.Mon
         assert configure_debug_logging(tmp_path, config) is logger
         assert logger.handlers == []
         release.set()
-        deadline = time.monotonic() + 1
-        while not logger.handlers and time.monotonic() < deadline:
-            configure_debug_logging(tmp_path, config)
-            time.sleep(0.01)
+        assert len(listener_threads) == 1
+        listener_threads[0].join(1)
+        assert not listener_threads[0].is_alive()
+        configure_debug_logging(tmp_path, config)
         assert logger.handlers
         debug_event("after_resume", logger=logger, phase="ready")
         deadline = time.monotonic() + 1
@@ -313,6 +315,83 @@ def test_debug_ring_drops_full_queue_and_bounds_shutdown(monkeypatch: pytest.Mon
         for line in (tmp_path / "debug.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert events.count("after_resume") == 1
+
+
+def test_configure_defers_until_listener_thread_can_finish_close(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    listener_threads: list[threading.Thread] = []
+    config = DebugLogConfig(shutdown_join_seconds=0.01, logger_name="tests.debug.listener_close")
+    logger = configure_debug_logging(tmp_path, config)
+
+    class CloseFromListener:
+        def __str__(self) -> str:
+            listener_threads.append(threading.current_thread())
+            close_debug_logging(logger)
+            entered.set()
+            release.wait(1)
+            return "close requested"
+
+    try:
+        logger.debug(CloseFromListener(), extra={"debug_event": "listener_close", "debug_fields": {}})
+        assert entered.wait(1)
+        assert configure_debug_logging(tmp_path, config) is logger
+        debug_event("while_pending", logger=logger)
+        release.set()
+        assert len(listener_threads) == 1
+        listener_threads[0].join(1)
+        assert not listener_threads[0].is_alive()
+        assert configure_debug_logging(tmp_path, config) is logger
+        debug_event("after_listener_recovery", logger=logger)
+    finally:
+        release.set()
+        if listener_threads:
+            listener_threads[0].join(1)
+        close_debug_logging(logger)
+
+    events = [
+        cast(Mapping[str, object], json.loads(line))["event"]
+        for line in (tmp_path / config.file_name).read_text(encoding="utf-8").splitlines()
+    ]
+    assert "after_listener_recovery" in events
+    assert "while_pending" not in events
+
+
+def test_configure_returns_logger_when_sink_close_times_out(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    listener_threads: list[threading.Thread] = []
+    config = DebugLogConfig(shutdown_join_seconds=0.01, logger_name="tests.debug.configure_timeout")
+    logger = configure_debug_logging(tmp_path, config)
+
+    class BlockOnListener:
+        def __str__(self) -> str:
+            listener_threads.append(threading.current_thread())
+            entered.set()
+            release.wait(1)
+            return "blocked diagnostic"
+
+    try:
+        logger.debug(BlockOnListener(), extra={"debug_event": "blocked", "debug_fields": {}})
+        assert entered.wait(1)
+        assert configure_debug_logging(tmp_path, config) is logger
+        release.set()
+        assert len(listener_threads) == 1
+        listener_threads[0].join(1)
+        assert not listener_threads[0].is_alive()
+        assert configure_debug_logging(tmp_path, config) is logger
+        debug_event("configure_recovered", logger=logger)
+    finally:
+        release.set()
+        if listener_threads:
+            listener_threads[0].join(1)
+        close_debug_logging(logger)
+
+    events = [
+        cast(Mapping[str, object], json.loads(line))["event"]
+        for line in (tmp_path / config.file_name).read_text(encoding="utf-8").splitlines()
+    ]
+    assert "configure_recovered" in events
 
 
 def test_utf16_ring_rotation_counts_encoded_bytes_and_keeps_jsonl_complete(tmp_path: Path) -> None:
@@ -462,3 +541,220 @@ def test_long_exception_keeps_a_bounded_traceback_marker(tmp_path: Path) -> None
     assert traceback
     assert len(traceback) < 100
     assert "…" in traceback
+
+
+def test_debug_ring_opens_file_only_after_first_record(tmp_path: Path) -> None:
+    config = DebugLogConfig(logger_name="tests.debug.lazy_file")
+    path = tmp_path / config.file_name
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        assert not path.exists()
+        debug_event("first_record", logger=logger)
+    finally:
+        close_debug_logging(logger)
+
+    assert path.is_file()
+    assert json.loads(path.read_text(encoding=config.encoding))["event"] == "first_record"
+
+
+def test_debug_exception_keeps_traceback_unavailable_marker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def broken_format_exception(self: logging.Formatter, exc_info: object) -> str:
+        _ = self, exc_info
+        raise RuntimeError("traceback formatting failed")
+
+    monkeypatch.setattr(logging.Formatter, "formatException", broken_format_exception)
+    config = DebugLogConfig(logger_name="tests.debug.traceback_unavailable")
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        debug_exception("broken_traceback", RuntimeError("failure"), logger=logger)
+    finally:
+        close_debug_logging(logger)
+
+    entry = cast(Mapping[str, object], json.loads((tmp_path / config.file_name).read_text(encoding="utf-8")))
+    assert entry["traceback"] == "<traceback unavailable>"
+
+
+def test_large_budget_compacts_long_event_without_fallback(tmp_path: Path) -> None:
+    config = DebugLogConfig(max_bytes=4096, max_record_bytes=1024, logger_name="tests.debug.long_event_1024")
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        debug_event("large_event_name", "x" * 10_000, logger=logger, phase="connect")
+    finally:
+        close_debug_logging(logger)
+
+    written = (tmp_path / config.file_name).read_bytes()
+    entry = cast(Mapping[str, object], json.loads(written))
+    fields = cast(Mapping[str, object], entry["fields"])
+    assert written.endswith(b"\n")
+    assert len(written) <= config.max_record_bytes
+    message = cast(str, entry["message"])
+    assert message.startswith("x")
+    assert message.endswith("…")
+    assert fields == {"truncated": True}
+    assert entry["truncated"] is True
+
+
+def test_debug_rotation_uses_at_least_boundary(tmp_path: Path) -> None:
+    calibration_root = tmp_path / "calibration"
+    calibration_config = DebugLogConfig(logger_name="tests.debug.rotation_boundary")
+    calibration_logger = configure_debug_logging(calibration_root, calibration_config)
+    try:
+        debug_event("same_size", logger=calibration_logger, attempt=0)
+    finally:
+        close_debug_logging(calibration_logger)
+    record_bytes = (calibration_root / calibration_config.file_name).stat().st_size
+
+    root = tmp_path / "boundary"
+    config = DebugLogConfig(
+        max_bytes=record_bytes * 2,
+        backup_count=1,
+        max_record_bytes=record_bytes * 2,
+        logger_name="tests.debug.rotation_boundary",
+    )
+    logger = configure_debug_logging(root, config)
+    try:
+        debug_event("same_size", logger=logger, attempt=1)
+        debug_event("same_size", logger=logger, attempt=2)
+    finally:
+        close_debug_logging(logger)
+
+    current = [json.loads(line) for line in (root / config.file_name).read_text(encoding="utf-8").splitlines()]
+    rotated = [json.loads(line) for line in (root / f"{config.file_name}.1").read_text(encoding="utf-8").splitlines()]
+    assert len(current) == len(rotated) == 1
+    assert cast(Mapping[str, object], current[0]["fields"])["attempt"] == 2
+    assert cast(Mapping[str, object], rotated[0]["fields"])["attempt"] == 1
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+def test_record_one_byte_over_cap_is_compacted(encoding: str, tmp_path: Path) -> None:
+    calibration_root = tmp_path / "calibration"
+    calibration_config = DebugLogConfig(
+        max_bytes=4096,
+        max_record_bytes=4096,
+        encoding=encoding,
+        logger_name=f"tests.debug.record_boundary.{encoding.replace('-', '_')}",
+    )
+    calibration_logger = configure_debug_logging(calibration_root, calibration_config)
+    try:
+        debug_event("boundary", "x" * 700, logger=calibration_logger)
+    finally:
+        close_debug_logging(calibration_logger)
+    calibrated = (calibration_root / calibration_config.file_name).read_bytes()
+    full_record_body_bytes = len(calibrated) - len("\n".encode(encoding))
+
+    config = DebugLogConfig(
+        max_bytes=4096,
+        max_record_bytes=full_record_body_bytes - 1,
+        encoding=encoding,
+        logger_name=f"tests.debug.record_boundary.{encoding.replace('-', '_')}",
+    )
+    logger = configure_debug_logging(tmp_path / "bounded", config)
+    try:
+        debug_event("boundary", "x" * 700, logger=logger)
+    finally:
+        close_debug_logging(logger)
+
+    written = (tmp_path / "bounded" / config.file_name).read_bytes()
+    entry = cast(Mapping[str, object], json.loads(written.decode(encoding)))
+    assert written.decode(encoding).endswith("\n")
+    assert len(written) <= config.max_record_bytes
+    assert entry["truncated"] is True
+    assert entry["message"] != "x" * 700
+
+
+def test_record_exactly_at_cap_keeps_full_event(tmp_path: Path) -> None:
+    calibration_root = tmp_path / "calibration"
+    logger_name = "tests.debug.record_equal_boundary"
+    calibration_config = DebugLogConfig(max_bytes=4096, max_record_bytes=4096, logger_name=logger_name)
+    calibration_logger = configure_debug_logging(calibration_root, calibration_config)
+    try:
+        debug_event("equal_boundary", "complete message " * 20, logger=calibration_logger, code=7)
+    finally:
+        close_debug_logging(calibration_logger)
+    exact_record_bytes = (calibration_root / calibration_config.file_name).stat().st_size
+
+    config = DebugLogConfig(
+        max_bytes=exact_record_bytes,
+        max_record_bytes=exact_record_bytes,
+        logger_name=logger_name,
+    )
+    logger = configure_debug_logging(tmp_path / "exact", config)
+    try:
+        debug_event("equal_boundary", "complete message " * 20, logger=logger, code=7)
+    finally:
+        close_debug_logging(logger)
+
+    written = (tmp_path / "exact" / config.file_name).read_bytes()
+    entry = cast(Mapping[str, object], json.loads(written))
+    assert len(written) == exact_record_bytes
+    assert entry["message"] == "complete message " * 20
+    assert cast(Mapping[str, object], entry["fields"]) == {"code": 7}
+    assert "truncated" not in entry
+
+
+def test_utf16_oversized_record_uses_truncated_fallback(tmp_path: Path) -> None:
+    config = DebugLogConfig(
+        max_bytes=1024,
+        max_record_bytes=512,
+        encoding="utf-16",
+        logger_name="tests.debug.utf16_fallback",
+    )
+    logger = configure_debug_logging(tmp_path, config)
+    try:
+        debug_event("fallback", "x" * 50_000, logger=logger, phase="capture")
+    finally:
+        close_debug_logging(logger)
+
+    written = (tmp_path / config.file_name).read_bytes()
+    entry = cast(Mapping[str, object], json.loads(written.decode("utf-16")))
+    assert written.decode("utf-16").endswith("\n")
+    assert len(written) <= config.max_record_bytes
+    assert entry == {"message": "diagnostic truncated", "truncated": True}
+
+
+def test_compacted_utf16_record_exactly_at_cap_keeps_structured_payload(tmp_path: Path) -> None:
+    logger_name = "tests.debug.compacted_equal_boundary"
+    record_budget = 1024
+    for attempt in range(8):
+        calibration_root = tmp_path / f"calibration_{attempt}"
+        calibration_config = DebugLogConfig(
+            max_bytes=4096,
+            max_record_bytes=record_budget,
+            encoding="utf-16",
+            logger_name=logger_name,
+        )
+        calibration_logger = configure_debug_logging(calibration_root, calibration_config)
+        try:
+            debug_event("compact_boundary", "x" * 10_000, logger=calibration_logger, phase="capture")
+        finally:
+            close_debug_logging(calibration_logger)
+
+        written = (calibration_root / calibration_config.file_name).read_bytes()
+        entry = cast(Mapping[str, object], json.loads(written.decode("utf-16")))
+        assert "event" in entry
+        next_budget = len(written) + len("".encode("utf-16"))
+        if next_budget == record_budget:
+            break
+        record_budget = next_budget
+    else:
+        pytest.fail("public compaction calibration did not reach an exact budget")
+
+    config = DebugLogConfig(
+        max_bytes=4096,
+        max_record_bytes=record_budget,
+        encoding="utf-16",
+        logger_name=logger_name,
+    )
+    logger = configure_debug_logging(tmp_path / "exact", config)
+    try:
+        debug_event("compact_boundary", "x" * 10_000, logger=logger, phase="capture")
+    finally:
+        close_debug_logging(logger)
+
+    final_entry = cast(
+        Mapping[str, object],
+        json.loads((tmp_path / "exact" / config.file_name).read_text(encoding="utf-16")),
+    )
+    assert final_entry["event"] == "compact_boundary"
+    assert final_entry["truncated"] is True
+    assert cast(str, final_entry["message"]).endswith("…")

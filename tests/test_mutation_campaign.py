@@ -244,6 +244,11 @@ def _write_cache(path: Path, rows: list[tuple[str, str]]) -> bytes:
     return path.read_bytes()
 
 
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+
+
 def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_project(
     campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -375,6 +380,186 @@ def test_resume_reuses_exact_job_and_preserves_completed_native_cache(
         assert cache.execute("SELECT * FROM results").fetchall() == [
             ("completed", '{"status": "ZAPPED"}'),
         ]
+
+
+def _create_two_paused_jobs(
+    repo: Path, env: dict[str, str], monkeypatch: pytest.MonkeyPatch, audit_root: Path
+) -> tuple[list[Path], dict[Path, bytes]]:
+    jobs: list[Path] = []
+    cache_images: dict[Path, bytes] = {}
+    for index in range(2):
+        existing_jobs = set(_job_directories(audit_root))
+        status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+        assert status == 0, stderr
+        job = next(iter(set(_job_directories(audit_root)) - existing_jobs))
+        receipt_path = job / "owner.json"
+        receipt = _read_json_object(receipt_path)
+        receipt.update(state="paused", checkpoint_verified=True)
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        cache_path = job / "checkout" / ".gremlins_cache" / "results.db"
+        cache_images[job] = _write_cache(cache_path, [(f"completed-{index}", "ZAPPED")])
+        jobs.append(job)
+    return jobs, cache_images
+
+
+def _assert_job_caches_unchanged(cache_images: dict[Path, bytes]) -> None:
+    assert all(
+        (job / "checkout" / ".gremlins_cache" / "results.db").read_bytes() == image
+        for job, image in cache_images.items()
+    )
+
+
+def test_explicit_resume_preserves_default_ambiguity(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_args, **_kwargs: 0)
+    jobs, cache_images = _create_two_paused_jobs(repo, env, monkeypatch, audit_root)
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "resume")
+
+    assert status == 1
+    assert "found 2" in stderr
+    assert [_read_json_object(job / "owner.json")["state"] for job in jobs] == ["paused", "paused"]
+    _assert_job_caches_unchanged(cache_images)
+
+
+def test_explicit_resume_blocks_other_running_job_and_preserves_unselected_job(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_args, **_kwargs: 0)
+    jobs, cache_images = _create_two_paused_jobs(repo, env, monkeypatch, audit_root)
+    other_receipt_path = jobs[0] / "owner.json"
+    paused_receipt = other_receipt_path.read_bytes()
+    receipt = _read_json_object(other_receipt_path)
+    receipt["state"] = "running"
+    other_receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    running_receipt = other_receipt_path.read_bytes()
+    selected = jobs[1]
+    selected_receipt = (selected / "owner.json").read_bytes()
+
+    result = _launch(repo, env, monkeypatch, "launch", "--mode", "resume", "--job", selected.name)
+
+    assert result[0] == 1
+    assert "another unresolved mutation job" in result[2]
+    assert other_receipt_path.read_bytes() == running_receipt
+    assert (selected / "owner.json").read_bytes() == selected_receipt
+    _assert_job_caches_unchanged(cache_images)
+    other_receipt_path.write_bytes(paused_receipt)
+    unselected_receipt = other_receipt_path.read_bytes()
+
+    resumed: list[Path] = []
+    monkeypatch.setattr(
+        mutation_campaign,
+        "_enter_owner",
+        lambda job_root, *_args, **_kwargs: resumed.append(job_root) or 0,
+    )
+    result = _launch(repo, env, monkeypatch, "launch", "--mode", "resume", "--job", selected.name)
+
+    assert result[0] == 0, result[2]
+    assert resumed == [selected]
+    assert (jobs[0] / "owner.json").read_bytes() == unselected_receipt
+    _assert_job_caches_unchanged(cache_images)
+
+
+def test_just_resume_passes_selector_payload_literally_to_validation(tmp_path: Path) -> None:
+    just_path = shutil.which("just")
+    if just_path is None:
+        pytest.skip("just is required to exercise the public mutation recipe")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    jobs_root = tmp_path / "managed-jobs"
+    jobs_root.mkdir(mode=0o700)
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir(mode=0o700)
+    for tool in ("chrt", "ionice", "nice"):
+        _write_executable(tools / tool, '#!/bin/sh\nshift 2\nexec "$@"\n')
+    _write_executable(
+        tools / "uv",
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from scripts.mutation_campaign import _selected_resume_job\n"
+        "args = sys.argv[1:]\n"
+        "prefix = ['run', '--frozen', '--no-sync', 'python', '-m', 'scripts.mutation_campaign', "
+        "'launch', '--mode', 'resume', '--job']\n"
+        "if args[:-1] != prefix:\n"
+        "    raise SystemExit(f'unexpected launch argv: {args!r}')\n"
+        "job_id = args[-1]\n"
+        "try:\n"
+        "    _selected_resume_job(job_id, Path(os.environ['MUTATION_TEST_JOBS_ROOT']))\n"
+        "except ValueError as error:\n"
+        "    print(f'VALIDATOR:{job_id}:{error}')\n"
+        "else:\n"
+        "    raise SystemExit('selector unexpectedly resolved')\n",
+    )
+    marker = tmp_path / "shell-payload-ran"
+    selector = f"$(touch {marker})"
+    repo = Path(__file__).parents[1]
+    environment = os.environ | {
+        "MUTATION_TEST_JOBS_ROOT": str(jobs_root),
+        "PYTHONPATH": str(repo) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        "XDG_RUNTIME_DIR": str(runtime_dir),
+        "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+    }
+
+    result = subprocess.run(
+        [
+            just_path,
+            "--justfile",
+            str(repo / "Justfile"),
+            "mutation",
+            "resume",
+            "--job",
+            selector,
+        ],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"VALIDATOR:{selector}:resume job selector must be one managed job ID" in result.stdout
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("job_id", ("../escape", "missing-job", "symlink-job"))
+def test_explicit_resume_rejects_unmanaged_job_id_without_mutating_jobs(
+    campaign_project: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    job_id: str,
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_args, **_kwargs: 0)
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+    assert status == 0, stderr
+    job = _job_directories(audit_root)[0]
+    receipt = _read_json_object(job / "owner.json")
+    receipt.update(state="paused", checkpoint_verified=True)
+    (job / "owner.json").write_text(json.dumps(receipt), encoding="utf-8")
+    original_receipt = (job / "owner.json").read_bytes()
+    if job_id == "symlink-job":
+        (job.parent / job_id).symlink_to(job, target_is_directory=True)
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "resume", "--job", job_id)
+
+    assert status == 1
+    assert stderr
+    assert (job / "owner.json").read_bytes() == original_receipt
 
 
 def test_incompatible_resume_refuses_before_mutating_cache(

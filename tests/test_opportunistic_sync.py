@@ -1174,7 +1174,9 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]),
+        StagingStore(tmp_path, _capture_root(tmp_path)),
+        replace(_options(), timeouts=TransferTimeouts(info=1, transfer=5)),
     )
 
     assert isinstance(result, CollectionResult)

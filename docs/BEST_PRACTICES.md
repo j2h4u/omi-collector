@@ -115,6 +115,9 @@ token-owned test processes, verifies the SQLite cache, records an interrupted
 checkpoint, and exits; no stopped test process remains. Resume starts a new
 controller so any in-flight mutant is retried. A failed baseline with zero
 mutants dispatched is recorded as a failed bootstrap, never a completed audit.
+When several paused jobs are preserved, select one explicitly with
+`just mutation resume --job <job-id>`; the default remains fail-closed when
+more than one resumable job exists.
 The owner and all children run at SCHED_IDLE CPU policy, ionice idle class, and
 nice 19. The 24-hour GNU timeout bounds the inner native test run, not the
 owner, and a timeout or signal is an interrupted audit rather than a clean

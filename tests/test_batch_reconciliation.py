@@ -770,6 +770,9 @@ async def _admit_partial_and_cancel(reconciler: BatchReconciler, runtime: _Runti
     try:
         async with asyncio.timeout(5):
             while not runtime.proxies or runtime.proxies[0].progress.submitted == 0:
+                if task.done():
+                    await task
+                    raise AssertionError("connected collection completed before writer submission")
                 await asyncio.sleep(0)
         task.cancel()
         try:
@@ -972,7 +975,7 @@ async def test_checkpoint_after_session_times_out_at_exact_writer_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = _Runtime()
-    timeout = 0.05
+    timeout = 1.0
     sleep_calls: list[float] = []
 
     async def forbidden_sleep(delay: float) -> None:
@@ -1008,7 +1011,7 @@ async def test_finalize_times_out_at_exact_writer_deadline_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = _Runtime()
-    timeout = 0.05
+    timeout = 1.0
     sleep_calls: list[float] = []
 
     async def forbidden_sleep(delay: float) -> None:

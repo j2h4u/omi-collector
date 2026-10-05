@@ -819,8 +819,7 @@ def test_concurrent_identical_prepare_returns_the_same_durable_correction(
     monkeypatch.setattr(Path, "open", wait_until_both_prepares_reach_the_lock)
     with ThreadPoolExecutor(max_workers=2) as callers:
         futures = [
-            callers.submit(store.prepare, 1300, 1000, 300.0, 20, operation_id="same-operation")
-            for _ in range(2)
+            callers.submit(store.prepare, 1300, 1000, 300.0, 20, operation_id="same-operation") for _ in range(2)
         ]
         try:
             results = [future.result(timeout=3) for future in futures]
@@ -832,9 +831,7 @@ def test_concurrent_identical_prepare_returns_the_same_durable_correction(
     assert store.records()[0] == results[0]
 
 
-def _fail_clock_correction_directory_fsync(
-    monkeypatch: pytest.MonkeyPatch, correction_root: Path
-) -> OSError:
+def _fail_clock_correction_directory_fsync(monkeypatch: pytest.MonkeyPatch, correction_root: Path) -> OSError:
     original_open = os.open
     original_fsync = os.fsync
     correction_directory_descriptors: set[int] = set()
@@ -935,21 +932,27 @@ def test_causal_reconcile_preserves_another_valid_unresolved_operation(
     assert other.state == "unresolved"
     other_record = other_root / "clock-corrections" / "other-operation.json"
     (tmp_path / "clock-corrections" / "other-operation.json").write_bytes(other_record.read_bytes())
-    initial = _append_native_observation(store, {
-        "session_id": "same-session",
-        "device_epoch": 1300,
-        "info_sequence_max": 20,
-        "operation_id": current.operation_id,
-        "observation_role": "initial",
-    })
-    later = _append_native_observation(store, {
-        "session_id": "same-session",
-        "device_epoch": 1000,
-        "info_sequence_max": 24,
-        "operation_id": current.operation_id,
-        "observation_role": "later",
-        "parent_observation_id": initial.observation_id,
-    })
+    initial = _append_native_observation(
+        store,
+        {
+            "session_id": "same-session",
+            "device_epoch": 1300,
+            "info_sequence_max": 20,
+            "operation_id": current.operation_id,
+            "observation_role": "initial",
+        },
+    )
+    later = _append_native_observation(
+        store,
+        {
+            "session_id": "same-session",
+            "device_epoch": 1000,
+            "info_sequence_max": 24,
+            "operation_id": current.operation_id,
+            "observation_role": "later",
+            "parent_observation_id": initial.observation_id,
+        },
+    )
     current_bytes = (tmp_path / "clock-corrections" / "current-operation.json").read_bytes()
     other_bytes = (tmp_path / "clock-corrections" / "other-operation.json").read_bytes()
 
@@ -968,20 +971,26 @@ def test_causal_reconcile_preserves_another_valid_unresolved_operation(
 
 def test_standalone_native_parent_can_support_cross_session_reconciliation(tmp_path: Path) -> None:
     store = ClockCorrectionStore(tmp_path / "device.json", tmp_path / "attempts")
-    parent = _append_native_observation(store, {
-        "session_id": "parent-session",
-        "device_epoch": 1000,
-        "info_sequence_max": 20,
-    })
+    parent = _append_native_observation(
+        store,
+        {
+            "session_id": "parent-session",
+            "device_epoch": 1000,
+            "info_sequence_max": 20,
+        },
+    )
     current = store.mark_unresolved(store.prepare(1100, 1000, 100.0, 20, operation_id="current-operation"))
-    later = _append_native_observation(store, {
-        "session_id": "later-session",
-        "device_epoch": 1000,
-        "info_sequence_max": 24,
-        "operation_id": current.operation_id,
-        "observation_role": "later",
-        "parent_observation_id": parent.observation_id,
-    })
+    later = _append_native_observation(
+        store,
+        {
+            "session_id": "later-session",
+            "device_epoch": 1000,
+            "info_sequence_max": 24,
+            "operation_id": current.operation_id,
+            "observation_role": "later",
+            "parent_observation_id": parent.observation_id,
+        },
+    )
 
     reconciled = store.reconcile_causal_observation(later, near_zero_threshold=5.0)
 

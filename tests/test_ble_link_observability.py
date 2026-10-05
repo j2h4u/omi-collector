@@ -299,9 +299,7 @@ def test_observer_records_data_length_effective_transitions_with_bound() -> None
         (0x22, "unknown", "unknown"),
     ],
 )
-def test_observer_disconnect_classifies_only_hci_reason_evidence(
-    reason: int, expected: str, reason_name: str
-) -> None:
+def test_observer_disconnect_classifies_only_hci_reason_evidence(reason: int, expected: str, reason_name: str) -> None:
     records: list[dict[str, object]] = []
     observer = BleLinkObserver("01:02:03:04:05:06", terminal_callback=records.append)
     observer.handle_packet(_connect())
@@ -815,8 +813,9 @@ def test_observer_warns_once_when_initial_phy_and_rssi_commands_fail(
         finally:
             await asyncio.wait_for(observer.close(), timeout=1.0)
 
-    with caplog.at_level(logging.DEBUG, logger=debug_logger.name), caplog.at_level(
-        logging.WARNING, logger=warning_logger.name
+    with (
+        caplog.at_level(logging.DEBUG, logger=debug_logger.name),
+        caplog.at_level(logging.WARNING, logger=warning_logger.name),
     ):
         asyncio.run(scenario())
 
@@ -893,8 +892,9 @@ def test_observer_receive_failure_degrades_and_warns_without_stopping_collection
         finally:
             await asyncio.wait_for(observer.close(), timeout=1.0)
 
-    with caplog.at_level(logging.DEBUG, logger=debug_logger.name), caplog.at_level(
-        logging.WARNING, logger=warning_logger.name
+    with (
+        caplog.at_level(logging.DEBUG, logger=debug_logger.name),
+        caplog.at_level(logging.WARNING, logger=warning_logger.name),
     ):
         asyncio.run(scenario())
 
@@ -1348,9 +1348,7 @@ def _assert_child_module_path(expected_module_path: str) -> None:
     assert Path(ble_link_observability.__file__).resolve() == Path(expected_module_path)
 
 
-def _blocked_reader_child(
-    entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str
-) -> None:
+def _blocked_reader_child(entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str) -> None:
     _assert_child_module_path(expected_module_path)
     blocked = threading.Event()
 
@@ -1381,9 +1379,7 @@ def _blocked_reader_child(
     asyncio.run(scenario())
 
 
-def _blocked_parser_child(
-    entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str
-) -> None:
+def _blocked_parser_child(entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str) -> None:
     _assert_child_module_path(expected_module_path)
     packets: queue.Queue[bytes] = queue.Queue()
     blocked = threading.Event()
@@ -1546,11 +1542,7 @@ def test_close_drains_a_full_public_packet_queue_after_callback_releases(
         "ble_link_observer_processor_timeout",
         "ble_link_observer_finalizer_timeout",
     }
-    observed = {
-        getattr(record, "debug_event", None)
-        for record in caplog.records
-        if record.name == debug_logger.name
-    }
+    observed = {getattr(record, "debug_event", None) for record in caplog.records if record.name == debug_logger.name}
     assert not shutdown_errors.intersection(observed)
     assert fake.closed
 

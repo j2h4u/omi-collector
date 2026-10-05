@@ -423,9 +423,7 @@ def test_reader_rejects_negative_persisted_firmware_metric_without_rewriting_byt
 
 
 @pytest.mark.parametrize("malformed_section", ["latest", "metrics"])
-def test_reader_and_spool_metrics_wrap_malformed_firmware_sections(
-    tmp_path: Path, malformed_section: str
-) -> None:
+def test_reader_and_spool_metrics_wrap_malformed_firmware_sections(tmp_path: Path, malformed_section: str) -> None:
     path = tmp_path / "device.json"
     FirmwareObservationStore(path).record(_info(1))
     document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
@@ -519,6 +517,7 @@ def test_blocked_writer_does_not_hold_forked_interpreter_shutdown(tmp_path: Path
     if process_id == 0:
         os.close(read_fd)
         try:
+
             class BlockingStore(FirmwareObservationStore):
                 def __init__(self) -> None:
                     super().__init__(tmp_path / "blocked-device.json")

@@ -73,8 +73,18 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 unit:
     nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
 
-# Audit all code against every test; resume an identified native campaign.
+# Create or resume the one frozen, durable full-project audit job.
 mutation mode='resume':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{mode}}" in
+        fresh|resume) ;;
+        *) printf 'mutation mode must be resume or fresh.\n' >&2; exit 2 ;;
+    esac
+    chrt --idle 0 ionice -c 3 nice -n 19 uv run python scripts/mutation_campaign.py launch --mode "{{mode}}"
+
+# Private child recipe; the job owner controls its lifetime and environment.
+mutation-internal mode='resume':
     #!/usr/bin/env bash
     set -uo pipefail
     mkdir -p .gremlins_cache || exit 1
@@ -99,25 +109,28 @@ mutation mode='resume':
     esac
     run_id="$(uv run python scripts/mutation_campaign.py prepare --launcher-pid "$$" "${prepare_flags[@]}")" || exit 1
     log_file=".gremlins_cache/mutation-${run_id}.log"
-    nice -n 19 ionice -c 3 timeout --verbose --signal=TERM --kill-after=5s 24h uv run pytest --gremlins "${cache_flags[@]}" tests |& tee "$log_file"
+    timeout --verbose --signal=TERM --kill-after=5s 24h uv run --frozen --no-sync pytest --gremlins "${cache_flags[@]}" tests |& tee "$log_file"
     statuses=("${PIPESTATUS[@]}")
     status="${statuses[0]}"
     if (( ${statuses[1]:-1} != 0 )); then
         printf 'Could not retain the mutation log.\n' >&2
         if (( status == 0 )); then status=1; fi
     fi
-    uv run python scripts/mutation_campaign.py finish --status "$status" || exit 1
+    finish_status=0
+    uv run --frozen --no-sync python scripts/mutation_campaign.py finish --status "$status" || finish_status=$?
+    if (( finish_status != 0 && finish_status != 3 )); then exit 1; fi
+    if (( status == 0 && finish_status == 3 )); then status=3; fi
     exit "$status"
 
 # Launch the full audit in a dedicated, controllable user scope.
 mutation-start:
-    uv run python scripts/mutation_scope.py start
+    just mutation resume
 
 # Clear prior evidence and launch a fresh audit in its dedicated user scope.
 mutation-fresh-start:
-    uv run python scripts/mutation_scope.py fresh-start
+    just mutation fresh
 
-# Freeze, resume, or inspect the sole managed mutation scope.
+# Checkpoint-stop, resume, or inspect the sole managed mutation job.
 mutation-pause:
     uv run python scripts/mutation_scope.py pause
 

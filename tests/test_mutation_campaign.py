@@ -1,547 +1,61 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
-from contextlib import redirect_stderr, redirect_stdout
+from collections import Counter
+from collections.abc import Callable
+from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
-from subprocess import CompletedProcess
 from typing import cast
 
 import pytest
 from scripts import mutation_campaign
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "mutation_campaign.py"
-
 
 @pytest.fixture
-def campaign_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
-    (tmp_path / ".gitignore").write_text(".gremlins_cache/\ncoverage/gremlins/\n", encoding="utf-8")
-    (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = 'campaign-fixture'\nversion = '0.1.0'\n", encoding="utf-8"
-    )
-    (tmp_path / "src" / "omi_collector").mkdir(parents=True)
-    (tmp_path / "src" / "omi_collector" / "demo.py").write_text("value = 1\n", encoding="utf-8")
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "demo.py").write_text("value = 2\n", encoding="utf-8")
-    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Campaign test"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "campaign-test@example.invalid"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "--quiet", "-m", "campaign fixture"], cwd=tmp_path, check=True)
-    env = os.environ.copy()
-    env.update(COVERAGE_CORE="ctrace", PYTEST_ADDOPTS="", UV_LINK_MODE="hardlink")
-    return tmp_path, env
-
-
-def _campaign(repo: Path, env: dict[str, str], *args: str) -> CompletedProcess[str]:
-    if args and args[0] == "prepare" and "--launcher-pid" not in args:
-        args = (*args, "--launcher-pid", "2147483647")
-    stdout, stderr = StringIO(), StringIO()
-    with pytest.MonkeyPatch.context() as patch:
-        patch.chdir(repo)
-        for key in mutation_campaign.RELEVANT_ENV:
-            if key in env:
-                patch.setenv(key, env[key])
-            else:
-                patch.delenv(key, raising=False)
-        patch.setattr(sys, "argv", [str(SCRIPT), *args])
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            status = mutation_campaign.main()
-    return CompletedProcess([str(SCRIPT), *args], status, stdout.getvalue(), stderr.getvalue())
-
-
-def _write_report(repo: Path, *, duplicate: bool = False) -> None:
-    report = repo / "coverage" / "gremlins" / "gremlins.json"
-    report.parent.mkdir(parents=True)
-    ids = ["g-001"]
-    results = [{"gremlin_id": "g-001", "file_path": str(repo / "src/omi_collector/demo.py"), "status": "zapped"}]
-    files = {str(repo / "src/omi_collector/demo.py"): {"total": 1, "zapped": 1, "survived": 0, "percentage": 100.0}}
-    if duplicate:
-        ids.append("g-001")
-        results.append(results[0])
-        files[str(repo / "src/omi_collector/demo.py")]["total"] = 2
-    report.write_text(
-        json.dumps(
-            {
-                "scope": {
-                    "source_files": ["scripts/demo.py", "src/omi_collector/demo.py"],
-                    "gremlin_ids": ids,
-                    "generation_errors": [],
-                },
-                "summary": {
-                    "total": len(ids),
-                    "zapped": len(ids),
-                    "survived": 0,
-                    "timeout": 0,
-                    "error": 0,
-                    "pardoned": 0,
-                },
-                "files": files,
-                "results": results,
-            }
-        ),
-        encoding="utf-8",
-    )
-    future = time.time_ns() + 1_000_000
-    os.utime(report, ns=(future, future))
-
-
-def _write_status_report(repo: Path, statuses: list[str]) -> None:
-    _write_report(repo)
-    report = repo / "coverage" / "gremlins" / "gremlins.json"
-    data = cast(dict[str, object], json.loads(report.read_text(encoding="utf-8")))
-    ids = [f"g-{index:03}" for index in range(len(statuses))]
-    source = str(repo / "src/omi_collector/demo.py")
-    data["scope"] = {
-        "source_files": ["scripts/demo.py", "src/omi_collector/demo.py"],
-        "gremlin_ids": ids,
-        "generation_errors": [],
-    }
-    data["results"] = [
-        {"gremlin_id": gremlin_id, "file_path": source, "status": status}
-        for gremlin_id, status in zip(ids, statuses, strict=True)
-    ]
-    data["summary"] = {
-        "total": len(ids),
-        **{status: statuses.count(status) for status in ("zapped", "survived", "timeout", "error", "pardoned")},
-    }
-    data["files"] = {source: {"total": len(ids)}}
-    report.write_text(json.dumps(data), encoding="utf-8")
-    future = time.time_ns() + 1_000_000
-    os.utime(report, ns=(future, future))
-
-
-def _corrupt_report(report: dict[str, object], corruption: str, repo: Path) -> None:
-    scope = cast(dict[str, object], report["scope"])
-    results = cast(list[dict[str, object]], report["results"])
-    source = str(repo / "src/omi_collector/demo.py")
-    files = cast(dict[str, dict[str, object]], report["files"])
-    summary = cast(dict[str, object], report["summary"])
-    targets = {
-        "scope": (report, "scope", []),
-        "results": (report, "results", {}),
-        "summary": (report, "summary", []),
-        "generation-errors-shape": (scope, "generation_errors", "none"),
-        "generation-errors-present": (scope, "generation_errors", ["demo.py"]),
-        "source-files-shape": (scope, "source_files", "src/omi_collector/demo.py"),
-        "ids-shape": (scope, "gremlin_ids", "g-001"),
-        "empty-source": (scope, "source_files", []),
-        "duplicate-source": (scope, "source_files", ["scripts/demo.py", "scripts/demo.py"]),
-        "unsorted-source": (scope, "source_files", ["src/omi_collector/demo.py", "scripts/demo.py"]),
-        "empty-ids": (scope, "gremlin_ids", []),
-        "duplicate-ids": (scope, "gremlin_ids", ["g-001", "g-001"]),
-        "unsorted-ids": (scope, "gremlin_ids", ["g-002", "g-001"]),
-        "unknown-status": (results[0], "status", "cancelled"),
-        "foreign-result-id": (results[0], "gremlin_id", "g-foreign"),
-        "summary-count": (summary, "zapped", 0),
-        "file-count": (files[source], "total", 2),
-        "outside-file-scope": (report, "files", {"src/omi_collector/unscoped.py": {"total": 1}}),
-        "foreign-file-path": (results[0], "file_path", "/foreign/outside.py"),
-        "invalid-source-path": (scope, "source_files", ["../demo.py"]),
-    }
-    if corruption == "generation-errors-missing":
-        scope.pop("generation_errors")
-    elif corruption == "missing-result":
-        report["results"] = []
-    elif corruption == "duplicate-result-id":
-        results.append(results[0].copy())
-    else:
-        target, key, value = targets[corruption]
-        target[key] = value
-    if corruption == "outside-file-scope":
-        results[0]["file_path"] = str(repo / "src/omi_collector/unscoped.py")
-
-
-def test_timeout_resume_keeps_campaign_and_native_cache(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    (repo / ".gremlins_cache").mkdir()
-    (repo / ".gremlins_cache" / "results.db").write_text("persisted verdict", encoding="utf-8")
-    # First create a campaign receipt before there is a native cache, as the real recipe does.
-    (repo / ".gremlins_cache" / "results.db").unlink()
-    assert _campaign(repo, env, "prepare").returncode == 0
-    (repo / ".gremlins_cache" / "results.db").write_text("persisted verdict", encoding="utf-8")
-    assert _campaign(repo, env, "finish", "--status", "124").returncode == 0
-    resumed = _campaign(repo, env, "prepare")
-    assert resumed.returncode == 0, resumed.stderr
-    assert (repo / ".gremlins_cache" / "results.db").read_text(encoding="utf-8") == "persisted verdict"
-    receipt = cast(
-        dict[str, object],
-        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
-    )
-    assert receipt["mode"] == "resume"
-
-
-def test_fresh_is_explicit_and_does_not_delete_cache_itself(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    (repo / ".gremlins_cache").mkdir()
-    (repo / ".gremlins_cache" / "results.db").write_text("old", encoding="utf-8")
-    assert _campaign(repo, env, "prepare").returncode != 0
-    fresh = _campaign(repo, env, "prepare", "--fresh")
-    assert fresh.returncode == 0, fresh.stderr
-    assert (repo / ".gremlins_cache" / "results.db").read_text(encoding="utf-8") == "old"
-
-
-def test_prepare_captures_pinned_tool_and_commit_identity(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-
-    assert _campaign(repo, env, "prepare").returncode == 0
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    identity = cast(dict[str, object], receipt["identity"])
-    uv = cast(dict[str, object], identity["uv"])
-    gremlins = cast(dict[str, object], identity["pytest_gremlins"])
-
-    assert identity["commit"]
-    assert uv["path"]
-    assert uv["version"]
-    assert gremlins["version"]
-    assert (
-        json.loads(cast(str, gremlins["direct_url"]))["vcs_info"]["commit_id"]
-        == "073a5e8d4e0239f3c3b468946a0d8469a510c69b"
-    )
-
-
-def test_prepare_tokens_remain_unique_within_the_same_second(
-    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo, env = campaign_repo
-    instants = iter((1_800_000_000_123_000_000, 1_800_000_000_456_000_000))
-    monkeypatch.setattr(mutation_campaign.time, "time_ns", lambda: next(instants))
-
-    first = _campaign(repo, env, "prepare")
-    second = _campaign(repo, env, "prepare", "--fresh")
-
-    assert first.returncode == second.returncode == 0
-    first_token, second_token = first.stdout.strip(), second.stdout.strip()
-    assert first_token != second_token
-    assert first_token[:15] == second_token[:15]
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    assert receipt["log"] == f".gremlins_cache/mutation-{second_token}.log"
-
-
-def test_prepare_records_external_uv_failure(
-    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo, env = campaign_repo
-    original_run = subprocess.run
-
-    def fail_uv(
-        args: list[str], *, check: bool, capture_output: bool, text: bool, cwd: Path | None = None
-    ) -> CompletedProcess[str]:
-        if args[:2] == ["/controlled/uv", "--version"]:
-            assert check is True
-            raise subprocess.CalledProcessError(1, args, stderr="uv unavailable")
-        return cast(
-            CompletedProcess[str], original_run(args, check=check, capture_output=capture_output, text=text, cwd=cwd)
-        )
-
-    monkeypatch.setattr(mutation_campaign.shutil, "which", lambda name: "/controlled/uv" if name == "uv" else None)
-    monkeypatch.setattr(mutation_campaign.subprocess, "run", fail_uv)
-
-    result = _campaign(repo, env, "prepare")
-
-    assert result.returncode == 1
-    assert "returned non-zero exit status 1" in result.stderr
-
-
-def test_inherited_coverage_file_is_rejected(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    env["COVERAGE_FILE"] = "/tmp/unrelated-coverage"
-    result = _campaign(repo, env, "prepare")
-    assert result.returncode != 0
-    assert "COVERAGE_FILE" in result.stderr
-
-
-def test_changed_committed_identity_refuses_resume(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    (repo / "uv.lock").write_text("changed\n", encoding="utf-8")
-    result = _campaign(repo, env, "prepare")
-    assert result.returncode != 0
-    assert "clean and committed" in result.stderr
-
-
-@pytest.mark.parametrize("duplicate", [False, True])
-def test_postflight_rejects_stale_or_duplicate_native_report(
-    campaign_repo: tuple[Path, dict[str, str]], duplicate: bool
-) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    if duplicate:
-        _write_report(repo, duplicate=True)
-        result = _campaign(repo, env, "finish", "--status", "0")
-        assert result.returncode != 0
-        assert "duplicate" in result.stderr or "do not match" in result.stderr
-    else:
-        result = _campaign(repo, env, "finish", "--status", "0")
-        assert result.returncode != 0
-        assert "fresh native JSON report" in result.stderr
-
-
-def test_postflight_rejects_old_report_even_when_its_timestamp_is_future(
-    campaign_repo: tuple[Path, dict[str, str]],
-) -> None:
-    repo, env = campaign_repo
-    _write_report(repo)
-    report = repo / "coverage" / "gremlins" / "gremlins.json"
-    os.utime(report, ns=(4_000_000_000_000_000_000, 4_000_000_000_000_000_000))
-    assert _campaign(repo, env, "prepare").returncode == 0
-    result = _campaign(repo, env, "finish", "--status", "0")
-    assert result.returncode != 0
-    assert "fresh native JSON report" in result.stderr
-    receipt = cast(
-        dict[str, object],
-        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
-    )
-    assert receipt["state"] == "failed"
-    assert "ended_at" in receipt
-
-
-def test_status_137_is_recorded_and_only_resumes_on_a_new_invocation(
-    campaign_repo: tuple[Path, dict[str, str]],
-) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    assert _campaign(repo, env, "finish", "--status", "137").returncode == 0
-    result = _campaign(repo, env, "prepare")
-    assert result.returncode == 0, result.stderr
-    receipt = cast(
-        dict[str, object],
-        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
-    )
-    assert receipt["mode"] == "resume"
-    assert receipt["exit_status"] is None
-
-
-def test_finish_records_nonzero_child_status_as_failed(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-
-    assert _campaign(repo, env, "finish", "--status", "127").returncode == 0
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    assert receipt["state"] == "failed"
-    assert receipt["exit_status"] == 127
-
-
-def test_resume_refuses_live_recorded_launcher(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare", "--launcher-pid", str(os.getpid())).returncode == 0
-    assert _campaign(repo, env, "finish", "--status", "124").returncode == 0
-    result = _campaign(repo, env, "prepare")
-    assert result.returncode != 0
-    assert "recorded campaign launcher" in result.stderr
-
-
-def test_postflight_subprocess_failure_records_terminal_receipt(
-    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-
-    def fail_identity() -> dict[str, object]:
-        raise subprocess.CalledProcessError(1, ["git", "status"])
-
-    monkeypatch.setattr(mutation_campaign, "_identity", fail_identity)
-    result = _campaign(repo, env, "finish", "--status", "0")
-    assert result.returncode != 0
-    receipt = cast(
-        dict[str, object],
-        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
-    )
-    assert receipt["state"] == "failed"
-    assert "returned non-zero exit status 1" in cast(str, receipt["postflight_error"])
-
-
-def test_native_errors_and_timeouts_remain_unresolved(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_report(repo)
-    report = repo / "coverage" / "gremlins" / "gremlins.json"
-    data = cast(dict[str, object], json.loads(report.read_text(encoding="utf-8")))
-    results = cast(list[dict[str, object]], data["results"])
-    summary = cast(dict[str, object], data["summary"])
-    results[0]["status"] = "timeout"
-    summary["zapped"] = 0
-    summary["timeout"] = 1
-    report.write_text(json.dumps(data), encoding="utf-8")
-    future = time.time_ns() + 1_000_000
-    os.utime(report, ns=(future, future))
-    assert _campaign(repo, env, "finish", "--status", "0").returncode == 3
-    receipt = cast(
-        dict[str, object],
-        json.loads((repo / ".gremlins_cache" / "campaign.json").read_text(encoding="utf-8")),
-    )
-    assert receipt["state"] == "complete_unresolved"
-    report_data = cast(dict[str, object], receipt["report"])
-    status_counts = cast(dict[str, int], report_data["status_counts"])
-    assert status_counts["timeout"] == 1
-
-
-def test_finish_reports_exact_unresolved_counts_on_stderr(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_status_report(repo, ["zapped", "timeout", "error"])
-
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 3
-    assert result.stderr == "Unresolved native outcomes remain: timeout=1 error=1; review required.\n"
-
-
-def test_finish_accepts_report_written_at_start_boundary(
-    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo, env = campaign_repo
-    _write_report(repo)
-    report_path = repo / "coverage" / "gremlins" / "gremlins.json"
-    started_at_ns = 1_800_000_000_000_000_000
-    previous_mtime_ns = started_at_ns - 1
-    os.utime(report_path, ns=(previous_mtime_ns, previous_mtime_ns))
-    monkeypatch.setattr(mutation_campaign.time, "time_ns", lambda: started_at_ns)
-
-    prepared = _campaign(repo, env, "prepare")
-
-    assert prepared.returncode == 0, prepared.stderr
-    receipt_path = repo / ".gremlins_cache" / "campaign.json"
-    receipt = cast(dict[str, object], json.loads(receipt_path.read_text(encoding="utf-8")))
-    assert receipt["started_at_ns"] == started_at_ns
-    assert receipt["report_mtime_before_ns"] == previous_mtime_ns
-    assert previous_mtime_ns != started_at_ns
-    os.utime(report_path, ns=(started_at_ns, started_at_ns))
-
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 0, result.stderr
-    finished = cast(dict[str, object], json.loads(receipt_path.read_text(encoding="utf-8")))
-    assert finished["state"] == "complete"
-
-
-def test_finish_accepts_all_zapped_results(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_status_report(repo, ["zapped", "zapped"])
-
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 0, result.stderr
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    assert receipt["state"] == "complete"
-    report = cast(dict[str, object], receipt["report"])
-    assert report["mutant_count"] == 2
-    assert report["source_file_count"] == 2
-
-
-def test_file_breakdown_can_be_a_strict_subset_of_source_scope(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_status_report(repo, ["zapped"])
-
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 0, result.stderr
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    assert cast(dict[str, object], receipt["report"])["source_file_count"] == 2
-
-
-def test_file_breakdown_can_equal_the_generated_source_scope(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_report(repo)
-    report_path = repo / "coverage" / "gremlins" / "gremlins.json"
-    data = cast(dict[str, object], json.loads(report_path.read_text(encoding="utf-8")))
-    scope = cast(dict[str, object], data["scope"])
-    scope["gremlin_ids"] = ["g-001", "g-002"]
-    results = cast(list[dict[str, object]], data["results"])
-    results.append({"gremlin_id": "g-002", "file_path": str(repo / "scripts/demo.py"), "status": "zapped"})
-    data["summary"] = {"total": 2, "zapped": 2, "survived": 0, "timeout": 0, "error": 0, "pardoned": 0}
-    data["files"] = {
-        str(repo / "scripts/demo.py"): {"total": 1},
-        str(repo / "src/omi_collector/demo.py"): {"total": 1},
-    }
-    report_path.write_text(json.dumps(data), encoding="utf-8")
-    future = time.time_ns() + 1_000_000
-    os.utime(report_path, ns=(future, future))
-
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 0, result.stderr
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    assert cast(dict[str, object], receipt["report"])["mutant_count"] == 2
-
-
-def test_finish_scope_excludes_tracked_non_python_inputs(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    (repo / "scripts" / "helper.sh").write_text("#!/bin/sh\n", encoding="utf-8")
-    (repo / "scripts" / "example.sudoers").write_text("root ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8")
-    (repo / "src" / "omi_collector" / "py.typed").write_text("", encoding="utf-8")
+def campaign_project(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    repo = tmp_path / "project"
+    repo.mkdir()
+    (repo / ".gitignore").write_text(".gremlins_cache/\ncoverage/\n", encoding="utf-8")
+    (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text("[project]\nname = 'campaign-fixture'\nversion = '0.1.0'\n", encoding="utf-8")
+    (repo / "src" / "omi_collector").mkdir(parents=True)
+    (repo / "src" / "omi_collector" / "demo.py").write_text("value = 'before'\n", encoding="utf-8")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "demo.py").write_text("script_value = 2\n", encoding="utf-8")
+    wrapper = repo / "scripts" / "omi-collector-deploy-release"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    sudoers = repo / "scripts" / "omi-collector-deploy-release.sudoers"
+    sudoers.write_text("operator ALL=(root) NOPASSWD: /usr/bin/true\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    sudoers.chmod(0o644)
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Campaign test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "campaign-test@example.invalid"], cwd=repo, check=True)
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "--quiet", "-m", "add non-Python scope fixtures"], cwd=repo, check=True)
-
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_status_report(repo, ["zapped"])
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 0, result.stderr
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    assert cast(dict[str, object], receipt["report"])["source_file_count"] == 2
+    subprocess.run(["git", "commit", "--quiet", "-m", "campaign fixture"], cwd=repo, check=True)
+    # Simulate the shared-filesystem mode drift from the failed host bootstrap.
+    wrapper.chmod(0o775)
+    sudoers.chmod(0o664)
+    env = os.environ.copy()
+    env.update(COVERAGE_CORE="ctrace", COVERAGE_FILE="", PYTEST_ADDOPTS="", UV_LINK_MODE="hardlink")
+    return repo, env
 
 
-def test_finish_reconciles_every_status_and_marks_unresolved(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_status_report(repo, ["zapped", "survived", "timeout", "error", "pardoned"])
-
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 3
-    receipt = cast(dict[str, object], json.loads((repo / ".gremlins_cache" / "campaign.json").read_text()))
-    assert receipt["state"] == "complete_unresolved"
-    report = cast(dict[str, object], receipt["report"])
-    assert report["status_counts"] == {"error": 1, "pardoned": 1, "survived": 1, "timeout": 1, "zapped": 1}
-
-
-def test_finish_requires_running_receipt(campaign_repo: tuple[Path, dict[str, str]]) -> None:
-    repo, env = campaign_repo
-
-    result = _campaign(repo, env, "finish", "--status", "0")
-
-    assert result.returncode == 1
-    assert "no active campaign receipt" in result.stderr
-
-
-def test_campaign_external_command_failures_are_reported(
-    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo, env = campaign_repo
-    original_run = subprocess.run
-
-    def fail_git(
-        args: list[str], *, check: bool, capture_output: bool, text: bool, cwd: Path | None = None
-    ) -> CompletedProcess[str]:
-        if args[:2] == ["git", "status"]:
-            assert check is True
-            raise subprocess.CalledProcessError(1, args, stderr="git unavailable")
-        return cast(
-            CompletedProcess[str], original_run(args, check=check, capture_output=capture_output, text=text, cwd=cwd)
-        )
-
-    monkeypatch.setattr(mutation_campaign.subprocess, "run", fail_git)
-
-    result = _campaign(repo, env, "prepare")
-
-    assert result.returncode == 1
-    assert "returned non-zero exit status 1" in result.stderr
-
-
-@pytest.mark.parametrize("arguments", [[], ["prepare"], ["finish"]])
-def test_main_requires_action_and_command_specific_arguments(
-    campaign_repo: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, arguments: list[str]
-) -> None:
-    repo, env = campaign_repo
+def _launch(
+    repo: Path,
+    env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    *args: str,
+) -> tuple[int, str, str]:
+    stdout, stderr = StringIO(), StringIO()
     with monkeypatch.context() as patch:
         patch.chdir(repo)
         for key in mutation_campaign.RELEVANT_ENV:
@@ -549,124 +63,492 @@ def test_main_requires_action_and_command_specific_arguments(
                 patch.setenv(key, env[key])
             else:
                 patch.delenv(key, raising=False)
-        patch.setattr(sys, "argv", [str(SCRIPT), *arguments])
-        with pytest.raises(SystemExit, match="2"):
-            mutation_campaign.main()
+        patch.setattr(sys, "argv", ["mutation_campaign", *args])
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = mutation_campaign.main()
+    return status, stdout.getvalue(), stderr.getvalue()
 
-    assert not (repo / ".gremlins_cache").exists()
+
+def _job_directories(audit_root: Path) -> list[Path]:
+    return sorted(path.parent for path in audit_root.glob("jobs/omi-collector/*/owner.json"))
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        pytest.param(("orphan", 10_001, True, True), id="orphan"),
-        pytest.param(("equal-start-tick", 10_000, True, True), id="equal-start-tick"),
-        pytest.param(("older", 9_999, True, False), id="older"),
-        pytest.param(("other-cwd", 10_001, False, False), id="other-cwd"),
-        pytest.param(("own-ancestor", 10_001, True, False), id="own-ancestor"),
-    ],
-)
-def test_resume_scans_proc_snapshot_for_campaign_owned_processes(
-    campaign_repo: tuple[Path, dict[str, str]],
-    monkeypatch: pytest.MonkeyPatch,
-    scenario: tuple[str, int, bool, bool],
+def _read_json_object(path: Path) -> dict[str, object]:
+    value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise AssertionError(f"expected JSON object in {path}")
+    return cast(dict[str, object], value)
+
+
+def _process_stopped(pid: int) -> bool:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            return True
+        if stat.rsplit(")", 1)[-1].split()[0] == "Z":
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _write_cache(path: Path, rows: list[tuple[str, str]]) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as cache, cache:
+        cache.execute("CREATE TABLE outcomes (gremlin_id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+        cache.executemany("INSERT INTO outcomes VALUES (?, ?)", rows)
+    return path.read_bytes()
+
+
+def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_project(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    candidate, ticks, cwd_matches, blocked = scenario
-    repo, env = campaign_repo
-    started_at = 100_100 * 1_000_000_000
-    monkeypatch.setattr(mutation_campaign.time, "time_ns", lambda: started_at)
-    assert _campaign(repo, env, "prepare").returncode == 0
-    assert _campaign(repo, env, "finish", "--status", "124").returncode == 0
-    real_path = Path
-    parent_pid = os.getpid()
-    candidate_pid = 1 if candidate == "own-ancestor" else 300_000
-    parent_map = {parent_pid: 1, 1: 0, candidate_pid: 0}
-    ticks_map = {parent_pid: 10_001, 1: 10_001, candidate_pid: ticks}
-    cwd_map = {parent_pid: repo, 1: repo, candidate_pid: repo if cwd_matches else repo.parent}
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    sync_calls: list[Path] = []
+    owner_calls: list[tuple[Path, str, str]] = []
 
-    class SnapshotPath:
-        def __init__(self, raw: str) -> None:
-            self.raw = raw
-            self.name = raw.rsplit("/", 1)[-1]
+    def sync(job_root: Path, _environment: dict[str, str] | None = None) -> None:
+        sync_calls.append(job_root)
 
-        def read_text(self, encoding: str | None = None) -> str:
-            assert encoding in {None, "ascii"}
-            if self.raw == "/proc/stat":
-                return "btime 100000\n"
-            pid = int(self.raw.split("/")[2])
-            if pid not in parent_map:
-                raise FileNotFoundError(self.raw)
-            tail = ["S", str(parent_map[pid]), *("0" for _ in range(17)), str(ticks_map[pid])]
-            return f"{pid} (pytest fixture) {' '.join(tail)}"
+    def owner(job_root: Path, mode: str, token: str, **_: object) -> int:
+        owner_calls.append((job_root, mode, token))
+        checkout = job_root / "checkout"
+        assert (checkout / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o755
+        assert (checkout / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o644
+        assert (checkout / "src/omi_collector/demo.py").read_text(encoding="utf-8") == "value = 'before'\n"
+        (repo / "src" / "omi_collector" / "demo.py").write_text("value = 'edited while running'\n", encoding="utf-8")
+        assert (checkout / "src/omi_collector/demo.py").read_text(encoding="utf-8") == "value = 'before'\n"
+        return 0
 
-        def read_bytes(self) -> bytes:
-            return b"python -m pytest\0" if self.raw.endswith("/cmdline") else b""
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", sync)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", owner)
 
-        def resolve(self) -> Path:
-            pid = int(self.raw.split("/")[2])
-            return real_path(cwd_map[pid])
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
 
-        def iterdir(self) -> list[SnapshotPath]:
-            return [SnapshotPath(f"/proc/{pid}") for pid in set(parent_map) | {candidate_pid}]
+    jobs = _job_directories(audit_root)
+    assert status == 0, stderr
+    assert len(jobs) == 1
+    assert len(sync_calls) == 1
+    assert owner_calls == [(jobs[0], "fresh", json.loads((jobs[0] / "owner.json").read_text())["run_token"])]
+    assert (repo / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o775
+    assert (repo / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o664
 
-        def joinpath(self, part: str) -> SnapshotPath:
-            return SnapshotPath(f"{self.raw}/{part}")
 
-    def snapshot_path(raw: str | Path) -> SnapshotPath | Path:
-        value = str(raw)
-        return SnapshotPath(value) if value == "/proc" or value.startswith("/proc/") else real_path(raw)
+def test_resume_reuses_exact_job_and_preserves_completed_native_cache(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_args, **_kwargs: 0)
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+    assert status == 0, stderr
+    job = _job_directories(audit_root)[0]
+    owner_receipt = _read_json_object(job / "owner.json")
+    with monkeypatch.context() as patch:
+        patch.chdir(repo)
+        for key in mutation_campaign.RELEVANT_ENV:
+            if key in env:
+                patch.setenv(key, env[key])
+            else:
+                patch.delenv(key, raising=False)
+        runtime_env = mutation_campaign._job_environment(job)
+        current_identity = mutation_campaign._snapshot_identity(job / "checkout", runtime_env)
+    expected_identity = owner_receipt.get("identity")
+    assert isinstance(expected_identity, dict)
+    differences = {
+        key: (expected_identity.get(key), current_identity.get(key))
+        for key in expected_identity.keys() | current_identity.keys()
+        if expected_identity.get(key) != current_identity.get(key)
+    }
+    assert not differences, json.dumps(differences, indent=2)
+    owner_receipt["state"] = "paused"
+    owner_receipt["checkpoint_verified"] = True
+    (job / "owner.json").write_text(json.dumps(owner_receipt), encoding="utf-8")
+    cache_path = job / "checkout" / ".gremlins_cache" / "results.db"
+    before = _write_cache(cache_path, [("completed", "ZAPPED")])
+    calls: list[tuple[Path, str]] = []
 
-    snapshot_path.cwd = real_path.cwd  # type: ignore[attr-defined]
-    monkeypatch.setattr(mutation_campaign, "Path", snapshot_path)
+    def resume_owner(job_root: Path, mode: str, *_args: object, **_kwargs: object) -> int:
+        calls.append((job_root, mode))
+        assert cache_path.read_bytes() == before
+        return 0
 
-    result = _campaign(repo, env, "prepare")
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", resume_owner)
 
-    assert result.returncode == int(blocked), result.stderr
-    assert ("campaign-owned processes may remain" in result.stderr) is blocked
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "resume")
+
+    assert status == 0, stderr
+    assert calls == [(job, "resume")]
+    assert cache_path.read_bytes() == before
+    with closing(sqlite3.connect(cache_path)) as cache, cache:
+        assert cache.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert cache.execute("SELECT * FROM outcomes").fetchall() == [("completed", "ZAPPED")]
+
+
+def test_incompatible_resume_refuses_before_mutating_cache(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_args, **_kwargs: 0)
+    assert _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")[0] == 0
+    job = _job_directories(audit_root)[0]
+    owner_receipt = _read_json_object(job / "owner.json")
+    owner_receipt["state"] = "paused"
+    owner_receipt["checkpoint_verified"] = True
+    (job / "owner.json").write_text(json.dumps(owner_receipt), encoding="utf-8")
+    cache_path = job / "checkout" / ".gremlins_cache" / "results.db"
+    before = _write_cache(cache_path, [("completed", "ZAPPED")])
+    env["COVERAGE_CORE"] = "invalid-runtime"
+    owner_calls: list[bool] = []
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_a, **_k: owner_calls.append(True) or 0)
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "resume")
+
+    assert status != 0
+    assert stderr
+    assert owner_calls == []
+    assert hashlib.sha256(cache_path.read_bytes()).digest() == hashlib.sha256(before).digest()
+
+
+def test_resume_rejects_changed_snapshot_content_and_preserves_native_cache(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_args, **_kwargs: 0)
+    assert _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")[0] == 0
+    job = _job_directories(audit_root)[0]
+    owner_receipt = _read_json_object(job / "owner.json")
+    owner_receipt["state"] = "paused"
+    owner_receipt["checkpoint_verified"] = True
+    (job / "owner.json").write_text(json.dumps(owner_receipt), encoding="utf-8")
+    snapshot_source = job / "checkout" / "src/omi_collector/demo.py"
+    snapshot_source.write_text("value = 'tampered snapshot'\n", encoding="utf-8")
+    cache_path = job / "checkout" / ".gremlins_cache" / "results.db"
+    before = _write_cache(cache_path, [("completed", "ZAPPED")])
+    owner_calls: list[bool] = []
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_a, **_k: owner_calls.append(True) or 0)
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "resume")
+
+    assert status != 0
+    assert stderr
+    assert owner_calls == []
+    assert cache_path.read_bytes() == before
+
+
+def test_live_snapshot_drift_stops_owner_and_invalidates_the_job(
+    campaign_project: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo, _env = campaign_project
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", tmp_path / "audit")
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setenv("COVERAGE_CORE", "ctrace")
+    monkeypatch.setenv("COVERAGE_FILE", "")
+    monkeypatch.setenv("PYTEST_ADDOPTS", "")
+    monkeypatch.setenv("UV_LINK_MODE", "hardlink")
+    job = mutation_campaign._new_job(repo)
+    checkout = job / "checkout"
+    pid_path = tmp_path / "child.pid"
+    token = "source-drift-run"
+    environment = mutation_campaign._job_environment(job)
+    with monkeypatch.context() as patch:
+        patch.chdir(checkout)
+        identity = mutation_campaign._snapshot_identity(checkout, environment)
+    (job / "owner.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "run_token": token,
+                "state": "preparing",
+                "identity": identity,
+                "control_socket": str(mutation_campaign.control_socket_path(job)),
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = f"""
+import os, pathlib, time
+source = pathlib.Path('src/omi_collector/demo.py')
+source.write_text("value = 'tampered while running'\\n")
+pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()))
+time.sleep(60)
+"""
+    monkeypatch.setattr(mutation_campaign, "OWNER_CHECK_SECONDS", 0.05)
+    owner_result: list[int] = []
+
+    def enter_owner() -> None:
+        owner_result.append(
+            mutation_campaign._enter_owner(
+                job,
+                "fresh",
+                token,
+                command=[sys.executable, "-c", runner],
+                environment=environment,
+            )
+        )
+
+    with monkeypatch.context() as patch:
+        patch.chdir(checkout)
+        owner = threading.Thread(target=enter_owner, daemon=True)
+        owner.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not pid_path.exists() and owner.is_alive():
+            time.sleep(0.01)
+        if not pid_path.is_file():
+            owner.join(timeout=5)
+            receipt = _read_json_object(job / "owner.json")
+            pytest.fail(
+                f"owner exited before child PID was recorded: {owner_result!r}; "
+                f"alive={owner.is_alive()}, receipt={receipt!r}"
+            )
+        child_pid = int(pid_path.read_text(encoding="ascii"))
+        owner.join(timeout=5)
+
+    assert not owner.is_alive()
+    assert owner_result == [1]
+    receipt = _read_json_object(job / "owner.json")
+    assert receipt["state"] == "source_invalidated"
+    assert receipt["cleanup_verified"] is True
+    assert mutation_campaign._token_pids(token) == {}
+    assert _process_stopped(child_pid)
+
+
+def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(tmp_path: Path) -> None:
+    native_job = tmp_path / "native-unresolved"
+    (native_job / "checkout" / ".gremlins_cache").mkdir(parents=True)
+    native_token = "native-unresolved-token"
+    (native_job / "owner.json").write_text(
+        json.dumps({"schema": 1, "run_token": native_token, "state": "preparing"}), encoding="utf-8"
+    )
+    native_report = "import json, pathlib; pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete_unresolved'})); raise SystemExit(3)"
+
+    native_status = mutation_campaign._enter_owner(
+        native_job,
+        "resume",
+        native_token,
+        command=[sys.executable, "-c", native_report],
+        environment=os.environ.copy(),
+    )
+
+    native_receipt = _read_json_object(native_job / "owner.json")
+    assert native_status == 3
+    assert native_receipt["state"] == "complete_unresolved"
+    native_campaign = cast(dict[str, object], native_receipt["campaign"])
+    assert native_campaign["state"] == "complete_unresolved"
+
+    failed_job = tmp_path / "controller-failed"
+    (failed_job / "checkout" / ".gremlins_cache").mkdir(parents=True)
+    failed_token = "controller-failed-token"
+    (failed_job / "owner.json").write_text(
+        json.dumps({"schema": 1, "run_token": failed_token, "state": "preparing"}), encoding="utf-8"
+    )
+
+    failed_status = mutation_campaign._enter_owner(
+        failed_job,
+        "resume",
+        failed_token,
+        command=[sys.executable, "-c", "raise SystemExit(1)"],
+        environment=os.environ.copy(),
+    )
+
+    failed_receipt = _read_json_object(failed_job / "owner.json")
+    assert failed_status == 1
+    assert failed_receipt["state"] == "failed"
+    assert failed_receipt["campaign"] is None
+
+
+def test_finish_reconciles_native_outcome_counts_without_crediting_error_or_timeout() -> None:
+    counts = mutation_campaign._result_counts(
+        [
+            {"gremlin_id": "done", "status": "zapped"},
+            {"gremlin_id": "survived", "status": "survived"},
+            {"gremlin_id": "error", "status": "error"},
+            {"gremlin_id": "timeout", "status": "timeout"},
+        ]
+    )
+
+    assert counts == {"error": 1, "pardoned": 0, "survived": 1, "timeout": 1, "zapped": 1}
+
+
+def test_invalid_native_status_is_not_classified_as_controller_success() -> None:
+    with pytest.raises(ValueError, match="invalid or unresolved status"):
+        mutation_campaign._result_counts([{"gremlin_id": "cancelled", "status": "cancelled"}])
+
+
+def _native_report(repo: Path, statuses: list[str]) -> dict[str, object]:
+    ids = [f"g-{index:03d}" for index in range(len(statuses))]
+    source = "src/omi_collector/demo.py"
+    source_paths = ["scripts/demo.py", source]
+    source_abs = str(repo / source)
+    status_counts = Counter(statuses)
+    return {
+        "scope": {"source_files": source_paths, "gremlin_ids": ids, "generation_errors": []},
+        "summary": {
+            "total": len(ids),
+            **{name: status_counts[name] for name in ("zapped", "survived", "timeout", "error", "pardoned")},
+        },
+        "files": {source_abs: {"total": len(ids)}},
+        "results": [
+            {"gremlin_id": gremlin_id, "file_path": source_abs, "status": status}
+            for gremlin_id, status in zip(ids, statuses, strict=True)
+        ],
+    }
+
+
+def _postflight(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report: dict[str, object],
+) -> dict[str, object]:
+    report_path = tmp_path / "gremlins.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    identity = {"commit": "test-commit"}
+    monkeypatch.setattr(mutation_campaign, "REPORT", report_path)
+    monkeypatch.setattr(mutation_campaign, "_identity", lambda: identity)
+    monkeypatch.setattr(mutation_campaign, "_load_report", lambda _started: report)
+    with monkeypatch.context() as patch:
+        patch.chdir(repo)
+        return mutation_campaign._postflight({"identity": identity, "started_at_ns": 1})
+
+
+def test_postflight_keeps_survivors_errors_and_timeouts_unresolved(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, _env = campaign_project
+
+    result = _postflight(repo, tmp_path, monkeypatch, _native_report(repo, ["zapped", "survived", "error", "timeout"]))
+
+    assert result["state"] == "complete_unresolved"
+    assert result["mutant_count"] == 4
+    assert result["source_file_count"] == 2
+    report = cast(dict[str, object], result["report"])
+    assert report["status_counts"] == {
+        "error": 1,
+        "pardoned": 0,
+        "survived": 1,
+        "timeout": 1,
+        "zapped": 1,
+    }
+
+
+def test_postflight_accepts_file_breakdown_covering_the_full_source_scope(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, _env = campaign_project
+    report = _native_report(repo, ["zapped", "zapped"])
+    results = cast(list[dict[str, object]], report["results"])
+    results[1]["file_path"] = str(repo / "scripts/demo.py")
+    report["files"] = {
+        str(repo / "src/omi_collector/demo.py"): {"total": 1},
+        str(repo / "scripts/demo.py"): {"total": 1},
+    }
+
+    result = _postflight(repo, tmp_path, monkeypatch, report)
+
+    assert result["state"] == "complete"
+    assert result["source_file_count"] == 2
+    assert result["mutant_count"] == 2
 
 
 @pytest.mark.parametrize(
     ("corruption", "diagnostic"),
     [
-        ("scope", "scope, results, or summary"),
-        ("results", "scope, results, or summary"),
-        ("summary", "scope, results, or summary"),
+        ("scope-shape", "scope, results, or summary"),
+        ("results-shape", "scope, results, or summary"),
+        ("summary-shape", "scope, results, or summary"),
         ("generation-errors-missing", "failed to transform"),
         ("generation-errors-shape", "failed to transform"),
-        ("generation-errors-present", "failed to transform"),
+        ("generation-errors", "failed to transform"),
         ("source-files-shape", "missing source files"),
         ("ids-shape", "missing source files"),
         ("empty-source", "source-file scope is empty"),
         ("duplicate-source", "source-file scope is empty"),
         ("unsorted-source", "source-file scope is empty"),
+        ("invalid-source", "invalid source path"),
         ("empty-ids", "generated mutant IDs are empty"),
         ("duplicate-ids", "generated mutant IDs are empty"),
         ("unsorted-ids", "generated mutant IDs are empty"),
-        ("unknown-status", "invalid or unresolved status"),
-        ("foreign-result-id", "duplicate, missing, or foreign"),
+        ("invalid-result-shape", "invalid or unresolved status"),
+        ("foreign-result", "duplicate, missing, or foreign"),
         ("missing-result", "duplicate, missing, or foreign"),
-        ("duplicate-result-id", "duplicate, missing, or foreign"),
+        ("duplicate-result", "duplicate, missing, or foreign"),
         ("summary-count", "summary counts do not match"),
+        ("invalid-status", "invalid or unresolved status"),
         ("file-count", "per-file results do not match"),
-        ("outside-file-scope", "outside generated source scope"),
-        ("foreign-file-path", "foreign path"),
-        ("invalid-source-path", "invalid source path"),
+        ("files-shape", "file breakdown is invalid"),
+        ("outside-source-scope", "outside generated source scope"),
+        ("foreign-file", "foreign path"),
     ],
 )
-def test_finish_rejects_malformed_native_report(
-    campaign_repo: tuple[Path, dict[str, str]], corruption: str, diagnostic: str
+def test_postflight_rejects_inconsistent_native_report_evidence(
+    campaign_project: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    corruption: str,
+    diagnostic: str,
 ) -> None:
-    repo, env = campaign_repo
-    assert _campaign(repo, env, "prepare").returncode == 0
-    _write_report(repo)
-    report_path = repo / "coverage" / "gremlins" / "gremlins.json"
-    report = cast(dict[str, object], json.loads(report_path.read_text(encoding="utf-8")))
-    _corrupt_report(report, corruption, repo)
-    report_path.write_text(json.dumps(report), encoding="utf-8")
-    future = time.time_ns() + 1_000_000
-    os.utime(report_path, ns=(future, future))
+    repo, _env = campaign_project
+    report = _native_report(repo, ["zapped"])
+    scope = cast(dict[str, object], report["scope"])
+    results = cast(list[dict[str, object]], report["results"])
+    summary = cast(dict[str, object], report["summary"])
+    files = cast(dict[str, dict[str, object]], report["files"])
+    source_abs = str(repo / "src/omi_collector/demo.py")
+    other_abs = str(repo / "src/omi_collector/other.py")
 
-    result = _campaign(repo, env, "finish", "--status", "0")
+    def omit_generation_errors() -> None:
+        scope.pop("generation_errors")
 
-    assert result.returncode == 1
-    assert diagnostic in result.stderr
+    def mark_outside_source_scope() -> None:
+        results[0].update(file_path=other_abs)
+        report.update(files={other_abs: {"total": 1}})
+
+    def mark_foreign_file() -> None:
+        results[0].update(file_path="/outside/foreign.py")
+        report.update(files={"/outside/foreign.py": {"total": 1}})
+
+    corruptions: dict[str, Callable[[], None]] = {
+        "scope-shape": lambda: report.update(scope=[]),
+        "results-shape": lambda: report.update(results={}),
+        "summary-shape": lambda: report.update(summary=[]),
+        "generation-errors-missing": omit_generation_errors,
+        "generation-errors-shape": lambda: scope.update(generation_errors="none"),
+        "generation-errors": lambda: scope.update(generation_errors=["demo.py"]),
+        "source-files-shape": lambda: scope.update(source_files="src/omi_collector/demo.py"),
+        "ids-shape": lambda: scope.update(gremlin_ids="g-000"),
+        "empty-source": lambda: scope.update(source_files=[]),
+        "duplicate-source": lambda: scope.update(source_files=["src/omi_collector/demo.py"] * 2),
+        "unsorted-source": lambda: scope.update(source_files=["src/z_demo.py", "src/omi_collector/demo.py"]),
+        "invalid-source": lambda: scope.update(source_files=["../demo.py"]),
+        "empty-ids": lambda: scope.update(gremlin_ids=[]),
+        "duplicate-ids": lambda: scope.update(gremlin_ids=["g-000", "g-000"]),
+        "unsorted-ids": lambda: scope.update(gremlin_ids=["g-002", "g-001"]),
+        "invalid-result-shape": lambda: report.update(results=["not-a-result"]),
+        "foreign-result": lambda: results[0].update(gremlin_id="g-foreign"),
+        "missing-result": lambda: report.update(results=[]),
+        "duplicate-result": lambda: results.append(results[0].copy()),
+        "summary-count": lambda: summary.update(zapped=0),
+        "invalid-status": lambda: results[0].update(status="controller_failed"),
+        "file-count": lambda: files[source_abs].update(total=2),
+        "files-shape": lambda: report.update(files=[]),
+        "outside-source-scope": mark_outside_source_scope,
+        "foreign-file": mark_foreign_file,
+    }
+    corruptions[corruption]()
+
+    with pytest.raises(ValueError, match=diagnostic):
+        _postflight(repo, tmp_path, monkeypatch, report)

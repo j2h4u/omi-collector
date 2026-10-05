@@ -94,15 +94,22 @@ errors or timeouts cannot certify a clean audit. Status 137 is fail-stopped and
 is never retried automatically. There is no mutation score gate, and mutation
 testing remains separate from `just verify`.
 
-For a controllable audit, run `just mutation-start` or
-`just mutation-fresh-start` in a persistent terminal such as tmux. Inspect it
-with `just mutation-status`, then use `just mutation-pause` and
-`just mutation-resume` from another shell to freeze and thaw its dedicated user
-scope. The scope runs at SCHED_IDLE CPU policy, ionice idle class, and nice 19.
-Freezing pauses processes, not their monotonic deadlines: GNU's 24-hour audit
-budget and the runner's 120-second test and 150-second mutant budgets continue
-to elapse. An in-flight test or mutant can time out immediately after resume.
-Keep the canonical `just mutation` recipe for foreground use.
+The audit runs from one detached snapshot with a per-job frozen uv environment
+and cache under `/srv/omi-collector-mutation-audit/jobs`. Its control socket is
+in a per-user mode-0700 directory under `/tmp`; the exact endpoint is recorded
+in the private job receipt.
+`just mutation fresh` creates a new job without deleting prior evidence;
+`just mutation` resumes only one compatible, verified paused or interrupted
+job. Use `just mutation-status` to inspect it and `just mutation-pause` to
+request a checkpoint. The owner stops and reaps the controller and its
+token-owned test processes, verifies the SQLite cache, records an interrupted
+checkpoint, and exits; no stopped test process remains. Resume starts a new
+controller so any in-flight mutant is retried. A failed baseline with zero
+mutants dispatched is recorded as a failed bootstrap, never a completed audit.
+The owner and all children run at SCHED_IDLE CPU policy, ionice idle class, and
+nice 19. The 24-hour GNU timeout bounds the inner native test run, not the
+owner, and a timeout or signal is an interrupted audit rather than a clean
+mutation result. Each job retains its snapshot and evidence for later review.
 
 ## Capture safety
 

@@ -73,6 +73,13 @@ separately from killed mutants. AST operators do not replace enum
 references in transition tables; independent complete state/event expectations
 remain necessary for those decisions.
 
+For a finite follow-up, freeze the original campaign report and account for its
+selected IDs in a separate ledger. Join by source identity and stable AST
+mutation identity, pair each mutant with a clean run using the same ordered
+selectors, and credit only strict pytest/JUnit behavioral failures. Keep
+observed failures, timeouts, equivalents, and nonviable mutations distinct; a
+completed ledger is not a new full-project score.
+
 Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
 `ionice` idle class; child test processes inherit both priorities. Ordinary
 pytest commands remain bounded to 600 seconds. The canonical full-project

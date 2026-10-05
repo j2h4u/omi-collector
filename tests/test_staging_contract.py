@@ -12,6 +12,7 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters.attempts import StagedAttempt
+from omi_collector.capture.adapters.publication import TerminalRetirementEvidence
 from omi_collector.capture.adapters.staging_contract import AttemptStateError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
@@ -32,6 +33,15 @@ else:
     raise AssertionError("invalid attempt id was accepted")
 """
     subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("timestamp", [0, -1], ids=["zero", "negative"])
+def test_terminal_retirement_json_rejects_nonpositive_timestamp(timestamp: int) -> None:
+    value = TerminalRetirementEvidence(1).as_dict()
+    value["terminalized_at_unix_ns"] = timestamp
+
+    with pytest.raises(AttemptStateError, match="terminalized_at_unix_ns must be a positive integer"):
+        TerminalRetirementEvidence.from_json(value)
 
 
 def _attempt(tmp_path: Path) -> StagedAttempt:

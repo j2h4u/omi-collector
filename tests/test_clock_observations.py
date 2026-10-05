@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from threading import Barrier
+from typing import IO
 
 import pytest
 
@@ -368,3 +371,213 @@ def test_out_of_range_sequence_and_boundary_values_are_rejected(tmp_path: Path, 
 
     with pytest.raises(ClockObservationError):
         ClockObservationStore(tmp_path / "device.json").append(evidence_kind="native_trusted", **values)
+
+
+def test_store_creates_a_new_nested_device_state_directory(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "new" / "nested" / "device.json")
+
+    original = store.append(evidence_kind="native_trusted", **_values())
+
+    assert store.records() == (original,)
+    assert (tmp_path / "new" / "nested" / "clock-observations" / f"{original.observation_id}.json").is_file()
+
+
+def test_first_append_rejects_parent_directory_sync_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sync_attempts: list[Path] = []
+
+    def fail_sync(path: Path) -> None:
+        sync_attempts.append(path)
+        raise OSError("directory sync failed")
+
+    monkeypatch.setattr(clock_observations, "_sync_directory", fail_sync)
+    store = ClockObservationStore(tmp_path / "new" / "device.json")
+
+    with pytest.raises(ClockObservationError, match="directory is not durable"):
+        store.append(evidence_kind="native_trusted", **_values())
+
+    assert sync_attempts == [tmp_path / "new"]
+    assert not tuple((tmp_path / "new" / "clock-observations").glob("*.json"))
+
+
+def test_concurrent_public_appends_repair_causal_order_after_initial_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    barrier = Barrier(2)
+    original_causal_fields = clock_observations._causal_fields
+
+    def synchronize_initial_reads(*args: object, **kwargs: object) -> tuple[str | None, str]:
+        barrier.wait(timeout=5)
+        return original_causal_fields(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(clock_observations, "_causal_fields", synchronize_initial_reads)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(store.append, evidence_kind="native_trusted", **_values()) for _ in range(2)]
+        appended = [future.result(timeout=10) for future in futures]
+
+    reopened = ClockObservationStore(tmp_path / "device.json").records()
+    assert sorted(item.causal_order for item in appended) == [0, 1]
+    assert [item.causal_order for item in reopened] == [0, 1]
+    assert {item.observation_id for item in reopened} == {item.observation_id for item in appended}
+
+
+def test_temporary_file_creation_failure_uses_typed_store_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_open = Path.open
+
+    def fail_temporary_open(  # noqa: PLR0913, PLR0917 - mirrors pathlib.Path.open for fault injection.
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> IO:
+        if mode == "xb" and path.name.endswith(".tmp"):
+            raise FileNotFoundError("temporary directory disappeared")
+        return original_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", fail_temporary_open)
+    store = ClockObservationStore(tmp_path / "device.json")
+
+    with pytest.raises(ClockObservationError, match="is not durable"):
+        store.append(evidence_kind="native_trusted", **_values())
+
+    assert not tuple((tmp_path / "clock-observations").glob("*.json"))
+
+
+def test_records_rejects_noncanonical_bytes_with_valid_causal_order(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    item = store.append(evidence_kind="native_trusted", **_values())
+    path = tmp_path / "clock-observations" / f"{item.observation_id}.json"
+    document = json.loads(path.read_text())
+    assert document["causal_order"] == 0
+    path.write_text(json.dumps(document, sort_keys=True) + "\n")
+
+    with pytest.raises(ClockObservationError, match="ledger is invalid"):
+        store.records()
+
+
+def test_identity_text_at_maximum_length_survives_reopen(tmp_path: Path) -> None:
+    session_id = "s" * 256
+    store = ClockObservationStore(tmp_path / "device.json")
+
+    original = store.append(evidence_kind="native_trusted", **{**_values(), "session_id": session_id})
+
+    (reopened,) = ClockObservationStore(tmp_path / "device.json").records()
+    assert reopened == original
+    assert reopened.session_id == session_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("session_id", ""), ("host_boot_id", ""), ("session_id", False), ("observation_id", 1)],
+)
+def test_invalid_identity_text_is_rejected_without_changing_ledger(tmp_path: Path, field: str, value: object) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    original = store.append(evidence_kind="native_trusted", **_values())
+    path = tmp_path / "clock-observations" / f"{original.observation_id}.json"
+    before = path.read_bytes()
+
+    with pytest.raises(ClockObservationError):
+        store.append(evidence_kind="native_trusted", **{**_values(), field: value})
+
+    assert path.read_bytes() == before
+    assert store.records() == (original,)
+
+
+def test_observation_rejects_negative_constructor_causal_order() -> None:
+    with pytest.raises(ClockObservationError, match="causal order is invalid"):
+        clock_observations.ClockObservation(
+            version=1,
+            observation_id="invalid-order",
+            causal_order=-1,
+            evidence_kind="native_trusted",
+            **_values(),
+        )
+
+
+def test_observation_rejects_boolean_constructor_causal_order() -> None:
+    with pytest.raises(ClockObservationError, match="causal order is invalid"):
+        clock_observations.ClockObservation(
+            version=1,
+            observation_id="boolean-order",
+            causal_order=True,
+            evidence_kind="native_trusted",
+            **_values(),
+        )
+
+
+def test_empty_operation_reference_is_rejected_without_changing_ledger(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    original = store.append(evidence_kind="native_trusted", **_values())
+    path = tmp_path / "clock-observations" / f"{original.observation_id}.json"
+    before = path.read_bytes()
+
+    with pytest.raises(ClockObservationError, match="operation reference is invalid"):
+        store.append(evidence_kind="native_trusted", operation_id="", **_values())
+
+    assert path.read_bytes() == before
+    assert store.records() == (original,)
+
+
+def test_empty_explicit_parent_reference_is_rejected_by_public_append(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+
+    with pytest.raises(ClockObservationError, match="parent reference is invalid"):
+        store.append(
+            evidence_kind="native_trusted",
+            observation_role="later",
+            parent_observation_id="",
+            **_values(),
+        )
+
+    assert store.records() == ()
+
+
+def test_boolean_effective_boundary_is_rejected_without_changing_ledger(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    original = store.append(evidence_kind="native_trusted", **_values())
+    path = tmp_path / "clock-observations" / f"{original.observation_id}.json"
+    before = path.read_bytes()
+
+    with pytest.raises(ClockObservationError, match="effective boundary is invalid"):
+        store.append(evidence_kind="native_trusted", effective_boundary_sequence=True, **_values())
+
+    assert path.read_bytes() == before
+    assert store.records() == (original,)
+
+
+def test_later_operation_does_not_adopt_foreign_initial_parent(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    foreign_initial = store.append(
+        evidence_kind="native_trusted", operation_id="op-a", observation_role="initial", **_values()
+    )
+
+    later = store.append(
+        evidence_kind="native_trusted",
+        operation_id="op-b",
+        observation_role="later",
+        **{**_values(), "host_boot_id": "boot-b"},
+    )
+
+    assert foreign_initial.observation_role == "initial"
+    assert later.operation_id == "op-b"
+    assert later.observation_role == "later"
+    assert later.parent_observation_id is None
+    assert ClockObservationStore(tmp_path / "device.json").records() == (foreign_initial, later)
+
+
+def test_escaped_unicode_canonical_record_survives_reopen(tmp_path: Path) -> None:
+    store = ClockObservationStore(tmp_path / "device.json")
+    item = store.append(evidence_kind="native_trusted", **_values())
+    path = tmp_path / "clock-observations" / f"{item.observation_id}.json"
+    document = json.loads(path.read_text())
+    document["session_id"] = "sesión-雪"
+    path.write_bytes((json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode())
+
+    (reopened,) = store.records()
+
+    assert reopened.session_id == "sesión-雪"
+    assert reopened.causal_order == 0

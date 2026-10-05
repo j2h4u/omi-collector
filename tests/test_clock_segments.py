@@ -553,6 +553,37 @@ def test_later_without_parent_uses_its_own_start_without_inventing_a_gap_owner()
     assert mapping.utc_for(15, 100) == pytest.approx(100.0)
 
 
+def test_standalone_estimate_with_parent_keeps_its_own_start_and_utc_owner() -> None:
+    parent = replace(
+        _observation(),
+        info_sequence_min=10,
+        info_sequence_max=20,
+        device_epoch=1600,
+        host_realtime_start=1000.0,
+        host_realtime_end=1000.0,
+        observation_role="standalone",
+    )
+    standalone = replace(
+        parent,
+        observation_id="standalone-with-parent",
+        causal_order=1,
+        info_sequence_min=15,
+        info_sequence_max=25,
+        device_epoch=2000,
+        host_realtime_start=2000.0,
+        host_realtime_end=2000.0,
+        parent_observation_id=parent.observation_id,
+    )
+
+    mapping = segments_with_estimates((parent, standalone), ClockSegmentMap(()))
+
+    assert [(item.start_sequence, item.next_sequence, item.observation_id) for item in mapping.segments] == [
+        (10, 15, parent.observation_id),
+        (15, 25, standalone.observation_id),
+    ]
+    assert mapping.utc_for(17, 100) == pytest.approx(100.0)
+
+
 def test_anchored_monotonic_observations_do_not_create_or_replace_estimates() -> None:
     native = replace(
         _observation(),

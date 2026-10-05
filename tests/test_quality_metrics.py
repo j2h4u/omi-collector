@@ -209,6 +209,31 @@ def test_append_only_jsonl_retains_complete_durable_low_rate_events(tmp_path: Pa
     assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
 
 
+def test_nonfinite_clock_correction_is_rejected_without_persisting_invalid_jsonl(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    metric = ClockCorrectionMetric(
+        "2026-09-02T01:02:05.456+00:00",
+        "nonfinite-drift",
+        float("nan"),
+        1789128032,
+        5898589,
+        5898591,
+        journal.release_version,
+        journal.source_revision,
+        "1.0.0",
+    )
+
+    try:
+        with pytest.raises(QualityMetricsError, match="cannot encode quality metrics") as raised:
+            journal.record_clock_correction(metric)
+        assert isinstance(raised.value.__cause__, ValueError)
+        assert journal.close(timeout_seconds=1)
+    finally:
+        assert journal.close(timeout_seconds=1)
+
+    assert not journal.path.exists()
+
+
 @pytest.mark.parametrize("value", ["A" * 40, "a" * 39, "a" * 65, "a" * 39 + "-"])
 def test_source_revision_requires_deployment_provided_lowercase_hex(value: str) -> None:
     with pytest.raises(ValueError, match="lowercase hexadecimal"):

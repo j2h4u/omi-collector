@@ -1265,6 +1265,27 @@ async def test_nonstale_candidate_connect_error_remains_transport_unavailable() 
     assert client.disconnected
 
 
+@pytest.mark.parametrize("error", [OSError("adapter unavailable"), TimeoutError("connect timed out")])
+def test_selected_candidate_backend_errors_remain_transport_unavailable(error: BaseException) -> None:
+    async def run() -> None:
+        client = FakeClient([])
+
+        async def fail_connect() -> None:
+            raise error
+
+        client.connect = fail_connect  # type: ignore[method-assign]
+        candidate = BLEDevice("AA:BB", "omi", object())
+        transport = BleakRingTransport("AA:BB", client_factory=_factory_for(client), device_selector=candidate)
+
+        with pytest.raises(RingTransportUnavailableError, match="connecting to Omi") as raised:
+            await transport.connect()
+
+        assert not isinstance(raised.value, CandidateUnavailableError)
+        assert client.disconnected
+
+    asyncio.run(run())
+
+
 @_async_test
 async def test_failed_connect_cleanup_callback_is_local_and_attempted_once() -> None:
     client = FakeClient([])

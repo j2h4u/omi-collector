@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -496,6 +497,16 @@ def _open_pidfd(pid: int, expected_ticks: str) -> int:
     return pidfd
 
 
+def _verified_process_exit_race(error: OSError, pid: int, expected_ticks: str) -> bool:
+    if error.errno not in {errno.ENOENT, errno.ESRCH}:
+        return False
+    try:
+        _parent, current_ticks, state = _proc_identity(pid)
+    except FileNotFoundError:
+        return True
+    return current_ticks != expected_ticks or state == "Z"
+
+
 def _pidfd_signal(pidfd: int, sig: signal.Signals) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     try:
@@ -527,13 +538,28 @@ def _wait_pidfds(pids: dict[int, tuple[str, str]], timeout: float) -> bool:
     return False
 
 
+def _terminate_owned_process(pid: int, ticks: str, pidfds: dict[int, int]) -> None:
+    try:
+        pidfd = _open_pidfd(pid, ticks)
+    except OSError as exc:
+        if _verified_process_exit_race(exc, pid, ticks):
+            return
+        raise
+    pidfds[pid] = pidfd
+    try:
+        _pidfd_signal(pidfd, signal.SIGTERM)
+    except OSError as exc:
+        if not _verified_process_exit_race(exc, pid, ticks):
+            raise
+        os.close(pidfds.pop(pid))
+
+
 def _cleanup_token_processes(token: str) -> None:
     owned = _token_pids(token)
     pidfds: dict[int, int] = {}
     try:
         for pid, (ticks, _cmdline) in owned.items():
-            pidfds[pid] = _open_pidfd(pid, ticks)
-            _pidfd_signal(pidfds[pid], signal.SIGTERM)
+            _terminate_owned_process(pid, ticks, pidfds)
         if not _wait_pidfds(owned, 2.0):
             for pidfd in pidfds.values():
                 with suppress_process_gone():
@@ -570,14 +596,31 @@ def _mark_campaign_interrupted(checkout: Path, reason: str) -> None:
 def _stop_direct_launcher(
     process: subprocess.Popen[bytes], owned: dict[int, tuple[str, str]], pidfds: dict[int, int]
 ) -> None:
+    if process.poll() is not None:
+        return
     try:
         _parent, ticks, state = _proc_identity(process.pid)
-        if state != "Z":
-            owned[process.pid] = (ticks, "direct mutation launcher")
-            pidfds[process.pid] = _open_pidfd(process.pid, ticks)
-            _pidfd_signal(pidfds[process.pid], signal.SIGSTOP)
-    except ProcessLookupError:
+    except FileNotFoundError:
+        if process.poll() is not None:
+            return
+        raise
+    if state == "Z":
         return
+    try:
+        pidfd = _open_pidfd(process.pid, ticks)
+    except OSError as exc:
+        if _verified_process_exit_race(exc, process.pid, ticks):
+            return
+        raise
+    pidfds[process.pid] = pidfd
+    owned[process.pid] = (ticks, "direct mutation launcher")
+    try:
+        _pidfd_signal(pidfd, signal.SIGSTOP)
+    except OSError as exc:
+        if not _verified_process_exit_race(exc, process.pid, ticks):
+            raise
+        os.close(pidfds.pop(process.pid))
+        owned.pop(process.pid)
 
 
 def _owned_tree_stopped(owned: dict[int, tuple[str, str]]) -> bool:
@@ -597,14 +640,26 @@ def _freeze_owned_tree(
     previous: set[int] = set()
     stable = 0
     for _ in range(20):
-        root_ticks = owned.get(process.pid, ("", ""))[0]
-        current = _token_pids(token, process.pid, root_ticks)
+        root = owned.get(process.pid)
+        current = _token_pids(token, process.pid, root[0]) if root is not None else _token_pids(token)
         stable = stable + 1 if current.keys() == previous else 0
         for pid, (ticks, cmdline) in current.items():
             if pid not in pidfds:
-                pidfds[pid] = _open_pidfd(pid, ticks)
+                try:
+                    pidfd = _open_pidfd(pid, ticks)
+                except OSError as exc:
+                    if _verified_process_exit_race(exc, pid, ticks):
+                        continue
+                    raise
+                pidfds[pid] = pidfd
                 owned[pid] = (ticks, cmdline)
-                _pidfd_signal(pidfds[pid], signal.SIGSTOP)
+                try:
+                    _pidfd_signal(pidfd, signal.SIGSTOP)
+                except OSError as exc:
+                    if not _verified_process_exit_race(exc, pid, ticks):
+                        raise
+                    os.close(pidfds.pop(pid))
+                    owned.pop(pid)
         if stable >= STABLE_PROCESS_SCANS and _owned_tree_stopped(owned):
             return
         previous = set(current)
@@ -671,7 +726,7 @@ class suppress_process_gone:
         return None
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        return isinstance(exc, (OSError, ProcessLookupError))
+        return isinstance(exc, OSError) and exc.errno == errno.ESRCH
 
 
 def _verify_native_cache(checkout: Path) -> dict[str, object]:
@@ -1141,6 +1196,7 @@ def _job_environment(job_root: Path) -> dict[str, str]:
         "PYTEST_PLUGINS",
         "PYTEST_TIMEOUT",
         "VIRTUAL_ENV",
+        JOB_TOKEN_ENV,
     ):
         env.pop(key, None)
     env.update(

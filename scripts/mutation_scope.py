@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -261,6 +262,68 @@ def _resume() -> int:
     return result.returncode
 
 
+def _terminal_status(job_root: Path, owner: dict[str, object]) -> dict[str, object]:
+    campaign = owner.get("campaign")
+    campaign_state = campaign.get("state") if isinstance(campaign, dict) else None
+    campaign_exit_status = campaign.get("exit_status") if isinstance(campaign, dict) else None
+    campaign_log = campaign.get("log") if isinstance(campaign, dict) else None
+    log = str(job_root / "checkout" / campaign_log) if isinstance(campaign_log, str) else None
+    results_db = job_root / "checkout" / ".gremlins_cache" / "results.db"
+    cached_result_rows: int | None = None
+    if results_db.is_file():
+        connection = sqlite3.connect(results_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = cast(tuple[object, ...] | None, connection.execute("SELECT COUNT(*) FROM results").fetchone())
+        except sqlite3.Error as exc:
+            raise ScopeError(f"cannot read mutation cache row count: {exc}") from exc
+        finally:
+            connection.close()
+        if row is None or not isinstance(row[0], int) or isinstance(row[0], bool):
+            raise ScopeError("mutation cache row count query returned no integer result")
+        cached_result_rows = row[0]
+    return {
+        "ok": True,
+        "state": owner.get("state"),
+        "job_root": str(job_root),
+        "commit": owner.get("commit"),
+        "started_at": owner.get("started_at"),
+        "ended_at": owner.get("ended_at"),
+        "exit_status": owner.get("exit_status"),
+        "cleanup_verified": owner.get("cleanup_verified"),
+        "checkpoint_verified": owner.get("checkpoint_verified"),
+        "error": owner.get("error"),
+        "postflight_error": owner.get("postflight_error"),
+        "log": log,
+        "campaign_state": campaign_state,
+        "campaign_exit_status": campaign_exit_status,
+        "cache": owner.get("cache"),
+        "cached_result_rows": cached_result_rows,
+    }
+
+
+def _status(audit_root: Path | None = None) -> dict[str, object]:
+    root = AUDIT_ROOT if audit_root is None else audit_root
+    owners = [(job_root, _read_owner(job_root)) for job_root in discover_jobs(root)]
+    active = [(job_root, owner) for job_root, owner in owners if owner.get("state") in {"running", "pausing"}]
+    if len(active) > 1:
+        raise ScopeError(f"expected at most one active mutation job; found {len(active)}")
+    if active:
+        return send_control(active[0][0], "status")
+    terminal = [(job_root, owner) for job_root, owner in owners if owner.get("state") not in {"running", "pausing"}]
+    if not terminal:
+        raise ScopeError("no active or terminal mutation job receipt found")
+    job_root, owner = max(
+        terminal,
+        key=lambda entry: (
+            entry[1].get("created_at") if isinstance(entry[1].get("created_at"), str) else "",
+            entry[0].name,
+        ),
+    )
+    if owner.get("state") == "preparing":
+        raise ScopeError("latest mutation job is preparing; no terminal receipt is available yet")
+    return _terminal_status(job_root, owner)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Control the durable Omi mutation audit owner.")
     parser.add_argument("action", choices=("status", "pause", "resume"))
@@ -269,10 +332,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if action == "resume":
             return _resume()
-        job_root = select_job(states={"running", "pausing"})
-        response = send_control(job_root, action)
+        if action == "status":
+            response = _status()
+        else:
+            job_root = select_job(states={"running", "pausing"})
+            response = send_control(job_root, action)
         print(json.dumps(response, sort_keys=True))
-    except (ScopeError, OSError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+    except (ScopeError, OSError, sqlite3.Error, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         print(f"mutation control: {exc}", file=sys.stderr)
         return 1
     return 0

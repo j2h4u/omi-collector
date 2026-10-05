@@ -45,10 +45,21 @@ def _select_test_job(monkeypatch: pytest.MonkeyPatch, job: Path) -> None:
     monkeypatch.setattr(mutation_scope, "select_job", lambda **_: job)
 
 
+def _discover_test_job(monkeypatch: pytest.MonkeyPatch, job: Path) -> None:
+    monkeypatch.setattr(mutation_scope, "discover_jobs", lambda _audit_root: [job])
+
+
 def _read_json_object(path: Path) -> dict[str, object]:
     value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     if not isinstance(value, dict):
         raise AssertionError(f"expected JSON object in {path}")
+    return cast(dict[str, object], value)
+
+
+def _read_json_object_from_text(text: str) -> dict[str, object]:
+    value = cast(object, json.loads(text))
+    if not isinstance(value, dict):
+        raise AssertionError("expected JSON object in command output")
     return cast(dict[str, object], value)
 
 
@@ -61,13 +72,19 @@ def _read_pid_map(path: Path) -> dict[str, int]:
     return cast(dict[str, int], value)
 
 
+def _without_outer_job_token() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop(mutation_campaign.JOB_TOKEN_ENV, None)
+    return environment
+
+
 def test_status_uses_the_owner_socket_and_returns_live_state(
     control_job: tuple[Path, mutation_scope.OwnerControlServer],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     job, _server = control_job
-    _select_test_job(monkeypatch, job)
+    _discover_test_job(monkeypatch, job)
 
     assert mutation_scope.main(["status"]) == 0
 
@@ -153,6 +170,128 @@ def test_missing_owner_socket_never_signals_a_pid_from_the_receipt(
         sentinel.wait(timeout=5)
 
 
+def test_status_falls_back_to_latest_terminal_receipt_and_exposes_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    audit_root = tmp_path / "audit"
+    jobs_root = audit_root / "jobs" / "omi-collector"
+    older_job = jobs_root / "20261001T120000Z-old"
+    latest_job = jobs_root / "20261002T120000Z-latest"
+    older_job.mkdir(parents=True)
+    latest_job.mkdir()
+    (older_job / mutation_scope.OWNER_FILE).write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "run_token": "old-terminal-token",
+                "state": "preparing",
+                "created_at": "2026-10-01T12:00:00+00:00",
+                "exit_status": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    campaign = {
+        "state": "complete_unresolved",
+        "counts": {"survived": 2},
+        "log": "mutation.log",
+        "exit_status": 3,
+    }
+    cache_receipt = {"results_db": "checkout/.gremlins_cache/results.db", "quick_check": "ok"}
+    (latest_job / mutation_scope.OWNER_FILE).write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "run_token": "latest-terminal-token",
+                "state": "complete_unresolved",
+                "commit": "abc123",
+                "created_at": "2026-10-02T12:00:00+00:00",
+                "started_at": "2026-10-02T12:01:00+00:00",
+                "ended_at": "2026-10-02T12:03:00+00:00",
+                "exit_status": 3,
+                "cleanup_verified": True,
+                "checkpoint_verified": False,
+                "campaign": campaign,
+                "cache": cache_receipt,
+                "error": "native unresolved outcomes remain",
+                "postflight_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache_path = latest_job / "checkout" / ".gremlins_cache" / "results.db"
+    cache_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(cache_path)) as database, database:
+        database.execute("CREATE TABLE results (cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL)")
+        database.executemany(
+            "INSERT INTO results VALUES (?, ?)",
+            [("g-1", '{"status":"SURVIVED"}'), ("g-2", '{"status":"ZAPPED"}')],
+        )
+    monkeypatch.setattr(mutation_scope, "AUDIT_ROOT", audit_root)
+
+    assert mutation_scope.main(["status"]) == 0
+
+    response = _read_json_object_from_text(capsys.readouterr().out)
+    assert response["ok"] is True
+    assert response["state"] == "complete_unresolved"
+    assert response["job_root"] == str(latest_job)
+    assert response["commit"] == "abc123"
+    assert response["started_at"] == "2026-10-02T12:01:00+00:00"
+    assert response["ended_at"] == "2026-10-02T12:03:00+00:00"
+    assert response["exit_status"] == 3
+    assert response["cleanup_verified"] is True
+    assert response["checkpoint_verified"] is False
+    assert response["campaign_state"] == campaign["state"]
+    assert response["campaign_exit_status"] == 3
+    assert response["log"] == str(latest_job / "checkout" / "mutation.log")
+    assert response["cache"] == cache_receipt
+    assert response["error"] == "native unresolved outcomes remain"
+    assert response["postflight_error"] is None
+    assert response["cached_result_rows"] == 2
+
+
+def test_status_without_jobs_uses_an_isolated_audit_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    audit_root = tmp_path / "empty-audit"
+    audit_root.mkdir()
+    monkeypatch.setattr(mutation_scope, "AUDIT_ROOT", audit_root)
+
+    assert mutation_scope.main(["status"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no active or terminal mutation job receipt found" in captured.err
+
+
+def test_status_refuses_fallback_when_multiple_jobs_are_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    audit_root = tmp_path / "audit"
+    jobs_root = audit_root / "jobs" / "omi-collector"
+    first_job = jobs_root / "20261001T120000Z-first"
+    second_job = jobs_root / "20261002T120000Z-second"
+    first_job.mkdir(parents=True)
+    second_job.mkdir()
+    for job, token in ((first_job, "first-active"), (second_job, "second-active")):
+        (job / mutation_scope.OWNER_FILE).write_text(
+            json.dumps({"schema": 1, "run_token": token, "state": "running"}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(mutation_scope, "AUDIT_ROOT", audit_root)
+    monkeypatch.setattr(
+        mutation_scope,
+        "send_control",
+        lambda *_args, **_kwargs: pytest.fail("status must refuse before contacting either owner"),
+    )
+
+    assert mutation_scope.main(["status"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err
+
+
 def test_resume_delegates_to_the_foreground_cache_backed_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -175,13 +314,13 @@ def _process_tree_runner(pids_path: Path) -> str:
 import json, os, pathlib, signal, sqlite3, subprocess, sys, time
 pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({{'state': 'running'}}))
 db = sqlite3.connect('.gremlins_cache/results.db')
-db.execute('CREATE TABLE outcomes (gremlin_id TEXT PRIMARY KEY, status TEXT NOT NULL)')
-db.execute("INSERT INTO outcomes VALUES ('completed', 'ZAPPED')")
+db.execute('CREATE TABLE results (cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL)')
+db.execute("INSERT INTO results VALUES (?, ?)", ('completed', json.dumps({{'status': 'ZAPPED'}})))
 db.commit()
 db.close()
 def cache_worker_exit(signum, frame):
     db = sqlite3.connect('.gremlins_cache/results.db')
-    db.execute("INSERT OR REPLACE INTO outcomes VALUES ('in-flight', 'ERROR')")
+    db.execute("INSERT OR REPLACE INTO results VALUES (?, ?)", ('in-flight', json.dumps({{'status': 'ERROR'}})))
     db.commit()
     db.close()
 signal.signal(signal.SIGCHLD, cache_worker_exit)
@@ -227,7 +366,7 @@ def test_pause_stops_new_session_descendant_but_preserves_unrelated_process(
                     "resume",
                     token,
                     command=[sys.executable, "-c", _process_tree_runner(pids_path), "--gremlins"],
-                    environment={**os.environ, "OMI_MUTATION_PID_FILE": str(pids_path)},
+                    environment={**_without_outer_job_token(), "OMI_MUTATION_PID_FILE": str(pids_path)},
                 )
             )
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -261,8 +400,8 @@ def test_pause_stops_new_session_descendant_but_preserves_unrelated_process(
         assert receipt["checkpoint_verified"] is True
         with closing(sqlite3.connect(checkout / ".gremlins_cache" / "results.db")) as cache:
             assert cache.execute("PRAGMA quick_check").fetchone() == ("ok",)
-            assert cache.execute("SELECT * FROM outcomes ORDER BY gremlin_id").fetchall() == [
-                ("completed", "ZAPPED"),
+            assert cache.execute("SELECT * FROM results ORDER BY cache_key").fetchall() == [
+                ("completed", '{"status": "ZAPPED"}'),
             ]
         for pid in _pids.values():
             assert _process_stopped(pid), f"owned process {pid} survived checkpoint stop"
@@ -285,12 +424,9 @@ def _owner_lock_available(job: Path) -> bool:
         return True
 
 
-def test_owner_sigterm_stops_process_tree_before_releasing_lock(tmp_path: Path) -> None:
-    job = tmp_path / "signal-job"
+def _start_signal_owner(job: Path, pids_path: Path, token: str) -> subprocess.Popen[str]:
     checkout = job / "checkout"
     (checkout / ".gremlins_cache").mkdir(parents=True)
-    token = "owner-sigterm-run"
-    pids_path = tmp_path / "signal-pids.json"
     (job / mutation_scope.OWNER_FILE).write_text(
         json.dumps(
             {
@@ -318,14 +454,42 @@ status = mutation_campaign._enter_owner(
 print(status, flush=True)
 raise SystemExit(status)
 """
-    owner = subprocess.Popen(
+    return subprocess.Popen(
         [sys.executable, "-c", owner_code],
         cwd=Path.cwd(),
+        env=_without_outer_job_token(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
+
+
+def _cleanup_signal_owner(owner: subprocess.Popen[str], sentinel: subprocess.Popen[bytes], token: str) -> None:
+    if owner.poll() is None:
+        owner.send_signal(signal.SIGTERM)
+    try:
+        owner.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        owner.kill()
+        owner.communicate(timeout=5)
+        with suppress(OSError, ValueError):
+            mutation_campaign._cleanup_token_processes(token)
+    finally:
+        if owner.stdout is not None:
+            owner.stdout.close()
+        if owner.stderr is not None:
+            owner.stderr.close()
+    sentinel.terminate()
+    sentinel.wait(timeout=5)
+
+
+def test_owner_sigterm_stops_process_tree_before_releasing_lock(tmp_path: Path) -> None:
+    job = tmp_path / "signal-job"
+    checkout = job / "checkout"
+    token = "owner-sigterm-run"
+    pids_path = tmp_path / "signal-pids.json"
+    owner = _start_signal_owner(job, pids_path, token)
     sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         deadline = time.monotonic() + 5
@@ -353,22 +517,12 @@ raise SystemExit(status)
         assert campaign["state"] == "interrupted"
         with closing(sqlite3.connect(checkout / ".gremlins_cache" / "results.db")) as cache:
             assert cache.execute("PRAGMA quick_check").fetchone() == ("ok",)
-            assert cache.execute("SELECT * FROM outcomes ORDER BY gremlin_id").fetchall() == [
-                ("completed", "ZAPPED"),
+            assert cache.execute("SELECT * FROM results ORDER BY cache_key").fetchall() == [
+                ("completed", '{"status": "ZAPPED"}'),
             ]
         for pid in pids.values():
             assert _process_stopped(pid), f"owned process {pid} survived SIGTERM cleanup"
         assert sentinel.poll() is None
         assert _owner_lock_available(job)
     finally:
-        if owner.poll() is None:
-            owner.send_signal(signal.SIGTERM)
-            try:
-                owner.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                owner.kill()
-                owner.wait(timeout=5)
-            with suppress(OSError, ValueError):
-                mutation_campaign._cleanup_token_processes(token)
-        sentinel.terminate()
-        sentinel.wait(timeout=5)
+        _cleanup_signal_owner(owner, sentinel, token)

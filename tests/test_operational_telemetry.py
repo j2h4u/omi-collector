@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
@@ -10,6 +12,7 @@ from hashlib import sha256
 from pathlib import Path
 from shutil import rmtree
 from struct import pack
+from textwrap import dedent
 from types import SimpleNamespace
 from typing import cast
 
@@ -298,9 +301,7 @@ def test_telemetry_without_emitter_still_persists_observation(tmp_path: Path) ->
 
 @pytest.mark.parametrize("timeout", [0, -0.1])
 @pytest.mark.parametrize("timeout_field", ["operation_timeout", "host_clock_probe_timeout"])
-def test_telemetry_rejects_nonpositive_timeouts_before_device_access(
-    timeout: float, timeout_field: str
-) -> None:
+def test_telemetry_rejects_nonpositive_timeouts_before_device_access(timeout: float, timeout_field: str) -> None:
     session = FakeOperationalSession({TIME_READ_UUID: pack("<I", 1000)})
     clock = (
         TelemetryClock(operation_timeout=timeout)
@@ -937,6 +938,85 @@ def test_timed_out_post_write_readback_does_not_record_membership(tmp_path: Path
     assert memberships.records() == ()
 
 
+def test_verified_correction_skips_membership_when_store_is_absent(tmp_path: Path) -> None:
+    session = FakeOperationalSession(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)},
+        readback=pack("<I", 1000),
+    )
+    events: list[dict[str, object]] = []
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    info_reads = 0
+    ticks = iter((1000.0,) * 8)
+
+    async def info_after() -> RingInfo:
+        nonlocal info_reads
+        info_reads += 1
+        return RingInfo(10, 14, 100, 2, RECORD_SIZE)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=info_after,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+            ),
+        )
+    )
+
+    [correction] = store.records()
+    assert correction.state == "applied"
+    assert correction.boundary_sequence_max == 14
+    assert info_reads == 1
+    assert _clock_event(events)["outcome"] == "verified"
+
+
+def test_unwritten_correction_does_not_read_post_write_boundary(tmp_path: Path) -> None:
+    class MissingTimeWrite(FakeOperationalSession):
+        async def write_optional_characteristic(self, uuid: str, value: bytes) -> bool:
+            self.writes.append((uuid, value))
+            return False
+
+    session = MissingTimeWrite({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
+    events: list[dict[str, object]] = []
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    info_reads = 0
+    ticks = iter((1000.0,) * 8)
+
+    async def info_after() -> RingInfo:
+        nonlocal info_reads
+        info_reads += 1
+        return RingInfo(10, 14, 100, 2, RECORD_SIZE)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=info_after,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+            ),
+        )
+    )
+
+    event = _clock_event(events)
+    assert event["outcome"] == "time_write_missing"
+    assert "boundary_sequence_max" not in event
+    assert info_reads == 0
+
+
 def test_clock_mutation_lease_guards_durable_sync_writes() -> None:
     active = False
     entries: list[str] = []
@@ -1078,6 +1158,73 @@ def test_verified_zero_width_boundary_is_resolved_immediately() -> None:
 
     assert sink.finished[-1]["state"] == "resolved"
     assert sink.finished[-1]["boundary_sequence_max"] == 12
+
+
+def test_equal_post_write_sequence_is_persisted_as_effective_boundary(tmp_path: Path) -> None:
+    session = FakeOperationalSession(
+        {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)},
+        readback=pack("<I", 1000),
+    )
+    events: list[dict[str, object]] = []
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    ticks = iter((1000.0,) * 8)
+
+    async def info_after() -> RingInfo:
+        return _info()
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                info_reader=info_after,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+            ),
+        )
+    )
+
+    [correction] = store.records()
+    later = next(item for item in store.observation_store.records() if item.observation_role == "later")
+    assert correction.state == "resolved"
+    assert correction.boundary_sequence_max == _info().write_sequence
+    assert later.effective_boundary_sequence == _info().write_sequence
+    assert _clock_event(events)["outcome"] == "verified"
+
+
+def test_unresolved_operation_without_initial_observation_keeps_sample_standalone(tmp_path: Path) -> None:
+    store = ClockCorrectionStore(tmp_path / "device.json")
+    store.mark_unresolved(store.prepare(1010, 1000, 10.0, _info().write_sequence))
+    events: list[dict[str, object]] = []
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1000)})
+    ticks = iter((1000.0,) * 8)
+
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                lambda: next(ticks),
+                lambda: True,
+                0.5,
+                correction_sink=cast(ClockCorrectionSink, store),
+                observation_sink=store.observation_store,
+            ),
+        )
+    )
+
+    [observation] = store.observation_store.records()
+    assert observation.operation_id is None
+    assert observation.observation_role == "standalone"
+    assert store.records()[0].state == "unresolved"
+    assert _clock_event(events)["reconciliation"] == "no_causal_operation"
 
 
 def test_verified_write_without_post_boundary_stays_unresolved() -> None:
@@ -1594,6 +1741,59 @@ def test_hanging_host_clock_probe_uses_configured_host_timeout() -> None:
 
     assert time.monotonic() - started < 0.1
     assert _clock_event(events)["outcome"] == "host_probe_timeout"
+
+
+def test_timed_out_trust_probe_does_not_keep_child_process_alive() -> None:
+    child_source = dedent(
+        """
+        import asyncio
+        import threading
+        from struct import pack
+
+        from omi_collector.capture.application.operational_telemetry import BATTERY_UUID, TIME_READ_UUID, TelemetryClock, collect_operational_telemetry
+        from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo, RingStatus
+
+        gate = threading.Event()
+        events = []
+
+        class Session:
+            async def read_optional_characteristic(self, uuid):
+                if uuid == BATTERY_UUID:
+                    return bytes((80,))
+                if uuid == TIME_READ_UUID:
+                    return pack("<I", 1010)
+                return None
+
+            async def write_optional_characteristic(self, uuid, value):
+                return True
+
+        async def main():
+            await collect_operational_telemetry(
+                Session(),
+                RingStatus(123, 2, 456, 1),
+                RingInfo(10, 12, 100, 2, RECORD_SIZE),
+                lambda event: events.append(dict(event)),
+                clock=TelemetryClock(
+                    now=lambda: 1000.0,
+                    synchronized=gate.wait,
+                    host_clock_probe_timeout=0.02,
+                ),
+            )
+
+        asyncio.run(main())
+        print(next(event["outcome"] for event in events if event.get("event") == "pendant_clock_sync"))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", child_source],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=2.0,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "host_probe_timeout"
 
 
 def test_slow_host_probe_and_large_ledger_finish_clock_stage_before_metadata(tmp_path: Path) -> None:

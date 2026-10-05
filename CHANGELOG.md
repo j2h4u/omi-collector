@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/j2h4u/omi-collector/compare/v0.11.1...v0.11.2) (2026-10-05)
+
+
+### Fixes
+
+* **mutation:** isolate nested owner token and report terminal state ([955f20a](https://github.com/j2h4u/omi-collector/commit/955f20a376a8a8a7edeb45d976e784ecc3d96a5e))
+
 ## [0.11.1](https://github.com/j2h4u/omi-collector/compare/v0.11.0...v0.11.1) (2026-10-05)
 
 

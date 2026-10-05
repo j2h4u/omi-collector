@@ -644,7 +644,6 @@ async def test_progress_due_snapshot_precedes_competing_data(
 ) -> None:
     runtime = _Runtime()
     interval = 0.02
-    config = replace(DEFAULT_CONFIG, transfer=replace(DEFAULT_CONFIG.transfer, progress_interval_seconds=interval))
     events: list[ProgressEvent] = []
     first_reported = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -656,7 +655,7 @@ async def test_progress_due_snapshot_precedes_competing_data(
     options = replace(
         _options(advance=False),
         policy=replace(_options(advance=False).policy, batch_records=4),
-        config=config,
+        config=replace(DEFAULT_CONFIG, transfer=replace(DEFAULT_CONFIG.transfer, progress_interval_seconds=interval)),
         progress=progress,
     )
     _store, reconciler = _make_reconciler(tmp_path, runtime, options)

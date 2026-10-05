@@ -252,7 +252,7 @@ def test_quarantine_sidecar_requires_exact_or_uuid_suffixed_identity(
     )
     attempts = tmp_path / "attempts"
     attempts.mkdir()
-    source_names = (
+    for name in (
         "valid-exact",
         "valid-uuid",
         "wrong-prefix",
@@ -261,45 +261,59 @@ def test_quarantine_sidecar_requires_exact_or_uuid_suffixed_identity(
         "empty-original",
         "missing-original",
         "nonstring-original",
-    )
-    for name in source_names:
+    ):
         (attempts / name).write_bytes(f"evidence:{name}".encode())
-    moved = store.quarantine_pending("opaque fixture")
     by_original_name = {
         cast(dict[str, object], loads(Path(f"{entry}.json").read_text(encoding="utf-8")))["original_name"]: entry
-        for entry in moved
+        for entry in store.quarantine_pending("opaque fixture")
     }
     valid_exact = by_original_name["valid-exact"]
-    exact_marker_path = Path(f"{valid_exact}.json")
-    exact_marker = cast(dict[str, object], loads(exact_marker_path.read_text(encoding="utf-8")))
-    exact_marker["original_name"] = valid_exact.name
-    exact_marker_path.write_text(dumps(exact_marker), encoding="utf-8")
-
-    short_suffix = by_original_name["short-suffix"]
-    nonhex_suffix = by_original_name["nonhex-suffix"]
-    renamed = (
-        (short_suffix, short_suffix.with_name(f"short-suffix-{'a' * 31}")),
-        (nonhex_suffix, nonhex_suffix.with_name(f"nonhex-suffix-{'g' * 32}")),
+    Path(f"{valid_exact}.json").write_text(
+        dumps(
+            {
+                **cast(dict[str, object], loads(Path(f"{valid_exact}.json").read_text(encoding="utf-8"))),
+                "original_name": valid_exact.name,
+            }
+        ),
+        encoding="utf-8",
     )
-    for old_path, new_path in renamed:
-        old_path.rename(new_path)
-        Path(f"{old_path}.json").rename(Path(f"{new_path}.json"))
-    marker_updates: dict[str, object] = {
+
+    by_original_name["short-suffix"].rename(by_original_name["short-suffix"].with_name(f"short-suffix-{'a' * 31}"))
+    Path(f"{by_original_name['short-suffix']}.json").rename(
+        Path(f"{by_original_name['short-suffix'].with_name(f'short-suffix-{"a" * 31}')}.json")
+    )
+    by_original_name["nonhex-suffix"].rename(by_original_name["nonhex-suffix"].with_name(f"nonhex-suffix-{'g' * 32}"))
+    Path(f"{by_original_name['nonhex-suffix']}.json").rename(
+        Path(f"{by_original_name['nonhex-suffix'].with_name(f'nonhex-suffix-{"g" * 32}')}.json")
+    )
+    for original_name, marker_value in {
         "wrong-prefix": "different-prefix",
         "empty-original": "",
         "nonstring-original": 7,
-    }
-    for original_name, marker_value in marker_updates.items():
-        entry = by_original_name[original_name]
-        marker_path = Path(f"{entry}.json")
-        marker = cast(dict[str, object], loads(marker_path.read_text(encoding="utf-8")))
-        marker["original_name"] = marker_value
-        marker_path.write_text(dumps(marker), encoding="utf-8")
-    missing_entry = by_original_name["missing-original"]
-    missing_marker_path = Path(f"{missing_entry}.json")
-    missing_marker = cast(dict[str, object], loads(missing_marker_path.read_text(encoding="utf-8")))
-    del missing_marker["original_name"]
-    missing_marker_path.write_text(dumps(missing_marker), encoding="utf-8")
+    }.items():
+        marker_path = Path(f"{by_original_name[original_name]}.json")
+        marker_path.write_text(
+            dumps(
+                {
+                    **cast(dict[str, object], loads(marker_path.read_text(encoding="utf-8"))),
+                    "original_name": marker_value,
+                }
+            ),
+            encoding="utf-8",
+        )
+    Path(f"{by_original_name['missing-original']}.json").write_text(
+        dumps(
+            {
+                key: value
+                for key, value in cast(
+                    dict[str, object],
+                    loads(Path(f"{by_original_name['missing-original']}.json").read_text(encoding="utf-8")),
+                ).items()
+                if key != "original_name"
+            }
+        ),
+        encoding="utf-8",
+    )
     invalid_entries = {
         original_name: (
             by_original_name[original_name].with_name(f"short-suffix-{'a' * 31}")

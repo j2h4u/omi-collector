@@ -109,6 +109,8 @@ mutation-internal mode='resume':
     esac
     run_id="$(uv run --frozen --no-sync python -m scripts.mutation_campaign prepare --launcher-pid "$$" "${prepare_flags[@]}")" || exit 1
     log_file=".gremlins_cache/mutation-${run_id}.log"
+    # pytest-gremlins keeps the 150s timeout for targeted mutants and applies
+    # the separate 600s budget only to mutations that require the full suite.
     timeout --verbose --signal=TERM --kill-after=5s 24h uv run --frozen --no-sync pytest --gremlins "${cache_flags[@]}" tests |& tee "$log_file"
     statuses=("${PIPESTATUS[@]}")
     status="${statuses[0]}"

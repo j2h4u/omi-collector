@@ -22,12 +22,21 @@ make a change pass.
   If a tool returns a running session, poll it to completion or terminate it before moving on.
 - The canonical full-project mutation campaign is the sole exception: run it
   through `just mutation` with one finite 24-hour GNU timeout and a five-second
-  KILL grace. Its 120-second test timeout, 150-second mutant timeout,
-  independent 600-second coverage scan, 60-second integration canary, and two
-  workers remain unchanged. Default resume requires a matching clean committed
-  campaign receipt; use `just mutation fresh` only after preserving prior
-  evidence. Any incomplete campaign remains incomplete and must be inspected
-  before resuming.
+  KILL grace. Keep the 120-second test timeout, 150-second targeted-mutant
+  timeout, independent 600-second coverage scan, 60-second integration
+  canary, and two workers. Full-suite declaration-time mutants use a separate
+  600-second timeout: a retained clean baseline collected 2,298 tests (2,296
+  passed, 2 skipped) in 287.25 seconds at nice 19/idle I/O; doubling that
+  measured duration for two workers leaves about 25 seconds of margin. This
+  diagnostic baseline is not a native mutation result. Earlier serial g082
+  benchmarks took 103.67–104.88 seconds with different diagnostic flags; the
+  cause of the timing difference is unconfirmed. A native two-worker attempt
+  timed out at 150.57 seconds after pytest ran 148.85 seconds. Selecting
+  `tests/` instead of all 2,294 IDs saved only 1.21 seconds in that older run.
+  Default resume
+  requires a matching clean committed campaign receipt; use `just mutation
+  fresh` only after preserving prior evidence. Any incomplete campaign remains
+  incomplete and must be inspected before resuming.
 - Keep stable QA and runtime practices in `docs/BEST_PRACTICES.md`; keep this
   file compact.
 

@@ -76,6 +76,138 @@ def _without_runner_defaults(environment: dict[str, str]) -> dict[str, str]:
     return caller_environment
 
 
+def _without_outer_job_token(environment: dict[str, str] | None = None) -> dict[str, str]:
+    child_environment = (os.environ if environment is None else environment).copy()
+    child_environment.pop(mutation_campaign.JOB_TOKEN_ENV, None)
+    return child_environment
+
+
+def test_job_environment_removes_outer_token_and_nested_owner_guard_stays_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = tmp_path / "guard-job"
+    (job / "checkout" / ".gremlins_cache").mkdir(parents=True)
+    token = "nested-owner-run"
+    outer_token = "outer-audit-run"
+    monkeypatch.setenv(mutation_campaign.JOB_TOKEN_ENV, outer_token)
+    monkeypatch.setenv("ACTIVE_GREMLIN", "preserve-this-runner-setting")
+    (job / "owner.json").write_text(
+        json.dumps({"schema": 1, "run_token": token, "state": "preparing"}), encoding="utf-8"
+    )
+
+    job_environment = mutation_campaign._job_environment(job)
+
+    assert mutation_campaign.JOB_TOKEN_ENV not in job_environment
+    assert job_environment["ACTIVE_GREMLIN"] == "preserve-this-runner-setting"
+    with pytest.raises(ValueError, match="must not contain the private child token"):
+        mutation_campaign._enter_owner(
+            job,
+            "resume",
+            token,
+            command=[sys.executable, "-c", "raise SystemExit(0)"],
+            environment={**job_environment, mutation_campaign.JOB_TOKEN_ENV: outer_token},
+        )
+
+
+def test_stop_owned_processes_accepts_pidfd_open_race_after_process_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "pidfd-exit-race"
+    environment = {**_without_outer_job_token(), mutation_campaign.JOB_TOKEN_ENV: token}
+    owner = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        env=environment,
+        start_new_session=True,
+    )
+    exiting = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        _parent, exiting_ticks, _state = mutation_campaign._proc_identity(exiting.pid)
+        real_open_pidfd = mutation_campaign._open_pidfd
+
+        def scan(
+            _token: str, root_pid: int | None = None, _root_ticks: str | None = None
+        ) -> dict[int, tuple[str, str]]:
+            return {exiting.pid: (exiting_ticks, "exiting token process")} if root_pid is not None else {}
+
+        def open_pidfd(pid: int, ticks: str) -> int:
+            if pid == exiting.pid:
+                exiting.terminate()
+                exiting.wait(timeout=5)
+                raise ProcessLookupError(3, "No such process")
+            return real_open_pidfd(pid, ticks)
+
+        monkeypatch.setattr(mutation_campaign, "_token_pids", scan)
+        monkeypatch.setattr(mutation_campaign, "_open_pidfd", open_pidfd)
+
+        checkpoint = mutation_campaign._stop_owned_processes(owner, token, tmp_path)
+
+        assert owner.poll() is not None
+        assert checkpoint["processes_stopped"] == [owner.pid]
+        assert checkpoint["cache"] == {"results_db": "absent", "quick_check": "not-applicable"}
+    finally:
+        for process in (owner, exiting):
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+
+def test_stop_owned_processes_rejects_esrch_when_pid_is_still_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "pidfd-live-race"
+    environment = {**_without_outer_job_token(), mutation_campaign.JOB_TOKEN_ENV: token}
+    owner = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        env=environment,
+        start_new_session=True,
+    )
+    live = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        _parent, live_ticks, _state = mutation_campaign._proc_identity(live.pid)
+        real_open_pidfd = mutation_campaign._open_pidfd
+
+        def scan(
+            _token: str, root_pid: int | None = None, _root_ticks: str | None = None
+        ) -> dict[int, tuple[str, str]]:
+            return {live.pid: (live_ticks, "still-live token process")} if root_pid is not None else {}
+
+        def open_pidfd(pid: int, ticks: str) -> int:
+            if pid == live.pid:
+                raise ProcessLookupError(3, "No such process")
+            return real_open_pidfd(pid, ticks)
+
+        monkeypatch.setattr(mutation_campaign, "_token_pids", scan)
+        monkeypatch.setattr(mutation_campaign, "_open_pidfd", open_pidfd)
+
+        with pytest.raises(ValueError, match="could not verify safe mutation checkpoint"):
+            mutation_campaign._stop_owned_processes(owner, token, tmp_path)
+
+        assert owner.poll() is None
+        assert live.poll() is None
+        _parent, current_ticks, state = mutation_campaign._proc_identity(live.pid)
+        assert current_ticks == live_ticks
+        assert state not in {"T", "t", "Z"}
+        with monkeypatch.context() as patch:
+            patch.setattr(mutation_campaign, "_proc_identity", lambda _pid: (_ for _ in ()).throw(PermissionError()))
+            with pytest.raises(PermissionError):
+                mutation_campaign._verified_process_exit_race(
+                    ProcessLookupError(3, "No such process"), live.pid, live_ticks
+                )
+    finally:
+        for process in (owner, live):
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+
 def _job_directories(audit_root: Path) -> list[Path]:
     return sorted(path.parent for path in audit_root.glob("jobs/omi-collector/*/owner.json"))
 
@@ -103,8 +235,11 @@ def _process_stopped(pid: int) -> bool:
 def _write_cache(path: Path, rows: list[tuple[str, str]]) -> bytes:
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path)) as cache, cache:
-        cache.execute("CREATE TABLE outcomes (gremlin_id TEXT PRIMARY KEY, status TEXT NOT NULL)")
-        cache.executemany("INSERT INTO outcomes VALUES (?, ?)", rows)
+        cache.execute("CREATE TABLE results (cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL)")
+        cache.executemany(
+            "INSERT INTO results VALUES (?, ?)",
+            [(key, json.dumps({"status": status})) for key, status in rows],
+        )
     return path.read_bytes()
 
 
@@ -122,6 +257,7 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
 
     def owner(job_root: Path, mode: str, token: str, **kwargs: object) -> int:
         runner_environment = cast(dict[str, str], kwargs["environment"])
+        assert mutation_campaign.JOB_TOKEN_ENV not in runner_environment
         assert runner_environment["COVERAGE_CORE"] == "ctrace"
         assert runner_environment["COVERAGE_FILE"] == ""
         assert runner_environment["PYTEST_ADDOPTS"] == ""
@@ -233,7 +369,9 @@ def test_resume_reuses_exact_job_and_preserves_completed_native_cache(
     assert cache_path.read_bytes() == before
     with closing(sqlite3.connect(cache_path)) as cache, cache:
         assert cache.execute("PRAGMA quick_check").fetchone() == ("ok",)
-        assert cache.execute("SELECT * FROM outcomes").fetchall() == [("completed", "ZAPPED")]
+        assert cache.execute("SELECT * FROM results").fetchall() == [
+            ("completed", '{"status": "ZAPPED"}'),
+        ]
 
 
 def test_incompatible_resume_refuses_before_mutating_cache(
@@ -386,7 +524,7 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
         "resume",
         native_token,
         command=[sys.executable, "-c", native_report],
-        environment=os.environ.copy(),
+        environment=_without_outer_job_token(),
     )
 
     native_receipt = _read_json_object(native_job / "owner.json")
@@ -407,7 +545,7 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
         "resume",
         failed_token,
         command=[sys.executable, "-c", "raise SystemExit(1)"],
-        environment=os.environ.copy(),
+        environment=_without_outer_job_token(),
     )
 
     failed_receipt = _read_json_object(failed_job / "owner.json")

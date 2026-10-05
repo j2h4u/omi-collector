@@ -197,7 +197,7 @@ def test_status_recipe_runs_scope_module_and_handles_no_job(tmp_path: Path) -> N
     )
 
     assert result.returncode == 1
-    assert "found 0" in result.stderr
+    assert "no active or terminal mutation job receipt found" in result.stderr
     assert "ModuleNotFoundError" not in result.stderr
     assert capture.read_text(encoding="utf-8").splitlines() == [
         "run",

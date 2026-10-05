@@ -373,6 +373,78 @@ def test_rotation_caps_real_serialized_bytes_and_preserves_retained_event_order(
     assert retained_ids == [f"event-{index:02}" for index in range(6)]
 
 
+def test_restart_rotates_one_byte_interrupted_journal_before_max_size_record(tmp_path: Path) -> None:
+    metric = _loss_metric("restart-boundary")
+    calibration = _journal(tmp_path / "calibration")
+    calibration.record_sequence_loss(metric)
+    assert calibration.close(timeout_seconds=1)
+    incoming_line = calibration.path.read_bytes()
+    max_bytes = len(incoming_line)
+
+    journal = JsonlQualityMetrics(
+        tmp_path / "restarted",
+        release_version="1.2.3",
+        source_revision="a" * 40,
+        config=QualityMetricsConfig(max_bytes=max_bytes, backup_count=1, max_record_bytes=max_bytes),
+    )
+    journal.path.parent.mkdir(parents=True, exist_ok=True)
+    journal.path.write_bytes(b"x")
+
+    try:
+        journal.record_sequence_loss(metric)
+        assert journal.close(timeout_seconds=1)
+    finally:
+        assert journal.close(timeout_seconds=1)
+
+    backup = journal.path.with_name(f"{journal.path.name}.1")
+    assert backup.read_bytes() == b"x"
+    assert journal.path.stat().st_size == max_bytes
+    assert journal.path.read_bytes() == incoming_line
+    assert json.loads(journal.path.read_bytes()) == metric.as_dict()
+
+
+def test_rotation_preserves_neighbor_beyond_configured_backup_count(tmp_path: Path) -> None:
+    first_metric = _loss_metric("rotate-a")
+    next_metric = _loss_metric("rotate-b")
+    calibration = _journal(tmp_path / "calibration")
+    calibration.record_sequence_loss(next_metric)
+    assert calibration.close(timeout_seconds=1)
+    max_bytes = calibration.path.stat().st_size
+
+    root = tmp_path / "journal"
+    config = QualityMetricsConfig(max_bytes=max_bytes, backup_count=3, max_record_bytes=max_bytes)
+    initial = JsonlQualityMetrics(
+        root,
+        release_version="1.2.3",
+        source_revision="a" * 40,
+        config=config,
+    )
+    initial.record_sequence_loss(first_metric)
+    assert initial.close(timeout_seconds=1)
+    current_bytes = initial.path.read_bytes()
+
+    seed_backups = [json.dumps({"seed": index}).encode() + b"\n" for index in range(1, 5)]
+    for index, seed in enumerate(seed_backups, start=1):
+        initial.path.with_name(f"{initial.path.name}.{index}").write_bytes(seed)
+
+    restarted = JsonlQualityMetrics(
+        root,
+        release_version="1.2.3",
+        source_revision="a" * 40,
+        config=config,
+    )
+    try:
+        restarted.record_sequence_loss(next_metric)
+        assert restarted.close(timeout_seconds=1)
+    finally:
+        assert restarted.close(timeout_seconds=1)
+
+    assert restarted.path.with_name(f"{restarted.path.name}.1").read_bytes() == current_bytes
+    assert restarted.path.with_name(f"{restarted.path.name}.2").read_bytes() == seed_backups[0]
+    assert restarted.path.with_name(f"{restarted.path.name}.3").read_bytes() == seed_backups[1]
+    assert restarted.path.with_name(f"{restarted.path.name}.4").read_bytes() == seed_backups[3]
+
+
 def test_journal_rejects_oversized_record_before_opening_file(tmp_path: Path) -> None:
     journal = JsonlQualityMetrics(
         tmp_path,

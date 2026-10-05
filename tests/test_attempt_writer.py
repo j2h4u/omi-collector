@@ -982,6 +982,99 @@ def test_cancelled_close_keeps_positive_remaining_shutdown_budget() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("after_deadline", [0.0, 0.25])
+def test_cancelled_close_reports_expired_remaining_budget(
+    after_deadline: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_close=True)
+        async with _started(target, bytearray()) as writer:
+            loop = asyncio.get_running_loop()
+            base_time = loop.time()
+            fake_time = [base_time]
+            closing: asyncio.Task[object] | None = None
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(loop, "time", lambda: fake_time[0])
+                    closing = asyncio.create_task(writer.close(timeout=0.5))
+                    assert await asyncio.to_thread(target.close_started.wait, 1)
+                    target.release_close.set()
+                    writer.thread.join(1)
+                    assert not writer.thread.is_alive()
+                    fake_time[0] = base_time + 0.5 + after_deadline
+                    closing.cancel()
+                    with pytest.raises(WriterShutdownTimeoutError):
+                        await closing
+            finally:
+                target.release_close.set()
+                if closing is not None and not closing.done():
+                    closing.cancel()
+                if closing is not None:
+                    await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), timeout=1)
+                await asyncio.to_thread(writer.thread.join, 1)
+                assert target.close_calls == 1
+
+    asyncio.run(exercise())
+
+
+def test_close_deadline_rejects_extra_join_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray()) as writer:
+            loop = asyncio.get_running_loop()
+            base_time = loop.time()
+            fake_time = [base_time]
+            release_worker = threading.Event()
+            worker_paused = threading.Event()
+            complete = writer._complete
+            join_until = writer._join_until
+            closing: asyncio.Task[object] | None = None
+
+            def pause_after_completion(
+                future: asyncio.Future[object],
+                result: object | None,
+                error: BaseException | None,
+            ) -> None:
+                complete(future, result, error)
+                worker_paused.set()
+                release_worker.wait(5)
+
+            def release_and_join_worker() -> None:
+                release_worker.set()
+                writer.thread.join(1)
+
+            async def join_at_deadline(
+                deadline: float,
+                *,
+                result: asyncio.Future[object] | None = None,
+            ) -> object:
+                with monkeypatch.context() as clock_patch:
+                    clock_patch.setattr(loop, "time", lambda: deadline)
+                    loop.call_soon(release_and_join_worker)
+                    return await join_until(deadline, result=result)
+
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(loop, "time", lambda: fake_time[0])
+                    patch.setattr(writer, "_complete", pause_after_completion)
+                    patch.setattr(writer, "_join_until", join_at_deadline)
+                    closing = asyncio.create_task(writer.close(timeout=0.5))
+                    assert await asyncio.to_thread(worker_paused.wait, 1)
+                    with pytest.raises(WriterShutdownTimeoutError):
+                        await closing
+            finally:
+                release_worker.set()
+                if closing is not None and not closing.done():
+                    closing.cancel()
+                if closing is not None:
+                    await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), timeout=1)
+                await asyncio.to_thread(writer.thread.join, 1)
+                assert not writer.thread.is_alive()
+                await writer.close(timeout=1)
+
+    asyncio.run(exercise())
+
+
 def test_cancelled_seal_remains_admitted_and_converges_to_one_target_call() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_seal=True)

@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.11.0](https://github.com/j2h4u/omi-collector/compare/v0.10.2...v0.11.0) (2026-10-05)
+
+
+### Features
+
+* **mutation:** harden durable audit lifecycle ([#179](https://github.com/j2h4u/omi-collector/issues/179)) ([681d99e](https://github.com/j2h4u/omi-collector/commit/681d99e37ac6c5911a50685558f86e2ca1b99408))
+
+
+### Fixes
+
+* **qa:** audit the full project with resumable mutation results and verified outcomes ([f6a5253](https://github.com/j2h4u/omi-collector/commit/f6a525308b3cdb7492384d5bb89c38036934b03e))
+
+
+### Build
+
+* pin pytest-gremlins mutation runner ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+
+
+### Documentation
+
+* **qa:** document strict selector and provenance controls ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* **qa:** record finite mutation queue disposition totals ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* record CI timeout and readiness repair ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* record mutation remediation evidence ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+
+
+### Tests
+
+* always close BLE transport observers ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* **ble:** cover transport readiness and reader delivery ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* bound disconnect notification wakeup ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* bound opportunistic presence readiness callers ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* bound presence scanner readiness waits ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* bound stalled finalization readiness ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* **capture:** verify clock and retry boundaries ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* clarify presence readiness watchdog binding ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* close all tracked quality journals ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* close quality journals in fake sync runs ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* cover partial retired batch receipts ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* own progress pump tasks with task groups ([658c1e7](https://github.com/j2h4u/omi-collector/commit/658c1e7af0f64a1e19b79a42b7205cae32d87bd5))
+* **quality:** strengthen metric and observation contracts ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* **quarantine:** preserve primary failures through cleanup ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* **queue:** reconcile finite mutation outcomes by stable identity ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* **storage:** cover durable staging and recovery invariants ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* **telemetry:** verify child cleanup and FIFO failure handling ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+* **writer:** verify progress ownership and cancellation behavior ([194baf3](https://github.com/j2h4u/omi-collector/commit/194baf3d62d057ba1161a26f228ce96983978789))
+
 ## [0.10.2](https://github.com/j2h4u/omi-collector/compare/v0.10.1...v0.10.2) (2026-10-01)
 
 

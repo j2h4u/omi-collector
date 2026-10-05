@@ -326,7 +326,10 @@ def cache_worker_exit(signum, frame):
     db.close()
 signal.signal(signal.SIGCHLD, cache_worker_exit)
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
-pathlib.Path({str(pids_path)!r}).write_text(json.dumps({{"parent": os.getpid(), 'child': child.pid}}))
+pids_path = pathlib.Path({str(pids_path)!r})
+temporary_pids_path = pids_path.with_suffix('.tmp')
+temporary_pids_path.write_text(json.dumps({{"parent": os.getpid(), 'child': child.pid}}), encoding='utf-8')
+temporary_pids_path.replace(pids_path)
 time.sleep(60)
 """
 

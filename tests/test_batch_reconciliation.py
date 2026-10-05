@@ -175,7 +175,7 @@ def _reconciler(store: StagingStore, descriptor: AttemptDescriptor, durable_next
     reconciler = BatchReconciler(
         store,
         OpportunisticOptions(
-            timeouts=TransferTimeouts(1, 1),
+            timeouts=_options().timeouts,
             policy=RetryPolicy(backoff=(0.001,), batch_records=2, stop_after_drained=True),
         ),
         OpportunisticRuntime(),
@@ -416,7 +416,7 @@ class _Runtime(OpportunisticRuntime):
 async def _close_real_writers(runtime: _Runtime) -> None:
     for proxy in runtime.proxies:
         if proxy.thread.is_alive():
-            await proxy.writer.close(timeout=1)
+            await proxy.writer.close(timeout=DEFAULT_CONFIG.transfer.sync_timeout_seconds)
         assert not proxy.thread.is_alive()
 
 
@@ -438,7 +438,10 @@ def _wire_done(end: int) -> bytes:
 
 def _options(*, advance: bool = True) -> OpportunisticOptions:
     return OpportunisticOptions(
-        timeouts=TransferTimeouts(1, 1),
+        timeouts=TransferTimeouts(
+            info=DEFAULT_CONFIG.transfer.info_timeout_seconds,
+            transfer=DEFAULT_CONFIG.transfer.sync_timeout_seconds,
+        ),
         policy=RetryPolicy(backoff=(0.001,), batch_records=2, stop_after_drained=True, advance_enabled=advance),
     )
 

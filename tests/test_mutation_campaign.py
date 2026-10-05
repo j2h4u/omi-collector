@@ -654,9 +654,12 @@ def test_live_snapshot_drift_stops_owner_and_invalidates_the_job(
     runner = f"""
 import os, pathlib, time
 pathlib.Path(os.environ['TMPDIR'], 'pytest_gremlins_sources.py').write_text('temporary')
+pid_path = pathlib.Path({str(pid_path)!r})
+temporary_pid_path = pid_path.with_suffix('.tmp')
+temporary_pid_path.write_text(str(os.getpid()), encoding='ascii')
+temporary_pid_path.replace(pid_path)
 source = pathlib.Path('src/omi_collector/demo.py')
 source.write_text("value = 'tampered while running'\\n")
-pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()))
 time.sleep(60)
 """
     monkeypatch.setattr(mutation_campaign, "OWNER_CHECK_SECONDS", 0.05)

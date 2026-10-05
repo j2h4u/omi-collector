@@ -263,17 +263,28 @@ def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.Monke
 
 
 def test_device_operation_interruption_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    created_operations: list[Coroutine[object, object, None]] = []
+
     async def fake_phy_check(_adapter: str) -> None:
         return
+
+    def track_phy_check(_adapter: str) -> Coroutine[object, object, None]:
+        operation = fake_phy_check(_adapter)
+        created_operations.append(operation)
+        return operation
 
     def interrupted(operation: Coroutine[object, object, object]) -> object:
         operation.close()
         raise device_cli.OperationInterruptedError("interrupted safely")
 
-    monkeypatch.setattr(device_cli, "phy_check", fake_phy_check)
+    monkeypatch.setattr(device_cli, "phy_check", track_phy_check)
     monkeypatch.setattr(device_cli, "run", interrupted)
 
-    result = CliRunner().invoke(app, ["device", "phy-check", "--confirm-host-change"])
+    try:
+        result = CliRunner().invoke(app, ["device", "phy-check", "--confirm-host-change"])
+    finally:
+        for operation in created_operations:
+            operation.close()
 
     assert result.exit_code == 0
     assert result.stdout == ""

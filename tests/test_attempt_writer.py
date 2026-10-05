@@ -7,12 +7,13 @@ import multiprocessing
 import os
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Protocol
+from unittest.mock import patch
 
 import pytest
 
@@ -161,6 +162,11 @@ class _ProcessFlags(Protocol):
     def __setitem__(self, index: int, value: int) -> None: ...
 
 
+def _test_daemon_thread_factory(target: Callable[..., object], name: str, daemon: bool) -> threading.Thread:
+    assert daemon is False
+    return threading.Thread(target=target, name=name, daemon=True)
+
+
 class ProcessLifetimeTarget:
     def __init__(self, entered: _ProcessEvent, release: _ProcessRelease, flags: _ProcessFlags) -> None:
         self.entered = entered
@@ -207,6 +213,7 @@ def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Conne
     async def lifecycle() -> None:
         writer = AttemptWriter(ProcessLifetimeTarget(entered, release, flags), bytes(RECORD_SIZE))
         try:
+            assert writer.thread.daemon is False
             await writer.start()
             await writer.prepare_leg(10, 1)
             await writer.read_begin("begin")
@@ -237,7 +244,8 @@ async def _owned_writer(
     config: WriterConfig = DEFAULT_CONFIG.writer,
     expect_failure: bool = False,
 ) -> AsyncIterator[AttemptWriter]:
-    writer = AttemptWriter(target, source, config=config)
+    with patch.object(attempt_writer, "Thread", _test_daemon_thread_factory):
+        writer = AttemptWriter(target, source, config=config)
     try:
         yield writer
     finally:

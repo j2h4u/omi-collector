@@ -74,14 +74,17 @@ unit:
     nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
 
 # Create or resume the one frozen, durable full-project audit job.
-mutation mode='resume':
+[positional-arguments]
+mutation mode='resume' *launch_args:
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{mode}}" in
+    mode="$1"
+    shift
+    case "$mode" in
         fresh|resume) ;;
         *) printf 'mutation mode must be resume or fresh.\n' >&2; exit 2 ;;
     esac
-    chrt --idle 0 ionice -c 3 nice -n 19 uv run --frozen --no-sync python -m scripts.mutation_campaign launch --mode "{{mode}}"
+    chrt --idle 0 ionice -c 3 nice -n 19 uv run --frozen --no-sync python -m scripts.mutation_campaign launch --mode "$mode" "$@"
 
 # Private child recipe; the job owner controls its lifetime and environment.
 mutation-internal mode='resume':

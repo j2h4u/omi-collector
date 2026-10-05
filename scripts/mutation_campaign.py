@@ -36,7 +36,8 @@ OWNER_FILE = "owner.json"
 OWNER_LOCK = ".owner.lock"
 JOB_TOKEN_ENV = "OMI_MUTATION_JOB_TOKEN"
 OWNER_CHECK_SECONDS = 600.0
-PRIVATE_TMP_MODE = 0o700
+PRIVATE_DIRECTORY_MODE = 0o700
+BLOCKING_JOB_STATES = {"running", "pausing", "control_failed", "cleanup_failed", "source_invalidated"}
 PROCESS_SETTLE_SECONDS = 0.1
 STABLE_PROCESS_SCANS = 2
 UNRESOLVED_EXIT_STATUS = 3
@@ -581,7 +582,7 @@ def _tmp_identity(path: Path) -> tuple[int, int]:
     if (
         not stat.S_ISDIR(details.st_mode)
         or details.st_uid != os.getuid()
-        or stat.S_IMODE(details.st_mode) != PRIVATE_TMP_MODE
+        or stat.S_IMODE(details.st_mode) != PRIVATE_DIRECTORY_MODE
     ):
         raise ValueError("mutation scratch directory is not a private directory owned by this user")
     return details.st_dev, details.st_ino
@@ -602,7 +603,7 @@ def _prepare_job_tmp(job_root: Path, receipt: dict[str, object]) -> Path:
         if recorded is None:
             raise ValueError("mutation scratch directory has no recorded owner identity")
     else:
-        path.mkdir(mode=PRIVATE_TMP_MODE)
+        path.mkdir(mode=PRIVATE_DIRECTORY_MODE)
     identity = _tmp_identity(path)
     if recorded is not None and recorded != {"device": identity[0], "inode": identity[1]}:
         raise ValueError("mutation scratch directory identity changed")
@@ -652,7 +653,7 @@ def _validate_private_tmp_owner_path(
     if (
         not stat.S_ISDIR(root_details.st_mode)
         or root_details.st_uid != os.getuid()
-        or stat.S_IMODE(root_details.st_mode) != PRIVATE_TMP_MODE
+        or stat.S_IMODE(root_details.st_mode) != PRIVATE_DIRECTORY_MODE
         or job_root.parent.resolve(strict=True) != jobs_root.resolve(strict=True)
     ):
         raise ValueError("mutation scratch owner path is not a private direct job; preserving it")
@@ -1407,7 +1408,7 @@ def _new_job(repo: Path) -> Path:
     ).stdout.strip()
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     job_root = AUDIT_ROOT / "jobs" / "omi-collector" / f"{stamp}-{commit[:12]}-{secrets.token_hex(3)}"
-    job_root.mkdir(parents=True, mode=0o700)
+    job_root.mkdir(parents=True, mode=PRIVATE_DIRECTORY_MODE)
     checkout = job_root / "checkout"
     subprocess.run(["git", "worktree", "add", "--detach", str(checkout), commit], cwd=repo, check=True)
     _canonicalize_snapshot_modes(checkout)
@@ -1455,34 +1456,90 @@ def _validate_resume(job_root: Path, environment: dict[str, str]) -> None:
     _verify_native_cache(job_root / "checkout")
 
 
-def _launch_locked(mode: str) -> int:
-    jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
+def _is_private_directory(details: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(details.st_mode)
+        and details.st_uid == os.getuid()
+        and stat.S_IMODE(details.st_mode) == PRIVATE_DIRECTORY_MODE
+    )
+
+
+def _is_owned_receipt_file(details: os.stat_result) -> bool:
+    return stat.S_ISREG(details.st_mode) and details.st_uid == os.getuid()
+
+
+def _selected_resume_job(job_id: str, jobs_root: Path) -> Path:
+    if not job_id or Path(job_id).name != job_id or job_id in {".", ".."}:
+        raise ValueError("resume job selector must be one managed job ID")
+    job_root = jobs_root / job_id
+    owner_path = job_root / OWNER_FILE
+    try:
+        managed_details = jobs_root.lstat()
+        job_details = job_root.lstat()
+        owner_details = owner_path.lstat()
+        managed_root = jobs_root.resolve(strict=True)
+        resolved_job = job_root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("selected mutation job is unavailable") from exc
+    if (
+        not _is_private_directory(managed_details)
+        or not _is_private_directory(job_details)
+        or resolved_job.parent != managed_root
+        or not _is_owned_receipt_file(owner_details)
+    ):
+        raise ValueError("selected mutation job is not a same-user managed job")
+    owner = _read_receipt_from(owner_path)
+    if owner is None or owner.get("state") not in {"paused", "interrupted"}:
+        raise ValueError("selected mutation job is not paused or interrupted")
+    return job_root
+
+
+def _refuse_other_unresolved_jobs(jobs_root: Path, selected_job: Path) -> None:
     for owner_path in jobs_root.glob("*/" + OWNER_FILE):
-        if owner_path.is_file():
-            _recover_abandoned_job_tmp(owner_path.parent)
+        if owner_path.parent == selected_job:
+            continue
+        owner = _read_receipt_from(owner_path) if owner_path.is_file() else None
+        if owner is not None and owner.get("state") in BLOCKING_JOB_STATES:
+            raise ValueError("another unresolved mutation job prevents resume")
+
+
+def _launch_locked(mode: str, job_id: str | None = None) -> int:
+    jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
     if mode == "fresh":
-        active_states = {"running", "pausing", "control_failed", "cleanup_failed", "source_invalidated"}
+        if job_id is not None:
+            raise ValueError("--job can be used only when resuming a mutation audit")
+        for owner_path in jobs_root.glob("*/" + OWNER_FILE):
+            if owner_path.is_file():
+                _recover_abandoned_job_tmp(owner_path.parent)
         active = [
             owner
             for owner in jobs_root.glob("*/" + OWNER_FILE)
             if owner.is_file()
             and (receipt := _read_receipt_from(owner)) is not None
-            and receipt.get("state") in active_states
+            and receipt.get("state") in BLOCKING_JOB_STATES
         ]
         if active:
             raise ValueError("an existing mutation job must be resolved before starting a fresh audit")
         job_root = _new_job(Path.cwd().resolve())
     else:
-        jobs = [
-            path
-            for path in sorted(jobs_root.glob("*/" + OWNER_FILE))
-            if path.is_file()
-            and _read_receipt_from(path) is not None
-            and cast(dict[str, object], _read_receipt_from(path)).get("state") in {"paused", "interrupted"}
-        ]
-        if len(jobs) != 1:
-            raise ValueError(f"resume requires exactly one paused mutation job; found {len(jobs)}")
-        job_root = jobs[0].parent
+        if job_id is not None:
+            job_root = _selected_resume_job(job_id, jobs_root)
+            _refuse_other_unresolved_jobs(jobs_root, job_root)
+            _recover_abandoned_job_tmp(job_root)
+        else:
+            for owner_path in jobs_root.glob("*/" + OWNER_FILE):
+                if owner_path.is_file():
+                    _recover_abandoned_job_tmp(owner_path.parent)
+            jobs = [
+                path
+                for path in sorted(jobs_root.glob("*/" + OWNER_FILE))
+                if path.is_file()
+                and _read_receipt_from(path) is not None
+                and cast(dict[str, object], _read_receipt_from(path)).get("state") in {"paused", "interrupted"}
+            ]
+            if len(jobs) != 1:
+                raise ValueError(f"resume requires exactly one paused mutation job; found {len(jobs)}")
+            job_root = jobs[0].parent
         _validate_resume(job_root, _job_environment(job_root))
     run_token = secrets.token_hex(32)
     _write_owner(
@@ -1510,7 +1567,7 @@ def _launch_locked(mode: str) -> int:
     return _enter_owner(job_root, mode, run_token, environment=_job_environment(job_root))
 
 
-def _launch(mode: str) -> int:
+def _launch(mode: str, job_id: str | None = None) -> int:
     import fcntl
 
     jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
@@ -1521,7 +1578,7 @@ def _launch(mode: str) -> int:
             fcntl.flock(launcher_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ValueError("another full-project mutation audit is already owned") from exc
-        return _launch_locked(mode)
+        return _launch_locked(mode, job_id)
 
 
 def main() -> int:
@@ -1534,6 +1591,7 @@ def main() -> int:
     finish.add_argument("--status", type=int, required=True)
     launch = commands.add_parser("launch")
     launch.add_argument("--mode", choices=("fresh", "resume"), required=True)
+    launch.add_argument("--job", help="resume this managed mutation job ID")
     commands.add_parser("identity")
     args = parser.parse_args()
     command = cast(str, args.command)
@@ -1548,7 +1606,7 @@ def main() -> int:
         elif command == "identity":
             print(json.dumps(_identity(), sort_keys=True))
         else:
-            return _launch(cast(str, args.mode))
+            return _launch(cast(str, args.mode), cast(str | None, args.job))
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError, ScopeError) as exc:
         print(f"mutation campaign: {exc}", file=sys.stderr)
         return 1

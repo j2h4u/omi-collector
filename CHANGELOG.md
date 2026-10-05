@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.5](https://github.com/j2h4u/omi-collector/compare/v0.11.4...v0.11.5) (2026-10-05)
+
+
+### Fixes
+
+* **qa:** budget mutation timeouts by selected test scope ([#189](https://github.com/j2h4u/omi-collector/issues/189)) ([6b9f041](https://github.com/j2h4u/omi-collector/commit/6b9f041763ff0d052dbf2b5efd76c52b45dd37a3))
+* **tests:** stabilize mutation audit baseline fixtures ([aef3c99](https://github.com/j2h4u/omi-collector/commit/aef3c99b725978111e219f3cfbcc39d42532daac))
+
 ## [0.11.4](https://github.com/j2h4u/omi-collector/compare/v0.11.3...v0.11.4) (2026-10-05)
 
 

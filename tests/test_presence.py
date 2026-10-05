@@ -617,6 +617,55 @@ def test_failed_start_is_replaced_by_a_new_scanner_that_can_wake() -> None:
     _run(scenario())
 
 
+def test_cooperative_start_timeout_retries_and_allows_a_later_presence_wake() -> None:
+    async def scenario() -> None:
+        first_start = asyncio.Event()
+        cancelled_start = asyncio.Event()
+
+        class CooperativeTimeout(FakeObserver):
+            starts = 0
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                self.starts += 1
+                if self.starts == 1:
+                    first_start.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        cancelled_start.set()
+                        raise
+                await super().start(callback)
+
+        observer = CooperativeTimeout()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(
+                scan_recheck_seconds=0.001,
+                drain_cooldown_seconds=0.001,
+                scan_transition_seconds=0.01,
+                scan_cancel_grace_min_seconds=0.001,
+                scan_cancel_grace_max_seconds=0.005,
+                scan_cancel_grace_fraction=0.5,
+            ),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            await asyncio.wait_for(first_start.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            await asyncio.wait_for(cancelled_start.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            await _wait_started(observer, scheduler, waiter)
+            await _emit_stable(observer)
+
+            wake = await asyncio.wait_for(waiter, timeout=_READINESS_TIMEOUT_SECONDS)
+
+            assert isinstance(wake, PresenceWake)
+            assert wake.reason == "advertisement"
+            assert observer.starts == 2
+        finally:
+            await _cancel_waiter_and_close(scheduler, waiter)
+
+    _run(scenario())
+
+
 def test_drained_quiet_recovery_wakes_after_a_soft_scanner_start_failure() -> None:
     async def scenario() -> None:
         starts = 0

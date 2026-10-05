@@ -81,7 +81,7 @@ mutation mode='resume':
         fresh|resume) ;;
         *) printf 'mutation mode must be resume or fresh.\n' >&2; exit 2 ;;
     esac
-    chrt --idle 0 ionice -c 3 nice -n 19 uv run python scripts/mutation_campaign.py launch --mode "{{mode}}"
+    chrt --idle 0 ionice -c 3 nice -n 19 uv run --frozen --no-sync python -m scripts.mutation_campaign launch --mode "{{mode}}"
 
 # Private child recipe; the job owner controls its lifetime and environment.
 mutation-internal mode='resume':
@@ -107,7 +107,7 @@ mutation-internal mode='resume':
             exit 2
             ;;
     esac
-    run_id="$(uv run python scripts/mutation_campaign.py prepare --launcher-pid "$$" "${prepare_flags[@]}")" || exit 1
+    run_id="$(uv run --frozen --no-sync python -m scripts.mutation_campaign prepare --launcher-pid "$$" "${prepare_flags[@]}")" || exit 1
     log_file=".gremlins_cache/mutation-${run_id}.log"
     timeout --verbose --signal=TERM --kill-after=5s 24h uv run --frozen --no-sync pytest --gremlins "${cache_flags[@]}" tests |& tee "$log_file"
     statuses=("${PIPESTATUS[@]}")
@@ -117,7 +117,7 @@ mutation-internal mode='resume':
         if (( status == 0 )); then status=1; fi
     fi
     finish_status=0
-    uv run --frozen --no-sync python scripts/mutation_campaign.py finish --status "$status" || finish_status=$?
+    uv run --frozen --no-sync python -m scripts.mutation_campaign finish --status "$status" || finish_status=$?
     if (( finish_status != 0 && finish_status != 3 )); then exit 1; fi
     if (( status == 0 && finish_status == 3 )); then status=3; fi
     exit "$status"
@@ -132,13 +132,13 @@ mutation-fresh-start:
 
 # Checkpoint-stop, resume, or inspect the sole managed mutation job.
 mutation-pause:
-    uv run python scripts/mutation_scope.py pause
+    uv run --frozen --no-sync python -m scripts.mutation_scope pause
 
 mutation-resume:
-    uv run python scripts/mutation_scope.py resume
+    uv run --frozen --no-sync python -m scripts.mutation_scope resume
 
 mutation-status:
-    uv run python scripts/mutation_scope.py status
+    uv run --frozen --no-sync python -m scripts.mutation_scope status
 
 # Test coverage report.
 coverage:

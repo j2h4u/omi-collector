@@ -1239,11 +1239,6 @@ def _validate_resume(job_root: Path, environment: dict[str, str]) -> None:
 
 
 def _launch_locked(mode: str) -> int:
-    environment = dict(os.environ)
-    expected = {"COVERAGE_CORE": "ctrace", "COVERAGE_FILE": "", "PYTEST_ADDOPTS": "", "UV_LINK_MODE": "hardlink"}
-    invalid = [key for key, value in expected.items() if environment.get(key, "") != value]
-    if invalid:
-        raise ValueError("mutation launch environment has invalid values for: " + ", ".join(invalid))
     if mode == "fresh":
         active_states = {"running", "pausing", "control_failed", "cleanup_failed", "source_invalidated"}
         active = [
@@ -1267,8 +1262,7 @@ def _launch_locked(mode: str) -> int:
         if len(jobs) != 1:
             raise ValueError(f"resume requires exactly one paused mutation job; found {len(jobs)}")
         job_root = jobs[0].parent
-        environment = _job_environment(job_root)
-        _validate_resume(job_root, environment)
+        _validate_resume(job_root, _job_environment(job_root))
     run_token = secrets.token_hex(32)
     _write_owner(
         job_root,

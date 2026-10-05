@@ -152,6 +152,66 @@ def test_multiple_pending_partials_are_quarantined_without_losing_raw_records(tm
     assert {(source / "records.bin").read_bytes() for source in quarantined_sources} == expected_records
 
 
+def test_two_pending_attempts_stay_blocked_under_public_promotion_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    expected_records = {
+        _seed_streaming_partial(store, count=1),
+        _seed_streaming_partial(store, count=2),
+    }
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    holder: threading.Thread | None = None
+    original_pending = store.pending_attempts
+    original_quarantine = store.quarantine_pending
+
+    def hold_real_promotion_lock() -> None:
+        with store.device_lock(recover_capture_temporaries=False, operation="competing-promotion"):
+            lock_held.set()
+            release_lock.wait(5)
+
+    def pending_while_real_lock_is_held() -> object:
+        nonlocal holder
+        descriptors = original_pending()
+        holder = threading.Thread(target=hold_real_promotion_lock, name="test-promotion-lock")
+        holder.start()
+        if not lock_held.wait(1):
+            release_lock.set()
+            holder.join(1)
+            raise TimeoutError("competing promotion lock was not acquired")
+        return descriptors
+
+    def release_lock_before_quarantine(reason: str) -> tuple[Path, ...]:
+        release_lock.set()
+        if holder is not None:
+            holder.join(1)
+            if holder.is_alive():
+                raise TimeoutError("competing promotion lock was not released")
+        return original_quarantine(reason)
+
+    monkeypatch.setattr(store, "pending_attempts", pending_while_real_lock_is_held)
+    monkeypatch.setattr(store, "quarantine_pending", release_lock_before_quarantine)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    try:
+        state = cast(PendingStartupState, _run(maintenance.prepare_pending_startup()))
+        assert state.pending is None
+        assert state.durable_next is None
+        assert state.disposition == "empty"
+        assert tuple(store.attempts_root.iterdir()) == ()
+        quarantined_sources = tuple(path for path in store.quarantined_attempts() if path.is_dir())
+        assert len(quarantined_sources) == 2
+        assert {(source / "records.bin").read_bytes() for source in quarantined_sources} == expected_records
+    finally:
+        release_lock.set()
+        if holder is not None:
+            holder.join(1)
+            assert not holder.is_alive()
+        _run(maintenance.close())
+        if original_pending():
+            original_quarantine("test cleanup")
+
+
 def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: Path) -> None:
     store = _store(tmp_path)
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
@@ -1162,6 +1222,44 @@ def test_capture_priority_joins_running_retry_and_defers_new_requests(
             assert recovery.calls == 2
         finally:
             recovery.release.set()
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_capture_priority_resumes_running_retry_without_new_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        recovery = _BlockedRecovery(store.recover_and_publish)
+        monkeypatch.setattr(store, "recover_and_publish", recovery)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        maintenance.schedule_publication_retry()
+        entering: asyncio.Task[None] | None = None
+        try:
+            assert await asyncio.to_thread(recovery.started.wait, 1)
+            entering = asyncio.create_task(maintenance.enter_capture_priority())
+            await asyncio.sleep(0)
+            assert not entering.done()
+            assert recovery.calls == 1
+
+            recovery.release.set()
+            await entering
+            assert recovery.finished.is_set()
+            assert recovery.calls == 1
+
+            maintenance.exit_capture_priority()
+            for _ in range(100):
+                if recovery.calls == 2:
+                    break
+                await asyncio.sleep(0.001)
+            assert recovery.calls == 2
+            assert recovery.maximum_active == 1
+        finally:
+            recovery.release.set()
+            if entering is not None:
+                await asyncio.gather(entering, return_exceptions=True)
             await maintenance.close()
 
     _run(scenario())

@@ -85,8 +85,13 @@ Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
 pytest commands remain bounded to 600 seconds. The canonical full-project
 mutation campaign uses one finite 24-hour GNU timeout with TERM and a
 five-second KILL grace; this is an operating budget, not a completion promise.
-Individual mutants retain their 150-second budget and the independent coverage
-pre-scan retains 600 seconds. The recipe retains the complete timeout and runner
+Targeted mutants retain their 150-second budget and the independent coverage
+pre-scan retains 600 seconds. Full-suite declaration-time mutants use a separate
+300-second budget. Isolated serial g082 benchmarks took 103.67–104.88 seconds;
+a native two-worker attempt did not complete, timing out at 150.57 seconds after
+pytest had run 148.85 seconds. Selecting `tests/` instead of all 2,294 IDs saved
+only 1.21 seconds in the serial benchmark. This budget applies only to mutants
+whose behavior is evaluated outside a callable body. The recipe retains the complete timeout and runner
 log and records a small identity/start/end/report receipt, then reconciles native generated IDs
 against the fresh native JSON report. Missing or malformed report metadata,
 identity changes, nonzero exits, duplicate/missing/foreign IDs, and unresolved

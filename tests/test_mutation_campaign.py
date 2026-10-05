@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -257,13 +258,15 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
 
     def owner(job_root: Path, mode: str, token: str, **kwargs: object) -> int:
         runner_environment = cast(dict[str, str], kwargs["environment"])
+        checkout = job_root / "checkout"
         assert mutation_campaign.JOB_TOKEN_ENV not in runner_environment
         assert runner_environment["COVERAGE_CORE"] == "ctrace"
         assert runner_environment["COVERAGE_FILE"] == ""
         assert runner_environment["PYTEST_ADDOPTS"] == ""
         assert runner_environment["UV_LINK_MODE"] == "hardlink"
+        assert runner_environment["TMPDIR"] == str(job_root / "tmp")
+        assert not Path(runner_environment["TMPDIR"]).is_relative_to(checkout)
         owner_calls.append((job_root, mode, token))
-        checkout = job_root / "checkout"
         assert (checkout / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o755
         assert (checkout / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o644
         assert (checkout / "src/omi_collector/demo.py").read_text(encoding="utf-8") == "value = 'before'\n"
@@ -465,6 +468,7 @@ def test_live_snapshot_drift_stops_owner_and_invalidates_the_job(
     )
     runner = f"""
 import os, pathlib, time
+pathlib.Path(os.environ['TMPDIR'], 'pytest_gremlins_sources.py').write_text('temporary')
 source = pathlib.Path('src/omi_collector/demo.py')
 source.write_text("value = 'tampered while running'\\n")
 pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()))
@@ -506,6 +510,7 @@ time.sleep(60)
     receipt = _read_json_object(job / "owner.json")
     assert receipt["state"] == "source_invalidated"
     assert receipt["cleanup_verified"] is True
+    assert not (job / "tmp").exists()
     assert mutation_campaign._token_pids(token) == {}
     assert _process_stopped(child_pid)
 
@@ -517,7 +522,7 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
     (native_job / "owner.json").write_text(
         json.dumps({"schema": 1, "run_token": native_token, "state": "preparing"}), encoding="utf-8"
     )
-    native_report = "import json, pathlib; pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete_unresolved'})); raise SystemExit(3)"
+    native_report = "import json, os, pathlib; pathlib.Path(os.environ['TMPDIR'], 'scratch').write_text('native'); pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete_unresolved'})); raise SystemExit(3)"
 
     native_status = mutation_campaign._enter_owner(
         native_job,
@@ -530,8 +535,31 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
     native_receipt = _read_json_object(native_job / "owner.json")
     assert native_status == 3
     assert native_receipt["state"] == "complete_unresolved"
+    assert not (native_job / "tmp").exists()
     native_campaign = cast(dict[str, object], native_receipt["campaign"])
     assert native_campaign["state"] == "complete_unresolved"
+
+    complete_job = tmp_path / "native-complete"
+    (complete_job / "checkout" / ".gremlins_cache").mkdir(parents=True)
+    complete_token = "native-complete-token"
+    (complete_job / "owner.json").write_text(
+        json.dumps({"schema": 1, "run_token": complete_token, "state": "preparing"}), encoding="utf-8"
+    )
+    complete_command = (
+        "import json, os, pathlib; pathlib.Path(os.environ['TMPDIR'], 'scratch').write_text('complete'); "
+        "pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete'}))"
+    )
+    complete_status = mutation_campaign._enter_owner(
+        complete_job,
+        "resume",
+        complete_token,
+        command=[sys.executable, "-c", complete_command],
+        environment=_without_outer_job_token(),
+    )
+    complete_receipt = _read_json_object(complete_job / "owner.json")
+    assert complete_status == 0
+    assert complete_receipt["state"] == "complete"
+    assert not (complete_job / "tmp").exists()
 
     failed_job = tmp_path / "controller-failed"
     (failed_job / "checkout" / ".gremlins_cache").mkdir(parents=True)
@@ -544,7 +572,11 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
         failed_job,
         "resume",
         failed_token,
-        command=[sys.executable, "-c", "raise SystemExit(1)"],
+        command=[
+            sys.executable,
+            "-c",
+            "import os, pathlib; pathlib.Path(os.environ['TMPDIR'], 'scratch').write_text('failure'); raise SystemExit(1)",
+        ],
         environment=_without_outer_job_token(),
     )
 
@@ -552,6 +584,147 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
     assert failed_status == 1
     assert failed_receipt["state"] == "failed"
     assert failed_receipt["campaign"] is None
+    assert not (failed_job / "tmp").exists()
+
+
+def _abandoned_job(audit_root: Path, *, cleanup_verified: bool) -> tuple[Path, Path]:
+    job_root = audit_root / "jobs" / "omi-collector" / "abandoned"
+    job_root.mkdir(parents=True, mode=0o700)
+    scratch = job_root / "tmp"
+    scratch.mkdir(mode=0o700)
+    (scratch / "pytest_gremlins_sources.py").write_text("temporary", encoding="utf-8")
+    identity = {"commit": "recorded-job"}
+    token = "abandoned-owner-token"
+    info = scratch.lstat()
+    receipt: dict[str, object] = {
+        "schema": 1,
+        "run_token": token,
+        "state": "running",
+        "identity": identity,
+        "tmp_identity": {"device": info.st_dev, "inode": info.st_ino},
+    }
+    if cleanup_verified:
+        receipt.update(
+            {
+                "cleanup_verified": True,
+                "cleanup_verified_token": token,
+                "cleanup_verified_identity": identity,
+            }
+        )
+    (job_root / mutation_campaign.OWNER_FILE).write_text(json.dumps(receipt), encoding="utf-8")
+    return job_root, scratch
+
+
+def test_next_launch_recovers_scratch_only_after_receipt_proves_reap(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    job_root, scratch = _abandoned_job(audit_root, cleanup_verified=True)
+    cache = job_root / "checkout" / ".gremlins_cache" / "results.db"
+    report = job_root / "checkout" / "coverage" / "gremlins" / "gremlins.json"
+    cache.parent.mkdir(parents=True)
+    report.parent.mkdir(parents=True)
+    cache.write_bytes(b"native-cache")
+    report.write_bytes(b"native-report")
+    owner_calls: list[bool] = []
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_a, **_k: owner_calls.append(True) or 0)
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+
+    assert status != 0
+    assert stderr
+    assert not scratch.exists()
+    assert _read_json_object(job_root / mutation_campaign.OWNER_FILE)["state"] == "running"
+    assert cache.read_bytes() == b"native-cache"
+    assert report.read_bytes() == b"native-report"
+    assert owner_calls == []
+
+
+def test_next_launch_preserves_scratch_without_verified_process_cleanup(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    job_root, scratch = _abandoned_job(audit_root, cleanup_verified=False)
+    contents = (scratch / "pytest_gremlins_sources.py").read_bytes()
+    monkeypatch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+    monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_a, **_k: pytest.fail("owner must not start"))
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+
+    assert status != 0
+    assert "preserving scratch" in stderr
+    assert (scratch / "pytest_gremlins_sources.py").read_bytes() == contents
+    assert _read_json_object(job_root / mutation_campaign.OWNER_FILE)["state"] == "running"
+
+
+def test_recovery_rejects_replaced_tmp_symlink_without_touching_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    job_root, scratch = _abandoned_job(audit_root, cleanup_verified=True)
+    target = tmp_path / "unrelated"
+    target.mkdir(mode=0o700)
+    protected = target / "keep.txt"
+    protected.write_text("preserve", encoding="utf-8")
+    shutil.rmtree(scratch)
+    scratch.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="private directory"):
+        mutation_campaign._recover_abandoned_job_tmp(job_root)
+
+    assert protected.read_text(encoding="utf-8") == "preserve"
+    assert scratch.is_symlink()
+
+
+def test_cleanup_receipt_survives_tmp_removal_error_for_next_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    job_root = audit_root / "jobs" / "omi-collector" / "cleanup-error"
+    checkout = job_root / "checkout"
+    (checkout / ".gremlins_cache").mkdir(parents=True, mode=0o700)
+    token = "cleanup-error-token"
+    (job_root / mutation_campaign.OWNER_FILE).write_text(
+        json.dumps({"schema": 1, "run_token": token, "state": "preparing"}), encoding="utf-8"
+    )
+    real_rmtree = mutation_campaign.shutil.rmtree
+
+    def fail_tmp_removal(path: str | os.PathLike[str]) -> None:
+        if Path(path) == job_root / "tmp":
+            raise PermissionError("simulated scratch removal failure")
+        real_rmtree(path)
+
+    monkeypatch.setattr(mutation_campaign.shutil, "rmtree", fail_tmp_removal)
+    status = mutation_campaign._enter_owner(
+        job_root,
+        "resume",
+        token,
+        command=[
+            sys.executable,
+            "-c",
+            "import json, pathlib; pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete'}))",
+        ],
+        environment=_without_outer_job_token(),
+    )
+
+    receipt = _read_json_object(job_root / mutation_campaign.OWNER_FILE)
+    scratch = job_root / "tmp"
+    assert status == 1
+    assert receipt["state"] == "cleanup_failed"
+    assert receipt["cleanup_verified"] is True
+    assert receipt["cleanup_verified_token"] == token
+    assert scratch.is_dir()
+
+    monkeypatch.setattr(mutation_campaign.shutil, "rmtree", real_rmtree)
+    assert mutation_campaign._recover_abandoned_job_tmp(job_root)
+    assert not scratch.exists()
 
 
 def test_finish_reconciles_native_outcome_counts_without_crediting_error_or_timeout() -> None:

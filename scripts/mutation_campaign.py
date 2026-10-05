@@ -36,6 +36,7 @@ OWNER_FILE = "owner.json"
 OWNER_LOCK = ".owner.lock"
 JOB_TOKEN_ENV = "OMI_MUTATION_JOB_TOKEN"
 OWNER_CHECK_SECONDS = 600.0
+PRIVATE_TMP_MODE = 0o700
 PROCESS_SETTLE_SECONDS = 0.1
 STABLE_PROCESS_SCANS = 2
 UNRESOLVED_EXIT_STATUS = 3
@@ -54,6 +55,7 @@ RELEVANT_ENV = (
     "PYTEST_PLUGINS",
     "PYTEST_TIMEOUT",
     "TZ",
+    "TMPDIR",
     "UV_CACHE_DIR",
     "UV_PROJECT_ENVIRONMENT",
     "VIRTUAL_ENV",
@@ -574,6 +576,129 @@ def _cleanup_token_processes(token: str) -> None:
             os.close(pidfd)
 
 
+def _tmp_identity(path: Path) -> tuple[int, int]:
+    details = path.lstat()
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or stat.S_IMODE(details.st_mode) != PRIVATE_TMP_MODE
+    ):
+        raise ValueError("mutation scratch directory is not a private directory owned by this user")
+    return details.st_dev, details.st_ino
+
+
+def _tmp_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _prepare_job_tmp(job_root: Path, receipt: dict[str, object]) -> Path:
+    path = job_root / "tmp"
+    recorded = receipt.get("tmp_identity")
+    if _tmp_exists(path):
+        if recorded is None:
+            raise ValueError("mutation scratch directory has no recorded owner identity")
+    else:
+        path.mkdir(mode=PRIVATE_TMP_MODE)
+    identity = _tmp_identity(path)
+    if recorded is not None and recorded != {"device": identity[0], "inode": identity[1]}:
+        raise ValueError("mutation scratch directory identity changed")
+    receipt["tmp_identity"] = {"device": identity[0], "inode": identity[1]}
+    return path
+
+
+def _remove_job_tmp(job_root: Path, receipt: dict[str, object]) -> None:
+    path = job_root / "tmp"
+    if not _tmp_exists(path):
+        return
+    identity = _tmp_identity(path)
+    if receipt.get("tmp_identity") != {"device": identity[0], "inode": identity[1]}:
+        raise ValueError("mutation scratch directory identity changed")
+    shutil.rmtree(path)
+    if _tmp_exists(path):
+        raise ValueError("mutation scratch directory remains after cleanup")
+
+
+def _record_tmp_cleanup_eligible(run: OwnerRun) -> None:
+    run.receipt.update(
+        {
+            "cleanup_verified": True,
+            "cleanup_verified_token": run.token,
+            "cleanup_verified_identity": run.receipt.get("identity"),
+        }
+    )
+    _write_owner(run.job_root, run.receipt)
+
+
+def _tmp_cleanup_proved(receipt: dict[str, object], token: str) -> bool:
+    return (
+        receipt.get("cleanup_verified") is True
+        and receipt.get("cleanup_verified_token") == token
+        and receipt.get("cleanup_verified_identity") == receipt.get("identity")
+    )
+
+
+def _cleanup_verified_job_tmp(run: OwnerRun) -> None:
+    _record_tmp_cleanup_eligible(run)
+    _remove_job_tmp(run.job_root, run.receipt)
+
+
+def _validate_private_tmp_owner_path(
+    job_root: Path, jobs_root: Path, root_details: os.stat_result, owner_details: os.stat_result
+) -> None:
+    if (
+        not stat.S_ISDIR(root_details.st_mode)
+        or root_details.st_uid != os.getuid()
+        or stat.S_IMODE(root_details.st_mode) != PRIVATE_TMP_MODE
+        or job_root.parent.resolve(strict=True) != jobs_root.resolve(strict=True)
+    ):
+        raise ValueError("mutation scratch owner path is not a private direct job; preserving it")
+    if not stat.S_ISREG(owner_details.st_mode) or owner_details.st_uid != os.getuid():
+        raise ValueError("mutation scratch owner path is not a private direct job; preserving it")
+
+
+def _recover_abandoned_job_tmp(job_root: Path) -> bool:
+    """Remove only scratch whose exact owner receipt proves its process tree was reaped."""
+    import fcntl
+
+    jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
+    try:
+        root_details = job_root.lstat()
+        owner_details = (job_root / OWNER_FILE).lstat()
+    except OSError as exc:
+        raise ValueError("mutation scratch owner path is unavailable; preserving it") from exc
+    _validate_private_tmp_owner_path(job_root, jobs_root, root_details, owner_details)
+    path = job_root / "tmp"
+    if not _tmp_exists(path):
+        return False
+    lock = (job_root / OWNER_LOCK).open("a+b")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("mutation owner is still active; preserving its scratch directory") from exc
+        receipt = _read_receipt_from(job_root / OWNER_FILE)
+        if receipt is None:
+            raise ValueError("mutation scratch has no owner receipt; preserving it")
+        token = receipt.get("run_token")
+        identity = receipt.get("identity")
+        if (
+            receipt.get("cleanup_verified") is not True
+            or receipt.get("cleanup_verified_token") != token
+            or receipt.get("cleanup_verified_identity") != identity
+            or not isinstance(token, str)
+        ):
+            raise ValueError("previous mutation owner did not verify process cleanup; preserving scratch")
+        _remove_job_tmp(job_root, receipt)
+        return True
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
 def _mark_campaign_interrupted(checkout: Path, reason: str) -> None:
     campaign_path = checkout / RECEIPT
     if not campaign_path.is_file():
@@ -783,6 +908,7 @@ def _check_snapshot_seal(run: OwnerRun) -> None:
             return
         reason = "snapshot-seal-changed"
         checkpoint = _stop_owned_processes(process, run.token, run.checkout)
+        _cleanup_verified_job_tmp(run)
         _mark_campaign_interrupted(run.checkout, reason)
         run.receipt.update(
             {
@@ -794,6 +920,11 @@ def _check_snapshot_seal(run: OwnerRun) -> None:
             }
         )
     except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as exc:
+        if _tmp_cleanup_proved(run.receipt, run.token):
+            run.receipt.update({"state": "cleanup_failed", "error": str(exc), "cleanup_verified": True})
+            _write_owner(run.job_root, run.receipt)
+            run.invalidated.set()
+            return
         try:
             checkpoint = _stop_owned_processes(process, run.token, run.checkout)
         except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as cleanup_exc:
@@ -805,6 +936,7 @@ def _check_snapshot_seal(run: OwnerRun) -> None:
                 }
             )
         else:
+            _cleanup_verified_job_tmp(run)
             _mark_campaign_interrupted(run.checkout, "snapshot-seal-unreadable")
             run.receipt.update(
                 {
@@ -833,9 +965,8 @@ def _monitor_owner_child(run: OwnerRun) -> None:
 
 
 def _record_child_failure(job_root: Path, receipt: dict[str, object], error: Exception, *, state: str) -> int:
-    receipt.update(
-        {"state": state, "cleanup_verified": False, "error": str(error), "ended_at": datetime.now(UTC).isoformat()}
-    )
+    receipt.update({"state": state, "error": str(error), "ended_at": datetime.now(UTC).isoformat()})
+    receipt.setdefault("cleanup_verified", False)
     _write_owner(job_root, receipt)
     return 1
 
@@ -844,6 +975,7 @@ def _finish_signalled_child(run: OwnerRun, signum: int) -> int:
     assert run.process is not None
     try:
         checkpoint = _stop_owned_processes(run.process, run.token, run.checkout)
+        _cleanup_verified_job_tmp(run)
         _mark_campaign_interrupted(run.checkout, "owner-signal")
     except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as exc:
         return _record_child_failure(run.job_root, run.receipt, exc, state="cleanup_failed")
@@ -866,6 +998,7 @@ def _finish_completed_child(run: OwnerRun) -> int:
     try:
         status = run.process.wait(timeout=5)
         _cleanup_token_processes(run.token)
+        _cleanup_verified_job_tmp(run)
         cache_check = _verify_native_cache(run.checkout)
         if (
             run.receipt.get("identity") is not None
@@ -877,13 +1010,14 @@ def _finish_completed_child(run: OwnerRun) -> int:
         run.receipt.update(
             {
                 "state": "cleanup_failed",
-                "cleanup_verified": False,
                 "checkpoint_verified": False,
                 "exit_status": run.process.returncode,
                 "error": str(exc),
                 "ended_at": datetime.now(UTC).isoformat(),
             }
         )
+        if not _tmp_cleanup_proved(run.receipt, run.token):
+            run.receipt["cleanup_verified"] = False
         _write_owner(run.job_root, run.receipt)
         return 1
     if status == 0 and campaign is None:
@@ -937,6 +1071,7 @@ def _request_pause(run: OwnerRun) -> bool:
         _write_owner(run.job_root, run.receipt)
         try:
             checkpoint = _stop_owned_processes(process, run.token, run.checkout)
+            _cleanup_verified_job_tmp(run)
             _mark_campaign_interrupted(run.checkout, "checkpoint-stop")
         except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as exc:
             run.receipt.update({"state": "control_failed", "checkpoint_verified": False, "error": str(exc)})
@@ -1008,28 +1143,18 @@ def _enter_owner(
 ) -> int:
     import fcntl
 
+    run_env = _owner_run_environment(job_root, environment)
     lock, receipt, socket_path = _prepare_owner(job_root, run_token)
-    run_env = dict(environment or os.environ)
-    if JOB_TOKEN_ENV in run_env:
-        lock.close()
-        raise ValueError("owner environment must not contain the private child token")
     checkout = job_root / "checkout"
     token = run_token
-    run_env["UV_PROJECT_ENVIRONMENT"] = str(job_root / ".venv")
-    run_env["UV_CACHE_DIR"] = str(job_root / "uv-cache")
-    run_env["UV_LINK_MODE"] = "hardlink"
-    run_env["UV_NO_SYNC"] = "1"
     child_env = {**run_env, JOB_TOKEN_ENV: token}
     actual_command = command or ["uv", "run", "--frozen", "--no-sync", "just", "mutation-internal", mode]
     run = OwnerRun(job_root, mode, token, checkout, run_env, receipt)
     previous_handlers: dict[int, signal.Handlers | int | Callable[[int, FrameType | None], object] | None] = {}
-    receipt.update(
-        {"state": "running", "mode": mode, "owner_pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()}
-    )
-    _write_owner(job_root, receipt)
 
     server = OwnerControlServer(socket_path, run_token, lambda: run.receipt.copy(), lambda: _request_pause(run))
     try:
+        _prepare_owner_tmp(run, mode)
         if threading.current_thread() is threading.main_thread():
 
             def request_stop(signum: int, _frame: object) -> None:
@@ -1064,15 +1189,17 @@ def _enter_owner(
         try:
             if run.process is not None and run.process.poll() is None:
                 _stop_owned_processes(run.process, token, checkout)
+                _cleanup_verified_job_tmp(run)
                 _mark_campaign_interrupted(checkout, "owner-exception")
             else:
                 _cleanup_token_processes(token)
+                _cleanup_verified_job_tmp(run)
         except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as cleanup_exc:
             cleanup_error = str(cleanup_exc)
         receipt.update(
             {
                 "state": "cleanup_failed" if cleanup_error else "controller_failed",
-                "cleanup_verified": cleanup_error is None,
+                "cleanup_verified": _tmp_cleanup_proved(receipt, token) or cleanup_error is None,
                 "error": str(exc) if cleanup_error is None else f"{exc}; cleanup failed: {cleanup_error}",
                 "ended_at": datetime.now(UTC).isoformat(),
             }
@@ -1086,6 +1213,38 @@ def _enter_owner(
         if lock and not run.paused.is_set():
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
+
+
+def _owner_run_environment(job_root: Path, environment: dict[str, str] | None) -> dict[str, str]:
+    run_env = dict(environment or os.environ)
+    if JOB_TOKEN_ENV in run_env:
+        raise ValueError("owner environment must not contain the private child token")
+    run_env.update(
+        {
+            "UV_PROJECT_ENVIRONMENT": str(job_root / ".venv"),
+            "UV_CACHE_DIR": str(job_root / "uv-cache"),
+            "UV_LINK_MODE": "hardlink",
+            "UV_NO_SYNC": "1",
+            "TMPDIR": str(job_root / "tmp"),
+        }
+    )
+    return run_env
+
+
+def _prepare_owner_tmp(run: OwnerRun, mode: str) -> None:
+    run.receipt.update(
+        {
+            "state": "running",
+            "mode": mode,
+            "owner_pid": os.getpid(),
+            "started_at": datetime.now(UTC).isoformat(),
+            "cleanup_verified": False,
+        }
+    )
+    run.receipt.pop("cleanup_verified_token", None)
+    run.receipt.pop("cleanup_verified_identity", None)
+    _prepare_job_tmp(run.job_root, run.receipt)
+    _write_owner(run.job_root, run.receipt)
 
 
 def _read_receipt_from(path: Path) -> dict[str, object] | None:
@@ -1206,6 +1365,7 @@ def _job_environment(job_root: Path) -> dict[str, str]:
             "PYTEST_ADDOPTS": "",
             "LC_ALL": "C.UTF-8",
             "TZ": "UTC",
+            "TMPDIR": str(job_root / "tmp"),
             "UV_CACHE_DIR": str(job_root / "uv-cache"),
             "UV_PROJECT_ENVIRONMENT": str(job_root / ".venv"),
             "UV_LINK_MODE": "hardlink",
@@ -1222,6 +1382,7 @@ def _sync_job_environment(job_root: Path, environment: dict[str, str] | None = N
     env["UV_CACHE_DIR"] = str(job_root / "uv-cache")
     env["UV_LINK_MODE"] = "hardlink"
     env.pop("UV_NO_SYNC", None)
+    env.pop("TMPDIR", None)
     Path(env["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["uv", "sync", "--frozen", "--project", str(checkout)],
@@ -1295,11 +1456,15 @@ def _validate_resume(job_root: Path, environment: dict[str, str]) -> None:
 
 
 def _launch_locked(mode: str) -> int:
+    jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
+    for owner_path in jobs_root.glob("*/" + OWNER_FILE):
+        if owner_path.is_file():
+            _recover_abandoned_job_tmp(owner_path.parent)
     if mode == "fresh":
         active_states = {"running", "pausing", "control_failed", "cleanup_failed", "source_invalidated"}
         active = [
             owner
-            for owner in (AUDIT_ROOT / "jobs" / "omi-collector").glob("*/" + OWNER_FILE)
+            for owner in jobs_root.glob("*/" + OWNER_FILE)
             if owner.is_file()
             and (receipt := _read_receipt_from(owner)) is not None
             and receipt.get("state") in active_states
@@ -1310,7 +1475,7 @@ def _launch_locked(mode: str) -> int:
     else:
         jobs = [
             path
-            for path in sorted((AUDIT_ROOT / "jobs" / "omi-collector").glob("*/" + OWNER_FILE))
+            for path in sorted(jobs_root.glob("*/" + OWNER_FILE))
             if path.is_file()
             and _read_receipt_from(path) is not None
             and cast(dict[str, object], _read_receipt_from(path)).get("state") in {"paused", "interrupted"}

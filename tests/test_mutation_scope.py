@@ -313,6 +313,7 @@ def _process_tree_runner(pids_path: Path) -> str:
     return f"""
 import json, os, pathlib, signal, sqlite3, subprocess, sys, time
 pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({{'state': 'running'}}))
+pathlib.Path(os.environ['TMPDIR'], 'pytest_gremlins_sources.py').write_text('temporary')
 db = sqlite3.connect('.gremlins_cache/results.db')
 db.execute('CREATE TABLE results (cache_key TEXT PRIMARY KEY, result_json TEXT NOT NULL)')
 db.execute("INSERT INTO results VALUES (?, ?)", ('completed', json.dumps({{'status': 'ZAPPED'}})))
@@ -398,6 +399,7 @@ def test_pause_stops_new_session_descendant_but_preserves_unrelated_process(
         receipt = _read_json_object(job / mutation_scope.OWNER_FILE)
         assert receipt["state"] == "paused"
         assert receipt["checkpoint_verified"] is True
+        assert not (job / "tmp").exists()
         with closing(sqlite3.connect(checkout / ".gremlins_cache" / "results.db")) as cache:
             assert cache.execute("PRAGMA quick_check").fetchone() == ("ok",)
             assert cache.execute("SELECT * FROM results ORDER BY cache_key").fetchall() == [
@@ -513,6 +515,7 @@ def test_owner_sigterm_stops_process_tree_before_releasing_lock(tmp_path: Path) 
         assert receipt["exit_status"] == 143
         assert receipt["cleanup_verified"] is True
         assert receipt["checkpoint_verified"] is True
+        assert not (job / "tmp").exists()
         campaign = _read_json_object(checkout / ".gremlins_cache" / "campaign.json")
         assert campaign["state"] == "interrupted"
         with closing(sqlite3.connect(checkout / ".gremlins_cache" / "results.db")) as cache:

@@ -23,7 +23,7 @@ from omi_collector.capture.adapters.staging_contract import (
     StagingError,
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -321,9 +321,7 @@ def test_device_lock_contention_uses_live_pid_one_metadata(tmp_path: Path) -> No
     assert context.holder_scope == "other_process"
 
 
-def test_device_lock_contender_preserves_live_owner_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_device_lock_contender_preserves_live_owner_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
         staging_filesystem,
@@ -351,16 +349,12 @@ def test_device_lock_contender_preserves_live_owner_metadata(
 
     with StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"):
         pass
-    released_operations = [
-        fields["operation"] for name, fields in events if name == "device_lock_released"
-    ]
+    released_operations = [fields["operation"] for name, fields in events if name == "device_lock_released"]
     assert released_operations == ["capture_batch", "resume_pending_attempt"]
 
 
 @pytest.mark.parametrize("process_start", [None, "float"])
-def test_device_lock_rejects_noncanonical_process_start_as_stale(
-    tmp_path: Path, process_start: object
-) -> None:
+def test_device_lock_rejects_noncanonical_process_start_as_stale(tmp_path: Path, process_start: object) -> None:
     spool = tmp_path / "spool"
     capture_root = _capture_root(tmp_path)
     store = StagingStore(spool, capture_root)
@@ -673,3 +667,21 @@ def test_statvfs_and_atomic_write_errors_leave_evidence(tmp_path: Path) -> None:
     with pytest.raises(OSError, match="atomic write"):
         StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_descriptor_sync).prepare_streaming_attempt(1, 1)
     assert list((tmp_path / "attempts").glob("*/.attempt.json.*.tmp"))
+
+
+def test_public_recovery_accepts_matching_temporary_when_destination_is_regular(tmp_path: Path) -> None:
+    capture_root = _capture_root(tmp_path)
+    attempt = _started_attempt(tmp_path, count=1)
+    attempt.accept_chunk(100, _record(1))
+    bundle = attempt.seal(DoneNotification(0, 101)).bundle_path
+    before = {path.name: path.read_bytes() for path in bundle.iterdir()}
+    temporary = capture_root / f".{bundle.name}.{'a' * 32}.tmp"
+    temporary.mkdir()
+    for name, content in before.items():
+        (temporary / name).write_bytes(content)
+
+    with StagingStore(tmp_path, capture_root).device_lock(operation="recovery_test"):
+        pass
+
+    assert not temporary.exists()
+    assert {path.name: path.read_bytes() for path in bundle.iterdir()} == before

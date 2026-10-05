@@ -261,6 +261,22 @@ def test_ready_bundle_symlink_is_not_counted(tmp_path: Path) -> None:
     assert collect_spool_metrics(tmp_path).current_window.bundle_count == 0
 
 
+def test_ready_bundle_rejects_symlinked_records_file_even_when_bytes_match(tmp_path: Path) -> None:
+    file_name = "records.bin"
+    bundle = _bundle(tmp_path, "bundle", (_record(10),))
+    artifact = bundle / file_name
+    target = tmp_path.parent / f"{tmp_path.name}-outside-{file_name}"
+    target.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    artifact.symlink_to(target)
+
+    try:
+        with pytest.raises(SpoolMetricsError, match="must be a regular file"):
+            collect_spool_metrics(tmp_path)
+    finally:
+        target.unlink()
+
+
 def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path) -> None:
     _firmware_observations(tmp_path, (4, 9, 12))
     ready_root = tmp_path / "ready"

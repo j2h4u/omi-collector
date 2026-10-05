@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.4](https://github.com/j2h4u/omi-collector/compare/v0.11.3...v0.11.4) (2026-10-05)
+
+
+### Fixes
+
+* **mutation:** select resumable audit job safely ([65b1d6d](https://github.com/j2h4u/omi-collector/commit/65b1d6d67d231dab1e1f13ce8c02beecca3e7da7))
+
 ## [0.11.3](https://github.com/j2h4u/omi-collector/compare/v0.11.2...v0.11.3) (2026-10-05)
 
 

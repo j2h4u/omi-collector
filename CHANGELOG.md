@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.3](https://github.com/j2h4u/omi-collector/compare/v0.11.2...v0.11.3) (2026-10-05)
+
+
+### Fixes
+
+* **mutation:** bound full-suite and cleanup budgets ([67bc580](https://github.com/j2h4u/omi-collector/commit/67bc5804daee1e393e4d7a181fe84d95db1de795))
+* **mutation:** budget full-suite workers from measured baseline ([67bc580](https://github.com/j2h4u/omi-collector/commit/67bc5804daee1e393e4d7a181fe84d95db1de795))
+
+
+### Tests
+
+* **writer:** bound native failure cleanup ([67bc580](https://github.com/j2h4u/omi-collector/commit/67bc5804daee1e393e4d7a181fe84d95db1de795))
+
 ## [0.11.2](https://github.com/j2h4u/omi-collector/compare/v0.11.1...v0.11.2) (2026-10-05)
 
 

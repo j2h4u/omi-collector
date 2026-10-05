@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -13,6 +14,7 @@ from omi_collector.capture.application.presence import (
     PresenceScanStopError,
     PresenceScanTransitionError,
     PresenceScheduler,
+    PresenceWake,
 )
 from omi_collector.capture.application.presence_machine import (
     CandidateUnavailable,
@@ -65,6 +67,32 @@ async def _emit_stable(
             now[0] += 0.00001
         observer.emit(candidate)
         await asyncio.sleep(0)
+
+
+def _emit_pair(
+    callback: Callable[[object], object], candidate: object, now: list[float], first: float, second: float
+) -> None:
+    now[0] = first
+    callback(PresenceAdvertisement(candidate, -72))
+    now[0] = second
+    callback(PresenceAdvertisement(candidate, -72))
+
+
+def _emit_at(callback: Callable[[object], object], candidate: object, now: list[float], at: float) -> None:
+    now[0] = at
+    callback(PresenceAdvertisement(candidate, -72))
+
+
+def _after_loop_turns(turns: int, callback: Callable[[], None]) -> None:
+    loop = asyncio.get_running_loop()
+
+    def hop(remaining: int) -> None:
+        if remaining == 0:
+            callback()
+        else:
+            loop.call_soon(hop, remaining - 1)
+
+    loop.call_soon(hop, turns - 1)
 
 
 async def _cancel_waiter_and_close[T](
@@ -354,17 +382,22 @@ def test_close_during_redeem_does_not_return_a_stopped_permit() -> None:
         observer = BlockingStop()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         waiter = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer, scheduler, waiter)
-        await _emit_stable(observer)
-        await entered_stop.wait()
-        closing = asyncio.create_task(scheduler.close())
-        await asyncio.sleep(0)
-        release_stop.set()
+        closing: asyncio.Task[None] | None = None
+        try:
+            await _wait_started(observer, scheduler, waiter)
+            await _emit_stable(observer)
+            await asyncio.wait_for(entered_stop.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            closing = asyncio.create_task(scheduler.close())
+            await asyncio.sleep(0)
+            release_stop.set()
 
-        with pytest.raises(RuntimeError, match="closed"):
-            await waiter
-        await closing
-        assert not observer.active
+            with pytest.raises(RuntimeError, match="closed"):
+                await waiter
+            await closing
+            assert not observer.active
+        finally:
+            release_stop.set()
+            await _cancel_waiter_and_close(scheduler, waiter, closing)
 
     _run(scenario())
 
@@ -393,12 +426,14 @@ def test_only_one_waiter_is_accepted() -> None:
         observer = FakeObserver()
         scheduler = PresenceScheduler(observer, policy=_test_policy())
         first = asyncio.create_task(scheduler.wait_for_attempt())
-        await _wait_started(observer, scheduler, first)
-        with pytest.raises(RuntimeError, match="one presence waiter"):
-            await scheduler.wait_for_attempt()
-        await _emit_stable(observer)
-        await first
-        await scheduler.close()
+        try:
+            await _wait_started(observer, scheduler, first)
+            with pytest.raises(RuntimeError, match="one presence waiter"):
+                await asyncio.wait_for(scheduler.wait_for_attempt(), timeout=_READINESS_TIMEOUT_SECONDS)
+            await _emit_stable(observer)
+            await first
+        finally:
+            await _cancel_waiter_and_close(scheduler, first)
 
     _run(scenario())
 
@@ -438,6 +473,76 @@ def test_presence_policy_accepts_effective_config_maxima_above_defaults() -> Non
 
     assert policy.scan_recheck_seconds == config.scan_recheck_seconds
     assert policy.drain_cooldown_seconds == config.drain_cooldown_seconds
+
+
+@pytest.mark.parametrize("absence_seconds", (0.0, -0.5))
+def test_presence_policy_rejects_nonpositive_absence_bounds(absence_seconds: float) -> None:
+    with pytest.raises(ValueError, match=r"^presence policy bounds must be positive$"):
+        PresencePolicy(absence_seconds=absence_seconds)
+
+
+def test_presence_policy_accepts_equal_scan_cancel_grace_bounds() -> None:
+    policy = PresencePolicy(
+        scan_cancel_grace_min_seconds=0.1,
+        scan_cancel_grace_max_seconds=0.1,
+    )
+
+    assert policy.scan_cancel_grace_min_seconds == 0.1
+    assert policy.scan_cancel_grace_max_seconds == 0.1
+
+
+@pytest.mark.parametrize("fraction", (0.0, 1.0))
+def test_presence_policy_accepts_scan_cancel_grace_fraction_boundaries(fraction: float) -> None:
+    policy = PresencePolicy(scan_cancel_grace_fraction=fraction)
+
+    assert policy.scan_cancel_grace_fraction == fraction
+
+
+@pytest.mark.parametrize("fraction", (-0.5, 1.5))
+def test_presence_policy_rejects_scan_cancel_grace_fraction_outside_bounds(fraction: float) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^scan cancellation fraction must be between zero and one$",
+    ):
+        PresencePolicy(scan_cancel_grace_fraction=fraction)
+
+
+@pytest.mark.parametrize("rapid_backoff", ((0.0,), (-0.5,)))
+def test_presence_policy_rejects_nonpositive_rapid_backoff(rapid_backoff: tuple[float, ...]) -> None:
+    with pytest.raises(ValueError, match=r"^rapid retry delays must be positive$"):
+        PresencePolicy(rapid_backoff=rapid_backoff)
+
+
+def test_presence_policy_rejects_empty_rapid_backoff() -> None:
+    with pytest.raises(ValueError, match=r"^rapid retry delays must be positive$"):
+        PresencePolicy(rapid_backoff=())
+
+
+def test_scheduler_keeps_derived_timing_when_policy_assignment_is_rejected() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        delays: list[float] = []
+
+        async def sleep(delay: float) -> None:
+            delays.append(delay)
+            now[0] += delay
+
+        policy = _test_policy(absence_seconds=7.0, scan_recheck_seconds=30.0)
+        scheduler = PresenceScheduler(FakeObserver(), policy=policy, clock=lambda: now[0], sleep=sleep)
+        with pytest.raises(FrozenInstanceError):
+            scheduler.policy.absence_seconds = 700.0  # type: ignore[reportAttributeAccessIssue]
+        assert scheduler.policy is policy
+
+        scheduler.resume_interrupted_visit()
+        try:
+            end = await scheduler.wait_for_attempt()
+            assert isinstance(end, PresenceEnd)
+            assert end.reason == "absence"
+            assert delays == [7.0]
+        finally:
+            await scheduler.close()
+
+    _run(scenario())
 
 
 def test_effective_grace_values_bound_resistant_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -508,6 +613,55 @@ def test_failed_start_is_replaced_by_a_new_scanner_that_can_wake() -> None:
         assert (await waiter).reason == "advertisement"
         assert starts == 2
         await scheduler.close()
+
+    _run(scenario())
+
+
+def test_cooperative_start_timeout_retries_and_allows_a_later_presence_wake() -> None:
+    async def scenario() -> None:
+        first_start = asyncio.Event()
+        cancelled_start = asyncio.Event()
+
+        class CooperativeTimeout(FakeObserver):
+            starts = 0
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                self.starts += 1
+                if self.starts == 1:
+                    first_start.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        cancelled_start.set()
+                        raise
+                await super().start(callback)
+
+        observer = CooperativeTimeout()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(
+                scan_recheck_seconds=0.001,
+                drain_cooldown_seconds=0.001,
+                scan_transition_seconds=0.01,
+                scan_cancel_grace_min_seconds=0.001,
+                scan_cancel_grace_max_seconds=0.005,
+                scan_cancel_grace_fraction=0.5,
+            ),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            await asyncio.wait_for(first_start.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            await asyncio.wait_for(cancelled_start.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            await _wait_started(observer, scheduler, waiter)
+            await _emit_stable(observer)
+
+            wake = await asyncio.wait_for(waiter, timeout=_READINESS_TIMEOUT_SECONDS)
+
+            assert isinstance(wake, PresenceWake)
+            assert wake.reason == "advertisement"
+            assert observer.starts == 2
+        finally:
+            await _cancel_waiter_and_close(scheduler, waiter)
 
     _run(scenario())
 
@@ -672,6 +826,60 @@ def test_close_is_idempotent_and_wakes_a_waiter() -> None:
     _run(scenario())
 
 
+def test_close_retries_stop_after_cancellation_during_public_close() -> None:
+    async def scenario() -> None:
+        stop_started = asyncio.Event()
+        stop_cancelled = asyncio.Event()
+        waiting_for_presence = asyncio.Event()
+
+        async def idle_sleep(_: float) -> None:
+            waiting_for_presence.set()
+            await asyncio.Future()
+
+        class CancelFirstStop(FakeObserver):
+            stop_calls = 0
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    stop_started.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        stop_cancelled.set()
+                        raise
+                await super().stop()
+
+        observer = CancelFirstStop()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(scan_recheck_seconds=60.0),
+            sleep=idle_sleep,
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        closing: asyncio.Task[None] | None = None
+        try:
+            await _wait_started(observer, scheduler, waiter)
+            assert observer.active
+            await asyncio.wait_for(waiting_for_presence.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+
+            closing = asyncio.create_task(scheduler.close())
+            await asyncio.wait_for(stop_started.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            closing.cancel()
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await asyncio.gather(closing, return_exceptions=True)
+            await asyncio.wait_for(stop_cancelled.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+
+            await scheduler.close()
+
+            assert observer.stop_calls == 2
+            assert not observer.active
+        finally:
+            await _cancel_waiter_and_close(scheduler, waiter, closing)
+
+    _run(scenario())
+
+
 def test_close_racing_with_start_stops_the_completed_scanner() -> None:
     async def scenario() -> None:
         entered_start = asyncio.Event()
@@ -781,11 +989,13 @@ def test_startup_interrupted_visit_ends_on_absence_without_a_permit() -> None:
         )
         scheduler.resume_interrupted_visit()
 
-        ended = await scheduler.wait_for_attempt()
+        try:
+            ended = await asyncio.wait_for(scheduler.wait_for_attempt(), timeout=_READINESS_TIMEOUT_SECONDS)
 
-        assert ended == PresenceEnd("absence")
-        assert observer.events == ["start", "stop"]
-        await scheduler.close()
+            assert ended == PresenceEnd("absence")
+            assert observer.events == ["start", "stop"]
+        finally:
+            await scheduler.close()
 
     _run(scenario())
 
@@ -851,5 +1061,542 @@ def test_startup_rearm_keeps_absence_after_an_early_unavailable_permit() -> None
 
         assert ended == PresenceEnd("absence")
         await scheduler.close()
+
+    _run(scenario())
+
+
+def test_resume_with_expired_absence_returns_end_without_sleeping() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        sleep_calls: list[float] = []
+        policy = _test_policy(absence_seconds=5.0, scan_recheck_seconds=60.0)
+        observer = FakeObserver()
+
+        async def sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        scheduler = PresenceScheduler(observer, policy=policy, clock=lambda: now[0], sleep=sleep)
+        scheduler.resume_interrupted_visit()
+        now[0] = policy.absence_seconds
+
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                ended = await scheduler.wait_for_attempt()
+
+            assert ended == PresenceEnd("absence")
+            assert observer.events == ["start", "stop"]
+            assert sleep_calls == []
+        finally:
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_cancelling_partial_scan_start_stops_before_scheduler_reuse() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        first_start = asyncio.Event()
+        retry_start = asyncio.Event()
+        candidate = object()
+
+        class PartialStart(FakeObserver):
+            blocked_once = False
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                if not self.blocked_once:
+                    self.blocked_once = True
+                    self.callback = callback
+                    self.callbacks.append(callback)
+                    self.events.append("start")
+                    self.active = True
+                    first_start.set()
+                    await asyncio.Future()
+                    return
+                await super().start(callback)
+                retry_start.set()
+                _emit_pair(callback, candidate, now, 0.0, 0.02)
+
+        observer = PartialStart()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(
+                scan_transition_seconds=0.1,
+                scan_cancel_grace_min_seconds=0.01,
+                scan_cancel_grace_max_seconds=0.01,
+                scan_cancel_grace_fraction=1.0,
+            ),
+            clock=lambda: now[0],
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        retry: asyncio.Task[PresenceWake | PresenceEnd] | None = None
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await first_start.wait()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                    await waiter
+
+            assert observer.events == ["start", "stop"]
+            assert not observer.active
+
+            retry = asyncio.create_task(scheduler.wait_for_attempt())
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await retry_start.wait()
+                wake = await retry
+            assert isinstance(wake, PresenceWake)
+            assert wake.candidate is candidate
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            if retry is not None and not retry.done():
+                retry.cancel()
+            await asyncio.gather(waiter, *(() if retry is None else (retry,)), return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_uncertain_partial_scan_start_stops_before_propagating_transition_error() -> None:
+    async def scenario() -> None:
+        entered_start = asyncio.Event()
+        cancelled_start = asyncio.Event()
+        release_start = asyncio.Event()
+        start_finished = asyncio.Event()
+
+        class ResistantStart(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                entered_start.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancelled_start.set()
+                    await release_start.wait()
+                finally:
+                    start_finished.set()
+
+        observer = ResistantStart()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(
+                scan_transition_seconds=0.01,
+                scan_cancel_grace_min_seconds=0.002,
+                scan_cancel_grace_max_seconds=0.002,
+                scan_cancel_grace_fraction=1.0,
+            ),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await entered_start.wait()
+            waiter.cancel()
+            with pytest.raises(PresenceScanTransitionError, match="start cancellation is uncertain"):
+                async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                    await waiter
+
+            assert cancelled_start.is_set()
+            assert not observer.active
+            assert observer.events == ["start", "stop"]
+            with pytest.raises(RuntimeError, match="closed"):
+                await scheduler.wait_for_attempt()
+        finally:
+            release_start.set()
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await start_finished.wait()
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_normal_partial_start_failure_stops_before_fresh_scan_can_wake() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        second_start = asyncio.Event()
+        candidate = object()
+        sleep_calls: list[float] = []
+
+        class FailFirstStart(FakeObserver):
+            def __init__(self) -> None:
+                super().__init__()
+                self.failed = False
+                self.active_before_start: list[bool] = []
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                self.active_before_start.append(self.active)
+                self.callback = callback
+                self.callbacks.append(callback)
+                self.events.append("start")
+                self.active = True
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("partial scanner start failed")
+                second_start.set()
+                _emit_pair(callback, candidate, now, now[0], now[0] + 0.02)
+
+        async def sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+            now[0] += delay
+
+        observer = FailFirstStart()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(scan_recheck_seconds=0.01, drain_cooldown_seconds=60.0),
+            clock=lambda: now[0],
+            sleep=sleep,
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await second_start.wait()
+                wake = await waiter
+
+            assert isinstance(wake, PresenceWake)
+            assert wake.candidate is candidate
+            assert observer.active_before_start == [False, False]
+            assert observer.events == ["start", "stop", "start", "stop"]
+            assert len(sleep_calls) == 1
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["cancel", "timeout", "oserror"])
+def test_close_retries_observer_stop_after_first_attempt_fails(failure: str) -> None:
+    async def scenario() -> None:
+        entered_stop = asyncio.Event()
+        scan_started = asyncio.Event()
+
+        class FailFirstStop(FakeObserver):
+            stop_calls = 0
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                scan_started.set()
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                self.events.append("stop")
+                entered_stop.set()
+                if self.stop_calls == 1:
+                    if failure in {"cancel", "timeout"}:
+                        await asyncio.Future()
+                    raise OSError("first scanner stop failed")
+                self.active = False
+
+        observer = FailFirstStop()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(
+                scan_transition_seconds=0.01,
+                scan_cancel_grace_min_seconds=0.002,
+                scan_cancel_grace_max_seconds=0.002,
+                scan_cancel_grace_fraction=1.0,
+            ),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        closing: asyncio.Task[None] | None = None
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await scan_started.wait()
+
+            closing = asyncio.create_task(scheduler.close())
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await entered_stop.wait()
+            if failure == "cancel":
+                closing.cancel()
+                await asyncio.gather(closing, return_exceptions=True)
+            else:
+                async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                    await closing
+
+            assert observer.active
+            assert observer.stop_calls == 1
+            with pytest.raises(RuntimeError, match="closed"):
+                async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                    await waiter
+
+            await scheduler.close()
+            assert observer.stop_calls == 2
+            assert not observer.active
+            assert observer.events == ["start", "stop", "stop"]
+        finally:
+            if closing is not None and not closing.done():
+                closing.cancel()
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, *(() if closing is None else (closing,)), return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_stop_failure_retries_cleanup_and_fails_closed_before_returning() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        started = asyncio.Event()
+        candidate = object()
+
+        class FailOnceStop(FakeObserver):
+            stop_calls = 0
+
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                started.set()
+                _emit_pair(callback, candidate, now, 0.0, 0.02)
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                self.events.append("stop")
+                if self.stop_calls == 1:
+                    raise OSError("first scanner stop failed")
+                self.active = False
+
+        observer = FailOnceStop()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(arrival_stability_seconds=0.01, arrival_max_gap_seconds=0.5),
+            clock=lambda: now[0],
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await started.wait()
+                with pytest.raises(PresenceScanStopError):
+                    await waiter
+
+            assert observer.stop_calls == 2
+            assert observer.events == ["start", "stop", "stop"]
+            assert not observer.active
+            with pytest.raises(RuntimeError, match="closed"):
+                await scheduler.wait_for_attempt()
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_timer_winner_drains_current_stable_advertisement_after_getter_cancellation() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        timer_started = [asyncio.Event(), asyncio.Event()]
+        sleep_calls = 0
+        candidate = object()
+
+        async def controlled_sleep(delay: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            timer_started[min(sleep_calls - 1, 1)].set()
+            if sleep_calls == 1:
+                await asyncio.Future()
+                return
+            now[0] = delay
+            callback = observer.callback
+            assert callback is not None
+
+            def deliver() -> None:
+                now[0] = delay + 0.02
+                callback(PresenceAdvertisement(candidate, -72))
+
+            _after_loop_turns(3, deliver)
+
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(scan_recheck_seconds=0.01),
+            clock=lambda: now[0],
+            sleep=controlled_sleep,
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await timer_started[0].wait()
+            observer.emit(candidate)
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await timer_started[1].wait()
+                wake = await waiter
+
+            assert isinstance(wake, PresenceWake)
+            assert wake.candidate is candidate
+            assert observer.events == ["start", "stop"]
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_expired_absence_wins_over_advertisement_during_wait_cleanup() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        candidate = object()
+
+        def schedule_pair(delay: float) -> None:
+            callback = observer.callback
+            assert callback is not None
+
+            def deliver() -> None:
+                now[0] = delay + 0.01
+                callback(PresenceAdvertisement(candidate, -72))
+                now[0] = delay + 0.03
+                callback(PresenceAdvertisement(candidate, -72))
+
+            _after_loop_turns(5, deliver)
+
+        async def expire_absence(delay: float) -> None:
+            now[0] = delay
+            schedule_pair(delay)
+
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+            clock=lambda: now[0],
+            sleep=expire_absence,
+        )
+        scheduler.resume_interrupted_visit()
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                result = await waiter
+
+            assert result == PresenceEnd("absence")
+            assert observer.events == ["start", "stop"]
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_expired_resumed_absence_preserves_partial_scanner_cleanup_for_close() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        stop_attempts = 0
+
+        class PartialObserver(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                self.callback = callback
+                self.callbacks.append(callback)
+                self.events.append("start")
+                self.active = True
+                raise RuntimeError("partial start")
+
+            async def stop(self) -> None:
+                nonlocal stop_attempts
+                stop_attempts += 1
+                self.events.append("stop")
+                if stop_attempts == 1:
+                    raise OSError("partial stop")
+                self.active = False
+
+        async def expire(delay: float) -> None:
+            now[0] = delay
+
+        observer = PartialObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(absence_seconds=0.01, scan_recheck_seconds=60.0),
+            clock=lambda: now[0],
+            sleep=expire,
+        )
+        scheduler.resume_interrupted_visit()
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                result = await scheduler.wait_for_attempt()
+
+            assert result == PresenceEnd("absence")
+            assert observer.active
+            await scheduler.close()
+            assert not observer.active
+            assert observer.events == ["start", "stop", "stop"]
+        finally:
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        second_scan_started = asyncio.Event()
+        first_scan_started = asyncio.Event()
+        waiting_for_advertisement = asyncio.Event()
+        first_candidate = object()
+        stale_candidate = object()
+        fresh_candidate = object()
+
+        class TwoGenerationObserver(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                if len(self.callbacks) == 1:
+                    first_scan_started.set()
+                elif len(self.callbacks) == 2:
+                    second_scan_started.set()
+
+        async def wait_for_ads(_delay: float) -> None:
+            waiting_for_advertisement.set()
+            await asyncio.Future()
+
+        observer = TwoGenerationObserver()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(arrival_stability_seconds=0.01, arrival_max_gap_seconds=0.5),
+            clock=lambda: now[0],
+            sleep=wait_for_ads,
+        )
+        first = asyncio.create_task(scheduler.wait_for_attempt())
+        second: asyncio.Task[PresenceWake | PresenceEnd] | None = None
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await first_scan_started.wait()
+            stale_callback = observer.callbacks[0]
+            _emit_pair(stale_callback, first_candidate, now, 0.0, 0.02)
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                first_wake = await first
+            assert isinstance(first_wake, PresenceWake)
+            assert first_wake.candidate is first_candidate
+            assert await scheduler.attempt_finished(CandidateUnavailable()) is None
+
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await second_scan_started.wait()
+            waiting_for_advertisement.clear()
+            second = asyncio.create_task(scheduler.wait_for_attempt())
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await waiting_for_advertisement.wait()
+
+            current_callback = observer.callbacks[1]
+            _emit_at(current_callback, fresh_candidate, now, 0.1)
+            waiting_for_advertisement.clear()
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await waiting_for_advertisement.wait()
+
+            _emit_pair(stale_callback, stale_candidate, now, 0.2, 0.22)
+            _emit_at(current_callback, fresh_candidate, now, 0.3)
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                second_wake = await second
+
+            assert isinstance(second_wake, PresenceWake)
+            assert second_wake.candidate is fresh_candidate
+        finally:
+            for task in (first, second):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(first, *(() if second is None else (second,)), return_exceptions=True)
+            await scheduler.close()
 
     _run(scenario())

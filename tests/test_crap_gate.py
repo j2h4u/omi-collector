@@ -110,3 +110,16 @@ def test_zero_statement_function_is_treated_as_fully_covered(tmp_path: Path) -> 
 
     assert metric.coverage_fraction == 1.0
     assert metric.crap == 1.0
+
+
+def test_main_rejects_uncovered_simple_function_at_threshold_below_its_crap_score(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source_root = tmp_path / "src"
+    source = _write_source(source_root, "example.py", "def simple():\n    return 1\n")
+    report = _write_report(tmp_path / "coverage.json", {source: {"simple": (0, 1)}})
+
+    assert main(["--coverage", str(report), "--src", str(source_root), "--threshold", "1.5"]) == 1
+    assert capsys.readouterr().out == (
+        "CRAP gate failed: 1 function(s) exceed 1.50\n  example.py::simple:1 CRAP 2.00, complexity 1, coverage 0.0%\n"
+    )

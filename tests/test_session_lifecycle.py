@@ -4,21 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from typing import Never, cast
+from struct import pack
+from typing import Literal, Never, cast
 
 import pytest
 
+from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
-from omi_collector.capture.application.collector import CollectorTimeoutError, NoDataResult, TransferTimeouts
-from omi_collector.capture.application.operational_telemetry import ClockCorrectionSink, TelemetryClock
+from omi_collector.capture.application.collector import (
+    AdvanceUncertainError,
+    CollectorTimeoutError,
+    NoDataResult,
+    TransferCounters,
+    TransferInterruptedError,
+    TransferTimeouts,
+)
+from omi_collector.capture.application.operational_telemetry import TIME_READ_UUID, ClockCorrectionSink, TelemetryClock
 from omi_collector.capture.application.ports import CaptureRuntimePort
 from omi_collector.capture.application.presence import (
     PresenceAdvertisement,
+    PresenceEnd,
     PresencePolicy,
     PresenceScheduler,
     PresenceWake,
@@ -30,9 +41,17 @@ from omi_collector.capture.application.presence_machine import (
     ConnectedInterruption,
     NotConnected,
 )
+from omi_collector.capture.application.quality_metrics import ClockCorrectionMetric, TransferSessionMetric
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
-from omi_collector.capture.application.ring_transport import RingSession, RingTransportUnavailableError
+from omi_collector.capture.application.ring_transport import (
+    CandidateUnavailableError,
+    NotificationOverflowError,
+    RingSession,
+    RingTransportDisconnectedError,
+    RingTransportUnavailableError,
+)
 from omi_collector.capture.application.session_lifecycle import (
+    ActivityEvent,
     InfoReader,
     OpportunisticOptions,
     RetryPolicy,
@@ -40,17 +59,150 @@ from omi_collector.capture.application.session_lifecycle import (
     SessionLifecycleCallbacks,
     SessionLifecycleRun,
     SessionPhaseState,
+    bounded,
     exit_context,
     presence_attempt_outcome,
+    recoverable_session_outcome,
+    report_session_error,
+    storage_not_ready_delay,
     teardown_was_interrupted,
+    validate_policy,
 )
 from omi_collector.capture.application.visit_machine import DrainConfirmed, RecoveryDisposition
-from omi_collector.capture.domain.ring_protocol import RingInfo
-from omi_collector.config import CollectorConfig, TelemetryConfig
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
+from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, TelemetryConfig
 
 
 def _run(coroutine: Coroutine[object, object, object]) -> object:
     return asyncio.run(coroutine)
+
+
+class _ScriptedPresence:
+    policy = PresencePolicy(rapid_backoff=(0.01,))
+    drained_cooldown_remaining_seconds = 0.0
+
+    def __init__(
+        self,
+        wakes: list[PresenceWake | PresenceEnd | BaseException],
+        end_results: list[PresenceEnd | None] | None = None,
+    ) -> None:
+        self._wakes: Iterator[PresenceWake | PresenceEnd | BaseException] = iter(wakes)
+        self._end_results: Iterator[PresenceEnd | None] = iter(end_results or [])
+        self.wake_count = 0
+        self.outcomes: list[AttemptOutcome] = []
+        self.resumed = 0
+        self.closed = False
+
+    def resume_interrupted_visit(self) -> None:
+        self.resumed += 1
+
+    async def wait_for_attempt(self) -> PresenceWake | PresenceEnd:
+        self.wake_count += 1
+        value = next(self._wakes)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def attempt_finished(self, outcome: AttemptOutcome) -> PresenceEnd | None:
+        self.outcomes.append(outcome)
+        try:
+            return next(self._end_results)
+        except StopIteration:
+            return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _NoopRingContext:
+    def __init__(self, session: RingSession | None = None) -> None:
+        self.session = session or cast(RingSession, object())
+
+    async def __aenter__(self) -> RingSession:
+        return self.session
+
+    async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+        return None
+
+
+class _ClockCaseSession:
+    def __init__(self, clock_case: str, writes: list[tuple[str, int]]) -> None:
+        self.clock_case = clock_case
+        self.writes = writes
+        self.time_reads = 0
+
+    async def read_status(self) -> None:
+        return None
+
+    async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+        if uuid != TIME_READ_UUID:
+            return None
+        self.time_reads += 1
+        if self.clock_case == "unavailable":
+            return None
+        return pack("<I", 1000 if self.time_reads > 1 else 100)
+
+    async def write_optional_characteristic(self, uuid: str, value: bytes) -> bool:
+        self.writes.append((uuid, int.from_bytes(value, "little")))
+        return True
+
+
+class _TerminalMetricSession:
+    async def write_control(self, _payload: bytes) -> None:
+        return None
+
+
+class _TerminalMetricContext:
+    def __init__(self, case: str, session: _TerminalMetricSession, secondary: BaseException) -> None:
+        self.case = case
+        self.session = session
+        self.secondary = secondary
+
+    async def __aenter__(self) -> RingSession:
+        return cast(RingSession, self.session)
+
+    async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+        if self.case in {"teardown", "fatal_with_teardown"}:
+            raise self.secondary
+
+
+class _TerminalMetricConnectedStep:
+    def __init__(self, case: str, primary: BaseException) -> None:
+        self.case = case
+        self.primary = primary
+
+    async def __call__(
+        self,
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        assert phase.quality is not None
+        phase.quality.note_read(0.25, 3)
+        if self.case == "retryable":
+            raise CollectorTimeoutError("READ timed out")
+        if self.case in {"fatal", "fatal_with_teardown"}:
+            raise self.primary
+        return "drained", current
+
+
+class _RecordingLifecycleMetrics:
+    release_version = "test"
+    source_revision = None
+
+    def __init__(self) -> None:
+        self.corrections: list[ClockCorrectionMetric] = []
+        self.transfers: list[TransferSessionMetric] = []
+
+    def record_advertisement(self, _metric: object) -> None:
+        return None
+
+    def record_transfer_session(self, metric: TransferSessionMetric) -> None:
+        self.transfers.append(metric)
+
+    def record_clock_correction(self, metric: ClockCorrectionMetric) -> None:
+        self.corrections.append(metric)
 
 
 def _unexpected_startup_recovery() -> None:
@@ -88,6 +240,8 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
         enter_capture_priority=enter,
         exit_capture_priority=lambda: events.append("exit"),
     )
+    with pytest.raises(FrozenInstanceError):
+        callbacks.exit_capture_priority = None  # type: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValueError, match="supplied together"):
         replace(callbacks, exit_capture_priority=None)
     run = SessionLifecycleRun(
@@ -102,6 +256,95 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
     assert events == ["enter", "attempt", "close", "exit"]
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (CollectorTimeoutError("timeout"), "operation timed out"),
+        (AdvanceUncertainError("unknown advance"), "advance acknowledgement uncertain"),
+        (NotificationOverflowError("queue full"), "notification queue overflow"),
+    ],
+)
+def test_report_session_error_keeps_stable_operator_message(error: Exception, expected: str) -> None:
+    async def scenario() -> None:
+        activity: list[ActivityEvent] = []
+        await report_session_error(activity.append, "read/reconcile", error, OpportunisticRuntime())
+        assert len(activity) == 1
+        event = activity[0]
+        assert event.state == "session_error"
+        assert event.error_message == expected
+
+    _run(scenario())
+
+
+def test_report_session_error_bounds_distinct_transport_cause_chain() -> None:
+    async def scenario() -> None:
+        max_entries = DEFAULT_CONFIG.observability.max_error_chain_entries
+        root = RingTransportDisconnectedError("link to AA:BB:CC:DD:EE:FF lost")
+        previous: BaseException = root
+        for index in range(max_entries):
+            cause = RuntimeError(f"cause-{index}")
+            previous.__cause__ = cause
+            previous = cause
+
+        activity: list[ActivityEvent] = []
+        await report_session_error(activity.append, "read/reconcile", root, OpportunisticRuntime())
+        event = activity[0]
+        assert event.error_message is not None
+        assert event.error_message.split(" <- ") == [
+            "RingTransportDisconnectedError: link to [BLE address] lost",
+            *(f"RuntimeError: cause-{index}" for index in range(max_entries - 1)),
+        ]
+
+    _run(scenario())
+
+
+def test_report_session_error_bounds_long_type_name_at_operator_boundary() -> None:
+    async def scenario() -> None:
+        max_chars = DEFAULT_CONFIG.observability.max_error_entry_chars
+        long_type = cast(type[Exception], type("E" * (max_chars + 10), (Exception,), {}))
+        cause: Exception = long_type("details")
+        transport = RingTransportDisconnectedError("device link lost")
+        transport.__cause__ = cause
+        activity: list[ActivityEvent] = []
+
+        await report_session_error(activity.append, "connect", transport, OpportunisticRuntime())
+
+        event = activity[0]
+        assert event.error_message is not None
+        _, bounded_cause = event.error_message.split(" <- ")
+        assert bounded_cause == f"{'E' * (max_chars - 2)}: "
+        assert len(bounded_cause) == max_chars
+
+    _run(scenario())
+
+
+def test_report_session_error_truncates_long_redacted_message_to_entry_limit() -> None:
+    async def scenario() -> None:
+        max_chars = DEFAULT_CONFIG.observability.max_error_entry_chars
+        address = "AA:BB:CC:DD:EE:FF"
+        cause = RuntimeError(f"device {address} failed: " + "x" * (max_chars * 2))
+        transport = RingTransportDisconnectedError("device link lost")
+        transport.__cause__ = cause
+        activity: list[ActivityEvent] = []
+
+        await report_session_error(activity.append, "connect", transport, OpportunisticRuntime())
+
+        event = activity[0]
+        assert event.error_message is not None
+        _, bounded_cause = event.error_message.split(" <- ")
+        expected_prefix = "RuntimeError: device [BLE address] failed: "
+        assert bounded_cause == expected_prefix + "x" * (max_chars - len(expected_prefix))
+        assert len(bounded_cause) == max_chars
+        assert address not in event.error_message
+
+    _run(scenario())
+
+
+def test_validate_policy_accepts_exact_fit_large_integer_capacity() -> None:
+    records = 2**53 + 1
+    validate_policy(RetryPolicy(batch_records=records, arena_max_bytes=records * RECORD_SIZE))
+
+
 def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         events: list[str] = []
@@ -112,8 +355,16 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
 
         monkeypatch.setattr(store, "recover_and_publish", publish)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        attempt_calls = 0
+
+        async def unexpected_cooldown_sleep(_seconds: float) -> None:
+            raise AssertionError("stop_after_drained must not sleep for cooldown")
 
         async def attempt(_self: SessionLifecycle, *, with_presence: bool) -> DrainConfirmed:
+            nonlocal attempt_calls
+            attempt_calls += 1
+            if attempt_calls > 1:
+                raise AssertionError("stop_after_drained must prevent a second attempt")
             assert not with_presence
             maintenance.schedule_publication_retry()
             await asyncio.sleep(0)
@@ -143,7 +394,9 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
         )
         run = SessionLifecycleRun(
             provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
-            options=OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(stop_after_drained=True)),
+            options=OpportunisticOptions(
+                TransferTimeouts(1, 1), RetryPolicy(stop_after_drained=True), sleep=unexpected_cooldown_sleep
+            ),
             runtime=OpportunisticRuntime(),
             callbacks=callbacks,
         )
@@ -413,6 +666,7 @@ def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytes
     ) -> None:
         del clock
         emit({"event": "pendant_observation", "firmware": "3.0.21", "battery_percent": 68})
+        emit({"event": "pendant_clock_sync", "action": "none", "outcome": "host_unsynchronized"})
 
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=_noop,
@@ -445,6 +699,11 @@ def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytes
 
     assert order == ["drained", "battery", "disconnect"]
     assert observations[0]["firmware"] == "3.0.21"
+    assert observations[1] == {
+        "event": "pendant_clock_sync",
+        "action": "none",
+        "outcome": "host_unsynchronized",
+    }
     assert observations[-1] == {
         "event": "pendant_observation",
         "firmware": "3.0.21",
@@ -744,10 +1003,14 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
     class Presence:
         policy = PresencePolicy(rapid_backoff=(1.0,))
         drained_cooldown_remaining_seconds = 0.0
+        wake_calls = 0
 
         resume_interrupted_visit = staticmethod(_unexpected_startup_recovery)
 
         async def wait_for_attempt(self) -> PresenceWake:
+            self.wake_calls += 1
+            if self.wake_calls > 1:
+                raise AssertionError("setup failure must propagate before a second permit")
             return PresenceWake("test", candidate=object(), observed_at=time.monotonic())
 
         async def attempt_finished(self, outcome: AttemptOutcome) -> None:
@@ -954,3 +1217,667 @@ def test_presence_outcomes_are_canonical(outcome: str, durable_progress: bool, e
     assert isinstance(result, expected_type)
     if isinstance(result, (NotConnected, ConnectedInterruption)):
         assert result.durable_progress is durable_progress
+
+
+@pytest.mark.parametrize("timeout", (0.0, -0.5))
+def test_bounded_rejects_nonpositive_timeout_without_consuming_futures(timeout: float) -> None:
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        completed: asyncio.Future[str] = loop.create_future()
+        completed.set_result("ready")
+        unrelated: asyncio.Future[None] = loop.create_future()
+
+        with pytest.raises(ValueError, match="timeouts must be positive"):
+            await bounded(completed, timeout)
+
+        assert completed.done() and not completed.cancelled()
+        assert completed.result() == "ready"
+        assert not unrelated.done() and not unrelated.cancelled()
+        unrelated.cancel()
+
+    _run(scenario())
+
+
+def test_storage_not_ready_delay_saturates_after_configured_backoff() -> None:
+    backoff = DEFAULT_CONFIG.retry.storage_not_ready_backoff
+
+    assert [storage_not_ready_delay(index) for index in range(len(backoff) + 3)] == [
+        *backoff,
+        backoff[-1],
+        backoff[-1],
+        backoff[-1],
+    ]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        RetryPolicy(batch_records=0),
+        RetryPolicy(batch_records=-1),
+        RetryPolicy(batch_records=2, arena_max_bytes=RECORD_SIZE),
+    ),
+)
+def test_validate_policy_rejects_empty_or_oversized_batch_capacity(policy: RetryPolicy) -> None:
+    with pytest.raises(ValueError, match="policy values must be positive"):
+        validate_policy(policy)
+
+
+def test_validate_policy_accepts_exact_fit_batch_capacity() -> None:
+    validate_policy(RetryPolicy(batch_records=2, arena_max_bytes=2 * RECORD_SIZE))
+
+
+def test_recoverable_session_outcome_keeps_contended_device_lease_retryable(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path / "spool", tmp_path / "captures")
+    activity: list[ActivityEvent] = []
+    options = OpportunisticOptions(TransferTimeouts(1, 1), activity=activity.append)
+    runtime = OpportunisticRuntime()
+
+    with (
+        store.device_lock(operation="held"),
+        pytest.raises(DeviceAlreadyRunningError) as raised,
+        store.device_lock(operation="contender"),
+    ):
+        raise AssertionError("contended lock must fail before acquisition")
+
+    outcome = _run(recoverable_session_outcome(None, "connect", raised.value, options, runtime))
+
+    assert outcome == "retry"
+    assert [event.state for event in activity] == ["session_error"]
+    assert all(event.state != "fatal" for event in activity)
+
+
+def test_recoverable_session_outcome_does_not_retry_a_fatal_error_with_timeout_cause() -> None:
+    async def scenario() -> None:
+        fatal = ValueError("invalid state")
+        fatal.__cause__ = TimeoutError("nested timeout")
+        activity: list[ActivityEvent] = []
+        options = OpportunisticOptions(TransferTimeouts(1, 1), activity=activity.append)
+        runtime = OpportunisticRuntime()
+
+        with pytest.raises(ValueError) as raised:
+            await recoverable_session_outcome(None, "connect", fatal, options, runtime)
+        assert raised.value is fatal
+        assert [event.state for event in activity] == ["session_error", "fatal"]
+
+        retry_activity: list[ActivityEvent] = []
+        wrapped = TransferInterruptedError("transfer stopped", TransferCounters(0, 0, 0))
+        wrapped.__cause__ = TimeoutError("operation timed out")
+        outcome = await recoverable_session_outcome(
+            None,
+            "read/reconcile",
+            wrapped,
+            OpportunisticOptions(TransferTimeouts(1, 1), activity=retry_activity.append),
+            runtime,
+        )
+        assert outcome == "retry"
+        assert [event.state for event in retry_activity] == ["session_error"]
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("end_boundary", "reason"),
+    (("wait", "absence"), ("attempt_finished", "recovery_exhausted")),
+)
+def test_presence_end_closes_restored_visit_without_opening_another_provider(end_boundary: str, reason: str) -> None:
+    class StopAfterClosureError(RuntimeError):
+        pass
+
+    end = PresenceEnd(cast(Literal["absence", "recovery_exhausted"], reason))
+    wake = PresenceWake("restored", candidate="candidate", observed_at=100.0)
+    presence = _ScriptedPresence(
+        [end, StopAfterClosureError("closed visit observed")]
+        if end_boundary == "wait"
+        else [wake, StopAfterClosureError("closed visit observed")],
+        [] if end_boundary == "wait" else [end],
+    )
+    provider_candidates: list[object | None] = []
+    closures: list[str] = []
+
+    def provider(candidate: object | None) -> Never:
+        provider_candidates.append(candidate)
+        raise RingTransportUnavailableError("provider must not open after the end")
+
+    async def close_visit(value: str) -> None:
+        closures.append(value)
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        return "drained", current
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=presence.wait_for_attempt,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+        close_visit=close_visit,
+        load_recovery=lambda: _resumable_recovery(),
+    )
+    run = SessionLifecycleRun(
+        provider,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.01,)),
+            presence=presence,
+            clock=lambda: 100.0,
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(StopAfterClosureError):
+            await SessionLifecycle(run).run_with_presence()
+
+    _run(scenario())
+    assert closures == [reason]
+    assert provider_candidates == ([] if end_boundary == "wait" else ["candidate"])
+    assert presence.resumed == 1
+    assert presence.closed
+
+
+async def _resumable_recovery() -> RecoveryDisposition:
+    return "resumable"
+
+
+@pytest.mark.parametrize("clock_case", ("verified", "unsynchronized", "unavailable"))
+def test_run_session_records_only_verified_clock_corrections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock_case: str
+) -> None:
+    info = RingInfo(10, 12, 100, 1, 512)
+    emitted: list[dict[str, object]] = []
+    writes: list[tuple[str, int]] = []
+    activity: list[ActivityEvent] = []
+
+    session = _ClockCaseSession(clock_case, writes)
+    context = _NoopRingContext(cast(RingSession, session))
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        return "drained", current
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    metrics = _RecordingLifecycleMetrics()
+    correction_store = ClockCorrectionStore(tmp_path / "device.json")
+    options = OpportunisticOptions(
+        TransferTimeouts(1, 1),
+        RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+        operational=lambda event: emitted.append(dict(event)),
+        activity=activity.append,
+        host_time=lambda: 1000.0,
+        host_clock_synchronized=lambda: clock_case == "verified",
+        quality_metrics=metrics,  # type: ignore[arg-type]
+        clock_correction_sink=correction_store,
+    )
+    run = SessionLifecycleRun(lambda _candidate: context, options, OpportunisticRuntime(), callbacks)
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+    assert _run(SessionLifecycle(run).run_session(context)) == "drained"
+
+    correction_events = [event for event in emitted if event.get("event") == "pendant_clock_sync"]
+    assert len(correction_events) == 1, (activity, writes, session.time_reads)
+    if clock_case == "verified":
+        [metric] = metrics.corrections
+        assert writes == [("19b10031-e8f2-537e-4f6c-d104768a1214", 1000)]
+        assert correction_events[0]["outcome"] == "verified"
+        assert metric.drift_seconds == -900.0
+        assert metric.target_epoch == 1000
+        assert metric.boundary_sequence_min == metric.boundary_sequence_max == 12
+    else:
+        assert metrics.corrections == []
+        assert writes == []
+        assert correction_events[0]["outcome"] in {"host_unsynchronized", "device_time_malformed"}
+
+
+@pytest.mark.parametrize("terminal_case", ("retryable", "fatal", "teardown", "fatal_with_teardown"))
+def test_run_session_records_one_terminal_transfer_metric_without_masking_session_result(
+    monkeypatch: pytest.MonkeyPatch, terminal_case: str
+) -> None:
+    info = RingInfo(10, 12, 100, 1, 512)
+    primary = ValueError("fatal READ failure")
+    secondary = RingTransportUnavailableError("close interrupted")
+    session = _TerminalMetricSession()
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_TerminalMetricConnectedStep(terminal_case, primary),
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    metrics = _RecordingLifecycleMetrics()
+    run = SessionLifecycleRun(
+        lambda _candidate: _TerminalMetricContext(terminal_case, session, secondary),
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.01,)),
+            quality_metrics=metrics,  # type: ignore[arg-type]
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+
+    if terminal_case in {"fatal", "fatal_with_teardown"}:
+        with pytest.raises(ValueError) as raised:
+            _run(SessionLifecycle(run).run_session(_TerminalMetricContext(terminal_case, session, secondary)))
+        assert raised.value is primary
+    else:
+        result = _run(SessionLifecycle(run).run_session(_TerminalMetricContext(terminal_case, session, secondary)))
+        assert result == "connected_interrupted"
+
+    assert len(metrics.transfers) == 1
+    [metric] = metrics.transfers
+    assert metric.requested_record_count == 3
+    assert metric.active_read_elapsed_ms == 250
+    expected = {
+        "retryable": ("connected_interrupted", "retryable_error"),
+        "fatal": ("failed", "fatal_error"),
+        "teardown": ("connected_interrupted", "teardown_interrupted"),
+        "fatal_with_teardown": ("failed", "fatal_error"),
+    }[terminal_case]
+    assert (metric.outcome, metric.termination_class) == expected
+
+
+@pytest.mark.parametrize("progress_kind", ("unchanged", "completed_batch", "durable_frontier"))
+def test_presence_interruption_reports_only_durable_progress_and_retries(
+    progress_kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    presence = _ScriptedPresence(
+        [PresenceWake(f"wake-{number}", candidate=number, observed_at=100.0) for number in (1, 2)]
+    )
+    completed_batches = 0
+    durable_frontier = 0
+    connected_calls = 0
+
+    def provider(_candidate: object | None) -> _NoopRingContext:
+        if presence.wake_count == 1 and progress_kind == "unchanged":
+            raise RingTransportUnavailableError("disconnected before connect")
+        return _NoopRingContext()
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        nonlocal completed_batches, durable_frontier, connected_calls
+        connected_calls += 1
+        if connected_calls == 1 and progress_kind != "unchanged":
+            if progress_kind == "completed_batch":
+                completed_batches += 1
+            elif progress_kind == "durable_frontier":
+                durable_frontier += 1
+            raise CollectorTimeoutError("interrupted after public progress boundary")
+        return "drained", current
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=presence.wait_for_attempt,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: completed_batches,
+        durable_progress_query=lambda: durable_frontier,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+    )
+    run = SessionLifecycleRun(
+        provider,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+            presence=presence,
+            clock=lambda: 100.0,
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return RingInfo(10, 10, 100, 0, 512)
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+
+    assert _run(SessionLifecycle(run).run_with_presence()) == NoDataResult(RingInfo(10, 10, 100, 0, 512))
+    assert len(presence.outcomes) == 2
+    first = presence.outcomes[0]
+    if progress_kind == "unchanged":
+        assert isinstance(first, NotConnected) and first.durable_progress is False
+    else:
+        assert isinstance(first, ConnectedInterruption) and first.durable_progress is True
+    assert isinstance(presence.outcomes[1], CleanDrain)
+    assert presence.wake_count == 2
+    assert presence.closed
+
+
+def test_presence_batch_complete_activity_only_follows_completed_batch_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    presence = _ScriptedPresence([PresenceWake("wake", candidate=number, observed_at=100.0) for number in (1, 2, 3)])
+    calls = 0
+    completed_batches = 0
+    activity: list[ActivityEvent] = []
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        nonlocal calls, completed_batches
+        calls += 1
+        if calls == 1:
+            raise CollectorTimeoutError("interrupted without completed batch")
+        if calls == 2:
+            completed_batches += 1
+            raise CollectorTimeoutError("interrupted after completed batch")
+        return "drained", current
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=presence.wait_for_attempt,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: completed_batches,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+    )
+    run = SessionLifecycleRun(
+        lambda _candidate: _NoopRingContext(),
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+            activity=activity.append,
+            presence=presence,
+            clock=lambda: 100.0,
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return RingInfo(10, 10, 100, 0, 512)
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+
+    _run(SessionLifecycle(run).run_with_presence())
+
+    assert [event.state for event in activity].count("batch_complete") == 1
+    assert [event.state for event in activity].count("drained") == 1
+    assert len(presence.outcomes) == 3
+    assert isinstance(presence.outcomes[0], ConnectedInterruption)
+    assert presence.outcomes[0].durable_progress is False
+    assert isinstance(presence.outcomes[1], ConnectedInterruption)
+    assert presence.outcomes[1].durable_progress is True
+    assert isinstance(presence.outcomes[2], CleanDrain)
+
+
+def test_direct_retry_backoff_resets_after_completed_batch_then_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = RingInfo(10, 10, 100, 0, 512)
+    provider_calls = 0
+    connected_calls = 0
+    completed_batches = 0
+    delays: list[float] = []
+    activity: list[ActivityEvent] = []
+
+    class Context:
+        async def __aenter__(self) -> RingSession:
+            return cast(RingSession, object())
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    def provider(_candidate: object | None) -> Context:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls <= 2:
+            raise RingTransportUnavailableError("connect interrupted")
+        return Context()
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        nonlocal connected_calls, completed_batches
+        connected_calls += 1
+        if connected_calls == 1:
+            completed_batches += 1
+            raise CollectorTimeoutError("interrupted after completed batch")
+        return "drained", current
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: completed_batches,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.1, 0.2, 0.4), stop_after_drained=True),
+            activity=activity.append,
+            sleep=sleep,
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+
+    assert _run(SessionLifecycle(run).run_direct()) == NoDataResult(info)
+    assert delays == [0.1, 0.2, 0.1]
+    assert "batch_complete" not in [event.state for event in activity]
+
+
+def test_presence_rejects_expired_and_untimed_wakes_before_provider_then_accepts_fresh_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    presence = _ScriptedPresence(
+        [
+            PresenceWake("exact-expiry", candidate="exact", observed_at=90.0),
+            PresenceWake("expired", candidate="late", observed_at=89.9),
+            PresenceWake("missing-time", candidate="untimed", observed_at=None),
+            PresenceWake("fresh", candidate="fresh", observed_at=99.9),
+        ]
+    )
+    provider_candidates: list[object | None] = []
+
+    def provider(candidate: object | None) -> _NoopRingContext:
+        provider_candidates.append(candidate)
+        return _NoopRingContext()
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        return "drained", current
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=presence.wait_for_attempt,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+    )
+    run = SessionLifecycleRun(
+        provider,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+            presence=presence,
+            clock=lambda: 100.0,
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return RingInfo(10, 10, 100, 0, 512)
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+    _run(SessionLifecycle(run).run_with_presence())
+
+    assert provider_candidates == ["fresh"]
+    assert presence.outcomes == [CandidateUnavailable(), CandidateUnavailable(), CandidateUnavailable(), CleanDrain()]
+
+
+def test_provider_candidate_unavailable_is_reported_and_next_wake_can_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    presence = _ScriptedPresence(
+        [
+            PresenceWake("fresh", candidate="candidate-1", observed_at=100.0),
+            PresenceWake("fresh", candidate="candidate-2", observed_at=100.0),
+        ]
+    )
+    candidates: list[object | None] = []
+
+    def provider(candidate: object | None) -> _NoopRingContext:
+        candidates.append(candidate)
+        if len(candidates) == 1:
+            raise CandidateUnavailableError("candidate disappeared before connection")
+        return _NoopRingContext()
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        return "drained", current
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=presence.wait_for_attempt,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+    )
+    run = SessionLifecycleRun(
+        provider,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+            presence=presence,
+            clock=lambda: 100.0,
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return RingInfo(10, 10, 100, 0, 512)
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+    _run(SessionLifecycle(run).run_with_presence())
+
+    assert candidates == ["candidate-1", "candidate-2"]
+    assert presence.outcomes == [CandidateUnavailable(), CleanDrain()]
+
+
+def test_presence_reports_disconnected_and_connected_interruption_kinds_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    presence = _ScriptedPresence(
+        [
+            PresenceWake("fresh", candidate="candidate-1", observed_at=100.0),
+            PresenceWake("fresh", candidate="candidate-2", observed_at=100.0),
+            PresenceWake("fresh", candidate="candidate-3", observed_at=100.0),
+        ]
+    )
+    provider_calls = 0
+    connected_calls = 0
+
+    def provider(_candidate: object | None) -> _NoopRingContext:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            raise RingTransportUnavailableError("disconnected before a GATT session")
+        return _NoopRingContext()
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        nonlocal connected_calls
+        connected_calls += 1
+        if connected_calls == 1:
+            raise CollectorTimeoutError("connected READ interrupted")
+        return "drained", current
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=presence.wait_for_attempt,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
+    )
+    run = SessionLifecycleRun(
+        provider,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+            presence=presence,
+            clock=lambda: 100.0,
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return RingInfo(10, 10, 100, 0, 512)
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+    _run(SessionLifecycle(run).run_with_presence())
+
+    assert presence.outcomes == [NotConnected(False), ConnectedInterruption(False), CleanDrain()]

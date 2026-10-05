@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from shutil import rmtree
+from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter, StagingWriterStateError, ThreadAffinityError
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
@@ -143,3 +146,130 @@ def test_target_rejects_direct_cross_thread_calls_after_first_call(tmp_path: Pat
 
     assert len(failures) == 1
     assert isinstance(failures[0], ThreadAffinityError)
+
+
+def test_prepare_is_idempotent_and_data_waits_for_each_read_begin(tmp_path: Path) -> None:
+    writer = StagingWriter(_store(tmp_path), 100, 3)
+    try:
+        descriptor = writer.prepare()
+        assert writer.prepare() == descriptor
+        raw = tmp_path / "attempts" / descriptor.attempt_id / "records.bin"
+        checkpoint = raw.with_name("checkpoint.json")
+        before = (raw.read_bytes(), checkpoint.read_bytes())
+
+        with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
+            writer.append_chunk(0, memoryview(_record(1)))
+        with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
+            writer.checkpoint()
+        assert (raw.read_bytes(), checkpoint.read_bytes()) == before
+
+        prefix = writer.prepare_leg(100, 3)
+        assert prefix.record_count == 0
+        with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
+            writer.append_chunk(0, memoryview(_record(1)))
+        with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
+            writer.checkpoint()
+
+        writer.read_begin(ReadBeginNotification(100, 3))
+        writer.append_chunk(0, memoryview(_record(1) * 2))
+        durable = writer.checkpoint()
+        recovery = writer.begin_recovery(102, 1)
+        assert recovery == durable
+        with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
+            writer.append_chunk(0, memoryview(_record(3)))
+        with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
+            writer.checkpoint()
+        writer.read_begin(ReadBeginNotification(102, 1))
+        writer.append_chunk(0, memoryview(_record(3)))
+        assert writer.checkpoint().next_sequence == 103
+    finally:
+        writer.close()
+
+
+def test_invalid_append_scalars_and_empty_data_leave_persisted_bytes_unchanged(tmp_path: Path) -> None:
+    writer = StagingWriter(_store(tmp_path), 100, 2)
+    try:
+        descriptor = writer.prepare()
+        writer.read_begin(ReadBeginNotification(100, 2))
+        raw = tmp_path / "attempts" / descriptor.attempt_id / "records.bin"
+        checkpoint = raw.with_name("checkpoint.json")
+        before = (raw.read_bytes(), checkpoint.read_bytes())
+
+        for offset, error in ((True, TypeError), ("0", TypeError), (-1, ValueError)):
+            with pytest.raises(error):
+                writer.append_chunk(cast(int, offset), memoryview(_record(1)))
+        with pytest.raises(ValueError, match="positive multiple"):
+            writer.append_chunk(0, memoryview(b""))
+        assert (raw.read_bytes(), checkpoint.read_bytes()) == before
+    finally:
+        writer.close()
+
+
+def test_prepare_leg_validates_bounds_and_accepts_zero_start(tmp_path: Path) -> None:
+    writer = StagingWriter(_store(tmp_path), 0, 2)
+    try:
+        prefix = writer.prepare_leg(0, 2)
+        assert (prefix.start_sequence, prefix.next_sequence, prefix.record_count) == (0, 0, 0)
+        for start, count in ((True, 1), (-1, 1), (0, 0), (0, True)):
+            with pytest.raises(ValueError):
+                writer.prepare_leg(start, count)
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("terminal", ["seal", "prefix"])
+def test_terminal_publication_blocks_later_appends(tmp_path: Path, terminal: str) -> None:
+    writer = StagingWriter(_store(tmp_path), 100, 1)
+    try:
+        _begin(writer, 100, 1)
+        if terminal == "seal":
+            writer.append_chunk(0, memoryview(_record(1)))
+            writer.checkpoint()
+            writer.seal(DoneNotification(0, 101))
+        else:
+            writer.append_chunk(0, memoryview(_record(1)))
+            writer.checkpoint()
+            writer.publish_prefix()
+        with pytest.raises(StagingWriterStateError, match="sealed"):
+            writer.append_chunk(0, memoryview(_record(2)))
+    finally:
+        writer.close()
+
+
+def test_close_flushes_raw_before_releasing_lease_and_resume_adopts_raw_tail(tmp_path: Path) -> None:
+    lock_checks: list[bool] = []
+    store: StagingStore
+
+    def fsync_and_check_lock(fd: int) -> None:
+        os.fsync(fd)
+        if Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin" and os.fstat(fd).st_size:
+            try:
+                with store.device_lock(operation="close_order_probe"):
+                    lock_checks.append(False)
+            except DeviceAlreadyRunningError:
+                lock_checks.append(True)
+
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_and_check_lock)
+    writer = StagingWriter(store, 100, 1)
+    try:
+        descriptor = writer.prepare()
+        writer.read_begin(ReadBeginNotification(100, 1))
+        writer.append_chunk(0, memoryview(_record(1)))
+        checkpoint = tmp_path / "attempts" / descriptor.attempt_id / "checkpoint.json"
+        checkpoint_before_close = checkpoint.read_bytes()
+        writer.close()
+    finally:
+        writer.close()
+
+    assert lock_checks == [True]
+    assert checkpoint.read_bytes() == checkpoint_before_close
+    with store.device_lock(operation="post_close_probe"):
+        pass
+
+    resumed = StagingWriter(store, 100, 1)
+    try:
+        resumed.prepare()
+        prefix = resumed.prepare_leg(100, 1)
+        assert (prefix.next_sequence, prefix.record_count) == (101, 1)
+    finally:
+        resumed.close()

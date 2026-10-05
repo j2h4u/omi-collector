@@ -5,7 +5,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from functools import partial, wraps
 from hashlib import sha256
 from json import loads
@@ -24,11 +24,13 @@ from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStor
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
+from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
 from omi_collector.capture.adapters.staging_contract import (
     AttemptDescriptor,
     DeviceAlreadyRunningError,
     DurablePrefix,
     LockContext,
+    StagingError,
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
@@ -416,7 +418,9 @@ class _SealResultBatchWriter:
 
 
 @asynccontextmanager
-async def _real_batch_writer(store: StagingStore, start: int, count: int) -> AsyncIterator[BatchWriterPort]:
+async def _real_batch_writer(
+    store: StagingStore, start: int, count: int, *, prepared: bool = True
+) -> AsyncIterator[BatchWriterPort]:
     writer = _runtime().make_batch_writer(
         store,
         start,
@@ -427,8 +431,9 @@ async def _real_batch_writer(store: StagingStore, start: int, count: int) -> Asy
     )
     try:
         await writer.start()
-        await writer.prepare_leg(start, count)
-        await writer.read_begin(ReadBeginNotification(start, count))
+        if prepared:
+            await writer.prepare_leg(start, count)
+            await writer.read_begin(ReadBeginNotification(start, count))
         yield writer
     finally:
         try:
@@ -436,6 +441,67 @@ async def _real_batch_writer(store: StagingStore, start: int, count: int) -> Asy
         finally:
             await asyncio.to_thread(writer.thread.join, 2)
             assert not writer.thread.is_alive()
+
+
+@_async_test
+async def test_real_runtime_writer_start_persists_pending_attempt_before_leg_work(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    async with _real_batch_writer(store, 100, 2, prepared=False) as writer:
+        pending = store.pending_attempts()
+        assert len(pending) == 1
+        assert pending[0].attempt_id == writer.attempt_id
+        assert pending[0].start_sequence == 100
+        assert pending[0].packet_count == 2
+        assert pending[0].read_begin_start is None
+        assert pending[0].read_begin_count is None
+
+
+@_async_test
+async def test_real_runtime_writer_barrier_returns_persisted_durable_prefix(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    record = _record(100)
+    async with _real_batch_writer(store, 100, 2) as writer:
+        assert writer.publish(RECORD_SIZE)
+        durable = await writer.barrier()
+
+        assert durable.start_sequence == 100
+        assert durable.next_sequence == 101
+        assert durable.record_count == 1
+        attempt_path = store.attempts_root / writer.attempt_id
+        assert (attempt_path / "records.bin").read_bytes() == record
+        checkpoint = cast(dict[str, object], loads((attempt_path / "checkpoint.json").read_text(encoding="utf-8")))
+        assert checkpoint["record_count"] == 1
+        assert checkpoint["raw_sha256"] == sha256(record).hexdigest()
+        assert durable.raw_sha256 == checkpoint["raw_sha256"]
+
+
+@_async_test
+async def test_real_runtime_writer_retains_seal_bundle_result(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    records = _records(100, 2)
+    async with _real_batch_writer(store, 100, 2) as writer:
+        assert writer.publish(len(records))
+        sealed = await writer.seal(DoneNotification(0, 102))
+        retained = await writer.await_seal_result()
+
+        assert retained == sealed
+        assert sealed.bundle_path.is_dir()
+        assert (sealed.bundle_path / "records.bin").read_bytes() == records
+        manifest = cast(dict[str, object], loads((sealed.bundle_path / "manifest.json").read_text(encoding="utf-8")))
+        assert manifest["start_sequence"] == 100
+        assert manifest["next_sequence"] == 102
+        assert manifest["record_count"] == 2
+
+
+@_async_test
+async def test_real_runtime_classifies_deferred_quarantine_failures() -> None:
+    runtime = _runtime()
+    errors: tuple[BaseException, ...] = (
+        QuarantineSalvageDeferredError("publication should wait"),
+        DeviceAlreadyRunningError(),
+        StagingError("local staging is temporarily unavailable"),
+    )
+    assert tuple(runtime.classify_quarantine_error(error) for error in errors) == ("deferred",) * len(errors)
 
 
 @_async_test
@@ -493,6 +559,26 @@ async def test_coordinator_wires_real_clock_observation_store(tmp_path: Path, mo
     correction, observation = observed
     assert isinstance(correction, ClockCorrectionStore)
     assert observation is correction.observation_store
+
+
+@_async_test
+async def test_empty_pending_startup_disposition_cannot_be_rewritten(tmp_path: Path) -> None:
+    staging = StagingStore(tmp_path / "spool", tmp_path / "captures")
+    maintenance = QuarantineMaintenance(staging, None, _runtime())
+    try:
+        initial = await maintenance.prepare_pending_startup()
+
+        assert initial.pending is None
+        assert initial.durable_next is None
+        assert initial.disposition == "empty"
+        with pytest.raises(FrozenInstanceError):
+            initial.disposition = "needs_interrupted_close"  # type: ignore[reportAttributeAccessIssue]
+
+        repeated = await maintenance.prepare_pending_startup()
+        assert repeated is initial
+        assert repeated.disposition == "empty"
+    finally:
+        await maintenance.close()
 
 
 @_async_test
@@ -570,7 +656,7 @@ async def test_progress_pump_coalesces_slow_callbacks_and_ignores_callback_failu
     async with asyncio.TaskGroup() as tasks:
         pump = tasks.create_task(batch_reconciliation._pump_progress(mailbox, slow_callback, 60.0))
         mailbox.publish(event(1))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
         mailbox.publish(event(2))
         mailbox.publish(event(3), terminal=True)
         release.set()
@@ -674,7 +760,7 @@ def _patch_observation_writer(
     close_calls: list[None],
     *,
     observe_error: bool = False,
-    close_error: bool = False,
+    close_error: bool | BaseException = False,
 ) -> None:
     class FakeObservationWriter:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -687,6 +773,8 @@ def _patch_observation_writer(
 
         def close(self) -> None:
             close_calls.append(None)
+            if isinstance(close_error, BaseException):
+                raise close_error
             if close_error:
                 raise RuntimeError("observation close unavailable")
 
@@ -913,6 +1001,39 @@ async def test_observation_writer_failures_do_not_block_collection(
     assert close_calls == [None]
     assert debug_records[0][0] == "firmware_observation_writer_error"
     assert debug_records[0][2]["operation"] == failure
+
+
+@pytest.mark.parametrize("failure_stage", ("collection", "finalization"))
+@_async_test
+async def test_observation_close_cancellation_does_not_mask_primary_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    close_calls: list[None] = []
+    primary = RuntimeError(f"primary {failure_stage} failure")
+    _patch_observation_writer(monkeypatch, [], close_calls, close_error=asyncio.CancelledError())
+
+    if failure_stage == "collection":
+
+        def provider(_candidate: object | None = None) -> AbstractAsyncContextManager[RingSession]:
+            raise primary
+
+        call = run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
+    else:
+        session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
+
+        async def fail_finalization(_reconciler: BatchReconciler) -> object:
+            raise primary
+
+        monkeypatch.setattr(BatchReconciler, "finalize_active", fail_finalization)
+        call = run_opportunistic_collector(
+            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        )
+
+    with pytest.raises(RuntimeError) as raised:
+        await call
+
+    assert raised.value is primary
+    assert close_calls == [None]
 
 
 @_async_test
@@ -1510,6 +1631,7 @@ async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_an
     assert isinstance(result, CollectionResult)
     assert session.writes == [b"\x10", b"\x10"]
     assert encode_advance_command(102) not in session.writes
+    assert result.advance_confirmed is False
     prefix_bundles = tuple(path for path in (_capture_root(tmp_path)).iterdir() if path.name.startswith("100-101-"))
     assert len(prefix_bundles) == 1
     assert not (prefix_bundles[0] / "gap.json").exists()
@@ -2889,6 +3011,8 @@ async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -
     assert isinstance(result, CollectionResult)
     assert result.packet_count == 2
     assert [metric["requested_record_count"] for metric in metrics] == [2, 1]
+    assert [metric["outcome"] for metric in metrics] == ["connected_interrupted", "drained"]
+    assert [metric["termination_class"] for metric in metrics] == ["retryable_error", "completed"]
     assert [metric["received_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
     assert [metric["submitted_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
     assert [metric["written_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
@@ -3709,6 +3833,7 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
     tmp_path: Path, phase: str, expected_kind: str
 ) -> None:
     entered = asyncio.Event()
+    release_advance = asyncio.Event()
 
     class GatedSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -3717,6 +3842,7 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
                 entered.set()
             if phase == "advance" and payload == encode_advance_command(12):
                 entered.set()
+                await release_advance.wait()
             if phase == "confirm" and payload == b"\x10" and len(self.writes) == 5:
                 entered.set()
 
@@ -3748,19 +3874,24 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
     task = asyncio.create_task(
         run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options())
     )
-    await entered.wait()
-    for _ in range(3):
-        await asyncio.sleep(0)
-    task.cancel()
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        task.cancel()
 
-    with pytest.raises(CollectionPreservedCancelledError) as raised:
-        await task
-    assert raised.value.kind == expected_kind
-    assert raised.value.preserved_path.exists()
-    if phase == "read":
-        assert raised.value.preserved_path == tmp_path / "attempts"
-    else:
-        assert raised.value.preserved_path.parent == _capture_root(tmp_path)
+        with pytest.raises(CollectionPreservedCancelledError) as raised:
+            await task
+        assert raised.value.kind == expected_kind
+        assert raised.value.preserved_path.exists()
+        if phase == "read":
+            assert raised.value.preserved_path == tmp_path / "attempts"
+        else:
+            assert raised.value.preserved_path.parent == _capture_root(tmp_path)
+    finally:
+        release_advance.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @_async_test

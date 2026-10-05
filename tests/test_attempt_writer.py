@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
+import os
 import threading
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
+from pathlib import Path
+from typing import Protocol
 
 import pytest
 
@@ -29,6 +34,12 @@ from omi_collector.config import DEFAULT_CONFIG, WriterConfig
 class DurableMarker:
     next_sequence: int
     record_count: int
+
+
+@dataclass(frozen=True)
+class UnvalidatedMarker:
+    next_sequence: object
+    record_count: object
 
 
 @dataclass
@@ -58,6 +69,7 @@ class FakeTarget:
     seal_calls: int = 0
     close_calls: int = 0
     checkpoint_result: object = "checkpointed"
+    prepare_leg_result: object = "prepared"
     append_readonly: list[bool] = field(default_factory=list)
     append_offsets: list[int] = field(default_factory=list)
     second_append_started: threading.Event = field(default_factory=threading.Event)
@@ -75,7 +87,7 @@ class FakeTarget:
 
     def prepare_leg(self, start_sequence: int, record_count: int) -> object:
         self._record("prepare_leg", (start_sequence, record_count))
-        return "prepared"
+        return self.prepare_leg_result
 
     def read_begin(self, notice: object) -> object:
         self._record("read_begin", notice)
@@ -131,6 +143,92 @@ class FakeTarget:
         return "closed"
 
 
+class _ProcessEvent(Protocol):
+    def set(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> bool: ...
+
+
+class _ProcessRelease(Protocol):
+    def poll(self, timeout: float | None = None) -> bool: ...
+
+    def recv(self) -> object: ...
+
+
+class _ProcessFlags(Protocol):
+    def __getitem__(self, index: int) -> int: ...
+
+    def __setitem__(self, index: int, value: int) -> None: ...
+
+
+class ProcessLifetimeTarget:
+    def __init__(self, entered: _ProcessEvent, release: _ProcessRelease, flags: _ProcessFlags) -> None:
+        self.entered = entered
+        self.release = release
+        self.flags = flags
+
+    def prepare(self) -> object:
+        return None
+
+    def prepare_leg(self, start_sequence: int, record_count: int) -> object:
+        del start_sequence, record_count
+        return None
+
+    def read_begin(self, notice: object) -> object:
+        del notice
+        self.flags[0] = 1
+        return None
+
+    def append_chunk(self, offset: int, chunk: memoryview) -> object:
+        del offset, chunk
+        self.entered.set()
+        if not self.release.poll(15):
+            raise TimeoutError("parent did not release the writer target")
+        self.release.recv()
+        return None
+
+    def checkpoint(self) -> object:
+        self.flags[1] = 1
+        return None
+
+    def seal(self, done_notice: object) -> object:
+        del done_notice
+        return None
+
+    def publish_prefix(self) -> object:
+        return None
+
+    def close(self) -> object:
+        self.flags[2] = 1
+        return None
+
+
+def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Connection, flags: _ProcessFlags) -> None:
+    async def lifecycle() -> None:
+        writer = AttemptWriter(ProcessLifetimeTarget(entered, release, flags), bytes(RECORD_SIZE))
+        try:
+            await writer.start()
+            await writer.prepare_leg(10, 1)
+            await writer.read_begin("begin")
+            writer.publish(RECORD_SIZE)
+            await writer.checkpoint()
+            await writer.close(timeout=5)
+        finally:
+            if writer.state is not WriterState.CLOSED:
+                await writer.close(timeout=5)
+
+    def owner() -> None:
+        try:
+            asyncio.run(lifecycle())
+        except Exception:  # noqa: BLE001 - the child reports owner-thread failures through shared state
+            flags[3] = 1
+
+    owner_thread = threading.Thread(target=owner, name="test-writer-owner", daemon=True)
+    owner_thread.start()
+    if not entered.wait(10):
+        flags[3] = 1
+
+
 @asynccontextmanager
 async def _owned_writer(
     target: FakeTarget,
@@ -180,6 +278,11 @@ async def _started(
         yield writer
 
 
+def _thread_cpu_ticks(native_id: int) -> int:
+    fields = Path(f"/proc/self/task/{native_id}/stat").read_text(encoding="ascii").rsplit(") ", maxsplit=1)[1].split()
+    return int(fields[11]) + int(fields[12])
+
+
 def test_arena_is_shared_and_data_waits_for_read_begin() -> None:
     asyncio.run(_test_arena_is_shared_and_data_waits_for_read_begin())
 
@@ -193,6 +296,52 @@ def test_writer_config_controls_writer_settings() -> None:
             assert writer._config.join_poll_seconds == 0.123
 
     asyncio.run(exercise())
+
+
+def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() -> None:
+    context = multiprocessing.get_context("fork")
+    entered = context.Event()
+    release_reader, release_writer = context.Pipe(duplex=False)
+    flags = context.Array("i", [0, 0, 0, 0])
+    process = context.Process(target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release_reader, flags))
+    started = False
+    released = False
+
+    try:
+        process.start()
+        started = True
+        release_reader.close()
+        assert entered.wait(5), "writer did not enter its blocked append"
+        process.join(timeout=1)
+        assert process.is_alive(), "process exited while writer-owned work was blocked"
+        assert flags[0] == 1
+        assert flags[1] == 0
+        assert flags[2] == 0
+
+        release_writer.send(None)
+        released = True
+        process.join(timeout=5)
+        assert not process.is_alive(), "writer workflow did not finish after target release"
+        assert process.exitcode == 0
+        assert flags[1] == 1
+        assert flags[2] == 1
+        assert flags[3] == 0
+    finally:
+        if not released:
+            with suppress(BrokenPipeError, EOFError, OSError):
+                release_writer.send(None)
+        if started and process.is_alive():
+            process.join(timeout=2)
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+        release_reader.close()
+        release_writer.close()
+        if started and not process.is_alive():
+            process.close()
 
 
 def test_writer_config_controls_control_capacity() -> None:
@@ -504,6 +653,24 @@ async def _test_drain_integrity_idle_writer_continues_after_first_chunk() -> Non
             await writer.close(timeout=1)
 
 
+def test_idle_writer_consumes_negligible_thread_cpu() -> None:
+    asyncio.run(_test_idle_writer_consumes_negligible_thread_cpu())
+
+
+async def _test_idle_writer_consumes_negligible_thread_cpu() -> None:
+    async with _owned_writer(FakeTarget(), bytes(RECORD_SIZE)) as writer:
+        await writer.start()
+        await writer.read_begin("begin")
+        native_id = writer.thread.native_id
+        assert native_id is not None
+        ticks_per_second = os.sysconf("SC_CLK_TCK")
+        before = _thread_cpu_ticks(native_id)
+        await asyncio.sleep(1.0)
+        elapsed_cpu = (_thread_cpu_ticks(native_id) - before) / ticks_per_second
+
+        assert elapsed_cpu <= 0.05, f"idle writer consumed {elapsed_cpu:.3f}s CPU"
+
+
 def test_snapshot_records_durable_checkpoint_ack_without_target_inspection() -> None:
     asyncio.run(_test_snapshot_records_durable_checkpoint_ack_without_target_inspection())
 
@@ -518,6 +685,131 @@ async def _test_snapshot_records_durable_checkpoint_ack_without_target_inspectio
         assert writer.snapshot.durable_next_sequence == 102
         assert writer.snapshot.durable_record_count == 2
         await writer.close()
+
+
+def test_prepare_leg_accepts_zero_count_and_forwards_target_receipt() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _owned_writer(target, bytearray()) as writer:
+            await writer.start()
+
+            result = await writer.prepare_leg(0, 0)
+
+            assert result == "prepared"
+            assert target.calls[-1] == ("prepare_leg", 0, (0, 0))
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("start_sequence,record_count", [(-1, 0), (0, -1)])
+def test_prepare_leg_rejects_negative_values_before_target_call(start_sequence: int, record_count: int) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray()) as writer:
+            calls_before = tuple(target.calls)
+
+            with pytest.raises(ValueError):
+                await writer.prepare_leg(start_sequence, record_count)
+
+            assert tuple(target.calls) == calls_before
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("timeout", [0, -0.5])
+def test_invalid_close_timeout_leaves_writer_usable(timeout: float) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray(RECORD_SIZE)) as writer:
+            with pytest.raises(ValueError, match="timeout must be positive"):
+                await writer.close(timeout=timeout)
+
+            assert target.close_calls == 0
+            assert writer.publish(RECORD_SIZE)
+            assert await writer.barrier() == "checkpointed"
+            assert writer.written_bytes == RECORD_SIZE
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_progress_byte_properties_track_snapshot_around_blocked_append() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_append=True)
+        async with _started(target, bytearray(RECORD_SIZE)) as writer:
+            before = writer.snapshot
+            assert (writer.submitted_bytes, writer.written_bytes) == (before.submitted, before.written) == (0, 0)
+            assert writer.publish(RECORD_SIZE)
+            assert await asyncio.to_thread(target.append_started.wait, 1)
+
+            blocked = writer.snapshot
+            assert (writer.submitted_bytes, writer.written_bytes) == (blocked.submitted, blocked.written)
+            assert (blocked.submitted, blocked.written) == (RECORD_SIZE, 0)
+
+            target.release_append.set()
+            await writer.barrier()
+            completed = writer.snapshot
+            assert (writer.submitted_bytes, writer.written_bytes) == (completed.submitted, completed.written)
+            assert (completed.submitted, completed.written) == (RECORD_SIZE, RECORD_SIZE)
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        DurableMarker(-1, 2),
+        DurableMarker(102, -1),
+        UnvalidatedMarker("102", 2),
+        UnvalidatedMarker(102, "2"),
+    ],
+)
+def test_invalid_checkpoint_receipt_preserves_last_valid_snapshot(receipt: object) -> None:
+    async def exercise() -> None:
+        target = FakeTarget(checkpoint_result=DurableMarker(102, 2))
+        async with _started(target, bytearray()) as writer:
+            await writer.checkpoint()
+            acknowledged = writer.snapshot
+            assert (acknowledged.durable_next_sequence, acknowledged.durable_record_count) == (102, 2)
+
+            target.checkpoint_result = receipt
+            assert await asyncio.wait_for(writer.checkpoint(), timeout=1) == receipt
+            assert writer.snapshot == acknowledged
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_zero_checkpoint_receipt_replaces_previous_acknowledgment() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(checkpoint_result=DurableMarker(102, 2))
+        async with _started(target, bytearray()) as writer:
+            await writer.checkpoint()
+            target.checkpoint_result = DurableMarker(0, 0)
+
+            assert await writer.checkpoint() == DurableMarker(0, 0)
+            assert (writer.snapshot.durable_next_sequence, writer.snapshot.durable_record_count) == (0, 0)
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_prepare_leg_receipt_does_not_replace_checkpoint_acknowledgment() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(checkpoint_result=DurableMarker(102, 2))
+        target.prepare_leg_result = DurableMarker(103, 3)
+        async with _started(target, bytearray()) as writer:
+            await writer.checkpoint()
+            acknowledged = writer.snapshot
+
+            assert await writer.prepare_leg(100, 3) == DurableMarker(103, 3)
+            assert writer.snapshot == acknowledged
+            await writer.close()
+
+    asyncio.run(exercise())
 
 
 def test_target_failure_latches_and_prevents_seal() -> None:
@@ -662,6 +954,123 @@ def test_bounded_close_survives_repeated_cancellation_until_target_release() -> 
                 await owner
             assert not writer.thread.is_alive()
             assert writer.state is WriterState.CLOSED
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_close_keeps_positive_remaining_shutdown_budget() -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_close=True)
+        async with _started(target, bytearray()) as writer:
+            closing = asyncio.create_task(writer.close(timeout=0.9))
+            try:
+                assert await asyncio.to_thread(target.close_started.wait, 1)
+                closing.cancel()
+                target.release_close.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, timeout=1)
+                assert target.close_calls == 1
+                assert not writer.thread.is_alive()
+                assert writer.state is WriterState.CLOSED
+            finally:
+                target.release_close.set()
+                if not closing.done():
+                    closing.cancel()
+                await asyncio.gather(closing, return_exceptions=True)
+                await asyncio.to_thread(writer.thread.join, 1)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("after_deadline", [0.0, 0.25])
+def test_cancelled_close_reports_expired_remaining_budget(
+    after_deadline: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        target = FakeTarget(block_close=True)
+        async with _started(target, bytearray()) as writer:
+            loop = asyncio.get_running_loop()
+            base_time = loop.time()
+            fake_time = [base_time]
+            closing: asyncio.Task[object] | None = None
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(loop, "time", lambda: fake_time[0])
+                    closing = asyncio.create_task(writer.close(timeout=0.5))
+                    assert await asyncio.to_thread(target.close_started.wait, 1)
+                    target.release_close.set()
+                    writer.thread.join(1)
+                    assert not writer.thread.is_alive()
+                    fake_time[0] = base_time + 0.5 + after_deadline
+                    closing.cancel()
+                    with pytest.raises(WriterShutdownTimeoutError):
+                        await closing
+            finally:
+                target.release_close.set()
+                if closing is not None and not closing.done():
+                    closing.cancel()
+                if closing is not None:
+                    await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), timeout=1)
+                await asyncio.to_thread(writer.thread.join, 1)
+                assert target.close_calls == 1
+
+    asyncio.run(exercise())
+
+
+def test_close_deadline_rejects_extra_join_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        async with _started(target, bytearray()) as writer:
+            loop = asyncio.get_running_loop()
+            base_time = loop.time()
+            fake_time = [base_time]
+            release_worker = threading.Event()
+            worker_paused = threading.Event()
+            complete = writer._complete
+            join_until = writer._join_until
+            closing: asyncio.Task[object] | None = None
+
+            def pause_after_completion(
+                future: asyncio.Future[object],
+                result: object | None,
+                error: BaseException | None,
+            ) -> None:
+                complete(future, result, error)
+                worker_paused.set()
+                release_worker.wait(5)
+
+            def release_and_join_worker() -> None:
+                release_worker.set()
+                writer.thread.join(1)
+
+            async def join_at_deadline(
+                deadline: float,
+                *,
+                result: asyncio.Future[object] | None = None,
+            ) -> object:
+                with monkeypatch.context() as clock_patch:
+                    clock_patch.setattr(loop, "time", lambda: deadline)
+                    loop.call_soon(release_and_join_worker)
+                    return await join_until(deadline, result=result)
+
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(loop, "time", lambda: fake_time[0])
+                    patch.setattr(writer, "_complete", pause_after_completion)
+                    patch.setattr(writer, "_join_until", join_at_deadline)
+                    closing = asyncio.create_task(writer.close(timeout=0.5))
+                    assert await asyncio.to_thread(worker_paused.wait, 1)
+                    with pytest.raises(WriterShutdownTimeoutError):
+                        await closing
+            finally:
+                release_worker.set()
+                if closing is not None and not closing.done():
+                    closing.cancel()
+                if closing is not None:
+                    await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), timeout=1)
+                await asyncio.to_thread(writer.thread.join, 1)
+                assert not writer.thread.is_alive()
+                await writer.close(timeout=1)
 
     asyncio.run(exercise())
 

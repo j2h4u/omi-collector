@@ -1,26 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
-from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Coroutine, Iterable
+from dataclasses import FrozenInstanceError, dataclass, field
 from struct import pack
+from typing import cast
 
 import pytest
 
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter
 from omi_collector.capture.application import collector as collector_module
 from omi_collector.capture.application.collector import (
+    AdvanceRejectedError,
+    AdvanceUncertainError,
     ProgressEvent,
     ProgressMailbox,
     ReadLegOptions,
     TransferCounters,
     TransferInterruptedError,
+    advance_leg,
     read_leg,
 )
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
+    STATUS_STORAGE_NOT_READY,
     RingStatus,
+    encode_advance_command,
     encode_read_command,
     encode_stop_command,
 )
@@ -89,6 +96,21 @@ class DelayedSession(BurstSession):
                 yield payload
 
         return stream()
+
+
+class AckSession(BurstSession):
+    def __init__(self, status: int) -> None:
+        super().__init__(())
+        self.status = status
+
+    def notifications(self) -> AsyncIterator[bytes]:
+        async def stream() -> AsyncIterator[bytes]:
+            yield bytes((0x01, self.status))
+
+        return stream()
+
+    async def write_control(self, payload: bytes) -> None:
+        self.writes.append(payload)
 
 
 class BlockingReadSession(BurstSession):
@@ -249,6 +271,93 @@ def test_burst_reaches_arena_while_heartbeat_runs_and_disk_is_after_done() -> No
     asyncio.run(scenario())
 
 
+def test_read_leg_accepts_keyword_start_and_count() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
+        writer = FakeWriter()
+        arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+
+        result = await read_leg(session, arena, writer, start=10, count=2, options=ReadLegOptions(1))
+
+        assert result.next_sequence == 12
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert session.writes == [encode_read_command(10, 2)]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["mixed", "missing", "extra", "duplicate", "invalid-third"])
+def test_read_leg_rejects_invalid_argument_bindings_before_writer_or_control(case: str) -> None:
+    async def scenario() -> None:
+        session = BurstSession(())
+        writer = FakeWriter()
+        arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+        options = ReadLegOptions(1)
+
+        with pytest.raises(TypeError):
+            if case == "mixed":
+                await read_leg(session, arena, writer, 10, count=2, options=options)
+            elif case == "missing":
+                await read_leg(session, arena, writer, start=10, options=options)
+            elif case == "extra":
+                await read_leg(session, arena, writer, start=10, count=2, other=options)
+            elif case == "duplicate":
+                await read_leg(session, arena, writer, 10, 2, options, options=options)
+            else:
+                await read_leg(session, arena, writer, 10, 2, "invalid")
+
+        assert writer.calls == []
+        assert session.writes == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("count", "timeout"), [(2, 0), (2, -0.5), (0, 1), (-1, 1)])
+def test_read_leg_rejects_nonpositive_count_or_timeout_before_writer_or_control(count: int, timeout: float) -> None:
+    async def scenario() -> None:
+        session = BurstSession(())
+        writer = FakeWriter()
+        arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+
+        with pytest.raises(ValueError):
+            await read_leg(session, arena, writer, start=10, count=count, options=ReadLegOptions(timeout))
+
+        assert writer.calls == []
+        assert session.writes == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("next_sequence", [True, 12.0, "12"])
+def test_advance_leg_rejects_non_integer_sequence_before_control(next_sequence: object) -> None:
+    async def scenario() -> None:
+        session = AckSession(status=0)
+
+        with pytest.raises(TypeError, match="next_sequence must be an integer"):
+            await advance_leg(session, next_sequence, timeout=1)  # type: ignore[arg-type]
+
+        assert session.writes == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(STATUS_STORAGE_NOT_READY, AdvanceUncertainError), (1, AdvanceRejectedError)],
+)
+def test_advance_leg_classifies_ack_rejection_statuses(status: int, error: type[Exception]) -> None:
+    async def scenario() -> None:
+        session = AckSession(status)
+
+        with pytest.raises(error):
+            await advance_leg(session, 12, timeout=1)
+
+        assert session.writes == [encode_advance_command(12)]
+
+    asyncio.run(scenario())
+
+
 def test_read_mailbox_preserves_intermediate_and_terminal_progress_on_success_and_interrupt() -> None:
     async def scenario() -> None:
         record = _record(1)
@@ -295,6 +404,191 @@ def test_read_mailbox_preserves_intermediate_and_terminal_progress_on_success_an
         assert interrupted.snapshot.event.records_completed == 1
 
     asyncio.run(scenario())
+
+
+def test_mailbox_wait_observes_terminal_revision_after_immediate_publish_and_finish() -> None:
+    async def scenario() -> None:
+        mailbox = ProgressMailbox()
+        event = ProgressEvent(1, 2, RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), 1.0)
+        mailbox.publish(event)
+        mailbox.finish()
+
+        snapshot = await asyncio.wait_for(mailbox.wait_for_change(0), 1)
+
+        assert snapshot.revision == 2
+        assert snapshot.terminal
+        assert snapshot.event is event
+
+    asyncio.run(scenario())
+
+
+def test_read_ack_before_begin_data_done_completes_the_full_leg() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        session = BurstSession((b"\x01\x00", _begin(10, 2), _data(record), _data(record), _done(12)))
+        writer = FakeWriter()
+        result = await read_leg(
+            session,
+            TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+            writer,
+            10,
+            2,
+            ReadLegOptions(1),
+        )
+
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert session.consumed == 5
+        assert session.writes == [encode_read_command(10, 2)]
+        assert writer.calls == [
+            "start",
+            "prepare",
+            "read_begin",
+            f"publish:{RECORD_SIZE}",
+            f"publish:{2 * RECORD_SIZE}",
+            "barrier",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_async_read_begin_failure_after_done_surfaces_and_is_retrieved() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        read_begin_error = OSError("READ_BEGIN persistence failed")
+        read_begin_tasks: list[asyncio.Task[None] | None] = []
+        read_begin_coroutines: list[Coroutine[object, object, None]] = []
+
+        class AsyncFailingReadBeginWriter(FakeWriter):
+            def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
+                del notice
+
+                async def fail() -> None:
+                    read_begin_tasks.append(asyncio.current_task())
+                    await asyncio.sleep(0)
+                    raise read_begin_error
+
+                self.calls.append("read_begin")
+                awaitable = fail()
+                read_begin_coroutines.append(cast(Coroutine[object, object, None], awaitable))
+                return cast(asyncio.Future[object], awaitable)
+
+        session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
+        writer = AsyncFailingReadBeginWriter()
+        with pytest.raises(TransferInterruptedError, match="writer failed after READ terminal") as caught:
+            try:
+                await read_leg(
+                    session,
+                    TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                    writer,
+                    10,
+                    2,
+                    ReadLegOptions(1),
+                )
+            finally:
+                await asyncio.sleep(0)
+                tasks = [task for task in read_begin_tasks if task is not None]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                for coroutine in read_begin_coroutines:
+                    if inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
+                        coroutine.close()
+
+        assert caught.value.__cause__ is read_begin_error
+        assert len(read_begin_tasks) == 1
+        task = read_begin_tasks[0]
+        assert task is not None and task.done()
+        assert task.exception() is read_begin_error
+        assert session.consumed == 4
+        assert session.writes == [encode_read_command(10, 2)]
+        assert "barrier" not in writer.calls
+
+    asyncio.run(scenario())
+
+
+def test_read_leg_publishes_rate_from_public_mailbox_at_intermediate_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        now = [10.0]
+
+        class PausedSession(BurstSession):
+            def __init__(self) -> None:
+                super().__init__((), count=3)
+                self.release_remaining = asyncio.Event()
+
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    self.consumed += 1
+                    yield _begin(10, 3)
+                    self.consumed += 1
+                    now[0] = 12.0
+                    yield _data(_record(1))
+                    await self.release_remaining.wait()
+                    for value in (2, 3):
+                        self.consumed += 1
+                        yield _data(_record(value))
+                    self.consumed += 1
+                    yield _done(13)
+
+                return stream()
+
+        loop = asyncio.get_running_loop()
+        real_monotonic = collector_module.time.monotonic
+        monkeypatch.setattr(loop, "time", real_monotonic)
+        monkeypatch.setattr(collector_module.time, "monotonic", lambda: now[0])
+        mailbox = ProgressMailbox()
+        session = PausedSession()
+        writer = FakeWriter(expected_count=3)
+        arena = TransferArena(10, 3, max_bytes=3 * RECORD_SIZE)
+        task = asyncio.create_task(read_leg(session, arena, writer, 10, 3, ReadLegOptions(1, progress_mailbox=mailbox)))
+        try:
+            async with asyncio.timeout(5):
+                snapshot = await mailbox.wait_for_change(0)
+            event = snapshot.event
+            assert event is not None
+            assert event.records_completed == 1
+            assert event.records_total == 3
+            assert event.elapsed == 2.0
+            assert event.records_per_second == pytest.approx(0.5)
+            assert event.bytes_per_second == pytest.approx(RECORD_SIZE / 2)
+            assert event.eta == pytest.approx(4.0)
+
+            session.release_remaining.set()
+            async with asyncio.timeout(5):
+                result = await task
+            assert result.received_bytes == 3 * RECORD_SIZE
+        finally:
+            session.release_remaining.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_progress_mailbox_retains_immutable_snapshot_and_event() -> None:
+    mailbox = ProgressMailbox()
+    first_event = ProgressEvent(1, 2, RECORD_SIZE, 1.0, 1.0, float(RECORD_SIZE), 1.0)
+    mailbox.publish(first_event)
+    first_snapshot = mailbox.snapshot
+
+    with pytest.raises(FrozenInstanceError):
+        first_snapshot.revision = 99  # type: ignore[reportAttributeAccessIssue]
+    with pytest.raises(FrozenInstanceError):
+        first_event.records_completed = 99  # type: ignore[reportAttributeAccessIssue]
+
+    assert mailbox.snapshot is first_snapshot
+    assert mailbox.snapshot.event is first_event
+    mailbox.finish()
+    terminal_snapshot = mailbox.snapshot
+    assert terminal_snapshot.revision == first_snapshot.revision + 1
+    assert terminal_snapshot.event is first_event
+    assert terminal_snapshot.terminal
+
+    mailbox.publish(ProgressEvent(2, 2, 2 * RECORD_SIZE, 2.0, 1.0, float(RECORD_SIZE), 0.0), terminal=True)
+    assert mailbox.snapshot is terminal_snapshot
 
 
 def test_read_leg_timeout_is_reset_by_continuous_notifications() -> None:

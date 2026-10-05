@@ -57,6 +57,13 @@ def test_pr_title_main_routes_messages_to_expected_streams(capsys: pytest.Captur
     assert captured.err.startswith("Unsupported Conventional Commit type 'wip'.")
 
 
+def test_pr_title_main_requires_title() -> None:
+    with pytest.raises(SystemExit) as error:
+        validate_title_main([])
+
+    assert error.value.code == 2
+
+
 def _write_release_fixture(root: Path, *, package: dict[str, object] | None = None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     release_package = (
@@ -105,6 +112,45 @@ def test_release_config_checks_manifest_project_and_lock_coherence(tmp_path: Pat
         "release-please manifest version must match pyproject.toml",
         "uv.lock project version must match pyproject.toml",
     ]
+
+
+@pytest.mark.parametrize(
+    "lock_text",
+    [
+        '[[package]]\nname = "another-package"\nversion = "1.2.3"\n',
+        '[[package]]\nname = "omi-collector"\nversion = 123\n',
+        (
+            '[[package]]\nname = "omi-collector"\nversion = "1.2.3"\n'
+            '[[package]]\nname = "omi-collector"\nversion = "1.2.3"\n'
+        ),
+    ],
+    ids=("missing-root-package", "non-string-version", "duplicate-root-package"),
+)
+def test_release_config_requires_one_string_root_package_version(tmp_path: Path, lock_text: str) -> None:
+    _write_release_fixture(tmp_path)
+    assert validate_release_config(tmp_path) == []
+    (tmp_path / "uv.lock").write_text(lock_text, encoding="utf-8")
+
+    assert validate_release_config(tmp_path) == ["uv.lock must contain exactly one 'omi-collector' package version"]
+
+
+def test_release_config_requires_root_package_configuration(tmp_path: Path) -> None:
+    _write_release_fixture(tmp_path)
+    (tmp_path / "release-please-config.json").write_text(json.dumps({"packages": {"other": {}}}), encoding="utf-8")
+
+    assert validate_release_config(tmp_path) == ["release-please-config.json must configure the root package"]
+
+
+def test_release_config_main_fails_when_root_package_configuration_is_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_release_fixture(tmp_path)
+    (tmp_path / "release-please-config.json").write_text(json.dumps({"packages": {"other": {}}}), encoding="utf-8")
+
+    assert validate_config_main(["--root", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "release configuration error: release-please-config.json must configure the root package\n"
+    assert captured.err == ""
 
 
 def test_release_config_reports_missing_project_version_and_lock_package_list(tmp_path: Path) -> None:
@@ -189,11 +235,50 @@ def test_release_notes_main_file_stdin_and_failure_streams(
     assert "Add a BEGIN_COMMIT_OVERRIDE / END_COMMIT_OVERRIDE block" in captured.err
 
 
+def test_release_notes_main_requires_body_and_commit_count_before_input_io(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class UnreadableInput:
+        def read(self) -> str:
+            raise AssertionError("stdin must not be read before argument validation")
+
+    def unreadable_file(_path: Path, *_args: object, **_kwargs: object) -> str:
+        raise AssertionError("body file must not be read before argument validation")
+
+    monkeypatch.setattr("sys.stdin", UnreadableInput())
+    with pytest.raises(SystemExit) as missing_body:
+        validate_notes_main(["--commit-count", "1"])
+    assert missing_body.value.code == 2
+
+    monkeypatch.setattr(Path, "read_text", unreadable_file)
+    with pytest.raises(SystemExit) as missing_count:
+        validate_notes_main(["--body-file", str(tmp_path / "body.md")])
+    assert missing_count.value.code == 2
+
+
 def test_override_block_splits_into_one_entry_per_message() -> None:
     ok, messages = validate_release_notes(OVERRIDE, commit_count=2, require_above=1)
 
     assert ok
     assert "2 changelog entr" in messages[0]
+
+
+def test_first_override_entry_at_block_start_accepts_multiple_well_formed_messages() -> None:
+    body = """PR context before release notes.
+BEGIN_COMMIT_OVERRIDE
+fix(capture): retain the first record
+
+Keep the first record attached to the attempt.
+
+feat(cli): expose current status
+
+Show the current collector state.
+END_COMMIT_OVERRIDE"""
+
+    assert validate_release_notes(body, commit_count=2, require_above=1) == (
+        True,
+        ["Override block parses into 2 changelog entr(ies)."],
+    )
 
 
 def test_github_default_squash_body_shape_is_rejected() -> None:

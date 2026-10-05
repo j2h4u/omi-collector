@@ -114,3 +114,16 @@ def test_main_reports_combined_check_result(
     )
     assert captured.out == expected_stdout
     assert captured.err == ""
+
+
+def test_main_accepts_missing_workflows_and_docker_inputs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    monkeypatch.setattr(supply_chain_pins, "__file__", str(script_dir / "check_supply_chain_pins.py"))
+
+    assert supply_chain_pins.main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == "Supply-chain pin check passed\n"
+    assert captured.err == ""

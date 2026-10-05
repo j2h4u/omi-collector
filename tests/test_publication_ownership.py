@@ -11,6 +11,8 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import _StagingWriterAdapter
+from omi_collector.capture.adapters.ready_closures import ReadyClosure
+from omi_collector.capture.adapters.ready_closures import load as load_ready_closures
 from omi_collector.capture.adapters.staging_contract import AttemptStateError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -48,6 +50,14 @@ def _seal_writer(store: StagingStore) -> StagingWriter:
     return writer
 
 
+def test_fresh_store_without_publication_boundary_is_a_noop(tmp_path: Path) -> None:
+    capture_root = tmp_path / "draft"
+    capture_root.mkdir()
+    store = StagingStore(tmp_path / "spool", capture_root)
+
+    assert store.publish_ready() is None
+
+
 def test_sealed_writer_publishes_with_its_held_lease(tmp_path: Path) -> None:
     store = _store(tmp_path)
     authority = store.create_publication_authority()
@@ -61,6 +71,19 @@ def test_sealed_writer_publishes_with_its_held_lease(tmp_path: Path) -> None:
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     writer.close()
     authority.close()
+
+
+def test_restart_closes_and_persists_the_frontier_of_an_orphaned_sealed_draft(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    writer = _seal_writer(store)
+    writer.close()
+
+    expected = ReadyClosure(101, "restart_interrupted")
+    assert store.close_orphaned_drafts("restart_interrupted") == expected
+    assert load_ready_closures(store.ready_closures_path) == (expected,)
+    drafts = tuple(store.capture_root.iterdir())
+    assert len(drafts) == 1
+    assert (drafts[0] / "records.bin").read_bytes() == _record(100)
 
 
 def test_prefix_close_retires_before_ready_publication_and_keeps_lease(

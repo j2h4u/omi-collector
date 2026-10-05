@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from errno import EEXIST, EIO
 from hashlib import sha256
 from json import dumps, loads
-from os import PathLike
+from multiprocessing import get_context
+from multiprocessing.queues import Queue as QueueType
+from os import PathLike, fsdecode, fsync, mkfifo
 from pathlib import Path
-from shutil import rmtree
+from shutil import copytree, rmtree
 from stat import S_IMODE
-from typing import cast
+from typing import BinaryIO, cast
 
 import pytest
 
@@ -20,7 +23,7 @@ from omi_collector.capture.adapters.quarantine_publish import (
 )
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError, StagingError
 from omi_collector.capture.adapters.staging_store import StagingStore
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -31,6 +34,12 @@ def _capture_root(tmp_path: Path) -> Path:
         rmtree(root, ignore_errors=True)
         _CAPTURE_ROOTS.add(tmp_path)
     return root
+
+
+def _case_path(tmp_path: Path, name: str) -> Path:
+    case = tmp_path / name
+    case.mkdir()
+    return case
 
 
 def _record(marker: int) -> bytes:
@@ -48,6 +57,82 @@ def _quarantined_attempt(spool: Path) -> tuple[Path, bytes, bytes]:
     attempt.close(durable=True)
     source = StagingStore(spool, spool.parent / "captures").quarantine_attempt_source(attempt.attempt_id)
     return source, prefix, tail
+
+
+def _single_quarantined_attempt(spool: Path, *, start: int = 100, count: int = 1) -> tuple[Path, bytes]:
+    store = StagingStore(spool, _capture_root(spool))
+    attempt = store.prepare_streaming_attempt(start, count)
+    attempt.record_read_begin(ReadBeginNotification(start, count))
+    payload = _record(1)
+    attempt.accept_chunk(start, payload)
+    attempt.checkpoint()
+    attempt.close(durable=True)
+    return store.quarantine_attempt_source(attempt.attempt_id), payload
+
+
+def _publish_fifo_child(source: str, spool: str, capture_root: str, output: QueueType[object]) -> None:
+    output.put(str(Path(cast(str, quarantine_publish.__file__)).resolve()))
+    try:
+        child_store = StagingStore(Path(spool), Path(capture_root))
+        publish_quarantined_prefix(Path(source), child_store.paths)
+    except QuarantinePublishError as error:
+        output.put(("raised", type(error).__name__, str(error)))
+    else:
+        output.put(("returned", "unexpectedly published FIFO source"))
+
+
+def _snapshot(source: Path) -> dict[str, bytes]:
+    return {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+
+
+def _rewrite_object(path: Path, key: str, value: object) -> None:
+    document = cast(dict[str, object], loads(path.read_text(encoding="utf-8")))
+    if key.startswith("delete:"):
+        del document[key.removeprefix("delete:")]
+    else:
+        document[key] = value
+    path.write_text(dumps(document), encoding="utf-8")
+
+
+class _ShortWritingStream:
+    def __init__(self, path: Path, wrapped: BinaryIO, written: dict[str, int]) -> None:
+        self.path = path
+        self.wrapped = wrapped
+        self.written = written
+
+    def write(self, payload: bytes) -> int:
+        if not payload:
+            raise AssertionError(f"publisher attempted an empty write to {self.path.name}")
+        short_payload = payload[:7]
+        count = self.wrapped.write(short_payload)
+        if count <= 0:
+            raise AssertionError(f"publisher made no write progress for {self.path.name}")
+        self.written[self.path.name] = self.written.get(self.path.name, 0) + count
+        return count
+
+    def flush(self) -> None:
+        self.wrapped.flush()
+
+    def fileno(self) -> int:
+        return self.wrapped.fileno()
+
+    def __enter__(self) -> _ShortWritingStream:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.wrapped.close()
+
+
+def _patch_short_writes(monkeypatch: pytest.MonkeyPatch, written: dict[str, int]) -> None:
+    real_open = cast(Callable[..., BinaryIO], Path.open)
+
+    def observed_open(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        wrapped = real_open(path, mode, *args, **kwargs)
+        if mode == "xb":
+            return _ShortWritingStream(path, wrapped, written)
+        return wrapped
+
+    monkeypatch.setattr(Path, "open", observed_open)
 
 
 def test_publishes_only_authenticated_prefix_and_leaves_source_unchanged(tmp_path: Path) -> None:
@@ -263,3 +348,563 @@ def test_defer_requested_after_atomic_rename_finishes_publication(
 
     assert renamed
     assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
+
+
+@pytest.mark.parametrize(
+    ("filename", "field", "value"),
+    [
+        ("attempt.json", "attempt_id", "f" * 32),
+        ("attempt.json", "schema_version", 3),
+        ("attempt.json", "start_sequence", -1),
+        ("attempt.json", "packet_count", 0),
+        ("attempt.json", "packet_count", True),
+        ("attempt.json", "record_size", RECORD_SIZE + 1),
+        ("attempt.json", "read_begin_start", "100"),
+        ("attempt.json", "read_begin_start", 99),
+        ("attempt.json", "read_begin_count", False),
+        ("attempt.json", "read_begin_count", 2),
+        ("attempt.json", "unexpected", "field"),
+    ],
+)
+def test_invalid_attempt_descriptor_is_preserved_and_valid_retry_publishes(
+    tmp_path: Path, filename: str, field: str, value: object
+) -> None:
+    case = _case_path(tmp_path, f"attempt-{filename}-{field}-{value}")
+    source, _, _ = _quarantined_attempt(case)
+    store = StagingStore(case, _capture_root(case))
+    original = _snapshot(source)
+    changed = source / filename
+    _rewrite_object(changed, field, value)
+    invalid_evidence = _snapshot(source)
+
+    with pytest.raises(QuarantinePublishError):
+        publish_quarantined_prefix(source, store.paths)
+
+    assert _snapshot(source) == invalid_evidence
+    assert not tuple(_capture_root(case).iterdir())
+    changed.write_bytes(original[filename])
+    result = publish_quarantined_prefix(source, store.paths)
+    assert result.record_count == 1
+    assert _snapshot(source) == original
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("unexpected", "field"),
+        ("version", 2),
+        ("attempt_id", "f" * 32),
+        ("record_count", -1),
+        ("record_count", True),
+        ("raw_sha256", "abc"),
+        ("raw_sha256", "g" * 64),
+        ("raw_sha256", "0" * 64),
+        ("record_count", 4),
+        ("record_count", 3),
+        ("delete:raw_sha256", None),
+    ],
+)
+def test_invalid_checkpoint_is_preserved_and_valid_retry_publishes(tmp_path: Path, field: str, value: object) -> None:
+    case = _case_path(tmp_path, f"checkpoint-{field}-{value}")
+    source, _, _ = _quarantined_attempt(case)
+    store = StagingStore(case, _capture_root(case))
+    original = _snapshot(source)
+    checkpoint = source / "checkpoint.json"
+    _rewrite_object(checkpoint, field, value)
+    invalid_evidence = _snapshot(source)
+
+    with pytest.raises(QuarantinePublishError):
+        publish_quarantined_prefix(source, store.paths)
+
+    assert _snapshot(source) == invalid_evidence
+    assert not tuple(_capture_root(case).iterdir())
+    checkpoint.write_bytes(original["checkpoint.json"])
+    result = publish_quarantined_prefix(source, store.paths)
+    assert result.record_count == 1
+    assert _snapshot(source) == original
+
+
+@pytest.mark.parametrize("conflict", ["records.bin", "manifest.json", "receipt.json"])
+def test_existing_bundle_conflicts_are_typed_and_preserve_both_sides(tmp_path: Path, conflict: str) -> None:
+    case = _case_path(tmp_path, f"conflict-{conflict}")
+    source, _, _ = _quarantined_attempt(case)
+    store = StagingStore(case, _capture_root(case))
+    result = publish_quarantined_prefix(source, store.paths)
+    source_before = _snapshot(source)
+    destination = result.bundle_path
+    conflict_file = destination / conflict
+
+    if conflict == "records.bin":
+        conflict_file.write_bytes(_record(9))
+    else:
+        document = cast(dict[str, object], loads(conflict_file.read_text(encoding="utf-8")))
+        if conflict == "manifest.json":
+            document["start_sequence"] = 200
+            document["next_sequence"] = 201
+        else:
+            original_id = cast(str, document["attempt_id"])
+            document["attempt_id"] = "0" * 32 if original_id != "0" * 32 else "1" * 32
+        conflict_file.write_text(dumps(document), encoding="utf-8")
+    destination_after_conflict = _snapshot(destination)
+
+    with pytest.raises(QuarantineOutputCollisionError):
+        publish_quarantined_prefix(source, store.paths)
+
+    assert _snapshot(source) == source_before
+    assert _snapshot(destination) == destination_after_conflict
+
+
+@pytest.mark.parametrize("missing", ["records.bin", "manifest.json", "receipt.json"])
+def test_incomplete_existing_destination_is_retryable_and_preserved(tmp_path: Path, missing: str) -> None:
+    case = _case_path(tmp_path, f"incomplete-{missing}")
+    source, _, _ = _quarantined_attempt(case)
+    store = StagingStore(case, _capture_root(case))
+    result = publish_quarantined_prefix(source, store.paths)
+    source_before = _snapshot(source)
+    destination_before = _snapshot(result.bundle_path)
+    (result.bundle_path / missing).unlink()
+    destination_after_removal = _snapshot(result.bundle_path)
+
+    with pytest.raises(OSError, match="not yet canonical") as error:
+        publish_quarantined_prefix(source, store.paths)
+
+    assert not isinstance(error.value, QuarantineOutputCollisionError)
+    assert _snapshot(source) == source_before
+    assert _snapshot(result.bundle_path) == destination_after_removal
+    (result.bundle_path / missing).write_bytes(destination_before[missing])
+    assert publish_quarantined_prefix(source, store.paths).deduplicated
+    assert _snapshot(source) == source_before
+
+
+def test_repeat_publication_ignores_opaque_source_tail_and_preserves_both_sides(tmp_path: Path) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    first = publish_quarantined_prefix(source, store.paths)
+    source_before = _snapshot(source)
+    destination_before = _snapshot(first.bundle_path)
+
+    duplicate = publish_quarantined_prefix(source, store.paths)
+
+    assert duplicate.deduplicated
+    assert _snapshot(source) == source_before
+    assert _snapshot(first.bundle_path) == destination_before
+    assert first.bundle_path.joinpath("records.bin").read_bytes() == prefix
+    assert source.joinpath("records.bin").read_bytes() == prefix + tail
+
+
+def test_publication_completes_short_positive_writes_without_empty_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    source_before = _snapshot(source)
+    written: dict[str, int] = {}
+    _patch_short_writes(monkeypatch, written)
+    result = publish_quarantined_prefix(source, store.paths)
+
+    digest = sha256(prefix).hexdigest()
+    attempt_id = cast(str, loads(source_before["attempt.json"])["attempt_id"])
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
+    assert loads(result.bundle_path.joinpath("manifest.json").read_text(encoding="utf-8")) == {
+        "schema_version": 2,
+        "start_sequence": 100,
+        "next_sequence": 101,
+        "record_count": 1,
+        "record_size": RECORD_SIZE,
+        "raw_sha256": digest,
+    }
+    assert loads(result.bundle_path.joinpath("receipt.json").read_text(encoding="utf-8")) == {
+        "attempt_id": attempt_id,
+        "raw_sha256": digest,
+        "status": "sealed",
+    }
+    assert written == {
+        "records.bin": len(prefix),
+        "manifest.json": len((result.bundle_path / "manifest.json").read_bytes()),
+        "receipt.json": len((result.bundle_path / "receipt.json").read_bytes()),
+    }
+    assert _snapshot(source) == source_before
+    assert source.joinpath("records.bin").read_bytes() == prefix + tail
+
+
+def test_public_publication_result_serializes_exact_raw_byte_count_and_replay_status(tmp_path: Path) -> None:
+    source, prefix, _ = _quarantined_attempt(tmp_path)
+    paths = StagingStore(tmp_path, _capture_root(tmp_path)).paths
+
+    first = publish_quarantined_prefix(source, paths)
+    first_payload = first.as_dict()
+    assert first_payload == {
+        "bundle_path": str(first.bundle_path),
+        "start_sequence": 100,
+        "next_sequence": 101,
+        "record_count": 1,
+        "raw_bytes": RECORD_SIZE,
+        "raw_sha256": sha256(prefix).hexdigest(),
+        "deduplicated": False,
+    }
+    assert type(first_payload["raw_bytes"]) is int
+
+    replay = publish_quarantined_prefix(source, paths)
+    replay_payload = replay.as_dict()
+    assert replay_payload["raw_bytes"] == RECORD_SIZE
+    assert type(replay_payload["raw_bytes"]) is int
+    assert replay_payload["deduplicated"] is True
+    assert replay_payload["bundle_path"] == str(first.bundle_path)
+
+
+def test_publication_leaves_unrelated_authenticated_capture_temporary_for_device_lock(tmp_path: Path) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    prior = store.prepare_streaming_attempt(200, 1)
+    prior.record_read_begin(ReadBeginNotification(200, 1))
+    prior.accept_chunk(200, _record(9))
+    published = prior.seal(DoneNotification(0, 201))
+    temporary = published.bundle_path.with_name(f".{published.bundle_path.name}.{'a' * 32}.tmp")
+    published.bundle_path.rename(temporary)
+    before = _snapshot(temporary)
+    source_before = _snapshot(source)
+
+    result = publish_quarantined_prefix(source, store.paths)
+
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
+    assert source.joinpath("records.bin").read_bytes() == prefix + tail
+    assert _snapshot(source) == source_before
+    assert temporary.is_dir()
+    assert _snapshot(temporary) == before
+    with store.device_lock():
+        pass
+    assert published.bundle_path.is_dir()
+    assert not temporary.exists()
+    assert (published.bundle_path / "records.bin").read_bytes() == _record(9)
+
+
+@pytest.mark.parametrize("record_count", [0, 4])
+def test_invalid_checkpoint_bounds_preserve_quarantine_source_and_publish_nothing(
+    tmp_path: Path, record_count: int
+) -> None:
+    source, _, _ = _quarantined_attempt(tmp_path)
+    checkpoint = source / "checkpoint.json"
+    raw = source / "records.bin"
+    if record_count == 0:
+        _rewrite_object(checkpoint, "record_count", 0)
+        _rewrite_object(checkpoint, "raw_sha256", sha256(b"").hexdigest())
+    else:
+        payload = raw.read_bytes() + _record(3) + _record(4)
+        raw.write_bytes(payload)
+        _rewrite_object(checkpoint, "record_count", record_count)
+        _rewrite_object(checkpoint, "raw_sha256", sha256(payload).hexdigest())
+    original = _snapshot(source)
+    capture = _capture_root(tmp_path)
+
+    with pytest.raises(QuarantinePublishError):
+        publish_quarantined_prefix(source, StagingStore(tmp_path, capture).paths)
+
+    assert _snapshot(source) == original
+    assert tuple(capture.iterdir()) == ()
+
+
+@pytest.mark.parametrize("invalid_id", ["g" * 32, "a" * 31])
+def test_publication_rejects_noncanonical_directory_identity_without_mutation(tmp_path: Path, invalid_id: str) -> None:
+    source, _, _ = _quarantined_attempt(tmp_path)
+    descriptor = cast(dict[str, object], loads((source / "attempt.json").read_text(encoding="utf-8")))
+    checkpoint = cast(dict[str, object], loads((source / "checkpoint.json").read_text(encoding="utf-8")))
+    old_id = cast(str, descriptor["attempt_id"])
+    descriptor["attempt_id"] = invalid_id
+    checkpoint["attempt_id"] = invalid_id
+    (source / "attempt.json").write_text(dumps(descriptor), encoding="utf-8")
+    (source / "checkpoint.json").write_text(dumps(checkpoint), encoding="utf-8")
+    invalid_source = source.with_name(invalid_id)
+    source.rename(invalid_source)
+    original = _snapshot(invalid_source)
+
+    with pytest.raises(QuarantinePublishError):
+        publish_quarantined_prefix(invalid_source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
+
+    assert _snapshot(invalid_source) == original
+    assert tuple(_capture_root(tmp_path).iterdir()) == ()
+    assert old_id != invalid_id
+
+
+def test_publication_succeeds_when_quarantine_source_basename_is_exact_attempt_id(tmp_path: Path) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    descriptor = cast(dict[str, object], loads((source / "attempt.json").read_text(encoding="utf-8")))
+    exact = source.with_name(cast(str, descriptor["attempt_id"]))
+    source.rename(exact)
+    source_before = _snapshot(exact)
+
+    result = publish_quarantined_prefix(exact, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
+
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
+    assert _snapshot(exact) == source_before
+    assert (exact / "records.bin").read_bytes() == prefix + tail
+
+
+def test_one_record_quarantine_publication_at_packet_count_boundary(tmp_path: Path) -> None:
+    source, raw = _single_quarantined_attempt(tmp_path, count=1)
+    original = _snapshot(source)
+
+    result = publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
+
+    assert result.start_sequence == 100
+    assert result.next_sequence == 101
+    assert result.record_count == 1
+    assert result.raw_bytes == RECORD_SIZE
+    assert result.raw_sha256 == sha256(raw).hexdigest()
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == raw
+    assert _snapshot(source) == original
+
+
+@pytest.mark.parametrize(("field", "value"), [("read_begin_start", False), ("read_begin_count", True)])
+def test_publication_rejects_boolean_read_begin_fields_matching_numeric_zero_and_one(
+    tmp_path: Path, field: str, value: bool
+) -> None:
+    source, _ = _single_quarantined_attempt(tmp_path, start=0, count=1)
+    capture_before = set(_capture_root(tmp_path).iterdir())
+    _rewrite_object(source / "attempt.json", field, value)
+    original = _snapshot(source)
+
+    with pytest.raises(QuarantinePublishError):
+        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
+
+    assert _snapshot(source) == original
+    assert set(_capture_root(tmp_path).iterdir()) == capture_before
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "read_start"),
+    [
+        ("start_sequence", -1, -1),
+        ("start_sequence", False, 0),
+    ],
+)
+def test_publication_rejects_negative_or_boolean_start_sequence_without_mutation(
+    tmp_path: Path, field: str, value: int | bool, read_start: int
+) -> None:
+    source, _ = _single_quarantined_attempt(tmp_path, start=0, count=1)
+    capture_before = set(_capture_root(tmp_path).iterdir())
+    _rewrite_object(source / "attempt.json", field, value)
+    _rewrite_object(source / "attempt.json", "read_begin_start", read_start)
+    original = _snapshot(source)
+
+    with pytest.raises(QuarantinePublishError):
+        publish_quarantined_prefix(source, StagingStore(tmp_path, _capture_root(tmp_path)).paths)
+
+    assert _snapshot(source) == original
+    assert set(_capture_root(tmp_path).iterdir()) == capture_before
+
+
+def test_publication_detects_symlinked_canonical_output_on_replay(tmp_path: Path) -> None:
+    source, prefix, _ = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    result = publish_quarantined_prefix(source, store.paths)
+    raw = result.bundle_path / "records.bin"
+    external = tmp_path / "external-published-raw"
+    raw.rename(external)
+    raw.symlink_to(external)
+    source_before = _snapshot(source)
+    manifest_before = (result.bundle_path / "manifest.json").read_bytes()
+    receipt_before = (result.bundle_path / "receipt.json").read_bytes()
+
+    with pytest.raises(QuarantineOutputCollisionError):
+        publish_quarantined_prefix(source, store.paths)
+
+    assert raw.is_symlink() and raw.readlink() == external
+    assert external.read_bytes() == prefix
+    assert (result.bundle_path / "manifest.json").read_bytes() == manifest_before
+    assert (result.bundle_path / "receipt.json").read_bytes() == receipt_before
+    assert _snapshot(source) == source_before
+
+
+def test_publication_rejects_oversized_canonical_raw_file_on_replay(tmp_path: Path) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    result = publish_quarantined_prefix(source, store.paths)
+    raw = result.bundle_path / "records.bin"
+    raw.write_bytes(prefix + b"x")
+    oversized = raw.read_bytes()
+    source_before = _snapshot(source)
+
+    with pytest.raises(QuarantineOutputCollisionError):
+        publish_quarantined_prefix(source, store.paths)
+
+    assert raw.read_bytes() == oversized
+    assert raw.read_bytes().startswith(prefix)
+    assert (source / "records.bin").read_bytes() == prefix + tail
+    assert _snapshot(source) == source_before
+
+
+def test_publication_resolves_identical_rename_collision_from_public_filesystem_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    source_before = _snapshot(source)
+    real_rename = quarantine_publish.os.rename
+    injected = False
+
+    def install_identical_destination_and_report_collision(
+        src: str | bytes | PathLike[str] | PathLike[bytes],
+        dst: str | bytes | PathLike[str] | PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal injected
+        source_path = (
+            Path(f"/proc/self/fd/{src_dir_fd}") / Path(fsdecode(src)).name
+            if src_dir_fd is not None
+            else Path(fsdecode(src))
+        )
+        destination_path = (
+            Path(f"/proc/self/fd/{dst_dir_fd}") / Path(fsdecode(dst)).name
+            if dst_dir_fd is not None
+            else Path(fsdecode(dst))
+        )
+        if not injected and source_path.name.startswith(".") and source_path.name.endswith(".tmp"):
+            copytree(source_path, destination_path)
+            injected = True
+            raise FileExistsError(EEXIST, "simulated identical rename collision")
+        real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(quarantine_publish.os, "rename", install_identical_destination_and_report_collision)
+    result = publish_quarantined_prefix(source, store.paths)
+
+    assert injected
+    assert not result.deduplicated
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
+    assert _snapshot(source) == source_before
+    assert (source / "records.bin").read_bytes() == prefix + tail
+
+
+def test_failed_publication_mkdir_preserves_source_and_retry_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    source_before = _snapshot(source)
+    capture = _capture_root(tmp_path)
+    real_mkdir = quarantine_publish.os.mkdir
+    sentinel = OSError(EIO, "injected publication temporary mkdir failure")
+
+    def fail_capture_temporary_mkdir(
+        path: str | bytes | PathLike[str] | PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if dir_fd is not None:
+            raise sentinel
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(quarantine_publish.os, "mkdir", fail_capture_temporary_mkdir)
+        with pytest.raises(OSError) as error:
+            publish_quarantined_prefix(source, store.paths)
+        assert error.value is sentinel
+
+    assert _snapshot(source) == source_before
+    assert tuple(capture.iterdir()) == ()
+    assert not tuple(capture.glob(".*.tmp"))
+    result = publish_quarantined_prefix(source, store.paths)
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
+    assert (source / "records.bin").read_bytes() == prefix + tail
+
+
+def test_publication_failure_preserves_source_and_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, prefix, tail = _quarantined_attempt(tmp_path)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    source_before = _snapshot(source)
+    capture = _capture_root(tmp_path)
+    real_fsync = fsync
+    sentinel = OSError(EIO, "injected pre-rename records sync failure")
+
+    def fail_raw_output_sync(fd: int) -> None:
+        try:
+            path = Path(f"/proc/self/fd/{fd}").resolve()
+        except OSError:
+            path = Path()
+        if path.name == "records.bin" and path.parent.parent == capture:
+            raise sentinel
+        real_fsync(fd)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(quarantine_publish.os, "fsync", fail_raw_output_sync)
+        with pytest.raises(OSError) as error:
+            publish_quarantined_prefix(source, store.paths)
+        assert error.value is sentinel
+    assert _snapshot(source) == source_before
+    assert tuple(capture.iterdir()) == ()
+    assert not tuple(capture.glob(".*.tmp"))
+    result = publish_quarantined_prefix(source, store.paths)
+
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == prefix
+    assert _snapshot(source) == source_before
+    assert (source / "records.bin").read_bytes() == prefix + tail
+
+
+@pytest.mark.parametrize("start", [0, -1])
+def test_publication_range_boundaries_preserve_exact_start_and_reject_negative_start(
+    tmp_path: Path, start: int
+) -> None:
+    source, raw = _single_quarantined_attempt(tmp_path, start=0, count=1)
+    capture_before = set(_capture_root(tmp_path).iterdir())
+    if start == -1:
+        _rewrite_object(source / "attempt.json", "start_sequence", -1)
+        _rewrite_object(source / "attempt.json", "read_begin_start", -1)
+    original = _snapshot(source)
+    capture = _capture_root(tmp_path)
+
+    if start < 0:
+        with pytest.raises(QuarantinePublishError):
+            publish_quarantined_prefix(source, StagingStore(tmp_path, capture).paths)
+        assert _snapshot(source) == original
+        assert set(capture.iterdir()) == capture_before
+        return
+
+    result = publish_quarantined_prefix(source, StagingStore(tmp_path, capture).paths)
+    assert result.start_sequence == 0
+    assert result.next_sequence == 1
+    assert result.bundle_path.joinpath("records.bin").read_bytes() == raw
+    assert _snapshot(source) == original
+
+
+def test_capture_output_fifo_is_rejected_in_bounded_fork_with_candidate_provenance(tmp_path: Path) -> None:
+    source, _, _ = _quarantined_attempt(tmp_path)
+    raw = source / "records.bin"
+    raw.unlink()
+    raw_target = tmp_path / "records.bin.regular-evidence"
+    raw_target.write_bytes(_record(1) + _record(2))
+    mkfifo(raw)
+    context = get_context("fork")
+    output = context.Queue()
+    expected_module_path = Path(cast(str, quarantine_publish.__file__)).resolve()
+    process = context.Process(
+        target=_publish_fifo_child,
+        args=(str(source), str(tmp_path), str(_capture_root(tmp_path)), output),
+    )
+
+    try:
+        process.start()
+        process.join(2)
+        assert not process.is_alive(), "FIFO publication blocked in the candidate child"
+        module_path = Path(cast(str, output.get(timeout=1))).resolve()
+        result = cast(tuple[str, ...], output.get(timeout=1))
+        assert module_path == expected_module_path
+        assert result[0] == "raised"
+        assert result[1] == "QuarantinePublishError"
+        assert source.is_dir()
+        assert raw.is_fifo()
+        assert raw_target.read_bytes() == _record(1) + _record(2)
+        assert not tuple(_capture_root(tmp_path).iterdir())
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(1)
+        if process.is_alive():
+            process.kill()
+            process.join(1)
+        assert not process.is_alive()
+        output.close()
+        output.join_thread()

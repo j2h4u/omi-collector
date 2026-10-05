@@ -14,6 +14,7 @@ from typing import BinaryIO, cast
 
 import pytest
 
+from omi_collector.capture.adapters import attempts as attempts_adapter
 from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
     RecordGapError,
@@ -195,6 +196,56 @@ def test_streaming_chunk_crossing_hash_boundary_persists_the_boundary_prefix(tmp
     assert attempt.durable_prefix.next_sequence == 1124
     assert (attempt.path / "records.bin").read_bytes() == b"".join(records)
     attempt.close()
+
+
+def test_streaming_chunk_hash_advances_once_across_checkpoint_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_sha256 = sha256
+    records = _record(1) + _record(2) + _record(3)
+    updates: list[bytes] = []
+
+    class DelegatingDigest:
+        def __init__(self, initial_data: bytes = b"") -> None:
+            self._digest = real_sha256(initial_data)
+
+        def update(self, data: bytes) -> None:
+            offset = sum(len(part) for part in updates)
+            assert data
+            assert offset + len(data) <= len(records)
+            assert data == records[offset : offset + len(data)]
+            updates.append(bytes(data))
+            self._digest.update(data)
+
+        def hexdigest(self) -> str:
+            return self._digest.hexdigest()
+
+    def observed_sha256(initial_data: bytes = b"") -> DelegatingDigest:
+        return DelegatingDigest(initial_data)
+
+    monkeypatch.setattr(attempts_adapter, "sha256", observed_sha256)
+    store = StagingStore(
+        tmp_path,
+        _capture_root(tmp_path),
+        config=CollectorConfig(durability=DurabilityConfig(checkpoint_records=2)),
+    )
+    attempt = store.prepare_streaming_attempt(100, 3)
+    try:
+        attempt.record_read_begin(ReadBeginNotification(100, 3))
+        attempt.accept_chunk(100, records)
+
+        checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+        boundary_bytes = 2 * RECORD_SIZE
+        assert checkpoint["record_count"] == 2
+        assert checkpoint["raw_sha256"] == real_sha256(records[:boundary_bytes]).hexdigest()
+        assert updates
+        assert all(updates)
+        assert b"".join(updates) == records
+        raw_bytes = (attempt.path / "records.bin").read_bytes()
+        assert raw_bytes == records
+        assert len(raw_bytes) == 3 * RECORD_SIZE
+    finally:
+        attempt.close()
 
 
 def test_streaming_accept_chunk_writes_the_appended_suffix_once(tmp_path: Path) -> None:
@@ -472,6 +523,196 @@ def test_streaming_resume_promotes_only_an_aligned_post_checkpoint_tail(tmp_path
 
     assert checkpoint_before["record_count"] == 1
     assert (attempt.path / "records.bin").read_bytes() == first + second
+    assert attempt.path.exists()
+
+
+def test_close_is_non_durable_by_default_and_durable_close_syncs_raw(tmp_path: Path) -> None:
+    raw_syncs: list[Path] = []
+
+    def record_raw_sync(fd: int) -> None:
+        try:
+            target = Path(f"/proc/self/fd/{fd}").resolve()
+        except OSError:
+            target = Path()
+        if target.name == "records.bin":
+            raw_syncs.append(target)
+        fsync(fd)
+
+    attempt = _started_streaming_attempt(tmp_path, fsync_fn=record_raw_sync)
+    attempt.accept_chunk(100, _record(1))
+    before_close = len(raw_syncs)
+    attempt.close()
+    assert len(raw_syncs) == before_close
+
+    durable = _started_streaming_attempt(tmp_path / "durable", fsync_fn=record_raw_sync)
+    durable.accept_chunk(100, _record(2))
+    before_durable_close = len(raw_syncs)
+    durable.close(durable=True)
+    assert raw_syncs[before_durable_close:] == [durable.path / "records.bin"]
+
+
+def test_resume_does_not_promote_already_checkpointed_raw_bytes(tmp_path: Path) -> None:
+    raw_syncs = 0
+
+    def count_raw_sync(fd: int) -> None:
+        nonlocal raw_syncs
+        if Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin":
+            raw_syncs += 1
+        fsync(fd)
+
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=count_raw_sync)
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    attempt.close()
+    before = raw_syncs
+
+    restarted = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=count_raw_sync)
+    with restarted.device_lock() as lease:
+        resumed = restarted.resume_streaming_attempt(lease)
+        assert resumed is not None
+        try:
+            assert resumed.durable_prefix.record_count == 1
+            assert raw_syncs == before
+        finally:
+            resumed.close()
+
+
+def test_prefix_publication_fsyncs_raw_evidence_before_bundle_is_visible(tmp_path: Path) -> None:
+    raw_sync_paths: list[Path] = []
+    armed = False
+    fail_raw_sync = False
+
+    def fail_first_raw_sync(fd: int) -> None:
+        nonlocal fail_raw_sync
+        target = Path(f"/proc/self/fd/{fd}").resolve()
+        if target.name == "records.bin" and armed:
+            raw_sync_paths.append(target)
+            if fail_raw_sync:
+                fail_raw_sync = False
+                raise OSError("raw prefix sync failed")
+        fsync(fd)
+
+    attempt = _started_streaming_attempt(tmp_path, count=1, fsync_fn=fail_first_raw_sync)
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    attempt.close()
+    armed = True
+    fail_raw_sync = True
+    restarted = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_first_raw_sync)
+    resumed = None
+    try:
+        with pytest.raises(OSError, match="raw prefix sync failed"), restarted.device_lock() as lease:
+            resumed = restarted.resume_streaming_attempt(lease)
+            assert resumed is not None
+            resumed.publish_prefix()
+    finally:
+        if resumed is not None:
+            resumed.close(durable=True)
+
+    assert len(raw_sync_paths) == 2
+    assert raw_sync_paths[0] == attempt.path / "records.bin"
+    assert attempt.path.exists()
+    assert not (attempt.path / "prefix-publication.json").exists()
+
+
+def test_seal_requires_raw_fsync_before_publishing_bundle(tmp_path: Path) -> None:
+    raw_sync_paths: list[Path] = []
+    armed = False
+
+    def fail_raw_sync(fd: int) -> None:
+        nonlocal armed
+        target = Path(f"/proc/self/fd/{fd}").resolve()
+        if armed and target.name == "records.bin":
+            raw_sync_paths.append(target)
+            armed = False
+            raise OSError("raw seal sync failed")
+        fsync(fd)
+
+    attempt = _started_streaming_attempt(tmp_path, count=1, fsync_fn=fail_raw_sync)
+    attempt.accept_chunk(100, _record(1))
+    armed = True
+    try:
+        with pytest.raises(OSError, match="raw seal sync failed"):
+            attempt.seal(DoneNotification(0, 101))
+    finally:
+        attempt.close(durable=True)
+
+    assert raw_sync_paths == [attempt.path / "records.bin"]
+    assert attempt.path.is_dir()
+    assert (attempt.path / "records.bin").read_bytes() == _record(1)
+    assert not tuple(_capture_root(tmp_path).glob("100-101-*"))
+
+
+def test_replayed_prefix_publication_deduplicates_without_changing_bundle(tmp_path: Path) -> None:
+    attempt = _started_streaming_attempt(tmp_path, count=1)
+    try:
+        attempt.accept_chunk(100, _record(1))
+        attempt.checkpoint()
+
+        first = attempt.publish_prefix()
+        assert first is not None
+        assert first.deduplicated is False
+        before = {entry.name: entry.read_bytes() for entry in first.bundle_path.iterdir()}
+
+        replay = attempt.publish_prefix()
+
+        assert replay is not None
+        assert replay.deduplicated is True
+        assert {entry.name: entry.read_bytes() for entry in replay.bundle_path.iterdir()} == before
+    finally:
+        attempt.close(durable=True)
+
+
+def test_resume_fsync_failure_does_not_promote_uncheckpointed_tail(tmp_path: Path) -> None:
+    fail_raw_sync = False
+
+    def fail_when_armed(fd: int) -> None:
+        if fail_raw_sync and Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin":
+            raise OSError("tail promotion sync failed")
+        fsync(fd)
+
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_when_armed)
+    attempt = store.prepare_streaming_attempt(100, 2)
+    attempt.record_read_begin(ReadBeginNotification(100, 2))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    attempt.accept_chunk(101, _record(2))
+    attempt.close(durable=True)
+    checkpoint = (attempt.path / "checkpoint.json").read_bytes()
+    raw = _record(1) + _record(2)
+    fail_raw_sync = True
+
+    restarted = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_when_armed)
+    with pytest.raises(OSError, match="tail promotion sync failed"), restarted.device_lock() as lease:
+        restarted.resume_streaming_attempt(lease)
+
+    assert (attempt.path / "checkpoint.json").read_bytes() == checkpoint
+    assert (attempt.path / "records.bin").read_bytes() == raw
+    assert attempt.path.is_dir()
+
+
+def test_empty_published_prefix_with_wrong_empty_digest_still_blocks_terminalization(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.checkpoint()
+    assert attempt.publish_prefix() is None
+    attempt.close(durable=True)
+    checkpoint = attempt.path / "checkpoint.json"
+    _rewrite_checkpoint(checkpoint, "raw_sha256", "f" * 64)
+    corrupted = checkpoint.read_bytes()
+
+    with pytest.raises(AttemptStateError):
+        store.open_attempt(attempt.attempt_id)
+    assert store.pending_attempts() == (attempt.descriptor,)
+    with pytest.raises(AttemptStateError):
+        store.terminalize_prefix_attempt(attempt.attempt_id)
+
+    assert checkpoint.read_bytes() == corrupted
+    assert (attempt.path / "prefix-publication.json").is_file()
+    assert not (attempt.path / "terminal-retired.json").exists()
     assert attempt.path.exists()
 
 

@@ -234,3 +234,25 @@ def test_unprocessable_is_terminal_only_after_marker_commit() -> None:
     assert pending.state is QuarantineState.UNPROCESSABLE_UNMARKED
     assert transition(pending.state, QuarantineEvent.MARK_FAILED).state is pending.state
     assert transition(pending.state, QuarantineEvent.MARK_COMMITTED).state is QuarantineState.UNPROCESSABLE
+
+
+def test_public_transition_decision_rejects_mutation_and_remains_unchanged() -> None:
+    decision = transition(QuarantineState.RETRYABLE, QuarantineEvent.INSPECT)
+    expected = (QuarantineState.RETRYABLE, QuarantineAction.SALVAGE)
+    state_attribute = "state"
+
+    try:
+        setattr(decision, state_attribute, QuarantineState.INVALID_EVIDENCE)
+    except AttributeError:
+        mutation_rejected = True
+    else:
+        mutation_rejected = False
+
+    subsequent = transition(QuarantineState.RETRYABLE, QuarantineEvent.INSPECT)
+    subsequent_value = (subsequent.state, subsequent.action)
+    if not mutation_rejected:
+        setattr(decision, state_attribute, expected[0])
+
+    assert mutation_rejected
+    assert (decision.state, decision.action) == expected
+    assert subsequent_value == expected

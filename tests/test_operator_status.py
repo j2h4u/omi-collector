@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
 import omi_collector.operator_status as status_module
+from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging, debug_event
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
 from omi_collector.capture.application.quality_metrics import (
@@ -19,7 +21,7 @@ from omi_collector.capture.application.quality_metrics import (
     TransferSessionMetric,
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
-from omi_collector.config import DEFAULT_CONFIG, QualityMetricsConfig
+from omi_collector.config import DEFAULT_CONFIG, DebugLogConfig, QualityMetricsConfig
 from omi_collector.operator_status import OperatorStatusError, collect_operator_status
 from omi_collector.spool_metrics import FirmwareLifetimeMetrics, SpoolMetrics, SpoolWindowMetrics
 from omi_collector.storage_layout import load_operator_config
@@ -604,6 +606,197 @@ def test_status_summarizes_latest_quality_events_in_file_order_independently(
     assert quality["last_advertisement_at"] == "2026-09-08T09:04:00.000+00:00"
     assert quality["last_transfer_outcome"] == "newer"
     assert quality["last_clock_correction_at"] == "2026-09-08T09:02:00.000+00:00"
+
+
+def test_status_keeps_first_debug_observation_at_equal_millisecond_timestamps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    first_timestamp = datetime(2026, 9, 8, 9, tzinfo=UTC)
+    seconds = (0, 0, 0, 1, 1, 2, 2, 3, 3)
+    timestamps = iter((first_timestamp + timedelta(seconds=second)).timestamp() for second in seconds)
+    original_factory = logging.getLogRecordFactory()
+    logger_name = "omi_collector.operator_status_equal_timestamp_test"
+
+    def timestamped_factory(*args: object, **kwargs: object) -> logging.LogRecord:
+        record = original_factory(*args, **kwargs)
+        if record.name == logger_name:
+            record.created = next(timestamps)
+        return record
+
+    debug_config = replace(
+        DEFAULT_CONFIG.observability.debug_log,
+        logger_name=logger_name,
+    )
+    logger = configure_debug_logging(layout.collector.root, debug_config)
+    logging.setLogRecordFactory(timestamped_factory)
+    try:
+        debug_event(
+            "sync_progress",
+            logger=logger,
+            progress={"event": "pendant_observation", "firmware": "first-firmware"},
+        )
+        debug_event(
+            "sync_progress",
+            logger=logger,
+            progress={"event": "pendant_observation", "firmware": "battery-firmware", "battery_percent": 88},
+        )
+        debug_event(
+            "sync_progress",
+            logger=logger,
+            progress={"event": "pendant_observation", "firmware": "later-firmware", "battery_percent": 12},
+        )
+        debug_event(
+            "sync_progress",
+            logger=logger,
+            progress={"status": "session_error", "error_message": "first-error"},
+        )
+        debug_event(
+            "sync_progress",
+            logger=logger,
+            progress={"status": "session_error", "error_message": "later-error"},
+        )
+        debug_event("ble_link_rssi_observed", logger=logger, rssi_dbm=-42)
+        debug_event("ble_link_rssi_observed", logger=logger, rssi_dbm=-70)
+        debug_event("sync_progress", logger=logger, progress={"status": "away"})
+        debug_event("sync_progress", logger=logger, progress={"status": "drained"})
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        assert close_debug_logging(logger) == 0
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    runtime = cast(dict[str, object], result["runtime"])
+    assert result["schema_version"] == 2
+    assert runtime["state"] == "away"
+    assert runtime["firmware"] == "first-firmware"
+    assert runtime["battery_percent"] == 88
+    assert cast(dict[str, object], runtime["last_error"])["error_message"] == "first-error"
+    assert runtime["connection_rssi_dbm"] == -42
+
+
+def test_status_keeps_first_quality_observation_at_equal_timestamps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    timestamp = "2026-09-08T09:00:00.000+00:00"
+    writer = JsonlQualityMetrics(layout.collector.root, release_version="1.2.3")
+    try:
+        writer.record_advertisement(AdvertisementMetric(timestamp, "first-ad", -81, "1.2.3", "abcdef123456", "auto"))
+        writer.record_advertisement(AdvertisementMetric(timestamp, "later-ad", -22, "1.2.3", "abcdef123456", "auto"))
+        writer.record_transfer_session(
+            TransferSessionMetric(
+                timestamp,
+                "first-transfer",
+                "first-outcome",
+                "retryable_error",
+                2_000,
+                10,
+                1,
+                1,
+                1,
+                "1.2.3",
+                "abcdef123456",
+                "1.0.0",
+                "auto",
+                -91,
+            )
+        )
+        writer.record_transfer_session(
+            TransferSessionMetric(
+                timestamp,
+                "later-transfer",
+                "later-outcome",
+                "fatal_error",
+                2_000,
+                10,
+                2,
+                2,
+                2,
+                "1.2.3",
+                "abcdef123456",
+                "1.0.0",
+                "auto",
+                -91,
+            )
+        )
+        writer.record_clock_correction(
+            ClockCorrectionMetric(timestamp, "first-clock", 1.25, 1, 4, 4, "1.2.3", None, "1.0.0")
+        )
+        writer.record_clock_correction(
+            ClockCorrectionMetric(timestamp, "later-clock", 2.5, 1, 4, 4, "1.2.3", None, "1.0.0")
+        )
+    finally:
+        assert writer.close()
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    quality = cast(dict[str, object], result["quality_window"])
+    assert result["schema_version"] == 2
+    assert quality["advertisements"] == 2
+    assert quality["last_advertisement_rssi_dbm"] == -81
+    assert quality["last_transfer_outcome"] == "first-outcome"
+    assert quality["last_transfer_termination_class"] == "retryable_error"
+    assert quality["last_clock_correction_drift_seconds"] == 1.25
+    assert result["status"] == "unknown"
+
+
+@pytest.mark.parametrize("journal", ["debug", "quality"])
+def test_status_accepts_exact_configured_record_limit_and_rejects_one_more(
+    journal: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    limit = 1_024
+    config = DEFAULT_CONFIG
+    if journal == "debug":
+        debug_config = DebugLogConfig(
+            max_bytes=2_048,
+            max_record_bytes=limit,
+            logger_name="omi_collector.operator_status_record_limit_test",
+        )
+        config = replace(
+            config,
+            observability=replace(config.observability, debug_log=debug_config),
+        )
+        logger = configure_debug_logging(layout.collector.root, debug_config)
+        try:
+            debug_event("sync_progress", logger=logger, progress={"status": "away"})
+        finally:
+            assert close_debug_logging(logger) == 0
+        path = layout.collector.debug_log
+    else:
+        quality_config = QualityMetricsConfig(max_bytes=2_048, backup_count=1, max_record_bytes=limit)
+        config = replace(
+            config,
+            observability=replace(config.observability, quality_metrics=quality_config),
+        )
+        writer = JsonlQualityMetrics(layout.collector.root, release_version="1.2.3", config=quality_config)
+        try:
+            writer.record_advertisement(
+                AdvertisementMetric("2026-09-08T09:00:00+00:00", "boundary", -91, "1.2.3", None, "auto")
+            )
+        finally:
+            assert writer.close()
+        path = layout.collector.root / "quality.jsonl"
+    monkeypatch.setattr(status_module, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    record = path.read_bytes().removesuffix(b"\n")
+    assert len(record) < limit
+    path.write_bytes(record + b" " * (limit - len(record)) + b"\n")
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    assert result["schema_version"] == 2
+    if journal == "debug":
+        assert cast(dict[str, object], result["runtime"])["state"] == "away"
+    else:
+        assert cast(dict[str, object], result["quality_window"])["advertisements"] == 1
+
+    path.write_bytes(record + b" " * (limit + 1 - len(record)) + b"\n")
+    with pytest.raises(OperatorStatusError, match="record exceeds configured size"):
+        collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
 
 def test_status_includes_both_quality_window_edges_and_equal_clock_sequences(

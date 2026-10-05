@@ -59,6 +59,10 @@ def _timer(state: Searching | CoolingDown | RetryWaiting, at: float) -> TimerFir
     return TimerFired(at=at, deadline=armed_deadline(state), timer_epoch=state.timer_epoch)
 
 
+def test_initial_state_uses_the_public_scan_recheck_interval() -> None:
+    assert initial_state(10.0, POLICY) == Searching(timer_epoch=0, scan_recheck_at=110.0)
+
+
 def test_search_advertisement_requires_stable_repeated_visibility() -> None:
     state = Searching(timer_epoch=3, scan_recheck_at=100.0)
     advertisement = _advertisement(9.0)
@@ -188,6 +192,25 @@ def test_cooldown_continuous_advertising_waits_for_post_cooldown_encounter() -> 
     assert released.directive == StopAndBeginAttempt(AdvertisementTrigger(stable_after_cooldown))
 
 
+def test_cooldown_ad_at_exact_boundary_starts_a_fresh_stability_window() -> None:
+    state = CoolingDown(timer_epoch=4, cooldown_at=50.0, recheck_at=50.0, advertisement=None)
+    at_boundary = _advertisement(50.0)
+
+    refreshed = transition(state, AdvertisementObserved(at_boundary), POLICY)
+
+    assert isinstance(refreshed.state, CoolingDown)
+    assert refreshed.state.advertisement is at_boundary
+    assert refreshed.state.arrival_started_at == 50.0
+    assert refreshed.directive == Observe(50.0)
+
+    stable = _advertisement(55.0)
+    released = transition(refreshed.state, AdvertisementObserved(stable), POLICY)
+
+    assert isinstance(released.state, Attempting)
+    assert released.state.trigger == AdvertisementTrigger(stable)
+    assert released.directive == StopAndBeginAttempt(AdvertisementTrigger(stable))
+
+
 def test_retry_advertisement_begins_a_fresh_encounter_after_backoff() -> None:
     state = RetryWaiting(
         timer_epoch=1,
@@ -266,9 +289,99 @@ def test_retry_backoff_returns_to_scanning_with_retained_recheck() -> None:
     )
 
 
+def test_search_timer_at_its_exact_deadline_advances_epoch_and_recheck() -> None:
+    state = Searching(timer_epoch=4, scan_recheck_at=100.0)
+
+    result = transition(state, TimerFired(at=100.0, deadline=100.0, timer_epoch=4), POLICY)
+
+    assert result == type(result)(Searching(timer_epoch=5, scan_recheck_at=200.0), Observe(200.0))
+
+
+def test_early_cooldown_timer_with_matching_deadline_keeps_cooling_down() -> None:
+    state = CoolingDown(timer_epoch=4, cooldown_at=50.0, recheck_at=50.0, advertisement=None)
+
+    result = transition(state, TimerFired(at=49.0, deadline=50.0, timer_epoch=4), POLICY)
+
+    assert result.state is state
+    assert result.directive == Observe(50.0)
+
+
+def test_scan_recheck_before_retry_preserves_retry_deadline() -> None:
+    state = RetryWaiting(
+        timer_epoch=4,
+        retry_at=30.0,
+        scan_recheck_at=10.0,
+        retry_index=1,
+        advertisement=None,
+        absence_at=200.0,
+    )
+
+    result = transition(state, TimerFired(at=10.0, deadline=10.0, timer_epoch=4), POLICY)
+
+    assert result == type(result)(RetryWaiting(5, 30.0, 110.0, 1, None, None, 200.0), Observe(30.0))
+
+
+def test_equal_retry_and_scan_deadlines_clear_retry_and_recheck_from_callback() -> None:
+    state = RetryWaiting(
+        timer_epoch=4,
+        retry_at=10.0,
+        scan_recheck_at=10.0,
+        retry_index=1,
+        advertisement=None,
+        absence_at=200.0,
+    )
+
+    result = transition(state, TimerFired(at=10.0, deadline=10.0, timer_epoch=4), POLICY)
+
+    assert result == type(result)(RetryWaiting(5, None, 110.0, 1, None, None, 200.0), Observe(110.0))
+
+
+@pytest.mark.parametrize(("at", "expected_recheck"), [(10.0, 110.0), (11.0, 111.0)])
+def test_retry_without_a_retry_deadline_rechecks_at_or_after_scan_deadline(at: float, expected_recheck: float) -> None:
+    state = RetryWaiting(
+        timer_epoch=4,
+        retry_at=None,
+        scan_recheck_at=10.0,
+        retry_index=1,
+        advertisement=None,
+        absence_at=200.0,
+    )
+
+    result = transition(state, TimerFired(at=at, deadline=10.0, timer_epoch=4), POLICY)
+
+    assert result == type(result)(
+        RetryWaiting(5, None, expected_recheck, 1, None, None, 200.0), Observe(expected_recheck)
+    )
+
+
+def test_duplicate_advertisement_timestamp_restarts_arrival_stability_window() -> None:
+    state: PresenceState = Searching(timer_epoch=0, scan_recheck_at=100.0)
+    observations = [_advertisement(at) for at in (1.0, 4.0, 4.0, 6.0)]
+    result = None
+
+    for advertisement in observations:
+        result = transition(state, AdvertisementObserved(advertisement), POLICY)
+        assert not isinstance(result.state, Attempting)
+        assert not isinstance(result.directive, StopAndBeginAttempt)
+        state = result.state
+
+    assert isinstance(state, Searching)
+    assert state.arrival_started_at == 4.0
+    assert result is not None and result.directive == Observe(100.0)
+
+    stable = _advertisement(9.0)
+    released = transition(state, AdvertisementObserved(stable), POLICY)
+
+    assert isinstance(released.state, Attempting)
+    assert released.state.trigger == AdvertisementTrigger(stable)
+    assert released.directive == StopAndBeginAttempt(AdvertisementTrigger(stable))
+
+
 @pytest.mark.parametrize(
     "state",
     (
+        Searching(timer_epoch=3, scan_recheck_at=50.0),
+        CoolingDown(timer_epoch=3, cooldown_at=20.0, recheck_at=50.0, advertisement=None),
         RetryWaiting(
             timer_epoch=3,
             retry_at=50.0,
@@ -278,7 +391,7 @@ def test_retry_backoff_returns_to_scanning_with_retained_recheck() -> None:
         ),
     ),
 )
-def test_timer_epoch_and_scheduled_deadline_must_both_match(state: CoolingDown | RetryWaiting) -> None:
+def test_timer_epoch_and_scheduled_deadline_must_both_match(state: Searching | CoolingDown | RetryWaiting) -> None:
     stale_epoch = transition(
         state, TimerFired(at=50.0, deadline=armed_deadline(state), timer_epoch=state.timer_epoch - 1), POLICY
     )
@@ -286,6 +399,53 @@ def test_timer_epoch_and_scheduled_deadline_must_both_match(state: CoolingDown |
 
     assert stale_epoch.state is state and isinstance(stale_epoch.directive, NoOperation)
     assert stale_deadline.state is state and isinstance(stale_deadline.directive, NoOperation)
+
+
+def test_late_search_timer_refreshes_the_recheck_from_callback_time() -> None:
+    state = Searching(timer_epoch=4, scan_recheck_at=100.0)
+
+    result = transition(state, TimerFired(at=101.0, deadline=100.0, timer_epoch=4), POLICY)
+
+    assert result == type(result)(Searching(5, 201.0), Observe(201.0))
+
+
+def test_late_cooldown_timer_returns_to_searching_from_callback_time() -> None:
+    state = CoolingDown(timer_epoch=6, cooldown_at=50.0, recheck_at=50.0, advertisement=None)
+
+    result = transition(state, TimerFired(at=51.0, deadline=50.0, timer_epoch=6), POLICY)
+
+    assert result == type(result)(Searching(7, 151.0), Observe(151.0))
+
+
+def test_late_retry_absence_timer_ends_visit_without_a_permit() -> None:
+    state = RetryWaiting(
+        timer_epoch=8,
+        retry_at=None,
+        scan_recheck_at=100.0,
+        retry_index=1,
+        advertisement=None,
+        absence_at=20.0,
+    )
+
+    result = transition(state, TimerFired(at=21.0, deadline=20.0, timer_epoch=8), POLICY)
+
+    assert result == type(result)(Searching(9, 121.0), EndVisit("absence"))
+
+
+def test_delayed_search_observations_within_gap_retain_the_trigger_candidate() -> None:
+    state = Searching(timer_epoch=2, scan_recheck_at=100.0)
+    first = _advertisement(1.0)
+    candidate = object()
+    second = _advertisement(6.0, candidate=candidate)
+
+    waiting = transition(state, AdvertisementObserved(first, processed_at=2.0), POLICY)
+    released = transition(waiting.state, AdvertisementObserved(second, processed_at=7.0), POLICY)
+
+    assert waiting.directive == Observe(100.0)
+    assert isinstance(released.directive, StopAndBeginAttempt)
+    assert isinstance(released.directive.trigger, AdvertisementTrigger)
+    assert released.directive.trigger.advertisement is second
+    assert released.directive.trigger.advertisement.candidate is candidate
 
 
 def test_deadline_projection_and_noop_transition_do_not_mutate_waiting_state() -> None:

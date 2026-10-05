@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from itertools import product
 from typing import Literal
 
@@ -20,33 +21,12 @@ from omi_collector.capture.application.session_machine import (
     SessionTransitionError,
     TeardownResolved,
     initial_state,
+    require_command,
     transition,
 )
 
 OUTCOMES = ("drained", "collected", "retry", "candidate_unavailable", "connected_interrupted")
 RETRY_OUTCOMES = ("retry", "candidate_unavailable", "connected_interrupted")
-STATES = (
-    *(
-        SessionState(command)
-        for command in (
-            SessionCommand.CONNECT,
-            SessionCommand.INFO,
-            SessionCommand.PREFLIGHT,
-            SessionCommand.READ,
-        )
-    ),
-    *(SessionState(SessionCommand.TEARDOWN, AfterTeardown.CHECKPOINT, outcome=outcome) for outcome in OUTCOMES),
-    *(SessionState(SessionCommand.TEARDOWN, after) for after in (AfterTeardown.FAILED, AfterTeardown.CANCELLED)),
-    *(
-        SessionState(command, outcome=outcome, teardown_interrupted=interrupted)
-        for command in (SessionCommand.CHECKPOINT, SessionCommand.FINISHED, SessionCommand.RETURNED)
-        for outcome in OUTCOMES
-        for interrupted in (False, True)
-        if not interrupted or outcome == "connected_interrupted"
-    ),
-    SessionState(SessionCommand.FAILED),
-    SessionState(SessionCommand.CANCELLED),
-)
 EVENTS = (
     Connected(),
     InfoResolved(),
@@ -72,8 +52,33 @@ VALID_EVENT_TYPES = {
 }
 
 
+def _states() -> tuple[SessionState, ...]:
+    return (
+        *(
+            SessionState(command)
+            for command in (
+                SessionCommand.CONNECT,
+                SessionCommand.INFO,
+                SessionCommand.PREFLIGHT,
+                SessionCommand.READ,
+            )
+        ),
+        *(SessionState(SessionCommand.TEARDOWN, AfterTeardown.CHECKPOINT, outcome=outcome) for outcome in OUTCOMES),
+        *(SessionState(SessionCommand.TEARDOWN, after) for after in (AfterTeardown.FAILED, AfterTeardown.CANCELLED)),
+        *(
+            SessionState(command, outcome=outcome, teardown_interrupted=interrupted)
+            for command in (SessionCommand.CHECKPOINT, SessionCommand.FINISHED, SessionCommand.RETURNED)
+            for outcome in OUTCOMES
+            for interrupted in (False, True)
+            if not interrupted or outcome == "connected_interrupted"
+        ),
+        SessionState(SessionCommand.FAILED),
+        SessionState(SessionCommand.CANCELLED),
+    )
+
+
 def test_every_state_and_event_pair_is_explicit() -> None:
-    for state, event in product(STATES, EVENTS):
+    for state, event in product(_states(), EVENTS):
         valid = type(event) in VALID_EVENT_TYPES[state.command]
         if isinstance(event, EffectFailed) and state.command in {
             SessionCommand.TEARDOWN,
@@ -107,6 +112,17 @@ def test_success_path_requires_preflight_read_teardown_and_checkpoint_receipts()
         transition(initial_state(), InfoResolved())
     with pytest.raises(SessionTransitionError, match="invalid while info"):
         transition(SessionState(SessionCommand.INFO), ReadResolved("drained"))
+
+
+def test_initial_session_state_rejects_command_mutation_and_retains_connect_guard() -> None:
+    state = initial_state()
+
+    with pytest.raises(FrozenInstanceError):
+        state.__setattr__("command", SessionCommand.TEARDOWN)
+
+    require_command(state, SessionCommand.CONNECT)
+    with pytest.raises(SessionTransitionError, match="invalid while connect"):
+        transition(state, InfoResolved())
 
 
 @pytest.mark.parametrize("preflight", ("disabled", "degraded"))

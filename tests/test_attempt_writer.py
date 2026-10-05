@@ -776,7 +776,7 @@ def test_invalid_checkpoint_receipt_preserves_last_valid_snapshot(receipt: objec
             assert (acknowledged.durable_next_sequence, acknowledged.durable_record_count) == (102, 2)
 
             target.checkpoint_result = receipt
-            assert await writer.checkpoint() == receipt
+            assert await asyncio.wait_for(writer.checkpoint(), timeout=1) == receipt
             assert writer.snapshot == acknowledged
             await writer.close()
 

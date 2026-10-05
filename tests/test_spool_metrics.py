@@ -8,6 +8,8 @@ import subprocess
 import sys
 import threading
 import time
+from multiprocessing import get_context
+from multiprocessing.connection import Connection
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
@@ -80,6 +82,17 @@ def _rewrite_manifest(bundle: Path, **updates: object) -> None:
     manifest = cast(dict[str, object], json.loads(manifest_path.read_text(encoding="utf-8")))
     manifest.update(updates)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _collect_spool_metrics_in_child(root: str, result: Connection) -> None:
+    try:
+        collect_spool_metrics(Path(root))
+    except SpoolMetricsError:
+        result.send("rejected")
+    else:
+        result.send("accepted")
+    finally:
+        result.close()
 
 
 def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
@@ -180,6 +193,38 @@ else:
     assert not writer_errors
     assert result.returncode == 0
     assert result.stdout.strip() == "rejected"
+
+
+def test_metrics_rejects_fifo_records_file_without_a_writer(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "10-11", (_record(1),))
+    records_path = bundle / "records.bin"
+    records_path.unlink()
+    os.mkfifo(records_path)
+    receive, send = get_context("fork").Pipe(duplex=False)
+    process = get_context("fork").Process(
+        target=_collect_spool_metrics_in_child,
+        args=(str(tmp_path), send),
+    )
+    process_started = False
+    try:
+        process.start()
+        process_started = True
+        send.close()
+        assert receive.poll(2.0), "spool metrics collection blocked opening a FIFO records file"
+        assert receive.recv() == "rejected"
+        process.join(timeout=2.0)
+        assert process.exitcode == 0
+    finally:
+        send.close()
+        receive.close()
+        if process_started and process.is_alive():
+            process.terminate()
+            process.join(timeout=2.0)
+        if process_started and process.is_alive():
+            process.kill()
+            process.join(timeout=2.0)
+        if process_started:
+            process.close()
 
 
 def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path: Path) -> None:

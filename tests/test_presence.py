@@ -826,6 +826,60 @@ def test_close_is_idempotent_and_wakes_a_waiter() -> None:
     _run(scenario())
 
 
+def test_close_retries_stop_after_cancellation_during_public_close() -> None:
+    async def scenario() -> None:
+        stop_started = asyncio.Event()
+        stop_cancelled = asyncio.Event()
+        waiting_for_presence = asyncio.Event()
+
+        async def idle_sleep(_: float) -> None:
+            waiting_for_presence.set()
+            await asyncio.Future()
+
+        class CancelFirstStop(FakeObserver):
+            stop_calls = 0
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    stop_started.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        stop_cancelled.set()
+                        raise
+                await super().stop()
+
+        observer = CancelFirstStop()
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(scan_recheck_seconds=60.0),
+            sleep=idle_sleep,
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        closing: asyncio.Task[None] | None = None
+        try:
+            await _wait_started(observer, scheduler, waiter)
+            assert observer.active
+            await asyncio.wait_for(waiting_for_presence.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+
+            closing = asyncio.create_task(scheduler.close())
+            await asyncio.wait_for(stop_started.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            closing.cancel()
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                await asyncio.gather(closing, return_exceptions=True)
+            await asyncio.wait_for(stop_cancelled.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+
+            await scheduler.close()
+
+            assert observer.stop_calls == 2
+            assert not observer.active
+        finally:
+            await _cancel_waiter_and_close(scheduler, waiter, closing)
+
+    _run(scenario())
+
+
 def test_close_racing_with_start_stops_the_completed_scanner() -> None:
     async def scenario() -> None:
         entered_start = asyncio.Event()

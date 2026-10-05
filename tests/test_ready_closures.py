@@ -130,6 +130,30 @@ def test_closures_reject_malformed_state(tmp_path: Path) -> None:
         load(path)
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param({"version": 1}, id="missing-closures"),
+        pytest.param({"version": 1, "closures": [], "unexpected": True}, id="extra-field"),
+    ],
+)
+def test_load_rejects_missing_or_extra_top_level_fields(tmp_path: Path, state: dict[str, object]) -> None:
+    path = tmp_path / "ready-closures.json"
+    path.write_text(dumps(state), encoding="utf-8")
+
+    with pytest.raises(ReadyClosureError, match="schema is invalid"):
+        load(path)
+
+
+def test_append_creates_missing_nested_parent_directories(tmp_path: Path) -> None:
+    path = tmp_path / "missing" / "nested" / "ready-closures.json"
+
+    closure = append(path, 10, "absence")
+
+    assert path.parent.is_dir()
+    assert load(path) == (closure,)
+
+
 @pytest.mark.parametrize("next_sequence", [-1, True, 1.5, "1"])
 def test_append_rejects_invalid_frontier_without_changing_queue(tmp_path: Path, next_sequence: object) -> None:
     path = tmp_path / "ready-closures.json"
@@ -234,9 +258,7 @@ def test_begin_visit_returns_existing_non_drained_closure_unchanged(tmp_path: Pa
 
 
 @pytest.mark.parametrize("queue_state", ["empty", "mismatched_head"])
-def test_remove_rejects_empty_or_mismatched_queue_without_changing_bytes(
-    tmp_path: Path, queue_state: str
-) -> None:
+def test_remove_rejects_empty_or_mismatched_queue_without_changing_bytes(tmp_path: Path, queue_state: str) -> None:
     path = tmp_path / "ready-closures.json"
     queued = append(path, 30, "absence")
     if queue_state == "empty":

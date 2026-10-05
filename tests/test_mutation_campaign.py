@@ -23,7 +23,7 @@ from scripts import mutation_campaign
 def campaign_project(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     repo = tmp_path / "project"
     repo.mkdir()
-    (repo / ".gitignore").write_text(".gremlins_cache/\ncoverage/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text(".gremlins_cache/\n.coveragerc.gremlins\ncoverage/\n", encoding="utf-8")
     (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     (repo / "pyproject.toml").write_text("[project]\nname = 'campaign-fixture'\nversion = '0.1.0'\n", encoding="utf-8")
     (repo / "src" / "omi_collector").mkdir(parents=True)
@@ -67,6 +67,13 @@ def _launch(
         with redirect_stdout(stdout), redirect_stderr(stderr):
             status = mutation_campaign.main()
     return status, stdout.getvalue(), stderr.getvalue()
+
+
+def _without_runner_defaults(environment: dict[str, str]) -> dict[str, str]:
+    caller_environment = environment.copy()
+    for key in mutation_campaign.FIXED_ENV:
+        caller_environment.pop(key, None)
+    return caller_environment
 
 
 def _job_directories(audit_root: Path) -> list[Path]:
@@ -113,7 +120,12 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
     def sync(job_root: Path, _environment: dict[str, str] | None = None) -> None:
         sync_calls.append(job_root)
 
-    def owner(job_root: Path, mode: str, token: str, **_: object) -> int:
+    def owner(job_root: Path, mode: str, token: str, **kwargs: object) -> int:
+        runner_environment = cast(dict[str, str], kwargs["environment"])
+        assert runner_environment["COVERAGE_CORE"] == "ctrace"
+        assert runner_environment["COVERAGE_FILE"] == ""
+        assert runner_environment["PYTEST_ADDOPTS"] == ""
+        assert runner_environment["UV_LINK_MODE"] == "hardlink"
         owner_calls.append((job_root, mode, token))
         checkout = job_root / "checkout"
         assert (checkout / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o755
@@ -126,7 +138,14 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
     monkeypatch.setattr(mutation_campaign, "_sync_job_environment", sync)
     monkeypatch.setattr(mutation_campaign, "_enter_owner", owner)
 
-    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+    status, _stdout, stderr = _launch(
+        repo,
+        _without_runner_defaults(env),
+        monkeypatch,
+        "launch",
+        "--mode",
+        "fresh",
+    )
 
     jobs = _job_directories(audit_root)
     assert status == 0, stderr
@@ -135,6 +154,21 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
     assert owner_calls == [(jobs[0], "fresh", json.loads((jobs[0] / "owner.json").read_text())["run_token"])]
     assert (repo / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o775
     assert (repo / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o664
+
+
+def test_generated_gremlins_coverage_config_stays_out_of_snapshot_identity(
+    campaign_project: tuple[Path, dict[str, str]],
+) -> None:
+    repo, environment = campaign_project
+    mutation_campaign._canonicalize_snapshot_modes(repo)
+    generated = repo / ".coveragerc.gremlins"
+    generated.write_text("[run]\nbranch = True\n", encoding="utf-8")
+
+    mutation_campaign._snapshot_identity(repo, environment)
+
+    (repo / "unexpected-run-output.tmp").write_text("not ignored\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="tracked or untracked changes"):
+        mutation_campaign._snapshot_identity(repo, environment)
 
 
 def test_resume_reuses_exact_job_and_preserves_completed_native_cache(
@@ -173,14 +207,26 @@ def test_resume_reuses_exact_job_and_preserves_completed_native_cache(
     before = _write_cache(cache_path, [("completed", "ZAPPED")])
     calls: list[tuple[Path, str]] = []
 
-    def resume_owner(job_root: Path, mode: str, *_args: object, **_kwargs: object) -> int:
+    def resume_owner(job_root: Path, mode: str, *_args: object, **kwargs: object) -> int:
+        runner_environment = cast(dict[str, str], kwargs["environment"])
+        assert runner_environment["COVERAGE_CORE"] == "ctrace"
+        assert runner_environment["COVERAGE_FILE"] == ""
+        assert runner_environment["PYTEST_ADDOPTS"] == ""
+        assert runner_environment["UV_LINK_MODE"] == "hardlink"
         calls.append((job_root, mode))
         assert cache_path.read_bytes() == before
         return 0
 
     monkeypatch.setattr(mutation_campaign, "_enter_owner", resume_owner)
 
-    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "resume")
+    status, _stdout, stderr = _launch(
+        repo,
+        _without_runner_defaults(env),
+        monkeypatch,
+        "launch",
+        "--mode",
+        "resume",
+    )
 
     assert status == 0, stderr
     assert calls == [(job, "resume")]
@@ -203,10 +249,10 @@ def test_incompatible_resume_refuses_before_mutating_cache(
     owner_receipt = _read_json_object(job / "owner.json")
     owner_receipt["state"] = "paused"
     owner_receipt["checkpoint_verified"] = True
+    cast(dict[str, object], owner_receipt["identity"])["tree"] = "not-the-recorded-tree"
     (job / "owner.json").write_text(json.dumps(owner_receipt), encoding="utf-8")
     cache_path = job / "checkout" / ".gremlins_cache" / "results.db"
     before = _write_cache(cache_path, [("completed", "ZAPPED")])
-    env["COVERAGE_CORE"] = "invalid-runtime"
     owner_calls: list[bool] = []
     monkeypatch.setattr(mutation_campaign, "_enter_owner", lambda *_a, **_k: owner_calls.append(True) or 0)
 

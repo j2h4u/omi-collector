@@ -41,3 +41,4 @@ graphify-out/
 # Local mutation reports and cache
 coverage/gremlins/
 .gremlins_cache/
+.coveragerc.gremlins

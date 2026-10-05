@@ -23,7 +23,7 @@ from scripts import mutation_campaign
 def campaign_project(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     repo = tmp_path / "project"
     repo.mkdir()
-    (repo / ".gitignore").write_text(".gremlins_cache/\ncoverage/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text(".gremlins_cache/\n.coveragerc.gremlins\ncoverage/\n", encoding="utf-8")
     (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     (repo / "pyproject.toml").write_text("[project]\nname = 'campaign-fixture'\nversion = '0.1.0'\n", encoding="utf-8")
     (repo / "src" / "omi_collector").mkdir(parents=True)
@@ -154,6 +154,21 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
     assert owner_calls == [(jobs[0], "fresh", json.loads((jobs[0] / "owner.json").read_text())["run_token"])]
     assert (repo / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o775
     assert (repo / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o664
+
+
+def test_generated_gremlins_coverage_config_stays_out_of_snapshot_identity(
+    campaign_project: tuple[Path, dict[str, str]],
+) -> None:
+    repo, environment = campaign_project
+    mutation_campaign._canonicalize_snapshot_modes(repo)
+    generated = repo / ".coveragerc.gremlins"
+    generated.write_text("[run]\nbranch = True\n", encoding="utf-8")
+
+    mutation_campaign._snapshot_identity(repo, environment)
+
+    (repo / "unexpected-run-output.tmp").write_text("not ignored\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="tracked or untracked changes"):
+        mutation_campaign._snapshot_identity(repo, environment)
 
 
 def test_resume_reuses_exact_job_and_preserves_completed_native_cache(

@@ -341,7 +341,10 @@ def _options(
 ) -> OpportunisticOptions:
     local_clock = clock or Clock()
     return OpportunisticOptions(
-        timeouts=TransferTimeouts(1, 1),
+        timeouts=TransferTimeouts(
+            info=DEFAULT_CONFIG.transfer.info_timeout_seconds,
+            transfer=DEFAULT_CONFIG.transfer.sync_timeout_seconds,
+        ),
         policy=RetryPolicy(backoff=(0.001,), batch_records=batch_records, stop_after_drained=True),
         activity=activity.append if activity is not None else None,
         progress=progress.append if progress is not None else None,
@@ -437,9 +440,9 @@ async def _real_batch_writer(
         yield writer
     finally:
         try:
-            await writer.close(timeout=2)
+            await writer.close(timeout=DEFAULT_CONFIG.transfer.sync_timeout_seconds)
         finally:
-            await asyncio.to_thread(writer.thread.join, 2)
+            await asyncio.to_thread(writer.thread.join, DEFAULT_CONFIG.transfer.sync_timeout_seconds)
             assert not writer.thread.is_alive()
 
 
@@ -1176,7 +1179,7 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
     result = await run_opportunistic_collector(
         Provider([session]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
-        replace(_options(), timeouts=TransferTimeouts(info=1, transfer=5)),
+        _options(),
     )
 
     assert isinstance(result, CollectionResult)
@@ -1686,7 +1689,7 @@ async def test_three_storage_not_ready_infos_reconnect_before_read(tmp_path: Pat
         ClosingProvider([first, second]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
-            TransferTimeouts(1, 1),
+            _options().timeouts,
             RetryPolicy(backoff=config.retry.rapid_backoff, batch_records=1, stop_after_drained=True),
             activity=activity.append,
             clock=clock,
@@ -1758,11 +1761,10 @@ async def test_resume_cursor_matrix(
 
     activity: list[ActivityEvent] = []
     try:
-        # Recovered writer seal/fsync is disk work, outside this cursor matrix's timing contract.
         result = await run_opportunistic_collector(
             Provider([session]),
             StagingStore(tmp_path, _capture_root(tmp_path)),
-            replace(_options(activity=activity), timeouts=TransferTimeouts(info=1, transfer=5)),
+            _options(activity=activity),
         )
     except IndexError as cause:
         failures = [event for event in activity if event.state == "session_error"]
@@ -1928,7 +1930,7 @@ async def test_quality_metrics_failure_does_not_change_completed_audio_collectio
     )
     clock = Clock()
     options = OpportunisticOptions(
-        TransferTimeouts(1, 1),
+        _options().timeouts,
         RetryPolicy(backoff=(0.001,), batch_records=1, advance_enabled=False, stop_after_drained=True),
         clock=clock,
         sleep=clock.sleep,
@@ -1966,7 +1968,7 @@ async def test_completed_read_emits_one_terminal_transfer_session_with_raw_count
     )
     clock = Clock()
     options = OpportunisticOptions(
-        TransferTimeouts(1, 1),
+        _options().timeouts,
         RetryPolicy(backoff=(0.001,), batch_records=1, advance_enabled=False, stop_after_drained=True),
         clock=clock,
         sleep=clock.sleep,
@@ -2479,13 +2481,14 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
         clock=clock,
         sleep=clock.sleep,
     )
+    timeouts = _options().timeouts if with_batch else TransferTimeouts(1, 1)
     try:
         async with asyncio.timeout(5.0) as watchdog:
             result = await run_opportunistic_collector(
                 provider,
                 StagingStore(tmp_path, _capture_root(tmp_path)),
                 OpportunisticOptions(
-                    TransferTimeouts(1, 1),
+                    timeouts,
                     RetryPolicy(
                         backoff=(0.0005,),
                         batch_records=1,
@@ -2647,7 +2650,7 @@ async def test_default_preflight_skips_cached_status_without_telemetry(tmp_path:
         ),
     )
     options = OpportunisticOptions(
-        TransferTimeouts(30, 1),
+        _options().timeouts,
         policy=RetryPolicy(backoff=(0.001,), batch_records=1, stop_after_drained=True),
     )
 
@@ -2945,7 +2948,7 @@ async def test_disconnect_next_day_replays_overlap_and_progress_counts_unique_by
         AwayProvider([first, *unavailable, complete]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
-            TransferTimeouts(1, 1),
+            _options().timeouts,
             RetryPolicy(backoff=(1, 2, 4, 8, 16, 30), batch_records=2, stop_after_drained=True),
             progress=progress.append,
             activity=activity.append,
@@ -2999,7 +3002,7 @@ async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -
         Provider([first, complete]),
         StagingStore(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
-            TransferTimeouts(1, 1),
+            _options().timeouts,
             RetryPolicy(backoff=(0.001,), batch_records=2, stop_after_drained=True),
             clock=clock,
             sleep=clock.sleep,

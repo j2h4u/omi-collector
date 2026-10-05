@@ -1869,7 +1869,10 @@ def test_presence_telemetry_reuses_first_info_without_duplicate_info_read(tmp_pa
             lambda _candidate: provider(_candidate),
             StagingStore(tmp_path, _capture_root(tmp_path)),
             OpportunisticOptions(
-                TransferTimeouts(1, 1),
+                TransferTimeouts(
+                    DEFAULT_CONFIG.transfer.info_timeout_seconds,
+                    DEFAULT_CONFIG.transfer.sync_timeout_seconds,
+                ),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
                 operational=_event_emitter(events),
                 host_clock_synchronized=lambda: False,

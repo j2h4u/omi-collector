@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
-import sys
+import multiprocessing
+import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+from multiprocessing.connection import Connection
 from pathlib import Path
 from shutil import rmtree
 from struct import pack
-from textwrap import dedent
 from types import SimpleNamespace
 from typing import cast
 
@@ -1743,57 +1743,53 @@ def test_hanging_host_clock_probe_uses_configured_host_timeout() -> None:
     assert _clock_event(events)["outcome"] == "host_probe_timeout"
 
 
+def _blocked_trust_probe_child(result: Connection) -> None:
+    gate = threading.Event()
+    events: list[dict[str, object]] = []
+    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
+    asyncio.run(
+        operational_telemetry.collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(
+                now=lambda: 1000.0,
+                synchronized=gate.wait,
+                host_clock_probe_timeout=0.02,
+            ),
+        )
+    )
+    result.send(_clock_event(events)["outcome"])
+    result.close()
+
+
 def test_timed_out_trust_probe_does_not_keep_child_process_alive() -> None:
-    child_source = dedent(
-        """
-        import asyncio
-        import threading
-        from struct import pack
-
-        from omi_collector.capture.application.operational_telemetry import BATTERY_UUID, TIME_READ_UUID, TelemetryClock, collect_operational_telemetry
-        from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo, RingStatus
-
-        gate = threading.Event()
-        events = []
-
-        class Session:
-            async def read_optional_characteristic(self, uuid):
-                if uuid == BATTERY_UUID:
-                    return bytes((80,))
-                if uuid == TIME_READ_UUID:
-                    return pack("<I", 1010)
-                return None
-
-            async def write_optional_characteristic(self, uuid, value):
-                return True
-
-        async def main():
-            await collect_operational_telemetry(
-                Session(),
-                RingStatus(123, 2, 456, 1),
-                RingInfo(10, 12, 100, 2, RECORD_SIZE),
-                lambda event: events.append(dict(event)),
-                clock=TelemetryClock(
-                    now=lambda: 1000.0,
-                    synchronized=gate.wait,
-                    host_clock_probe_timeout=0.02,
-                ),
-            )
-
-        asyncio.run(main())
-        print(next(event["outcome"] for event in events if event.get("event") == "pendant_clock_sync"))
-        """
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", child_source],
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=2.0,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "host_probe_timeout"
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("trust probe process-exit check requires fork")
+    context = multiprocessing.get_context("fork")
+    receive_result, send_result = context.Pipe(duplex=False)
+    process = context.Process(target=_blocked_trust_probe_child, args=(send_result,))
+    started = False
+    try:
+        process.start()
+        started = True
+        send_result.close()
+        assert receive_result.poll(1.0), "child did not report the bounded public probe outcome"
+        assert receive_result.recv() == "host_probe_timeout"
+        process.join(timeout=2.0)
+        assert process.exitcode == 0, "timed-out trust probe kept its child process alive"
+    finally:
+        receive_result.close()
+        send_result.close()
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=1.0)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        if started:
+            process.close()
 
 
 def test_slow_host_probe_and_large_ledger_finish_clock_stage_before_metadata(tmp_path: Path) -> None:

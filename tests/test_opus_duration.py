@@ -81,6 +81,11 @@ def test_rejects_header_only_code3_padding() -> None:
         count_20ms_packets(_record(bytes((0x0B, 0x41))))
 
 
+def test_rejects_empty_code3_frame_count_with_nonempty_body() -> None:
+    with pytest.raises(ValueError, match="20 ms"):
+        count_20ms_packets(_record(bytes((0x0B, 0x00, 0x55))))
+
+
 @pytest.mark.parametrize(
     "packet",
     (
@@ -99,6 +104,8 @@ def test_ignores_maximum_sized_packet_when_it_reaches_the_record_end() -> None:
 
     assert len(record) == RECORD_SIZE
     assert count_20ms_packets(record) == 0
+
+
 @pytest.mark.parametrize(
     "packet",
     (

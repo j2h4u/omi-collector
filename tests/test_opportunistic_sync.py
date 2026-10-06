@@ -113,6 +113,14 @@ P = ParamSpec("P")
 T = TypeVar("T")
 
 
+async def _finish_task[T](task: asyncio.Task[T], *, cancel: bool = False) -> None:
+    if cancel:
+        task.cancel()
+    done, pending = await asyncio.wait({task}, timeout=5.0)
+    assert task in done and not pending
+    await asyncio.gather(task, return_exceptions=True)
+
+
 def _runtime() -> OpportunisticRuntime:
     """Build the concrete runtime explicitly for coordinator tests."""
     return OpportunisticRuntime()
@@ -1497,6 +1505,8 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
     maintenance_started = asyncio.Event()
     maintenance_stopped = asyncio.Event()
     release_wake = asyncio.Event()
+    release_maintenance = asyncio.Event()
+    waiter_task: asyncio.Task[PresenceWake] | None = None
 
     class BlockingPresence:
         closed = False
@@ -1507,11 +1517,18 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
         )
 
         async def wait_for_attempt(self) -> PresenceWake:
+            nonlocal waiter_task
+            current = asyncio.current_task()
+            assert current is not None
+            waiter_task = cast(asyncio.Task[PresenceWake], current)
             scan_started.set()
             await release_wake.wait()
             return PresenceWake(
                 "advertisement", candidate=object(), observed_at=time.monotonic(), advertisement_rssi_dbm=-72
             )
+
+        def resume_interrupted_visit(self) -> None:
+            raise AssertionError("fresh collector should not resume an interrupted visit")
 
         async def attempt_finished(self, _outcome: AttemptOutcome) -> None:
             return None
@@ -1528,9 +1545,11 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
     ) -> None:
         assert scan_started.is_set()
         maintenance_started.set()
-        while not should_defer():
-            await asyncio.sleep(0)
-        maintenance_stopped.set()
+        try:
+            while not release_maintenance.is_set() and not should_defer():
+                await asyncio.sleep(0)
+        finally:
+            maintenance_stopped.set()
 
     class OrderedProvider(Provider):
         def __call__(self, candidate: object | None = None):
@@ -1552,18 +1571,32 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
             ),
         )
     )
-    await maintenance_started.wait()
-    release_wake.set()
-
-    assert isinstance(await task, NoDataResult)
-    assert maintenance_stopped.is_set()
-    assert presence.closed
-    [advertisement] = [
-        cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert advertisement["event"] == "advertisement_observation"
-    assert advertisement["recorded_at"] == "1970-01-01T00:16:40.000+00:00"
-    assert advertisement["advertisement_rssi_dbm"] == -72
+    maintenance_ready = asyncio.create_task(maintenance_started.wait())
+    try:
+        done, _ = await asyncio.wait({maintenance_ready, task}, timeout=5.0, return_when=asyncio.FIRST_COMPLETED)
+        assert maintenance_ready in done, "collector completed before startup maintenance started"
+        assert maintenance_ready.result()
+        release_wake.set()
+        done, pending = await asyncio.wait({task}, timeout=5.0)
+        assert task in done and not pending
+        assert isinstance(task.result(), NoDataResult)
+        assert maintenance_stopped.is_set()
+        assert presence.closed
+        [advertisement] = [
+            cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert advertisement["event"] == "advertisement_observation"
+        assert advertisement["recorded_at"] == "1970-01-01T00:16:40.000+00:00"
+        assert advertisement["advertisement_rssi_dbm"] == -72
+    finally:
+        release_wake.set()
+        release_maintenance.set()
+        if waiter_task is not None:
+            waiter_task.cancel()
+        if waiter_task is not None:
+            await _finish_task(waiter_task)
+        await _finish_task(maintenance_ready, cancel=True)
+        await _finish_task(task, cancel=True)
 
 
 @_async_test
@@ -1572,6 +1605,8 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
 ) -> None:
     worker_started = threading.Event()
     worker_stopped = threading.Event()
+    release_worker = threading.Event()
+    waiter_task: asyncio.Task[PresenceWake] | None = None
 
     class BlockingPresence:
         closed = False
@@ -1582,17 +1617,26 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
         )
 
         async def wait_for_attempt(self) -> PresenceWake:
+            nonlocal waiter_task
+            current = asyncio.current_task()
+            assert current is not None
+            waiter_task = cast(asyncio.Task[PresenceWake], current)
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
+
+        def resume_interrupted_visit(self) -> None:
+            raise AssertionError("fresh collector should not resume an interrupted visit")
 
         async def close(self) -> None:
             self.closed = True
 
     def maintenance_worker(should_defer: Callable[[], bool]) -> None:
         worker_started.set()
-        while not should_defer():
-            time.sleep(0.001)
-        worker_stopped.set()
+        try:
+            while not release_worker.is_set() and not should_defer():
+                time.sleep(0.001)
+        finally:
+            worker_stopped.set()
 
     async def blocking_maintenance(
         _maintenance: QuarantineMaintenance,
@@ -1609,13 +1653,34 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
             replace(_options(), presence=cast(PresenceScheduler, presence)),
         )
     )
-    assert await asyncio.to_thread(worker_started.wait, 1)
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert worker_stopped.is_set()
-    assert presence.closed
+    worker_ready = asyncio.create_task(asyncio.to_thread(worker_started.wait, 1))
+    try:
+        done, _ = await asyncio.wait({worker_ready, task}, timeout=5.0, return_when=asyncio.FIRST_COMPLETED)
+        assert worker_ready in done, "maintenance worker did not start before owner completed"
+        assert worker_ready.result()
+        task.cancel()
+        done, pending = await asyncio.wait({task}, timeout=5.0)
+        assert not pending
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
+        assert worker_stopped.is_set()
+        assert presence.closed
+    finally:
+        release_worker.set()
+        worker_ready.cancel()
+        if waiter_task is not None:
+            waiter_task.cancel()
+        task.cancel()
+        done, pending = await asyncio.wait({task}, timeout=5.0)
+        assert task in done and not pending
+        if waiter_task is not None:
+            done, pending = await asyncio.wait({waiter_task}, timeout=5.0)
+            assert waiter_task in done and not pending
+            await asyncio.gather(waiter_task, return_exceptions=True)
+        done, pending = await asyncio.wait({worker_ready}, timeout=5.0)
+        assert worker_ready in done and not pending
+        await asyncio.gather(worker_ready, return_exceptions=True)
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @_async_test
@@ -3815,18 +3880,25 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
     provider = Provider([])
     presence = PresenceScheduler(Observer(), policy=PresencePolicy(rapid_backoff=(0.001,)))
     task = asyncio.create_task(run_opportunistic_collector(provider, store, replace(_options(), presence=presence)))
+    scan_ready = asyncio.create_task(scanning.wait())
+    checks_completed = False
     try:
-        await asyncio.wait_for(scanning.wait(), 2)
+        done, _ = await asyncio.wait({scan_ready, task}, timeout=2.0, return_when=asyncio.FIRST_COMPLETED)
+        assert scan_ready in done, "collector completed before scanning started"
+        scan_ready.result()
         assert not task.done()
         assert provider.opened == 0
         assert (attempt.path / "terminal-retired.json").is_file()
         assert store.pending_attempts() == ()
         assert (attempt.path / "records.bin").read_bytes() == records
         assert not store.inspect_recovery()[1], "durable closure must cover retained drafts"
+        checks_completed = True
     finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        await _finish_task(task, cancel=True)
+        await _finish_task(scan_ready, cancel=True)
+        if checks_completed:
+            with pytest.raises(asyncio.CancelledError):
+                task.result()
 
 
 @_async_test

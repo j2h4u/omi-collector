@@ -1085,6 +1085,7 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
     async def scenario() -> None:
         worker_started = threading.Event()
         worker_stopped = threading.Event()
+        release_sweep = threading.Event()
         waiter_started = asyncio.Event()
         waiter_cancelled = asyncio.Event()
         waiter_task: asyncio.Task[object] | None = None
@@ -1111,7 +1112,7 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
 
         def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
             worker_started.set()
-            while not should_defer():
+            while not release_sweep.is_set() and not should_defer():
                 time.sleep(0.001)
             worker_stopped.set()
             return ()
@@ -1124,14 +1125,21 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
             assert await asyncio.to_thread(worker_started.wait, 1)
             task.cancel()
             await asyncio.wait_for(waiter_cancelled.wait(), timeout=5.0)
+            done, pending = await asyncio.wait({task}, timeout=5.0)
+            assert task in done and not pending
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=5.0)
+                task.result()
             assert worker_stopped.is_set()
         finally:
             if waiter_task is not None:
                 waiter_task.cancel()
+                done, pending = await asyncio.wait({waiter_task}, timeout=5.0)
+                assert waiter_task in done and not pending
                 await asyncio.gather(waiter_task, return_exceptions=True)
+            release_sweep.set()
             task.cancel()
+            done, pending = await asyncio.wait({task}, timeout=5.0)
+            assert task in done and not pending
             await asyncio.gather(task, return_exceptions=True)
             await maintenance.close()
 
@@ -1451,15 +1459,21 @@ def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
             await asyncio.sleep(0.01)
             assert not owner.done()
             release.set()
+            done, pending = await asyncio.wait({owner}, timeout=5.0)
+            assert owner in done and not pending
             with pytest.raises(asyncio.CancelledError):
-                await owner
+                owner.result()
             assert finished.is_set()
         finally:
             release.set()
             if presence.waiter_task is not None:
                 presence.waiter_task.cancel()
+                done, pending = await asyncio.wait({presence.waiter_task}, timeout=5.0)
+                assert presence.waiter_task in done and not pending
                 await asyncio.gather(presence.waiter_task, return_exceptions=True)
             owner.cancel()
+            done, pending = await asyncio.wait({owner}, timeout=5.0)
+            assert owner in done and not pending
             await asyncio.gather(owner, return_exceptions=True)
             await maintenance.close()
 
@@ -1521,15 +1535,24 @@ def test_cancellation_after_internal_permit_closes_presence(tmp_path: Path) -> N
         maintenance._prepare_and_run = wait_for_deferral  # type: ignore[method-assign]
         presence = Presence()
         task = asyncio.create_task(maintenance.wait_for_presence_attempt(presence, lambda _: None))
-        await started.wait()
-        release_permit.set()
-        await deferral_started.wait()
-        task.cancel()
-        finish_maintenance.set()
-
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert presence.closed
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            release_permit.set()
+            await asyncio.wait_for(deferral_started.wait(), timeout=5.0)
+            task.cancel()
+            finish_maintenance.set()
+            done, pending = await asyncio.wait({task}, timeout=5.0)
+            assert task in done and not pending
+            with pytest.raises(asyncio.CancelledError):
+                task.result()
+            assert presence.closed
+        finally:
+            release_permit.set()
+            finish_maintenance.set()
+            task.cancel()
+            done, pending = await asyncio.wait({task}, timeout=5.0)
+            assert task in done and not pending
+            await asyncio.gather(task, return_exceptions=True)
 
     _run(scenario())
 
@@ -1774,11 +1797,16 @@ def test_startup_failure_before_presence_permit_leaves_presence_open(
         inspection_started = threading.Event()
         release_inspection = threading.Event()
         waiter_cancelled = asyncio.Event()
+        waiter_task: asyncio.Task[PresenceWake] | None = None
 
         class Presence:
             closed = False
 
             async def wait_for_attempt(self) -> PresenceWake:
+                nonlocal waiter_task
+                current = asyncio.current_task()
+                assert current is not None
+                waiter_task = cast(asyncio.Task[PresenceWake], current)
                 try:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
@@ -1806,13 +1834,22 @@ def test_startup_failure_before_presence_permit_leaves_presence_open(
             assert await asyncio.to_thread(inspection_started.wait, 1)
             release_inspection.set()
             with pytest.raises(RuntimeError, match="startup inspection failed"):
-                await owner
+                done, pending = await asyncio.wait({owner}, timeout=5.0)
+                assert owner in done and not pending
+                owner.result()
             assert waiter_cancelled.is_set()
             assert not presence.closed
             assert store.pending_attempts is fail_public_startup_inspection
         finally:
             release_inspection.set()
+            if waiter_task is not None:
+                waiter_task.cancel()
+                done, pending = await asyncio.wait({waiter_task}, timeout=5.0)
+                assert waiter_task in done and not pending
+                await asyncio.gather(waiter_task, return_exceptions=True)
             owner.cancel()
+            done, pending = await asyncio.wait({owner}, timeout=5.0)
+            assert owner in done and not pending
             await asyncio.gather(owner, return_exceptions=True)
             await maintenance.close()
             monkeypatch.setattr(store, "pending_attempts", original_pending)
@@ -1866,6 +1903,8 @@ def test_presence_wake_waits_until_public_maintenance_scan_finishes(tmp_path: Pa
         finally:
             release_wake.set()
             owner.cancel()
+            done, pending = await asyncio.wait({owner}, timeout=5.0)
+            assert owner in done and not pending
             await asyncio.gather(owner, return_exceptions=True)
             await maintenance.close()
 
@@ -1879,11 +1918,16 @@ def test_repeated_owner_cancellation_during_startup_failure_cleanup_preserves_fa
         inspection_started = threading.Event()
         release_inspection = threading.Event()
         cancellation_cleanup_started = asyncio.Event()
+        waiter_task: asyncio.Task[PresenceWake] | None = None
         failure = RuntimeError("authoritative startup failure")
         owner: asyncio.Task[object] | None = None
 
         class Presence:
             async def wait_for_attempt(self) -> PresenceWake:
+                nonlocal waiter_task
+                current = asyncio.current_task()
+                assert current is not None
+                waiter_task = cast(asyncio.Task[PresenceWake], current)
                 try:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
@@ -1913,13 +1957,22 @@ def test_repeated_owner_cancellation_during_startup_failure_cleanup_preserves_fa
             assert await asyncio.to_thread(inspection_started.wait, 1)
             release_inspection.set()
             with pytest.raises(asyncio.CancelledError) as error:
-                await owner
+                done, pending = await asyncio.wait({owner}, timeout=5.0)
+                assert owner in done and not pending
+                owner.result()
             assert error.value.__cause__ is failure
             assert cancellation_cleanup_started.is_set()
             assert owner.done()
         finally:
             release_inspection.set()
+            if waiter_task is not None:
+                waiter_task.cancel()
+                done, pending = await asyncio.wait({waiter_task}, timeout=5.0)
+                assert waiter_task in done and not pending
+                await asyncio.gather(waiter_task, return_exceptions=True)
             owner.cancel()
+            done, pending = await asyncio.wait({owner}, timeout=5.0)
+            assert owner in done and not pending
             await asyncio.gather(owner, return_exceptions=True)
             await maintenance.close()
 

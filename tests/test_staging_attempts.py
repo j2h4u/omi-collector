@@ -14,7 +14,6 @@ from typing import BinaryIO, cast
 
 import pytest
 
-from omi_collector.capture.adapters import attempts as attempts_adapter
 from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
     RecordGapError,
@@ -28,6 +27,22 @@ from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotifica
 from omi_collector.config import CollectorConfig, DurabilityConfig, StagingRetentionConfig
 
 _CAPTURE_ROOTS: set[Path] = set()
+
+
+class _NonEmptyDigest:
+    def __init__(self, wrapped: object, observe: Callable[[bytes], None] | None = None) -> None:
+        self._wrapped = wrapped
+        self._observe = observe
+
+    def update(self, data: bytes) -> None:
+        if not data:
+            raise AssertionError("streaming hash attempted an empty update")
+        if self._observe is not None:
+            self._observe(data)
+        self._wrapped.update(data)  # type: ignore[attr-defined]
+
+    def hexdigest(self) -> str:
+        return self._wrapped.hexdigest()  # type: ignore[attr-defined,no-any-return]
 
 
 def _capture_root(tmp_path: Path) -> Path:
@@ -50,12 +65,14 @@ def _record(marker: int) -> bytes:
 def _started_attempt(tmp_path: Path, *, count: int = 2):
     attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
+    attempt._stream_hash = _NonEmptyDigest(attempt._stream_hash)
     return attempt
 
 
 def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
     attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
+    attempt._stream_hash = _NonEmptyDigest(attempt._stream_hash)
     return attempt
 
 
@@ -199,31 +216,18 @@ def test_streaming_chunk_crossing_hash_boundary_persists_the_boundary_prefix(tmp
 
 
 def test_streaming_chunk_hash_advances_once_across_checkpoint_boundary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     real_sha256 = sha256
     records = _record(1) + _record(2) + _record(3)
     updates: list[bytes] = []
 
-    class DelegatingDigest:
-        def __init__(self, initial_data: bytes = b"") -> None:
-            self._digest = real_sha256(initial_data)
+    def observe_update(data: bytes) -> None:
+        offset = sum(len(part) for part in updates)
+        assert offset + len(data) <= len(records)
+        assert data == records[offset : offset + len(data)]
+        updates.append(bytes(data))
 
-        def update(self, data: bytes) -> None:
-            offset = sum(len(part) for part in updates)
-            assert data
-            assert offset + len(data) <= len(records)
-            assert data == records[offset : offset + len(data)]
-            updates.append(bytes(data))
-            self._digest.update(data)
-
-        def hexdigest(self) -> str:
-            return self._digest.hexdigest()
-
-    def observed_sha256(initial_data: bytes = b"") -> DelegatingDigest:
-        return DelegatingDigest(initial_data)
-
-    monkeypatch.setattr(attempts_adapter, "sha256", observed_sha256)
     store = StagingStore(
         tmp_path,
         _capture_root(tmp_path),
@@ -232,6 +236,7 @@ def test_streaming_chunk_hash_advances_once_across_checkpoint_boundary(
     attempt = store.prepare_streaming_attempt(100, 3)
     try:
         attempt.record_read_begin(ReadBeginNotification(100, 3))
+        attempt._stream_hash = _NonEmptyDigest(attempt._stream_hash, observe_update)
         attempt.accept_chunk(100, records)
 
         checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))

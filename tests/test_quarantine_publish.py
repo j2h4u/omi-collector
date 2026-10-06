@@ -95,16 +95,23 @@ def _rewrite_object(path: Path, key: str, value: object) -> None:
 
 
 class _ShortWritingStream:
-    def __init__(self, path: Path, wrapped: BinaryIO, written: dict[str, int]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        wrapped: BinaryIO,
+        written: dict[str, int],
+        short_write_size: int | None,
+    ) -> None:
         self.path = path
         self.wrapped = wrapped
         self.written = written
+        self.short_write_size = short_write_size
 
     def write(self, payload: bytes) -> int:
         if not payload:
             raise AssertionError(f"publisher attempted an empty write to {self.path.name}")
-        short_payload = payload[:7]
-        count = self.wrapped.write(short_payload)
+        write_payload = payload if self.short_write_size is None else payload[: self.short_write_size]
+        count = self.wrapped.write(write_payload)
         if count <= 0:
             raise AssertionError(f"publisher made no write progress for {self.path.name}")
         self.written[self.path.name] = self.written.get(self.path.name, 0) + count
@@ -116,6 +123,9 @@ class _ShortWritingStream:
     def fileno(self) -> int:
         return self.wrapped.fileno()
 
+    def close(self) -> None:
+        self.wrapped.close()
+
     def __enter__(self) -> _ShortWritingStream:
         return self
 
@@ -123,16 +133,26 @@ class _ShortWritingStream:
         self.wrapped.close()
 
 
-def _patch_short_writes(monkeypatch: pytest.MonkeyPatch, written: dict[str, int]) -> None:
+def _patch_short_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    written: dict[str, int],
+    *,
+    short_write_size: int | None = None,
+) -> None:
     real_open = cast(Callable[..., BinaryIO], Path.open)
 
     def observed_open(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
         wrapped = real_open(path, mode, *args, **kwargs)
-        if mode == "xb":
-            return _ShortWritingStream(path, wrapped, written)
+        if mode == "xb" and path.parent.name.startswith(".") and path.parent.name.endswith(".tmp"):
+            return _ShortWritingStream(path, wrapped, written, short_write_size)
         return wrapped
 
     monkeypatch.setattr(Path, "open", observed_open)
+
+
+@pytest.fixture(autouse=True)
+def _guard_publication_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_short_writes(monkeypatch, {})
 
 
 def test_publishes_only_authenticated_prefix_and_leaves_source_unchanged(tmp_path: Path) -> None:
@@ -499,7 +519,7 @@ def test_publication_completes_short_positive_writes_without_empty_writes(
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     source_before = _snapshot(source)
     written: dict[str, int] = {}
-    _patch_short_writes(monkeypatch, written)
+    _patch_short_writes(monkeypatch, written, short_write_size=7)
     result = publish_quarantined_prefix(source, store.paths)
 
     digest = sha256(prefix).hexdigest()

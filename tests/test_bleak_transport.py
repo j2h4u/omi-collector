@@ -1009,6 +1009,7 @@ async def test_cancelling_disconnect_during_normal_close_propagates_and_preserve
         disconnect_started.set()
         await asyncio.Future()
 
+    original_disconnect = client.disconnect
     client.disconnect = hang_disconnect  # type: ignore[method-assign]
     transport = BleakRingTransport("fake", client_factory=_factory_for(client))
     original_debug_event = bleak_transport.debug_event
@@ -1021,14 +1022,17 @@ async def test_cancelling_disconnect_during_normal_close_propagates_and_preserve
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await closing
+        with pytest.raises(RingTransportDisconnectedError, match="ring session is closed"):
+            await session.read_status()
         assert client.disconnect_callback is not None
         client.disconnect_callback(client)
     finally:
+        client.disconnect = original_disconnect  # type: ignore[method-assign]
         if closing is not None:
             closing.cancel()
-            await asyncio.gather(closing, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), timeout=5.0)
         bleak_transport.debug_event = original_debug_event
-        await transport.disconnect()
+        await asyncio.wait_for(transport.disconnect(), timeout=5.0)
     assert "ble_gatt_unexpected_disconnect" not in debug_events
 
 

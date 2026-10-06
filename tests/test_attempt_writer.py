@@ -1056,8 +1056,13 @@ def test_close_deadline_rejects_extra_join_turn(monkeypatch: pytest.MonkeyPatch)
                 *,
                 result: asyncio.Future[object] | None = None,
             ) -> object:
+                async def reject_poll_after_deadline(delay: float) -> None:
+                    del delay
+                    assert loop.time() < deadline, "writer must not poll after its close deadline"
+
                 with monkeypatch.context() as clock_patch:
                     clock_patch.setattr(loop, "time", lambda: deadline)
+                    clock_patch.setattr(attempt_writer.asyncio, "sleep", reject_poll_after_deadline)
                     loop.call_soon(release_and_join_worker)
                     return await join_until(deadline, result=result)
 

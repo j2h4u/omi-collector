@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -39,6 +40,26 @@ def control_job(tmp_path: Path) -> Generator[tuple[Path, mutation_scope.OwnerCon
         yield job, server
     finally:
         server.stop()
+
+
+@pytest.fixture(autouse=True)
+def _bounded_owner_control_io(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    handler_threads: list[threading.Thread] = []
+    real_handle = mutation_scope.OwnerControlServer._handle
+
+    def bounded_handle(server: mutation_scope.OwnerControlServer, connection: socket.socket) -> None:
+        connection.settimeout(2.0)
+        handler_threads.append(threading.current_thread())
+        real_handle(server, connection)
+
+    monkeypatch.setattr(mutation_scope, "PAUSE_ACK_SECONDS", 5.0)
+    monkeypatch.setattr(mutation_scope.OwnerControlServer, "_handle", bounded_handle)
+    try:
+        yield
+    finally:
+        for handler in handler_threads:
+            handler.join(timeout=5.0)
+            assert not handler.is_alive(), "owner control handler survived its bounded join"
 
 
 def _select_test_job(monkeypatch: pytest.MonkeyPatch, job: Path) -> None:
@@ -347,8 +368,20 @@ def _process_stopped(pid: int) -> bool:
     return False
 
 
+def _ensure_pause_owner_stopped(owner: threading.Thread, job: Path, token: str) -> None:
+    if not owner.is_alive():
+        return
+    with suppress(mutation_scope.ScopeError):
+        mutation_scope.send_control(job, "pause")
+    owner.join(timeout=5)
+    if owner.is_alive():
+        mutation_campaign._cleanup_token_processes(token)
+        owner.join(timeout=5)
+    assert not owner.is_alive(), "owned process-tree controller survived bounded cleanup"
+
+
 def test_pause_stops_new_session_descendant_but_preserves_unrelated_process(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     job = tmp_path / "job"
     job.mkdir()
@@ -389,7 +422,6 @@ def test_pause_stops_new_session_descendant_but_preserves_unrelated_process(
         assert pids_path.is_file()
         _pids = _read_pid_map(pids_path)
         assert (checkout / ".gremlins_cache" / "results.db").is_file()
-        monkeypatch.setattr(mutation_scope, "PAUSE_ACK_SECONDS", 5.0)
 
         response = mutation_scope.send_control(job, "pause")
 
@@ -411,12 +443,11 @@ def test_pause_stops_new_session_descendant_but_preserves_unrelated_process(
         for pid in _pids.values():
             assert _process_stopped(pid), f"owned process {pid} survived checkpoint stop"
     finally:
-        if owner.is_alive():
-            with suppress(mutation_scope.ScopeError):
-                mutation_scope.send_control(job, "pause")
-            owner.join(timeout=5)
-        sentinel.terminate()
-        sentinel.wait(timeout=5)
+        try:
+            _ensure_pause_owner_stopped(owner, job, token)
+        finally:
+            sentinel.terminate()
+            sentinel.wait(timeout=5)
 
 
 def _owner_lock_available(job: Path) -> bool:

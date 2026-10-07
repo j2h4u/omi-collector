@@ -922,6 +922,55 @@ def test_transient_clock_publication_does_not_gate_startup_and_arms_retry(
     _run(scenario())
 
 
+def test_transient_publication_retry_settles_and_clears_schedule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.01,)))
+        store = _publication_store(tmp_path, config=config)
+        retried = threading.Event()
+        calls = 0
+        events: list[tuple[str, str | None]] = []
+
+        def recover_and_publish() -> ReadyOutcome:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
+            retried.set()
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle")
+
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", recover_and_publish)
+        runtime = OpportunisticRuntime()
+        monkeypatch.setattr(
+            runtime,
+            "debug_event",
+            lambda event, **fields: events.append((event, fields.get("reason"))),
+        )
+        maintenance = QuarantineMaintenance(store, None, runtime, config=config)
+        try:
+            await maintenance.ensure_publication_ready()
+            assert calls == 1
+            assert store.publication_retry_schedule() is not None
+
+            assert await asyncio.to_thread(retried.wait, 5)
+            retry = maintenance._publication_retry_task
+            assert retry is not None
+            await retry
+
+            assert calls == 2
+            assert store.publication_retry_schedule() is None
+            assert not store.publication_followup_due()
+            assert events == [
+                ("ready_publication_transient", "storage_busy_or_io"),
+                ("ready_publication_waiting", "idle"),
+            ]
+        finally:
+            await maintenance.close()
+
+    _run(scenario())
+
+
 @pytest.mark.parametrize(
     ("successful_result", "success_event"),
     [

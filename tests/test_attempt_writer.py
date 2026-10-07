@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Protocol
@@ -293,6 +293,26 @@ def _thread_cpu_ticks(native_id: int) -> int:
 
 def test_arena_is_shared_and_data_waits_for_read_begin() -> None:
     asyncio.run(_test_arena_is_shared_and_data_waits_for_read_begin())
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "replacement"),
+    (
+        (attempt_writer.WriterProgress(1, 0), "submitted", 2),
+        (attempt_writer.WriterSnapshot(1, 0), "submitted", 2),
+        (attempt_writer.PrepareLegCommand(1, 1), "record_count", 2),
+        (attempt_writer.ReadBeginCommand("begin"), "notice", "changed"),
+        (attempt_writer.CheckpointCommand(64), "high_water", 128),
+        (attempt_writer.SealCommand(64, "done"), "done_notice", "changed"),
+        (attempt_writer.PublishPrefixCommand(64), "high_water", 128),
+        (attempt_writer.CloseCommand(64), "high_water", 128),
+    ),
+)
+def test_writer_progress_and_commands_reject_field_reassignment(
+    value: object, field: str, replacement: object
+) -> None:
+    with pytest.raises(FrozenInstanceError):
+        setattr(value, field, replacement)
 
 
 def test_writer_config_controls_writer_settings() -> None:

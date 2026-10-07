@@ -13,8 +13,10 @@ from typing import Literal, Never, cast
 
 import pytest
 
+from omi_collector.capture.adapters import ready_closures
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.collector import (
@@ -357,12 +359,18 @@ def test_validate_policy_accepts_exact_fit_large_integer_capacity() -> None:
 def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         events: list[str] = []
-        store = StagingStore(tmp_path / "spool", tmp_path / "captures")
+        bootstrap = StagingStore(tmp_path / "spool", tmp_path / "captures")
+        ready = tmp_path / "ready"
+        ready.mkdir(mode=0o2750)
+        ready.chmod(0o2750)
+        store = StagingStore.from_paths(bootstrap.paths, publication_root=ready)
 
-        def publish() -> None:
+        def publish() -> ReadyOutcome:
+            assert ready_closures.load(store.ready_closures_path)[-1].reason == "drained"
             events.append("publish")
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_eligible_drafts")
 
-        monkeypatch.setattr(store, "recover_and_publish", publish)
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         attempt_calls = 0
 
@@ -382,6 +390,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
 
         async def close(_reason: str) -> None:
             await asyncio.sleep(0)
+            store.append_ready_closure(10, "drained")
             events.append("closure")
             assert "publish" not in events
 
@@ -419,6 +428,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
             assert events == ["attempt", "closure", "publish"]
         finally:
             await maintenance.close()
+        assert events == ["attempt", "closure", "publish"]
 
     _run(scenario())
 

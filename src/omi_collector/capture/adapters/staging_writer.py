@@ -21,6 +21,7 @@ from threading import get_ident
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .attempts import StagedAttempt
 from .publication import SealResult
+from .ready_bundles import ReadyOutcome
 from .staging_contract import AttemptDescriptor, DurablePrefix
 from .staging_filesystem import DeviceLock
 from .staging_store import StagingStore
@@ -81,7 +82,6 @@ class StagingWriter:
         lease: DeviceLock | None = None
         try:
             lease = context.__enter__()
-            self._store.transfer_publication_authority(lease)
             attempt = self._store.resume_streaming_attempt(lease)
             if attempt is None:
                 attempt = self._store.prepare_streaming_attempt(self._start_sequence, self._packet_count)
@@ -196,9 +196,10 @@ class StagingWriter:
         self._require_lease()
         result = self._attempt.seal(done_notice)
         self._sealed = True
+        self._store.publication_input_changed()
         return result
 
-    def publish_ready(self) -> object | None:
+    def publish_ready(self) -> ReadyOutcome:
         """Project sealed capture using this writer's already-held device lease."""
         self._enter("publish_ready")
         self._require_prepared()
@@ -215,6 +216,8 @@ class StagingWriter:
         result = self._attempt.publish_prefix()
         self._prefix_published = True
         self._sealed = True
+        if result is not None:
+            self._store.publication_input_changed()
         return result
 
     def close(self) -> None:

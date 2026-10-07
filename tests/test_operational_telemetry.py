@@ -1310,8 +1310,6 @@ def test_native_clock_handoff_43_to_72_at_incident_frontier(tmp_path: Path) -> N
         publication_root=published,
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
-    retries: list[bool] = []
-    authority = staging.create_publication_authority(lambda: retries.append(True))
     session = FakeOperationalSession(
         {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 43)},
         readback=pack("<I", 72),
@@ -1336,7 +1334,6 @@ def test_native_clock_handoff_43_to_72_at_incident_frontier(tmp_path: Path) -> N
                 info_reader=info_after,
                 correction_sink=cast(ClockCorrectionSink, store),
                 observation_sink=store.observation_store,
-                publisher=authority,
                 mutation_lease=staging.clock_mutation_lease,
             ),
         )
@@ -1351,11 +1348,8 @@ def test_native_clock_handoff_43_to_72_at_incident_frontier(tmp_path: Path) -> N
     assert {"initial", "later"} <= {item.observation_role for item in store.observation_store.records()}
     clock_event = _clock_event(events)
     assert clock_event["outcome"] == "verified"
-    assert clock_event.get("publication") != "failed"
-    assert retries == []
     with staging.device_lock(recover_capture_temporaries=False, operation="capture_batch") as lease:
         staging.require_device_lock(lease)
-    authority.close()
 
 
 def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tmp_path: Path) -> None:
@@ -1371,7 +1365,6 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
         publication_root=published,
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
-    authority = staging.create_publication_authority()
     session = FakeOperationalSession(
         {BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 43)},
         readback=pack("<I", 72),
@@ -1397,7 +1390,6 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
                     0.5,
                     info_reader=info_after,
                     correction_sink=cast(ClockCorrectionSink, ClockCorrectionStore(staging.device_state_path)),
-                    publisher=authority,
                     mutation_lease=staging.clock_mutation_lease,
                 ),
             )
@@ -1405,7 +1397,6 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
         await task
 
     asyncio.run(collect_from_bounded_child())
-    assert _clock_event(events).get("publication") != "failed"
 
     durable_store = ClockCorrectionStore(staging.device_state_path)
     corrections = durable_store.records()
@@ -1428,7 +1419,6 @@ def test_native_clock_handoff_publishes_raw_bundles_after_restart_without_ble(tm
     assert tuple(capture_root.iterdir()) == ()
     assert all(json.loads((path / "manifest.json").read_text(encoding="utf-8"))["time_ranges"] for path in ready)
     assert ClockCorrectionStore(staging.device_state_path).records()[0].state == "applied"
-    authority.close()
 
 
 def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:

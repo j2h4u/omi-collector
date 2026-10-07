@@ -9,28 +9,24 @@ from omi_collector.capture.domain.ready_machine import ReadyCommand, ReadyState,
 
 
 def test_ready_machine_complete_boolean_table() -> None:
-    for drained, has_audio, threshold_met, contiguous in product((False, True), repeat=4):
+    for drained, has_audio, threshold_met in product((False, True), repeat=3):
         if threshold_met and not has_audio:
             with pytest.raises(ValueError, match="empty audio"):
                 decide_ready(
                     drained=drained,
                     has_audio=has_audio,
                     threshold_met=threshold_met,
-                    contiguous=contiguous,
                 )
             continue
         decision = decide_ready(
             drained=drained,
             has_audio=has_audio,
             threshold_met=threshold_met,
-            contiguous=contiguous,
         )
         if not drained:
             expected = ReadyState.WAITING_FOR_DRAIN
         elif not has_audio or not threshold_met:
             expected = ReadyState.WAITING_FOR_THRESHOLD
-        elif not contiguous:
-            expected = ReadyState.INVALID_GAP
         else:
             expected = ReadyState.READY_TO_PUBLISH
         assert decision.state == expected
@@ -40,7 +36,7 @@ def test_ready_machine_complete_boolean_table() -> None:
 
 
 def test_ready_decision_cannot_change_after_derivation() -> None:
-    decision = decide_ready(drained=True, has_audio=True, threshold_met=True, contiguous=True)
+    decision = decide_ready(drained=True, has_audio=True, threshold_met=True)
     with pytest.raises(FrozenInstanceError):
         decision.__setattr__("command", ReadyCommand.WAIT)
     assert decision.command == ReadyCommand.PUBLISH

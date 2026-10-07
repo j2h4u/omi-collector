@@ -27,6 +27,7 @@ from omi_collector.capture.adapters.attempts import (
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
     DeviceAlreadyRunningError,
@@ -237,7 +238,7 @@ def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_p
 
     result = store.recover_and_publish()
 
-    assert result is None
+    assert result.state == "waiting"
     assert correction_store.records()[0].state == "applied"
     assert tuple(store.capture_root.iterdir()) == ()
 
@@ -258,7 +259,7 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
 
     result = store.recover_and_publish()
 
-    assert len(cast(tuple[object, ...], result)) == 1
+    assert len(result.published) == 1
     ready_bundles = tuple(path for path in published.iterdir() if path.is_dir() and (path / "manifest.json").is_file())
     assert len(ready_bundles) == 1
     assert loads((ready_bundles[0] / "manifest.json").read_text(encoding="utf-8"))["record_count"] == len(sequences)
@@ -272,7 +273,7 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
     assert later.info_sequence_max == _ACCEPTANCE_FRONTIER
     assert all(loads((bundle / "manifest.json").read_text(encoding="utf-8"))["time_ranges"] for bundle in ready_bundles)
     second_result = store.recover_and_publish()
-    assert second_result is None
+    assert second_result.state == "waiting"
 
 
 def test_corrupt_clock_ledger_does_not_block_closed_audio_publication(
@@ -296,7 +297,7 @@ def test_corrupt_clock_ledger_does_not_block_closed_audio_publication(
 
     ready = next(published.iterdir())
     manifest = cast(dict[str, object], loads((ready / "manifest.json").read_text(encoding="utf-8")))
-    assert len(cast(tuple[object, ...], result)) == 1
+    assert len(result.published) == 1
     assert (ready / "records.bin").read_bytes() == original
     assert manifest["time_ranges"] == [{"start_sequence": 100, "next_sequence": 101, "utc": None}]
     assert "clock metadata unavailable" in caplog.text
@@ -312,7 +313,7 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
     store.append_ready_closure(101, "drained")
-    first = cast(tuple[object, ...], store.recover_and_publish())
+    first = store.recover_and_publish().published
     assert len(first) == 1
     bundle = next(published.iterdir())
     manifest = cast(dict[str, object], loads((bundle / "manifest.json").read_text(encoding="utf-8")))
@@ -340,7 +341,7 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
         encoding="utf-8",
     )
 
-    assert store.recover_and_publish() is None
+    assert store.recover_and_publish().state == "waiting"
     assert tuple(published.iterdir()) == ()
     ledger = cast(dict[str, object], loads((tmp_path / "ready-publications.json").read_text(encoding="utf-8")))
     bundles = cast(dict[str, dict[str, object]], ledger["bundles"])
@@ -355,7 +356,7 @@ def test_scheduled_maintenance_publishes_closed_draft_without_pendant(tmp_path: 
     open_bundle = _one_record_bundle(drafts, 101, 44)
     utime(closed_bundle / "manifest.json", (1, 1))
     utime(open_bundle / "manifest.json", (1, 1))
-    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=1))
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02))
     store = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
     store.append_ready_closure(101, "drained")
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
@@ -381,8 +382,7 @@ def test_acknowledged_group_recovery_cleans_child_drafts_before_retirement(
     remove = ready_bundles._remove_draft
     monkeypatch.setattr(ready_bundles, "_remove_draft", lambda _: (_ for _ in ()).throw(OSError("crash")))
 
-    with pytest.raises(OSError, match="crash"):
-        store.recover_and_publish()
+    assert store.recover_and_publish().state is ReadyOutcomeState.TRANSIENT
     assert len(tuple(published.iterdir())) == 1
     assert len(tuple(drafts.iterdir())) == 2
     manifest = cast(dict[str, object], loads((next(published.iterdir()) / "manifest.json").read_text(encoding="utf-8")))
@@ -413,7 +413,7 @@ def test_acknowledged_group_recovery_cleans_child_drafts_before_retirement(
     monkeypatch.setattr(ready_bundles, "_remove_draft", remove)
     restarted = StagingStore.from_paths(StagingStore(tmp_path, drafts).paths, publication_root=published, config=config)
 
-    assert restarted.recover_and_publish() is None
+    assert restarted.recover_and_publish().state == "waiting"
     assert tuple(drafts.iterdir()) == ()
     assert tuple(published.iterdir()) == ()
     ledger = cast(dict[str, object], loads((tmp_path / "ready-publications.json").read_text(encoding="utf-8")))
@@ -429,9 +429,8 @@ def _publication_store(tmp_path: Path) -> StagingStore:
     )
 
 
-def test_background_thread_authority_does_not_borrow_an_unrelated_active_lease(tmp_path: Path) -> None:
+def test_background_publication_does_not_borrow_an_unrelated_active_lease(tmp_path: Path) -> None:
     store = _publication_store(tmp_path)
-    authority = store.create_publication_authority()
     barrier = Barrier(2)
     observed: dict[str, object] = {}
 
@@ -439,11 +438,7 @@ def test_background_thread_authority_does_not_borrow_an_unrelated_active_lease(t
 
         def contend() -> None:
             barrier.wait()
-            try:
-                authority.publish()
-                observed["publication"] = "borrowed"
-            except DeviceAlreadyRunningError:
-                observed["publication"] = "rejected"
+            observed["publication"] = store.publish_ready().state
             try:
                 with store.device_lock(recover_capture_temporaries=False):
                     observed["lock"] = "borrowed"
@@ -455,11 +450,10 @@ def test_background_thread_authority_does_not_borrow_an_unrelated_active_lease(t
         barrier.wait()
         thread.join()
 
-    authority.close()
-    assert observed == {"publication": "rejected", "lock": "contended"}
+    assert observed == {"publication": ReadyOutcomeState.TRANSIENT, "lock": "contended"}
 
 
-def test_authority_issued_during_foreign_lease_does_not_adopt_it(tmp_path: Path) -> None:
+def test_publication_during_foreign_lease_does_not_adopt_it(tmp_path: Path) -> None:
     store = _publication_store(tmp_path)
     barrier = Barrier(2)
 
@@ -471,51 +465,23 @@ def test_authority_issued_during_foreign_lease_does_not_adopt_it(tmp_path: Path)
     thread = Thread(target=hold_foreign_lease)
     thread.start()
     barrier.wait()
-    authority = store.create_publication_authority()
     try:
-        with pytest.raises(DeviceAlreadyRunningError):
-            authority.publish()
+        assert store.publish_ready().state is ReadyOutcomeState.TRANSIENT
     finally:
-        authority.close()
         barrier.wait()
         thread.join()
 
 
-def test_preissued_authority_rejects_foreign_active_lease(tmp_path: Path) -> None:
+def test_publication_can_acquire_two_sequential_leases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _publication_store(tmp_path)
-    authority = store.create_publication_authority()
-    barrier = Barrier(2)
-
-    def hold_foreign_lease() -> None:
-        with store.device_lock(recover_capture_temporaries=False):
-            barrier.wait()
-            barrier.wait()
-
-    thread = Thread(target=hold_foreign_lease)
-    thread.start()
-    barrier.wait()
-    try:
-        with pytest.raises(DeviceAlreadyRunningError):
-            authority.publish()
-    finally:
-        authority.close()
-        barrier.wait()
-        thread.join()
-
-
-def test_authority_can_acquire_two_sequential_publication_leases(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = _publication_store(tmp_path)
-    authority = store.create_publication_authority()
-    results = iter((object(), object()))
+    results = iter((ReadyOutcome(ReadyOutcomeState.WAITING), ReadyOutcome(ReadyOutcomeState.WAITING)))
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", lambda: next(results))
 
-    first = authority.publish()
-    second = authority.publish()
+    first = store.publish_ready()
+    store.publication_input_changed()
+    second = store.publish_ready()
 
     assert first is not second
-    authority.close()
 
 
 @pytest.mark.parametrize(
@@ -733,7 +699,7 @@ def test_concurrent_publish_ready_rejects_promptly_while_publication_is_active(
     second_bundle = _one_record_bundle(capture_root, 101, 44)
     utime(first_bundle / "manifest.json", (1, 1))
     utime(second_bundle / "manifest.json", (1, 1))
-    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02, max_wait_seconds=1))
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02))
     bootstrap = StagingStore(tmp_path, capture_root, config=config)
     store = StagingStore.from_paths(
         bootstrap.paths,
@@ -775,7 +741,8 @@ def test_concurrent_publish_ready_rejects_promptly_while_publication_is_active(
         second.join(1)
         assert not second.is_alive(), "concurrent publication waited for the active publisher"
         assert len(outcome) == 1
-        assert isinstance(outcome[0], AttemptStateError)
+        assert isinstance(outcome[0], ReadyOutcome)
+        assert outcome[0].reason == "publication_active"
     finally:
         release.set()
         first.join(5)

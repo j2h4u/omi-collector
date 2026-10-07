@@ -6,18 +6,16 @@ from contextlib import contextmanager
 from pathlib import Path
 from struct import pack
 from threading import Event, Thread
-from typing import cast
 
 import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import _StagingWriterAdapter
+from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.ready_closures import ReadyClosure
 from omi_collector.capture.adapters.ready_closures import load as load_ready_closures
-from omi_collector.capture.adapters.staging_contract import AttemptStateError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
-from omi_collector.capture.application.ports import StagingWriterTargetPort
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
 
@@ -55,22 +53,20 @@ def test_fresh_store_without_publication_boundary_is_a_noop(tmp_path: Path) -> N
     capture_root.mkdir()
     store = StagingStore(tmp_path / "spool", capture_root)
 
-    assert store.publish_ready() is None
+    assert store.publish_ready().state == "waiting"
 
 
 def test_sealed_writer_publishes_with_its_held_lease(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    authority = store.create_publication_authority()
     writer = _seal_writer(store)
     assert writer._lease is not None
     store._append_ready_closure_unlocked(writer._lease, 101, "drained")
 
     ready = writer.publish_ready()
 
-    assert ready is not None
+    assert ready.state == "published"
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     writer.close()
-    authority.close()
 
 
 def test_restart_closes_and_persists_the_frontier_of_an_orphaned_sealed_draft(tmp_path: Path) -> None:
@@ -90,7 +86,6 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    authority = store.create_publication_authority()
     writer = StagingWriter(store, 100, 1)
     writer.prepare()
     writer.prepare_leg(100, 1)
@@ -117,28 +112,25 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     assert (attempt_path / "terminal-retired.json").is_file()
     writer.close()
     store.append_ready_closure(101, "drained")
-    assert authority.publish() is not None
+    assert store.publish_ready() is not None
     assert not tuple(store.capture_root.iterdir())
     assert store.sweep_terminal_retired() == ()
-    authority.close()
 
 
-def test_authorized_clock_child_task_publishes_after_writer_releases(tmp_path: Path) -> None:
+def test_child_task_publishes_after_writer_releases(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    authority = store.create_publication_authority()
     writer = _seal_writer(store)
     writer.close()
     store.append_ready_closure(101, "drained")
 
     async def publish_from_child_task() -> object | None:
         async def publish() -> object | None:
-            return authority.publish()
+            return store.publish_ready()
 
         return await asyncio.create_task(publish())
 
     assert asyncio.run(publish_from_child_task()) is not None
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
-    authority.close()
 
 
 def test_clock_mutation_lease_reuses_active_writer_storage_lease(tmp_path: Path) -> None:
@@ -151,14 +143,13 @@ def test_clock_mutation_lease_reuses_active_writer_storage_lease(tmp_path: Path)
         assert clock_lease is writer_lease
 
 
-def test_clock_mutation_lease_binds_publication_and_falls_back_after_release(
+def test_clock_mutation_lease_reuses_current_publication_lease_and_falls_back_after_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    authority = store.create_publication_authority()
     acquired: list[DeviceLock] = []
     publication_leases: list[DeviceLock | None] = []
-    published = object()
+    published = ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_closed_frontier")
     original_device_lock = store.device_lock
 
     @contextmanager
@@ -171,7 +162,7 @@ def test_clock_mutation_lease_binds_publication_and_falls_back_after_release(
             acquired.append(lease)
             yield lease
 
-    def publish_unlocked() -> object:
+    def publish_unlocked() -> ReadyOutcome:
         publication_leases.append(store._filesystem._active_lease)
         return published
 
@@ -179,30 +170,26 @@ def test_clock_mutation_lease_binds_publication_and_falls_back_after_release(
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish_unlocked)
 
     with store.clock_mutation_lease() as lease:
-        assert authority.publish() is published
+        assert store.publish_ready(lease) is published
         assert acquired == [lease]
         assert publication_leases == [lease]
 
-    assert authority.publish() is published
+    store.publication_input_changed()
+    assert store.publish_ready() is published
     assert len(acquired) == 2
     assert publication_leases == [acquired[0], acquired[1]]
-    authority.close()
 
 
-def test_failed_sealed_publication_retains_capture_for_authorized_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_failed_sealed_publication_retains_capture_for_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
-    authority = store.create_publication_authority()
     writer = _seal_writer(store)
     original = store._recover_and_publish_unlocked
 
-    def fail_publication() -> object:
+    def fail_publication() -> ReadyOutcome:
         raise OSError("source unavailable")
 
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", fail_publication)
-    with pytest.raises(OSError, match="source unavailable"):
-        writer.publish_ready()
+    assert writer.publish_ready().state is ReadyOutcomeState.TRANSIENT
 
     assert tuple(store.capture_root.iterdir())
     assert not tuple((tmp_path / "ready").glob("*/manifest.json"))
@@ -210,100 +197,72 @@ def test_failed_sealed_publication_retains_capture_for_authorized_retry(
 
     assert writer._lease is not None
     store._append_ready_closure_unlocked(writer._lease, 101, "drained")
-    assert authority.publish() is not None
+    assert writer.publish_ready().state is ReadyOutcomeState.PUBLISHED
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
     writer.close()
-    authority.close()
 
 
-def test_writer_publication_failure_schedules_local_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_writer_seal_keeps_draft_until_closed_visit(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    retries: list[str] = []
-    authority = store.create_publication_authority(lambda: retries.append("scheduled"))
-    writer = _StagingWriterAdapter(store.make_staging_writer(100, 1), store.notify_publication_failure, 100)
+    writer = _StagingWriterAdapter(store.make_staging_writer(100, 1), 100)
     writer.prepare()
     writer.prepare_leg(100, 1)
     writer.read_begin(ReadBeginNotification(100, 1))
     writer.append_chunk(0, memoryview(_record(100)))
 
-    def fail_publication() -> object:
-        raise OSError("source unavailable")
-
-    monkeypatch.setattr(store, "_recover_and_publish_unlocked", fail_publication)
     writer.seal(DoneNotification(0, 101))
 
-    assert retries == ["scheduled"]
     assert tuple(store.capture_root.iterdir())
+    assert not tuple((tmp_path / "ready").iterdir())
     writer.close()
-    authority.close()
+    store.append_ready_closure(101, "drained")
+    assert store.publish_ready().state is ReadyOutcomeState.PUBLISHED
 
 
-def test_writer_noop_publication_emits_recovered_event(monkeypatch: pytest.MonkeyPatch) -> None:
-    class NoOpWriter:
-        def publish_ready(self) -> None:
-            return None
-
+def test_writer_seal_does_not_report_false_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
     events: list[str] = []
     monkeypatch.setattr(
         "omi_collector.capture.adapters.opportunistic_runtime.debug_event",
         lambda event, **_fields: events.append(event),
     )
-    writer = _StagingWriterAdapter(cast(StagingWriterTargetPort, NoOpWriter()), lambda: None, 0)
+    writer = _StagingWriterAdapter(store.make_staging_writer(100, 1), 100)
+    writer.prepare()
+    writer.prepare_leg(100, 1)
+    writer.read_begin(ReadBeginNotification(100, 1))
+    writer.append_chunk(0, memoryview(_record(100)))
+    writer.seal(DoneNotification(0, 101))
+    writer.close()
+    assert events == []
 
-    writer._publish_ready()
 
-    assert events == ["ready_publication_recovered"]
-
-
-def test_publication_authority_rejects_duplicate_transfer_and_use_after_release(tmp_path: Path) -> None:
+def test_publication_owner_rejects_concurrent_projection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
-    authority = store.create_publication_authority()
-
-    with pytest.raises(AttemptStateError, match="already active"):
-        store.create_publication_authority()
-    with store.device_lock(recover_capture_temporaries=False) as lease:
-        store.transfer_publication_authority(lease)
-        with pytest.raises(AttemptStateError, match="already transferred"):
-            store.transfer_publication_authority(lease)
-
-    authority.close()
-
-    with pytest.raises(AttemptStateError, match="revoked"):
-        authority.publish()
-    with pytest.raises(AttemptStateError, match="revoked"):
-        authority.close()
-
-
-def test_publication_authority_rejects_concurrent_projection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = _store(tmp_path)
-    authority = store.create_publication_authority()
     writer = _seal_writer(store)
     writer.close()
     entered = Event()
     release = Event()
     errors: list[BaseException] = []
 
-    def blocked_publication() -> object:
+    def blocked_publication() -> ReadyOutcome:
         entered.set()
         assert release.wait(timeout=1)
-        return object()
+        return ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_closed_frontier")
 
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", blocked_publication)
 
     def publish() -> None:
         try:
-            authority.publish()
+            store.publish_ready()
         except BaseException as error:  # noqa: BLE001 - test records the thread boundary
             errors.append(error)
 
     thread = Thread(target=publish)
     thread.start()
     assert entered.wait(timeout=1)
-    with pytest.raises(AttemptStateError, match="already active"):
-        authority.publish()
+    assert store.publish_ready().reason == "publication_active"
     release.set()
     thread.join(timeout=1)
 
     assert not thread.is_alive()
     assert errors == []
-    authority.close()

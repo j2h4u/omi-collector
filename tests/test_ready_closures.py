@@ -60,7 +60,7 @@ def test_closures_coalesce_to_latest_watermark_and_keep_equal_drain(tmp_path: Pa
     assert loads(path.read_text(encoding="utf-8"))["version"] == 1
 
 
-def test_new_visit_revokes_old_drain_through_clock_publication_and_restart(tmp_path: Path) -> None:
+def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: Path) -> None:
     base = StagingStore(tmp_path / "spool", tmp_path / "draft")
     ready = tmp_path / "ready"
     ready.mkdir(mode=0o2750)
@@ -77,26 +77,24 @@ def test_new_visit_revokes_old_drain_through_clock_publication_and_restart(tmp_p
     )
     (draft / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
     store.append_ready_closure(11, "drained")
-    authority = store.create_publication_authority()
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
 
     async def visit() -> None:
         await maintenance.enter_capture_priority()
         try:
             assert load(store.ready_closures_path)[0].reason == "collecting"
-            assert authority.publish() is None
+            assert store.publish_ready().reason == "capture_active"
         finally:
             maintenance.exit_capture_priority()
             await maintenance.close()
 
     asyncio.run(visit())
-    authority.close()
     restarted = StagingStore.from_paths(base.paths, publication_root=ready, config=config)
-    assert restarted.recover_and_publish() is None
+    assert restarted.recover_and_publish().state == "waiting"
     assert draft.exists()
     assert not tuple(ready.iterdir())
     restarted.append_ready_closure(11, "drained")
-    assert restarted.recover_and_publish() is not None
+    assert restarted.recover_and_publish().state == "published"
     assert not draft.exists()
 
 
@@ -287,7 +285,7 @@ def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_pa
         assert publication is not None
         resumed.close(durable=True)
     store.append_ready_closure(11, "legacy_prefix_publication")
-    assert store.recover_and_publish() is None
+    assert store.recover_and_publish().state == "waiting"
     assert publication.bundle_path.exists()
     assert not tuple(ready.iterdir())
     assert loads(store.ready_closures_path.read_text())["closures"] == [

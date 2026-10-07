@@ -18,7 +18,7 @@ from ..domain.ring_protocol import RingInfo
 from . import collector
 from .batch_reconciliation import BatchReconciler
 from .operational_telemetry import OperationalEmitter
-from .ports import CaptureRuntimePort, ObservationWriterPort, PublicationAuthorityPort, StagingPort
+from .ports import CaptureRuntimePort, ObservationWriterPort, StagingPort
 from .presence import PresenceEnd, PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
 from .session_lifecycle import (
@@ -59,7 +59,7 @@ class _Run:
     maintenance: QuarantineMaintenance
 
 
-async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams are explicit
+async def run_opportunistic_collector(
     provider: SessionProvider,
     staging: StagingPort,
     options: OpportunisticOptions,
@@ -90,16 +90,6 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
     if options.clock_lease is None:
         options = replace(options, clock_lease=staging.clock_mutation_lease)
 
-    def schedule_publication_retry() -> None:
-        try:
-            loop.call_soon_threadsafe(maintenance.schedule_publication_retry)
-        except RuntimeError:
-            return
-
-    publication_authority: PublicationAuthorityPort | None = None
-    if options.timeline_publisher is None:
-        publication_authority = staging.create_publication_authority(schedule_publication_retry)
-        options = _configure_timeline_publisher(options, publication_authority)
     observation_writer = runtime.make_observation_writer(
         staging, options.config.firmware_observations, report_observation_error
     )
@@ -138,16 +128,6 @@ async def run_opportunistic_collector(  # noqa: C901, PLR0915 - startup seams ar
                     await maintenance.close()
                 finally:
                     _close_quality_metrics(run)
-                    if publication_authority is not None:
-                        publication_authority.close()
-
-
-def _configure_timeline_publisher(
-    options: OpportunisticOptions,
-    authority: PublicationAuthorityPort,
-) -> OpportunisticOptions:
-    """Bind projection retries to the run-issued, task-independent capability."""
-    return replace(options, timeline_publisher=authority)
 
 
 def _configure_clock_sinks(

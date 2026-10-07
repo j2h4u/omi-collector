@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.11](https://github.com/j2h4u/omi-collector/compare/v0.11.10...v0.11.11) (2026-10-07)
+
+
+### Fixes
+
+* **deploy:** isolate uv config and release checkout permissions ([#205](https://github.com/j2h4u/omi-collector/issues/205)) ([a48a949](https://github.com/j2h4u/omi-collector/commit/a48a949beb10152ede7c7de12a81f4b26dbf50e7))
+
 ## [0.11.10](https://github.com/j2h4u/omi-collector/compare/v0.11.9...v0.11.10) (2026-10-07)
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from omi_collector.capture.adapters.attempt_writer_machine import (
@@ -36,6 +38,7 @@ from omi_collector.capture.adapters.attempt_writer_machine import (
     RejectionKind,
     ReuseClose,
     StartRequested,
+    TransitionResult,
     failure_of,
     transition,
 )
@@ -88,6 +91,27 @@ def test_every_state_event_pair_is_pure_and_total(
         type(state) | Constructed | Preparing | Prepared | Reading | Finalizing | Finalized | Failed | Closing | Closed,
     )
     assert isinstance(result.directive, Admit | Ignore | Reject | ReuseClose)
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "replacement"),
+    (
+        (Failed(ERROR), "error", CLOSE_ERROR),
+        (Closing(None, False, True), "failure", ERROR),
+        (Closing(None, False, True), "drain", True),
+        (Closing(None, False, True), "start_admitted", False),
+        (Closed(ERROR, True), "failure", None),
+        (Closed(ERROR, True), "start_admitted", False),
+        (CommandFailed(ERROR), "error", CLOSE_ERROR),
+        (CloseFailed(CLOSE_ERROR), "error", ERROR),
+        (Reject(RejectionKind.FAILED), "kind", RejectionKind.CLOSED),
+        (TransitionResult(Constructed(), Admit()), "state", Preparing()),
+        (TransitionResult(Constructed(), Admit()), "directive", Ignore()),
+    ),
+)
+def test_machine_records_reject_field_reassignment(value: object, field: str, replacement: object) -> None:
+    with pytest.raises(FrozenInstanceError):
+        setattr(value, field, replacement)
 
 
 def test_request_admissions_and_rejections_are_exact() -> None:

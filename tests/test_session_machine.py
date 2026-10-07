@@ -125,6 +125,13 @@ def test_initial_session_state_rejects_command_mutation_and_retains_connect_guar
         transition(state, InfoResolved())
 
 
+def test_effect_failure_event_rejects_retry_outcome_mutation() -> None:
+    event = EffectFailed("retry")
+
+    with pytest.raises(FrozenInstanceError):
+        event.__setattr__("retry_outcome", None)
+
+
 @pytest.mark.parametrize("preflight", ("disabled", "degraded"))
 def test_optional_preflight_resolution_still_precedes_read(preflight: Literal["disabled", "degraded"]) -> None:
     state = transition(initial_state(), Connected())

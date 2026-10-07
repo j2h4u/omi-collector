@@ -866,6 +866,39 @@ def test_quarantine_state_reports_missing_owned_path_as_invalid_evidence(tmp_pat
     )
 
 
+def test_terminal_retired_sweep_rechecks_attempts_root_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    outside = tmp_path / "outside-attempts"
+    outside.mkdir()
+    attempts_root = store._filesystem.attempts_root
+    prepare_roots = store._filesystem._prepare_roots
+
+    def swap_after_validation() -> None:
+        prepare_roots()
+        attempts_root.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(store._filesystem, "_prepare_roots", swap_after_validation)
+
+    with pytest.raises(StagingError, match="terminal-retired partial root is not a directory"):
+        store.sweep_terminal_retired()
+
+    assert attempts_root.is_symlink()
+    assert outside.is_dir()
+
+
+def test_quarantine_state_classifies_non_directory_as_invalid_evidence(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    quarantine_root = store._filesystem.quarantine_root
+    quarantine_root.mkdir()
+    opaque = quarantine_root / "opaque-evidence"
+    opaque.write_text("preserved evidence", encoding="utf-8")
+
+    assert store.quarantine_state(opaque) is QuarantineState.INVALID_EVIDENCE
+    assert opaque.read_text(encoding="utf-8") == "preserved evidence"
+
+
 def test_sidecar_plus_one_internal_quarantine_marker_remains_live_at_expiry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

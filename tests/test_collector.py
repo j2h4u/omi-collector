@@ -15,17 +15,21 @@ from omi_collector.capture.application import collector as collector_module
 from omi_collector.capture.application.collector import (
     AdvanceRejectedError,
     AdvanceUncertainError,
+    CollectionResult,
     ProgressEvent,
     ProgressMailbox,
     ReadLegOptions,
+    ReadLegResult,
     TransferCounters,
     TransferInterruptedError,
+    TransferTimeouts,
     advance_leg,
     read_leg,
 )
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     STATUS_STORAGE_NOT_READY,
+    RingInfo,
     RingStatus,
     encode_advance_command,
     encode_read_command,
@@ -269,6 +273,33 @@ def test_burst_reaches_arena_while_heartbeat_runs_and_disk_is_after_done() -> No
         assert session.writes == [encode_read_command(10, 2)]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("value", "field_name"),
+    [
+        (TransferCounters(0, 0, 0), "received_bytes"),
+        (TransferTimeouts(1, 1), "info"),
+        (ReadLegOptions(1), "timeout"),
+        (ReadLegResult(10, 11, 1), "start_sequence"),
+        (collector_module._LegBaselines(0, 0, 0), "received_bytes"),
+    ],
+)
+def test_collector_values_are_immutable(value: object, field_name: str) -> None:
+    with pytest.raises(FrozenInstanceError):
+        setattr(value, field_name, object())
+
+
+def test_collection_result_defaults_to_unconfirmed_advance() -> None:
+    result = CollectionResult(info=RingInfo(10, 10, 100, 0, RECORD_SIZE), packet_count=0, seal=object())
+
+    assert not result.advance_confirmed
+
+
+def test_transfer_counters_count_only_complete_records() -> None:
+    counters = TransferCounters(RECORD_SIZE + 1, 0, 0)
+
+    assert counters.received_records == 1
 
 
 def test_read_leg_accepts_keyword_start_and_count() -> None:

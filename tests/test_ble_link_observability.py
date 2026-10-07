@@ -193,6 +193,11 @@ def test_observer_ignores_telemetry_if_disconnect_wins_dispatch_race(
         (ble_link_observability.ConnectionParameterRequest, 4, "min_interval_ms"),
         (ble_link_observability.ConnectionParameterUpdate, 3, "status_hex"),
         (ble_link_observability.BleLinkSessionRecord, 24, "address"),
+        (ble_link_observability._PhyEvent, 4, "handle"),
+        (ble_link_observability._DataLengthChangeEvent, 5, "handle"),
+        (ble_link_observability._ConnectionParameterRequestEvent, 5, "handle"),
+        (ble_link_observability._CommandCompleteEvent, 5, "opcode"),
+        (ble_link_observability._DisconnectEvent, 2, "handle"),
     ],
 )
 def test_observer_telemetry_records_are_immutable(record_type: type[object], field_count: int, field_name: str) -> None:
@@ -725,6 +730,8 @@ def test_observer_sends_read_phy_tracks_transition_and_finishes_once() -> None:
         terminal_callback=records.append,
     )
     asyncio.run(observer.start())
+    assert observer._reader is not None and observer._reader.daemon
+    assert observer._processor is not None and observer._processor.daemon
     assert native_bind_calls == [(37, 31, 3, 0)]
     assert fake.options == [(0, 2, hci_filter_bytes())]
     # This scenario drives packets and the fake clock synchronously.

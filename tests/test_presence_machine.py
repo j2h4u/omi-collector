@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from collections.abc import Callable
+from dataclasses import FrozenInstanceError, fields
 from itertools import product
 from types import UnionType
 from typing import cast
@@ -34,6 +35,7 @@ from omi_collector.capture.application.presence_machine import (
     Stop,
     StopAndBeginAttempt,
     TimerFired,
+    TransitionResult,
     UnexpectedAttemptOutcomeError,
     armed_deadline,
     drained_cooldown_remaining_seconds,
@@ -49,6 +51,29 @@ POLICY = PresenceMachinePolicy(
     arrival_stability_seconds=5.0,
     arrival_max_gap_seconds=10.0,
 )
+
+
+@pytest.mark.parametrize(
+    ("record_type", "field_count", "field_name"),
+    [
+        (PresenceMachinePolicy, 6, "absence_seconds"),
+        (Advertisement, 3, "observed_at"),
+        (RetryWaiting, 7, "retry_at"),
+        (ResumeInterruptedVisit, 1, "at"),
+        (NotConnected, 1, "durable_progress"),
+        (AttemptFinished, 2, "at"),
+        (Observe, 1, "until"),
+        (TransitionResult, 2, "state"),
+    ],
+)
+def test_presence_machine_values_are_immutable(
+    record_type: type[object], field_count: int, field_name: str
+) -> None:
+    record_factory = cast(Callable[..., object], record_type)
+    record = record_factory(*([None] * field_count))
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(record, field_name, object())
 
 
 def _advertisement(at: float, candidate: object | None = None) -> Advertisement:

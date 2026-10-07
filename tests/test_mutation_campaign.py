@@ -3,21 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import select
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 from collections import Counter
 from collections.abc import Callable
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from io import StringIO
 from pathlib import Path
 from typing import cast
 
 import pytest
 from scripts import mutation_campaign
+
+_REAL_RMTREE = shutil.rmtree
 
 
 @pytest.fixture
@@ -81,6 +84,95 @@ def _without_outer_job_token(environment: dict[str, str] | None = None) -> dict[
     child_environment = (os.environ if environment is None else environment).copy()
     child_environment.pop(mutation_campaign.JOB_TOKEN_ENV, None)
     return child_environment
+
+
+def _process_descendants(root_pid: int) -> set[int]:
+    children: dict[int, list[int]] = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdecimal():
+            continue
+        try:
+            fields = proc.joinpath("stat").read_text(encoding="ascii").rsplit(")", 1)[-1].split()
+            if fields[0] != "Z":
+                children.setdefault(int(fields[1]), []).append(int(proc.name))
+        except FileNotFoundError, PermissionError, ValueError, IndexError:
+            continue
+    descendants: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        for pid in children.get(pending.pop(), ()):
+            if pid not in descendants:
+                descendants.add(pid)
+                pending.append(pid)
+    return descendants
+
+
+def _stop_test_process_tree(root_pid: int) -> None:
+    with suppress(ProcessLookupError):
+        os.kill(root_pid, signal.SIGSTOP)
+    for _attempt in range(100):
+        descendants = _process_descendants(root_pid)
+        if not descendants:
+            break
+        for pid in descendants:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        time.sleep(0.01)
+    remaining = _process_descendants(root_pid)
+    with suppress(ProcessLookupError):
+        os.kill(root_pid, signal.SIGKILL)
+    os.waitpid(root_pid, 0)
+    assert not remaining, f"isolated _enter_owner descendants survived cleanup: {sorted(remaining)}"
+
+
+def _enter_owner_bounded(
+    job: Path,
+    token: str,
+    command: list[str],
+    environment: dict[str, str],
+    *,
+    mode: str = "resume",
+) -> int:
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            result = {
+                "status": mutation_campaign._enter_owner(job, mode, token, command=command, environment=environment)
+            }
+        except (
+            AssertionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OSError,
+            sqlite3.Error,
+            subprocess.SubprocessError,
+        ) as exc:
+            result = {"error": repr(exc)}
+        os.write(write_fd, json.dumps(result).encode())
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        ready, _writable, _exceptional = select.select([read_fd], [], [], 5)
+        if not ready:
+            _stop_test_process_tree(pid)
+            _REAL_RMTREE(job / "tmp", ignore_errors=True)
+            pytest.fail(f"_enter_owner exceeded 5 seconds; isolated process tree {pid} was killed")
+        result = cast(dict[str, object], json.loads(os.read(read_fd, 4096)))
+        _child_pid, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, (
+            f"isolated _enter_owner exited abnormally: {status}"
+        )
+        error = result.get("error")
+        assert error is None, f"isolated _enter_owner failed: {error}"
+        owner_status = result.get("status")
+        assert isinstance(owner_status, int)
+        return owner_status
+    finally:
+        os.close(read_fd)
 
 
 def test_job_environment_removes_outer_token_and_nested_owner_guard_stays_strict(
@@ -663,38 +755,19 @@ source.write_text("value = 'tampered while running'\\n")
 time.sleep(60)
 """
     monkeypatch.setattr(mutation_campaign, "OWNER_CHECK_SECONDS", 0.05)
-    owner_result: list[int] = []
-
-    def enter_owner() -> None:
-        owner_result.append(
-            mutation_campaign._enter_owner(
-                job,
-                "fresh",
-                token,
-                command=[sys.executable, "-c", runner],
-                environment=environment,
-            )
-        )
-
     with monkeypatch.context() as patch:
         patch.chdir(checkout)
-        owner = threading.Thread(target=enter_owner, daemon=True)
-        owner.start()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not pid_path.exists() and owner.is_alive():
-            time.sleep(0.01)
-        if not pid_path.is_file():
-            owner.join(timeout=5)
-            receipt = _read_json_object(job / "owner.json")
-            pytest.fail(
-                f"owner exited before child PID was recorded: {owner_result!r}; "
-                f"alive={owner.is_alive()}, receipt={receipt!r}"
-            )
-        child_pid = int(pid_path.read_text(encoding="ascii"))
-        owner.join(timeout=5)
+        status = _enter_owner_bounded(
+            job,
+            token,
+            [sys.executable, "-c", runner],
+            environment,
+            mode="fresh",
+        )
 
-    assert not owner.is_alive()
-    assert owner_result == [1]
+    assert pid_path.is_file()
+    child_pid = int(pid_path.read_text(encoding="ascii"))
+    assert status == 1
     receipt = _read_json_object(job / "owner.json")
     assert receipt["state"] == "source_invalidated"
     assert receipt["cleanup_verified"] is True
@@ -712,12 +785,8 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
     )
     native_report = "import json, os, pathlib; pathlib.Path(os.environ['TMPDIR'], 'scratch').write_text('native'); pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete_unresolved'})); raise SystemExit(3)"
 
-    native_status = mutation_campaign._enter_owner(
-        native_job,
-        "resume",
-        native_token,
-        command=[sys.executable, "-c", native_report],
-        environment=_without_outer_job_token(),
+    native_status = _enter_owner_bounded(
+        native_job, native_token, [sys.executable, "-c", native_report], _without_outer_job_token()
     )
 
     native_receipt = _read_json_object(native_job / "owner.json")
@@ -737,12 +806,8 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
         "import json, os, pathlib; pathlib.Path(os.environ['TMPDIR'], 'scratch').write_text('complete'); "
         "pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete'}))"
     )
-    complete_status = mutation_campaign._enter_owner(
-        complete_job,
-        "resume",
-        complete_token,
-        command=[sys.executable, "-c", complete_command],
-        environment=_without_outer_job_token(),
+    complete_status = _enter_owner_bounded(
+        complete_job, complete_token, [sys.executable, "-c", complete_command], _without_outer_job_token()
     )
     complete_receipt = _read_json_object(complete_job / "owner.json")
     assert complete_status == 0
@@ -756,16 +821,15 @@ def test_controller_failure_and_native_unresolved_report_have_distinct_receipts(
         json.dumps({"schema": 1, "run_token": failed_token, "state": "preparing"}), encoding="utf-8"
     )
 
-    failed_status = mutation_campaign._enter_owner(
+    failed_status = _enter_owner_bounded(
         failed_job,
-        "resume",
         failed_token,
-        command=[
+        [
             sys.executable,
             "-c",
             "import os, pathlib; pathlib.Path(os.environ['TMPDIR'], 'scratch').write_text('failure'); raise SystemExit(1)",
         ],
-        environment=_without_outer_job_token(),
+        _without_outer_job_token(),
     )
 
     failed_receipt = _read_json_object(failed_job / "owner.json")
@@ -890,16 +954,15 @@ def test_cleanup_receipt_survives_tmp_removal_error_for_next_launch(
         real_rmtree(path)
 
     monkeypatch.setattr(mutation_campaign.shutil, "rmtree", fail_tmp_removal)
-    status = mutation_campaign._enter_owner(
+    status = _enter_owner_bounded(
         job_root,
-        "resume",
         token,
-        command=[
+        [
             sys.executable,
             "-c",
             "import json, pathlib; pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete'}))",
         ],
-        environment=_without_outer_job_token(),
+        _without_outer_job_token(),
     )
 
     receipt = _read_json_object(job_root / mutation_campaign.OWNER_FILE)

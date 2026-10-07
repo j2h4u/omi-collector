@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.12](https://github.com/j2h4u/omi-collector/compare/v0.11.11...v0.11.12) (2026-10-07)
+
+
+### Tests
+
+* cover quarantine path guard edges ([#207](https://github.com/j2h4u/omi-collector/issues/207)) ([ab97949](https://github.com/j2h4u/omi-collector/commit/ab97949429de3fefb60a68b40bd9853624b4c352))
+
 ## [0.11.11](https://github.com/j2h4u/omi-collector/compare/v0.11.10...v0.11.11) (2026-10-07)
 
 

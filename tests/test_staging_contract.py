@@ -69,13 +69,15 @@ def _ample_statvfs(_: str | Path) -> object:
     ],
     ids=["durable-prefix", "streaming-checkpoint"],
 )
-def test_durable_staging_values_are_immutable(value: object, field: str, replacement: int) -> None:
-    original = getattr(value, field)
+def test_durable_staging_values_are_immutable(
+    value: DurablePrefix | StreamingCheckpoint, field: str, replacement: int
+) -> None:
+    original = value.record_count
 
     with pytest.raises(FrozenInstanceError):
         setattr(value, field, replacement)
 
-    assert getattr(value, field) == original
+    assert value.record_count == original
 
 
 def test_open_persisted_attempt_accepts_protocol_maximum_without_capacity_preflight(tmp_path: Path) -> None:

@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.11.7](https://github.com/j2h4u/omi-collector/compare/v0.11.6...v0.11.7) (2026-10-07)
+
+
+### Fixes
+
+* **test:** narrow owner receipt payload types ([7693ed7](https://github.com/j2h4u/omi-collector/commit/7693ed7361e436e398f7360982ca66316fc061c9))
+* **test:** narrow owner receipt payload types ([4b41bff](https://github.com/j2h4u/omi-collector/commit/4b41bff1f8e1d6176cc79d25fbd60646e4125bd2))
+* **test:** narrow owner receipt payload types ([87607dd](https://github.com/j2h4u/omi-collector/commit/87607dd466391bdce37d48de33ac35dbbeedb66a))
+* **test:** narrow owner receipt payload types ([8d46ccb](https://github.com/j2h4u/omi-collector/commit/8d46ccb57aaa2fd63e2ca4712eaf96f71da81793))
+* **test:** narrow owner receipt payload types ([6e48b68](https://github.com/j2h4u/omi-collector/commit/6e48b68fe8b0c1f34621b57dcd0c95f2140a0b20))
+* **test:** narrow owner receipt payload types ([6b0aa6e](https://github.com/j2h4u/omi-collector/commit/6b0aa6ebf30648fc629b8e065a70facfd3ec9dcb))
+
+
+### Style
+
+* format machine immutability test signatures ([54aabc8](https://github.com/j2h4u/omi-collector/commit/54aabc83dcae47ad4babcc0264490b1e69b95fa9))
+* format machine immutability test signatures ([b8a77c8](https://github.com/j2h4u/omi-collector/commit/b8a77c8c6f0777a8051669f94ba43cabc20b3aa1))
+* format machine immutability test signatures ([6387f0d](https://github.com/j2h4u/omi-collector/commit/6387f0d0ca9c76ff1a9085cdc09d88da9d05a281))
+* **test:** format mutation campaign helpers ([7693ed7](https://github.com/j2h4u/omi-collector/commit/7693ed7361e436e398f7360982ca66316fc061c9))
+* **test:** format mutation campaign helpers ([4b41bff](https://github.com/j2h4u/omi-collector/commit/4b41bff1f8e1d6176cc79d25fbd60646e4125bd2))
+* **test:** format mutation campaign helpers ([87607dd](https://github.com/j2h4u/omi-collector/commit/87607dd466391bdce37d48de33ac35dbbeedb66a))
+* **test:** format mutation campaign helpers ([8d46ccb](https://github.com/j2h4u/omi-collector/commit/8d46ccb57aaa2fd63e2ca4712eaf96f71da81793))
+* **test:** format mutation campaign helpers ([6e48b68](https://github.com/j2h4u/omi-collector/commit/6e48b68fe8b0c1f34621b57dcd0c95f2140a0b20))
+* **test:** format mutation campaign helpers ([6b0aa6e](https://github.com/j2h4u/omi-collector/commit/6b0aa6ebf30648fc629b8e065a70facfd3ec9dcb))
+
+
+### Tests
+
+* assert machine dataclasses are frozen ([54aabc8](https://github.com/j2h4u/omi-collector/commit/54aabc83dcae47ad4babcc0264490b1e69b95fa9))
+* assert machine dataclasses are frozen ([b8a77c8](https://github.com/j2h4u/omi-collector/commit/b8a77c8c6f0777a8051669f94ba43cabc20b3aa1))
+* assert machine dataclasses are frozen ([6387f0d](https://github.com/j2h4u/omi-collector/commit/6387f0d0ca9c76ff1a9085cdc09d88da9d05a281))
+* bound mutation scope control requests ([#194](https://github.com/j2h4u/omi-collector/issues/194)) ([90d4bf4](https://github.com/j2h4u/omi-collector/commit/90d4bf443a027b308aebacc6fd06302e64f51b50))
+* **mutation:** bound owner receipt scenarios ([7693ed7](https://github.com/j2h4u/omi-collector/commit/7693ed7361e436e398f7360982ca66316fc061c9))
+* **mutation:** bound owner receipt scenarios ([4b41bff](https://github.com/j2h4u/omi-collector/commit/4b41bff1f8e1d6176cc79d25fbd60646e4125bd2))
+* **mutation:** bound owner receipt scenarios ([87607dd](https://github.com/j2h4u/omi-collector/commit/87607dd466391bdce37d48de33ac35dbbeedb66a))
+* **mutation:** bound owner receipt scenarios ([8d46ccb](https://github.com/j2h4u/omi-collector/commit/8d46ccb57aaa2fd63e2ca4712eaf96f71da81793))
+* **mutation:** bound owner receipt scenarios ([6e48b68](https://github.com/j2h4u/omi-collector/commit/6e48b68fe8b0c1f34621b57dcd0c95f2140a0b20))
+* **mutation:** bound owner receipt scenarios ([6b0aa6e](https://github.com/j2h4u/omi-collector/commit/6b0aa6ebf30648fc629b8e065a70facfd3ec9dcb))
+* **qa:** bound lifecycle cleanup and assert presence admission contracts ([62adaea](https://github.com/j2h4u/omi-collector/commit/62adaea11168722535c3971228afd66b17a76209))
+* **qa:** reduce startup maintenance test locals ([62adaea](https://github.com/j2h4u/omi-collector/commit/62adaea11168722535c3971228afd66b17a76209))
+
 ## [0.11.6](https://github.com/j2h4u/omi-collector/compare/v0.11.5...v0.11.6) (2026-10-06)
 
 

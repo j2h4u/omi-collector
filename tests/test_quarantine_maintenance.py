@@ -2043,9 +2043,9 @@ def test_successful_publication_retry_schedule_finishes_without_a_second_invocat
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         try:
             maintenance.schedule_publication_retry()
-            assert await asyncio.to_thread(started.wait, 1)
             publication = maintenance._publication_retry_task
             assert publication is not None
+            assert await asyncio.to_thread(started.wait, 1)
             await publication
             assert calls == [ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle")]
         finally:

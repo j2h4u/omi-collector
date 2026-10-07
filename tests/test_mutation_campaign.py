@@ -95,7 +95,7 @@ def _process_descendants(root_pid: int) -> set[int]:
             fields = proc.joinpath("stat").read_text(encoding="ascii").rsplit(")", 1)[-1].split()
             if fields[0] != "Z":
                 children.setdefault(int(fields[1]), []).append(int(proc.name))
-        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        except FileNotFoundError, PermissionError, ValueError, IndexError:
             continue
     descendants: set[int] = set()
     pending = [root_pid]
@@ -139,9 +139,7 @@ def _enter_owner_bounded(
         os.close(read_fd)
         try:
             result = {
-                "status": mutation_campaign._enter_owner(
-                    job, mode, token, command=command, environment=environment
-                )
+                "status": mutation_campaign._enter_owner(job, mode, token, command=command, environment=environment)
             }
         except (
             AssertionError,
@@ -165,7 +163,9 @@ def _enter_owner_bounded(
             pytest.fail(f"_enter_owner exceeded 5 seconds; isolated process tree {pid} was killed")
         result = json.loads(os.read(read_fd, 4096))
         _child_pid, status = os.waitpid(pid, 0)
-        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, f"isolated _enter_owner exited abnormally: {status}"
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, (
+            f"isolated _enter_owner exited abnormally: {status}"
+        )
         assert "error" not in result, f"isolated _enter_owner failed: {result.get('error')}"
         return int(result["status"])
     finally:

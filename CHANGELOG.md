@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.6](https://github.com/j2h4u/omi-collector/compare/v0.11.5...v0.11.6) (2026-10-06)
+
+
+### Tests
+
+* **qa:** fail stalled mutation paths without waiting for timeouts ([#191](https://github.com/j2h4u/omi-collector/issues/191)) ([3190f49](https://github.com/j2h4u/omi-collector/commit/3190f491f085f6194d24d63704b224d85b62f946))
+
 ## [0.11.5](https://github.com/j2h4u/omi-collector/compare/v0.11.4...v0.11.5) (2026-10-05)
 
 

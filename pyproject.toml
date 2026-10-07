@@ -7,7 +7,7 @@ license = "PolyForm-Noncommercial-1.0.0"
 requires-python = ">=3.14"
 dependencies = [
     "bleak>=1.1.1",
-    "dbus-fast==5.0.22",
+    "dbus-fast==5.2.0",
     "typer>=0.26.7",
 ]
 

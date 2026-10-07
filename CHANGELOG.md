@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.14](https://github.com/j2h4u/omi-collector/compare/v0.11.13...v0.11.14) (2026-10-07)
+
+
+### Tests
+
+* improve collector mutation regression coverage ([2be4777](https://github.com/j2h4u/omi-collector/commit/2be477728ac2d2ab34e33ca92682ee9854c35ab6))
+
 ## [0.11.13](https://github.com/j2h4u/omi-collector/compare/v0.11.12...v0.11.13) (2026-10-07)
 
 

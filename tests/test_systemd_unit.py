@@ -360,6 +360,22 @@ def test_dev_release_deployer_accepts_https_with_readonly_caller_variable() -> N
     subprocess.run(("bash", "-c", command), check=True)
 
 
+@pytest.mark.parametrize("entrypoint", (_RELEASE_COMMAND, _DEV_DEPLOYER))
+def test_release_deploy_entrypoints_reset_restrictive_umask(entrypoint: Path, tmp_path: Path) -> None:
+    source = entrypoint.read_text(encoding="utf-8")
+    prefix = (
+        source.split("function die", maxsplit=1)[0]
+        if entrypoint == _DEV_DEPLOYER
+        else source.split("(( EUID == 0 ))", maxsplit=1)[0]
+    )
+    target = tmp_path / "checkout-file"
+    command = "\n".join(("umask 0077", prefix, 'printf "public\\n" > "$1"', "stat -c '%a' -- \"$1\""))
+
+    result = subprocess.run(("bash", "-c", command, "bash", str(target)), check=True, capture_output=True, text=True)
+
+    assert result.stdout.strip() == "644"
+
+
 def test_feature_rules_do_not_contain_steps_outside_a_scenario() -> None:
     step_context = "feature"
     for raw_line in _FEATURE.read_text(encoding="utf-8").splitlines():
@@ -397,7 +413,7 @@ def _write_build_fakes(
     (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
         "set -uo pipefail\n"
-        f'printf "uv cwd=%s args=%s\\n" "$PWD" "$*" >> {quoted_log}\n'
+        f'printf "uv cwd=%s UV_NO_CONFIG=%s args=%s\\n" "$PWD" "${{UV_NO_CONFIG:-}}" "$*" >> {quoted_log}\n'
         '[[ "$DEPLOY_BUILD_FAIL" != 1 ]] || exit 1\n'
         'if [[ "$1" == python && "$2" == find ]]; then\n'
         f'    [[ -x "$UV_PYTHON_INSTALL_DIR/{managed_python_directory}/bin/python" ]] || exit 1\n'
@@ -785,7 +801,7 @@ def test_deployer_verifies_candidate_as_builder_before_root_seals_or_restarts(tm
     )
 
 
-def test_deployer_build_user_runs_uv_from_the_staged_repository_not_the_caller_directory(tmp_path: Path) -> None:
+def test_deployer_build_user_isolates_uv_config_from_caller_and_checkout(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path)
     caller_cwd = tmp_path / "caller"
     caller_cwd.mkdir()
@@ -797,6 +813,7 @@ def test_deployer_build_user_runs_uv_from_the_staged_repository_not_the_caller_d
     expected_cwd = harness.deployer.parents[1]
     uv_runs = [line for line in commands.splitlines() if line.startswith("uv cwd=")]
     assert len(uv_runs) == 4
+    assert all("UV_NO_CONFIG=1" in line for line in uv_runs)
     assert all(f"uv cwd={expected_cwd} " in line for line in uv_runs)
     assert all(f"uv cwd={caller_cwd} " not in line for line in uv_runs)
     assert "args=python find --managed-python --no-python-downloads --no-project 3.14" in uv_runs[0]

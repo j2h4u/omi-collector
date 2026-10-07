@@ -4,6 +4,8 @@
 # checkout. It is not a portable installer for third-party deployments.
 
 set -uo pipefail
+# assert: detached release files remain readable by the unprivileged build account
+umask 0022
 
 function die {
     local -r message="${1:-operation failed}"

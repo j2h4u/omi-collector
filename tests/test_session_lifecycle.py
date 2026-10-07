@@ -78,7 +78,6 @@ def _run(coroutine: Coroutine[object, object, object]) -> object:
 
 
 class _ScriptedPresence:
-    policy = PresencePolicy(rapid_backoff=(0.01,))
     drained_cooldown_remaining_seconds = 0.0
 
     def __init__(
@@ -88,6 +87,7 @@ class _ScriptedPresence:
         *,
         allowed_recovery_arms: int = 0,
     ) -> None:
+        self.policy = PresencePolicy(rapid_backoff=(0.01,))
         self._wakes: Iterator[PresenceWake | PresenceEnd | BaseException] = iter(wakes)
         self._end_results: Iterator[PresenceEnd | None] = iter(end_results or [])
         self._allowed_recovery_arms = allowed_recovery_arms

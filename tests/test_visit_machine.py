@@ -122,7 +122,7 @@ def _expected_transitions() -> list[tuple[tuple[VisitState, VisitEvent, bool], T
             [
                 (
                     (Recovering(), RecoveryLoaded("empty"), stop_after_drained),
-                    TransitionResult(Idle(), WaitForAttempt()),
+                    TransitionResult(Idle(), WaitForAttempt(arm_restored=False)),
                 ),
                 (
                     (Recovering(), RecoveryLoaded("resumable"), stop_after_drained),
@@ -180,7 +180,10 @@ def _expected_transitions() -> list[tuple[tuple[VisitState, VisitEvent, bool], T
                             SessionFinished(CandidateUnavailable()),
                             stop_after_drained,
                         ),
-                        TransitionResult(origin, WaitForAttempt(previous_outcome=CandidateUnavailable())),
+                        TransitionResult(
+                            origin,
+                            WaitForAttempt(arm_restored=False, previous_outcome=CandidateUnavailable()),
+                        ),
                     ),
                     (
                         (
@@ -197,7 +200,10 @@ def _expected_transitions() -> list[tuple[tuple[VisitState, VisitEvent, bool], T
                     rows.append(
                         (
                             (Attempting(origin), SessionFinished(outcome), stop_after_drained),
-                            TransitionResult(Waiting(), WaitForAttempt(previous_outcome=outcome)),
+                            TransitionResult(
+                                Waiting(),
+                                WaitForAttempt(arm_restored=False, previous_outcome=outcome),
+                            ),
                         )
                     )
         for state in STATES:
@@ -242,7 +248,9 @@ FIELD_INVENTORY = {
 
 def test_startup_recovery_disposition_and_interrupted_close_loop() -> None:
     assert initial_transition() == TransitionResult(Recovering(), InspectRecovery())
-    assert transition(Recovering(), RecoveryLoaded("empty")) == TransitionResult(Idle(), WaitForAttempt())
+    assert transition(Recovering(), RecoveryLoaded("empty")) == TransitionResult(
+        Idle(), WaitForAttempt(arm_restored=False)
+    )
     assert transition(Recovering(), RecoveryLoaded("resumable")) == TransitionResult(
         Waiting(), WaitForAttempt(arm_restored=True)
     )
@@ -278,7 +286,7 @@ def test_interruption_returns_to_waiting_with_outcome(durable_progress: bool) ->
 
     result = transition(Attempting(Waiting()), SessionFinished(outcome))
 
-    assert result == TransitionResult(Waiting(), WaitForAttempt(previous_outcome=outcome))
+    assert result == TransitionResult(Waiting(), WaitForAttempt(arm_restored=False, previous_outcome=outcome))
 
 
 @pytest.mark.parametrize("origin", [Idle(), Waiting()])
@@ -287,7 +295,10 @@ def test_candidate_unavailable_restores_attempt_origin(origin: Idle | Waiting) -
     result = transition(granted.state, SessionFinished(CandidateUnavailable()))
 
     assert granted == TransitionResult(Attempting(origin), RunAttempt())
-    assert result == TransitionResult(origin, WaitForAttempt(previous_outcome=CandidateUnavailable()))
+    assert result == TransitionResult(
+        origin,
+        WaitForAttempt(arm_restored=False, previous_outcome=CandidateUnavailable()),
+    )
 
 
 def test_drain_requires_closure_before_idle_or_stop() -> None:

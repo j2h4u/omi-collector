@@ -566,10 +566,10 @@ def test_publish_zero_and_repeated_high_water_are_noops() -> None:
         target = FakeTarget()
         async with _started(target, bytearray(b"x" * RECORD_SIZE)) as writer:
             try:
-                assert not writer.publish(0)
+                assert writer.publish(0) is False
                 assert writer.publish(RECORD_SIZE)
-                assert not writer.publish(RECORD_SIZE)
-                assert not writer.publish(0)
+                assert writer.publish(RECORD_SIZE) is False
+                assert writer.publish(0) is False
                 await writer.barrier()
 
                 assert [call for call in target.calls if call[0] == "append"] == [("append", 0, b"x" * RECORD_SIZE)]

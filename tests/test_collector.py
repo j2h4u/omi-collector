@@ -297,9 +297,10 @@ def test_collection_result_defaults_to_unconfirmed_advance() -> None:
 
 
 def test_transfer_counters_count_only_complete_records() -> None:
-    counters = TransferCounters(RECORD_SIZE + 1, 0, 0)
+    counters = TransferCounters(RECORD_SIZE + 1, RECORD_SIZE + 1, RECORD_SIZE + 1)
 
     assert counters.received_records == 1
+    assert counters.written_records == 1
 
 
 def test_read_leg_accepts_keyword_start_and_count() -> None:

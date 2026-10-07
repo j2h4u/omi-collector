@@ -161,13 +161,16 @@ def _enter_owner_bounded(
             _stop_test_process_tree(pid)
             _REAL_RMTREE(job / "tmp", ignore_errors=True)
             pytest.fail(f"_enter_owner exceeded 5 seconds; isolated process tree {pid} was killed")
-        result = json.loads(os.read(read_fd, 4096))
+        result = cast(dict[str, object], json.loads(os.read(read_fd, 4096)))
         _child_pid, status = os.waitpid(pid, 0)
         assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, (
             f"isolated _enter_owner exited abnormally: {status}"
         )
-        assert "error" not in result, f"isolated _enter_owner failed: {result.get('error')}"
-        return int(result["status"])
+        error = result.get("error")
+        assert error is None, f"isolated _enter_owner failed: {error}"
+        owner_status = result.get("status")
+        assert isinstance(owner_status, int)
+        return owner_status
     finally:
         os.close(read_fd)
 

@@ -1506,10 +1506,10 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
     maintenance_stopped = asyncio.Event()
     release_wake = asyncio.Event()
     release_maintenance = asyncio.Event()
-    waiter_task: asyncio.Task[PresenceWake] | None = None
 
     class BlockingPresence:
         closed = False
+        waiter_task: asyncio.Task[PresenceWake] | None = None
         policy = PresencePolicy(
             scan_recheck_seconds=30.0,
             rapid_backoff=(0.001,),
@@ -1517,10 +1517,9 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
         )
 
         async def wait_for_attempt(self) -> PresenceWake:
-            nonlocal waiter_task
             current = asyncio.current_task()
             assert current is not None
-            waiter_task = cast(asyncio.Task[PresenceWake], current)
+            self.waiter_task = cast(asyncio.Task[PresenceWake], current)
             scan_started.set()
             await release_wake.wait()
             return PresenceWake(
@@ -1591,10 +1590,10 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
     finally:
         release_wake.set()
         release_maintenance.set()
-        if waiter_task is not None:
-            waiter_task.cancel()
-        if waiter_task is not None:
-            await _finish_task(waiter_task)
+        if presence.waiter_task is not None:
+            presence.waiter_task.cancel()
+        if presence.waiter_task is not None:
+            await _finish_task(presence.waiter_task)
         await _finish_task(maintenance_ready, cancel=True)
         await _finish_task(task, cancel=True)
 

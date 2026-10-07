@@ -37,18 +37,38 @@ def _record(timestamp: int, marker: int) -> bytes:
 
 
 def _draft(root: Path, timestamps: tuple[int, ...], *, start_sequence: int = 10, marker_start: int = 1) -> Path:
+    records = tuple(_record(timestamp, marker_start + index) for index, timestamp in enumerate(timestamps))
+    return _records_draft(root, records, start_sequence=start_sequence)
+
+
+def _records_draft(root: Path, records: tuple[bytes, ...], *, start_sequence: int) -> Path:
     ready = root.parent / "ready"
     ready.mkdir(mode=0o2750, exist_ok=True)
     ready.chmod(0o2750)
-    raw = b"".join(_record(timestamp, marker_start + index) for index, timestamp in enumerate(timestamps))
+    raw = b"".join(records)
     digest = sha256(raw).hexdigest()
-    path = root / f"{start_sequence}-{start_sequence + len(timestamps)}-{digest[:16]}"
+    path = root / f"{start_sequence}-{start_sequence + len(records)}-{digest[:16]}"
     path.mkdir(parents=True)
     (path / "records.bin").write_bytes(raw)
-    manifest = BundleManifest(2, start_sequence, start_sequence + len(timestamps), len(timestamps), RECORD_SIZE, digest)
+    manifest = BundleManifest(2, start_sequence, start_sequence + len(records), len(records), RECORD_SIZE, digest)
     (path / "manifest.json").write_text(dumps(manifest.as_dict()), encoding="utf-8")
     (path / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
     return path
+
+
+def _overflow_record(timestamp: int, size: int, marker: int) -> bytes:
+    record = bytearray(_record(timestamp, marker))
+    record[4 + 438] = size
+    return bytes(record)
+
+
+def _sized_record(timestamp: int, size: int, marker: int) -> bytes:
+    record = bytearray(RECORD_SIZE)
+    record[:4] = timestamp.to_bytes(4, "big")
+    record[4] = size
+    record[5] = 8
+    record[6 : 5 + size] = bytes((marker,)) * (size - 1)
+    return bytes(record)
 
 
 def _audio_draft(root: Path, *, sequence: int, timestamp: int = 100) -> Path:
@@ -181,6 +201,86 @@ def test_sequence_gap_publishes_actual_records_and_canonical_ledger_geometry(tmp
     entry = entries[expected_id]
     assert entry["gaps"] == [[11, 12]]
     assert not first.exists() and not second.exists()
+
+
+def test_contiguous_overflow_break_publishes_byte_exact_independent_bundles(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    records = (
+        _record(100, 1),
+        _overflow_record(101, 75, 2),
+        _sized_record(3_543, 88, 3),
+        _overflow_record(3_544, 97, 4),
+        _sized_record(3_554, 130, 5),
+    )
+    source = _records_draft(draft_root, records, start_sequence=10)
+
+    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+
+    assert [(item.next_sequence - item.record_count, item.next_sequence) for item in published] == [
+        (10, 12),
+        (12, 14),
+        (14, 15),
+    ]
+    assert b"".join((item.path / "records.bin").read_bytes() for item in published) == b"".join(records)
+    assert source.exists() is False
+
+
+def test_contiguous_overflow_break_between_drafts_creates_independent_bundles(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    _records_draft(draft_root, (_overflow_record(100, 99, 1),), start_sequence=10)
+    _records_draft(draft_root, (_sized_record(24_496, 121, 2),), start_sequence=11)
+
+    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+
+    assert [(item.next_sequence - item.record_count, item.next_sequence) for item in published] == [(10, 11), (11, 12)]
+
+
+def test_matching_overflow_continuation_remains_one_bundle(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    _records_draft(
+        draft_root,
+        (_overflow_record(100, 75, 1), _sized_record(101, 75, 2)),
+        start_sequence=10,
+    )
+
+    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+
+    assert len(published) == 1
+    assert published[0].record_count == 2
+
+
+def test_split_publication_keeps_source_until_every_child_is_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draft_root = tmp_path / "draft"
+    source = _records_draft(
+        draft_root,
+        (_overflow_record(100, 75, 1), _sized_record(3_543, 88, 2)),
+        start_sequence=10,
+    )
+    original = ready_bundles._finalize_group
+    calls = 0
+
+    def interrupted(*args: object, **kwargs: object) -> ready_bundles.ReadyBundleResult | None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("interrupted")
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ready_bundles, "_finalize_group", interrupted)
+    with pytest.raises(OSError, match="interrupted"):
+        _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+
+    assert source.exists()
+    assert len(tuple((tmp_path / "ready").iterdir())) == 1
+
+    monkeypatch.setattr(ready_bundles, "_finalize_group", original)
+    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+
+    assert len(published) == 1
+    assert source.exists() is False
+    assert len(tuple((tmp_path / "ready").iterdir())) == 2
 
 
 def test_below_threshold_waits_and_clock_segments_are_preserved(tmp_path: Path) -> None:

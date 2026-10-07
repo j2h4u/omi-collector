@@ -19,7 +19,7 @@ from typing import cast
 from uuid import uuid4
 
 from ...config import ReadyConfig
-from ..domain.opus_duration import count_20ms_packets
+from ..domain.opus_duration import inspect_20ms_record
 from ..domain.ready_machine import ReadyCommand, decide_ready
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
 from .bundle_contract import BundleManifest, SealedReceipt
@@ -117,6 +117,14 @@ class _BundleFacts:
 
 
 @dataclass(frozen=True, slots=True)
+class _DraftAudio:
+    packet_count: int
+    first_size: int
+    final_overflow_size: int | None
+    continuity_breaks: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _ReadySource:
     """A validated ready bundle used only to compare replayed payloads."""
 
@@ -129,7 +137,7 @@ class ReadyInventory:
     drafts: tuple[_Draft, ...]
     ready: tuple[_ReadySource, ...]
     identities: dict[str, tuple[tuple[int, int, int, int, int], ...]]
-    audio_packets: dict[tuple[str, int, int], int]
+    audio_packets: dict[tuple[str, int, int], _DraftAudio]
     replay_slices: dict[str, tuple[_Draft, ...]] | None = None
     replay_keys: dict[str, tuple[tuple[str, tuple[tuple[int, int, int, int, int], ...]], ...]] | None = None
     normalized_slices: tuple[_Draft, ...] | None = None
@@ -191,7 +199,7 @@ def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publ
         for path in replayed_paths:
             _remove_draft(path)
         return ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_eligible_drafts", inventory=inventory)
-    packets = sum(_cached_audio_packets(draft, inventory) for draft in eligible)
+    packets = sum(_cached_draft_audio(draft, inventory).packet_count for draft in eligible)
     decision = decide_ready(
         drained=drained,
         has_audio=packets > 0,
@@ -201,13 +209,12 @@ def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publ
         source_paths = tuple(
             draft.path for draft in inventory.drafts if frontier is None or draft.manifest.next_sequence <= frontier
         )
-        result = _finalize_group(
-            _make_group(eligible),
-            finalization,
-            source_paths,
-        )
-        if result is not None:
-            results.append(result)
+        for group in _continuity_groups(eligible, inventory):
+            result = _finalize_group(group, finalization, ())
+            if result is not None:
+                results.append(result)
+        for path in source_paths:
+            _remove_draft(path)
     else:
         for path in replayed_paths:
             _remove_draft(path)
@@ -331,10 +338,10 @@ def _read_draft(path: Path) -> _Draft:
     return _Draft(path, manifest)
 
 
-def _cached_audio_packets(draft: _Draft, inventory: ReadyInventory) -> int:
+def _cached_draft_audio(draft: _Draft, inventory: ReadyInventory) -> _DraftAudio:
     key = (str(draft.path), draft.byte_offset, draft.manifest.record_count)
     if key not in inventory.audio_packets:
-        inventory.audio_packets[key] = _draft_audio_packets(draft)
+        inventory.audio_packets[key] = _draft_audio(draft)
     return inventory.audio_packets[key]
 
 
@@ -378,19 +385,58 @@ def _make_group(drafts: tuple[_Draft, ...]) -> _DraftGroup:
     return _DraftGroup(drafts, _BundleFacts(first.start_sequence, last.next_sequence, count, digest.hexdigest(), gaps))
 
 
-def _draft_audio_packets(draft: _Draft) -> int:
+def _draft_audio(draft: _Draft) -> _DraftAudio:
     total = 0
+    first_size = 0
+    previous_overflow: int | None = None
+    continuity_breaks: list[int] = []
     with (draft.path / _RAW_NAME).open("rb") as stream:
         stream.seek(draft.byte_offset)
-        for _ in range(draft.manifest.record_count):
+        for index in range(draft.manifest.record_count):
             record = stream.read(RECORD_SIZE)
             if len(record) != RECORD_SIZE:
                 raise ReadyBundleError("draft records ended unexpectedly")
             try:
-                total += count_20ms_packets(record)
+                layout = inspect_20ms_record(record)
             except ValueError as error:
                 raise ReadyBundleError("draft contains an invalid 20 ms Opus packet") from error
-    return total
+            if index == 0:
+                first_size = layout.first_size
+            elif previous_overflow is not None and layout.first_size != previous_overflow:
+                continuity_breaks.append(draft.manifest.start_sequence + index)
+            total += layout.packet_count
+            previous_overflow = layout.overflow_size
+    return _DraftAudio(total, first_size, previous_overflow, tuple(continuity_breaks))
+
+
+def _continuity_groups(drafts: tuple[_Draft, ...], inventory: ReadyInventory) -> tuple[_DraftGroup, ...]:
+    """Split physical output where firmware packet continuation is unavailable."""
+    groups: list[_DraftGroup] = []
+    current: list[_Draft] = []
+    previous: _Draft | None = None
+    previous_audio: _DraftAudio | None = None
+    for draft in drafts:
+        audio = _cached_draft_audio(draft, inventory)
+        if (
+            previous is not None
+            and previous_audio is not None
+            and previous.manifest.next_sequence == draft.manifest.start_sequence
+            and previous_audio.final_overflow_size is not None
+            and audio.first_size != previous_audio.final_overflow_size
+        ):
+            groups.append(_make_group(tuple(current)))
+            current.clear()
+        cursor = draft.manifest.start_sequence
+        for boundary in (*audio.continuity_breaks, draft.manifest.next_sequence):
+            current.append(_crop_draft(draft, cursor, boundary))
+            if boundary != draft.manifest.next_sequence:
+                groups.append(_make_group(tuple(current)))
+                current.clear()
+            cursor = boundary
+        previous, previous_audio = draft, audio
+    if current:
+        groups.append(_make_group(tuple(current)))
+    return tuple(groups)
 
 
 def _finalize_group(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 _PAYLOAD_DATA_LIMIT = 439
 _MAX_PACKET_SIZE = 160
 _PACKET_SAMPLES = 960
@@ -13,11 +15,26 @@ _LENGTH_EXTENDED = 252
 _TWO_FRAMES = 2
 
 
+@dataclass(frozen=True, slots=True)
+class RecordAudioLayout:
+    """Audio framing facts needed across adjacent fixed-size records."""
+
+    packet_count: int
+    first_size: int
+    overflow_size: int | None
+
+
 def count_20ms_packets(record: bytes) -> int:
     """Count valid 20 ms Opus packets; ignore zero padding and overflow tails."""
+    return inspect_20ms_record(record).packet_count
+
+
+def inspect_20ms_record(record: bytes) -> RecordAudioLayout:
+    """Validate one record and expose its cross-record continuation markers."""
     payload = record[4:]
     offset = 0
     count = 0
+    overflow_size: int | None = None
     while offset < _PAYLOAD_DATA_LIMIT:
         size = payload[offset]
         offset += 1
@@ -27,12 +44,13 @@ def count_20ms_packets(record: bytes) -> int:
         if end >= len(payload):
             if size > _MAX_PACKET_SIZE:
                 raise ValueError("invalid Opus packet size")
+            overflow_size = size
             break
         if size > _MAX_PACKET_SIZE or not _is_20ms(payload[offset:end]):
             raise ValueError("invalid 20 ms Opus packet")
         count += 1
         offset = end
-    return count
+    return RecordAudioLayout(count, payload[0], overflow_size)
 
 
 def _is_20ms(packet: bytes) -> bool:

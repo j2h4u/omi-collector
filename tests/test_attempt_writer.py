@@ -308,9 +308,7 @@ def test_arena_is_shared_and_data_waits_for_read_begin() -> None:
         (attempt_writer.CloseCommand(64), "high_water", 128),
     ),
 )
-def test_writer_progress_and_commands_reject_field_reassignment(
-    value: object, field: str, replacement: object
-) -> None:
+def test_writer_progress_and_commands_reject_field_reassignment(value: object, field: str, replacement: object) -> None:
     with pytest.raises(FrozenInstanceError):
         setattr(value, field, replacement)
 

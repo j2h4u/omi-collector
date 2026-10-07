@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.10](https://github.com/j2h4u/omi-collector/compare/v0.11.9...v0.11.10) (2026-10-07)
+
+
+### Fixes
+
+* **capture:** own ready publication lifecycle ([f7290fc](https://github.com/j2h4u/omi-collector/commit/f7290fcd87f5bd1fca8d10a5dc29703e7920a162))
+* **config:** remove inactive ready max wait option ([f7290fc](https://github.com/j2h4u/omi-collector/commit/f7290fcd87f5bd1fca8d10a5dc29703e7920a162))
+* **mutation:** tolerate verified zombie exit races ([f7290fc](https://github.com/j2h4u/omi-collector/commit/f7290fcd87f5bd1fca8d10a5dc29703e7920a162))
+
+
+### Tests
+
+* **publication:** retain retry task before wakeup ([f7290fc](https://github.com/j2h4u/omi-collector/commit/f7290fcd87f5bd1fca8d10a5dc29703e7920a162))
+
 ## [0.11.9](https://github.com/j2h4u/omi-collector/compare/v0.11.8...v0.11.9) (2026-10-07)
 
 

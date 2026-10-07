@@ -246,6 +246,15 @@ FIELD_INVENTORY = {
 }
 
 
+def test_visit_machine_values_are_immutable() -> None:
+    for record_type in FIELD_INVENTORY:
+        record = record_type(*([None] * len(fields(record_type))))
+        hash(record)
+        if record_fields := fields(record_type):
+            with pytest.raises(FrozenInstanceError):
+                setattr(record, record_fields[0].name, object())
+
+
 def test_startup_recovery_disposition_and_interrupted_close_loop() -> None:
     assert initial_transition() == TransitionResult(Recovering(), InspectRecovery())
     assert transition(Recovering(), RecoveryLoaded("empty")) == TransitionResult(

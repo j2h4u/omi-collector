@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import FrozenInstanceError
 from json import dumps, loads
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,11 @@ import pytest
 
 from omi_collector.capture.adapters.attempts import StagedAttempt
 from omi_collector.capture.adapters.publication import TerminalRetirementEvidence
-from omi_collector.capture.adapters.staging_contract import AttemptStateError
+from omi_collector.capture.adapters.staging_contract import (
+    AttemptStateError,
+    DurablePrefix,
+    StreamingCheckpoint,
+)
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 
@@ -54,6 +59,25 @@ def _store(tmp_path: Path) -> StagingStore:
 
 def _ample_statvfs(_: str | Path) -> object:
     return SimpleNamespace(f_bavail=10**15, f_frsize=1)
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "replacement"),
+    [
+        (DurablePrefix(10, 12, 2, "a" * 64), "record_count", 3),
+        (StreamingCheckpoint(1, "a" * 32, 2, "a" * 64), "record_count", 3),
+    ],
+    ids=["durable-prefix", "streaming-checkpoint"],
+)
+def test_durable_staging_values_are_immutable(
+    value: DurablePrefix | StreamingCheckpoint, field: str, replacement: int
+) -> None:
+    original = value.record_count
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(value, field, replacement)
+
+    assert value.record_count == original
 
 
 def test_open_persisted_attempt_accepts_protocol_maximum_without_capacity_preflight(tmp_path: Path) -> None:

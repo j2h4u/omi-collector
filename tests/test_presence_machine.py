@@ -58,20 +58,34 @@ POLICY = PresenceMachinePolicy(
     [
         (PresenceMachinePolicy, 6, "absence_seconds"),
         (Advertisement, 3, "observed_at"),
+        (Searching, 4, "timer_epoch"),
+        (CoolingDown, 5, "timer_epoch"),
         (RetryWaiting, 7, "retry_at"),
+        (Attempting, 2, "trigger"),
+        (AdvertisementObserved, 2, "advertisement"),
+        (TimerFired, 3, "at"),
+        (CleanDrain, 0, "unused"),
         (ResumeInterruptedVisit, 1, "at"),
         (NotConnected, 1, "durable_progress"),
+        (ConnectedInterruption, 1, "durable_progress"),
         (AttemptFinished, 2, "at"),
+        (Shutdown, 1, "at"),
         (Observe, 1, "until"),
+        (StopAndBeginAttempt, 1, "trigger"),
+        (Stop, 0, "unused"),
+        (NoOperation, 0, "unused"),
+        (EndVisit, 1, "reason"),
         (TransitionResult, 2, "state"),
     ],
 )
 def test_presence_machine_values_are_immutable(record_type: type[object], field_count: int, field_name: str) -> None:
     record_factory = cast(Callable[..., object], record_type)
     record = record_factory(*([None] * field_count))
+    hash(record)
 
-    with pytest.raises(FrozenInstanceError):
-        setattr(record, field_name, object())
+    if field_count:
+        with pytest.raises(FrozenInstanceError):
+            setattr(record, field_name, object())
 
 
 def _advertisement(at: float, candidate: object | None = None) -> Advertisement:

@@ -160,6 +160,7 @@ function find_managed_build_python {
     "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
         UV_CACHE_DIR="$uv_cache_dir" \
         UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+        UV_NO_CONFIG=1 \
         "$uv_bin" python find --managed-python --no-python-downloads --no-project 3.14
 }
 
@@ -188,6 +189,7 @@ function install_managed_build_python_if_missing {
     if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
         UV_CACHE_DIR="$uv_cache_dir" \
         UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+        UV_NO_CONFIG=1 \
         "$uv_bin" python install 3.14; then
         die 'could not install the managed build Python'
     fi
@@ -558,6 +560,7 @@ if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$uv
     UV_LINK_MODE=copy \
     UV_CACHE_DIR="$uv_cache_dir" \
     UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+    UV_NO_CONFIG=1 \
     "$uv_bin" sync --project "$repo_root" --locked --no-dev --no-editable --reinstall-package omi-collector \
         --managed-python --no-python-downloads; then
     die 'uv sync failed; systemd was not touched'

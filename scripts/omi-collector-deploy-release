@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# assert: release checkout files remain readable by the unprivileged build account
+umask 0022
 
 declare -r deployer='/opt/omi-collector/scripts/dev-deploy-release.sh'
 

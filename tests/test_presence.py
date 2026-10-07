@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -822,6 +822,24 @@ def test_close_is_idempotent_and_wakes_a_waiter() -> None:
         with pytest.raises(RuntimeError, match="closed"):
             await waiter
         assert observer.events == ["start", "stop"]
+
+    _run(scenario())
+
+
+def test_transition_awaits_custom_awaitable() -> None:
+    class ProbeAwaitable:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def __await__(self) -> Generator[None]:
+            self.events.append("started")
+            yield from ()
+            self.events.append("completed")
+
+    async def scenario() -> None:
+        awaitable = ProbeAwaitable()
+        await presence_module._transition(awaitable, policy=_test_policy(), operation="start")
+        assert awaitable.events == ["started", "completed"]
 
     _run(scenario())
 

@@ -137,10 +137,9 @@ Replace the placeholder with the pendant Bluetooth address. The optional
 30 seconds of observations with no gap of 10 seconds or more before GATT is
 opened. A timer, a remembered address, or a stale scanner event cannot create
 an automatic connection permit. The fixed configuration location determines
-storage. `[ready]` is a backwards-compatible configuration section. Its
-`target_audio_seconds` and `max_wait_seconds` values are accepted for deployed
-config compatibility; ready publication is bounded by explicit physical-visit
-closure and does not use an hourly or age trigger.
+storage. `[ready]` configures `target_audio_seconds`. Ready publication
+requires a confirmed complete physical-visit drain and the configured audio
+minimum; smaller downloads accumulate across visits, with no age-based flush.
 Duration is the sum of valid 20 ms Opus packet durations.
 The installer creates the service account, keeps the configuration root-owned
 and readable by both services as mode `0644`, and enables the service. It does not start the

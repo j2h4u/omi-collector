@@ -109,9 +109,7 @@ def test_every_state_event_pair_is_pure_and_total(
         (TransitionResult(Constructed(), Admit()), "directive", Ignore()),
     ),
 )
-def test_machine_records_reject_field_reassignment(
-    value: object, field: str, replacement: object
-) -> None:
+def test_machine_records_reject_field_reassignment(value: object, field: str, replacement: object) -> None:
     with pytest.raises(FrozenInstanceError):
         setattr(value, field, replacement)
 

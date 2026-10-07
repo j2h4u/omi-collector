@@ -469,9 +469,7 @@ def test_finite_model_is_exhaustive_and_reachable() -> None:
         (TransitionResult(Recovering(), InspectRecovery()), "command", NoOp()),
     ),
 )
-def test_machine_records_reject_field_reassignment(
-    value: object, field: str, replacement: object
-) -> None:
+def test_machine_records_reject_field_reassignment(value: object, field: str, replacement: object) -> None:
     with pytest.raises(FrozenInstanceError):
         setattr(value, field, replacement)
 

@@ -729,43 +729,52 @@ def test_observer_sends_read_phy_tracks_transition_and_finishes_once() -> None:
         clock=lambda: clock_value[0],
         terminal_callback=records.append,
     )
-    asyncio.run(observer.start())
-    assert observer._reader is not None and observer._reader.daemon
-    assert observer._processor is not None and observer._processor.daemon
-    assert native_bind_calls == [(37, 31, 3, 0)]
-    assert fake.options == [(0, 2, hci_filter_bytes())]
-    # This scenario drives packets and the fake clock synchronously.
-    observer._stop.set()
-    for worker in (observer._reader, observer._processor):
-        assert worker is not None
-        worker.join(1)
-        assert not worker.is_alive()
-    observer.handle_packet(_connect())
-    assert fake.sent == [b"\x01\x30\x20\x02\x42\x00", b"\x01\x05\x14\x02\x42\x00"]
-    observer.handle_packet(_read_phy_complete(1, 1))
-    observer.handle_packet(_read_rssi_complete())
-    observer.handle_packet(_phy(3, 3))
-    clock_value[0] = 40.1
-    observer._poll_rssi()
-    assert fake.sent[-1] == b"\x01\x05\x14\x02\x42\x00"
-    assert len(fake.sent) == 3
-    clock_value[0] = 12.5
-    observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x08"))
-    observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
-    asyncio.run(observer.close())
-    assert len(records) == 1
-    assert records[0]["initial_connection_parameters"] == {
-        "interval_ms": 30.0,
-        "latency": 3,
-        "supervision_timeout_ms": 2000.0,
-    }
-    assert records[0]["final_connection_parameters"] == records[0]["initial_connection_parameters"]
-    assert records[0]["connection_parameter_requests"] == ()
-    assert records[0]["connection_parameter_updates"] == ()
-    assert records[0]["tx_phy"] == "coded"
-    assert records[0]["disconnect_reason_hex"] == "0x08"
-    assert records[0]["observer_status"] == "available"
-    assert records[0]["dropped_packets"] == 0
+    workers: tuple[threading.Thread | None, threading.Thread | None] = (None, None)
+    try:
+        asyncio.run(observer.start())
+        workers = observer._reader, observer._processor
+        assert observer._reader is not None and observer._reader.daemon
+        assert observer._processor is not None and observer._processor.daemon
+        assert native_bind_calls == [(37, 31, 3, 0)]
+        assert fake.options == [(0, 2, hci_filter_bytes())]
+        # This scenario drives packets and the fake clock synchronously.
+        observer._stop.set()
+        for worker in workers:
+            assert worker is not None
+            worker.join(1)
+            assert not worker.is_alive()
+        observer.handle_packet(_connect())
+        assert fake.sent == [b"\x01\x30\x20\x02\x42\x00", b"\x01\x05\x14\x02\x42\x00"]
+        observer.handle_packet(_read_phy_complete(1, 1))
+        observer.handle_packet(_read_rssi_complete())
+        observer.handle_packet(_phy(3, 3))
+        clock_value[0] = 40.1
+        observer._poll_rssi()
+        assert fake.sent[-1] == b"\x01\x05\x14\x02\x42\x00"
+        assert len(fake.sent) == 3
+        clock_value[0] = 12.5
+        observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x08"))
+        observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+        asyncio.run(observer.close())
+        assert len(records) == 1
+        assert records[0]["initial_connection_parameters"] == {
+            "interval_ms": 30.0,
+            "latency": 3,
+            "supervision_timeout_ms": 2000.0,
+        }
+        assert records[0]["final_connection_parameters"] == records[0]["initial_connection_parameters"]
+        assert records[0]["connection_parameter_requests"] == ()
+        assert records[0]["connection_parameter_updates"] == ()
+        assert records[0]["tx_phy"] == "coded"
+        assert records[0]["disconnect_reason_hex"] == "0x08"
+        assert records[0]["observer_status"] == "available"
+        assert records[0]["dropped_packets"] == 0
+    finally:
+        asyncio.run(observer.close())
+        for worker in workers:
+            if worker is not None:
+                worker.join(1)
+                assert not worker.is_alive()
 
 
 def test_observer_tracks_bounded_connection_parameter_handshake() -> None:

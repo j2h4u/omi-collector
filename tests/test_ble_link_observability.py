@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -120,6 +120,90 @@ def test_observer_logs_only_matching_handle_rssi_observations(caplog: pytest.Log
         "status_hex": "0x00",
         "status_name": "success",
     }
+
+
+@pytest.mark.parametrize(
+    ("packet", "record_method"),
+    [
+        (_read_rssi_complete(-47), "_record_rssi"),
+        (_read_phy_complete(2, 2), "_record_phy_snapshot"),
+    ],
+    ids=("rssi", "phy_snapshot"),
+)
+def test_observer_ignores_telemetry_if_disconnect_wins_dispatch_race(
+    packet: bytes,
+    record_method: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    records: list[dict[str, object]] = []
+    debug_logger = logging.getLogger("tests.ble_link.disconnect_dispatch_race")
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        terminal_callback=records.append,
+        debug_logger=debug_logger,
+    )
+    observer.handle_packet(_connect())
+    dispatch_entered = threading.Event()
+    resume_dispatch = threading.Event()
+    failures: list[BaseException] = []
+    original = cast(Callable[..., None], getattr(observer, record_method))
+
+    def pause_before_record(event: object) -> None:
+        dispatch_entered.set()
+        if not resume_dispatch.wait(1.0):
+            raise TimeoutError("telemetry dispatch was not resumed")
+        original(event)
+
+    monkeypatch.setattr(observer, record_method, pause_before_record)
+
+    def dispatch() -> None:
+        try:
+            observer.handle_packet(packet)
+        except BaseException as error:  # noqa: BLE001 - assert race path remains nonfatal
+            failures.append(error)
+
+    worker = threading.Thread(target=dispatch)
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        worker.start()
+        try:
+            assert dispatch_entered.wait(1.0)
+            observer.handle_packet(_packet(0x05, b"\x00\x42\x00\x13"))
+        finally:
+            resume_dispatch.set()
+            worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert len(records) == 1
+    assert records[0]["initial_phy_snapshot"] is None
+    assert not any(
+        record.name == debug_logger.name
+        and getattr(record, "debug_event", None) == "ble_link_rssi_observed"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    ("record_type", "field_count", "field_name"),
+    [
+        (ble_link_observability.PhyTransition, 2, "tx_phy"),
+        (ble_link_observability.PhyOutcome, 3, "status_hex"),
+        (ble_link_observability.DataLengthTransition, 4, "max_tx_octets"),
+        (ble_link_observability.ConnectionParameters, 3, "interval_ms"),
+        (ble_link_observability.ConnectionParameterRequest, 4, "min_interval_ms"),
+        (ble_link_observability.ConnectionParameterUpdate, 3, "status_hex"),
+        (ble_link_observability.BleLinkSessionRecord, 24, "address"),
+    ],
+)
+def test_observer_telemetry_records_are_immutable(
+    record_type: type[object], field_count: int, field_name: str
+) -> None:
+    record_factory = cast(Callable[..., object], record_type)
+    record = record_factory(*([None] * field_count))
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(record, field_name, object())
 
 
 def _connection_update(

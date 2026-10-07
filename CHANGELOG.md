@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.13](https://github.com/j2h4u/omi-collector/compare/v0.11.12...v0.11.13) (2026-10-07)
+
+
+### Fixes
+
+* **capture:** split discontinuous ready audio ([#209](https://github.com/j2h4u/omi-collector/issues/209)) ([14b78db](https://github.com/j2h4u/omi-collector/commit/14b78db4de380fa2795587e29fc7555b130f45da))
+
 ## [0.11.12](https://github.com/j2h4u/omi-collector/compare/v0.11.11...v0.11.12) (2026-10-07)
 
 

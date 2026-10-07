@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import FrozenInstanceError
 from errno import EXDEV
 from json import dumps, loads
 from multiprocessing import Event, Process, get_context
@@ -34,6 +35,16 @@ def _capture_root(tmp_path: Path) -> Path:
         rmtree(root, ignore_errors=True)
         _CAPTURE_ROOTS.add(tmp_path)
     return root
+
+
+def test_resolved_staging_paths_are_immutable(tmp_path: Path) -> None:
+    paths = StagingStore(tmp_path, _capture_root(tmp_path)).paths
+    field = "root"
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(paths, field, tmp_path / "replacement")
+
+    assert paths.root == tmp_path
 
 
 @pytest.fixture(autouse=True)

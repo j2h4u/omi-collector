@@ -557,6 +557,33 @@ async def test_fresh_info_regression_keeps_sealed_batch_without_advance(tmp_path
 
 
 @_async_test
+async def test_fresh_info_cursor_ahead_does_not_claim_advance_confirmation(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1), _real_batch_steps())
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    fresh = RingInfo(103, 103, 100, 0, RECORD_SIZE)
+
+    async def info(_session: object) -> RingInfo:
+        return fresh
+
+    try:
+        disposition, seen = await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
+        assert disposition is None
+        assert seen == fresh
+        result = reconciler.drained_result()
+        assert isinstance(result, CollectionResult)
+        assert result.advance_confirmed is False
+        assert result.next_sequence == 102
+        assert all(command[0] != 0x12 for command in session.writes)
+        assert len(runtime.proxies) == 1
+        assert not runtime.proxies[0].thread.is_alive()
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
 async def test_acknowledged_advance_with_old_cursor_repeats_without_reread(tmp_path: Path) -> None:
     runtime = _Runtime()
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())

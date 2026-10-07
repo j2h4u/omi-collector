@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from enum import Enum, auto
 from pathlib import Path
 from threading import Event
 from time import monotonic
@@ -60,12 +59,6 @@ class PendingStartupState:
     disposition: RecoveryDisposition = "empty"
 
 
-class _PublicationPriority(Enum):
-    BACKGROUND_ALLOWED = auto()
-    CAPTURE = auto()
-    CLOSED = auto()
-
-
 class QuarantineMaintenance:
     """Own restart evidence, quarantine salvage, and presence coordination."""
 
@@ -86,11 +79,9 @@ class QuarantineMaintenance:
         self._maintenance_not_before = 0.0
         self._quarantine_retry_not_before = 0.0
         self._quarantine_retry_number = 0
-        self._publication_retry_not_before = 0.0
         self._publication_retry_handle: asyncio.TimerHandle | None = None
-        self._publication_retry_task: asyncio.Task[bool] | None = None
-        self._publication_retry_requested = False
-        self._publication_priority = _PublicationPriority.BACKGROUND_ALLOWED
+        self._publication_retry_task: asyncio.Task[None] | None = None
+        self._publication_effect_tasks: set[asyncio.Task[object]] = set()
 
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
@@ -137,106 +128,84 @@ class QuarantineMaintenance:
         self._startup_state = None
         self._startup_state_bound = False
 
-    async def _recover_and_publish(self) -> bool:
-        if self._publication_retry_not_before > monotonic():
-            self._schedule_publication_retry()
-            return False
-        # A local publication can lose a short race with another filesystem
-        # operation. Retry only this bounded local step before any BLE provider
-        # is opened; capture must not be used as an implicit publication retry.
-        backoff = self._config.retry.rapid_backoff
-        for attempt in range(len(backoff) + 1):
-            try:
-                published = await joined_to_thread(self._staging.recover_and_publish)
-                self._publication_retry_not_before = 0.0
-                if published is not None:
-                    self._runtime.debug_event("ready_publication_published")
-                else:
-                    self._runtime.debug_event("ready_publication_recovered")
-                return True
-            except Exception as error:  # noqa: BLE001 - publication cannot block capture
-                self._runtime.debug_exception("ready_publication_blocked", error, attempt=attempt + 1)
-                if attempt >= len(backoff):
-                    retry = backoff[-1] if backoff else 1.0
-                    self._publication_retry_not_before = monotonic() + retry
-                    self._schedule_publication_retry()
-                    return False
-                await asyncio.sleep(backoff[attempt])
-        return False
+    async def _recover_and_publish(self) -> None:
+        task = asyncio.create_task(joined_to_thread(self._staging.recover_and_publish))
+        self._publication_effect_tasks.add(task)
+        try:
+            outcome = await join_owned(task)
+        finally:
+            self._publication_effect_tasks.discard(task)
+        state = getattr(outcome, "state", None)
+        if state == "published":
+            self._runtime.debug_event("ready_publication_published")
+        elif state == "blocked":
+            self._runtime.debug_event("ready_publication_blocked", reason=getattr(outcome, "reason", None))
+        elif state == "transient":
+            self._runtime.debug_event("ready_publication_transient", reason=getattr(outcome, "reason", None))
+            self._arm_publication_timer()
+        else:
+            self._runtime.debug_event("ready_publication_waiting", reason=getattr(outcome, "reason", None))
 
     async def ensure_publication_ready(self) -> None:
         """Run one bounded local recovery attempt without blocking BLE forever."""
         await self._recover_and_publish()
 
     def schedule_publication_retry(self) -> None:
-        """Retry a known publication failure without waiting for another pendant visit."""
-        if self._publication_priority is _PublicationPriority.CLOSED:
+        """Dispatch the canonical owner after a durable input event."""
+        if self._staging.publication_wake_admitted():
+            self._start_publication_retry()
+
+    def _arm_publication_timer(self) -> None:
+        schedule = self._staging.publication_retry_schedule()
+        if schedule is None:
             return
-        self._publication_retry_not_before = monotonic()
+        generation, deadline = schedule
         if self._publication_retry_handle is not None:
             self._publication_retry_handle.cancel()
-            self._publication_retry_handle = None
-        self._schedule_publication_retry()
+        self._publication_retry_handle = asyncio.get_running_loop().call_at(
+            deadline, self._publication_timer_fired, generation, deadline
+        )
 
-    def _schedule_publication_retry(self) -> None:
-        if self._publication_priority is _PublicationPriority.CLOSED:
-            return
-        if self._publication_priority is _PublicationPriority.CAPTURE:
-            self._publication_retry_requested = True
-            return
-        if self._publication_retry_task is not None and not self._publication_retry_task.done():
-            self._publication_retry_requested = True
-            return
-        if self._publication_retry_handle is not None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        delay = max(self._publication_retry_not_before - monotonic(), 0.0)
-        self._publication_retry_handle = loop.call_later(delay, self._start_publication_retry)
+    def _publication_timer_fired(self, generation: int, deadline: float) -> None:
+        self._publication_retry_handle = None
+        if self._staging.publication_timer_fired(generation, deadline):
+            self._start_publication_retry()
+        else:
+            self._arm_publication_timer()
 
     def _start_publication_retry(self) -> None:
-        self._publication_retry_handle = None
-        if self._publication_priority is _PublicationPriority.CLOSED:
-            return
-        if self._publication_priority is _PublicationPriority.CAPTURE:
-            self._publication_retry_requested = True
-            return
         if self._publication_retry_task is not None and not self._publication_retry_task.done():
-            self._publication_retry_requested = True
             return
         task = asyncio.create_task(self._recover_and_publish())
         self._publication_retry_task = task
         task.add_done_callback(self._consume_publication_retry)
 
-    def _consume_publication_retry(self, task: asyncio.Task[bool]) -> None:
+    def _consume_publication_retry(self, task: asyncio.Task[None]) -> None:
         if self._publication_retry_task is task:
             self._publication_retry_task = None
-            if (
-                self._publication_retry_requested
-                and self._publication_priority is _PublicationPriority.BACKGROUND_ALLOWED
-            ):
-                self._publication_retry_requested = False
-                self._schedule_publication_retry()
         with suppress(asyncio.CancelledError, Exception):
             task.result()
+        if self._staging.publication_followup_due():
+            self._start_publication_retry()
 
     async def enter_capture_priority(self) -> None:
         """Stop background publication and revoke stale drain permission before capture."""
-        if self._publication_priority is not _PublicationPriority.BACKGROUND_ALLOWED:
-            raise RuntimeError("capture priority cannot be entered twice or after close")
-        self._publication_priority = _PublicationPriority.CAPTURE
+        self._staging.publication_capture_begin()
         try:
             if self._publication_retry_handle is not None:
                 self._publication_retry_handle.cancel()
                 self._publication_retry_handle = None
-                self._publication_retry_requested = True
             task = self._publication_retry_task
             if task is not None and not task.done():
-                self._publication_retry_requested = True
                 task.cancel()
-                await join_owned(asyncio.gather(task, return_exceptions=True))
+            active = tuple(self._publication_effect_tasks)
+            for effect in active:
+                effect.cancel()
+            if task is not None or active:
+                await join_owned(
+                    asyncio.gather(*(active + ((task,) if task is not None else ())), return_exceptions=True)
+                )
+            self._staging.publication_quiesced()
             await joined_to_thread(self._staging.begin_ready_visit)
         except BaseException:
             self.exit_capture_priority()
@@ -244,17 +213,12 @@ class QuarantineMaintenance:
 
     def exit_capture_priority(self) -> None:
         """Release foreground priority and resume one deferred publication."""
-        if self._publication_priority is not _PublicationPriority.CAPTURE:
-            return
-        self._publication_priority = _PublicationPriority.BACKGROUND_ALLOWED
-        if self._publication_retry_requested:
-            self._publication_retry_requested = False
-            self._schedule_publication_retry()
+        if self._staging.publication_capture_end():
+            self._start_publication_retry()
 
     async def close(self) -> None:
         """Cancel and join local publication retry work before loop shutdown."""
-        self._publication_priority = _PublicationPriority.CLOSED
-        self._publication_retry_requested = False
+        self._staging.publication_shutdown()
         if self._publication_retry_handle is not None:
             self._publication_retry_handle.cancel()
             self._publication_retry_handle = None
@@ -262,7 +226,11 @@ class QuarantineMaintenance:
         self._publication_retry_task = None
         if task is not None and not task.done():
             task.cancel()
-            await join_owned(asyncio.gather(task, return_exceptions=True))
+        active = tuple(self._publication_effect_tasks)
+        for effect in active:
+            effect.cancel()
+        if task is not None or active:
+            await join_owned(asyncio.gather(*(active + ((task,) if task is not None else ())), return_exceptions=True))
 
     async def run_once(self, should_defer: Callable[[], bool]) -> None:
         """Run one cooperative terminal sweep and quarantine salvage pass."""

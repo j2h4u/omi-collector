@@ -14,6 +14,7 @@ from omi_collector.config import (
     PhyConfig,
     PresenceConfig,
     QualityMetricsConfig,
+    ReadyConfig,
     RetryConfig,
     ServiceConfig,
     StagingRetentionConfig,
@@ -64,6 +65,8 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.observability.quality_metrics.max_record_bytes == 1 * 1024 * 1024
     assert DEFAULT_CONFIG.phy.reap_timeout_seconds == 5.0
     assert DEFAULT_CONFIG.service.max_records == 256
+    assert isinstance(DEFAULT_CONFIG.ready, ReadyConfig)
+    assert DEFAULT_CONFIG.ready.target_audio_seconds == 3600.0
     with pytest.raises(FrozenInstanceError):
         DEFAULT_CONFIG.presence = PresenceConfig()  # type: ignore[reportAttributeAccessIssue]
     with pytest.raises(FrozenInstanceError):
@@ -102,6 +105,7 @@ def test_staging_retention_default_is_terminal_lifecycle_window() -> None:
         (QualityMetricsConfig, "shutdown_join_seconds", 0.0),
         (PhyConfig, "reap_timeout_seconds", 0.0),
         (ServiceConfig, "interval_seconds", 0),
+        (ReadyConfig, "target_audio_seconds", 0.0),
     ],
 )
 def test_runtime_limits_must_be_positive(factory: type[object], field: str, value: object) -> None:

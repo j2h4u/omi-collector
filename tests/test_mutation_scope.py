@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -366,6 +367,26 @@ def _process_stopped(pid: int) -> bool:
             return True
         time.sleep(0.01)
     return False
+
+
+def test_pidfd_zombie_race_is_safe_only_for_the_same_process_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    pid = 12345
+    ticks = "42"
+    monkeypatch.setattr(mutation_campaign, "_proc_identity", lambda _pid: (1, ticks, "Z"))
+
+    with pytest.raises(ProcessLookupError) as zombie:
+        mutation_campaign._open_pidfd(pid, ticks)
+    assert zombie.value.errno == errno.ESRCH
+    assert mutation_campaign._verified_process_exit_race(zombie.value, pid, ticks)
+
+    monkeypatch.setattr(mutation_campaign, "_proc_identity", lambda _pid: (1, "43", "S"))
+    with pytest.raises(ProcessLookupError) as reused:
+        mutation_campaign._open_pidfd(pid, ticks)
+    assert reused.value.errno is None
+    assert not mutation_campaign._verified_process_exit_race(zombie.value, pid, ticks)
+
+    monkeypatch.setattr(mutation_campaign, "_proc_identity", lambda _pid: (1, ticks, "S"))
+    assert not mutation_campaign._verified_process_exit_race(zombie.value, pid, ticks)
 
 
 def _ensure_pause_owner_stopped(owner: threading.Thread, job: Path, token: str) -> None:

@@ -23,7 +23,6 @@ from .ports import (
     ClockCorrectionShape,
     ClockMembershipPort,
     ClockObservationShape,
-    PublicationAuthorityPort,
     StorageLeaseFactory,
 )
 from .ports import (
@@ -87,7 +86,6 @@ class TelemetryClock:
     monotonic: Callable[[], float] = time.monotonic
     host_boot_id: str = field(default_factory=system_host_boot_id)
     session_id: str = "native"
-    publisher: PublicationAuthorityPort | None = None
     mutation_lease: ClockMutationLease | None = None
 
 
@@ -177,7 +175,6 @@ async def collect_operational_telemetry(
         telemetry_clock.session_id,
         telemetry_clock.monotonic,
         telemetry_clock.membership_store,
-        telemetry_clock.publisher,
     )
     await _sync_clock_with_mutation_lease(sync, telemetry_clock.mutation_lease)
     for event in clock_events:
@@ -294,7 +291,6 @@ class _ClockSync:
     session_id: str
     host_monotonic: Callable[[], float]
     membership_store: ClockMembershipPort | None
-    publisher: PublicationAuthorityPort | None
 
 
 async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: ClockMutationLease | None) -> None:
@@ -370,7 +366,6 @@ async def _sync_trusted_clock(sync: _ClockSync, event: dict[str, object], drift:
     if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
         event.update(action="none", outcome="within_threshold")
         await _record_same_session_membership(sync, observation_evidence, sync.info_before.write_sequence)
-        await _publish_ready(sync, event)
         sync.emit(event)
         return
     target = int(sync.host_time())
@@ -414,21 +409,7 @@ async def _sync_trusted_clock(sync: _ClockSync, event: dict[str, object], drift:
     elif info_after is not None and post_observation is not None:
         await _record_same_session_membership(sync, post_observation, info_after.write_sequence)
     _finish_clock_intent(sync, correction, event, info_after, readback.epoch if readback else None)
-    await _publish_ready(sync, event)
     sync.emit(event)
-
-
-async def _publish_ready(sync: _ClockSync, event: dict[str, object]) -> None:
-    if sync.publisher is None:
-        return
-    try:
-        result = sync.publisher.publish()
-        if isawaitable(result):
-            await _bounded_optional(cast(Awaitable[object], result), sync.operation_timeout)
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # noqa: BLE001 - publication is a retryable projection
-        event["publication"] = "failed"
 
 
 def _persist_clock_observation(sync: _ClockSync, pending_operation: str | None) -> ClockObservationShape | None:

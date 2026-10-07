@@ -28,7 +28,7 @@ from .operational_telemetry import (
     collect_battery_observation,
     collect_operational_telemetry,
 )
-from .ports import CaptureRuntimePort, ClockMembershipPort, PublicationAuthorityPort, StorageLeaseFactory
+from .ports import CaptureRuntimePort, ClockMembershipPort, StorageLeaseFactory
 from .presence import PresenceEnd, PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
@@ -175,7 +175,6 @@ class OpportunisticOptions:
     clock_correction_sink: ClockCorrectionSink | None = None
     clock_observation_sink: ClockObservationSink | None = None
     clock_membership_store: ClockMembershipPort | None = None
-    timeline_publisher: PublicationAuthorityPort | None = None
     clock_lease: StorageLeaseFactory | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
@@ -715,7 +714,6 @@ class SessionLifecycle:
                             membership_store=options.clock_membership_store,
                             monotonic=options.clock,
                             session_id=phase.quality.session_id if phase.quality is not None else "native",
-                            publisher=options.timeline_publisher,
                             mutation_lease=options.clock_lease,
                         ),
                     ),

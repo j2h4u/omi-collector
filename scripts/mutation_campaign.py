@@ -476,8 +476,10 @@ def _token_pids(token: str, root_pid: int | None = None, root_ticks: str | None 
 
 def _open_pidfd(pid: int, expected_ticks: str) -> int:
     _parent, current_ticks, state = _proc_identity(pid)
-    if current_ticks != expected_ticks or state == "Z":
+    if current_ticks != expected_ticks:
         raise ProcessLookupError(pid)
+    if state == "Z":
+        raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
     libc = ctypes.CDLL(None, use_errno=True)
     try:
         pidfd_open = libc.pidfd_open
@@ -492,8 +494,10 @@ def _open_pidfd(pid: int, expected_ticks: str) -> int:
     pidfd = int(raw_fd)
     try:
         _parent, current_ticks, state = _proc_identity(pid)
-        if current_ticks != expected_ticks or state == "Z":
+        if current_ticks != expected_ticks:
             raise ProcessLookupError(pid)
+        if state == "Z":
+            raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
     except BaseException:
         os.close(pidfd)
         raise
@@ -507,7 +511,7 @@ def _verified_process_exit_race(error: OSError, pid: int, expected_ticks: str) -
         _parent, current_ticks, state = _proc_identity(pid)
     except FileNotFoundError:
         return True
-    return current_ticks != expected_ticks or state == "Z"
+    return current_ticks == expected_ticks and state == "Z"
 
 
 def _pidfd_signal(pidfd: int, sig: signal.Signals) -> None:

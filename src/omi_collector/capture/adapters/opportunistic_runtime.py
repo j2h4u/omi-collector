@@ -31,11 +31,8 @@ from .staging_contract import DeviceAlreadyRunningError, StagingError
 class _StagingWriterAdapter:
     """Checked ``AttemptWriter`` target over the public staging-writer API."""
 
-    def __init__(
-        self, writer: StagingWriterTargetPort, notify_publication_failure: Callable[[], None], source_start: int
-    ) -> None:
+    def __init__(self, writer: StagingWriterTargetPort, source_start: int) -> None:
         self._writer = writer
-        self._notify_publication_failure = notify_publication_failure
         self._leg_base = 0
         self._source_start = source_start
 
@@ -66,23 +63,10 @@ class _StagingWriterAdapter:
     def seal(self, done_notice: object) -> SealResultShape:
         if not isinstance(done_notice, DoneNotification):
             raise TypeError("done_notice must be a DoneNotification")
-        result = self._writer.seal(done_notice)
-        self._publish_ready()
-        return result
+        return self._writer.seal(done_notice)
 
     def publish_prefix(self) -> SealResultShape | None:
         return self._writer.publish_prefix()
-
-    def _publish_ready(self) -> None:
-        try:
-            result = self._writer.publish_ready()
-            if result is not None:
-                debug_event("ready_publication_published")
-            else:
-                debug_event("ready_publication_recovered")
-        except Exception as error:  # noqa: BLE001 - capture remains authoritative while publication waits
-            self._notify_publication_failure()
-            debug_exception("ready_publication_blocked", error)
 
     def close(self) -> None:
         self._writer.close()
@@ -186,9 +170,7 @@ class OpportunisticRuntime(CaptureRuntimePort):
         source: memoryview,
         config: WriterConfig,
     ) -> BatchWriterPort:
-        target = _StagingWriterAdapter(
-            staging.make_staging_writer(start, count), staging.notify_publication_failure, source_start
-        )
+        target = _StagingWriterAdapter(staging.make_staging_writer(start, count), source_start)
         return _BatchWriter(
             AttemptWriter(target, source, config=config),
             target,

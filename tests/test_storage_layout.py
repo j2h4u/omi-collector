@@ -10,7 +10,7 @@ from omi_collector.storage_layout import StorageLayoutError, load_operator_confi
 
 def _config(path: Path, address: str = "AA:BB:CC:DD:EE:FF") -> Path:
     path.write_text(
-        f'[pendant]\naddress = "{address}"\n[ready]\ntarget_audio_seconds = 3600.0\nmax_wait_seconds = 86400.0\n',
+        f'[pendant]\naddress = "{address}"\n[ready]\ntarget_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
     return path
@@ -34,7 +34,7 @@ def test_config_accepts_strict_optional_presence_section(tmp_path: Path) -> None
     path.write_text(
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n'
         "[presence]\narrival_stability_seconds = 12.5\narrival_max_gap_seconds = 4.0\n"
-        "[ready]\ntarget_audio_seconds = 3600.0\nmax_wait_seconds = 86400.0\n",
+        "[ready]\ntarget_audio_seconds = 3600.0\n",
         encoding="utf-8",
     )
 
@@ -44,26 +44,24 @@ def test_config_accepts_strict_optional_presence_section(tmp_path: Path) -> None
     assert loaded.config.presence.arrival_max_gap_seconds == 4.0
 
 
-@pytest.mark.parametrize("legacy_wait", ["", "max_wait_seconds = 43200.0\n"])
-def test_config_wires_strict_ready_section(tmp_path: Path, legacy_wait: str) -> None:
+def test_config_wires_strict_ready_section(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 1200.0\n' + legacy_wait,
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 1200.0\n',
         encoding="utf-8",
     )
 
     loaded = load_operator_config(path)
 
     assert loaded.config.ready.target_audio_seconds == 1200.0
-    assert loaded.config.ready.max_wait_seconds == (43200.0 if legacy_wait else 86400.0)
 
 
 @pytest.mark.parametrize(
     "section",
     [
         "max_wait_seconds = 43200.0\n",
-        "target_audio_seconds = 1200.0\nmax_wait_seconds = 43200.0\nextra = 1\n",
-        "target_audio_seconds = 0.0\nmax_wait_seconds = 43200.0\n",
+        "target_audio_seconds = 1200.0\nmax_wait_seconds = 43200.0\n",
+        "target_audio_seconds = 0.0\n",
     ],
 )
 def test_config_rejects_invalid_ready_section(tmp_path: Path, section: str) -> None:
@@ -97,7 +95,7 @@ def test_config_rejects_incomplete_or_extended_presence_section(tmp_path: Path, 
     path.write_text(
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[presence]\n'
         + presence
-        + "[ready]\ntarget_audio_seconds = 3600.0\nmax_wait_seconds = 86400.0\n",
+        + "[ready]\ntarget_audio_seconds = 3600.0\n",
         encoding="utf-8",
     )
 

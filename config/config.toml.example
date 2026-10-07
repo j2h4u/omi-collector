@@ -7,7 +7,7 @@ address = "AA:BB:CC:DD:EE:FF"
 arrival_stability_seconds = 30.0
 arrival_max_gap_seconds = 10.0
 
-# Legacy compatibility only. Publication waits for a durable physical-visit
-# closure; these values no longer trigger publication by size or age.
+# Minimum retained Opus audio after a confirmed complete drain. Smaller
+# downloads accumulate across visits; no age-based flush exists.
 [ready]
 target_audio_seconds = 3600.0

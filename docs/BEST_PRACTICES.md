@@ -209,15 +209,14 @@ sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
 ```
 
 The configuration is strict and contains `[pendant] address`, plus optional
-`[presence]` and backwards-compatible `[ready]` sections. `[ready]` accepts
-`target_audio_seconds` (3600 seconds by default). Only a confirmed complete
+`[presence]` and `[ready]` sections. `[ready]` accepts `target_audio_seconds`
+(3600 seconds by default). Only a confirmed complete
 pendant drain permits packaging, and only when the cumulative captured Opus
 audio reaches that minimum. All accumulated eligible drafts then form one
 bundle; crossing the minimum during downloading never splits the visit.
 Smaller downloads accumulate across visits and restarts indefinitely. Calendar
-gaps do not count toward audio duration. The legacy `max_wait_seconds` key is
-accepted for existing configurations but has no effect; no age-based or manual
-flush exists. Interrupted closures preserve data but do not authorize packaging.
+gaps do not count toward audio duration; no age-based or manual flush exists.
+Interrupted closures preserve data but do not authorize packaging.
 Admission of a new capture visit durably revokes the previous drain permit
 before BLE work. Clock publication and restart recovery cannot reuse that stale
 permit; a new confirmed drain grants permission again at the retained frontier.

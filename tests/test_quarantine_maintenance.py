@@ -5,6 +5,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import Context
 from json import dumps, loads
 from pathlib import Path
 from struct import pack
@@ -15,6 +16,7 @@ import pytest
 from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
+from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.ports import StagingPort
@@ -34,6 +36,16 @@ def _run(coro: object) -> object:
 
 def _store(tmp_path: Path) -> StagingStore:
     return StagingStore(tmp_path, tmp_path.parent / f"{tmp_path.name}-captures")
+
+
+def _publication_store(tmp_path: Path, *, config: CollectorConfig | None = None) -> StagingStore:
+    draft = tmp_path / "drafts"
+    draft.mkdir(parents=True)
+    bootstrap = StagingStore(tmp_path / "spool", draft, config=config or CollectorConfig())
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    return StagingStore.from_paths(bootstrap.paths, publication_root=ready, config=config or CollectorConfig())
 
 
 def _record(value: int) -> bytes:
@@ -64,7 +76,7 @@ def _source_snapshot(source: Path) -> dict[str, bytes]:
 
 
 class _BlockedRecovery:
-    def __init__(self, recover: Callable[[], object | None]) -> None:
+    def __init__(self, recover: Callable[[], ReadyOutcome]) -> None:
         self.recover = recover
         self.started = threading.Event()
         self.release = threading.Event()
@@ -73,7 +85,7 @@ class _BlockedRecovery:
         self.active = 0
         self.maximum_active = 0
 
-    def __call__(self) -> object | None:
+    def __call__(self) -> ReadyOutcome:
         self.calls += 1
         self.active += 1
         self.maximum_active = max(self.maximum_active, self.active)
@@ -886,74 +898,97 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
     assert (bundles[0] / "records.bin").read_bytes() == expected
 
 
-def test_failed_clock_publication_does_not_gate_ble_and_retries_locally(
+def test_transient_clock_publication_does_not_gate_startup_and_arms_retry(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
+        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.02,)))
+        store = _publication_store(tmp_path, config=config)
         attempts: list[int] = []
 
-        def recover_and_publish() -> None:
+        def recover_and_publish() -> ReadyOutcome:
             attempts.append(1)
-            if len(attempts) < 3:
-                raise OSError("transient local publication failure")
+            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
 
-        store.recover_and_publish = recover_and_publish  # type: ignore[method-assign]
-        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.001,)))
+        store._recover_and_publish_unlocked = recover_and_publish  # type: ignore[method-assign]
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
 
         await maintenance.ensure_publication_ready()
-        first_return = len(attempts)
-        await asyncio.sleep(0.01)
-
-        assert first_return == len(config.retry.rapid_backoff) + 1
-        assert len(attempts) >= 3
+        assert attempts == [1]
+        schedule = store.publication_retry_schedule()
+        assert schedule is not None
+        assert schedule[1] > time.monotonic()
 
     _run(scenario())
 
 
 @pytest.mark.parametrize(
     ("successful_result", "success_event"),
-    [(None, "ready_publication_recovered"), (("ready",), "ready_publication_published")],
+    [
+        (ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle"), "ready_publication_waiting"),
+        (ReadyOutcome(ReadyOutcomeState.PUBLISHED, reason="published"), "ready_publication_published"),
+    ],
 )
-def test_successful_recovery_after_device_contention_clears_blocked_state(
+def test_typed_publication_results_are_reported_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    successful_result: object | None,
+    successful_result: ReadyOutcome,
     success_event: str,
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
+        store = _publication_store(tmp_path)
         attempts = 0
         events: list[tuple[str, str, int | None]] = []
 
-        def recover_and_publish() -> object | None:
+        def recover_and_publish() -> ReadyOutcome:
             nonlocal attempts
             attempts += 1
-            if attempts == 1:
-                raise DeviceAlreadyRunningError("recovery is already active")
             return successful_result
 
-        store.recover_and_publish = recover_and_publish  # type: ignore[method-assign]
+        store._recover_and_publish_unlocked = recover_and_publish  # type: ignore[method-assign]
         runtime = OpportunisticRuntime()
-        monkeypatch.setattr(
-            runtime,
-            "debug_exception",
-            lambda event, _error, **fields: events.append(
-                ("exception", event, cast(int | None, fields.get("attempt")))
-            ),
-        )
         monkeypatch.setattr(runtime, "debug_event", lambda event, **_fields: events.append(("event", event, None)))
-        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.001,)))
-        maintenance = QuarantineMaintenance(store, None, runtime, config=config)
+        maintenance = QuarantineMaintenance(store, None, runtime)
 
         assert await maintenance.ensure_publication_ready() is None
 
-        assert attempts == 2
-        assert events == [
-            ("exception", "ready_publication_blocked", 1),
-            ("event", success_event, None),
-        ]
+        assert attempts == 1
+        assert events == [("event", success_event, None)]
+
+    _run(scenario())
+
+
+def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        store = _publication_store(tmp_path)
+        calls = 0
+        events: list[tuple[str, str | None]] = []
+
+        def fail_unexpectedly() -> ReadyOutcome:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("unexpected publication fault")
+
+        runtime = OpportunisticRuntime()
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", fail_unexpectedly)
+        monkeypatch.setattr(
+            runtime,
+            "debug_event",
+            lambda event, **fields: events.append((event, fields.get("reason"))),
+        )
+        maintenance = QuarantineMaintenance(store, None, runtime)
+        await maintenance.ensure_publication_ready()
+        await asyncio.sleep(0)
+
+        assert calls == 1
+        assert events == [("ready_publication_blocked", "RuntimeError")]
+        assert "unexpected publication fault" in caplog.text
+        assert store.publication_retry_schedule() is None
+        await maintenance.close()
 
     _run(scenario())
 
@@ -1153,17 +1188,18 @@ def test_publication_shutdown_joins_mutation_after_repeated_cancellation(
         started = threading.Event()
         release = threading.Event()
         finished = threading.Event()
-        store = _store(tmp_path)
-        publications: list[None] = []
+        store = _publication_store(tmp_path)
+        publications: list[ReadyOutcome] = []
 
-        def publish() -> None:
-            publications.append(None)
+        def publish() -> ReadyOutcome:
+            publications.append(ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle"))
             started.set()
             if not release.wait(2):
                 raise TimeoutError("publication mutation was not released")
             finished.set()
+            return publications[-1]
 
-        monkeypatch.setattr(store, "recover_and_publish", publish)
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         maintenance.schedule_publication_retry()
         closing: asyncio.Task[None] | None = None
@@ -1175,7 +1211,7 @@ def test_publication_shutdown_joins_mutation_after_repeated_cancellation(
             maintenance.schedule_publication_retry()
             await asyncio.sleep(0.01)
             assert maintenance._publication_retry_task is publication
-            assert publications == [None]
+            assert len(publications) == 1
             closing = asyncio.create_task(maintenance.close())
             await asyncio.sleep(0.01)
             assert not closing.done()
@@ -1186,7 +1222,8 @@ def test_publication_shutdown_joins_mutation_after_repeated_cancellation(
             await closing
             assert finished.is_set()
             assert publication.done()
-            assert publications == [None]
+            assert len(publications) == 1
+            assert not store.publication_wake_admitted()
         finally:
             release.set()
             if closing is not None:
@@ -1200,9 +1237,9 @@ def test_capture_priority_joins_running_retry_and_defers_new_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
-        recovery = _BlockedRecovery(store.recover_and_publish)
-        monkeypatch.setattr(store, "recover_and_publish", recovery)
+        store = _publication_store(tmp_path)
+        recovery = _BlockedRecovery(store._recover_and_publish_unlocked)
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", recovery)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         maintenance.schedule_publication_retry()
         try:
@@ -1239,9 +1276,9 @@ def test_capture_priority_resumes_running_retry_without_new_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
-        recovery = _BlockedRecovery(store.recover_and_publish)
-        monkeypatch.setattr(store, "recover_and_publish", recovery)
+        store = _publication_store(tmp_path)
+        recovery = _BlockedRecovery(store._recover_and_publish_unlocked)
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", recovery)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         maintenance.schedule_publication_retry()
         entering: asyncio.Task[None] | None = None
@@ -1277,25 +1314,35 @@ def test_capture_priority_defers_pending_publication_timer_until_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
-        published = asyncio.Event()
+        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(30.0,)))
+        store = _publication_store(tmp_path, config=config)
+        resumed = threading.Event()
         loop = asyncio.get_running_loop()
-        calls: list[None] = []
+        calls = 0
 
-        def publish() -> None:
-            calls.append(None)
-            loop.call_soon_threadsafe(published.set)
+        def publish() -> ReadyOutcome:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
+            loop.call_soon_threadsafe(resumed.set)
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle")
 
-        monkeypatch.setattr(store, "recover_and_publish", publish)
-        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
-        maintenance.schedule_publication_retry()
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
         try:
+            await maintenance.ensure_publication_ready()
+            assert calls == 1
+            assert maintenance._publication_retry_handle is not None
+            assert store.publication_retry_schedule() is not None
+
             await maintenance.enter_capture_priority()
-            assert calls == []
+            assert maintenance._publication_retry_handle is None
+            assert store.publication_retry_schedule() is None
 
             maintenance.exit_capture_priority()
-            await asyncio.wait_for(published.wait(), timeout=1)
-            assert calls == [None]
+            assert await asyncio.to_thread(resumed.wait, 1)
+            assert calls == 2
         finally:
             await maintenance.close()
 
@@ -1309,15 +1356,16 @@ def test_cancelled_capture_priority_entry_joins_retry_before_releasing_gate(
         started = threading.Event()
         release = threading.Event()
         finished = threading.Event()
-        store = _store(tmp_path)
+        store = _publication_store(tmp_path)
 
-        def publish() -> None:
+        def publish() -> ReadyOutcome:
             started.set()
             if not release.wait(2):
                 raise TimeoutError("publication mutation was not released")
             finished.set()
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle")
 
-        monkeypatch.setattr(store, "recover_and_publish", publish)
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         maintenance.schedule_publication_retry()
         entering: asyncio.Task[None] | None = None
@@ -1351,7 +1399,7 @@ def test_cancelled_capture_priority_entry_joins_retry_before_releasing_gate(
 
 def test_visit_begin_failure_releases_capture_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
+        store = _publication_store(tmp_path)
         store.append_ready_closure(11, "drained")
         original = store.begin_ready_visit
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
@@ -1359,7 +1407,7 @@ def test_visit_begin_failure_releases_capture_priority(tmp_path: Path, monkeypat
 
         with pytest.raises(OSError, match="storage unavailable"):
             await maintenance.enter_capture_priority()
-        assert maintenance._publication_priority.name == "BACKGROUND_ALLOWED"
+        assert store.publication_wake_admitted()
         assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "drained"
 
         monkeypatch.setattr(store, "begin_ready_visit", original)
@@ -1375,7 +1423,7 @@ def test_cancelled_visit_begin_joins_storage_before_releasing_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
+        store = _publication_store(tmp_path)
         store.append_ready_closure(11, "drained")
         started = threading.Event()
         release = threading.Event()
@@ -1398,7 +1446,7 @@ def test_cancelled_visit_begin_joins_storage_before_releasing_gate(
             release.set()
             with pytest.raises(asyncio.CancelledError):
                 await entering
-            assert maintenance._publication_priority.name == "BACKGROUND_ALLOWED"
+            assert store.publication_wake_admitted()
             assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "collecting"
         finally:
             release.set()
@@ -1981,21 +2029,25 @@ def test_repeated_owner_cancellation_during_startup_failure_cleanup_preserves_fa
 
 def test_successful_publication_retry_schedule_finishes_without_a_second_invocation(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
+        store = _publication_store(tmp_path)
         started = threading.Event()
-        calls: list[None] = []
+        calls: list[ReadyOutcome] = []
 
-        def recovered() -> None:
-            calls.append(None)
+        def recovered() -> ReadyOutcome:
+            outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle")
+            calls.append(outcome)
             started.set()
+            return outcome
 
-        store.recover_and_publish = recovered  # type: ignore[method-assign]
+        store._recover_and_publish_unlocked = recovered  # type: ignore[method-assign]
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         try:
             maintenance.schedule_publication_retry()
+            publication = maintenance._publication_retry_task
+            assert publication is not None
             assert await asyncio.to_thread(started.wait, 1)
-            await asyncio.sleep(0.02)
-            assert calls == [None]
+            await publication
+            assert calls == [ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle")]
         finally:
             await maintenance.close()
 
@@ -2005,59 +2057,56 @@ def test_successful_publication_retry_schedule_finishes_without_a_second_invocat
 def test_publication_retry_timer_observes_exact_deadline_and_saturates_backoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def scenario() -> None:
-        store = _store(tmp_path)
-        now = 100.0
-        calls = 0
-        six_calls = threading.Event()
-        monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
-        real_sleep = asyncio.sleep
-
-        async def skip_local_retry_delay(_delay: float) -> None:
-            await real_sleep(0)
-
-        monkeypatch.setattr(
-            "omi_collector.capture.application.quarantine_maintenance.asyncio.sleep", skip_local_retry_delay
-        )
-        loop = asyncio.get_running_loop()
-        original_call_later = loop.call_later
+    def defer_loop_timers(
+        loop: asyncio.AbstractEventLoop,
+    ) -> list[tuple[float, Callable[..., object], tuple[object, ...], asyncio.TimerHandle]]:
+        original_call_at = loop.call_at
         scheduled: list[tuple[float, Callable[..., object], tuple[object, ...], asyncio.TimerHandle]] = []
 
-        def controlled_call_later(delay: float, callback: Callable[..., object], *args: object) -> asyncio.TimerHandle:
-            handle = original_call_later(3600.0, callback, *args)
-            scheduled.append((now + delay, callback, args, handle))
+        def controlled_call_at(
+            when: float, callback: Callable[..., object], *args: object, context: Context | None = None
+        ) -> asyncio.TimerHandle:
+            handle = original_call_at(loop.time() + 3600.0, callback, *args, context=context)
+            scheduled.append((when, callback, args, handle))
             return handle
 
-        monkeypatch.setattr(loop, "call_later", controlled_call_later)
+        monkeypatch.setattr(loop, "call_at", controlled_call_at)
+        return scheduled
 
-        def keep_failing() -> None:
+    async def scenario() -> None:
+        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.1, 0.2)))
+        store = _publication_store(tmp_path, config=config)
+        now = 100.0
+        calls = 0
+        monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now)
+        monkeypatch.setattr("omi_collector.capture.adapters.staging_store.monotonic", lambda: now)
+        scheduled = defer_loop_timers(asyncio.get_running_loop())
+
+        def transient() -> ReadyOutcome:
             nonlocal calls
             calls += 1
-            if calls >= 6:
-                six_calls.set()
-            raise OSError("local publication remains blocked")
+            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
 
-        store.recover_and_publish = keep_failing  # type: ignore[method-assign]
-        config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.1, 0.2)))
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", transient)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
         try:
             await maintenance.ensure_publication_ready()
-            assert calls == len(config.retry.rapid_backoff) + 1
+            assert calls == 1
             assert len(scheduled) == 1
-            deadline, callback, args, handle = scheduled[0]
-            assert deadline == 100.2
-            now = deadline - 0.001
-            await real_sleep(0)
-            assert calls == 3
-            handle.cancel()
-            now = deadline
-            callback(*args)
-            assert await asyncio.to_thread(six_calls.wait, 1)
-            for _ in range(10):
-                await real_sleep(0)
-            assert calls == 6
+            assert scheduled[0][0] == 100.1
+            scheduled[0][1](*scheduled[0][2])
+            assert calls == 1
             assert len(scheduled) == 2
-            assert scheduled[1][0] == now + config.retry.rapid_backoff[-1]
+            scheduled[0][3].cancel()
+            scheduled[1][3].cancel()
+            now = scheduled[0][0]
+            scheduled[1][1](*scheduled[1][2])
+            retry_task = maintenance._publication_retry_task
+            assert retry_task is not None
+            await retry_task
+            assert calls == 2
+            assert scheduled[1][0] == now
+            assert scheduled[-1][0] == now + config.retry.rapid_backoff[-1]
         finally:
             await maintenance.close()
 
@@ -2065,7 +2114,7 @@ def test_publication_retry_timer_observes_exact_deadline_and_saturates_backoff(
 
 
 class _TwoBlockedRecoveries:
-    def __init__(self, recover: Callable[[], object | None]) -> None:
+    def __init__(self, recover: Callable[[], ReadyOutcome]) -> None:
         self.recover = recover
         self.started = (threading.Event(), threading.Event())
         self.release = (threading.Event(), threading.Event())
@@ -2075,7 +2124,7 @@ class _TwoBlockedRecoveries:
         self.active = 0
         self.maximum_active = 0
 
-    def __call__(self) -> object | None:
+    def __call__(self) -> ReadyOutcome:
         with self.lock:
             self.calls += 1
             index = self.calls - 1
@@ -2102,14 +2151,13 @@ async def _exercise_background_coalescing(maintenance: QuarantineMaintenance, re
     try:
         maintenance.schedule_publication_retry()
         await _wait_for_thread_event(recovery.started[0])
+        publication = maintenance._publication_retry_task
+        assert publication is not None
         maintenance.schedule_publication_retry()
         maintenance.schedule_publication_retry()
         recovery.release[0].set()
-        await _wait_for_thread_event(recovery.started[1])
-        recovery.release[1].set()
-        await _wait_for_thread_event(recovery.finished[1])
-        await asyncio.sleep(0.02)
-        assert recovery.calls == 2
+        await publication
+        assert recovery.calls == 1
         assert recovery.maximum_active == 1
     finally:
         recovery.release[0].set()
@@ -2132,9 +2180,11 @@ async def _exercise_capture_priority_coalescing(
         await entering
         maintenance.exit_capture_priority()
         await _wait_for_thread_event(recovery.started[1])
+        publication = maintenance._publication_retry_task
+        assert publication is not None
         recovery.release[1].set()
         await _wait_for_thread_event(recovery.finished[1])
-        await asyncio.sleep(0.02)
+        await publication
         assert recovery.calls == 2
         assert recovery.maximum_active == 1
     finally:
@@ -2149,15 +2199,15 @@ def test_background_publication_requests_coalesce_to_one_follow_up_in_both_prior
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path / "background")
-        recovery = _TwoBlockedRecoveries(store.recover_and_publish)
-        monkeypatch.setattr(store, "recover_and_publish", recovery)
+        store = _publication_store(tmp_path / "background")
+        recovery = _TwoBlockedRecoveries(store._recover_and_publish_unlocked)
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", recovery)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         await _exercise_background_coalescing(maintenance, recovery)
 
-        capture_store = _store(tmp_path / "capture")
-        capture_recovery = _TwoBlockedRecoveries(capture_store.recover_and_publish)
-        monkeypatch.setattr(capture_store, "recover_and_publish", capture_recovery)
+        capture_store = _publication_store(tmp_path / "capture")
+        capture_recovery = _TwoBlockedRecoveries(capture_store._recover_and_publish_unlocked)
+        monkeypatch.setattr(capture_store, "_recover_and_publish_unlocked", capture_recovery)
         capture_maintenance = QuarantineMaintenance(capture_store, None, OpportunisticRuntime())
         await _exercise_capture_priority_coalescing(capture_maintenance, capture_recovery)
 

@@ -4,25 +4,57 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from logging import getLogger
 from os import fsync, statvfs
 from pathlib import Path
 from threading import Lock
+from time import monotonic
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from ..domain.quarantine_machine import QuarantineState
+from ..domain.ready_machine import (
+    CaptureBegin,
+    CaptureEnd,
+    Finished,
+    InputChanged,
+    PublicationAction,
+    PublicationCommand,
+    PublicationEvent,
+    PublicationMode,
+    PublicationResult,
+    PublicationState,
+    Quiesced,
+    RetryWait,
+    Running,
+    Settled,
+    Shutdown,
+    TimerFired,
+    Wake,
+    publication_transition,
+)
 from . import publication, quarantine, ready_closures
 from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionError, ClockCorrectionStore
 from .clock_memberships import ClockMembershipError, ClockMembershipStore
 from .clock_observations import ClockObservationError
 from .clock_segments import ClockSegmentError, ClockSegmentMap, segments_with_estimates
-from .ready_bundles import draft_frontier, finalize_drafts, has_drafts_at_or_below, resume_retired, retire_acknowledged
+from .ready_bundles import (
+    ReadyBundleError,
+    ReadyInventory,
+    ReadyOutcome,
+    ReadyOutcomeState,
+    authenticated_inventory,
+    draft_frontier,
+    finalize_drafts,
+    resume_retired,
+    retire_acknowledged,
+    source_revision,
+)
 from .staging_contract import (
     _DESCRIPTOR_NAME,
     _PREFIX_PUBLICATION_NAME,
@@ -30,6 +62,7 @@ from .staging_contract import (
     _TERMINAL_RETIRED_NAME,
     AttemptDescriptor,
     AttemptStateError,
+    DeviceAlreadyRunningError,
     PendingAttemptError,
     StreamingCheckpoint,
     _validate_attempt_id,
@@ -52,31 +85,13 @@ if TYPE_CHECKING:
     from .quarantine_publish import QuarantinePublication
 
 _LOGGER = getLogger(__name__)
+_UNKNOWN_REVISION = object()
 
 
-class _PublicationAuthority:
-    """Store-issued, lifecycle-bound publication capability.
-
-    The store accepts only the exact instance it issued.  The capability may
-    move between asyncio tasks, but cannot outlive the collector run that
-    closes it.
-    """
-
-    __slots__ = ("_on_failure", "_store")
-
-    def __init__(self, store: StagingStore, on_failure: Callable[[], None] | None) -> None:
-        self._store = store
-        self._on_failure = on_failure
-
-    def publish(self) -> object | None:
-        return self._store._publish_with_authority(self)
-
-    def close(self) -> None:
-        self._store._revoke_publication_authority(self)
-
-    def schedule_retry(self) -> None:
-        if self._on_failure is not None:
-            self._on_failure()
+@dataclass(frozen=True, slots=True)
+class _FailedReadyInspection:
+    revision: tuple[tuple[str, int, int, int, int, int], ...]
+    error: ReadyBundleError
 
 
 class StagingStore:
@@ -91,6 +106,7 @@ class StagingStore:
         statvfs_fn: Statvfs = statvfs,
         config: CollectorConfig = DEFAULT_CONFIG,
     ) -> None:
+        self._config = config
         self._filesystem = StagingFilesystem(
             spool,
             capture_root,
@@ -100,9 +116,9 @@ class StagingStore:
         )
         self._validated_attempts: dict[str, StagedAttempt] = {}
         self._publication_root: Path | None = None
-        self._publication_authority: _PublicationAuthority | None = None
-        self._publication_authority_lease: DeviceLock | None = None
         self._publication_lock = Lock()
+        self._publication_state = PublicationState()
+        self._ready_inspection: ReadyInventory | _FailedReadyInspection | None = None
 
     @classmethod
     def from_paths(
@@ -114,80 +130,178 @@ class StagingStore:
     ) -> StagingStore:
         """Build a store from the external layout authority."""
         store = cls.__new__(cls)
+        store._config = config
         store._filesystem = StagingFilesystem.from_paths(paths, config=config)
         store._validated_attempts = {}
         store._publication_root = publication_root
-        store._publication_authority = None
-        store._publication_authority_lease = None
         store._publication_lock = Lock()
+        store._publication_state = PublicationState()
+        store._ready_inspection = None
         return store
 
-    def publish_ready(self, held_lease: DeviceLock | None = None) -> object | None:
+    def publish_ready(self, held_lease: DeviceLock | None = None) -> ReadyOutcome:
         """Publish a complete normalized view when this store has an external boundary."""
-        if not self._publication_lock.acquire(blocking=False):
-            raise AttemptStateError("ready publication is already active")
-        try:
-            return self._publish_ready(held_lease)
-        finally:
-            self._publication_lock.release()
-
-    def _publish_ready(self, held_lease: DeviceLock | None) -> object | None:
         if self._publication_root is None:
-            return None
-        if held_lease is None:
-            with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
-                return self._recover_and_publish_unlocked()
-        self._filesystem.require_device_lock(held_lease)
-        return self._recover_and_publish_unlocked()
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
+        command = self._publication_event(Wake(None, monotonic()))
+        return self._execute_publication_command(command, held_lease)
 
-    def create_publication_authority(self, on_failure: Callable[[], None] | None = None) -> _PublicationAuthority:
-        """Issue the sole capability allowed to publish during one collector run."""
+    def _publication_event(self, event: PublicationEvent) -> PublicationCommand:
         with self._publication_lock:
-            if self._publication_authority is not None:
-                raise AttemptStateError("publication authority is already active")
-            authority = _PublicationAuthority(self, on_failure)
-            self._publication_authority = authority
-            self._publication_authority_lease = None
-            return authority
+            self._publication_state, command = publication_transition(self._publication_state, event)
+            return command
 
-    def _publish_with_authority(self, authority: _PublicationAuthority) -> object | None:
-        """Publish under an issued capability, never under task-local identity."""
-        if not self._publication_lock.acquire(blocking=False):
-            raise AttemptStateError("ready publication is already active")
-        try:
-            if authority is not self._publication_authority:
-                raise AttemptStateError("publication authority is revoked or was not issued by this store")
+    def _publication_outcome(self, command: PublicationCommand) -> ReadyOutcome:
+        with self._publication_lock:
+            state = self._publication_state
+        if command.action is PublicationAction.ARM and command.deadline is not None:
+            reason = (
+                state.work.outcome.reason
+                if isinstance(state.work, RetryWait) and isinstance(state.work.outcome, ReadyOutcome)
+                else "storage_busy_or_io"
+            )
+            return ReadyOutcome(
+                ReadyOutcomeState.TRANSIENT, reason=reason, retry_after_seconds=max(0.0, command.deadline - monotonic())
+            )
+        if state.mode is PublicationMode.CAPTURE:
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="capture_active")
+        if state.mode is PublicationMode.CLOSED:
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_closed")
+        if isinstance(state.work, Settled) and isinstance(state.work.outcome, ReadyOutcome):
+            if state.work.outcome.state is ReadyOutcomeState.PUBLISHED:
+                return ReadyOutcome(ReadyOutcomeState.WAITING, reason="settled_input")
+            return state.work.outcome
+        return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_active")
+
+    def _execute_publication_command(self, command: PublicationCommand, held_lease: DeviceLock | None) -> ReadyOutcome:
+        while command.action is PublicationAction.CHECK_INPUT:
             try:
-                lease = self._publication_authority_lease
-                if lease is not None and lease._matches(self._filesystem):
-                    return self._publish_ready(lease)
-                return self._publish_ready(None)
-            except Exception:
-                authority.schedule_retry()
-                raise
-        finally:
-            self._publication_lock.release()
+                revision: object = self._publication_revision()
+                probe_failed = False
+            except OSError:
+                revision = _UNKNOWN_REVISION
+                probe_failed = True
+            command = self._publication_event(Wake(revision, monotonic()))
+            if probe_failed and command.action is PublicationAction.RUN:
+                return self._finish_publication(
+                    command, revision, ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
+                )
+        if command.action is PublicationAction.RUN:
+            assert command.token is not None
+            outcome, revision = self._run_publication_effect(command.token, held_lease)
+            return self._finish_publication(command, revision, outcome, held_lease)
+        return self._publication_outcome(command)
 
-    def notify_publication_failure(self) -> None:
-        """Schedule the run's existing local retry after writer-side projection fails."""
+    def _run_publication_effect(self, token: int, held_lease: DeviceLock | None) -> tuple[ReadyOutcome, object]:
         with self._publication_lock:
-            authority = self._publication_authority
-        if authority is not None:
-            authority.schedule_retry()
+            running = self._publication_state.work
+            allowed = (
+                self._publication_state.mode is PublicationMode.AVAILABLE
+                and isinstance(running, Running)
+                and running.token == token
+            )
+        if not allowed or not isinstance(running, Running):
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="capture_active"), _UNKNOWN_REVISION
+        try:
+            if held_lease is None:
+                with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
+                    outcome = self._recover_and_publish_unlocked()
+                    revision = self._publication_revision()
+            else:
+                self._filesystem.require_device_lock(held_lease)
+                outcome = self._recover_and_publish_unlocked()
+                revision = self._publication_revision()
+            return outcome, revision
+        except OSError, DeviceAlreadyRunningError:
+            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io"), running.revision
+        except Exception as error:
+            if not isinstance(error, ReadyBundleError):
+                _LOGGER.exception("ready publication failed unexpectedly")
+            try:
+                revision = self._publication_revision()
+            except OSError:
+                return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io"), _UNKNOWN_REVISION
+            reason = str(error) if isinstance(error, ReadyBundleError) else type(error).__name__
+            return ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=reason), revision
 
-    def _revoke_publication_authority(self, authority: _PublicationAuthority) -> None:
+    def _finish_publication(
+        self,
+        command: PublicationCommand,
+        revision: object,
+        outcome: ReadyOutcome,
+        held_lease: DeviceLock | None = None,
+    ) -> ReadyOutcome:
+        assert command.token is not None
+        result = (
+            PublicationResult.TRANSIENT if outcome.state is ReadyOutcomeState.TRANSIENT else PublicationResult.SETTLED
+        )
+        next_command = self._publication_event(
+            Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff)
+        )
+        if next_command.action is PublicationAction.CHECK_INPUT:
+            checked = self._execute_publication_command(next_command, held_lease)
+            if outcome.state is ReadyOutcomeState.PUBLISHED and checked.state is ReadyOutcomeState.WAITING:
+                return outcome
+            return checked
+        if next_command.action is PublicationAction.ARM:
+            return self._publication_outcome(next_command)
+        return outcome
+
+    def _publication_revision(self) -> tuple[tuple[str, int, int, int, int, int], ...]:
+        if self._publication_root is None:
+            return ()
+        ledger_path = self.device_state_path.parent / "ready-publications.json"
+        checkpoint_path = self._publication_root.parent / "work" / "omi-ready-checkpoint.json"
+        return source_revision(
+            self.capture_root,
+            self._publication_root,
+            extras=(ledger_path, checkpoint_path, self.ready_closures_path),
+        )
+
+    def publication_retry_schedule(self) -> tuple[int, float] | None:
+        """Project the current reducer-owned deadline for the async timer handle."""
         with self._publication_lock:
-            if authority is not self._publication_authority:
-                raise AttemptStateError("publication authority is revoked or was not issued by this store")
-            self._publication_authority = None
-            self._publication_authority_lease = None
+            state = self._publication_state
+            if state.mode is PublicationMode.AVAILABLE and isinstance(state.work, RetryWait):
+                return state.generation, state.work.deadline
+        return None
 
-    def recover_and_publish(self) -> object | None:
+    def publication_followup_due(self) -> bool:
+        """Report a reducer-issued input check that has not been consumed."""
+        with self._publication_lock:
+            state = self._publication_state
+            return state.mode is PublicationMode.AVAILABLE and state.needs_check
+
+    def publication_wake_admitted(self) -> bool:
+        with self._publication_lock:
+            return self._publication_state.mode is PublicationMode.AVAILABLE
+
+    def publication_timer_fired(self, generation: int, deadline: float) -> bool:
+        command = self._publication_event(TimerFired(generation, deadline, monotonic()))
+        return command.action is PublicationAction.CHECK_INPUT
+
+    def publication_capture_begin(self) -> None:
+        self._publication_event(CaptureBegin())
+
+    def publication_quiesced(self) -> None:
+        self._publication_event(Quiesced())
+
+    def publication_capture_end(self) -> bool:
+        command = self._publication_event(CaptureEnd())
+        return command.action is PublicationAction.CHECK_INPUT
+
+    def publication_shutdown(self) -> None:
+        self._publication_event(Shutdown())
+
+    def publication_input_changed(self) -> bool:
+        command = self._publication_event(InputChanged())
+        return command.action is PublicationAction.CHECK_INPUT
+
+    def recover_and_publish(self) -> ReadyOutcome:
         """Replay native durable clock evidence and publish without a BLE connection."""
         if self._publication_root is None:
-            return None
-        with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
-            return self._recover_and_publish_unlocked()
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
+        return self.publish_ready()
 
     def inspect_recovery(self) -> tuple[bool, bool]:
         """Report prefix-marker and orphan-draft evidence under the device lease."""
@@ -203,7 +317,7 @@ class StagingStore:
                     if (path / _PREFIX_PUBLICATION_NAME).exists():
                         recoverable_prefix = True
                         break
-            frontier = draft_frontier(self.capture_root)
+            frontier = self._cached_draft_frontier()
             closures = ready_closures.coalesce(self.ready_closures_path)
             unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
             return recoverable_prefix, unclosed_drafts
@@ -219,6 +333,10 @@ class StagingStore:
 
     def begin_ready_visit(self) -> ready_closures.ReadyClosure | None:
         """Fence an older drain permit before a new physical visit can run."""
+        with self._publication_lock:
+            needs_fence = self._publication_state.mode is PublicationMode.AVAILABLE
+        if needs_fence:
+            self.publication_capture_begin()
         active = self._filesystem._active_lease
         if active is not None:
             self._filesystem.require_device_lock(active)
@@ -229,10 +347,32 @@ class StagingStore:
     def close_orphaned_drafts(self, reason: str) -> object | None:
         """Create a restart closure for authenticated drafts without a pending attempt."""
         with self.device_lock(recover_capture_temporaries=False, operation="close_orphaned_drafts") as lease:
-            frontier = draft_frontier(self.capture_root)
+            frontier = self._cached_draft_frontier()
             if frontier is None:
                 return None
             return self._append_ready_closure_unlocked(lease, frontier, reason)
+
+    def _cached_draft_frontier(self) -> int | None:
+        publication_root = self._publication_root
+        if publication_root is None or not publication_root.is_dir():
+            return draft_frontier(self.capture_root)
+        inventory = self._authenticated_ready_inventory(publication_root)
+        return max((draft.manifest.next_sequence for draft in inventory.drafts), default=None)
+
+    def _authenticated_ready_inventory(self, publication_root: Path) -> ReadyInventory:
+        """Reuse an authenticated view or the unchanged source-validation failure."""
+        revision = source_revision(self.capture_root, publication_root)
+        previous = self._ready_inspection
+        if isinstance(previous, _FailedReadyInspection) and previous.revision == revision:
+            raise previous.error.with_traceback(None)
+        prior_inventory = previous if isinstance(previous, ReadyInventory) else None
+        try:
+            inventory = authenticated_inventory(self.capture_root, publication_root, prior_inventory)
+        except ReadyBundleError as error:
+            self._ready_inspection = _FailedReadyInspection(revision, error)
+            raise
+        self._ready_inspection = inventory
+        return inventory
 
     def close_pending_prefix(
         self, reason: str, *, include_unpublished: bool = True
@@ -281,12 +421,16 @@ class StagingStore:
         self, lease: DeviceLock, next_sequence: int, reason: str
     ) -> ready_closures.ReadyClosure:
         self._filesystem.require_device_lock(lease)
-        return ready_closures.append(self.ready_closures_path, next_sequence, reason)
+        closure = ready_closures.append(self.ready_closures_path, next_sequence, reason)
+        self._publication_event(InputChanged())
+        return closure
 
-    def _recover_and_publish_unlocked(self) -> object | None:
+    def _recover_and_publish_unlocked(self) -> ReadyOutcome:
         publication_root = self._publication_root
         if publication_root is None:
-            return None
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
+        ledger_path = self.device_state_path.parent / "ready-publications.json"
+        checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
         corrections = ClockCorrectionStore(self.device_state_path)
         try:
             corrections.recover_prepared()
@@ -302,14 +446,16 @@ class StagingStore:
         except (ClockCorrectionError, ClockObservationError, ClockMembershipError, ClockSegmentError) as error:
             _LOGGER.warning("clock metadata unavailable; publishing ready audio without UTC normalization: %s", error)
             segments = ClockSegmentMap(())
-        ledger_path = self.device_state_path.parent / "ready-publications.json"
         resume_retired(publication_root, ledger_path)
-        published: list[object] = []
         closures = ready_closures.coalesce(self.ready_closures_path)
-        if closures:
+        outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_closed_frontier")
+        if not closures:
+            self._authenticated_ready_inventory(publication_root)
+        else:
             closure = closures[-1]
-            published.extend(
-                finalize_drafts(
+            try:
+                inventory = self._authenticated_ready_inventory(publication_root)
+                outcome = finalize_drafts(
                     self.capture_root,
                     publication_root,
                     ledger_path,
@@ -317,33 +463,26 @@ class StagingStore:
                     config=self._filesystem._ready,
                     frontier=closure.next_sequence,
                     drained=closure.reason == "drained",
+                    inventory=inventory,
                 )
-            )
-            if not has_drafts_at_or_below(self.capture_root, closure.next_sequence):
-                ready_closures.remove(self.ready_closures_path, closure)
-        retire_acknowledged(
-            publication_root,
-            ledger_path,
-            publication_root.parent / "work" / "omi-ready-checkpoint.json",
-        )
-        return tuple(published) or None
+                self._ready_inspection = outcome.inventory
+            except ReadyBundleError as error:
+                outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
+            if not outcome.remaining_at_frontier:
+                inventory = self._authenticated_ready_inventory(publication_root)
+                pending = any(draft.manifest.next_sequence <= closure.next_sequence for draft in inventory.drafts)
+                if pending:
+                    outcome = replace(outcome, remaining_at_frontier=True, inventory=inventory)
+                else:
+                    ready_closures.remove(self.ready_closures_path, closure)
+        retired = retire_acknowledged(publication_root, ledger_path, checkpoint_path)
+        if retired and outcome.state is ReadyOutcomeState.WAITING:
+            outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="ack_retired")
+        return outcome
 
     @property
     def capture_root(self) -> Path:
         return self._filesystem.capture_root
-
-    def transfer_publication_authority(self, lease: DeviceLock) -> None:
-        """Bind this active storage lease to the run's publication capability."""
-        self._filesystem.require_device_lock(lease)
-        with self._publication_lock:
-            bound = self._publication_authority_lease
-            if self._publication_authority is None:
-                return
-            if bound is lease:
-                raise AttemptStateError("publication authority was already transferred to this writer")
-            if bound is not None and bound._matches(self._filesystem):
-                raise AttemptStateError("publication authority is already bound to another active writer")
-            self._publication_authority_lease = lease
 
     @property
     def attempts_root(self) -> Path:
@@ -425,7 +564,9 @@ class StagingStore:
         """Salvage one quarantined prefix through this store's explicit paths capability."""
         from .quarantine_publish import publish_quarantined_prefix
 
-        return publish_quarantined_prefix(source, self.paths, should_defer=should_defer)
+        published = publish_quarantined_prefix(source, self.paths, should_defer=should_defer)
+        self.publication_input_changed()
+        return published
 
     def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.sweep_terminal_quarantine(
@@ -542,7 +683,6 @@ class StagingStore:
             yield active
             return
         with self.device_lock(recover_capture_temporaries=False, operation="clock_mutation") as lease:
-            self.transfer_publication_authority(lease)
             yield lease
 
     def require_device_lock(self, lease: DeviceLock) -> None:

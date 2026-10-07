@@ -25,6 +25,7 @@ from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRu
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
 from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
+from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import (
     AttemptDescriptor,
     DeviceAlreadyRunningError,
@@ -107,7 +108,7 @@ from omi_collector.capture.domain.ring_protocol import (
     encode_stop_command,
 )
 from omi_collector.capture.domain.transfer_arena import TransferArena
-from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, RetryConfig, StagingRetentionConfig
+from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, ReadyConfig, RetryConfig, StagingRetentionConfig
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -2883,7 +2884,7 @@ async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path)
     ]
 
 
-class _ProjectionClockSession(ScriptedRingSession):
+class _PublicationClockSession(ScriptedRingSession):
     def __init__(self, steps: tuple[WriteStep, ...], events: list[str]) -> None:
         super().__init__(_status(), steps)
         self.events = events
@@ -2898,54 +2899,67 @@ class _ProjectionClockSession(ScriptedRingSession):
     async def write_control(self, payload: bytes) -> None:
         if payload == encode_read_command(10, 1):
             await asyncio.sleep(0.01)
-            assert self.events == ["clock_projection_failed"]
+            assert self.events == []
             self.events.append("read")
         await super().write_control(payload)
 
 
 @_async_test
-async def test_clock_projection_failure_defers_retry_until_after_real_capture_closure(
+async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_closure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ready = tmp_path / "ready"
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02), retry=RetryConfig(rapid_backoff=(0.001,)))
     store = StagingStore.from_paths(
         StagingStore(tmp_path / "spool", _capture_root(tmp_path)).paths,
         publication_root=ready,
+        config=config,
     )
     events: list[str] = []
     original_publish = store._recover_and_publish_unlocked
     original_closure = BatchReconciler.close_visit
     original_background = store.recover_and_publish
+    published = threading.Event()
     failed = False
 
-    def publish() -> object | None:
+    def publish() -> ReadyOutcome:
         nonlocal failed
         if session.clock_read and not failed:
+            assert events == ["read", "closure"]
             failed = True
-            events.append("clock_projection_failed")
+            events.append("publication_transient")
             raise OSError("ready projection failed")
         return original_publish()
 
-    def background() -> object | None:
+    def background() -> ReadyOutcome:
         if failed:
             events.append("retry")
-        return original_background()
+        outcome = original_background()
+        if outcome.state is ReadyOutcomeState.PUBLISHED:
+            published.set()
+        return outcome
 
     async def close_visit(reconciler: BatchReconciler, reason: str) -> None:
         await original_closure(reconciler, reason)
+        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+            {"next_sequence": 11, "reason": "drained"}
+        ]
         events.append("closure")
 
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
     monkeypatch.setattr(store, "recover_and_publish", background)
     monkeypatch.setattr(BatchReconciler, "close_visit", close_visit)
 
-    session = _ProjectionClockSession(
+    session = _PublicationClockSession(
         (
             WriteStep(b"\x10", (_info(10, 11),)),
             WriteStep(b"\x10", (_info(10, 11),)),
-            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+            WriteStep(
+                encode_read_command(10, 1),
+                (_begin(10, 1), _data(pack(">I", 10) + bytes((2, 8, 10)) + bytes(RECORD_SIZE - 7)), _done(11)),
+            ),
             WriteStep(b"\x10", (_info(10, 11),)),
             WriteStep(encode_advance_command(11), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(11, 11),)),
@@ -2955,7 +2969,7 @@ async def test_clock_projection_failure_defers_retry_until_after_real_capture_cl
 
     async def activity(event: ActivityEvent) -> None:
         if event.state == "drained":
-            await asyncio.sleep(0.02)
+            assert await asyncio.to_thread(published.wait, 5)
 
     result = await run_opportunistic_collector(
         Provider([session]),
@@ -2966,11 +2980,18 @@ async def test_clock_projection_failure_defers_retry_until_after_real_capture_cl
             host_time=lambda: 10_000.0,
             host_clock_synchronized=lambda: True,
             activity=activity,
+            config=config,
         ),
     )
 
     assert isinstance(result, CollectionResult)
-    assert events == ["clock_projection_failed", "read", "closure", "retry"]
+    assert session.clock_read
+    assert any(
+        item.device_epoch == 10_000
+        for item in ClockCorrectionStore(store.device_state_path).observation_store.records()
+    )
+    assert events == ["read", "closure", "publication_transient", "retry"]
+    assert len(tuple(ready.iterdir())) == 1
 
 
 @_async_test

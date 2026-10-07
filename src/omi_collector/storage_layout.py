@@ -115,10 +115,7 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
         except ValueError as error:
             raise StorageLayoutError(f"presence settings are invalid: {error}") from error
     if "ready" in document:
-        keys = {"target_audio_seconds"}
-        if isinstance(document["ready"], dict) and "max_wait_seconds" in document["ready"]:
-            keys.add("max_wait_seconds")
-        ready = _number_section(document["ready"], keys, "ready")
+        ready = _number_section(document["ready"], {"target_audio_seconds"}, "ready")
         try:
             runtime_config = replace(runtime_config, ready=ReadyConfig(**ready))
         except ValueError as error:

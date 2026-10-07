@@ -364,14 +364,12 @@ class ServiceConfig:
 
 @dataclass(frozen=True, slots=True)
 class ReadyConfig:
-    """Minimum captured audio required after drain; legacy wait is inactive."""
+    """Minimum captured audio required after a confirmed drain."""
 
     target_audio_seconds: float = 3600.0
-    max_wait_seconds: float = 86400.0
 
     def __post_init__(self) -> None:
         _require_positive_float(self.target_audio_seconds, "target_audio_seconds")
-        _require_positive_float(self.max_wait_seconds, "max_wait_seconds")
 
 
 @dataclass(frozen=True, slots=True)

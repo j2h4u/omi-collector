@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.9](https://github.com/j2h4u/omi-collector/compare/v0.11.8...v0.11.9) (2026-10-07)
+
+
+### Style
+
+* **test:** format BLE observability and presence machine tests ([2c38318](https://github.com/j2h4u/omi-collector/commit/2c383188bf4e341a6c7a3dace413073aee610261))
+* **test:** format BLE observability and presence machine tests ([c2ab833](https://github.com/j2h4u/omi-collector/commit/c2ab83310683d31cb9895df1bb88def1ceaa030e))
+
+
+### Tests
+
+* assert presence machine values are immutable ([2c38318](https://github.com/j2h4u/omi-collector/commit/2c383188bf4e341a6c7a3dace413073aee610261))
+* assert presence machine values are immutable ([c2ab833](https://github.com/j2h4u/omi-collector/commit/c2ab83310683d31cb9895df1bb88def1ceaa030e))
+* cover BLE observation dispatch race and immutable records ([2c38318](https://github.com/j2h4u/omi-collector/commit/2c383188bf4e341a6c7a3dace413073aee610261))
+* cover BLE observation dispatch race and immutable records ([c2ab833](https://github.com/j2h4u/omi-collector/commit/c2ab83310683d31cb9895df1bb88def1ceaa030e))
+
 ## [0.11.8](https://github.com/j2h4u/omi-collector/compare/v0.11.7...v0.11.8) (2026-10-07)
 
 

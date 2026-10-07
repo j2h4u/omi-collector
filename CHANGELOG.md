@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.8](https://github.com/j2h4u/omi-collector/compare/v0.11.7...v0.11.8) (2026-10-07)
+
+
+### Tests
+
+* strengthen presence error mutation coverage ([18d97c0](https://github.com/j2h4u/omi-collector/commit/18d97c0be385cf5470775a3baca2bb715142168d))
+
 ## [0.11.7](https://github.com/j2h4u/omi-collector/compare/v0.11.6...v0.11.7) (2026-10-07)
 
 

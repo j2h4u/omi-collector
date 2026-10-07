@@ -66,9 +66,7 @@ POLICY = PresenceMachinePolicy(
         (TransitionResult, 2, "state"),
     ],
 )
-def test_presence_machine_values_are_immutable(
-    record_type: type[object], field_count: int, field_name: str
-) -> None:
+def test_presence_machine_values_are_immutable(record_type: type[object], field_count: int, field_name: str) -> None:
     record_factory = cast(Callable[..., object], record_type)
     record = record_factory(*([None] * field_count))
 

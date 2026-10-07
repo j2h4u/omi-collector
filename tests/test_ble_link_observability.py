@@ -178,8 +178,7 @@ def test_observer_ignores_telemetry_if_disconnect_wins_dispatch_race(
     assert len(records) == 1
     assert records[0]["initial_phy_snapshot"] is None
     assert not any(
-        record.name == debug_logger.name
-        and getattr(record, "debug_event", None) == "ble_link_rssi_observed"
+        record.name == debug_logger.name and getattr(record, "debug_event", None) == "ble_link_rssi_observed"
         for record in caplog.records
     )
 
@@ -196,9 +195,7 @@ def test_observer_ignores_telemetry_if_disconnect_wins_dispatch_race(
         (ble_link_observability.BleLinkSessionRecord, 24, "address"),
     ],
 )
-def test_observer_telemetry_records_are_immutable(
-    record_type: type[object], field_count: int, field_name: str
-) -> None:
+def test_observer_telemetry_records_are_immutable(record_type: type[object], field_count: int, field_name: str) -> None:
     record_factory = cast(Callable[..., object], record_type)
     record = record_factory(*([None] * field_count))
 

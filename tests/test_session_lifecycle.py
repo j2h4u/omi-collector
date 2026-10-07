@@ -85,15 +85,20 @@ class _ScriptedPresence:
         self,
         wakes: list[PresenceWake | PresenceEnd | BaseException],
         end_results: list[PresenceEnd | None] | None = None,
+        *,
+        allowed_recovery_arms: int = 0,
     ) -> None:
         self._wakes: Iterator[PresenceWake | PresenceEnd | BaseException] = iter(wakes)
         self._end_results: Iterator[PresenceEnd | None] = iter(end_results or [])
+        self._allowed_recovery_arms = allowed_recovery_arms
         self.wake_count = 0
         self.outcomes: list[AttemptOutcome] = []
         self.resumed = 0
         self.closed = False
 
     def resume_interrupted_visit(self) -> None:
+        if self.resumed >= self._allowed_recovery_arms:
+            raise AssertionError("unexpected recovery arming")
         self.resumed += 1
 
     async def wait_for_attempt(self) -> PresenceWake | PresenceEnd:
@@ -207,6 +212,10 @@ class _RecordingLifecycleMetrics:
 
 def _unexpected_startup_recovery() -> None:
     raise AssertionError("startup recovery is outside this lifecycle check")
+
+
+async def _unexpected_direct_admission() -> None:
+    raise AssertionError("direct admission is outside this presence-only lifecycle check")
 
 
 def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1033,7 +1042,7 @@ def test_presence_setup_failure_closes_issued_permit_before_propagation(monkeypa
 
     presence = Presence()
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -1097,7 +1106,7 @@ def test_real_presence_setup_failure_closes_issued_permit(monkeypatch: pytest.Mo
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -1177,7 +1186,7 @@ def test_presence_outcome_follows_gatt_teardown_and_checkpoint(monkeypatch: pyte
 
     presence = Presence()
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=checkpoint,
@@ -1330,6 +1339,7 @@ def test_presence_end_closes_restored_visit_without_opening_another_provider(end
         if end_boundary == "wait"
         else [wake, StopAfterClosureError("closed visit observed")],
         [] if end_boundary == "wait" else [end],
+        allowed_recovery_arms=1,
     )
     provider_candidates: list[object | None] = []
     closures: list[str] = []
@@ -1350,7 +1360,7 @@ def test_presence_end_closes_restored_visit_without_opening_another_provider(end
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -1538,7 +1548,7 @@ def test_presence_interruption_reports_only_durable_progress_and_retries(
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -1600,7 +1610,7 @@ def test_presence_batch_complete_activity_only_follows_completed_batch_interrupt
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -1735,7 +1745,7 @@ def test_presence_rejects_expired_and_untimed_wakes_before_provider_then_accepts
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -1791,7 +1801,7 @@ def test_provider_candidate_unavailable_is_reported_and_next_wake_can_complete(
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
@@ -1854,7 +1864,7 @@ def test_presence_reports_disconnected_and_connected_interruption_kinds_in_order
         return "drained", current
 
     callbacks = SessionLifecycleCallbacks(
-        before_direct_attempt=_noop,
+        before_direct_attempt=_unexpected_direct_admission,
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,

@@ -989,6 +989,29 @@ async def test_finalize_does_not_checkpoint_empty_positive_admission(tmp_path: P
 
 
 @_async_test
+async def test_finalize_does_not_adopt_seal_after_writer_already_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _Runtime()
+    runtime.late_seal_fault = RuntimeError("must not adopt after writer already stopped")
+    _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    is_alive = proxy.thread.is_alive
+    monkeypatch.setattr(proxy.thread, "is_alive", lambda: False)
+    try:
+        result = await reconciler.finalize_active()
+
+        assert result.close_error is None
+        assert result.checkpoint_error is None
+        assert proxy.seal_result_calls == 1
+    finally:
+        monkeypatch.setattr(proxy.thread, "is_alive", is_alive)
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
 async def test_finalize_sealed_batch_skips_checkpoint_and_second_seal_adoption(tmp_path: Path) -> None:
     runtime = _Runtime()
     close_error = OSError("close failed after seal")

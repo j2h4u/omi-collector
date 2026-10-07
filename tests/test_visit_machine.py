@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 from itertools import product
 from typing import Literal, Protocol, cast, get_args
 
@@ -448,6 +448,30 @@ def test_finite_model_is_exhaustive_and_reachable() -> None:
 
     assert (accepted, rejected) == (114, 238)
     _assert_all_states_reachable()
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "replacement"),
+    (
+        (Attempting(Idle()), "origin", Waiting()),
+        (Closing("drained"), "reason", "absence"),
+        (Interrupted(True, False), "connected", False),
+        (Interrupted(True, False), "durable_progress", True),
+        (RecoveryLoaded("empty"), "disposition", "resumable"),
+        (SessionFinished(DrainConfirmed()), "outcome", CandidateUnavailable()),
+        (RecoveryEnded("absence"), "reason", "recovery_exhausted"),
+        (WaitForAttempt(), "arm_restored", True),
+        (WaitForAttempt(), "previous_outcome", Interrupted(True, False)),
+        (CommitClosure("drained"), "reason", "absence"),
+        (FinishVisit("drained", False), "reason", "absence"),
+        (FinishVisit("drained", False), "stop", True),
+        (TransitionResult(Recovering(), InspectRecovery()), "state", Idle()),
+        (TransitionResult(Recovering(), InspectRecovery()), "command", NoOp()),
+    ),
+)
+def test_machine_records_reject_field_reassignment(value: object, field: str, replacement: object) -> None:
+    with pytest.raises(FrozenInstanceError):
+        setattr(value, field, replacement)
 
 
 def _assert_finite_invariants(

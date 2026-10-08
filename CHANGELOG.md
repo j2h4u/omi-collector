@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.15](https://github.com/j2h4u/omi-collector/compare/v0.11.14...v0.11.15) (2026-10-08)
+
+
+### Fixes
+
+* **metrics:** account for sparse ready ranges ([#213](https://github.com/j2h4u/omi-collector/issues/213)) ([dc5625b](https://github.com/j2h4u/omi-collector/commit/dc5625b1c9cd77e58718032d199b553a9b760e62))
+
 ## [0.11.14](https://github.com/j2h4u/omi-collector/compare/v0.11.13...v0.11.14) (2026-10-07)
 
 

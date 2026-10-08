@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from itertools import pairwise
 from multiprocessing import get_context
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -51,14 +52,17 @@ def _bundle(
     records: tuple[bytes, ...],
     *,
     start: int = 10,
+    time_ranges: tuple[tuple[int, int], ...] | None = None,
 ) -> Path:
     path = root / name
     path.mkdir(parents=True)
     raw = b"".join(records)
     raw_hash = hashlib.sha256(raw).hexdigest()
     (path / "records.bin").write_bytes(raw)
-    end = start + len(records)
-    bundle_id = hashlib.sha256(f"{start}:{end}:{raw_hash}".encode()).hexdigest()
+    ranges = time_ranges or ((start, start + len(records)),)
+    end = ranges[-1][1]
+    gaps = "".join(f":{left[1]}-{right[0]}" for left, right in pairwise(ranges) if left[1] < right[0])
+    bundle_id = hashlib.sha256(f"{start}:{end}:{raw_hash}{gaps}".encode()).hexdigest()
     (path / "manifest.json").write_text(
         json.dumps(
             {
@@ -69,7 +73,10 @@ def _bundle(
                 "record_size": RECORD_SIZE,
                 "records_sha256": raw_hash,
                 "draft_raw_sha256": raw_hash,
-                "time_ranges": [{"start_sequence": start, "next_sequence": end, "utc": None}],
+                "time_ranges": [
+                    {"start_sequence": range_start, "next_sequence": range_end, "utc": None}
+                    for range_start, range_end in ranges
+                ],
             }
         ),
         encoding="utf-8",
@@ -250,6 +257,36 @@ def test_ready_bundle_is_a_valid_device_spool(tmp_path: Path) -> None:
     assert result.current_window.bundle_count == 1
     assert result.current_window.downloaded_records == 2
     assert result.current_window.downloaded_raw_bytes == 2 * RECORD_SIZE
+
+
+def test_sparse_ready_bundle_uses_manifest_ranges_for_loss_accounting(tmp_path: Path) -> None:
+    _bundle(tmp_path, "sparse", (_record(1000), _record(1001)), start=10, time_ranges=((10, 11), (12, 13)))
+
+    result = collect_spool_metrics(tmp_path)
+
+    assert result.current_window.downloaded_records == 2
+    assert result.current_window.lost_records == 1
+    assert result.current_window.lost_raw_bytes == RECORD_SIZE
+
+
+@pytest.mark.parametrize(
+    "time_ranges",
+    [
+        [{"start_sequence": 10, "next_sequence": 10, "utc": None}],
+        [{"start_sequence": 11, "next_sequence": 12, "utc": None}],
+        [{"start_sequence": 10, "next_sequence": 12, "utc": None}],
+        [
+            {"start_sequence": 10, "next_sequence": 11, "utc": None},
+            {"start_sequence": 11, "next_sequence": 13, "utc": None},
+        ],
+    ],
+)
+def test_ready_bundle_rejects_malformed_time_ranges(tmp_path: Path, time_ranges: object) -> None:
+    bundle = _bundle(tmp_path, "invalid", (_record(1), _record(2)), start=10, time_ranges=((10, 11), (12, 13)))
+    _rewrite_manifest(bundle, time_ranges=time_ranges)
+
+    with pytest.raises(SpoolMetricsError, match="ready manifest is invalid"):
+        collect_spool_metrics(tmp_path)
 
 
 @pytest.mark.parametrize(

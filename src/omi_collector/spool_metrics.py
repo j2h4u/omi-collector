@@ -14,6 +14,7 @@ from omi_collector.capture.adapters.firmware_observations import (
     FirmwareObservationError,
     read_firmware_observations,
 )
+from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, _validate_ready_ranges
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
 
@@ -100,6 +101,7 @@ class _ReadyManifest:
     record_count: int
     record_size: int
     records_sha256: str
+    ranges: tuple[tuple[int, int], ...]
 
 
 def collect_spool_metrics(
@@ -155,7 +157,7 @@ def _read_bundle_artifact(path: Path) -> _BundleMeasurement:
         ),
         manifest.record_count,
         manifest.record_count * manifest.record_size,
-        ((manifest.start_sequence, manifest.next_sequence),),
+        manifest.ranges,
     )
 
 
@@ -193,18 +195,26 @@ def _ready_manifest_values(value: dict[str, object], path: Path) -> _ReadyManife
     start, end, count, size = (cast(int, value[name]) for name in numeric)
     if not _ready_dimensions_are_valid(start, end, count, size):
         raise SpoolMetricsError(f"ready manifest is invalid: {path}")
+    try:
+        gaps = _validate_ready_ranges(value["time_ranges"], start, end, count)
+    except ReadyBundleError as error:
+        raise SpoolMetricsError(f"ready manifest is invalid: {path}") from error
     if not _ready_hashes_are_valid(value):
         raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    if not isinstance(value["time_ranges"], list) or not value["time_ranges"]:
-        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    identity = f"{start}:{end}:{value['draft_raw_sha256']}".encode()
+    ranges_value = cast(list[dict[str, object]], value["time_ranges"])
+    ranges = tuple((cast(int, item["start_sequence"]), cast(int, item["next_sequence"])) for item in ranges_value)
+    identity = (
+        f"{start}:{end}:{value['draft_raw_sha256']}" + "".join(f":{gap_start}-{gap_end}" for gap_start, gap_end in gaps)
+    ).encode()
     if value["bundle_id"] != sha256(identity).hexdigest():
         raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    return _ReadyManifest(cast(str, value["bundle_id"]), start, end, count, size, cast(str, value["records_sha256"]))
+    return _ReadyManifest(
+        cast(str, value["bundle_id"]), start, end, count, size, cast(str, value["records_sha256"]), ranges
+    )
 
 
 def _ready_dimensions_are_valid(start: int, end: int, count: int, size: int) -> bool:
-    return start >= 0 and end == start + count and count > 0 and size == RECORD_SIZE
+    return start >= 0 and end > start and count > 0 and size == RECORD_SIZE
 
 
 def _ready_hashes_are_valid(value: dict[str, object]) -> bool:

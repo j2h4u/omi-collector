@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.17](https://github.com/j2h4u/omi-collector/compare/v0.11.16...v0.11.17) (2026-10-09)
+
+
+### Fixes
+
+* validate publication checkpoint access ([#217](https://github.com/j2h4u/omi-collector/issues/217)) ([2c56066](https://github.com/j2h4u/omi-collector/commit/2c5606652c29b728c8e40307267941ce0397b828))
+
 ## [0.11.16](https://github.com/j2h4u/omi-collector/compare/v0.11.15...v0.11.16) (2026-10-09)
 
 

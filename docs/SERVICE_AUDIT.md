@@ -100,34 +100,51 @@ unresolved.
   diff were checked and accepted by root.
 9. [ ] **Collector cannot traverse the ready-checkpoint parent.** The retained
   revision in `/srv/pipelines/omi/work/omi-ready-checkpoint.json` is a real ACK
-  dependency. Its parent is owned by `j2h4u:j2h4u` with mode `2770` and has no
-  collector traverse ACL. Repeated `storage_busy_or_io` remains visible, but
-  syscall-level attribution has not been observed. The accepted code provisions
-  only execute/traverse ACL on the existing work parent without widening its
-  mask or changing ownership; deployment checks the service identity's access
-  before stopping the running service, rejects symlink checkpoints, and allows
-  an absent checkpoint. Runtime diagnostics distinguish sanitized access,
-  storage I/O, and lock-contention reasons while publication retries and capture
-  continues. The focused cluster passed 148 tests with 2 skips; Sol accepted
-  the implementation. Keep this item open until live ACL repair and successful
-  publication recovery are verified; do not claim a syscall trace or cleared
-  publication backlog without that evidence.
+  dependency. The work parent is `j2h4u:j2h4u` mode `2770` without collector
+  traverse ACL; the checkpoint is UID 10001/GID 1000 mode `0660` without
+  collector read ACL. Repeated `storage_busy_or_io` remains visible, but no
+  syscall trace has confirmed runtime attribution.
+
+  Producer PR #33 (main `2d0ebc3`) grants the trusted collector UID a numeric
+  read ACL on the temporary checkpoint before fsync and replace; if ACL
+  application fails, the old checkpoint stays intact. Consumer PRs #217/#218
+  add an execute-only ACL for parent traversal without widening masks or
+  changing ownership, and preflight the service identity before stopping the
+  old service; symlinks are rejected and an absent checkpoint is allowed.
+  Runtime diagnostics distinguish sanitized access, storage I/O, and lock
+  contention while publication retries and capture continues. Producer tests
+  (33 focused, 265 full), consumer tests (148 with 2 skips), and shared-image
+  tests (318) passed with their static, lock-freshness, and CI checks.
+
+  Shared-image PR #42 uses source `58fecbe3282683bb459aa405a4f953cdb2ac7445`.
+  Its isolated candidate image `windmill-universal-worker:1.816.0-acl-58fecbe`
+  built successfully (2,224,728,580 bytes, digest
+  `sha256:6e25f39e693e9c93979331cee3e6ee718bb19e51815f3bcb3f5e69897be2bf34`)
+  from pinned `python:3.13.14-slim-trixie` digest
+  `sha256:69e18bd8d831d88e0ef70239dc7771ab7c28bc296ae78ac75cde71e60aa4434f`.
+  Its UID 1000 ACL/read smoke and Python runtime policies passed. Keep this item
+  open until the live ACL repair, control-only rollout, canonical pipeline
+  publish, two scratch-checkpoint writes read by the actual collector, and
+  publication recovery are verified. Authorization is pending; do not claim a
+  syscall trace or recovered publication backlog.
 
 ## Release status
 
-PR #215 merged at `25ee0169096774ccb7d9422b30ba29cbdbbebf2d`; CI run
-`37958587738` and CodeQL passed with 2,556 tests and 2 skips. Main CI
-`37958945739` and CodeQL passed. Release PR #216 published `v0.11.16` at
-revision `0d7b7ed90b1dc6d3a84d25c7b36e788401d3d3ef` on 2026-10-09. The
-deployment wrapper exited successfully; that revision runs as PID 492997 with
-zero restarts and readiness confirmed using `/srv/pipelines/omi/config.toml`.
-The operational snapshot, confirmed-loss ledger, and collector lock are mode
-`0600`; the prior service stopped gracefully. The new finding 9 candidate is
-not merged or deployed. Its full local gates passed: `just check`, `just unit`
-(2,566 passed, 2 skipped), `just crap-check` (2,566 passed, 2 skipped; 1,585
-functions at CRAP 30 or below), `just docker-build`, and healthy/`ok`
-`just runtime-smoke`; its temporary container and network were removed. Live
-ACL repair and publication recovery remain unverified, so finding 9 is open.
+PR #215 merged at `25ee0169096774ccb7d9422b30ba29cbdbbebf2d`; PR and main CI
+and CodeQL passed. Release PR #216 published `v0.11.16` at revision
+`0d7b7ed90b1dc6d3a84d25c7b36e788401d3d3ef`. The deployment was verified with
+zero restarts and readiness; private state files were mode `0600`.
+
+Consumer PRs #217/#218 merged with green CI on main
+`54b1254701b28272ccca10bada848f4d84a66bbc`, published as `v0.11.17`; the
+live service remains on `v0.11.16`. Producer PR #33 and shared-image PR #42
+also merged with fresh CI. Candidate full unit (2,566 passed, 2 skipped), CRAP
+(2,566 passed, 2 skipped; 1,585 functions at or below 30), static checks,
+Docker build, and runtime smoke passed. The isolated image build and runtime
+ACL/read smoke passed; its temporary build worktrees, branches, and 308 MB
+environment were removed. Finding 9 is implemented and verified in code and
+build tests, but remains open pending authorized live ACL repair and end-to-end
+publication recovery.
 
 ## QA follow-up
 

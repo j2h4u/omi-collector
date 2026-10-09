@@ -373,6 +373,8 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
   guidance.
 - [Transfer-quality evidence](docs/QUALITY_METRICS.md) — the durable metric
   journal and how operators interpret its records.
+- [Service audit tracker](docs/SERVICE_AUDIT.md) — root-cause fixes and
+  acceptance checks for the eight service-audit findings.
 - [Acceptance specification (Gherkin)](features/opportunistic_collection.feature)
   — presence, transfer, interruption, recovery, and publication behavior.
   The specification is reviewed alongside the executable pytest suite; the

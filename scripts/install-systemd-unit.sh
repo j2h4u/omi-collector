@@ -60,6 +60,32 @@ function validate_operator_config_file {
         || die "operator configuration must be root:root 0644: ${config_file}"
 }
 
+function provision_publication_checkpoint_traversal {
+    # args
+    local -r work_dir="$1" account_user="$2" account_group="$3"
+
+    # vars
+    local setfacl_bin runuser_bin
+
+    # code
+    # assert: only provision an existing Windmill directory; do not create or take ownership of its state
+    if [[ ! -e "$work_dir" && ! -L "$work_dir" ]]; then
+        return
+    fi
+    [[ -d "$work_dir" && ! -L "$work_dir" ]] \
+        || die "publication work path must be an existing real directory: ${work_dir}"
+    setfacl_bin=$(command -v setfacl || true)
+    [[ -n "$setfacl_bin" ]] || die 'setfacl is required to grant publication checkpoint traversal'
+    # assert: add execute-only access for the collector without widening the existing ACL mask
+    "$setfacl_bin" --no-mask --modify "u:${account_user}:--x" -- "$work_dir" \
+        || die "could not grant ${account_user} traversal of ${work_dir}"
+    runuser_bin=$(command -v runuser || true)
+    [[ -n "$runuser_bin" || -x /usr/sbin/runuser ]] || die 'runuser is required to verify publication traversal'
+    [[ -n "$runuser_bin" ]] || runuser_bin='/usr/sbin/runuser'
+    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -x "$work_dir" \
+        || die "${account_user} cannot traverse publication work directory: ${work_dir}"
+}
+
 function stage_file {
     # args
     local -r source="$1" target="$2" mode="$3" output_name="$4"
@@ -148,7 +174,7 @@ function validate_staged_unit {
 }
 
 declare script_dir repo_root source_unit source_bluetooth_ready source_status source_status_sudoers source_deploy_release source_deploy_release_sudoers
-declare config_file storage_root unit_target bluetooth_ready_target status_target status_sudoers_target deploy_release_target deploy_release_sudoers_target service_name
+declare config_file storage_root publication_work_dir unit_target bluetooth_ready_target status_target status_sudoers_target deploy_release_target deploy_release_sudoers_target service_name
 declare account_user account_group state_dir staged_status staged_status_sudoers staged_deploy_release staged_deploy_release_sudoers staged_unit staged_bluetooth_ready
 declare status_backup status_sudoers_backup deploy_release_backup deploy_release_sudoers_backup unit_backup bluetooth_ready_backup
 declare -i restart_requested=0
@@ -163,6 +189,7 @@ source_deploy_release="${repo_root}/scripts/omi-collector-deploy-release"
 source_deploy_release_sudoers="${repo_root}/scripts/omi-collector-deploy-release.sudoers"
 config_file='/srv/pipelines/omi/config.toml'
 storage_root=$(dirname -- "$config_file") || die 'cannot resolve storage root'
+publication_work_dir="${storage_root}/work"
 unit_target='/etc/systemd/system/omi-collector.service'
 bluetooth_ready_target='/usr/local/sbin/omi-collector-bluetooth-ready'
 status_target='/usr/local/sbin/omi-collector-status'
@@ -246,6 +273,7 @@ command -v systemctl &> /dev/null || die 'systemctl is required'
 ensure_service_account "$account_user" "$account_group" "$state_dir"
 [[ -d "$storage_root" && ! -L "$storage_root" ]] \
     || die "storage root is missing or unsafe: ${storage_root}"
+provision_publication_checkpoint_traversal "$publication_work_dir" "$account_user" "$account_group"
 validate_operator_config_file "$config_file" "$account_group"
 /usr/sbin/visudo -cf "$source_status_sudoers" || die 'status sudo policy is invalid'
 /usr/sbin/visudo -cf "$source_deploy_release_sudoers" || die 'release deploy sudo policy is invalid'

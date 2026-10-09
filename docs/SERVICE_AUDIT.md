@@ -1,10 +1,9 @@
 # Service audit tracker
 
-This tracker covers the eight host-side findings from the service audit. A
-checked item means its fix is implemented and its targeted evidence has been
-reviewed and accepted by the root agent; it does not mean release gates passed
-or deployment completed. Leave an item open until that target proof is
-accepted.
+This tracker covers the eight original service findings and later QA and
+operational follow-ups. A checked item means its fix is implemented and its
+targeted evidence has been reviewed and accepted; an open item remains
+unresolved.
 
 ## Findings
 
@@ -99,20 +98,36 @@ accepted.
   timestamps. Acceptance: README accurately describes those rules and its
   examples agree with manifest behavior. The clock source and documentation
   diff were checked and accepted by root.
+9. [ ] **Collector cannot traverse the ready-checkpoint parent.** The retained
+  revision in `/srv/pipelines/omi/work/omi-ready-checkpoint.json` is a real ACK
+  dependency. Its parent is owned by `j2h4u:j2h4u` with mode `2770` and has no
+  collector traverse ACL. Repeated `storage_busy_or_io` remains visible, but
+  syscall-level attribution has not been observed. The accepted code provisions
+  only execute/traverse ACL on the existing work parent without widening its
+  mask or changing ownership; deployment checks the service identity's access
+  before stopping the running service, rejects symlink checkpoints, and allows
+  an absent checkpoint. Runtime diagnostics distinguish sanitized access,
+  storage I/O, and lock-contention reasons while publication retries and capture
+  continues. The focused cluster passed 148 tests with 2 skips; Sol accepted
+  the implementation. Keep this item open until live ACL repair and successful
+  publication recovery are verified; do not claim a syscall trace or cleared
+  publication backlog without that evidence.
 
 ## Release status
 
-Before the private-state fix, all local release gates passed: `just check` had
-no errors or warnings; `just crap-check` reported 2,555 passed, 2 skipped, and
-1,583 functions at CRAP 30 or below; `just unit` reported 2,555 passed and 2
-skipped; `just docker-build` passed; and `just runtime-smoke` reported healthy
-and `ok`, with its temporary container and network removed. PR #215's canonical
-CI gates also passed, including a fresh full 2,555-test run, CRAP, and Docker.
-The focused private-state fix below passed 128 tests in 1.16 seconds; `just
-check` passed before the final create-mode literal correction. Merge remains
-blocked pending a fresh CodeQL scan. No feature files from this change have
-been deployed; the live service remains at v0.11.15, so no release migration
-is needed. Release and deployment are not complete.
+PR #215 merged at `25ee0169096774ccb7d9422b30ba29cbdbbebf2d`; CI run
+`37958587738` and CodeQL passed with 2,556 tests and 2 skips. Main CI
+`37958945739` and CodeQL passed. Release PR #216 published `v0.11.16` at
+revision `0d7b7ed90b1dc6d3a84d25c7b36e788401d3d3ef` on 2026-10-09. The
+deployment wrapper exited successfully; that revision runs as PID 492997 with
+zero restarts and readiness confirmed using `/srv/pipelines/omi/config.toml`.
+The operational snapshot, confirmed-loss ledger, and collector lock are mode
+`0600`; the prior service stopped gracefully. The new finding 9 candidate is
+not merged or deployed. Its full local gates passed: `just check`, `just unit`
+(2,566 passed, 2 skipped), `just crap-check` (2,566 passed, 2 skipped; 1,585
+functions at CRAP 30 or below), `just docker-build`, and healthy/`ok`
+`just runtime-smoke`; its temporary container and network were removed. Live
+ACL repair and publication recovery remain unverified, so finding 9 is open.
 
 ## QA follow-up
 
@@ -143,10 +158,8 @@ wrapper remains `0755`.
   `0600`. The writer verifies regular-file ownership and obtains the exclusive
   lock before applying `fchmod` to the held descriptor. The writer and reader
   run as the same service UID. The focused permission and lifecycle tests
-  passed (128 tests in 1.16 seconds). Sol caught and corrected the final
-  create-mode literal to match the actual source mode. No directory or
-  audio/ready permissions changed and no query was suppressed. A fresh CodeQL
-  scan remains pending before merge.
+  passed (128 tests in 1.16 seconds). No directory or audio/ready permissions
+  changed and no query was suppressed. PR #215 CodeQL passed after the fix.
 
 ## Operational context
 

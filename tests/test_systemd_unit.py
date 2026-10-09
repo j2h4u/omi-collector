@@ -43,6 +43,8 @@ class _DeploymentScenario:
     busybox_tools: bool = False
     root_sealed_python_without_interpreter: bool = False
     versioned_python_alias: bool = False
+    service_work_traversable: bool = True
+    service_checkpoint_readable: bool = True
 
 
 _DEFAULT_SCENARIO = _DeploymentScenario()
@@ -72,6 +74,7 @@ class _DeploymentHarness:
     current_link: Path
     config_file: Path
     log: Path
+    publication_work_dir: Path
     environment: dict[str, str]
 
 
@@ -206,6 +209,31 @@ def test_installer_keeps_the_unit_and_config_targets_fixed() -> None:
     assert "/usr/local/sbin/omi-collector-status" in installer
     assert "/etc/sudoers.d/omi-collector-status" in installer
     assert "/usr/sbin/visudo -cf" in installer
+
+
+def test_installer_provisions_only_execute_access_to_existing_publication_work() -> None:
+    installer = _INSTALLER.read_text(encoding="utf-8")
+
+    assert 'publication_work_dir="${storage_root}/work"' in installer
+    assert "function provision_publication_checkpoint_traversal" in installer
+    assert '"$setfacl_bin" --no-mask --modify "u:${account_user}:--x" -- "$work_dir"' in installer
+    assert '"$runuser_bin" --user "$account_user" --group "$account_group" -- test -x "$work_dir"' in installer
+    assert 'if [[ ! -e "$work_dir" && ! -L "$work_dir" ]]; then' in installer
+    assert 'provision_publication_checkpoint_traversal "$publication_work_dir"' in installer
+    assert "--default" not in installer
+    assert 'install -d -- "$work_dir"' not in installer
+    assert 'chown -- "$work_dir"' not in installer
+
+
+def test_deployer_validates_publication_checkpoint_access_before_stopping_service() -> None:
+    deployer = _DEPLOYER.read_text(encoding="utf-8")
+
+    assert "publication_work_dir='/srv/pipelines/omi/work'" in deployer
+    assert "function validate_publication_checkpoint_access" in deployer
+    assert 'test -x "$work_dir"' in deployer
+    assert 'test -r "$checkpoint_file"' in deployer
+    assert 'if [[ -L "$checkpoint_file" ]]; then' in deployer
+    assert "Windmill may not have published its first checkpoint yet." in deployer
 
 
 def test_installer_stages_root_owned_release_deploy_material_with_rollback() -> None:
@@ -416,6 +444,8 @@ def _write_build_fakes(
     quoted_log = shlex.quote(str(context.log))
     quoted_source = shlex.quote(str(context.source_package))
     quoted_user = shlex.quote(context.build_user)
+    quoted_service_user = shlex.quote(context.account_user)
+    quoted_service_group = shlex.quote(context.account_group)
     alias_directory = "cpython-3.14-linux-x86_64-gnu"
     versioned_directory = "cpython-3.14.6-linux-x86_64-gnu"
     managed_python_directory = alias_directory if scenario.versioned_python_alias else "cpython-3.14"
@@ -476,6 +506,20 @@ def _write_build_fakes(
     (fake_bin / "runuser").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "runuser args=%s\\n" "$*" >> {quoted_log}\n'
+        f'if [[ "$1" == --user && "$2" == {quoted_service_user} && "$3" == --group '
+        f'&& "$4" == {quoted_service_group} && "$5" == -- ]]; then\n'
+        "    shift 5\n"
+        f'    printf "runuser service args=%s\\n" "$*" >> {quoted_log}\n'
+        '    if [[ "$1" == test && "$2" == -x ]]; then\n'
+        '        [[ "${DEPLOY_SERVICE_WORK_TRAVERSABLE:-1}" == 1 ]] || exit 1\n'
+        "        exit 0\n"
+        "    fi\n"
+        '    if [[ "$1" == test && "$2" == -r ]]; then\n'
+        '        [[ "${DEPLOY_SERVICE_CHECKPOINT_READABLE:-1}" == 1 ]] || exit 1\n'
+        "        exit 0\n"
+        "    fi\n"
+        "    exit 2\n"
+        "fi\n"
         f'[[ "$1" == --user && "$2" == {quoted_user} && "$3" == --group && "$4" == {shlex.quote(context.build_group)} && "$5" == -- ]] || exit 2\n'
         "shift 5\n"
         'exec "$@"\n',
@@ -694,6 +738,7 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
 def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT_SCENARIO) -> _DeploymentHarness:
     scripts_dir, source_package, installed_unit = _stage_harness_repository(tmp_path)
     context = _fake_command_context(tmp_path, source_package)
+    publication_work_dir = tmp_path / "pipeline" / "omi" / "work"
     _write_fake_commands(
         context,
         scenario,
@@ -704,6 +749,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
     replacements = (
         ("/etc/systemd/system/omi-collector.service", str(installed_unit)),
         ("/srv/pipelines/omi/config.toml", str(context.config_file)),
+        ("/srv/pipelines/omi/work", str(publication_work_dir)),
         ("/usr/local/bin/uv", str(context.fake_bin / "uv")),
         ("/var/lib/omi-collector-deployments/releases", str(context.deployments_dir)),
         (
@@ -734,6 +780,8 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "DEPLOY_BUILD_FAIL": "0",
         "DEPLOY_CONFIG_FAIL": "1" if scenario.config_check_failure else "0",
         "DEPLOY_METADATA_SYMLINK": "1" if scenario.metadata_symlink else "0",
+        "DEPLOY_SERVICE_WORK_TRAVERSABLE": "1" if scenario.service_work_traversable else "0",
+        "DEPLOY_SERVICE_CHECKPOINT_READABLE": "1" if scenario.service_checkpoint_readable else "0",
         "DEPLOY_SENTINEL": str(tmp_path / "metadata-sentinel"),
     }
     return _DeploymentHarness(
@@ -742,6 +790,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         current_link,
         context.config_file,
         context.log,
+        publication_work_dir,
         environment,
     )
 
@@ -787,9 +836,83 @@ def test_deployer_builds_validates_selects_and_seals_one_release(tmp_path: Path)
     assert "uv cwd=" in commands
     assert "args=sync --project" in commands
     assert "config check --config" in commands
+    assert "runuser service args=" not in commands
     assert "systemctl args=stop omi-collector.service" in commands
     assert "systemctl args=restart omi-collector.service" in commands
     assert f"config={harness.config_file}" in result.stdout
+
+
+def test_deployer_checks_existing_publication_checkpoint_as_service_before_stop(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path)
+    harness.publication_work_dir.mkdir(parents=True)
+    checkpoint = harness.publication_work_dir / "omi-ready-checkpoint.json"
+    checkpoint.write_text("{}\n", encoding="utf-8")
+
+    result = _run_deployer(harness)
+
+    assert result.returncode == 0, result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    service_checks = [line for line in commands.splitlines() if line.startswith("runuser service args=")]
+    assert service_checks == [
+        f"runuser service args=test -x {harness.publication_work_dir}",
+        f"runuser service args=test -r {checkpoint}",
+    ]
+    stop = commands.index("systemctl args=stop omi-collector.service")
+    assert all(commands.index(check) < stop for check in service_checks)
+
+
+def test_deployer_allows_existing_work_without_first_checkpoint(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path)
+    harness.publication_work_dir.mkdir(parents=True)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode == 0, result.stderr
+    service_checks = [
+        line
+        for line in harness.log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("runuser service args=")
+    ]
+    assert service_checks == [f"runuser service args=test -x {harness.publication_work_dir}"]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "error_message"),
+    [
+        (_DeploymentScenario(service_work_traversable=False), "cannot traverse publication work directory"),
+        (_DeploymentScenario(service_checkpoint_readable=False), "cannot read publication checkpoint"),
+    ],
+)
+def test_deployer_rejects_unreadable_publication_inputs_before_stopping_service(
+    tmp_path: Path, scenario: _DeploymentScenario, error_message: str
+) -> None:
+    harness = _deployment_harness(tmp_path, scenario)
+    harness.publication_work_dir.mkdir(parents=True)
+    (harness.publication_work_dir / "omi-ready-checkpoint.json").write_text("{}\n", encoding="utf-8")
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert error_message in result.stderr
+    assert "systemctl args=stop omi-collector.service" not in harness.log.read_text(encoding="utf-8")
+
+
+def test_deployer_rejects_symlinked_publication_checkpoint(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path)
+    harness.publication_work_dir.mkdir(parents=True)
+    checkpoint = harness.publication_work_dir / "omi-ready-checkpoint.json"
+    checkpoint_target = tmp_path / "checkpoint-target"
+    checkpoint_target.write_text("{}\n", encoding="utf-8")
+    checkpoint.symlink_to(checkpoint_target)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "publication checkpoint must not be a symlink" in result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    assert f"runuser service args=test -x {harness.publication_work_dir}" in commands
+    assert "runuser service args=test -r" not in commands
+    assert "systemctl args=stop omi-collector.service" not in commands
 
 
 def test_deployer_verifies_candidate_as_builder_before_root_seals_or_restarts(tmp_path: Path) -> None:

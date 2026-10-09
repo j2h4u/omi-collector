@@ -68,6 +68,37 @@ function validate_operator_config_file {
         || die "operator configuration must be root:root 0644: ${config_file}"
 }
 
+function validate_publication_checkpoint_access {
+    # args
+    local -r runuser_bin="$1" account_user="$2" account_group="$3" work_dir="$4"
+
+    # vars
+    local checkpoint_file
+
+    # code
+    checkpoint_file="${work_dir}/omi-ready-checkpoint.json"
+    if [[ -L "$work_dir" ]]; then
+        die "publication work path must not be a symlink: ${work_dir}"
+    fi
+    if [[ ! -e "$work_dir" ]]; then
+        return
+    fi
+    [[ -d "$work_dir" ]] || die "publication work path is not a directory: ${work_dir}"
+    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -x "$work_dir" \
+        || die "${account_user} cannot traverse publication work directory; rerun install-systemd-unit.sh: ${work_dir}"
+    if [[ -L "$checkpoint_file" ]]; then
+        die "publication checkpoint must not be a symlink: ${checkpoint_file}"
+    fi
+    if [[ ! -e "$checkpoint_file" ]]; then
+        # Windmill may not have published its first checkpoint yet.
+        return
+    fi
+    [[ -f "$checkpoint_file" ]] || die "publication checkpoint is not a regular file: ${checkpoint_file}"
+    # Windmill must preserve the checkpoint's read ACL when atomically replacing it.
+    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -r "$checkpoint_file" \
+        || die "${account_user} cannot read publication checkpoint: ${checkpoint_file}"
+}
+
 function ensure_build_account {
     # args
     local -r build_user="$1" build_group="$2" build_state_dir="$3" service_user="$4" service_group="$5"
@@ -425,7 +456,7 @@ function require_clean_source_tree {
         || die 'refusing deployment from a dirty source tree; commit, stash, or remove every change first'
 }
 
-declare script_dir repo_root source_package source_unit installed_unit config_file service_name
+declare script_dir repo_root source_package source_unit installed_unit config_file publication_work_dir service_name
 declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user account_group build_user build_group
 declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
@@ -443,6 +474,7 @@ source_package="${repo_root}/src/omi_collector"
 source_unit="${repo_root}/systemd/omi-collector.service"
 installed_unit='/etc/systemd/system/omi-collector.service'
 config_file='/srv/pipelines/omi/config.toml'
+publication_work_dir='/srv/pipelines/omi/work'
 service_name='omi-collector.service'
 uv_bin='/usr/local/bin/uv'
 sealer_python='/usr/bin/python3'
@@ -571,6 +603,7 @@ seal_managed_python "$python_install_dir" "$deployment_root" "$sealer_python" "$
 seal_deployment_environment "$staged_environment" "$deployments_dir" "$sealer_python" "$sealer_script" "$sealer_owner" \
     "$python_install_dir"
 write_release_metadata "$staged_environment" "$deployments_dir" "$source_revision"
+validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
 
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"

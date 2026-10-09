@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,7 +19,12 @@ import pytest
 from omi_collector.capture.adapters import staging_store as staging_store_module
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.adapters.ready_bundles import ConflictingOverlapError, ReadyOutcome, ReadyOutcomeState
+from omi_collector.capture.adapters.ready_bundles import (
+    ConflictingOverlapError,
+    ReadyBundleError,
+    ReadyOutcome,
+    ReadyOutcomeState,
+)
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -164,6 +171,160 @@ def test_repeated_retry_wakes_keep_the_absolute_deadline_and_one_effect(
     )
 
 
+def test_checkpoint_access_denial_is_diagnostic_and_ack_retry_self_heals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, backoff=0.02)
+    _draft(store, "only", 100)
+    store.append_ready_closure(101, "drained")
+    published = store.recover_and_publish().published[0]
+    checkpoint = tmp_path / "work" / "omi-ready-checkpoint.json"
+    checkpoint.parent.mkdir()
+    checkpoint.write_text(
+        dumps(
+            {
+                "analysis_cursor": None,
+                "vad_decisions": [],
+                "open_speech_tail": None,
+                "acknowledged": [{"bundle_id": published.bundle_id, "records_sha256": published.records_sha256}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    deny_checkpoint = [True]
+    original_lstat = Path.lstat
+
+    def deny_checkpoint_lstat(path: Path) -> os.stat_result:
+        if path == checkpoint and deny_checkpoint[0]:
+            raise PermissionError(errno.EACCES, "test access denied", str(path))
+        return original_lstat(path)
+
+    diagnostics: list[dict[str, object]] = []
+
+    def capture_diagnostic(event: str, *_args: object, **fields: object) -> None:
+        if event == "ready_publication_failure":
+            diagnostics.append(fields)
+
+    outcomes: list[ReadyOutcome] = []
+    retry_completed = Event()
+    original_recover = store.recover_and_publish
+
+    def observe_recovery() -> ReadyOutcome:
+        outcome = original_recover()
+        outcomes.append(outcome)
+        if len(outcomes) > 1:
+            retry_completed.set()
+        return outcome
+
+    monkeypatch.setattr(Path, "lstat", deny_checkpoint_lstat)
+    monkeypatch.setattr(staging_store_module, "debug_event", capture_diagnostic)
+    monkeypatch.setattr(store, "recover_and_publish", observe_recovery)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+
+    async def scenario() -> None:
+        await maintenance.ensure_publication_ready()
+        assert outcomes[0].state is ReadyOutcomeState.TRANSIENT
+        assert outcomes[0].reason == "publication_access_denied"
+        assert store.publication_retry_schedule() is not None
+        assert store.publication_wake_admitted()
+        assert published.path.exists()
+
+        deny_checkpoint[0] = False
+        assert await asyncio.to_thread(retry_completed.wait, 2)
+        await maintenance.close()
+
+    asyncio.run(scenario())
+
+    assert len(diagnostics) == 1
+    assert "logger" not in diagnostics[0]
+    assert diagnostics[0]["phase"] == "input_revision"
+    assert diagnostics[0]["error_type"] == "PermissionError"
+    assert diagnostics[0]["errno"] == errno.EACCES
+    assert diagnostics[0]["path"] == str(checkpoint)
+    assert outcomes[1].state is ReadyOutcomeState.WAITING
+    assert outcomes[1].reason == "ack_retired"
+    assert not published.path.exists()
+    assert store.publication_retry_schedule() is None
+
+
+def test_publication_effect_access_denial_has_typed_retry_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    _draft(store, "only", 100)
+    store.append_ready_closure(101, "drained")
+    failure_path = tmp_path / "protected" / "checkpoint.json"
+
+    def fail_effect() -> ReadyOutcome:
+        raise PermissionError(errno.EACCES, "test access denied", str(failure_path))
+
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", fail_effect)
+    diagnostics: list[dict[str, object]] = []
+
+    def capture_diagnostic(event: str, *_args: object, **fields: object) -> None:
+        if event == "ready_publication_failure":
+            diagnostics.append(fields)
+
+    monkeypatch.setattr(staging_store_module, "debug_event", capture_diagnostic)
+
+    outcome = store.recover_and_publish()
+
+    assert outcome.state is ReadyOutcomeState.TRANSIENT
+    assert outcome.reason == "publication_access_denied"
+    assert store.publication_retry_schedule() is not None
+    assert len(diagnostics) == 1
+    assert "logger" not in diagnostics[0]
+    assert diagnostics[0]["phase"] == "publication_effect"
+    assert diagnostics[0]["error_type"] == "PermissionError"
+    assert diagnostics[0]["errno"] == errno.EACCES
+    assert diagnostics[0]["path"] == str(failure_path)
+
+
+def test_secondary_revision_access_denial_preserves_effect_error_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    failure_path = tmp_path / "protected" / "checkpoint.json"
+    revision_calls = [0]
+    original_revision = store._publication_revision
+
+    def fail_after_initial_revision() -> tuple[tuple[str, int, int, int, int, int], ...]:
+        revision_calls[0] += 1
+        if revision_calls[0] > 1:
+            raise PermissionError(errno.EACCES, "test access denied", str(failure_path))
+        return original_revision()
+
+    def fail_effect() -> ReadyOutcome:
+        raise ReadyBundleError("controlled publication failure")
+
+    monkeypatch.setattr(store, "_publication_revision", fail_after_initial_revision)
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", fail_effect)
+    diagnostics: list[dict[str, object]] = []
+
+    def capture_diagnostic(event: str, *_args: object, **fields: object) -> None:
+        if event == "ready_publication_failure":
+            diagnostics.append(fields)
+
+    monkeypatch.setattr(staging_store_module, "debug_event", capture_diagnostic)
+
+    outcome = store.recover_and_publish()
+
+    assert outcome.state is ReadyOutcomeState.TRANSIENT
+    assert outcome.reason == "publication_access_denied"
+    assert store.publication_retry_schedule() is not None
+    assert [diagnostic["phase"] for diagnostic in diagnostics] == [
+        "publication_effect",
+        "post_effect_revision",
+        "input_revision",
+    ]
+    assert diagnostics[0]["error_type"] == "ReadyBundleError"
+    assert diagnostics[0]["errno"] is None
+    assert diagnostics[1]["error_type"] == "PermissionError"
+    assert diagnostics[1]["errno"] == errno.EACCES
+    assert diagnostics[1]["path"] == str(failure_path)
+
+
 @dataclass
 class _RetryScenario:
     store: StagingStore
@@ -180,7 +341,9 @@ async def _exercise_retry_deadline(scenario: _RetryScenario) -> None:
     counts, clock = scenario.counts, scenario.clock
     backoff, attempts, ready_root = scenario.backoff, scenario.attempts, scenario.ready_root
     clock[0] = asyncio.get_running_loop().time()
-    assert store.recover_and_publish().state is ReadyOutcomeState.TRANSIENT
+    first = store.recover_and_publish()
+    assert first.state is ReadyOutcomeState.TRANSIENT
+    assert first.reason == "publication_lock_busy"
     schedule = store.publication_retry_schedule()
     assert schedule is not None
     generation, deadline = schedule

@@ -280,7 +280,7 @@ def _write_snapshot(path: Path, payload: bytes) -> None:
         path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         with os.fdopen(descriptor, "wb") as stream:
-            os.fchmod(stream.fileno(), 0o640)
+            os.fchmod(stream.fileno(), 0o600)
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -303,14 +303,16 @@ def _acquire_writer_lease(path: Path) -> int:
         descriptor = os.open(
             path,
             os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o640,
+            0o600,
         )
     except OSError as error:
         raise OperationalStatusError("operational status writer lease is unsafe or unavailable") from error
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
             raise OperationalStatusError("operational status writer lease is unsafe")
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.fchmod(descriptor, 0o600)
     except OSError as error:
         os.close(descriptor)
         if error.errno in {errno.EACCES, errno.EAGAIN}:

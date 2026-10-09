@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ def test_ledger_retries_are_idempotent_and_existing_facts_are_retained(tmp_path:
     assert facts[0].occurred_at == OCCURRED_AT
     assert facts[0].missing_record_count == 10
     assert facts[0].missing_raw_bytes == 10 * RECORD_SIZE
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_missing_ledger_after_initialization_fails_closed(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import stat
 from itertools import product
 from pathlib import Path
 
@@ -75,6 +76,21 @@ def test_snapshot_writes_only_for_state_or_identity_changes(tmp_path: Path, monk
 
     store.update(OperationalDimension.QUALITY, OperationalSignal.CLEAR)
     assert len(writes) == 2
+
+
+def test_snapshot_and_existing_writer_lease_are_owner_only(tmp_path: Path) -> None:
+    path = tmp_path / "operational-status.json"
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o640)
+
+    store = OperationalStatusStore(path, OperationalIdentity(BOOT, INVOCATION))
+    try:
+        store.initialize()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("payload", [b"{", b"{}", b" " * 8_193])

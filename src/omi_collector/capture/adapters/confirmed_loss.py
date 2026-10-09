@@ -141,7 +141,7 @@ class ConfirmedLossLedger:
             target.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
             descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
             with os.fdopen(descriptor, "wb") as stream:
-                os.fchmod(stream.fileno(), 0o640)
+                os.fchmod(stream.fileno(), 0o600)
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())

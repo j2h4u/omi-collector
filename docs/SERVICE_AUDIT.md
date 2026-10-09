@@ -102,14 +102,17 @@ accepted.
 
 ## Release status
 
-All local release gates pass: final `just check` had no errors or warnings;
-`just crap-check` reported 2,555 passed, 2 skipped, and 1,583 functions at
-CRAP 30 or below; `just unit` reported 2,555 passed and 2 skipped;
-`just docker-build` passed; and `just runtime-smoke` reported healthy and
-`ok`. The temporary smoke container and network were removed. After these
-production gates, only test code changed to fix the transient publication
-retry flake; its exact test and module passed as recorded below, with
-production sources unchanged. Merge and deployment remain pending.
+Before the private-state fix, all local release gates passed: `just check` had
+no errors or warnings; `just crap-check` reported 2,555 passed, 2 skipped, and
+1,583 functions at CRAP 30 or below; `just unit` reported 2,555 passed and 2
+skipped; `just docker-build` passed; and `just runtime-smoke` reported healthy
+and `ok`, with its temporary container and network removed. PR #215's canonical
+CI gates also passed, including a fresh full 2,555-test run, CRAP, and Docker.
+The focused private-state fix below passed 128 tests in 1.16 seconds; `just
+check` passed before the final create-mode literal correction. Merge remains
+blocked pending a fresh CodeQL scan. No feature files from this change have
+been deployed; the live service remains at v0.11.15, so no release migration
+is needed. Release and deployment are not complete.
 
 ## QA follow-up
 
@@ -133,6 +136,17 @@ wrapper remains `0755`.
   extra follow-up sequence. Sol accepted the test-only fix; the full quarantine
   module passed 60 tests in 1.30 seconds and the exact test passed in 0.47
   seconds. Production sources were unchanged.
+- [x] **Operational state files must be private to the service account.**
+  CodeQL reported a high-severity group-readable lock file at
+  `src/omi_collector/capture/adapters/operational_status.py:303`. The snapshot,
+  writer lock, and confirmed-loss ledger are private to the service UID at mode
+  `0600`. The writer verifies regular-file ownership and obtains the exclusive
+  lock before applying `fchmod` to the held descriptor. The writer and reader
+  run as the same service UID. The focused permission and lifecycle tests
+  passed (128 tests in 1.16 seconds). Sol caught and corrected the final
+  create-mode literal to match the actual source mode. No directory or
+  audio/ready permissions changed and no query was suppressed. A fresh CodeQL
+  scan remains pending before merge.
 
 ## Operational context
 

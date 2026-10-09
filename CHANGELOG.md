@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.16](https://github.com/j2h4u/omi-collector/compare/v0.11.15...v0.11.16) (2026-10-09)
+
+
+### Fixes
+
+* enforce capture and audit lifecycle invariants ([86c24be](https://github.com/j2h4u/omi-collector/commit/86c24be746903d4dc0a9766583877bdfe92e5452))
+
 ## [0.11.15](https://github.com/j2h4u/omi-collector/compare/v0.11.14...v0.11.15) (2026-10-08)
 
 

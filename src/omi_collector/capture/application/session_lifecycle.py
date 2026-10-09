@@ -207,7 +207,7 @@ class SessionLifecycleCallbacks:
     drained_result: Callable[[], collector.CollectResult]
     observe_info: Callable[[RingInfo], object] | None = None
     durable_progress_query: Callable[[], int] | None = None
-    close_visit: Callable[[str], Awaitable[None]] | None = None
+    close_visit: Callable[[str, int | None], Awaitable[None]] | None = None
     load_recovery: Callable[[], Awaitable[VisitRecoveryDisposition]] | None = None
     invalidate_recovery: Callable[[], None] | None = None
     enter_capture_priority: Callable[[], Awaitable[None]] | None = None
@@ -250,6 +250,7 @@ class SessionLifecycle:
         self._pending_wake: PresenceWake | None = None
         self._direct_retry = 0
         self._pending_presence_outcome: CleanDrain | None = None
+        self._pending_drain_cursor: int | None = None
 
     async def run_direct(self) -> collector.CollectResult:
         return await self._run_visit_machine(with_presence=False)
@@ -323,7 +324,7 @@ class SessionLifecycle:
         if isinstance(command, RunAttempt):
             return SessionFinished(await self._attempt_visit(with_presence=with_presence))
         if isinstance(command, CommitClosure):
-            await self._close_visit(command.reason)
+            await self._close_visit(command.reason, command.drain_cursor)
             invalidate = self.run.callbacks.invalidate_recovery
             if command.reason == "restart_interrupted" and invalidate is not None:
                 invalidate()
@@ -359,11 +360,13 @@ class SessionLifecycle:
     async def _attempt_visit(self, *, with_presence: bool) -> SessionOutcome:
         completed_before = self.run.callbacks.completed_batch_query()
         progress_before = self._durable_progress()
+        self._pending_drain_cursor = None
         outcome = await self._run_one_attempt(with_presence)
         durable_progress = (
             self.run.callbacks.completed_batch_query() > completed_before or self._durable_progress() > progress_before
         )
-        event = self._session_event(outcome, durable_progress)
+        drain_cursor = self._pending_drain_cursor if outcome == "drained" else None
+        event = self._session_event(outcome, durable_progress, drain_cursor)
         if isinstance(event, DrainConfirmed):
             self._pending_presence_outcome = CleanDrain() if with_presence else None
             self._direct_retry = 0
@@ -422,10 +425,14 @@ class SessionLifecycle:
 
     @staticmethod
     def _session_event(
-        outcome: str, durable_progress: bool
+        outcome: str, durable_progress: bool, drain_cursor: int | None = None
     ) -> DrainConfirmed | Interrupted | MachineCandidateUnavailable | OperatorBatchCompleted:
         if outcome == "drained":
-            return DrainConfirmed()
+            if drain_cursor is None:
+                raise RuntimeError("drained session lacks its confirmed cursor")
+            return DrainConfirmed(drain_cursor)
+        if drain_cursor is not None:
+            raise RuntimeError("nondrained session carries a confirmed drain cursor")
         if outcome == "collected":
             return OperatorBatchCompleted()
         if outcome == "candidate_unavailable":
@@ -452,10 +459,10 @@ class SessionLifecycle:
             if presence is None:
                 await sleep(self.run.options.sleep, cooldown)
 
-    async def _close_visit(self, reason: str) -> None:
+    async def _close_visit(self, reason: str, drain_cursor: int | None) -> None:
         callback = self.run.callbacks.close_visit
         if callback is not None:
-            await callback(reason)
+            await callback(reason, drain_cursor)
 
     def _durable_progress(self) -> int:
         query = self.run.callbacks.durable_progress_query
@@ -586,6 +593,10 @@ class SessionLifecycle:
             if outcome not in ("drained", "collected"):
                 machine = transition_session(machine, ReadResolved("pending"))
                 continue
+            if outcome == "drained":
+                if current is None or current.read_sequence != current.write_sequence:
+                    raise RuntimeError("drained session lacks a fresh empty-ring cursor")
+                self._pending_drain_cursor = current.read_sequence
             if current is not None:
                 await self._refresh_battery(session, current, phase)
             machine = transition_session(machine, ReadResolved(cast(Literal["drained", "collected"], outcome)))

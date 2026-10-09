@@ -928,7 +928,7 @@ def test_transient_publication_retry_settles_and_clears_schedule(
     async def scenario() -> None:
         config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.01,)))
         store = _publication_store(tmp_path, config=config)
-        retried = threading.Event()
+        settled = asyncio.Event()
         calls = 0
         events: list[tuple[str, str | None]] = []
 
@@ -937,15 +937,22 @@ def test_transient_publication_retry_settles_and_clears_schedule(
             calls += 1
             if calls == 1:
                 return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
-            retried.set()
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="idle")
 
         monkeypatch.setattr(store, "_recover_and_publish_unlocked", recover_and_publish)
         runtime = OpportunisticRuntime()
+
+        def record_event(event: str, **fields: object) -> None:
+            reason = fields.get("reason")
+            assert isinstance(reason, str)
+            events.append((event, reason))
+            if event == "ready_publication_waiting":
+                settled.set()
+
         monkeypatch.setattr(
             runtime,
             "debug_event",
-            lambda event, **fields: events.append((event, fields.get("reason"))),
+            record_event,
         )
         maintenance = QuarantineMaintenance(store, None, runtime, config=config)
         try:
@@ -953,10 +960,7 @@ def test_transient_publication_retry_settles_and_clears_schedule(
             assert calls == 1
             assert store.publication_retry_schedule() is not None
 
-            assert await asyncio.to_thread(retried.wait, 5)
-            retry = maintenance._publication_retry_task
-            assert retry is not None
-            await retry
+            await asyncio.wait_for(settled.wait(), timeout=5)
 
             assert calls == 2
             assert store.publication_retry_schedule() is None

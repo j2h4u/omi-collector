@@ -37,6 +37,7 @@ class Command(StrEnum):
     CLOSE = "close"
     RETIRE = "retire"
     KEEP = "keep"
+    REJECT = "reject"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,10 +53,22 @@ _TRANSITIONS = {
     (Milestone.SEALED, Event.WRITER_CLOSED): Transition(Milestone.RETIRED, Command.RETIRE),
 }
 _CURSOR_COMMANDS = {
-    (Event.FRESH_INFO, action): Command.ADVANCE if action is CursorAction.REPEAT else Command.CLOSE
+    (Event.FRESH_INFO, action): (
+        Command.ADVANCE
+        if action is CursorAction.REPEAT
+        else Command.REJECT
+        if action in (CursorAction.REGRESSED, CursorAction.EXPIRED)
+        else Command.CLOSE
+    )
     for action in CursorAction
 } | {
-    (Event.ADVANCE_ACK_INFO, action): Command.KEEP if action is CursorAction.REPEAT else Command.CLOSE
+    (Event.ADVANCE_ACK_INFO, action): (
+        Command.KEEP
+        if action is CursorAction.REPEAT
+        else Command.REJECT
+        if action in (CursorAction.REGRESSED, CursorAction.EXPIRED)
+        else Command.CLOSE
+    )
     for action in CursorAction
 }
 

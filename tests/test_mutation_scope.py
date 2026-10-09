@@ -43,26 +43,6 @@ def control_job(tmp_path: Path) -> Generator[tuple[Path, mutation_scope.OwnerCon
         server.stop()
 
 
-@pytest.fixture(autouse=True)
-def _bounded_owner_control_io(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
-    handler_threads: list[threading.Thread] = []
-    real_handle = mutation_scope.OwnerControlServer._handle
-
-    def bounded_handle(server: mutation_scope.OwnerControlServer, connection: socket.socket) -> None:
-        connection.settimeout(2.0)
-        handler_threads.append(threading.current_thread())
-        real_handle(server, connection)
-
-    monkeypatch.setattr(mutation_scope, "PAUSE_ACK_SECONDS", 5.0)
-    monkeypatch.setattr(mutation_scope.OwnerControlServer, "_handle", bounded_handle)
-    try:
-        yield
-    finally:
-        for handler in handler_threads:
-            handler.join(timeout=5.0)
-            assert not handler.is_alive(), "owner control handler survived its bounded join"
-
-
 def _select_test_job(monkeypatch: pytest.MonkeyPatch, job: Path) -> None:
     monkeypatch.setattr(mutation_scope, "select_job", lambda **_: job)
 
@@ -146,6 +126,184 @@ def test_pause_fails_closed_when_owner_cannot_confirm_cleanup(
     assert mutation_scope.main(["pause"]) == 1
 
     assert "could not verify a safe checkpoint stop" in capsys.readouterr().err
+
+
+def test_owner_control_shutdown_closes_silent_client_and_joins_handler(
+    control_job: tuple[Path, mutation_scope.OwnerControlServer],
+) -> None:
+    _job, server = control_job
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(server.socket_path))
+    with server._changed:
+        assert server._changed.wait_for(lambda: "reading" in server._connections.values(), timeout=2)
+
+    server.stop()
+
+    assert client.recv(1) == b""
+    assert not server._connections
+    assert all(not handler.is_alive() for handler in server._handlers.values())
+    client.close()
+
+
+def test_owner_control_shutdown_joins_handlers_when_listener_close_raises(
+    control_job: tuple[Path, mutation_scope.OwnerControlServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _job, server = control_job
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(server.socket_path))
+    with server._changed:
+        assert server._changed.wait_for(lambda: "reading" in server._connections.values(), timeout=2)
+    assert server.listener is not None
+    listener = server.listener
+
+    class ListenerCloseFailure:
+        def accept(self) -> tuple[socket.socket, str]:
+            return listener.accept()
+
+        def close(self) -> None:
+            listener.close()
+            raise OSError("injected listener close failure")
+
+    monkeypatch.setattr(server, "listener", cast(socket.socket, ListenerCloseFailure()))
+    with pytest.raises(mutation_scope.ScopeError, match="could not close mutation control listener"):
+        server.stop()
+
+    assert client.recv(1) == b""
+    assert not server._connections
+    assert all(not handler.is_alive() for handler in server._handlers.values())
+    monkeypatch.setattr(server, "listener", listener)
+    client.close()
+
+
+def test_owner_control_shutdown_reports_handler_past_shared_deadline(
+    control_job: tuple[Path, mutation_scope.OwnerControlServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _job, server = control_job
+    monkeypatch.setattr(mutation_scope, "PAUSE_ACK_SECONDS", 1.0)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def blocked_pause() -> bool:
+        callback_entered.set()
+        release_callback.wait()
+        return True
+
+    server.pause_requester = blocked_pause
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(server.socket_path))
+    client.sendall(b'{"action":"pause","token":"test-run-token"}\n')
+    assert callback_entered.wait(timeout=2)
+
+    try:
+        with pytest.raises(mutation_scope.ScopeError, match="did not stop before deadline"):
+            server.stop()
+        assert not server.socket_path.exists()
+        assert any(handler.is_alive() for handler in server._handlers.values())
+    finally:
+        release_callback.set()
+        for handler in server._handlers.values():
+            handler.join(timeout=2)
+        client.close()
+
+
+def test_owner_control_shutdown_allows_dispatching_pause_to_acknowledge(
+    control_job: tuple[Path, mutation_scope.OwnerControlServer],
+) -> None:
+    _job, server = control_job
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    stop_entered = threading.Event()
+    stop_errors: list[Exception] = []
+
+    def blocked_pause() -> bool:
+        callback_entered.set()
+        release_callback.wait()
+        return True
+
+    def stop_server() -> None:
+        stop_entered.set()
+        try:
+            server.stop()
+        except mutation_scope.ScopeError as exc:
+            stop_errors.append(exc)
+
+    server.pause_requester = blocked_pause
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(2)
+    client.connect(str(server.socket_path))
+    client.sendall(b'{"action":"pause","token":"test-run-token"}\n')
+    assert callback_entered.wait(timeout=2)
+    stopper = threading.Thread(target=stop_server)
+    stopper.start()
+    assert stop_entered.wait(timeout=2)
+    with server._changed:
+        assert server._changed.wait_for(lambda: server._lifecycle == "stopping", timeout=2)
+    release_callback.set()
+    response = _read_json_object_from_text(client.recv(mutation_scope.MAX_CONTROL_BYTES).decode())
+    stopper.join(timeout=2)
+    client.close()
+
+    assert response["ok"] is True
+    assert response["state"] == "paused"
+    assert not stop_errors
+    assert not stopper.is_alive()
+
+
+def test_owner_control_read_deadline_is_absolute_during_slow_drip(
+    control_job: tuple[Path, mutation_scope.OwnerControlServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _job, server = control_job
+    pause_calls: list[bool] = []
+    server.pause_requester = lambda: pause_calls.append(True) or True
+    monkeypatch.setattr(mutation_scope, "CONTROL_READ_SECONDS", 0.3)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(2)
+    client.connect(str(server.socket_path))
+    client.sendall(b'{"token":')
+
+    def drip() -> None:
+        threading.Event().wait(0.2)
+        with suppress(OSError):
+            client.sendall(b'"test-run-token",')
+        threading.Event().wait(0.2)
+        with suppress(OSError):
+            client.sendall(b'"action":"pause"}\n')
+
+    dripper = threading.Thread(target=drip)
+    dripper.start()
+    response = client.recv(mutation_scope.MAX_CONTROL_BYTES)
+    dripper.join(timeout=2)
+
+    assert b'"ok": false' in response
+    assert pause_calls == []
+    client.close()
+
+
+def test_owner_control_caps_concurrent_silent_clients(
+    control_job: tuple[Path, mutation_scope.OwnerControlServer],
+) -> None:
+    _job, server = control_job
+    clients: list[socket.socket] = []
+    try:
+        for _ in range(mutation_scope.MAX_CONTROL_HANDLERS + 3):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(2)
+            client.connect(str(server.socket_path))
+            clients.append(client)
+        with server._changed:
+            assert server._changed.wait_for(
+                lambda: len(server._connections) == mutation_scope.MAX_CONTROL_HANDLERS,
+                timeout=2,
+            )
+        assert len(server._handlers) <= mutation_scope.MAX_CONTROL_HANDLERS
+        assert all(client.recv(1) == b"" for client in clients[mutation_scope.MAX_CONTROL_HANDLERS :])
+    finally:
+        server.stop()
+        for client in clients:
+            client.close()
 
 
 def test_stale_token_cannot_signal_an_unrelated_live_process(

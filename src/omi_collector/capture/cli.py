@@ -36,6 +36,7 @@ from .application.opportunistic_sync import (
 from .application.presence import PresencePolicy, PresenceScheduler
 from .application.ring_transport import CandidateUnavailableError, RingSession
 from .application.session_lifecycle import ActivityEvent, OpportunisticOptions, RetryPolicy
+from .domain.operational_status_machine import OperationalSignal, PublicationOutcome
 from .domain.ring_protocol import RingInfo, RingStatus
 
 MAX_RECORDS = DEFAULT_CONFIG.service.max_records
@@ -264,6 +265,8 @@ async def sync(  # noqa: PLR0913
     link_terminal_callback: Callable[[dict[str, object]], object] | None = None,
     debug_logger: logging.Logger | None = None,
     config: CollectorConfig = DEFAULT_CONFIG,
+    operational_quality_signal: Callable[[OperationalSignal], None] | None = None,
+    record_publication: Callable[[PublicationOutcome], None] | None = None,
 ) -> collector.CollectResult:
     """Run until cancelled, draining RAM-admitted batches while the pendant is near.
 
@@ -327,15 +330,21 @@ async def sync(  # noqa: PLR0913
         activity=_activity_callback(progress),
         operational=_operational_callback(progress),
         presence=presence,
-        quality_metrics=_quality_metrics(staging, config, debug_logger),
+        quality_metrics=_quality_metrics(staging, config, debug_logger, operational_signal=operational_quality_signal),
         phy_policy="force_1m" if force_1m else "auto",
         config=config,
     )
-    return await run_opportunistic_collector(provider, staging, options, runtime=OpportunisticRuntime())
+    return await run_opportunistic_collector(
+        provider, staging, options, runtime=OpportunisticRuntime(record_publication)
+    )
 
 
 def _quality_metrics(
-    staging: StagingStore, config: CollectorConfig, debug_logger: logging.Logger | None = None
+    staging: StagingStore,
+    config: CollectorConfig,
+    debug_logger: logging.Logger | None = None,
+    *,
+    operational_signal: Callable[[OperationalSignal], None] | None = None,
 ) -> JsonlQualityMetrics | None:
     """Build auxiliary evidence storage without making capture depend on it."""
     from .adapters.debug_logging import debug_event, debug_exception
@@ -348,9 +357,13 @@ def _quality_metrics(
             config=config.observability.quality_metrics,
             diagnostic_logger=debug_logger,
         )
+        if operational_signal is not None:
+            metrics.set_operational_signal(operational_signal)
         debug_event("quality_metrics_ready", logger=debug_logger)
         return metrics
     except Exception as error:  # noqa: BLE001 - provenance/journal setup is auxiliary
+        if operational_signal is not None:
+            operational_signal(OperationalSignal.BLOCK)
         debug_exception("quality_metrics_configuration_error", error, logger=debug_logger)
         return None
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from typing import TypeAliasType, cast, get_args, get_type_hints
 
 import pytest
 
@@ -105,6 +106,43 @@ def test_declared_work_states_admit_only_the_expected_wake_action() -> None:
             and event.now < state.work.deadline
         ):
             assert command.deadline == state.work.deadline, name
+
+
+def test_publication_event_work_and_result_inventories_are_explicit() -> None:
+    event_types = {
+        Wake,
+        InputChanged,
+        Finished,
+        TimerFired,
+        CaptureBegin,
+        CaptureEnd,
+        Shutdown,
+        Quiesced,
+    }
+    production_events = _type_alias_members(cast(TypeAliasType, PublicationEvent))
+    production_work = set(get_args(get_type_hints(PublicationState)["work"]))
+
+    assert production_events == event_types
+    assert production_work == {Idle, Running, Settled, RetryWait}
+    assert {type(event) for event in _matrix_events(object())} == production_events
+    assert {type(work) for _name, work in _matrix_work_phases(object())} == production_work
+    assert tuple(PublicationResult) == (PublicationResult.SETTLED, PublicationResult.TRANSIENT)
+
+    with pytest.raises(ValueError, match="unsupported publication event"):
+        publication_transition(PublicationState(), cast(PublicationEvent, object()))
+    running = PublicationState(work=Running(1, "rev", 0), next_token=1)
+    with pytest.raises(ValueError, match="unsupported publication result"):
+        publication_transition(running, Finished(1, "rev", object(), cast(PublicationResult, "future"), 1.0))
+
+
+def _type_alias_members(alias: TypeAliasType) -> set[type[object]]:
+    members = cast(tuple[object, ...], get_args(cast(object, alias.__value__)))
+    assert members
+    result: set[type[object]] = set()
+    for member in members:
+        assert isinstance(member, type)
+        result.add(cast(type[object], member))
+    return result
 
 
 def _matrix_events(outcome: object) -> tuple[PublicationEvent, ...]:

@@ -19,6 +19,7 @@ from ..application.ports import (
     StagingPort,
     StagingWriterTargetPort,
 )
+from ..domain.operational_status_machine import PublicationOutcome
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .attempt_writer import AttemptWriter, WriterError, WriterFailedError, WriterProgress
 from .clock_corrections import ClockCorrectionStore
@@ -160,6 +161,9 @@ class _BatchWriter:
 class OpportunisticRuntime(CaptureRuntimePort):
     """Compose the existing capture adapters for one application run."""
 
+    def __init__(self, record_publication: Callable[[PublicationOutcome], None] | None = None) -> None:
+        self._record_publication = record_publication
+
     def make_batch_writer(  # noqa: PLR0913 - transfer intent values stay explicit
         self,
         staging: StagingPort,
@@ -221,6 +225,15 @@ class OpportunisticRuntime(CaptureRuntimePort):
         return isinstance(error, DeviceAlreadyRunningError)
 
     def debug_event(self, event: str, **fields: object) -> None:
+        if self._record_publication is not None:
+            if event == "ready_publication_blocked":
+                self._record_publication(PublicationOutcome.BLOCKED)
+            elif event == "ready_publication_published":
+                self._record_publication(PublicationOutcome.PUBLISHED)
+            elif event == "ready_publication_transient":
+                self._record_publication(PublicationOutcome.TRANSIENT)
+            elif event == "ready_publication_waiting":
+                self._record_publication(PublicationOutcome.WAITING)
         cast(Callable[..., None], debug_event)(event, **fields)
 
     def debug_exception(self, event: str, error: BaseException, **fields: object) -> None:

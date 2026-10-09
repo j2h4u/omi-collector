@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+_CLOSURE_ENTRY_FIELDS = 2
+
 
 class ReadyState(StrEnum):
     WAITING_FOR_DRAIN = "waiting_for_drain"
@@ -32,6 +34,63 @@ def decide_ready(*, drained: bool, has_audio: bool, threshold_met: bool) -> Read
     if not has_audio or not threshold_met:
         return ReadyDecision(ReadyState.WAITING_FOR_THRESHOLD, ReadyCommand.WAIT)
     return ReadyDecision(ReadyState.READY_TO_PUBLISH, ReadyCommand.PUBLISH)
+
+
+def recovered_closure(
+    *,
+    existing: tuple[int, str] | None,
+    recovered_frontier: int | None,
+    reason: str,
+    drain_cursor: int | None,
+) -> tuple[int, str] | None:
+    """Merge authenticated recovery evidence without regressing a closure."""
+    cursor = _validate_recovered_closure(existing, recovered_frontier, reason, drain_cursor)
+    if recovered_frontier is None:
+        return None
+    if reason == "drained" and cursor is not None and cursor < recovered_frontier:
+        raise ValueError("confirmed drain cursor does not cover the recovered closure frontier")
+    if existing is None:
+        return recovered_frontier, reason
+    existing_frontier, existing_reason = existing
+    if recovered_frontier > existing_frontier:
+        return recovered_frontier, reason
+    if recovered_frontier < existing_frontier:
+        return (existing_frontier, reason) if reason == "drained" else None
+    if existing_reason == "drained" or reason != "drained":
+        return None
+    return existing_frontier, reason
+
+
+def _validate_recovered_closure(
+    existing: tuple[int, str] | None, recovered_frontier: int | None, reason: str, drain_cursor: int | None
+) -> int | None:
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("recovery closure reason is invalid")
+    existing_frontier = _validate_closure_entry(existing)
+    if recovered_frontier is not None and (type(recovered_frontier) is not int or recovered_frontier < 0):
+        raise ValueError("recovery closure frontier must be a nonnegative integer")
+    if reason != "drained":
+        if drain_cursor is not None:
+            raise ValueError("only a drained recovery closure may carry a confirmed cursor")
+        return None
+    if type(drain_cursor) is not int or drain_cursor < 0:
+        raise ValueError("a drained recovery closure requires its confirmed cursor")
+    if existing_frontier is not None and drain_cursor < existing_frontier:
+        raise ValueError("confirmed drain cursor does not cover the existing closure frontier")
+    return drain_cursor
+
+
+def _validate_closure_entry(existing: tuple[int, str] | None) -> int | None:
+    if existing is None:
+        return None
+    if not isinstance(existing, tuple) or len(existing) != _CLOSURE_ENTRY_FIELDS:
+        raise ValueError("existing closure must contain one frontier and reason")
+    frontier, reason = existing
+    if type(frontier) is not int or frontier < 0:
+        raise ValueError("recovery closure frontier must be a nonnegative integer")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("existing closure reason is invalid")
+    return frontier
 
 
 class PublicationMode(StrEnum):
@@ -157,7 +216,9 @@ def publication_transition(
         return _finished(state, event)
     if isinstance(event, TimerFired):
         return _timer(state, event)
-    return _lifecycle(state, event)
+    if isinstance(event, (InputChanged, CaptureBegin, CaptureEnd, Shutdown, Quiesced)):
+        return _lifecycle(state, event)
+    raise ValueError(f"unsupported publication event: {type(event).__name__}")
 
 
 def _lifecycle(
@@ -207,8 +268,12 @@ def _finished(state: PublicationState, event: Finished) -> tuple[PublicationStat
             state.next_token,
         )
         return updated, PublicationCommand(PublicationAction.ARM, deadline=deadline)
-    updated = PublicationState(state.mode, Settled(event.revision, event.outcome), state.generation, state.next_token)
-    return updated, PublicationCommand()
+    if event.result is PublicationResult.SETTLED:
+        updated = PublicationState(
+            state.mode, Settled(event.revision, event.outcome), state.generation, state.next_token
+        )
+        return updated, PublicationCommand()
+    raise ValueError(f"unsupported publication result: {event.result!r}")
 
 
 def _timer(state: PublicationState, event: TimerFired) -> tuple[PublicationState, PublicationCommand]:

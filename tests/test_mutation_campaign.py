@@ -9,18 +9,27 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from io import StringIO
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, Unpack, cast
 
 import pytest
 from scripts import mutation_campaign
 
 _REAL_RMTREE = shutil.rmtree
+
+
+class _RunOptions(TypedDict, total=False):
+    cwd: str | os.PathLike[str] | None
+    env: Mapping[str, str] | None
+    check: bool
+    capture_output: bool
+    text: bool | None
 
 
 @pytest.fixture
@@ -351,6 +360,8 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
     owner_calls: list[tuple[Path, str, str]] = []
 
     def sync(job_root: Path, _environment: dict[str, str] | None = None) -> None:
+        receipt = _read_json_object(job_root / mutation_campaign.OWNER_FILE)
+        assert receipt["state"] == "preparing"
         sync_calls.append(job_root)
 
     def owner(job_root: Path, mode: str, token: str, **kwargs: object) -> int:
@@ -390,6 +401,383 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
     assert owner_calls == [(jobs[0], "fresh", json.loads((jobs[0] / "owner.json").read_text())["run_token"])]
     assert (repo / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o775
     assert (repo / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o664
+
+
+def _raise_in_test(error: Exception) -> None:
+    raise error
+
+
+def _inject_fresh_bootstrap_failure(stage: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_run = subprocess.run
+
+    if stage != "sync":
+
+        def sync(job_root: Path, environment: dict[str, str] | None = None) -> None:
+            assert environment is not None and mutation_campaign.JOB_TOKEN_ENV in environment
+            (job_root / ".venv").mkdir()
+            (job_root / "uv-cache").mkdir()
+
+        monkeypatch.setattr(mutation_campaign, "_sync_job_environment", sync)
+
+    if stage in {"worktree", "status"}:
+
+        def run(
+            command: Sequence[str],
+            **kwargs: Unpack[_RunOptions],
+        ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+            cwd = kwargs.get("cwd")
+            if stage == "worktree" and command[:3] == ["git", "worktree", "add"]:
+                raise subprocess.CalledProcessError(1, command)
+            if stage == "status" and command[:2] == ["git", "status"] and Path(cwd or Path.cwd()).name == "checkout":
+                return subprocess.CompletedProcess(command, 0, "?? changed\n", "")
+            return cast(
+                subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes],
+                real_run(command, **kwargs),
+            )
+
+        monkeypatch.setattr(mutation_campaign.subprocess, "run", run)
+        return
+    if stage == "sync":
+
+        def sync(job_root: Path, environment: dict[str, str] | None = None) -> None:
+            assert environment is not None and mutation_campaign.JOB_TOKEN_ENV in environment
+            (job_root / ".venv").mkdir()
+            (job_root / "uv-cache").mkdir()
+            raise subprocess.CalledProcessError(1, ["uv", "sync"])
+
+        monkeypatch.setattr(mutation_campaign, "_sync_job_environment", sync)
+    else:
+        target, error = {
+            "mode": ("_canonicalize_snapshot_modes", ValueError("mode")),
+            "metadata": ("_snapshot_identity", ValueError("metadata")),
+            "socket": ("remove_stale_socket", OSError("socket")),
+            "preflight": ("_preflight_process_control", ValueError("preflight")),
+            "preflight_uncertain": (
+                "_preflight_process_control",
+                mutation_campaign.OwnerCleanupUnverifiedError("probe remains live"),
+            ),
+        }[stage]
+        monkeypatch.setattr(mutation_campaign, target, lambda *_: _raise_in_test(error))
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ("worktree", "mode", "status", "sync", "metadata", "socket", "preflight", "preflight_uncertain")
+)
+def test_fresh_bootstrap_failures_are_receipted_and_clean_owned_resources(
+    campaign_project: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    _inject_fresh_bootstrap_failure(failure_stage, monkeypatch)
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+
+    jobs = _job_directories(audit_root)
+    assert status == 1, stderr
+    assert len(jobs) == 1
+    receipt = _read_json_object(jobs[0] / mutation_campaign.OWNER_FILE)
+    if failure_stage == "preflight_uncertain":
+        assert receipt["state"] == "cleanup_failed"
+        assert receipt["cleanup_verified"] is False
+        assert (jobs[0] / "checkout").is_dir()
+        assert (jobs[0] / ".venv").is_dir()
+        assert (jobs[0] / "uv-cache").is_dir()
+        return
+    assert receipt["state"] == "controller_failed"
+    assert receipt["cleanup_verified"] is True
+    assert not (jobs[0] / "checkout").exists()
+    assert not (jobs[0] / ".venv").exists()
+    assert not (jobs[0] / "uv-cache").exists()
+
+
+def test_receipt_write_failure_leaves_a_discovery_blocker_without_deleting_it(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    real_write_owner = mutation_campaign._write_owner
+
+    def fail_receipt(job_root: Path, _receipt: dict[str, object]) -> None:
+        (job_root / "owner.tmp").write_text("incomplete", encoding="utf-8")
+        raise OSError("receipt write failed")
+
+    monkeypatch.setattr(mutation_campaign, "_write_owner", fail_receipt)
+    status, _stdout, _stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+    ownerless_jobs = [path for path in (audit_root / "jobs" / "omi-collector").iterdir() if path.is_dir()]
+    assert status == 1
+    assert len(ownerless_jobs) == 1
+    blocker = ownerless_jobs[0]
+    assert not (blocker / mutation_campaign.OWNER_FILE).exists()
+    assert (blocker / "owner.tmp").read_text(encoding="utf-8") == "incomplete"
+
+    monkeypatch.setattr(mutation_campaign, "_write_owner", real_write_owner)
+    second_status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+
+    assert second_status == 1
+    assert "owner receipt" in stderr
+    assert blocker.is_dir()
+    assert (blocker / "owner.tmp").exists()
+
+
+def test_job_directory_creation_failure_leaves_no_partial_job(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    jobs_root = audit_root / "jobs" / "omi-collector"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    real_mkdir = Path.mkdir
+
+    def fail_job_mkdir(path: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
+        if path != jobs_root and path.parent == jobs_root:
+            raise PermissionError("job directory allocation failed")
+        real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", fail_job_mkdir)
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+
+    assert status == 1
+    assert "job directory allocation failed" in stderr
+    assert _job_directories(audit_root) == []
+
+
+def test_discovery_rejects_unrecognized_receipt_without_replacing_it(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    jobs_root = audit_root / "jobs" / "omi-collector"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    job = jobs_root / "unknown"
+    job.mkdir(parents=True, mode=0o700)
+    receipt_path = job / mutation_campaign.OWNER_FILE
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    receipt_before = receipt_path.read_bytes()
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+
+    assert status == 1
+    assert "invalid owner receipt" in stderr
+    assert receipt_path.read_bytes() == receipt_before
+    assert len(_job_directories(audit_root)) == 1
+
+
+def test_failed_fresh_bootstrap_preserves_other_jobs_and_native_evidence(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    jobs_root = audit_root / "jobs" / "omi-collector"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    old_job = jobs_root / "paused-job"
+    old_checkout = old_job / "checkout"
+    old_checkout.mkdir(parents=True, mode=0o700)
+    marker = old_checkout / ".gremlins_cache" / "results.db"
+    marker.parent.mkdir()
+    marker.write_bytes(b"preserve")
+    (old_job / mutation_campaign.OWNER_FILE).write_text(
+        json.dumps({"schema": 1, "run_token": "paused", "state": "paused"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        mutation_campaign,
+        "_sync_job_environment",
+        lambda *_: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["uv", "sync"])),
+    )
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "fresh")
+
+    assert status == 1, stderr
+    assert marker.read_bytes() == b"preserve"
+    assert _read_json_object(old_job / mutation_campaign.OWNER_FILE)["state"] == "paused"
+
+
+def test_resume_preflight_failure_preserves_paused_receipt_and_native_cache(
+    campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, env = campaign_project
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(mutation_campaign, "AUDIT_ROOT", audit_root)
+    with monkeypatch.context() as patch:
+        patch.setattr(mutation_campaign, "_sync_job_environment", lambda *_: None)
+        patch.setattr(mutation_campaign, "_enter_owner", lambda *_args, **_kwargs: 0)
+        assert _launch(repo, env, patch, "launch", "--mode", "fresh")[0] == 0
+    job = _job_directories(audit_root)[0]
+    receipt_path = job / mutation_campaign.OWNER_FILE
+    receipt = _read_json_object(receipt_path)
+    receipt.update(state="paused", checkpoint_verified=True)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    old_receipt = receipt_path.read_bytes()
+    cache = job / "checkout" / ".gremlins_cache" / "results.db"
+    cache_bytes = _write_cache(cache, [("done", "ZAPPED")])
+    monkeypatch.setattr(
+        mutation_campaign, "_preflight_process_control", lambda *_: (_ for _ in ()).throw(ValueError("preflight"))
+    )
+
+    status, _stdout, stderr = _launch(repo, env, monkeypatch, "launch", "--mode", "resume")
+
+    assert status == 1
+    assert stderr
+    assert receipt_path.read_bytes() == old_receipt
+    assert cache.read_bytes() == cache_bytes
+
+
+def test_control_server_teardown_failure_keeps_job_blocked_after_child_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = tmp_path / "teardown-job"
+    (job / "checkout" / ".gremlins_cache").mkdir(parents=True, mode=0o700)
+    token = "teardown-failure"
+    owner_path = job / mutation_campaign.OWNER_FILE
+    owner_path.write_text(json.dumps({"schema": 1, "run_token": token, "state": "preparing"}), encoding="utf-8")
+    real_stop = mutation_campaign.OwnerControlServer.stop
+
+    def fail_after_stop(server: mutation_campaign.OwnerControlServer) -> None:
+        real_stop(server)
+        raise TimeoutError("injected join uncertainty")
+
+    monkeypatch.setattr(mutation_campaign.OwnerControlServer, "stop", fail_after_stop)
+    command = [
+        sys.executable,
+        "-c",
+        "import json, pathlib; pathlib.Path('.gremlins_cache/campaign.json').write_text(json.dumps({'state': 'complete'}))",
+    ]
+
+    with pytest.raises(ValueError, match="owner teardown failed"):
+        mutation_campaign._enter_owner(job, "fresh", token, command=command, environment=_without_outer_job_token())
+
+    receipt = _read_json_object(owner_path)
+    assert receipt["state"] == "cleanup_failed"
+    assert receipt["cleanup_verified"] is False
+    assert mutation_campaign._token_pids(token) == {}
+
+
+def test_teardown_failure_does_not_wait_for_or_accept_late_pause_commit(tmp_path: Path) -> None:
+    job = tmp_path / "blocked-pause-job"
+    job.mkdir(mode=0o700)
+    token = "blocked-pause"
+    owner_path = job / mutation_campaign.OWNER_FILE
+    owner_path.write_text(json.dumps({"schema": 1, "run_token": token, "state": "pausing"}), encoding="utf-8")
+    run = mutation_campaign.OwnerRun(job, "resume", token, job / "checkout", {}, _read_json_object(owner_path))
+    lock = (job / mutation_campaign.OWNER_LOCK).open("a+b")
+
+    class StuckControlServer:
+        def stop(self) -> None:
+            raise TimeoutError("injected handler deadline")
+
+    errors: list[ValueError] = []
+
+    def teardown() -> None:
+        try:
+            mutation_campaign._teardown_owner(
+                job, run, cast(mutation_campaign.OwnerControlServer, StuckControlServer()), lock, {}
+            )
+        except ValueError as exc:
+            errors.append(exc)
+
+    run.state_lock.acquire()
+    worker = threading.Thread(target=teardown)
+    try:
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive(), "teardown blocked behind a pause handler's process wait"
+        assert errors
+        assert run.stopping.is_set()
+        assert not mutation_campaign._commit_owner_state(run, "pausing", "paused", checkpoint_verified=True)
+        receipt = _read_json_object(owner_path)
+        assert receipt["state"] == "cleanup_failed"
+        assert receipt["cleanup_verified"] is False
+    finally:
+        run.state_lock.release()
+        if worker.is_alive():
+            worker.join(timeout=2)
+
+
+@pytest.mark.parametrize(("pause_state", "expected_status"), [("paused", 130), ("control_failed", 1)])
+def test_child_exit_waits_for_overlapping_pause_result(tmp_path: Path, pause_state: str, expected_status: int) -> None:
+    job = tmp_path / f"overlapping-{pause_state}"
+    job.mkdir(mode=0o700)
+    token = "overlapping-pause"
+    owner_path = job / mutation_campaign.OWNER_FILE
+    owner_path.write_text(json.dumps({"schema": 1, "run_token": token, "state": "pausing"}), encoding="utf-8")
+
+    class ExitedProcess:
+        def poll(self) -> int:
+            return 0
+
+    run = mutation_campaign.OwnerRun(job, "resume", token, job / "checkout", {}, _read_json_object(owner_path))
+    run.process = cast(subprocess.Popen[bytes], ExitedProcess())
+    handler_started = threading.Event()
+    finish_handler = threading.Event()
+    finisher_waiting = threading.Event()
+    pause_complete = threading.Event()
+
+    class ObservedPauseDone:
+        def wait(self, timeout: float | None = None) -> bool:
+            finisher_waiting.set()
+            return pause_complete.wait(timeout)
+
+        def set(self) -> None:
+            pause_complete.set()
+
+    run.pause_done = cast(threading.Event, ObservedPauseDone())
+
+    def pause_handler() -> None:
+        handler_started.set()
+        assert finish_handler.wait(timeout=2)
+        run.receipt["state"] = pause_state
+        if pause_state == "paused":
+            run.paused.set()
+        run.pause_done.set()
+
+    handler = threading.Thread(target=pause_handler)
+    handler.start()
+    result: list[int] = []
+    finisher = threading.Thread(target=lambda: result.append(mutation_campaign._finish_owner_child(run)))
+    try:
+        assert handler_started.wait(timeout=2)
+        finisher.start()
+        assert finisher_waiting.wait(timeout=2)
+        finish_handler.set()
+        finisher.join(timeout=2)
+        assert result == [expected_status]
+        handler.join(timeout=2)
+        assert not handler.is_alive()
+    finally:
+        finish_handler.set()
+        pause_complete.set()
+        if finisher.is_alive():
+            finisher.join(timeout=2)
+        handler.join(timeout=2)
+
+
+def test_pause_ack_timeout_records_uncertain_cleanup_before_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = tmp_path / "pause-timeout"
+    job.mkdir(mode=0o700)
+    token = "pause-timeout"
+    owner_path = job / mutation_campaign.OWNER_FILE
+    owner_path.write_text(json.dumps({"schema": 1, "run_token": token, "state": "pausing"}), encoding="utf-8")
+
+    class ExitedProcess:
+        def poll(self) -> int:
+            return 0
+
+    run = mutation_campaign.OwnerRun(job, "resume", token, job / "checkout", {}, _read_json_object(owner_path))
+    run.process = cast(subprocess.Popen[bytes], ExitedProcess())
+    monkeypatch.setattr(mutation_campaign, "PAUSE_ACK_SECONDS", 0)
+
+    assert mutation_campaign._finish_owner_child(run) == 1
+    assert run.stopping.is_set()
+    receipt = _read_json_object(owner_path)
+    assert receipt["state"] == "cleanup_failed"
+    assert receipt["cleanup_verified"] is False
 
 
 def test_generated_gremlins_coverage_config_stays_out_of_snapshot_identity(

@@ -4,8 +4,10 @@ import re
 from pathlib import Path
 
 WORKFLOW_USES_PATTERN = re.compile(r"^\s*(?:-\s*)?uses:\s*([^@\s]+)@([^\s#]+)", re.MULTILINE)
-FROM_PATTERN = re.compile(r"^\s*FROM\s+(?P<image>[^\s]+)", re.MULTILINE)
-STAGE_NAME_PATTERN = re.compile(r"^\s*FROM\s+[^\s]+\s+AS\s+(?P<stage>[^\s]+)", re.IGNORECASE | re.MULTILINE)
+FROM_PATTERN = re.compile(
+    r"^\s*FROM\s+(?:--platform=[^\s]+\s+)?(?P<image>[^\s]+)(?:\s+AS\s+(?P<stage>[^\s]+))?",
+    re.IGNORECASE | re.MULTILINE,
+)
 COPY_FROM_PATTERN = re.compile(r"^\s*COPY\s+--from=(?P<image>[^\s]+)", re.MULTILINE)
 IMAGE_PATTERN = re.compile(r"^\s*image:\s*(?P<image>[^\s#]+)", re.MULTILINE)
 
@@ -46,12 +48,10 @@ def _check_container_refs(root: Path) -> list[str]:
         if not dockerfile.is_file():
             continue
         text = dockerfile.read_text(encoding="utf-8")
-        stage_names = {match.group("stage") for match in STAGE_NAME_PATTERN.finditer(text)}
         for match in FROM_PATTERN.finditer(text):
             image = match.group("image")
-            if image.startswith("--"):
-                continue
             errors.extend(_check_image_ref(image, str(dockerfile.relative_to(root))))
+        stage_names = {match.group("stage") for match in FROM_PATTERN.finditer(text) if match.group("stage")}
         for match in COPY_FROM_PATTERN.finditer(text):
             image = match.group("image")
             if image in stage_names or image.isdigit():

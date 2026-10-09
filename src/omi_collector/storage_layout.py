@@ -37,6 +37,8 @@ class CollectorLayout:
     lock: Path
     device_state: Path
     debug_log: Path
+    operational_status: Path
+    confirmed_loss_ledger: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +97,8 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
             lock=collector_root / "collector.lock",
             device_state=collector_root / "device.json",
             debug_log=collector_root / "debug.jsonl",
+            operational_status=collector_root / "operational-status.json",
+            confirmed_loss_ledger=collector_root / "confirmed-loss.json",
         ),
         draft=root / "draft",
         publication=PublicationLayout(root=publication_root),

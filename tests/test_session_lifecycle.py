@@ -226,12 +226,12 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
     async def attempt(_self: SessionLifecycle, *, with_presence: bool) -> DrainConfirmed:
         assert not with_presence
         events.append("attempt")
-        return DrainConfirmed()
+        return DrainConfirmed(10)
 
     async def enter() -> None:
         events.append("enter")
 
-    async def close(_reason: str) -> None:
+    async def close(_reason: str, _drain_cursor: int | None) -> None:
         events.append("close")
         raise OSError("closure failed")
 
@@ -386,9 +386,9 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
             maintenance.schedule_publication_retry()
             await asyncio.sleep(0)
             events.append("attempt")
-            return DrainConfirmed()
+            return DrainConfirmed(10)
 
-        async def close(_reason: str) -> None:
+        async def close(_reason: str, _drain_cursor: int | None) -> None:
             await asyncio.sleep(0)
             store.append_ready_closure(10, "drained")
             events.append("closure")
@@ -440,7 +440,7 @@ def test_restart_closure_keeps_priority_through_followup_inspection() -> None:
         events.append("inspect")
         return "needs_interrupted_close" if events.count("inspect") == 1 else "empty"
 
-    async def close(_reason: str) -> None:
+    async def close(_reason: str, _drain_cursor: int | None) -> None:
         events.append("closure")
 
     async def enter() -> None:
@@ -644,7 +644,7 @@ def test_retryable_read_failure_is_torn_down_and_checkpoints_before_return(
 
 
 def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:
-    info = RingInfo(10, 12, 100, 1, 512)
+    info = RingInfo(10, 10, 100, 1, 512)
     order: list[str] = []
     observations: list[dict[str, object]] = []
 
@@ -666,10 +666,10 @@ def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytes
             order.append("disconnect")
 
     async def connected_step(
-        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+        _session: RingSession, _current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
     ) -> tuple[str, RingInfo | None]:
         order.append("drained")
-        return "drained", current
+        return "drained", RingInfo(12, 12, 100, 1, 512)
 
     async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
         del timeout
@@ -727,7 +727,7 @@ def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytes
         "event": "pendant_observation",
         "firmware": "3.0.21",
         "battery_percent": 74,
-        "read_sequence": 10,
+        "read_sequence": 12,
         "write_sequence": 12,
         "capacity_packets": 100,
         "dropped_packets": 1,
@@ -737,7 +737,7 @@ def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytes
 
 
 def test_battery_refresh_failure_does_not_interrupt_successful_drain(monkeypatch: pytest.MonkeyPatch) -> None:
-    info = RingInfo(10, 12, 100, 0, 512)
+    info = RingInfo(10, 10, 100, 0, 512)
     order: list[str] = []
 
     class Session:
@@ -756,10 +756,10 @@ def test_battery_refresh_failure_does_not_interrupt_successful_drain(monkeypatch
             order.append("disconnect")
 
     async def connected_step(
-        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+        _session: RingSession, _current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
     ) -> tuple[str, RingInfo | None]:
         order.append("drained")
-        return "drained", current
+        return "drained", RingInfo(10, 10, 100, 0, 512)
 
     async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
         del timeout
@@ -1358,16 +1358,16 @@ def test_presence_end_closes_restored_visit_without_opening_another_provider(end
         provider_candidates.append(candidate)
         raise RingTransportUnavailableError("provider must not open after the end")
 
-    async def close_visit(value: str) -> None:
+    async def close_visit(value: str, _drain_cursor: int | None) -> None:
         closures.append(value)
 
     async def connected_step(
         _session: RingSession,
-        current: RingInfo | None,
+        _current: RingInfo | None,
         _read_info: InfoReader,
         _phase: SessionPhaseState,
     ) -> tuple[str, RingInfo | None]:
-        return "drained", current
+        return "drained", RingInfo(12, 12, 100, 1, 512)
 
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=_unexpected_direct_admission,
@@ -1410,7 +1410,7 @@ async def _resumable_recovery() -> RecoveryDisposition:
 def test_run_session_records_only_verified_clock_corrections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock_case: str
 ) -> None:
-    info = RingInfo(10, 12, 100, 1, 512)
+    info = RingInfo(10, 10, 100, 1, 512)
     emitted: list[dict[str, object]] = []
     writes: list[tuple[str, int]] = []
     activity: list[ActivityEvent] = []
@@ -1428,7 +1428,7 @@ def test_run_session_records_only_verified_clock_corrections(
 
     async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
         del timeout
-        return info
+        return RingInfo(12, 12, 100, 1, 512)
 
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=_noop,
@@ -1470,11 +1470,53 @@ def test_run_session_records_only_verified_clock_corrections(
         assert correction_events[0]["outcome"] in {"host_unsynchronized", "device_time_malformed"}
 
 
+def test_fresh_empty_ring_cursor_reaches_visit_closure(monkeypatch: pytest.MonkeyPatch) -> None:
+    info = RingInfo(102, 102, 100, 0, 512)
+    session = _ClockCaseSession("unavailable", [])
+    context = _NoopRingContext(cast(RingSession, session))
+    closures: list[tuple[str, int | None]] = []
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    async def connected_step(
+        _session: RingSession,
+        current: RingInfo | None,
+        _read_info: InfoReader,
+        _phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        return "drained", current
+
+    async def close_visit(reason: str, drain_cursor: int | None) -> None:
+        closures.append((reason, drain_cursor))
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+        close_visit=close_visit,
+    )
+    run = SessionLifecycleRun(
+        lambda _candidate: context,
+        OpportunisticOptions(TransferTimeouts(1, 1), RetryPolicy(stop_after_drained=True)),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+
+    assert _run(SessionLifecycle(run).run_direct()) == NoDataResult(info)
+    assert closures == [("drained", 102)]
+
+
 @pytest.mark.parametrize("terminal_case", ("retryable", "fatal", "teardown", "fatal_with_teardown"))
 def test_run_session_records_one_terminal_transfer_metric_without_masking_session_result(
     monkeypatch: pytest.MonkeyPatch, terminal_case: str
 ) -> None:
-    info = RingInfo(10, 12, 100, 1, 512)
+    info = RingInfo(10, 10, 100, 1, 512)
     primary = ValueError("fatal READ failure")
     secondary = RingTransportUnavailableError("close interrupted")
     session = _TerminalMetricSession()

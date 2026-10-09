@@ -187,8 +187,8 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
     async def post_session_checkpoint() -> None:
         await reconciler.checkpoint_after_session()
 
-    async def close_visit(reason: str) -> None:
-        await reconciler.close_visit(reason)
+    async def close_visit(reason: str, drain_cursor: int | None) -> None:
+        await reconciler.close_visit(reason, drain_cursor)
         run.maintenance.schedule_publication_retry()
 
     async def before_direct_attempt() -> None:

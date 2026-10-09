@@ -691,3 +691,40 @@ def test_full_queue_drops_auxiliary_event_without_blocking(
     finally:
         release.set()
         assert journal.close(timeout_seconds=1)
+
+
+def test_async_write_failure_blocks_and_a_later_durable_append_clears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omi_collector.capture.domain.operational_status_machine import OperationalSignal
+
+    signals: list[OperationalSignal] = []
+    recovered = threading.Event()
+
+    def record(signal: OperationalSignal) -> None:
+        signals.append(signal)
+        if signal is OperationalSignal.CLEAR:
+            recovered.set()
+
+    journal = JsonlQualityMetrics(tmp_path, release_version="1.2.3")
+    journal.set_operational_signal(record)
+    real_append = journal._append
+    attempts = 0
+
+    def fail_once(line: bytes) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("disk unavailable")
+        real_append(line)
+
+    monkeypatch.setattr(journal, "_append", fail_once)
+    try:
+        journal.record_sequence_loss(_loss_metric("first"))
+        journal.record_sequence_loss(_loss_metric("recovery"))
+        assert recovered.wait(2)
+    finally:
+        assert journal.close(timeout_seconds=2)
+
+    assert signals == [OperationalSignal.CONFIGURED, OperationalSignal.BLOCK, OperationalSignal.CLEAR]

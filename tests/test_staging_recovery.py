@@ -20,6 +20,7 @@ import pytest
 
 from omi_collector.capture.adapters import quarantine, ready_bundles, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
+    CollisionError,
     RecordGapError,
     RecordMismatchError,
     RecordRegressionError,
@@ -564,6 +565,147 @@ def test_recovery_reports_drafts_beyond_the_latest_ready_closure(tmp_path: Path)
 
     store.append_ready_closure(101, "closed visit")
     assert store.inspect_recovery() == (False, False)
+
+
+def test_clean_drain_closes_older_authenticated_orphan_at_existing_frontier_and_publishes(
+    tmp_path: Path,
+) -> None:
+    drafts = _capture_root(tmp_path)
+    draft = _one_record_bundle(drafts, 100, 43)
+    published = _shared_ready(tmp_path / "published")
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path, drafts).paths,
+        publication_root=published,
+        config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
+    )
+    existing = store.append_ready_closure(102, "absence")
+    original_queue = store.ready_closures_path.read_bytes()
+
+    assert store.close_orphaned_drafts("absence") == existing
+    assert store.close_orphaned_drafts("absence") == existing
+    assert store.ready_closures_path.read_bytes() == original_queue
+    with pytest.raises(ready_bundles.ReadyBundleError):
+        (draft / "receipt.json").write_text("{}", encoding="utf-8")
+        store.close_orphaned_drafts("absence")
+    (draft / "receipt.json").write_text(
+        dumps(SealedReceipt("a" * 32, sha256((draft / "records.bin").read_bytes()).hexdigest()).as_dict()),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cursor"):
+        store.close_orphaned_drafts("drained", drain_cursor=101)
+    assert store.ready_closures_path.read_bytes() == original_queue
+    assert draft.is_dir()
+
+    closure = store.close_orphaned_drafts("drained", drain_cursor=102)
+    assert closure is not None and (closure.next_sequence, closure.reason) == (102, "drained")
+    outcome = store.recover_and_publish()
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    assert len(outcome.published) == 1
+    assert not draft.exists()
+
+
+def test_prefix_recovery_validates_drain_before_mutating_marker_or_closure(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(100))
+    attempt.checkpoint()
+    attempt.publish_prefix()
+    attempt.close(durable=True)
+    marker = attempt.path / "prefix-publication.json"
+    marker_before = marker.read_bytes()
+    existing = store.append_ready_closure(102, "absence")
+    closure_before = store.ready_closures_path.read_bytes()
+
+    with pytest.raises(ValueError, match="cursor"):
+        store.close_pending_prefix("drained", drain_cursor=101)
+
+    assert marker.read_bytes() == marker_before
+    assert not (attempt.path / "terminal-retired.json").exists()
+    assert store.ready_closures_path.read_bytes() == closure_before
+
+    closure = store.close_pending_prefix("drained", drain_cursor=102)
+    assert closure is not None and (closure.next_sequence, closure.reason) == (102, "drained")
+    assert (attempt.path / "terminal-retired.json").is_file()
+    assert existing.next_sequence == closure.next_sequence
+
+
+def test_multiple_prefix_markers_preflight_the_highest_frontier_before_drain_commit(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempts = [store.prepare_streaming_attempt(start, 1) for start in (100, 102)]
+    for start, attempt in zip((100, 102), attempts, strict=True):
+        attempt.record_read_begin(ReadBeginNotification(start, 1))
+        attempt.accept_chunk(start, _record(start))
+        attempt.checkpoint()
+        attempt.publish_prefix()
+        attempt.close(durable=True)
+    markers = {attempt.attempt_id: (attempt.path / "prefix-publication.json").read_bytes() for attempt in attempts}
+    existing = store.append_ready_closure(102, "absence")
+    queue = store.ready_closures_path.read_bytes()
+
+    with pytest.raises(ValueError, match="recovered closure frontier"):
+        store.close_pending_prefix("drained", drain_cursor=102)
+
+    assert store.ready_closures_path.read_bytes() == queue
+    for attempt in attempts:
+        assert (attempt.path / "prefix-publication.json").read_bytes() == markers[attempt.attempt_id]
+        assert not (attempt.path / "terminal-retired.json").exists()
+
+    closure = store.close_pending_prefix("drained", drain_cursor=103)
+    assert closure is not None and (closure.next_sequence, closure.reason) == (103, "drained")
+    assert existing.next_sequence == 102
+    assert all((attempt.path / "terminal-retired.json").is_file() for attempt in attempts)
+
+
+def test_prefix_recovery_authenticates_existing_bundle_even_when_closure_is_kept(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(100))
+    attempt.checkpoint()
+    published = attempt.publish_prefix()
+    assert published is not None
+    attempt.close(durable=True)
+    marker = attempt.path / "prefix-publication.json"
+    marker_before = marker.read_bytes()
+    (published.bundle_path / "receipt.json").write_text("{}", encoding="utf-8")
+    existing = store.append_ready_closure(200, "absence")
+    queue_before = store.ready_closures_path.read_bytes()
+
+    with pytest.raises(CollisionError):
+        store.close_pending_prefix("absence")
+
+    assert store.ready_closures_path.read_bytes() == queue_before
+    assert marker.read_bytes() == marker_before
+    assert not (attempt.path / "terminal-retired.json").exists()
+    assert existing.next_sequence == 200
+
+
+def test_prefix_close_preflights_later_orphan_before_drained_queue_upgrade(tmp_path: Path) -> None:
+    drafts = _capture_root(tmp_path)
+    _one_record_bundle(drafts, 200, 43)
+    store = StagingStore.from_paths(
+        StagingStore(tmp_path, drafts).paths,
+        publication_root=_shared_ready(tmp_path / "published"),
+    )
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(100))
+    attempt.checkpoint()
+    attempt.publish_prefix()
+    attempt.close(durable=True)
+    marker = attempt.path / "prefix-publication.json"
+    marker_before = marker.read_bytes()
+    store.append_ready_closure(102, "absence")
+    queue_before = store.ready_closures_path.read_bytes()
+
+    with pytest.raises(ValueError, match="recovered closure frontier"):
+        store.close_pending_prefix("drained", drain_cursor=102)
+
+    assert store.ready_closures_path.read_bytes() == queue_before
+    assert marker.read_bytes() == marker_before
+    assert not (attempt.path / "terminal-retired.json").exists()
 
 
 def test_close_pending_prefix_rejects_symlinked_attempt_even_when_unpublished_is_excluded(

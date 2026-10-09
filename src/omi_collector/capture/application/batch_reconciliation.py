@@ -162,17 +162,25 @@ class BatchReconciler:
         if pending is not None and durable_next is not None and durable_next > pending.start_sequence:
             self._state.visit_frontier = max(self._state.visit_frontier or durable_next, durable_next)
 
-    async def close_visit(self, reason: str) -> None:
+    async def close_visit(self, reason: str, drain_cursor: int | None = None) -> None:
         """Close the physical visit and enqueue its durable publication frontier."""
+        if reason == "drained":
+            if type(drain_cursor) is not int or drain_cursor < 0:
+                raise RuntimeError("drained visit lacks its confirmed cursor")
+        elif drain_cursor is not None:
+            raise RuntimeError("nondrained visit carries a confirmed cursor")
         batch = self._state.batch
         if batch is None:
             # Startup recovery may have found a published prefix marker or an
             # authenticated draft without a live writer.  The storage adapter
             # terminalizes it before appending its closure, under one lease.
             await joined_to_thread(
-                self._run.staging.close_pending_prefix, reason, include_unpublished=reason != "restart_interrupted"
+                self._run.staging.close_pending_prefix,
+                reason,
+                include_unpublished=reason != "restart_interrupted",
+                drain_cursor=drain_cursor,
             )
-            await joined_to_thread(self._run.staging.close_orphaned_drafts, reason)
+            await joined_to_thread(self._run.staging.close_orphaned_drafts, reason, drain_cursor=drain_cursor)
             self._state.pending_descriptor = None
             self._state.pending_durable_next = None
             self._state.visit_frontier = None
@@ -194,6 +202,8 @@ class BatchReconciler:
         frontier = self._state.visit_frontier
         if frontier is None:
             return
+        if reason == "drained" and drain_cursor is not None and drain_cursor < frontier:
+            raise RuntimeError("confirmed drain cursor does not cover the live batch frontier")
         await joined_to_thread(self._run.staging.append_ready_closure, frontier, reason)
         self._state.visit_frontier = None
 
@@ -483,6 +493,8 @@ async def _advance_batch(
     await _report_activity(run.options.activity, "advancing")
     action = batch_machine.CursorAction(_advance_action(current, batch))
     decision = batch_machine.transition(_batch_milestone(batch), batch_machine.Event.FRESH_INFO, action)
+    if decision.command is batch_machine.Command.REJECT:
+        raise _sealed_cursor_rejection(current, batch, action, "fresh INFO before ADVANCE")
     if decision.command is batch_machine.Command.CLOSE:
         # The immutable bundle is already safe.  Do not issue an old ADVANCE
         # when fresh INFO proves another actor/firmware state has moved on;
@@ -502,6 +514,8 @@ async def _advance_batch(
     confirmed = await info(session)
     action = batch_machine.CursorAction(_advance_action(confirmed, batch))
     decision = batch_machine.transition(_batch_milestone(batch), batch_machine.Event.ADVANCE_ACK_INFO, action)
+    if decision.command is batch_machine.Command.REJECT:
+        raise _sealed_cursor_rejection(confirmed, batch, action, "INFO after ADVANCE acknowledgment")
     if decision.command is batch_machine.Command.CLOSE:
         await _complete_batch(
             state, batch, run.options, advance_confirmed=action is batch_machine.CursorAction.CONFIRMED
@@ -674,6 +688,14 @@ async def _publish_cursor_ahead(
     # No READ is legal after the device cursor passed the durable prefix.
     # Activate the persisted original READ_BEGIN only so the writer can
     # durably publish its checkpoint-authenticated prefix on its own thread.
+    occurred_at = utc_timestamp(options.host_time())
+    loss_id = await joined_to_thread(
+        run.staging.record_confirmed_loss,
+        batch.writer.attempt_id,
+        durable_next,
+        cursor,
+        occurred_at,
+    )
     await _rebind_durable_batch(batch, options)
     published = await _bounded(batch.writer.publish_prefix(), options.timeouts.transfer)
     await _report_loss_detected(
@@ -689,7 +711,7 @@ async def _publish_cursor_ahead(
         try:
             options.quality_metrics.record_sequence_loss(
                 SequenceLossMetric(
-                    utc_timestamp(options.host_time()),
+                    occurred_at,
                     quality.session_id,
                     cursor - durable_next,
                     (cursor - durable_next) * RECORD_SIZE,
@@ -697,6 +719,7 @@ async def _publish_cursor_ahead(
                     options.quality_metrics.release_version,
                     options.quality_metrics.source_revision,
                     quality.firmware_version,
+                    loss_id,
                 )
             )
         except Exception as error:  # noqa: BLE001 - metrics cannot stop audio capture
@@ -909,6 +932,18 @@ def _advance_action(current: RingInfo, batch: _Batch) -> str:
     if cursor > batch.end:
         return "ahead"
     return "repeat"
+
+
+def _sealed_cursor_rejection(
+    current: RingInfo,
+    batch: _Batch,
+    action: batch_machine.CursorAction,
+    observation: str,
+) -> CursorConsistencyError:
+    return CursorConsistencyError(
+        f"{observation} classified sealed batch {batch.start}..{batch.end} as {action.value} "
+        f"(read={current.read_sequence}, write={current.write_sequence}); preserving sealed evidence"
+    )
 
 
 async def _complete_batch(

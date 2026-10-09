@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from omi_collector import cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
+from omi_collector.capture.adapters.operational_status import OperationalIdentity
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.staging_contract import StagingError
 from omi_collector.capture.application.collector import CollectionResult
@@ -82,6 +83,11 @@ def test_config_check_reports_canonical_path(tmp_path: Path) -> None:
 def test_service_announces_readiness_after_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = _layout(tmp_path)
     sync_options: list[dict[str, object]] = []
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(
+        "omi_collector.capture.application.operational_telemetry.system_host_boot_id",
+        lambda: "00000000-0000-0000-0000-000000000001",
+    )
 
     def fake_sync(*_args: object, **kwargs: object) -> None:
         sync_options.append(kwargs)
@@ -93,7 +99,15 @@ def test_service_announces_readiness_after_preflight(monkeypatch: pytest.MonkeyP
     assert result.exit_code == 0
     assert result.stdout == ""
     assert json.loads(result.stderr) == {"config": str(path), "status": "deployment_ready"}
-    assert sync_options == [{"force_1m": False, "log_level": cli.SyncLogLevel.INFO}]
+    assert len(sync_options) == 1
+    assert sync_options[0]["force_1m"] is False
+    assert sync_options[0]["log_level"] is cli.SyncLogLevel.INFO
+    from omi_collector.capture.adapters.operational_status import OperationalStatusStore
+
+    status = cast(OperationalStatusStore, sync_options[0]["operational_status"])
+    assert status.identity.boot_id == "00000000-0000-0000-0000-000000000001"
+    assert isinstance(status.identity.invocation_id, str) and len(status.identity.invocation_id) == 32
+    assert status._closed
 
 
 def test_service_does_not_announce_readiness_for_invalid_config(tmp_path: Path) -> None:
@@ -127,6 +141,37 @@ def test_device_status_only_flags_a_confirmed_inactive_service(
         payload = cast(dict[str, object], json.loads(result.output))
         assert payload["status"] == expected_status
         assert payload["service"] == service_status
+
+
+def test_device_status_fetches_systemd_invocation_before_collecting_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    observed: list[OperationalIdentity] = []
+
+    def service_status() -> dict[str, object]:
+        events.append("systemd")
+        return {
+            "available": True,
+            "active_state": "active",
+            "invocation_id": "00000000000000000000000000000003",
+        }
+
+    def collect(*_args: object, **kwargs: object) -> dict[str, object]:
+        events.append("collect")
+        identity = kwargs["identity"]
+        assert isinstance(identity, OperationalIdentity)
+        observed.append(identity)
+        return {"status": "unknown"}
+
+    monkeypatch.setattr(cli, "_systemd_service_status", service_status)
+    monkeypatch.setattr(cli, "collect_operator_status", collect)
+
+    result = CliRunner().invoke(app, ["device", "status", "--config", str(_layout(tmp_path))])
+
+    assert result.exit_code == 0
+    assert events == ["systemd", "collect"]
+    assert observed[0].invocation_id == "00000000000000000000000000000003"
 
 
 def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(tmp_path: Path) -> None:
@@ -167,6 +212,7 @@ ActiveEnterTimestamp=Sat 2026-09-12 10:00:00 +05"""
         "active_state": "active",
         "available": True,
         "exec_main_status": 0,
+        "invocation_id": None,
         "main_pid": 42,
         "restart_count": 0,
         "sub_state": "running",
@@ -225,6 +271,7 @@ def test_systemd_service_status_parses_text_and_handles_nonzero_exit(
         "active_state": "active",
         "available": True,
         "exec_main_status": 0,
+        "invocation_id": None,
         "main_pid": 42,
         "restart_count": 0,
         "sub_state": "running",

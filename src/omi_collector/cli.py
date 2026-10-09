@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import subprocess
 import time
 from collections.abc import Callable, Coroutine, Mapping
+from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Protocol, cast
+from uuid import uuid4
 
 import typer
 
@@ -16,8 +20,10 @@ from omi_collector.core import package_version
 from omi_collector.storage_layout import DEFAULT_CONFIG_PATH
 
 if TYPE_CHECKING:
+    from omi_collector.capture.adapters.operational_status import OperationalStatusStore
     from omi_collector.capture.adapters.staging_store import StagingStore
     from omi_collector.capture.cli import DownloadProgress
+    from omi_collector.capture.domain.operational_status_machine import OperationalSignal
     from omi_collector.storage_layout import OperatorConfig
 
 
@@ -77,7 +83,7 @@ def _systemd_service_status(unit: str = "omi-collector.service") -> dict[str, ob
         "systemctl",
         "show",
         unit,
-        "--property=ActiveState,SubState,MainPID,NRestarts,ExecMainStatus,ActiveEnterTimestamp",
+        "--property=ActiveState,SubState,MainPID,NRestarts,ExecMainStatus,ActiveEnterTimestamp,InvocationID",
     ]
     try:
         completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=3)
@@ -91,6 +97,7 @@ def _systemd_service_status(unit: str = "omi-collector.service") -> dict[str, ob
         "active_state": values.get("ActiveState") or None,
         "available": True,
         "exec_main_status": _decimal(values.get("ExecMainStatus")),
+        "invocation_id": values.get("InvocationID") or None,
         "main_pid": _decimal(values.get("MainPID")),
         "restart_count": _decimal(values.get("NRestarts")),
         "sub_state": values.get("SubState") or None,
@@ -179,10 +186,14 @@ class SyncProgressReporter:
         *,
         emit: Callable[[str], object] | None = None,
         debug_logger: logging.Logger | None = None,
+        operational_status: OperationalStatusStore | None = None,
+        staging: StagingStore | None = None,
     ) -> None:
         self.level = level
         self._emit = emit or (lambda line: typer.echo(line, err=True))
         self._debug_logger = debug_logger
+        self._operational_status = operational_status
+        self._staging = staging
         self._session_error_keys: set[tuple[str, str, str | None]] = set()
         self._session_error_key: tuple[str, str, str | None] | None = None
         self._progress_emitted = False
@@ -193,6 +204,8 @@ class SyncProgressReporter:
 
         """Persist every aggregate callback before journal visibility filtering."""
         debug_event("sync_progress", logger=self._debug_logger, progress=progress.as_dict())
+        if self._operational_status is not None and progress.operational_event is not None:
+            self._record_clock_status(progress.operational_event)
         state = progress.state
         if state == "session_error":
             self._report_session_error(progress)
@@ -228,6 +241,38 @@ class SyncProgressReporter:
             return
         self._session_error_keys.add(key)
         self._emit_json(progress.as_dict())
+
+    def _record_clock_status(self, event: Mapping[str, object]) -> None:
+        if event.get("event") != "pendant_clock_sync":
+            return
+        from omi_collector.capture.domain.operational_status_machine import (
+            OperationalDimension,
+            OperationalSignal,
+        )
+
+        assert self._operational_status is not None
+        self._operational_status.update(OperationalDimension.QUALITY, OperationalSignal.UNCHANGED)
+        self._operational_status.update(OperationalDimension.PUBLICATION, OperationalSignal.UNCHANGED)
+        outcome = event.get("outcome")
+        if outcome in {"evidence_persist_failed", "intent_persist_failed", "result_persist_failed"}:
+            signal = OperationalSignal.BLOCK
+        elif outcome in {"verified", "within_threshold"} and _clock_reconciliation_is_conclusive(event):
+            signal = OperationalSignal.UNCHANGED
+            if self._staging is not None:
+                from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+
+                try:
+                    records = ClockCorrectionStore(
+                        self._staging.device_state_path, self._staging.attempts_root
+                    ).records()
+                except Exception:  # noqa: BLE001 - unreadable evidence cannot prove recovery
+                    pass
+                else:
+                    if not any(record.state in {"prepared", "unresolved", "unknown"} for record in records):
+                        signal = OperationalSignal.CLEAR
+        else:
+            signal = OperationalSignal.UNCHANGED
+        self._operational_status.update(OperationalDimension.CLOCK, signal)
 
     def _report_recovery(self) -> None:
         if self._session_error_key is None:
@@ -288,6 +333,15 @@ class SyncProgressReporter:
         self._emit(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
+def _clock_reconciliation_is_conclusive(event: Mapping[str, object]) -> bool:
+    if "reconciliation" in event:
+        return False
+    count = event.get("reconciled_operations")
+    if count is None:
+        return "reconciled_operations" not in event
+    return isinstance(count, int) and not isinstance(count, bool) and count >= 0
+
+
 @app.callback(invoke_without_command=True)
 def main(
     version: Annotated[bool, typer.Option("--version", help="Show the installed version and exit.")] = False,
@@ -320,6 +374,34 @@ def service(
     loaded = _load_config(config_path)
     staging = _staging(loaded)
     _preflight_storage(staging)
+    from omi_collector.capture.adapters.operational_status import (
+        OperationalIdentity,
+        OperationalStatusError,
+        OperationalStatusStore,
+    )
+    from omi_collector.capture.adapters.staging_contract import StagingError
+    from omi_collector.capture.application.operational_telemetry import system_host_boot_id
+
+    boot_id = system_host_boot_id()
+    invocation_id = os.environ.get("INVOCATION_ID")
+    if boot_id == "unknown":
+        typer.echo("service invocation identity is unavailable", err=True)
+        raise typer.Exit(code=1)
+    if invocation_id is None:
+        invocation_id = uuid4().hex
+    operational_status: OperationalStatusStore | None = None
+    try:
+        operational_status = OperationalStatusStore(
+            loaded.storage.collector.operational_status,
+            OperationalIdentity(boot_id, invocation_id),
+        )
+        staging.initialize_confirmed_loss_ledger()
+        operational_status.initialize()
+    except (OperationalStatusError, StagingError) as error:
+        if operational_status is not None:
+            operational_status.close()
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
     typer.echo(
         json.dumps(
             {"config": str(loaded.path), "status": "deployment_ready"},
@@ -328,7 +410,17 @@ def service(
         ),
         err=True,
     )
-    _sync(loaded, staging, force_1m=False, log_level=SyncLogLevel.INFO)
+    try:
+        assert operational_status is not None
+        _sync(
+            loaded,
+            staging,
+            force_1m=False,
+            log_level=SyncLogLevel.INFO,
+            operational_status=operational_status,
+        )
+    finally:
+        operational_status.close()
 
 
 @device.command("phy-check")
@@ -409,6 +501,7 @@ def device_collect(
     loaded = _load_config(config_path)
     staging = _staging(loaded)
     _preflight_storage(staging)
+    _initialize_confirmed_loss_ledger(staging)
     started = time.monotonic()
     result = _run_device_operation(
         _capture_cli().collect(
@@ -454,6 +547,7 @@ def device_sync(
     loaded = _load_config(config_path)
     staging = _staging(loaded)
     _preflight_storage(staging)
+    _initialize_confirmed_loss_ledger(staging)
     _sync(loaded, staging, force_1m=force_1m, log_level=log_level)
 
 
@@ -463,6 +557,7 @@ def _sync(
     *,
     force_1m: bool,
     log_level: SyncLogLevel,
+    operational_status: OperationalStatusStore | None = None,
 ) -> None:
     """Run one foreground sync using validated configuration and storage."""
     started = time.monotonic()
@@ -476,25 +571,37 @@ def _sync(
         loaded.storage.collector.root, file_name=loaded.storage.collector.debug_log.name
     )
     try:
-        report_progress = SyncProgressReporter(log_level, debug_logger=debug_logger)
+        report_progress = SyncProgressReporter(
+            log_level,
+            debug_logger=debug_logger,
+            operational_status=operational_status,
+            staging=staging,
+        )
         presence = _capture_cli().make_presence_scheduler(
             loaded.pendant.address,
             _capture_cli().SUPPORTED_ADAPTER,
             config=loaded.config,
         )
-        result = _run_device_operation(
-            _capture_cli().sync(
-                loaded.pendant.address,
-                _capture_cli().SUPPORTED_ADAPTER,
-                staging,
-                report_progress,
-                force_1m=force_1m,
-                presence=presence,
-                config=loaded.config,
-                link_terminal_callback=report_progress.report_ble_link,
-                debug_logger=debug_logger,
-            )
+        sync_operation = _capture_cli().sync(
+            loaded.pendant.address,
+            _capture_cli().SUPPORTED_ADAPTER,
+            staging,
+            report_progress,
+            force_1m=force_1m,
+            presence=presence,
+            config=loaded.config,
+            link_terminal_callback=report_progress.report_ble_link,
+            debug_logger=debug_logger,
+            operational_quality_signal=(
+                _quality_status_callback(operational_status) if operational_status is not None else None
+            ),
+            record_publication=(
+                operational_status.record_publication_outcome if operational_status is not None else None
+            ),
         )
+        if operational_status is not None:
+            sync_operation = _supervise_operational_status(sync_operation, operational_status)
+        result = _run_device_operation(sync_operation)
         metrics = _capture_cli().download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
         typer.echo(_capture_cli().render_sync(cast(object, result), metrics))
     except Exception as error:
@@ -502,6 +609,59 @@ def _sync(
         raise
     finally:
         close_debug_logging(debug_logger)
+
+
+def _quality_status_callback(
+    operational_status: OperationalStatusStore,
+) -> Callable[[OperationalSignal], None]:
+    from omi_collector.capture.domain.operational_status_machine import (
+        OperationalDimension,
+        OperationalSignal,
+    )
+
+    def record(signal: OperationalSignal) -> None:
+        operational_status.update(OperationalDimension.PUBLICATION, OperationalSignal.UNCHANGED)
+        operational_status.update(OperationalDimension.CLOCK, OperationalSignal.UNCHANGED)
+        operational_status.update(OperationalDimension.QUALITY, signal)
+
+    return record
+
+
+async def _supervise_operational_status(
+    operation: Coroutine[object, object, object], operational_status: OperationalStatusStore
+) -> object:
+    from omi_collector.capture.adapters.operational_status import OperationalStatusError
+
+    capture_task = asyncio.create_task(operation)
+    failure_task = asyncio.create_task(operational_status.wait_failure())
+    try:
+        done, _ = await asyncio.wait((capture_task, failure_task), return_when=asyncio.FIRST_COMPLETED)
+        if failure_task in done:
+            failure = failure_task.result()
+            capture_task.cancel()
+            try:
+                await capture_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as cleanup_error:
+                raise OperationalStatusError("operational status persistence failed") from cleanup_error
+            raise OperationalStatusError("operational status persistence failed") from failure
+        return await capture_task
+    except asyncio.CancelledError:
+        if not capture_task.done():
+            capture_task.cancel()
+        try:
+            await capture_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as cleanup_error:
+            raise OperationalStatusError("capture cleanup failed during cancellation") from cleanup_error
+        raise
+    finally:
+        if not failure_task.done():
+            failure_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await failure_task
 
 
 @device.command("metrics")
@@ -534,18 +694,30 @@ def device_status(
     hours: Annotated[int, typer.Option("--hours", min=1, max=8760, help="Recent quality window in hours.")] = 24,
 ) -> None:
     """Summarize current backlog, publication, transfers, and confirmed loss."""
+    from omi_collector.capture.adapters.operational_status import OperationalIdentity
+    from omi_collector.capture.application.operational_telemetry import system_host_boot_id
     from omi_collector.operator_status import OperatorStatusError
 
     try:
         loaded = _load_config(config_path)
+        service_status = _systemd_service_status()
+        raw_invocation_id = (
+            service_status.get("invocation_id")
+            if service_status.get("available") is True and service_status.get("active_state") == "active"
+            else None
+        )
+        invocation_id = raw_invocation_id if isinstance(raw_invocation_id, str) else None
         status = collect_operator_status
         if status is None:
             from omi_collector.operator_status import collect_operator_status as status
-        result = cast(Callable[..., dict[str, object]], status)(loaded.storage, hours=hours)
+        result = cast(Callable[..., dict[str, object]], status)(
+            loaded.storage,
+            hours=hours,
+            identity=OperationalIdentity(system_host_boot_id(), invocation_id),
+        )
     except OperatorStatusError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
-    service_status = _systemd_service_status()
     result["service"] = service_status
     if service_status.get("available") is True and service_status.get("active_state") != "active":
         result["status"] = "attention"
@@ -566,6 +738,17 @@ def _preflight_storage(staging: StagingStore) -> None:
         staging.preflight_storage()
     except StagingError as error:
         typer.echo(f"storage preflight failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+
+def _initialize_confirmed_loss_ledger(staging: StagingStore) -> None:
+    """Initialize first-use evidence only at an explicit capture boundary."""
+    from omi_collector.capture.adapters.staging_contract import StagingError
+
+    try:
+        staging.initialize_confirmed_loss_ledger()
+    except StagingError as error:
+        typer.echo(f"confirmed-loss ledger initialization failed: {error}", err=True)
         raise typer.Exit(code=1) from error
 
 

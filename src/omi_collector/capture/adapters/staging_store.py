@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -12,7 +13,7 @@ from os import fsync, statvfs
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
@@ -47,6 +48,7 @@ from .clock_memberships import ClockMembershipError, ClockMembershipStore
 from .clock_observations import ClockObservationError
 from .clock_segments import ClockSegmentError, ClockSegmentMap, segments_with_estimates
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
+from .debug_logging import debug_event
 from .ready_bundles import (
     ReadyBundleError,
     ReadyInventory,
@@ -90,6 +92,34 @@ if TYPE_CHECKING:
 
 _LOGGER = getLogger(__name__)
 _UNKNOWN_REVISION = object()
+_PUBLICATION_ERROR_PATH_LIMIT = 256
+
+
+def _debug_publication_failure(
+    error: BaseException,
+    *,
+    phase: str,
+    path: Path | None = None,
+) -> None:
+    filename: object = cast(object, error.filename) if isinstance(error, OSError) else None
+    if filename is None and path is not None:
+        filename = os.fspath(path)
+    if isinstance(filename, bytes):
+        filename = os.fsdecode(filename)
+    diagnostic_path = filename[:_PUBLICATION_ERROR_PATH_LIMIT] if isinstance(filename, str) else None
+    debug_event(
+        "ready_publication_failure",
+        phase=phase,
+        error_type=type(error).__name__,
+        errno=error.errno if isinstance(error, OSError) else None,
+        path=diagnostic_path,
+    )
+
+
+def _publication_io_reason(error: OSError) -> str:
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        return "publication_access_denied"
+    return "publication_io_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +192,7 @@ class StagingStore:
             reason = (
                 state.work.outcome.reason
                 if isinstance(state.work, RetryWait) and isinstance(state.work.outcome, ReadyOutcome)
-                else "storage_busy_or_io"
+                else "publication_io_error"
             )
             return ReadyOutcome(
                 ReadyOutcomeState.TRANSIENT, reason=reason, retry_after_seconds=max(0.0, command.deadline - monotonic())
@@ -179,16 +209,19 @@ class StagingStore:
 
     def _execute_publication_command(self, command: PublicationCommand, held_lease: DeviceLock | None) -> ReadyOutcome:
         while command.action is PublicationAction.CHECK_INPUT:
+            probe_error: OSError | None = None
             try:
                 revision: object = self._publication_revision()
-                probe_failed = False
-            except OSError:
+            except OSError as error:
+                _debug_publication_failure(error, phase="input_revision")
                 revision = _UNKNOWN_REVISION
-                probe_failed = True
+                probe_error = error
             command = self._publication_event(Wake(revision, monotonic()))
-            if probe_failed and command.action is PublicationAction.RUN:
+            if probe_error is not None and command.action is PublicationAction.RUN:
                 return self._finish_publication(
-                    command, revision, ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
+                    command,
+                    revision,
+                    ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(probe_error)),
                 )
         if command.action is PublicationAction.RUN:
             assert command.token is not None
@@ -206,25 +239,38 @@ class StagingStore:
             )
         if not allowed or not isinstance(running, Running):
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="capture_active"), _UNKNOWN_REVISION
+        phase = "publication_effect"
         try:
             if held_lease is None:
                 with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
                     outcome = self._recover_and_publish_unlocked()
+                    phase = "post_effect_revision"
                     revision = self._publication_revision()
             else:
                 self._filesystem.require_device_lock(held_lease)
                 outcome = self._recover_and_publish_unlocked()
+                phase = "post_effect_revision"
                 revision = self._publication_revision()
             return outcome, revision
-        except OSError, DeviceAlreadyRunningError:
-            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io"), running.revision
+        except DeviceAlreadyRunningError as error:
+            _debug_publication_failure(error, phase="device_lock", path=self._filesystem.lock_path)
+            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="publication_lock_busy"), running.revision
+        except OSError as error:
+            _debug_publication_failure(error, phase=phase)
+            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), running.revision
         except Exception as error:
             if not isinstance(error, ReadyBundleError):
                 _LOGGER.exception("ready publication failed unexpectedly")
             try:
                 revision = self._publication_revision()
-            except OSError:
-                return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io"), _UNKNOWN_REVISION
+            except OSError as revision_error:
+                if isinstance(error, ReadyBundleError):
+                    _debug_publication_failure(error, phase="publication_effect")
+                _debug_publication_failure(revision_error, phase="post_effect_revision")
+                return (
+                    ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(revision_error)),
+                    _UNKNOWN_REVISION,
+                )
             reason = str(error) if isinstance(error, ReadyBundleError) else type(error).__name__
             return ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=reason), revision
 

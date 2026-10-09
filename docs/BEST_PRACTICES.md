@@ -247,13 +247,15 @@ service write access to that root. Use filesystem ownership or ACLs on the
 derived directories when a downstream account also needs access.
 
 The retained ready-bundle ACK checkpoint under `work` is a real publication
-dependency. The collector needs read access to the checkpoint and traverse
-permission on its parent. Provision only the required execute ACL on the
-existing parent with the established helper; do not grant blanket read or
-default ACLs and do not change ownership. Surface access failures with
-sanitized phase, error type, errno, and path, separately from lock contention.
-An unavailable checkpoint blocks publication and retries, while collection
-continues.
+dependency. The producer must grant the trusted collector UID a numeric read
+ACL on each temporary checkpoint before fsync and replace, preserving the old
+checkpoint if that step fails. The consumer needs traverse permission on the
+parent; provision only the required execute ACL with the established helper.
+Do not grant blanket read or default ACLs and do not change ownership. Before
+stopping the old service, preflight the service identity's checkpoint access;
+reject symlinks and allow an absent checkpoint. Surface sanitized access,
+storage-I/O, and lock-contention failures separately. An unavailable
+checkpoint blocks publication and retries, while collection continues.
 
 After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
 builds the environment as the dedicated build account, copies dependencies into it,

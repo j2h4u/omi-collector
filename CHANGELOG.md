@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.18](https://github.com/j2h4u/omi-collector/compare/v0.11.17...v0.11.18) (2026-10-09)
+
+
+### Documentation
+
+* track the checkpoint access contract and rollout ([#219](https://github.com/j2h4u/omi-collector/issues/219)) ([23dafc0](https://github.com/j2h4u/omi-collector/commit/23dafc0a96d359353bcfd30c0460567057ff3edc))
+
 ## [0.11.17](https://github.com/j2h4u/omi-collector/compare/v0.11.16...v0.11.17) (2026-10-09)
 
 

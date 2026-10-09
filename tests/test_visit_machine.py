@@ -57,6 +57,7 @@ CLOSE_REASONS = cast(tuple[CloseReason, ...], _alias_args(CloseReason))
 RECOVERY_DISPOSITIONS = cast(tuple[RecoveryDisposition, ...], _alias_args(RecoveryDisposition))
 RECOVERY_END_REASONS = cast(tuple[RecoveryEndReason, ...], _alias_args(RecoveryEndReason))
 STOP_POLICIES = (False, True)
+DRAIN_CURSOR = 17
 COMMAND_TYPES = (InspectRecovery, WaitForAttempt, RunAttempt, CommitClosure, FinishVisit, PreserveAndStop, NoOp)
 STATES = (
     Recovering(),
@@ -64,11 +65,21 @@ STATES = (
     Waiting(),
     Attempting(Idle()),
     Attempting(Waiting()),
-    *(Closing(reason) for reason in CLOSE_REASONS),
+    *(Closing(reason, DRAIN_CURSOR if reason == "drained" else None) for reason in CLOSE_REASONS),
     Stopped(),
 )
+
+
+def _closing(reason: CloseReason) -> Closing:
+    return Closing(reason, DRAIN_CURSOR if reason == "drained" else None)
+
+
+def _commit(reason: CloseReason) -> CommitClosure:
+    return CommitClosure(reason, DRAIN_CURSOR if reason == "drained" else None)
+
+
 OUTCOMES = (
-    DrainConfirmed(),
+    DrainConfirmed(DRAIN_CURSOR),
     *(Interrupted(connected, durable) for connected, durable in product((False, True), repeat=2)),
     CandidateUnavailable(),
     OperatorBatchCompleted(),
@@ -146,7 +157,7 @@ def _expected_transitions() -> list[tuple[tuple[VisitState, VisitEvent, bool], T
                     TransitionResult(Closing("recovery_exhausted"), CommitClosure("recovery_exhausted")),
                 ),
                 (
-                    (Closing("drained"), ClosureCommitted(), stop_after_drained),
+                    (Closing("drained", DRAIN_CURSOR), ClosureCommitted(), stop_after_drained),
                     EXPECTED_CLOSURE_RESULTS["drained"][stop_after_drained],
                 ),
                 (
@@ -171,8 +182,8 @@ def _expected_transitions() -> list[tuple[tuple[VisitState, VisitEvent, bool], T
             rows.extend(
                 [
                     (
-                        (Attempting(origin), SessionFinished(DrainConfirmed()), stop_after_drained),
-                        TransitionResult(Closing("drained"), CommitClosure("drained")),
+                        (Attempting(origin), SessionFinished(DrainConfirmed(DRAIN_CURSOR)), stop_after_drained),
+                        TransitionResult(Closing("drained", DRAIN_CURSOR), CommitClosure("drained", DRAIN_CURSOR)),
                     ),
                     (
                         (
@@ -212,7 +223,7 @@ def _expected_transitions() -> list[tuple[tuple[VisitState, VisitEvent, bool], T
             else:
                 for event in EVENTS:
                     rows.append(((state, event, stop_after_drained), TransitionResult(state, NoOp())))
-        for state in (Closing(reason) for reason in CLOSE_REASONS):
+        for state in (_closing(reason) for reason in CLOSE_REASONS):
             rows.append(((state, CloseFailed(), stop_after_drained), TransitionResult(Stopped(), PreserveAndStop())))
     return rows
 
@@ -222,9 +233,9 @@ FIELD_INVENTORY = {
     Idle: (),
     Waiting: (),
     Attempting: ("origin",),
-    Closing: ("reason",),
+    Closing: ("reason", "drain_cursor"),
     Stopped: (),
-    DrainConfirmed: (),
+    DrainConfirmed: ("cursor",),
     Interrupted: ("connected", "durable_progress"),
     CandidateUnavailable: (),
     OperatorBatchCompleted: (),
@@ -238,7 +249,7 @@ FIELD_INVENTORY = {
     InspectRecovery: (),
     WaitForAttempt: ("arm_restored", "previous_outcome"),
     RunAttempt: (),
-    CommitClosure: ("reason",),
+    CommitClosure: ("reason", "drain_cursor"),
     FinishVisit: ("reason", "stop"),
     PreserveAndStop: (),
     NoOp: (),
@@ -247,8 +258,13 @@ FIELD_INVENTORY = {
 
 
 def test_visit_machine_values_are_immutable() -> None:
+    examples = {
+        Closing: Closing("drained", DRAIN_CURSOR),
+        DrainConfirmed: DrainConfirmed(DRAIN_CURSOR),
+        CommitClosure: CommitClosure("drained", DRAIN_CURSOR),
+    }
     for record_type in FIELD_INVENTORY:
-        record = record_type(*([None] * len(fields(record_type))))
+        record = examples[record_type] if record_type in examples else record_type(*([None] * len(fields(record_type))))
         hash(record)
         if record_fields := fields(record_type):
             with pytest.raises(FrozenInstanceError):
@@ -286,7 +302,7 @@ def test_restored_startup_arms_waiting_but_empty_and_interrupted_visits_do_not()
 def test_waiting_recovery_end_commits_closure(reason: str) -> None:
     result = transition(Waiting(), RecoveryEnded(reason))  # type: ignore[arg-type]
 
-    assert result == TransitionResult(Closing(reason), CommitClosure(reason))  # type: ignore[arg-type]
+    assert result == TransitionResult(_closing(reason), _commit(reason))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("durable_progress", [False, True])
@@ -311,13 +327,42 @@ def test_candidate_unavailable_restores_attempt_origin(origin: Idle | Waiting) -
 
 
 def test_drain_requires_closure_before_idle_or_stop() -> None:
-    closing = transition(Attempting(Idle()), SessionFinished(DrainConfirmed()))
+    closing = transition(Attempting(Idle()), SessionFinished(DrainConfirmed(10)))
 
-    assert closing == TransitionResult(Closing("drained"), CommitClosure("drained"))
+    assert closing == TransitionResult(Closing("drained", 10), CommitClosure("drained", 10))
     assert transition(closing.state, ClosureCommitted()) == TransitionResult(Idle(), FinishVisit("drained", False))
     assert transition(closing.state, ClosureCommitted(), stop_after_drained=True) == TransitionResult(
         Stopped(), FinishVisit("drained", True)
     )
+
+
+@pytest.mark.parametrize(
+    ("factory", "args"),
+    (
+        (DrainConfirmed, (True,)),
+        (DrainConfirmed, (-1,)),
+        (DrainConfirmed, (1.0,)),
+        (Closing, ("drained",)),
+        (Closing, ("drained", None)),
+        (Closing, ("drained", -1)),
+        (Closing, ("drained", True)),
+        (Closing, ("absence", 10)),
+        (Closing, ("unknown", None)),
+        (CommitClosure, ("drained",)),
+        (CommitClosure, ("drained", None)),
+        (CommitClosure, ("drained", -1)),
+        (CommitClosure, ("drained", True)),
+        (CommitClosure, ("absence", 10)),
+    ),
+)
+def test_drain_cursor_contract_rejects_impossible_machine_values(factory: object, args: tuple[object, ...]) -> None:
+    with pytest.raises(ValueError):
+        factory(*args)  # type: ignore[operator]
+
+
+def test_drain_confirmation_requires_cursor_argument() -> None:
+    with pytest.raises(TypeError):
+        DrainConfirmed()  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize("reason", ["absence", "recovery_exhausted"])
@@ -352,7 +397,7 @@ def test_close_failure_shutdown_and_stopped_late_events_preserve_evidence() -> N
     late_events = (
         RecoveryLoaded("empty"),
         AttemptGranted(),
-        SessionFinished(DrainConfirmed()),
+        SessionFinished(DrainConfirmed(DRAIN_CURSOR)),
         RecoveryEnded("absence"),
         ClosureCommitted(),
         CloseFailed(),
@@ -365,11 +410,11 @@ def test_close_failure_shutdown_and_stopped_late_events_preserve_evidence() -> N
 @pytest.mark.parametrize(
     ("state", "event"),
     [
-        (Recovering(), SessionFinished(DrainConfirmed())),
-        (Idle(), SessionFinished(DrainConfirmed())),
-        (Waiting(), SessionFinished(DrainConfirmed())),
+        (Recovering(), SessionFinished(DrainConfirmed(DRAIN_CURSOR))),
+        (Idle(), SessionFinished(DrainConfirmed(DRAIN_CURSOR))),
+        (Waiting(), SessionFinished(DrainConfirmed(DRAIN_CURSOR))),
         (Attempting(Idle()), ClosureCommitted()),
-        (Closing("drained"), AttemptGranted()),
+        (Closing("drained", DRAIN_CURSOR), AttemptGranted()),
         (Idle(), RecoveryEnded("absence")),
     ],
 )
@@ -463,15 +508,15 @@ def test_finite_model_is_exhaustive_and_reachable() -> None:
     ("value", "field", "replacement"),
     (
         (Attempting(Idle()), "origin", Waiting()),
-        (Closing("drained"), "reason", "absence"),
+        (Closing("drained", DRAIN_CURSOR), "reason", "absence"),
         (Interrupted(True, False), "connected", False),
         (Interrupted(True, False), "durable_progress", True),
         (RecoveryLoaded("empty"), "disposition", "resumable"),
-        (SessionFinished(DrainConfirmed()), "outcome", CandidateUnavailable()),
+        (SessionFinished(DrainConfirmed(DRAIN_CURSOR)), "outcome", CandidateUnavailable()),
         (RecoveryEnded("absence"), "reason", "recovery_exhausted"),
         (WaitForAttempt(), "arm_restored", True),
         (WaitForAttempt(), "previous_outcome", Interrupted(True, False)),
-        (CommitClosure("drained"), "reason", "absence"),
+        (CommitClosure("drained", DRAIN_CURSOR), "reason", "absence"),
         (FinishVisit("drained", False), "reason", "absence"),
         (FinishVisit("drained", False), "stop", True),
         (TransitionResult(Recovering(), InspectRecovery()), "state", Idle()),
@@ -510,7 +555,7 @@ def _assert_finite_invariants(
             assert result.command.stop is False
     if isinstance(event, SessionFinished) and isinstance(event.outcome, DrainConfirmed):
         assert isinstance(state, Attempting)
-        assert result.state == Closing("drained")
+        assert result.state == Closing("drained", event.outcome.cursor)
     if isinstance(event, SessionFinished) and isinstance(event.outcome, CandidateUnavailable):
         assert isinstance(state, Attempting)
         assert result.state == state.origin

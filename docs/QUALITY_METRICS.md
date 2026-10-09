@@ -32,15 +32,34 @@ published bundles, and a bounded quality window:
 uv run omi-collector device status
 ```
 
-Its top-level `status` is `ok` when the window contains a completed transfer
-and no confirmed loss or terminal failure, `attention` as the degraded state
-when confirmed loss or a latest fatal, cancelled, or teardown-interrupted
-transfer is present, and
-`unknown` when there is no completed transfer to assess. `publication` reports
-the currently visible bundle inventory. `quality_window` reports recent
-advertisements, transfer sessions, pooled bytes per second, outcome counts,
-termination-class counts, and confirmed loss totals. A null `device` means no
-firmware observation has been recorded for that device.
+Its top-level `status` is `ok` only when the quality window contains a
+completed transfer, operational health is `clear`, and there is no confirmed
+loss or terminal failure. A blocked health state or confirmed loss produces
+`attention`; no completed transfer by itself is `unknown`, never evidence of
+healthy operation. `publication` reports the currently visible bundle
+inventory. `quality_window` reports recent advertisements, transfer sessions,
+pooled bytes per second, outcome counts, termination-class counts, and
+confirmed loss totals. A null `device` means no firmware observation has been
+recorded for that device.
+
+Confirmed loss must remain visible independently of this bounded telemetry
+window. The accepted contract is an authoritative loss ledger, fsynced before
+prefix publication; status reads that ledger, while `quality.jsonl` remains a
+projection. Queue overflow may drop a metric record, but cannot erase the loss
+fact or permit a later successful transfer to clear attention. Repeated
+observations are deduplicated automatically, and retained legacy loss facts
+remain part of the status. The service implements this contract; see the
+[Service audit](SERVICE_AUDIT.md) for targeted proof and release status.
+
+Current operational health is held separately from rotating debug logs as
+low-rate `unknown`, `clear`, or `blocked` states for quality, publication, and
+clock processing. The snapshot is tied to the host boot ID and systemd
+invocation ID. On identity change, prior `clear` becomes `unknown`; prior
+`blocked` remains attention until recovery is recorded. These states change on
+events, not a periodic heartbeat or TTL. If snapshot persistence fails, the
+service supervises the writer failure, cancels collection through its audio
+finalizer, and exits nonzero rather than reporting a false healthy result. See
+[Best practices](BEST_PRACTICES.md#status-and-logs) for operational guidance.
 
 Use `journalctl -u omi-collector.service` for the operational timeline. The
 service's INFO stream omits routine `storage_wait` polling and detailed

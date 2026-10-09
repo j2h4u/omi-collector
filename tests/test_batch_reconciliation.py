@@ -17,10 +17,11 @@ import pytest
 
 from fakes import DelayedNotification, ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.attempt_writer import WriterError, WriterFailedError
+from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, read_confirmed_losses
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.staging_contract import AttemptDescriptor, StagingError
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application.batch_reconciliation import BatchReconciler, CursorConsistencyError
 from omi_collector.capture.application.collector import (
     CollectionResult,
@@ -37,7 +38,12 @@ from omi_collector.capture.application.ports import (
     StagingPort,
     WriterProgressShape,
 )
-from omi_collector.capture.application.quality_metrics import SessionQuality
+from omi_collector.capture.application.quality_metrics import (
+    QualityMetricsPort,
+    SequenceLossMetric,
+    SessionQuality,
+    utc_timestamp,
+)
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy, SessionPhaseState
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
@@ -131,6 +137,8 @@ async def test_regressed_pending_prefix_keeps_authenticated_visit_frontier(tmp_p
 @_async_test
 async def test_cursor_ahead_with_metrics_disabled_has_no_metrics_error_event(tmp_path: Path) -> None:
     store, _path, _raw, _checkpoint = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     descriptor = store.pending_attempts()[0]
     durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
     runtime = _Runtime()
@@ -455,6 +463,209 @@ def _real_batch_steps() -> tuple[WriteStep, ...]:
     )
 
 
+async def _ignore_quarantine(_attempt_id: str) -> None:
+    return None
+
+
+@dataclass(slots=True)
+class _CursorAheadLossRetry:
+    reconciler: BatchReconciler
+    store: StagingStore
+    current: RingInfo
+    runtime: _Runtime
+    session: ScriptedRingSession
+    quality: SessionQuality
+    events: list[str]
+    loss_ids: list[str]
+    metrics: _LossMetrics
+
+
+def _install_confirmed_loss_retry_observers(
+    store: StagingStore,
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+    loss_ids: list[str],
+) -> None:
+    original_record = store.record_confirmed_loss
+    original_read_begin = StagingWriter.read_begin
+    original_publish_prefix = StagingWriter.publish_prefix
+    fail_after_recording = True
+
+    def record_loss(attempt_id: str, start: int, end: int, occurred_at: str) -> str:
+        nonlocal fail_after_recording
+        loss_id = original_record(attempt_id, start, end, occurred_at)
+        loss_ids.append(loss_id)
+        events.append("loss")
+        if fail_after_recording:
+            fail_after_recording = False
+            raise OSError("simulated interruption after durable loss record")
+        return loss_id
+
+    def read_begin(writer: StagingWriter, notice: ReadBeginNotification) -> None:
+        events.append("rebind")
+        original_read_begin(writer, notice)
+
+    def publish_prefix(writer: StagingWriter) -> SealResultShape | None:
+        events.append("publish")
+        return original_publish_prefix(writer)
+
+    monkeypatch.setattr(store, "record_confirmed_loss", record_loss)
+    monkeypatch.setattr(StagingWriter, "read_begin", read_begin)
+    monkeypatch.setattr(StagingWriter, "publish_prefix", publish_prefix)
+
+
+def _assert_confirmed_loss(store: StagingStore, loss_id: str) -> None:
+    [fact] = read_confirmed_losses(store.confirmed_loss_ledger_path)
+    assert fact.loss_id == loss_id
+    assert (fact.start_sequence, fact.end_sequence) == (101, 103)
+    assert fact.missing_record_count == 2
+    assert fact.missing_raw_bytes == 2 * RECORD_SIZE
+
+
+def _make_cursor_ahead_loss_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _CursorAheadLossRetry:
+    store, _attempt_path, _raw, _checkpoint = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
+    descriptor = store.pending_attempts()[0]
+    durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
+    runtime = _Runtime()
+    metrics = _LossMetrics()
+    options = replace(_options(), quality_metrics=cast(QualityMetricsPort, metrics), host_time=lambda: 1_700_000_000.0)
+    reconciler = BatchReconciler(store, options, runtime, _ignore_quarantine)
+    reconciler.set_startup_state(descriptor, durable_next)
+    scenario = _CursorAheadLossRetry(
+        reconciler,
+        store,
+        RingInfo(103, 103, 100, 0, RECORD_SIZE),
+        runtime,
+        ScriptedRingSession(RingStatus(0, 0, 0, 1)),
+        SessionQuality(None, "test", session_id="session-1"),
+        [],
+        [],
+        metrics,
+    )
+    _install_confirmed_loss_retry_observers(store, monkeypatch, scenario.events, scenario.loss_ids)
+    return scenario
+
+
+async def _assert_confirmed_loss_retry_completion(
+    scenario: _CursorAheadLossRetry,
+    seen: RingInfo | None,
+) -> None:
+    assert seen is scenario.current
+    assert scenario.events == ["loss", "rebind", "publish"]
+    assert len(scenario.loss_ids) == 2 and scenario.loss_ids[0] == scenario.loss_ids[1]
+    _assert_confirmed_loss(scenario.store, scenario.loss_ids[0])
+    [metric] = scenario.metrics.losses
+    assert metric.loss_id == scenario.loss_ids[0]
+    assert metric.occurred_at == utc_timestamp(1_700_000_000.0)
+    result = scenario.reconciler.drained_result()
+    assert isinstance(result, CollectionResult)
+    assert result.packet_count == 1
+    assert result.next_sequence == 101
+    assert result.advance_confirmed is False
+    await scenario.reconciler.close_visit("drained", drain_cursor=scenario.current.read_sequence)
+    assert loads(scenario.store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
+        {"next_sequence": 101, "reason": "drained"}
+    ]
+
+
+@_async_test
+async def test_cursor_ahead_loss_is_durable_before_prefix_publish_and_idempotent_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = _make_cursor_ahead_loss_retry(tmp_path, monkeypatch)
+
+    async def info(_session: object) -> RingInfo:
+        return scenario.current
+
+    try:
+        with pytest.raises(OSError, match="simulated interruption after durable loss record"):
+            await scenario.reconciler.connected_step(
+                scenario.session, scenario.current, info, SessionPhaseState("read/reconcile", scenario.quality)
+            )
+        assert scenario.events == ["loss"]
+        _assert_confirmed_loss(scenario.store, scenario.loss_ids[0])
+
+        scenario.events.clear()
+        disposition, seen = await scenario.reconciler.connected_step(
+            scenario.session,
+            scenario.current,
+            info,
+            SessionPhaseState("read/reconcile", scenario.quality),
+        )
+        assert (disposition, seen) == ("drained", scenario.current)
+        await _assert_confirmed_loss_retry_completion(scenario, seen)
+    finally:
+        await _close_real_writers(scenario.runtime)
+        await scenario.session.close()
+
+
+@_async_test
+async def test_confirmed_loss_write_failure_preserves_unpublished_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, attempt_path, raw_before, checkpoint_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
+    descriptor = store.pending_attempts()[0]
+    durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
+    runtime = _Runtime()
+    reconciler = BatchReconciler(store, _options(), runtime, _ignore_quarantine)
+    reconciler.set_startup_state(descriptor, durable_next)
+    current = RingInfo(103, 103, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1))
+    events: list[str] = []
+    original_read_begin = StagingWriter.read_begin
+    original_publish_prefix = StagingWriter.publish_prefix
+
+    def fail_record(_attempt_id: str, _start: int, _end: int, _occurred_at: str) -> str:
+        events.append("loss")
+        raise ConfirmedLossError("simulated confirmed-loss ledger failure")
+
+    def read_begin(writer: StagingWriter, notice: ReadBeginNotification) -> None:
+        events.append("rebind")
+        original_read_begin(writer, notice)
+
+    def publish_prefix(writer: StagingWriter) -> SealResultShape | None:
+        events.append("publish")
+        return original_publish_prefix(writer)
+
+    monkeypatch.setattr(store, "record_confirmed_loss", fail_record)
+    monkeypatch.setattr(StagingWriter, "read_begin", read_begin)
+    monkeypatch.setattr(StagingWriter, "publish_prefix", publish_prefix)
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        with pytest.raises(ConfirmedLossError, match="simulated confirmed-loss ledger failure"):
+            await reconciler.connected_step(
+                session, current, info, SessionPhaseState("read/reconcile", SessionQuality(None, "test"))
+            )
+        assert events == ["loss"]
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+    assert store.pending_attempts() == (descriptor,)
+    assert (attempt_path / "records.bin").read_bytes() == raw_before
+    assert (attempt_path / "checkpoint.json").read_bytes() == checkpoint_before
+    assert not (attempt_path / "prefix-publication.json").exists()
+    assert not tuple(store.capture_root.iterdir())
+
+
+class _LossMetrics:
+    release_version = "test"
+    source_revision = None
+
+    def __init__(self) -> None:
+        self.losses: list[SequenceLossMetric] = []
+
+    def record_sequence_loss(self, metric: SequenceLossMetric) -> None:
+        self.losses.append(metric)
+
+
 @dataclass
 class _CadenceRecorder:
     events: list[ProgressEvent]
@@ -525,7 +736,7 @@ async def test_collect_only_adopts_seal_completed_before_ack_timeout(tmp_path: P
 @_async_test
 async def test_fresh_info_regression_keeps_sealed_batch_without_advance(tmp_path: Path) -> None:
     runtime = _Runtime()
-    _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
     session = ScriptedRingSession(RingStatus(0, 0, 0, 1), _real_batch_steps())
     current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
     fresh = RingInfo(99, 102, 100, 0, RECORD_SIZE)
@@ -537,20 +748,13 @@ async def test_fresh_info_regression_keeps_sealed_batch_without_advance(tmp_path
         return fresh
 
     try:
-        disposition, _ = await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
-        assert disposition is None
-        result = reconciler.drained_result()
-        assert isinstance(result, CollectionResult)
-        assert result.advance_confirmed is False
-        assert result.next_sequence == 102
+        with pytest.raises(CursorConsistencyError, match=r"fresh INFO before ADVANCE classified.*regressed"):
+            await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
         assert all(command[0] != 0x12 for command in session.writes)
         assert calls == 1
         assert len(runtime.proxies) == 1
-        assert not runtime.proxies[0].thread.is_alive()
-        seal = result.seal
-        assert isinstance(seal, SealResult)
-        assert seal.bundle_path.is_dir()
-        assert (seal.bundle_path / "records.bin").read_bytes() == _record(100) + _record(101)
+        [bundle] = store.capture_root.glob("100-102-*")
+        assert (bundle / "records.bin").read_bytes() == _record(100) + _record(101)
     finally:
         await _close_real_writers(runtime)
         await session.close()

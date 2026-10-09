@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from threading import Lock, Thread
 from typing import cast
@@ -20,6 +21,7 @@ from ..application.quality_metrics import (
     SequenceLossMetric,
     TransferSessionMetric,
 )
+from ..domain.operational_status_machine import OperationalSignal
 
 _REVISION = re.compile(r"[0-9a-f]{40,64}")
 _RELEASE_METADATA = Path("share/omi-collector/release.json")
@@ -54,10 +56,15 @@ class JsonlQualityMetrics(QualityMetricsPort):
         self._dropped_records = 0
         self._shutdown_timeout = config.shutdown_join_seconds
         self._logger = diagnostic_logger or logging.getLogger(__name__)
+        self._operational_signal: Callable[[OperationalSignal], None] | None = None
         self.release_version = _require_release_version(release_version)
         self.source_revision = normalize_source_revision(source_revision)
         self._thread = Thread(target=self._run, name="omi-quality-metrics", daemon=True)
         self._thread.start()
+
+    def set_operational_signal(self, callback: Callable[[OperationalSignal], None]) -> None:
+        self._operational_signal = callback
+        self._signal(OperationalSignal.CONFIGURED)
 
     @property
     def path(self) -> Path:
@@ -137,13 +144,20 @@ class JsonlQualityMetrics(QualityMetricsPort):
                 return
             try:
                 self._append(line)
+                self._signal(OperationalSignal.CLEAR)
             except Exception as error:  # noqa: BLE001 - auxiliary storage must not kill collection
+                self._signal(OperationalSignal.BLOCK)
                 self._diagnose("write_failed", error)
 
     def _record_drop(self, reason: str) -> None:
         with self._state_lock:
             self._dropped_records += 1
         self._diagnose(reason)
+        self._signal(OperationalSignal.BLOCK)
+
+    def _signal(self, signal: OperationalSignal) -> None:
+        if self._operational_signal is not None:
+            self._operational_signal(signal)
 
     def _diagnose(self, event: str, error: BaseException | None = None) -> None:
         try:

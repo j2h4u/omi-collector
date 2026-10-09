@@ -43,6 +43,10 @@ class Closing:
     """The visit is closed and awaits durable closure acknowledgement."""
 
     reason: CloseReason
+    drain_cursor: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_drain_cursor(self.reason, self.drain_cursor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +60,12 @@ type VisitState = Recovering | Idle | Waiting | Attempting | Closing | Stopped
 @dataclass(frozen=True, slots=True)
 class DrainConfirmed:
     """A fresh final INFO confirmed the ring is drained after teardown."""
+
+    cursor: int
+
+    def __post_init__(self) -> None:
+        if type(self.cursor) is not int or self.cursor < 0:
+            raise ValueError("drain cursor must be a nonnegative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +148,10 @@ class RunAttempt:
 @dataclass(frozen=True, slots=True)
 class CommitClosure:
     reason: CloseReason
+    drain_cursor: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_drain_cursor(self.reason, self.drain_cursor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,10 +236,20 @@ def _attempting_transition(state: Attempting, event: VisitEvent) -> TransitionRe
     if isinstance(outcome, CandidateUnavailable):
         return TransitionResult(state.origin, WaitForAttempt(previous_outcome=outcome))
     if isinstance(outcome, DrainConfirmed):
-        return TransitionResult(Closing("drained"), CommitClosure("drained"))
+        return TransitionResult(Closing("drained", outcome.cursor), CommitClosure("drained", outcome.cursor))
     if isinstance(outcome, OperatorBatchCompleted):
         return TransitionResult(Closing("operator_limit"), CommitClosure("operator_limit"))
     raise VisitTransitionError(f"unsupported session outcome: {type(outcome).__name__}")
+
+
+def _validate_drain_cursor(reason: CloseReason, cursor: int | None) -> None:
+    if reason not in {"drained", "absence", "recovery_exhausted", "restart_interrupted", "operator_limit"}:
+        raise ValueError("unsupported closure reason")
+    if reason == "drained":
+        if type(cursor) is not int or cursor < 0:
+            raise ValueError("drained closure requires a nonnegative confirmed cursor")
+    elif cursor is not None:
+        raise ValueError("only drained closure may carry a confirmed cursor")
 
 
 def _closing_transition(state: Closing, event: VisitEvent, *, stop_after_drained: bool) -> TransitionResult:

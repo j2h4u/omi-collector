@@ -13,7 +13,9 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import cast
 
@@ -23,6 +25,8 @@ OWNER_FILE = "owner.json"
 MAX_CONTROL_BYTES = 4096
 PEERCRED_SIZE = struct.calcsize("3i")
 PAUSE_ACK_SECONDS = 180.0
+CONTROL_READ_SECONDS = 5.0
+MAX_CONTROL_HANDLERS = 4
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_SOCKET_MODE = 0o600
 SOCKET_DIRECTORY = Path(f"/tmp/omi-mutation-control-{os.getuid()}")
@@ -129,6 +133,12 @@ class OwnerControlServer:
         self.listener: socket.socket | None = None
         self.thread: threading.Thread | None = None
         self.socket_identity: tuple[int, int] | None = None
+        self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
+        self._connections: dict[socket.socket, str] = {}
+        self._handlers: dict[socket.socket, threading.Thread] = {}
+        self._handler_slots = threading.BoundedSemaphore(MAX_CONTROL_HANDLERS)
+        self._lifecycle = "stopped"
 
     def start(self) -> None:
         _validate_socket_directory()
@@ -141,17 +151,60 @@ class OwnerControlServer:
         self.socket_identity = (details.st_dev, details.st_ino)
         self.listener.listen(8)
         self.listener.settimeout(0.2)
+        self._lifecycle = "accepting"
         self.thread = threading.Thread(target=self._serve, name="mutation-control", daemon=True)
         self.thread.start()
 
     def stop(self) -> None:
+        deadline = time.monotonic() + PAUSE_ACK_SECONDS
         self.stop_event.set()
-        if self.listener is not None:
-            self.listener.close()
+        with self._changed:
+            self._lifecycle = "stopping"
+            for connection, state in self._connections.items():
+                if state == "reading":
+                    self._connections[connection] = "stopping"
+            self._changed.notify_all()
+        try:
+            close_error: OSError | None = None
+            if self.listener is not None:
+                try:
+                    self.listener.close()
+                except OSError as exc:
+                    close_error = exc
+            try:
+                self._join_control_workers(deadline)
+            except ScopeError:
+                if close_error is None:
+                    raise
+            if close_error is not None:
+                raise ScopeError(f"could not close mutation control listener: {close_error}") from close_error
+        finally:
+            if self.socket_identity is not None and _socket_identity(self.socket_path) == self.socket_identity:
+                self.socket_path.unlink()
+
+    def _join_control_workers(self, deadline: float) -> None:
         if self.thread is not None:
-            self.thread.join(timeout=2)
-        if self.socket_identity is not None and _socket_identity(self.socket_path) == self.socket_identity:
-            self.socket_path.unlink()
+            self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            connections = tuple(self._connections.items())
+            handlers = tuple(self._handlers.values())
+        for connection, state in connections:
+            if state == "stopping":
+                self._shutdown_connection(connection)
+        workers = ([self.thread] if self.thread is not None else []) + list(handlers)
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        survivors = [worker.name for worker in workers if worker.is_alive()]
+        if survivors:
+            for connection, _state in connections:
+                self._shutdown_connection(connection)
+            raise ScopeError(f"mutation control threads did not stop before deadline: {', '.join(survivors)}")
+
+    @staticmethod
+    def _shutdown_connection(connection: socket.socket) -> None:
+        with suppress(OSError):
+            connection.shutdown(socket.SHUT_RDWR)
+        connection.close()
 
     def _serve(self) -> None:
         while not self.stop_event.is_set():
@@ -165,51 +218,86 @@ class OwnerControlServer:
                 if self.stop_event.is_set():
                     return
                 continue
-            threading.Thread(target=self._handle, args=(connection,), daemon=True).start()
+            with self._changed:
+                if self._lifecycle != "accepting" or not self._handler_slots.acquire(blocking=False):
+                    connection.close()
+                    continue
+                for accepted, previous in tuple(self._handlers.items()):
+                    if not previous.is_alive():
+                        previous.join()
+                        self._handlers.pop(accepted, None)
+                self._connections[connection] = "reading"
+                handler = threading.Thread(
+                    target=self._handle,
+                    args=(connection,),
+                    name="mutation-control-handler",
+                    daemon=True,
+                )
+                self._handlers[connection] = handler
+                self._changed.notify_all()
+                handler.start()
 
     def _handle(self, connection: socket.socket) -> None:
-        with connection:
-            try:
-                peer_pid, peer_uid, _peer_gid = cast(
-                    tuple[int, int, int],
-                    struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, PEERCRED_SIZE)),
-                )
-                if peer_uid != os.getuid():
-                    raise ScopeError("control peer UID does not match the audit owner")
-                request = _receive_request(connection)
-                if request.get("token") != self.run_token:
-                    raise ScopeError("control run token is stale or invalid")
-                action = request.get("action")
-                if action == "status":
-                    state = self.state_reader()
-                    response = {
-                        "ok": True,
-                        "state": state.get("state"),
-                        "commit": state.get("commit"),
-                        "started_at": state.get("started_at"),
-                        "owner_pid": os.getpid(),
-                    }
-                elif action == "pause":
-                    acknowledged = self.pause_requester()
-                    if not acknowledged:
-                        raise ScopeError("owner could not verify a safe checkpoint stop")
-                    response = {
-                        "ok": True,
-                        "state": "paused",
-                        "checkpoint_verified": True,
-                        "owner_pid": os.getpid(),
-                    }
-                else:
-                    raise ScopeError("control action must be status or pause")
-                response["peer_pid"] = peer_pid
-            except (ScopeError, OSError, ValueError, json.JSONDecodeError, struct.error) as exc:
-                response = {"ok": False, "error": str(exc)}
-            connection.sendall((json.dumps(response, sort_keys=True) + "\n").encode("utf-8"))
+        try:
+            peer_pid, peer_uid, _peer_gid = cast(
+                tuple[int, int, int],
+                struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, PEERCRED_SIZE)),
+            )
+            if peer_uid != os.getuid():
+                raise ScopeError("control peer UID does not match the audit owner")
+            request = _receive_request(connection, time.monotonic() + CONTROL_READ_SECONDS)
+            if request.get("token") != self.run_token:
+                raise ScopeError("control run token is stale or invalid")
+            action = request.get("action")
+            with self._changed:
+                if self._lifecycle == "stopping":
+                    raise ScopeError("mutation control server is stopping")
+                self._connections[connection] = "dispatching"
+                self._changed.notify_all()
+            if action == "status":
+                state = self.state_reader()
+                response = {
+                    "ok": True,
+                    "state": state.get("state"),
+                    "commit": state.get("commit"),
+                    "started_at": state.get("started_at"),
+                    "owner_pid": os.getpid(),
+                }
+            elif action == "pause":
+                acknowledged = self.pause_requester()
+                if not acknowledged:
+                    raise ScopeError("owner could not verify a safe checkpoint stop")
+                response = {
+                    "ok": True,
+                    "state": "paused",
+                    "checkpoint_verified": True,
+                    "owner_pid": os.getpid(),
+                }
+            else:
+                raise ScopeError("control action must be status or pause")
+            response["peer_pid"] = peer_pid
+        except TimeoutError as exc:
+            response = {"ok": False, "error": f"control request read timed out: {exc}"}
+        except (ScopeError, OSError, ValueError, json.JSONDecodeError, struct.error) as exc:
+            response = {"ok": False, "error": str(exc)}
+        try:
+            with suppress(OSError):
+                connection.sendall((json.dumps(response, sort_keys=True) + "\n").encode("utf-8"))
+        finally:
+            connection.close()
+            with self._changed:
+                self._connections.pop(connection, None)
+                self._handler_slots.release()
+                self._changed.notify_all()
 
 
-def _receive_request(connection: socket.socket) -> dict[str, object]:
+def _receive_request(connection: socket.socket, deadline: float) -> dict[str, object]:
     data = bytearray()
     while b"\n" not in data and len(data) < MAX_CONTROL_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("control request deadline expired")
+        connection.settimeout(remaining)
         chunk = connection.recv(min(1024, MAX_CONTROL_BYTES - len(data)))
         if not chunk:
             break

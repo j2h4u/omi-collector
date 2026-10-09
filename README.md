@@ -320,22 +320,27 @@ Correcting the clock can make later raw records appear earlier than records
 written immediately before the change. The collector persists its intent,
 verifies the readback, and confirms a sequence interval only after two INFO
 reads in the same BLE session. It rewrites timestamps only inside such a
-confirmed interval. Other records retain their device timestamps and are
-marked `utc: null` in the ready manifest. A bundle boundary alone is not proof
-of a clock correction.
+confirmed interval. It can also estimate UTC over intervals bounded by
+trusted native clock reads when no confirmed mapping covers them. Those
+timestamps are rewritten too, and their ready-manifest mapping carries
+`confidence: approximate`. Records with no usable estimate retain their device
+timestamps and have `utc: null`. A bundle boundary alone is not proof of a
+clock correction.
 
 This preserves device evidence without inventing UTC for historical backlog.
-It does not explain or fix the underlying RTC behavior. Treat `sequence_loss`
-as confirmed unrecoverable loss, and treat a raw timestamp regression as UTC
-known only when it falls within a confirmed clock-membership range. Recheck
-both behaviors after every firmware upgrade; a new version number alone is not
-proof that either one was fixed.
+It does not explain or fix the underlying RTC behavior. Record sequence is the
+authoritative audio order; calendar timestamps do not reorder the stream.
+Treat `sequence_loss` as confirmed unrecoverable loss, and treat UTC as known
+only where the ready manifest supplies a confirmed or explicitly approximate
+mapping. Recheck both behaviors after every firmware upgrade; a new version
+number alone is not proof that either one was fixed.
 
 Clock observations, including healthy reads, are retained in a separate
 immutable evidence ledger. A restart replays native causal observations without
-a new BLE visit. UTC is estimated only for an explicitly confirmed clock
-segment from the host midpoint at its RTC read; records outside such a segment
-remain unknown rather than being assigned a guessed time.
+a new BLE visit. Confirmed mappings use verified clock membership; approximate
+mappings use the host midpoint at a trusted RTC read and are explicitly marked
+in the manifest. Records outside every confirmed or approximate segment remain
+unknown rather than being assigned a guessed time.
 
 The optional `--force-1m` weak-RF workaround changes controller-wide PHY state.
 It is disabled by default and restores the prior selection after completion,
@@ -373,6 +378,8 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
   guidance.
 - [Transfer-quality evidence](docs/QUALITY_METRICS.md) — the durable metric
   journal and how operators interpret its records.
+- [Service audit tracker](docs/SERVICE_AUDIT.md) — root-cause fixes and
+  acceptance checks for the eight service-audit findings.
 - [Acceptance specification (Gherkin)](features/opportunistic_collection.feature)
   — presence, transfer, interruption, recovery, and publication behavior.
   The specification is reviewed alongside the executable pytest suite; the

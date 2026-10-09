@@ -75,6 +75,23 @@ class _DeploymentHarness:
     environment: dict[str, str]
 
 
+def _git_index_mode(path: Path) -> str:
+    """Use Git's executable bit; checkout permissions also reflect the caller's umask."""
+    relative_path = path.relative_to(_ROOT)
+    result = subprocess.run(
+        ("git", "ls-files", "--stage", "--", str(relative_path)),
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    records = result.stdout.splitlines()
+    assert len(records) == 1
+    mode, _object_id, stage_and_path = records[0].split(" ", 2)
+    assert stage_and_path == f"0\t{relative_path}"
+    return mode
+
+
 def _unit_sections() -> dict[str, dict[str, str]]:
     sections: dict[str, dict[str, str]] = {}
     section: dict[str, str] | None = None
@@ -222,8 +239,8 @@ def test_release_deploy_wrapper_has_fixed_privileged_contract() -> None:
     assert "stat -c '%U:%G:%a' \"$deployer\"" in command
     assert "root:root:755" in command
     assert policy == "%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-deploy-release\n"
-    assert (_RELEASE_COMMAND.stat().st_mode & 0o777) == 0o755
-    assert (_RELEASE_SUDOERS.stat().st_mode & 0o777) == 0o644
+    assert _git_index_mode(_RELEASE_COMMAND) == "100755"
+    assert _git_index_mode(_RELEASE_SUDOERS) == "100644"
 
 
 def test_release_deploy_wrapper_rejects_invalid_arguments_without_delegating() -> None:

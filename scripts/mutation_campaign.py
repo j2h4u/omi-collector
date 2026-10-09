@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, distribution
@@ -26,7 +26,14 @@ from pathlib import Path
 from types import FrameType
 from typing import BinaryIO, cast
 
-from scripts.mutation_scope import AUDIT_ROOT, OwnerControlServer, ScopeError, control_socket_path, remove_stale_socket
+from scripts.mutation_scope import (
+    AUDIT_ROOT,
+    PAUSE_ACK_SECONDS,
+    OwnerControlServer,
+    ScopeError,
+    control_socket_path,
+    remove_stale_socket,
+)
 
 CACHE = Path(".gremlins_cache")
 RECEIPT = CACHE / "campaign.json"
@@ -37,7 +44,29 @@ OWNER_LOCK = ".owner.lock"
 JOB_TOKEN_ENV = "OMI_MUTATION_JOB_TOKEN"
 OWNER_CHECK_SECONDS = 600.0
 PRIVATE_DIRECTORY_MODE = 0o700
-BLOCKING_JOB_STATES = {"running", "pausing", "control_failed", "cleanup_failed", "source_invalidated"}
+OWNER_STATES = {
+    "preparing",
+    "running",
+    "pausing",
+    "control_failed",
+    "cleanup_failed",
+    "source_invalidated",
+    "paused",
+    "interrupted",
+    "complete",
+    "complete_unresolved",
+    "baseline_failed",
+    "controller_failed",
+    "failed",
+}
+BLOCKING_JOB_STATES = {
+    "preparing",
+    "running",
+    "pausing",
+    "control_failed",
+    "cleanup_failed",
+    "source_invalidated",
+}
 PROCESS_SETTLE_SECONDS = 0.1
 STABLE_PROCESS_SCANS = 2
 UNRESOLVED_EXIT_STATUS = 3
@@ -77,9 +106,21 @@ class OwnerRun:
     receipt: dict[str, object]
     process: subprocess.Popen[bytes] | None = None
     paused: threading.Event = field(default_factory=threading.Event)
+    pause_done: threading.Event = field(default_factory=threading.Event)
     invalidated: threading.Event = field(default_factory=threading.Event)
+    stopping: threading.Event = field(default_factory=threading.Event)
+    finishing: threading.Event = field(default_factory=threading.Event)
     state_lock: threading.Lock = field(default_factory=threading.Lock)
+    receipt_lock: threading.Lock = field(default_factory=threading.Lock)
     requested_signal: list[int] = field(default_factory=list)
+
+
+class OwnerCleanupUnverifiedError(ValueError):
+    """A preflight process could not be confirmed reaped."""
+
+
+class OwnerPrechildFailureError(ValueError):
+    """Owner startup failed before the mutation child was handed off."""
 
 
 def _git(*args: str) -> str:
@@ -628,14 +669,17 @@ def _remove_job_tmp(job_root: Path, receipt: dict[str, object]) -> None:
 
 
 def _record_tmp_cleanup_eligible(run: OwnerRun) -> None:
-    run.receipt.update(
-        {
-            "cleanup_verified": True,
-            "cleanup_verified_token": run.token,
-            "cleanup_verified_identity": run.receipt.get("identity"),
-        }
-    )
-    _write_owner(run.job_root, run.receipt)
+    with run.receipt_lock:
+        if run.stopping.is_set() or run.receipt.get("run_token") != run.token:
+            raise ValueError("owner is stopping; preserving mutation scratch")
+        run.receipt.update(
+            {
+                "cleanup_verified": True,
+                "cleanup_verified_token": run.token,
+                "cleanup_verified_identity": run.receipt.get("identity"),
+            }
+        )
+        _write_owner(run.job_root, run.receipt)
 
 
 def _tmp_cleanup_proved(receipt: dict[str, object], token: str) -> bool:
@@ -898,11 +942,29 @@ def _preflight_process_control(job_root: Path) -> None:
         _pidfd_signal(pidfd, signal.SIGKILL)
         probe.wait(timeout=3)
     finally:
-        if pidfd is not None:
+        _reap_preflight_probe(probe, pidfd)
+
+
+def _reap_preflight_probe(probe: subprocess.Popen[bytes], pidfd: int | None) -> None:
+    cleanup_error: Exception | None = None
+    if pidfd is not None:
+        try:
             os.close(pidfd)
+        except OSError as exc:
+            cleanup_error = exc
+    try:
         if probe.poll() is None:
-            probe.kill()
-            probe.wait(timeout=3)
+            with suppress(ProcessLookupError):
+                probe.kill()
+        probe.wait(timeout=3)
+    except (OSError, subprocess.SubprocessError) as exc:
+        cleanup_error = cleanup_error or exc
+    if cleanup_error is not None:
+        raise OwnerCleanupUnverifiedError(
+            f"process-control preflight could not verify probe cleanup: {cleanup_error}"
+        ) from cleanup_error
+    if probe.poll() is None:
+        raise OwnerCleanupUnverifiedError("process-control preflight probe remains alive after cleanup")
 
 
 def _check_snapshot_seal(run: OwnerRun) -> None:
@@ -1060,38 +1122,83 @@ def _finish_owner_child(run: OwnerRun) -> int:
     with run.state_lock:
         if run.paused.is_set():
             return 130
-        if run.invalidated.is_set() or run.receipt.get("state") == "control_failed":
-            return 1
-        if run.requested_signal:
-            return _finish_signalled_child(run, run.requested_signal[0])
-        return _finish_completed_child(run)
+        pause_in_progress = run.receipt.get("state") == "pausing"
+        if pause_in_progress:
+            requested_signal = None
+        else:
+            if run.invalidated.is_set() or run.receipt.get("state") == "control_failed":
+                return 1
+            run.finishing.set()
+            requested_signal = run.requested_signal[0] if run.requested_signal else None
+    if pause_in_progress:
+        return _finish_overlapping_pause(run)
+    if requested_signal is not None:
+        return _finish_signalled_child(run, requested_signal)
+    return _finish_completed_child(run)
+
+
+def _finish_overlapping_pause(run: OwnerRun) -> int:
+    if run.pause_done.wait(PAUSE_ACK_SECONDS):
+        return 130 if run.paused.is_set() else 1
+    run.stopping.set()
+    with run.receipt_lock:
+        if run.receipt.get("run_token") == run.token and run.receipt.get("state") == "pausing":
+            run.receipt.update(
+                {
+                    "state": "cleanup_failed",
+                    "cleanup_verified": False,
+                    "error": "pause handler did not finish before its acknowledgement deadline",
+                    "ended_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            with suppress(OSError):
+                _write_owner(run.job_root, run.receipt)
+    return 1
 
 
 def _request_pause(run: OwnerRun) -> bool:
-    with run.state_lock:
-        process = run.process
-        if run.paused.is_set() or process is None or process.poll() is not None:
-            return run.paused.is_set()
-        run.receipt.update({"state": "pausing", "pause_requested_at": datetime.now(UTC).isoformat()})
-        _write_owner(run.job_root, run.receipt)
+    try:
+        with run.state_lock:
+            process = run.process
+            if run.stopping.is_set() or run.finishing.is_set():
+                return run.paused.is_set()
+            if run.paused.is_set() or process is None or process.poll() is not None:
+                return run.paused.is_set()
+            if not _commit_owner_state(run, "running", "pausing", pause_requested_at=datetime.now(UTC).isoformat()):
+                return False
         try:
             checkpoint = _stop_owned_processes(process, run.token, run.checkout)
             _cleanup_verified_job_tmp(run)
             _mark_campaign_interrupted(run.checkout, "checkpoint-stop")
         except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as exc:
-            run.receipt.update({"state": "control_failed", "checkpoint_verified": False, "error": str(exc)})
-            _write_owner(run.job_root, run.receipt)
+            _commit_owner_state(run, "pausing", "control_failed", checkpoint_verified=False, error=str(exc))
             return False
-        run.receipt.update(
-            {
-                "state": "paused",
-                "checkpoint_verified": True,
-                "checkpoint": checkpoint,
-                "ended_at": datetime.now(UTC).isoformat(),
-            }
-        )
-        _write_owner(run.job_root, run.receipt)
+        if not _commit_owner_state(
+            run,
+            "pausing",
+            "paused",
+            checkpoint_verified=True,
+            checkpoint=checkpoint,
+            ended_at=datetime.now(UTC).isoformat(),
+        ):
+            return False
         run.paused.set()
+        return True
+    finally:
+        run.pause_done.set()
+
+
+def _commit_owner_state(run: OwnerRun, expected_state: str, state: str, **changes: object) -> bool:
+    with run.receipt_lock:
+        if (
+            run.stopping.is_set()
+            or run.receipt.get("run_token") != run.token
+            or run.receipt.get("state") != expected_state
+        ):
+            return False
+        next_receipt = {**run.receipt, "state": state, **changes}
+        _write_owner(run.job_root, next_receipt)
+        run.receipt.update(next_receipt)
         return True
 
 
@@ -1123,15 +1230,17 @@ def _prepare_owner(job_root: Path, run_token: str) -> tuple[BinaryIO, dict[str, 
     try:
         _preflight_process_control(job_root)
     except (OSError, ValueError, subprocess.SubprocessError, TimeoutError) as exc:
-        receipt.update(
-            {
-                "state": "controller_failed",
-                "cleanup_verified": True,
-                "error": f"process-control preflight failed: {exc}",
-                "ended_at": datetime.now(UTC).isoformat(),
-            }
-        )
-        _write_owner(job_root, receipt)
+        if isinstance(exc, OwnerCleanupUnverifiedError):
+            receipt.update(
+                {
+                    "state": "cleanup_failed",
+                    "cleanup_verified": False,
+                    "error": str(exc),
+                    "ended_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            with suppress(OSError):
+                _write_owner(job_root, receipt)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
         raise
@@ -1146,39 +1255,69 @@ def _enter_owner(
     command: list[str] | None = None,
     environment: dict[str, str] | None = None,
 ) -> int:
-    import fcntl
-
-    run_env = _owner_run_environment(job_root, environment)
-    lock, receipt, socket_path = _prepare_owner(job_root, run_token)
+    try:
+        run_env = _owner_run_environment(job_root, environment)
+        lock, receipt, socket_path = _prepare_owner(job_root, run_token)
+    except (OSError, ValueError, subprocess.SubprocessError, TimeoutError, ScopeError) as exc:
+        if mode == "fresh":
+            raise OwnerPrechildFailureError(str(exc)) from exc
+        raise
+    receipt_before_run = receipt.copy()
     checkout = job_root / "checkout"
     token = run_token
     child_env = {**run_env, JOB_TOKEN_ENV: token}
     actual_command = command or ["uv", "run", "--frozen", "--no-sync", "just", "mutation-internal", mode]
     run = OwnerRun(job_root, mode, token, checkout, run_env, receipt)
-    previous_handlers: dict[int, signal.Handlers | int | Callable[[int, FrameType | None], object] | None] = {}
-
     server = OwnerControlServer(socket_path, run_token, lambda: run.receipt.copy(), lambda: _request_pause(run))
+    handlers: dict[int, signal.Handlers | int | Callable[[int, FrameType | None], object] | None] = {}
     try:
-        _prepare_owner_tmp(run, mode)
-        if threading.current_thread() is threading.main_thread():
+        try:
+            handlers = _install_owner_signal_handlers(run)
+        except (OSError, ValueError) as exc:
+            if mode == "fresh":
+                raise OwnerPrechildFailureError(str(exc)) from exc
+            raise
+        return _run_owner_session(run, server, actual_command, child_env, receipt_before_run)
+    finally:
+        _teardown_owner(job_root, run, server, lock, handlers)
 
-            def request_stop(signum: int, _frame: object) -> None:
-                run.requested_signal.append(signum)
 
-            for signum in (signal.SIGINT, signal.SIGTERM):
-                previous_handlers[signum] = signal.getsignal(signum)
-                signal.signal(signum, request_stop)
+def _install_owner_signal_handlers(
+    run: OwnerRun,
+) -> dict[int, signal.Handlers | int | Callable[[int, FrameType | None], object] | None]:
+    handlers: dict[int, signal.Handlers | int | Callable[[int, FrameType | None], object] | None] = {}
+    if threading.current_thread() is not threading.main_thread():
+        return handlers
+
+    def request_stop(signum: int, _frame: FrameType | None) -> None:
+        run.requested_signal.append(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_stop)
+    return handlers
+
+
+def _run_owner_session(
+    run: OwnerRun,
+    server: OwnerControlServer,
+    command: list[str],
+    child_env: dict[str, str],
+    previous_receipt: dict[str, object],
+) -> int:
+    try:
+        _prepare_owner_tmp(run, run.mode)
         server.start()
         run.process = subprocess.Popen(
-            actual_command,
-            cwd=checkout,
+            command,
+            cwd=run.checkout,
             env=child_env,
             start_new_session=True,
             stdout=None,
             stderr=None,
         )
-        receipt.update({"child_pid": run.process.pid, "child_start_ticks": _proc_identity(run.process.pid)[1]})
-        _write_owner(job_root, receipt)
+        run.receipt.update({"child_pid": run.process.pid, "child_start_ticks": _proc_identity(run.process.pid)[1]})
+        _write_owner(run.job_root, run.receipt)
         _monitor_owner_child(run)
         return _finish_owner_child(run)
     except (
@@ -1190,34 +1329,123 @@ def _enter_owner(
         TimeoutError,
         ScopeError,
     ) as exc:
-        cleanup_error: str | None = None
-        try:
-            if run.process is not None and run.process.poll() is None:
-                _stop_owned_processes(run.process, token, checkout)
-                _cleanup_verified_job_tmp(run)
-                _mark_campaign_interrupted(checkout, "owner-exception")
-            else:
-                _cleanup_token_processes(token)
-                _cleanup_verified_job_tmp(run)
-        except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as cleanup_exc:
-            cleanup_error = str(cleanup_exc)
-        receipt.update(
-            {
-                "state": "cleanup_failed" if cleanup_error else "controller_failed",
-                "cleanup_verified": _tmp_cleanup_proved(receipt, token) or cleanup_error is None,
-                "error": str(exc) if cleanup_error is None else f"{exc}; cleanup failed: {cleanup_error}",
-                "ended_at": datetime.now(UTC).isoformat(),
-            }
-        )
-        _write_owner(job_root, receipt)
-        return 1
-    finally:
+        return _handle_owner_failure(run, previous_receipt, exc)
+
+
+def _handle_owner_failure(run: OwnerRun, previous_receipt: dict[str, object], error: Exception) -> int:
+    if run.process is None:
+        _cleanup_prechild_owner_failure(run.job_root, run.mode, run.receipt, previous_receipt, error)
+        raise OwnerPrechildFailureError(str(error)) from error
+    cleanup_error: str | None = None
+    try:
+        if run.process.poll() is None:
+            _stop_owned_processes(run.process, run.token, run.checkout)
+            _cleanup_verified_job_tmp(run)
+            _mark_campaign_interrupted(run.checkout, "owner-exception")
+        else:
+            _cleanup_token_processes(run.token)
+            _cleanup_verified_job_tmp(run)
+    except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as exc:
+        cleanup_error = str(exc)
+    run.receipt.update(
+        {
+            "state": "cleanup_failed" if cleanup_error else "controller_failed",
+            "cleanup_verified": _tmp_cleanup_proved(run.receipt, run.token) or cleanup_error is None,
+            "error": str(error) if cleanup_error is None else f"{error}; cleanup failed: {cleanup_error}",
+            "ended_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    _write_owner(run.job_root, run.receipt)
+    return 1
+
+
+def _teardown_owner(
+    job_root: Path,
+    run: OwnerRun,
+    server: OwnerControlServer,
+    lock: BinaryIO,
+    handlers: dict[int, signal.Handlers | int | Callable[[int, FrameType | None], object] | None],
+) -> None:
+    teardown_error: Exception | None = None
+    try:
         server.stop()
-        for signum, previous in previous_handlers.items():
+    except (OSError, ValueError, RuntimeError, TimeoutError, ScopeError) as exc:
+        teardown_error = exc
+    finally:
+        # stop() joins active handlers. Let a valid in-flight pause finish its
+        # receipt commit before closing the state transition window.
+        run.stopping.set()
+    if teardown_error is not None:
+        teardown_error = _stop_owner_after_control_failure(run, teardown_error)
+    for signum, previous in handlers.items():
+        try:
             signal.signal(signum, previous)
-        if lock and not run.paused.is_set():
+        except (OSError, ValueError) as exc:
+            teardown_error = teardown_error or exc
+    try:
+        if not run.paused.is_set():
+            import fcntl
+
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-        lock.close()
+    except OSError as exc:
+        teardown_error = teardown_error or exc
+    finally:
+        try:
+            lock.close()
+        except OSError as exc:
+            teardown_error = teardown_error or exc
+    if teardown_error is not None:
+        with run.receipt_lock:
+            run.receipt.update(
+                {
+                    "state": "cleanup_failed",
+                    "cleanup_verified": False,
+                    "error": f"owner teardown failed: {teardown_error}",
+                    "ended_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            with suppress(OSError):
+                _write_owner(job_root, run.receipt)
+        raise ValueError(f"owner teardown failed: {teardown_error}") from teardown_error
+
+
+def _stop_owner_after_control_failure(run: OwnerRun, error: Exception) -> Exception:
+    if run.process is None or run.process.poll() is not None:
+        return error
+    try:
+        _stop_owned_processes(run.process, run.token, run.checkout)
+    except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as cleanup_error:
+        return ValueError(f"{error}; owned process cleanup failed: {cleanup_error}")
+    return error
+
+
+def _cleanup_prechild_owner_failure(
+    job_root: Path,
+    mode: str,
+    receipt: dict[str, object],
+    previous_receipt: dict[str, object],
+    error: BaseException,
+) -> None:
+    cleanup_error: str | None = None
+    try:
+        if _tmp_exists(job_root / "tmp"):
+            _remove_job_tmp(job_root, receipt)
+    except (OSError, ValueError) as exc:
+        cleanup_error = str(exc)
+    if cleanup_error is None:
+        if mode == "resume":
+            previous_receipt["last_preflight_error"] = str(error)
+            _write_owner(job_root, previous_receipt)
+        return
+    receipt.update(
+        {
+            "state": "cleanup_failed",
+            "cleanup_verified": False,
+            "error": f"{error}; cleanup failed: {cleanup_error}",
+            "ended_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    _write_owner(job_root, receipt)
 
 
 def _owner_run_environment(job_root: Path, environment: dict[str, str] | None) -> dict[str, str]:
@@ -1413,20 +1641,117 @@ def _new_job(repo: Path) -> Path:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     job_root = AUDIT_ROOT / "jobs" / "omi-collector" / f"{stamp}-{commit[:12]}-{secrets.token_hex(3)}"
     job_root.mkdir(parents=True, mode=PRIVATE_DIRECTORY_MODE)
-    checkout = job_root / "checkout"
-    subprocess.run(["git", "worktree", "add", "--detach", str(checkout), commit], cwd=repo, check=True)
-    _canonicalize_snapshot_modes(checkout)
-    status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=checkout,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    if status:
-        raise ValueError("canonical mutation snapshot is not clean: " + status.strip())
-    _sync_job_environment(job_root)
+    receipt: dict[str, object] = {
+        "schema": 1,
+        "run_token": secrets.token_hex(32),
+        "state": "preparing",
+        "mode": "fresh",
+        "commit": commit,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    _write_owner(job_root, receipt)
+    try:
+        checkout = job_root / "checkout"
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(checkout), commit],
+            cwd=repo,
+            env={**os.environ, JOB_TOKEN_ENV: cast(str, receipt["run_token"])},
+            check=True,
+        )
+        _canonicalize_snapshot_modes(checkout)
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if status:
+            raise ValueError("canonical mutation snapshot is not clean: " + status.strip())
+        sync_environment = {**_job_environment(job_root), JOB_TOKEN_ENV: cast(str, receipt["run_token"])}
+        _sync_job_environment(job_root, sync_environment)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        _fail_fresh_bootstrap(job_root, repo, receipt, exc)
+        raise
     return job_root
+
+
+def _remove_bootstrap_directory(path: Path, job_root: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or path.resolve(strict=True).parent != job_root.resolve()
+    ):
+        raise ValueError(f"bootstrap resource is not an owned directory: {path.name}")
+    shutil.rmtree(path)
+    if path.exists() or path.is_symlink():
+        raise ValueError(f"bootstrap resource remains after cleanup: {path.name}")
+
+
+def _fail_fresh_bootstrap(job_root: Path, repo: Path, receipt: dict[str, object], error: BaseException) -> None:
+    cleanup_error: str | None = None
+    try:
+        _cleanup_fresh_bootstrap_resources(job_root, repo, receipt, error)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        cleanup_error = str(exc)
+    receipt.update(
+        {
+            "state": "cleanup_failed" if cleanup_error else "controller_failed",
+            "cleanup_verified": cleanup_error is None,
+            "error": str(error) if cleanup_error is None else f"{error}; cleanup failed: {cleanup_error}",
+            "ended_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    _write_owner(job_root, receipt)
+
+
+def _cleanup_fresh_bootstrap_resources(
+    job_root: Path, repo: Path, receipt: dict[str, object], error: BaseException
+) -> None:
+    token = receipt.get("run_token")
+    if not isinstance(token, str):
+        raise ValueError("bootstrap receipt has no process ownership token")
+    if isinstance(error, OwnerCleanupUnverifiedError):
+        raise ValueError(str(error))
+    _cleanup_token_processes(token)
+    if _token_pids(token):
+        raise ValueError("bootstrap processes remain after cleanup")
+    root = job_root.lstat()
+    jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
+    if not _is_private_directory(root) or job_root.resolve(strict=True).parent != jobs_root.resolve(strict=True):
+        raise ValueError("bootstrap job root is not a private managed directory")
+    _remove_bootstrap_checkout(job_root, repo)
+    for name in (".venv", "uv-cache", "tmp"):
+        _remove_bootstrap_directory(job_root / name, job_root)
+    if _token_pids(token):
+        raise ValueError("bootstrap process appeared during cleanup")
+
+
+def _remove_bootstrap_checkout(job_root: Path, repo: Path) -> None:
+    checkout = job_root / "checkout"
+    if not checkout.exists() and not checkout.is_symlink():
+        return
+    if checkout.is_symlink() or not checkout.is_dir() or checkout.resolve(strict=True).parent != job_root.resolve():
+        raise ValueError("bootstrap checkout is not an owned worktree directory")
+    if any(
+        (checkout / path).exists() or (checkout / path).is_symlink()
+        for path in (*NATIVE_CACHE, REPORT, CACHE, REPORT.parent)
+    ):
+        raise ValueError("native audit cache or report exists; preserving bootstrap evidence")
+    worktree = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout
+    registered = any(line == f"worktree {checkout.resolve()}" for line in worktree.splitlines())
+    if registered:
+        subprocess.run(["git", "worktree", "remove", "--force", str(checkout)], cwd=repo, check=True)
+    elif checkout.exists():
+        shutil.rmtree(checkout)
+    if checkout.exists() or checkout.is_symlink():
+        raise ValueError("bootstrap checkout remains after cleanup")
 
 
 def _validate_resume(job_root: Path, environment: dict[str, str]) -> None:
@@ -1507,67 +1832,102 @@ def _refuse_other_unresolved_jobs(jobs_root: Path, selected_job: Path) -> None:
             raise ValueError("another unresolved mutation job prevents resume")
 
 
-def _launch_locked(mode: str, job_id: str | None = None) -> int:
-    jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
-    if mode == "fresh":
-        if job_id is not None:
-            raise ValueError("--job can be used only when resuming a mutation audit")
+def _assert_jobs_discoverable(jobs_root: Path) -> None:
+    if not jobs_root.exists():
+        return
+    for job_root in jobs_root.iterdir():
+        if job_root.name.startswith("."):
+            continue
+        if job_root.is_symlink() or not job_root.is_dir():
+            raise ValueError("an unmanaged mutation job entry prevents launch; preserving it")
+        try:
+            details = job_root.lstat()
+            owner_details = (job_root / OWNER_FILE).lstat()
+        except OSError as exc:
+            raise ValueError("a mutation job has no discoverable owner receipt; preserving it") from exc
+        if not _is_private_directory(details) or not _is_owned_receipt_file(owner_details):
+            raise ValueError("a mutation job has no valid private owner receipt; preserving it")
+        receipt = _read_receipt_from(job_root / OWNER_FILE)
+        if receipt is None or receipt.get("schema") != 1 or receipt.get("state") not in OWNER_STATES:
+            raise ValueError("a mutation job has an invalid owner receipt; preserving it")
+
+
+def _prepare_fresh_launch(jobs_root: Path) -> tuple[Path, Path]:
+    for owner_path in jobs_root.glob("*/" + OWNER_FILE):
+        if owner_path.is_file():
+            _recover_abandoned_job_tmp(owner_path.parent)
+    active = [
+        owner
+        for owner in jobs_root.glob("*/" + OWNER_FILE)
+        if owner.is_file()
+        and (receipt := _read_receipt_from(owner)) is not None
+        and receipt.get("state") in BLOCKING_JOB_STATES
+    ]
+    if active:
+        raise ValueError("an existing mutation job must be resolved before starting a fresh audit")
+    repo = Path.cwd().resolve()
+    return _new_job(repo), repo
+
+
+def _prepare_resume_launch(jobs_root: Path, job_id: str | None) -> Path:
+    if job_id is not None:
+        job_root = _selected_resume_job(job_id, jobs_root)
+        _refuse_other_unresolved_jobs(jobs_root, job_root)
+        _recover_abandoned_job_tmp(job_root)
+    else:
         for owner_path in jobs_root.glob("*/" + OWNER_FILE):
             if owner_path.is_file():
                 _recover_abandoned_job_tmp(owner_path.parent)
-        active = [
-            owner
-            for owner in jobs_root.glob("*/" + OWNER_FILE)
-            if owner.is_file()
-            and (receipt := _read_receipt_from(owner)) is not None
-            and receipt.get("state") in BLOCKING_JOB_STATES
+        jobs = [
+            path
+            for path in sorted(jobs_root.glob("*/" + OWNER_FILE))
+            if path.is_file()
+            and _read_receipt_from(path) is not None
+            and cast(dict[str, object], _read_receipt_from(path)).get("state") in {"paused", "interrupted"}
         ]
-        if active:
-            raise ValueError("an existing mutation job must be resolved before starting a fresh audit")
-        job_root = _new_job(Path.cwd().resolve())
-    else:
+        if len(jobs) != 1:
+            raise ValueError(f"resume requires exactly one paused mutation job; found {len(jobs)}")
+        job_root = jobs[0].parent
+    _validate_resume(job_root, _job_environment(job_root))
+    return job_root
+
+
+def _launch_fresh_owner(job_root: Path, repo: Path) -> int:
+    receipt = cast(dict[str, object], _read_receipt_from(job_root / OWNER_FILE))
+    run_token = cast(str, receipt["run_token"])
+    try:
+        identity = _snapshot_identity(job_root / "checkout", _job_environment(job_root))
+        receipt.update(
+            {
+                "tree": identity["tree"],
+                "identity": identity,
+                "control_socket": str(control_socket_path(job_root)),
+            }
+        )
+        _write_owner(job_root, receipt)
+    except (OSError, ValueError, sqlite3.Error, json.JSONDecodeError, subprocess.SubprocessError, TimeoutError) as exc:
+        _fail_fresh_bootstrap(job_root, repo, receipt, exc)
+        raise
+    try:
+        return _enter_owner(job_root, "fresh", run_token, environment=_job_environment(job_root))
+    except OwnerPrechildFailureError as exc:
+        current = _read_receipt_from(job_root / OWNER_FILE)
+        if current is None or current.get("state") != "cleanup_failed" or current.get("cleanup_verified") is not False:
+            _fail_fresh_bootstrap(job_root, repo, receipt, exc.__cause__ or exc)
+        raise
+
+
+def _launch_locked(mode: str, job_id: str | None = None) -> int:
+    jobs_root = AUDIT_ROOT / "jobs" / "omi-collector"
+    _assert_jobs_discoverable(jobs_root)
+    if mode == "fresh":
         if job_id is not None:
-            job_root = _selected_resume_job(job_id, jobs_root)
-            _refuse_other_unresolved_jobs(jobs_root, job_root)
-            _recover_abandoned_job_tmp(job_root)
-        else:
-            for owner_path in jobs_root.glob("*/" + OWNER_FILE):
-                if owner_path.is_file():
-                    _recover_abandoned_job_tmp(owner_path.parent)
-            jobs = [
-                path
-                for path in sorted(jobs_root.glob("*/" + OWNER_FILE))
-                if path.is_file()
-                and _read_receipt_from(path) is not None
-                and cast(dict[str, object], _read_receipt_from(path)).get("state") in {"paused", "interrupted"}
-            ]
-            if len(jobs) != 1:
-                raise ValueError(f"resume requires exactly one paused mutation job; found {len(jobs)}")
-            job_root = jobs[0].parent
-        _validate_resume(job_root, _job_environment(job_root))
-    run_token = secrets.token_hex(32)
-    _write_owner(
-        job_root,
-        {
-            "schema": 1,
-            "run_token": run_token,
-            "state": "preparing",
-            "mode": mode,
-            "commit": subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=job_root / "checkout", check=True, capture_output=True, text=True
-            ).stdout.strip(),
-            "tree": subprocess.run(
-                ["git", "rev-parse", "HEAD^{tree}"],
-                cwd=job_root / "checkout",
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip(),
-            "identity": _snapshot_identity(job_root / "checkout", _job_environment(job_root)),
-            "control_socket": str(control_socket_path(job_root)),
-            "created_at": datetime.now(UTC).isoformat(),
-        },
-    )
+            raise ValueError("--job can be used only when resuming a mutation audit")
+        job_root, repo = _prepare_fresh_launch(jobs_root)
+        return _launch_fresh_owner(job_root, repo)
+    job_root = _prepare_resume_launch(jobs_root, job_id)
+    receipt = cast(dict[str, object], _read_receipt_from(job_root / OWNER_FILE))
+    run_token = cast(str, receipt["run_token"])
     return _enter_owner(job_root, mode, run_token, environment=_job_environment(job_root))
 
 

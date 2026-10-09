@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, ConfirmedLossFact, read_confirmed_losses
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservation, read_firmware_observations
+from omi_collector.capture.adapters.operational_status import (
+    OperationalIdentity,
+    OperationalStatusError,
+    read_operational_status,
+)
+from omi_collector.capture.application.operational_telemetry import system_host_boot_id
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
 from omi_collector.spool_metrics import collect_spool_metrics
@@ -18,6 +27,12 @@ from omi_collector.storage_layout import StorageLayout
 
 _SCHEMA_VERSION = 2
 _SOURCE_REVISION = re.compile(r"[0-9a-f]{12}\Z")
+_LOSS_ID = re.compile(r"[0-9a-f]{64}\Z")
+_OPERATIONAL_ATTENTION = {
+    "quality": "quality_metrics_unavailable",
+    "publication": "ready_publication_blocked",
+    "clock": "clock_correction_blocked",
+}
 _TERMINATION_CLASSES = frozenset({"cancelled", "completed", "fatal_error", "retryable_error", "teardown_interrupted"})
 _ADVERTISEMENT_FIELDS = frozenset(
     {
@@ -66,6 +81,7 @@ _LOSS_FIELDS = frozenset(
         "firmware_version",
     }
 )
+_KEYED_LOSS_FIELDS = _LOSS_FIELDS | {"loss_id"}
 _CLOCK_CORRECTION_FIELDS = frozenset(
     {
         "schema_version",
@@ -195,6 +211,8 @@ class _QualityEvent:
     active_read_elapsed_ms: int = 0
     missing_record_count: int = 0
     missing_raw_bytes: int = 0
+    reason: str | None = None
+    loss_id: str | None = None
     drift_seconds: float | None = None
 
 
@@ -203,6 +221,7 @@ def collect_operator_status(
     *,
     hours: int,
     now: datetime | None = None,
+    identity: OperationalIdentity | None = None,
 ) -> dict[str, object]:
     """Summarize current device state, publication evidence, and recent quality events."""
     if isinstance(hours, bool) or not isinstance(hours, int) or hours <= 0:
@@ -217,12 +236,23 @@ def collect_operator_status(
             layout.publication.root,
             observation_root=layout.collector.device_state,
         )
-        quality = _quality_window(layout.collector.root, start, end.astimezone(UTC))
-        runtime = _runtime_status(layout.collector.debug_log, end.astimezone(UTC))
-    except ValueError as error:
+        confirmed_losses = read_confirmed_losses(
+            layout.collector.confirmed_loss_ledger,
+            allow_missing=not os.path.lexists(layout.collector.operational_status),
+        )
+        quality = _quality_window(
+            layout.collector.root,
+            start,
+            end.astimezone(UTC),
+            confirmed_losses=confirmed_losses,
+        )
+        current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
+        operational_status = read_operational_status(layout.collector.operational_status, current_identity)
+        runtime = _runtime_status(layout.collector.debug_log, end.astimezone(UTC), operational_status)
+    except (ConfirmedLossError, ValueError, OperationalStatusError) as error:
         raise OperatorStatusError(str(error)) from error
     device = _device_status(observations[0]) if observations else None
-    window_status = _window_status(quality, runtime_state=runtime["state"])
+    window_status = _window_status(quality, operational_status=operational_status)
     if runtime["attention_reasons"]:
         window_status = "attention"
     return {
@@ -237,20 +267,14 @@ def collect_operator_status(
     }
 
 
-def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
+def _runtime_status(path: Path, now: datetime, operational_status: dict[str, str]) -> dict[str, object]:
     latest: tuple[datetime, dict[str, object]] | None = None
     observation: tuple[datetime, dict[str, object]] | None = None
     battery_observation: tuple[datetime, dict[str, object]] | None = None
     error: tuple[datetime, dict[str, object]] | None = None
     connection_rssi: tuple[datetime, int] | None = None
-    attention: dict[str, bool] = {
-        "quality_metrics_unavailable": False,
-        "ready_publication_blocked": False,
-        "clock_correction_blocked": False,
-    }
     if _path_exists(path, "debug journal"):
         for row in _debug_rows(path):
-            _update_runtime_attention(attention, row)
             connection_rssi = _newest_connection_rssi(connection_rssi, _decode_connection_rssi(row))
             decoded = _decode_sync_progress(row)
             if decoded is None:
@@ -274,13 +298,16 @@ def _runtime_status(path: Path, now: datetime) -> dict[str, object]:
     state = current.get("status", "unknown")
     active = state == "progress"
     return {
-        "attention_reasons": sorted(reason for reason, active_reason in attention.items() if active_reason),
+        "attention_reasons": sorted(
+            _OPERATIONAL_ATTENTION[name] for name, state in operational_status.items() if state == "blocked"
+        ),
         "battery_percent": battery.get("battery_percent"),
         "battery_observed_at": _iso(battery_observation[0]) if battery_observation else None,
         "connection_rssi_dbm": connection_rssi[1] if connection_rssi else None,
         "connection_rssi_observed_at": _iso(connection_rssi[0]) if connection_rssi else None,
         "firmware": observed.get("firmware"),
         "last_error": _runtime_error(error),
+        "operational_status": operational_status,
         "state": "transferring" if active else state,
         "updated_at": _iso(latest[0]) if latest else None,
         "updated_age_seconds": max(0, int((now - latest[0]).total_seconds())) if latest else None,
@@ -310,26 +337,6 @@ def _newest_connection_rssi(
     if current is None or candidate[0] > current[0]:
         return candidate
     return current
-
-
-def _update_runtime_attention(attention: dict[str, bool], row: dict[str, object]) -> None:
-    event = row.get("event")
-    if event == "quality_metrics_configuration_error":
-        attention["quality_metrics_unavailable"] = True
-    elif event == "quality_metrics_ready":
-        attention["quality_metrics_unavailable"] = False
-    elif event == "ready_publication_blocked":
-        attention["ready_publication_blocked"] = True
-    elif event in {"ready_publication_published", "ready_publication_recovered"}:
-        attention["ready_publication_blocked"] = False
-    if event != "sync_progress":
-        return
-    fields = row.get("fields")
-    progress = fields.get("progress") if isinstance(fields, dict) else None
-    if not isinstance(progress, dict) or progress.get("event") != "pendant_clock_sync":
-        return
-    outcome = progress.get("outcome")
-    attention["clock_correction_blocked"] = outcome in {"intent_persist_failed", "result_persist_failed"}
 
 
 def _runtime_error(error: tuple[datetime, dict[str, object]] | None) -> dict[str, object] | None:
@@ -411,22 +418,83 @@ def _device_status(observation: FirmwareObservation) -> dict[str, object]:
     }
 
 
-def _window_status(quality: _QualityWindow, *, runtime_state: object) -> str:
+def _window_status(quality: _QualityWindow, *, operational_status: dict[str, str]) -> str:
     if quality.loss_events:
         return "attention"
     if quality.last_transfer_termination_class in {"cancelled", "fatal_error", "teardown_interrupted"}:
         return "attention"
-    if runtime_state in {"away", "drained"}:
-        return "ok"
-    return "ok" if quality.completed_transfers else "unknown"
+    if "blocked" in operational_status.values():
+        return "attention"
+    return (
+        "ok"
+        if quality.completed_transfers and all(state == "clear" for state in operational_status.values())
+        else "unknown"
+    )
 
 
-def _quality_window(root: Path, start: datetime, end: datetime) -> _QualityWindow:
+def _quality_window(
+    root: Path,
+    start: datetime,
+    end: datetime,
+    *,
+    confirmed_losses: tuple[ConfirmedLossFact, ...] = (),
+) -> _QualityWindow:
     accumulator = _QualityAccumulator()
+    facts_by_id = {fact.loss_id: fact for fact in confirmed_losses}
+    _accumulate_confirmed_loss_facts(accumulator, confirmed_losses, start, end)
     for row in _quality_rows(root):
         event = _decode_quality_event(row)
+        if event.loss_id is not None:
+            _validate_loss_projection(event, facts_by_id)
+            continue
         _accumulate_quality_event(accumulator, event, start, end)
     return accumulator.build()
+
+
+def _accumulate_confirmed_loss_facts(
+    accumulator: _QualityAccumulator,
+    facts: tuple[ConfirmedLossFact, ...],
+    start: datetime,
+    end: datetime,
+) -> None:
+    relevant = [fact for fact in facts if start <= datetime.fromisoformat(fact.occurred_at).astimezone(UTC) <= end]
+    intervals_by_attempt: dict[str, list[tuple[int, int]]] = {}
+    for fact in relevant:
+        intervals_by_attempt.setdefault(fact.attempt_id, []).append((fact.start_sequence, fact.end_sequence))
+    for intervals in intervals_by_attempt.values():
+        event_count, union_size = _union_interval_stats(intervals)
+        accumulator.loss_events += event_count
+        accumulator.missing_records += union_size
+        accumulator.missing_raw_bytes += union_size * RECORD_SIZE
+
+
+def _union_interval_stats(intervals: Iterable[tuple[int, int]]) -> tuple[int, int]:
+    ordered = sorted(intervals)
+    if not ordered:
+        return 0, 0
+    components = 1
+    total = 0
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start > current_end:
+            total += current_end - current_start
+            current_start, current_end = start, end
+            components += 1
+        else:
+            current_end = max(current_end, end)
+    return components, total + current_end - current_start
+
+
+def _validate_loss_projection(event: _QualityEvent, facts_by_id: dict[str, ConfirmedLossFact]) -> None:
+    fact = facts_by_id.get(event.loss_id or "")
+    if fact is None:
+        raise OperatorStatusError("keyed sequence loss is missing from confirmed-loss ledger")
+    if (
+        fact.missing_record_count != event.missing_record_count
+        or fact.missing_raw_bytes != event.missing_raw_bytes
+        or fact.reason != event.reason
+    ):
+        raise OperatorStatusError("keyed sequence loss does not match confirmed-loss ledger")
 
 
 def _accumulate_quality_event(
@@ -620,7 +688,17 @@ def _decode_transfer(row: dict[str, object]) -> _QualityEvent:
 
 
 def _decode_loss(row: dict[str, object]) -> _QualityEvent:
-    timestamp = _event_header(row, _LOSS_FIELDS, "occurred_at")
+    if set(row) == _LOSS_FIELDS:
+        loss_id = None
+        fields = _LOSS_FIELDS
+    elif set(row) == _KEYED_LOSS_FIELDS:
+        loss_id = _require_string(row, "loss_id")
+        if _LOSS_ID.fullmatch(loss_id) is None:
+            raise OperatorStatusError("sequence loss has invalid loss_id")
+        fields = _KEYED_LOSS_FIELDS
+    else:
+        raise OperatorStatusError("quality journal event fields are invalid")
+    timestamp = _event_header(row, fields, "occurred_at")
     _require_string(row, "session_id")
     _require_string(row, "reason")
     _require_string(row, "release_version")
@@ -631,6 +709,8 @@ def _decode_loss(row: dict[str, object]) -> _QualityEvent:
         timestamp,
         missing_record_count=_integer(row, "missing_record_count", minimum=0),
         missing_raw_bytes=_integer(row, "missing_raw_bytes", minimum=0),
+        reason=_require_string(row, "reason"),
+        loss_id=loss_id,
     )
 
 

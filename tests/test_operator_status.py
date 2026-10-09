@@ -11,8 +11,10 @@ from typing import cast
 import pytest
 
 import omi_collector.operator_status as status_module
+from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossLedger, read_confirmed_losses
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging, debug_event
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
+from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
 from omi_collector.capture.application.quality_metrics import (
     AdvertisementMetric,
@@ -20,14 +22,15 @@ from omi_collector.capture.application.quality_metrics import (
     SequenceLossMetric,
     TransferSessionMetric,
 )
+from omi_collector.capture.domain.operational_status_machine import OperationalDimension, OperationalSignal
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.config import DEFAULT_CONFIG, DebugLogConfig, QualityMetricsConfig
 from omi_collector.operator_status import OperatorStatusError, collect_operator_status
 from omi_collector.spool_metrics import FirmwareLifetimeMetrics, SpoolMetrics, SpoolWindowMetrics
-from omi_collector.storage_layout import load_operator_config
+from omi_collector.storage_layout import StorageLayout, load_operator_config
 
 
-def _layout(tmp_path: Path):
+def _layout(tmp_path: Path) -> StorageLayout:
     path = tmp_path / "config.toml"
     path.write_text(
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n',
@@ -42,6 +45,138 @@ def _spool() -> SpoolMetrics:
         SpoolWindowMetrics(2, 30, 13_320, 0, 0, 0.0),
         FirmwareLifetimeMetrics(1, 0, 0, 0, 0, 1),
     )
+
+
+def _operational_status(
+    layout: StorageLayout, states: dict[OperationalDimension, OperationalSignal]
+) -> OperationalIdentity:
+    identity = OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001")
+    ConfirmedLossLedger(layout.collector.confirmed_loss_ledger).initialize(allow_create=True)
+    store = OperationalStatusStore(layout.collector.operational_status, identity)
+    store.initialize()
+    for dimension, signal in states.items():
+        store.update(dimension, signal)
+    return identity
+
+
+def test_confirmed_loss_status_unions_intervals_and_deduplicates_keyed_projections(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    ledger = ConfirmedLossLedger(layout.collector.confirmed_loss_ledger)
+    ledger.initialize(allow_create=True)
+    first_id = ledger.record("0123456789abcdef0123456789abcdef", 100, 110, "2026-09-08T09:30:00+00:00")
+    extended_id = ledger.record("0123456789abcdef0123456789abcdef", 105, 115, "2026-09-08T09:31:00+00:00")
+    second_id = ledger.record("1123456789abcdef0123456789abcdef", 105, 115, "2026-09-08T09:30:00+00:00")
+    rows = [
+        SequenceLossMetric(
+            "2026-09-08T09:30:00+00:00",
+            "session-1",
+            10,
+            10 * RECORD_SIZE,
+            "device_cursor_advanced_before_host_durable_prefix",
+            "1.2.3",
+            None,
+            None,
+            first_id,
+        ).as_dict(),
+        SequenceLossMetric(
+            "2026-09-08T09:31:00+00:00",
+            "session-1",
+            10,
+            10 * RECORD_SIZE,
+            "device_cursor_advanced_before_host_durable_prefix",
+            "1.2.3",
+            None,
+            None,
+            extended_id,
+        ).as_dict(),
+        SequenceLossMetric(
+            "2026-09-08T09:30:00+00:00",
+            "session-2",
+            10,
+            10 * RECORD_SIZE,
+            "device_cursor_advanced_before_host_durable_prefix",
+            "1.2.3",
+            None,
+            None,
+            second_id,
+        ).as_dict(),
+        SequenceLossMetric(
+            "2026-09-08T09:30:00+00:00",
+            "session-legacy",
+            3,
+            3 * RECORD_SIZE,
+            "legacy loss",
+            "1.2.3",
+            None,
+            None,
+        ).as_dict(),
+    ]
+    journal = layout.collector.root / DEFAULT_CONFIG.observability.quality_metrics.file_name
+    journal.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    quality = status_module._quality_window(
+        layout.collector.root,
+        datetime(2026, 9, 8, 9, tzinfo=UTC),
+        datetime(2026, 9, 8, 10, tzinfo=UTC),
+        confirmed_losses=read_confirmed_losses(layout.collector.confirmed_loss_ledger),
+    )
+
+    assert quality.loss_events == 3
+    assert quality.missing_records == 28
+    assert quality.missing_raw_bytes == 28 * RECORD_SIZE
+
+
+def test_durable_loss_keeps_attention_after_restart_and_unrelated_quality_append(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    ledger = ConfirmedLossLedger(layout.collector.confirmed_loss_ledger)
+    ledger.initialize(allow_create=True)
+    ledger.record("0123456789abcdef0123456789abcdef", 100, 110, "2026-09-08T09:30:00+00:00")
+    assert len(read_confirmed_losses(layout.collector.confirmed_loss_ledger)) == 1
+    _operational_status(
+        layout,
+        {
+            OperationalDimension.QUALITY: OperationalSignal.CLEAR,
+            OperationalDimension.PUBLICATION: OperationalSignal.CLEAR,
+            OperationalDimension.CLOCK: OperationalSignal.CLEAR,
+        },
+    )
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
+    journal = layout.collector.root / DEFAULT_CONFIG.observability.quality_metrics.file_name
+    journal.write_text(
+        json.dumps(
+            _transfer("2026-09-08T09:45:00+00:00", outcome="ok", termination_class="completed", written_raw_bytes=444)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = collect_operator_status(
+        layout,
+        hours=24,
+        now=datetime(2026, 9, 8, 10, tzinfo=UTC),
+        identity=OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001"),
+    )
+
+    assert result["status"] == "attention"
+    quality = cast(dict[str, object], result["quality_window"])
+    assert quality["confirmed_loss_events"] == 1
+    assert quality["confirmed_lost_records"] == 10
+
+
+def test_status_fails_closed_when_initialized_loss_ledger_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    _operational_status(layout, {})
+    layout.collector.confirmed_loss_ledger.unlink()
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
+
+    with pytest.raises(OperatorStatusError, match="missing"):
+        collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
 
 def _advertisement(timestamp: str) -> dict[str, object]:
@@ -139,6 +274,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "connection_rssi_observed_at": None,
         "firmware": None,
         "last_error": None,
+        "operational_status": {"clock": "unknown", "publication": "unknown", "quality": "unknown"},
         "state": "unknown",
         "transfer": None,
         "updated_age_seconds": None,
@@ -190,9 +326,17 @@ def test_status_marks_persistent_runtime_failures_for_attention(
         },
     )
     layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    identity = _operational_status(
+        layout,
+        {
+            OperationalDimension.QUALITY: OperationalSignal.BLOCK,
+            OperationalDimension.PUBLICATION: OperationalSignal.BLOCK,
+            OperationalDimension.CLOCK: OperationalSignal.BLOCK,
+        },
+    )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC), identity=identity)
 
     assert result["status"] == "attention"
     runtime = cast(dict[str, object], result["runtime"])
@@ -255,7 +399,9 @@ def test_status_clears_ready_publication_block_after_successful_noop_recovery(
     assert result["status"] == "unknown"
 
 
-def test_status_treats_expected_pendant_absence_as_healthy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_status_treats_expected_pendant_absence_as_unknown_without_completed_clear_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     layout = _layout(tmp_path)
     row = {
         "event": "sync_progress",
@@ -267,8 +413,58 @@ def test_status_treats_expected_pendant_absence_as_healthy(monkeypatch: pytest.M
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
-    assert result["status"] == "ok"
+    assert result["status"] == "unknown"
     assert cast(dict[str, object], result["runtime"])["state"] == "away"
+
+
+def test_status_is_ok_only_after_a_completed_transfer_and_all_current_dimensions_clear(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    identity = _operational_status(
+        layout,
+        dict.fromkeys(OperationalDimension, OperationalSignal.CLEAR),
+    )
+    (layout.collector.root / "quality.jsonl").write_text(
+        json.dumps(
+            _transfer(
+                "2026-09-08T09:05:00+00:00",
+                outcome="collected",
+                termination_class="completed",
+                written_raw_bytes=4_440,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC), identity=identity)
+
+    assert result["status"] == "ok"
+
+
+def test_debug_log_history_cannot_override_current_snapshot_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    identity = _operational_status(
+        layout,
+        dict.fromkeys(OperationalDimension, OperationalSignal.CLEAR),
+    )
+    row = {
+        "event": "quality_metrics_configuration_error",
+        "fields": {},
+        "timestamp": "2026-09-08T09:00:00+00:00",
+    }
+    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC), identity=identity)
+
+    runtime = cast(dict[str, object], result["runtime"])
+    assert runtime["attention_reasons"] == []
+    assert result["status"] == "unknown"
 
 
 def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -1117,7 +1117,8 @@ async def test_malformed_resume_evidence_is_quarantined_before_provider(tmp_path
         evidence.write_text("{malformed", encoding="utf-8")
     else:
         evidence.write_bytes(evidence.read_bytes() + b"torn")
-    provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))])
+    cursor = 101 if damage == "raw" else 100
+    provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(cursor, cursor),)),))])
     result = await run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
 
     assert isinstance(result, NoDataResult)
@@ -1318,6 +1319,9 @@ async def test_acknowledged_advance_with_ahead_cursor_is_not_reported_confirmed(
 @_async_test
 async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=3, persisted=1)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
         _status(),
         (
@@ -1330,9 +1334,7 @@ async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor
         ),
     )
 
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
-    )
+    result = await run_opportunistic_collector(Provider([session]), store, _options(batch_records=3))
 
     assert isinstance(result, CollectionResult)
     assert session.writes[2] == encode_read_command(102, 1)
@@ -1342,6 +1344,9 @@ async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor
 @_async_test
 async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_current_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
         _status(),
         (
@@ -1354,9 +1359,7 @@ async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_curren
         ),
     )
 
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
-    )
+    result = await run_opportunistic_collector(Provider([session]), store, _options())
 
     assert isinstance(result, CollectionResult)
     assert encode_read_command(103, 1) in session.writes
@@ -1393,7 +1396,7 @@ async def test_startup_sweep_removes_only_aged_terminal_retired_partials(
     attempt.close(durable=True)
     store.terminalize_prefix_attempt(attempt.attempt_id)
     now += 1_000_000_000
-    session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
+    session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))
 
     result = await run_opportunistic_collector(Provider([session]), store, _options())
 
@@ -1433,7 +1436,7 @@ async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startu
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
     store.terminalize_prefix_attempt(attempt.attempt_id)
-    drained = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))])
+    drained = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))])
 
     class RetryThenDrain:
         calls = 0
@@ -1686,6 +1689,9 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
 @_async_test
 async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_and_drains(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
         _status(),
         (
@@ -1694,9 +1700,7 @@ async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_an
         ),
     )
 
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
-    )
+    result = await run_opportunistic_collector(Provider([session]), store, _options())
 
     assert isinstance(result, CollectionResult)
     assert session.writes == [b"\x10", b"\x10"]
@@ -1790,6 +1794,9 @@ async def test_resume_cursor_matrix(
     tmp_path: Path, read: int, write: int, persisted: int, error: type[Exception] | None
 ) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=persisted)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     read_start = max(read, 100 + persisted)
     requested = 102 - read_start
     notifications = (_begin(read_start, requested), _data(_records(read_start, requested)), _done(102))
@@ -1817,9 +1824,7 @@ async def test_resume_cursor_matrix(
 
     if error is not None:
         provider = Provider([session])
-        result = await run_opportunistic_collector(
-            provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options()
-        )
+        result = await run_opportunistic_collector(provider, store, _options())
         assert isinstance(result, NoDataResult)
         assert provider.opened == 1
         return
@@ -1828,7 +1833,7 @@ async def test_resume_cursor_matrix(
     try:
         result = await run_opportunistic_collector(
             Provider([session]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            store,
             _options(activity=activity),
         )
     except IndexError as cause:
@@ -1892,6 +1897,9 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
 @_async_test
 async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
         _status(),
         (
@@ -1904,19 +1912,20 @@ async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_curs
         ),
     )
 
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
-    )
+    result = await run_opportunistic_collector(Provider([session]), store, _options())
 
     assert isinstance(result, CollectionResult)
     assert encode_read_command(103, 1) in session.writes
-    assert not StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts()
+    assert not store.pending_attempts()
     assert any(path.name.startswith("100-101-") for path in (_capture_root(tmp_path)).iterdir())
 
 
 @_async_test
 async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audio(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=4, persisted=0)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     activity: list[ActivityEvent] = []
     operational_events: list[dict[str, object]] = []
     journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
@@ -1942,7 +1951,7 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
 
     result = await run_opportunistic_collector(
         Provider([session]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        store,
         replace(
             _options(activity=activity, batch_records=4),
             operational=fail_operational,
@@ -1957,11 +1966,15 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     assert any(event.get("event") == "loss_detected" for event in operational_events)
     metrics = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
     loss = next(item for item in metrics if item["event"] == "sequence_loss")
+    loss_id = loss["loss_id"]
+    assert isinstance(loss_id, str) and len(loss_id) == 64
+    assert all(character in "0123456789abcdef" for character in loss_id)
     assert loss == {
         "schema_version": 2,
         "event": "sequence_loss",
         "occurred_at": "1970-01-01T00:16:40.000+00:00",
         "session_id": loss["session_id"],
+        "loss_id": loss_id,
         "missing_record_count": 1,
         "missing_raw_bytes": RECORD_SIZE,
         "reason": "device_cursor_advanced_before_host_durable_prefix",
@@ -2067,6 +2080,9 @@ async def test_completed_read_emits_one_terminal_transfer_session_with_raw_count
 async def test_real_ring_cursor_ahead_publishes_hash_bound_prefix_and_continues(tmp_path: Path) -> None:
     start, end, prefix_end, cursor, write = 1560520, 1564616, 1561108, 1561130, 1570627
     _seed_streaming_partial(tmp_path, count=end - start, persisted=prefix_end - start, start=start)
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     operational_events: list[dict[str, object]] = []
 
     def emit_operational(event: Mapping[str, object]) -> None:
@@ -2076,7 +2092,7 @@ async def test_real_ring_cursor_ahead_publishes_hash_bound_prefix_and_continues(
 
     result = await run_opportunistic_collector(
         Provider([session]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        store,
         replace(_options(batch_records=4096), operational=emit_operational),
     )
     assert isinstance(result, CollectionResult)
@@ -2519,7 +2535,7 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
         )
     else:
         first = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
-    second = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
+    second = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))
 
     def provider(_candidate: object | None = None) -> AbstractAsyncContextManager[ScriptedRingSession]:
         nonlocal opened
@@ -2941,8 +2957,8 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
             published.set()
         return outcome
 
-    async def close_visit(reconciler: BatchReconciler, reason: str) -> None:
-        await original_closure(reconciler, reason)
+    async def close_visit(reconciler: BatchReconciler, reason: str, drain_cursor: int | None = None) -> None:
+        await original_closure(reconciler, reason, drain_cursor)
         assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
             {"next_sequence": 11, "reason": "drained"}
         ]
@@ -3147,9 +3163,12 @@ async def test_same_process_recovery_disconnect_rebinds_original_read_begin_for_
         ),
     )
 
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
     result = await run_opportunistic_collector(
         Provider([first, recovery, gapped]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        store,
         _options(batch_records=3),
     )
 
@@ -3300,15 +3319,18 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
         ]
     second = ScriptedRingSession(_status(), tuple(steps))
 
-    result = await run_opportunistic_collector(
-        Provider([first, second]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
-    )
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
+    result = await run_opportunistic_collector(Provider([first, second]), store, _options(batch_records=3))
     assert isinstance(result, (CollectionResult, NoDataResult))
     assert not StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts()
     assert second.writes[0] == b"\x10"
     quarantine = tmp_path / "quarantine"
     if case == "gap":
-        assert not quarantine.exists()
+        assert quarantine.is_dir()
+        assert tuple(quarantine.iterdir()) == ()
+        assert "quarantine" not in ordering
     else:
         destinations = tuple(quarantine.iterdir())
         assert len(destinations) == 1
@@ -3387,7 +3409,7 @@ async def test_admission_prefix_mismatch_closes_writer_and_releases_lease(
 
 
 @_async_test
-async def test_cursor_regression_after_advance_ack_keeps_bundle_and_continues(tmp_path: Path) -> None:
+async def test_cursor_regression_after_advance_ack_rejects_drain_and_keeps_bundle(tmp_path: Path) -> None:
     session = ScriptedRingSession(
         _status(),
         (
@@ -3399,13 +3421,14 @@ async def test_cursor_regression_after_advance_ack_keeps_bundle_and_continues(tm
         ),
     )
 
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
-    )
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    with pytest.raises(CursorConsistencyError, match=r"INFO after ADVANCE acknowledgment classified.*expired"):
+        await run_opportunistic_collector(Provider([session]), store, _options(batch_records=3))
 
-    assert isinstance(result, CollectionResult)
     assert session.writes.count(encode_advance_command(102)) == 1
-    assert result.next_sequence == 102
+    assert tuple(store.capture_root.glob("100-102-*"))
+    assert not store.pending_attempts()
+    assert not store.ready_closures_path.exists()
 
 
 @_async_test

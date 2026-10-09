@@ -122,9 +122,10 @@ class SequenceLossMetric:
     release_version: str
     source_revision: str | None
     firmware_version: str | None
+    loss_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        event: dict[str, object] = {
             "schema_version": 2,
             "event": "sequence_loss",
             "occurred_at": self.occurred_at,
@@ -136,6 +137,9 @@ class SequenceLossMetric:
             "source_revision": self.source_revision,
             "firmware_version": self.firmware_version,
         }
+        if self.loss_id is not None:
+            event["loss_id"] = self.loss_id
+        return event
 
 
 @dataclass(frozen=True, slots=True)

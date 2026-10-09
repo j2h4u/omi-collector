@@ -181,15 +181,30 @@ runtime-smoke:
     project="omi-collector-qa-$$-$RANDOM"
     cleanup() {
         status="$1"
+        trap - EXIT INT TERM
         if [ "$status" -ne 0 ]; then
-            docker compose -p "$project" ps || true
-            docker compose -p "$project" logs --no-color --timestamps --tail=200 || true
+            timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" ps || true
+            timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" logs --no-color --timestamps --tail=200 || true
         fi
-        docker compose -p "$project" down -v --remove-orphans || true
+        if ! timeout --signal=TERM --kill-after=5s 120s docker compose -p "$project" down -v --remove-orphans; then
+            printf 'Failed to clean up Docker project %s.\n' "$project" >&2
+            if [ "$status" -eq 0 ]; then
+                status=1
+            fi
+        fi
+        exit "$status"
     }
     trap 'cleanup "$?"' EXIT
-    docker compose -p "$project" up -d --build --force-recreate --remove-orphans --wait --wait-timeout 90
-    docker compose -p "$project" exec -T omi-collector-qa omi-collector health
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    timeout --signal=TERM --kill-after=5s 600s docker compose -p "$project" up -d --build --force-recreate --remove-orphans --wait --wait-timeout 90
+    timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" exec -T omi-collector-qa omi-collector health
+    container_id="$(timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" ps --quiet omi-collector-qa)"
+    state="$(timeout --signal=TERM --kill-after=5s 30s docker inspect --format='{{"{{.State.Running}} {{.State.Health.Status}}"}}' "$container_id")"
+    if [[ "$state" != 'true healthy' ]]; then
+        printf 'Docker project %s is not running and healthy: %s\n' "$project" "$state" >&2
+        exit 1
+    fi
 
 # Full local gate for agents before claiming completion.
 verify: check crap-check unit docker-build runtime-smoke

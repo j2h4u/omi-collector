@@ -69,11 +69,19 @@ def test_transition_matrix_rejects_every_unlisted_pair() -> None:
     for action in _CURSORS:
         allowed[Milestone.SEALED, Event.FRESH_INFO, action] = (
             Milestone.SEALED,
-            Command.ADVANCE if action is CursorAction.REPEAT else Command.CLOSE,
+            Command.ADVANCE
+            if action is CursorAction.REPEAT
+            else Command.REJECT
+            if action in (CursorAction.REGRESSED, CursorAction.EXPIRED)
+            else Command.CLOSE,
         )
         allowed[Milestone.SEALED, Event.ADVANCE_ACK_INFO, action] = (
             Milestone.SEALED,
-            Command.KEEP if action is CursorAction.REPEAT else Command.CLOSE,
+            Command.KEEP
+            if action is CursorAction.REPEAT
+            else Command.REJECT
+            if action in (CursorAction.REGRESSED, CursorAction.EXPIRED)
+            else Command.CLOSE,
         )
 
     for milestone, event, cursor in product(_MILESTONES, _EVENTS, (None, *_CURSORS)):
@@ -95,8 +103,12 @@ def test_legal_lifecycle_reaches_retired_only_after_close() -> None:
     sealed = transition(full, Event.SEAL).milestone
 
     assert transition(sealed, Event.FRESH_INFO, CursorAction.REPEAT).command is Command.ADVANCE
+    assert transition(sealed, Event.FRESH_INFO, CursorAction.EXPIRED).command is Command.REJECT
+    assert transition(sealed, Event.FRESH_INFO, CursorAction.REGRESSED).command is Command.REJECT
     assert transition(sealed, Event.ADVANCE_UNCERTAIN).command is Command.KEEP
     assert transition(sealed, Event.ADVANCE_ACK_INFO, CursorAction.REPEAT).command is Command.KEEP
+    assert transition(sealed, Event.ADVANCE_ACK_INFO, CursorAction.EXPIRED).command is Command.REJECT
+    assert transition(sealed, Event.ADVANCE_ACK_INFO, CursorAction.REGRESSED).command is Command.REJECT
     assert transition(sealed, Event.ADVANCE_ACK_INFO, CursorAction.CONFIRMED).command is Command.CLOSE
     assert transition(sealed, Event.WRITER_CLOSED).milestone is Milestone.RETIRED
 

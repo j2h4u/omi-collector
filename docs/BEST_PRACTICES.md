@@ -21,6 +21,19 @@ Use `uv` and keep `uv.lock` synchronized. The required gates are:
 Do not weaken or locally suppress a gate. Use targeted checks while iterating,
 then run the full contract before release or handoff.
 
+Runtime QA must run serially at low CPU and idle I/O priority. The canonical
+`just unit` command is bounded to 600 seconds; set
+`PYTEST_XDIST_AUTO_NUM_WORKERS=1` so its pytest-xdist invocation uses one
+worker. Keep the tests and assertions intact.
+
+Git tracks only whether a source file is executable (`100644` or `100755`),
+not its full worktree permission bits. Tests of source-file executability must
+read the Git index mode instead of comparing `stat()` with exact `0755` or
+`0644` permissions that umask can change. Keep installer safety checks exact:
+the installed wrapper must be `root:root 0755` and sudoers files `0440`.
+Correcting a mistaken source-mode assertion must not weaken these installed
+permission checks.
+
 ## Mutation testing
 
 Run `just mutation` for a separate full-project behavioral audit: mutate
@@ -149,6 +162,14 @@ and restart. Graph reachability alone does not guarantee progress: retry loops
 depend on explicit timer, availability, and fairness assumptions. No FSM
 library replaces these contracts; prefer the existing pure reducers unless a
 dependency removes concrete complexity.
+
+Pin each model's declared event, work, and result inventories alongside its
+transition expectations. Cover every declared state/event cell, or state the
+bounded representative coverage and its declared unions explicitly; assert
+unsupported variants are rejected rather than silently taking a default
+branch. This guarantee covers the declared finite variants, not arbitrary
+payloads or future undeclared cases. Keep the inventory fixtures tied to the
+model's enums and unions so new variants force a test update.
 
 Foreground attempt and closure effects own priority over background publication
 retries. Join any running retry before admission and defer new retries until
@@ -322,14 +343,33 @@ and the selected recent window from `quality.jsonl`:
 sudo -n /usr/local/sbin/omi-collector-status
 ```
 
-Interpret `ok` as a completed transfer with no confirmed loss or terminal
-failure in the window. `attention` is the degraded state for confirmed loss or
-a latest fatal, cancelled, or teardown-interrupted transfer; `unknown` means no
-completed transfer in the window. The quality window includes both outcome and
-termination-class counts. A missing `device` object means no firmware
-observation has been recorded yet. Treat the status as an operational summary:
-inspect the journal, debug ring, and sealed bundles before diagnosing a
-specific transfer.
+The operational snapshot stores low-rate `unknown`, `clear`, or `blocked`
+states for quality, publication, and clock health. It is separate from the
+rotating debug ring and is scoped to the host boot ID and systemd invocation
+ID: a new identity degrades old `clear` state to `unknown`, while old
+`blocked` state remains attention until the service records recovery. State
+changes, not arbitrary heartbeats or TTLs, update the snapshot. A failed
+snapshot write is supervised: collection is cancelled through its finalizer,
+which closes or preserves active audio evidence, and the service exits with an
+error instead of claiming healthy status.
+
+Confirmed loss needs its own authoritative durable ledger: append and fsync the
+loss fact before publishing the prefix that exposes the gap, then derive status
+from that ledger. The bounded quality journal is a telemetry projection and
+may lose a queued metric during overflow; a later successful metric must never
+clear confirmed loss. Deduplicate repeated ledger/projection observations
+automatically, preserve retained legacy loss facts, and require no manual reset.
+The service implements this contract; the audit tracker records its targeted
+verification separately from the full release gates.
+
+Interpret `ok` as requiring a completed transfer in the quality window and
+`clear` operational states, with no confirmed loss or terminal failure.
+Without a completed transfer, status is `unknown` unless a blocked operational
+state or a known stopped service requires `attention`; absence alone is not
+healthy. The quality window includes outcome and termination-class counts. A
+missing `device` object means no firmware observation has been recorded yet.
+Treat status as an operational summary: inspect the journal, debug ring, and
+sealed bundles before diagnosing a specific transfer.
 
 ## Documentation hygiene
 

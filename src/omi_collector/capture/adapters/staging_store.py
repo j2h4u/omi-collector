@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -36,13 +37,16 @@ from ..domain.ready_machine import (
     TimerFired,
     Wake,
     publication_transition,
+    recovered_closure,
 )
+from ..domain.ring_protocol import RECORD_SIZE
 from . import publication, quarantine, ready_closures
 from .attempts import StagedAttempt
 from .clock_corrections import ClockCorrectionError, ClockCorrectionStore
 from .clock_memberships import ClockMembershipError, ClockMembershipStore
 from .clock_observations import ClockObservationError
 from .clock_segments import ClockSegmentError, ClockSegmentMap, segments_with_estimates
+from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
 from .ready_bundles import (
     ReadyBundleError,
     ReadyInventory,
@@ -344,13 +348,13 @@ class StagingStore:
         with self.device_lock(recover_capture_temporaries=False, operation="ready_visit_begin"):
             return ready_closures.begin_visit(self.ready_closures_path)
 
-    def close_orphaned_drafts(self, reason: str) -> object | None:
+    def close_orphaned_drafts(
+        self, reason: str, *, drain_cursor: int | None = None
+    ) -> ready_closures.ReadyClosure | None:
         """Create a restart closure for authenticated drafts without a pending attempt."""
         with self.device_lock(recover_capture_temporaries=False, operation="close_orphaned_drafts") as lease:
             frontier = self._cached_draft_frontier()
-            if frontier is None:
-                return None
-            return self._append_ready_closure_unlocked(lease, frontier, reason)
+            return self._merge_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
 
     def _cached_draft_frontier(self) -> int | None:
         publication_root = self._publication_root
@@ -375,47 +379,140 @@ class StagingStore:
         return inventory
 
     def close_pending_prefix(
-        self, reason: str, *, include_unpublished: bool = True
+        self, reason: str, *, include_unpublished: bool = True, drain_cursor: int | None = None
     ) -> ready_closures.ReadyClosure | None:
         """Replay and close every published or resumable prefix under one lease."""
         with self.device_lock(recover_capture_temporaries=False, operation="close_pending_prefix") as lease:
-            if not self.attempts_root.exists():
+            self._validate_recovery_cursor_unlocked(lease, reason, drain_cursor)
+            candidates = self._pending_prefix_candidates(include_unpublished)
+            drained_plan: tuple[tuple[int, str] | None, ready_closures.ReadyClosure | None] | None = None
+            orphan_frontier = self._cached_draft_frontier() if reason == "drained" else None
+            preflight_all = reason == "drained" and (len(candidates) > 1 or orphan_frontier is not None)
+            if preflight_all:
+                frontiers = [self._preflight_prefix_frontier(item[2]) for item in candidates]
+                if orphan_frontier is not None:
+                    frontiers.append(orphan_frontier)
+                frontier = max(frontiers) if frontiers else None
+                drained_plan = self._decide_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
+            if not candidates:
                 return None
-            _require_regular_directory(self.attempts_root)
-            pending_ids = (
-                {descriptor.attempt_id for descriptor in self.pending_attempts()} if include_unpublished else set()
-            )
-            candidates: list[tuple[int, Path, AttemptDescriptor]] = []
-            for path in tuple(self.attempts_root.iterdir()):
-                if path.is_symlink() or not path.is_dir():
-                    raise AttemptStateError("partial staging root contains a non-directory entry")
-                marker = path / _PREFIX_PUBLICATION_NAME
-                terminal_marker = path / _TERMINAL_RETIRED_NAME
-                if terminal_marker.is_symlink():
-                    raise AttemptStateError("terminal-retired marker must not be a symlink")
-                if terminal_marker.exists():
-                    continue
-                marker_present = marker.exists() or marker.is_symlink()
-                if not marker_present and path.name not in pending_ids:
-                    continue
-                if marker_present:
-                    _require_regular_file(marker, "recoverable prefix publication marker")
-                descriptor = self._filesystem._read_descriptor(path)
-                candidates.append((descriptor.start_sequence, path, descriptor))
-
             last_closure: ready_closures.ReadyClosure | None = None
             for _start_sequence, _path, descriptor in sorted(candidates, key=lambda item: item[0]):
-                attempt = self.open_attempt(descriptor.attempt_id)
-                try:
-                    attempt.activate_for_resume(lease)
-                    prefix = attempt.durable_prefix
-                    attempt.publish_prefix()
-                    attempt.close(durable=True)
-                    self.terminalize_prefix_attempt_held(attempt.attempt_id, lease)
-                    last_closure = self._append_ready_closure_unlocked(lease, prefix.next_sequence, reason)
-                finally:
-                    attempt.close(durable=True)
+                last_closure = self._close_prefix_candidate(
+                    lease, descriptor, reason, drain_cursor, defer_drain_commit=preflight_all
+                )
+            if drained_plan is not None:
+                decision, existing = drained_plan
+                if decision is None:
+                    return existing
+                return self._append_ready_closure_unlocked(lease, *decision)
             return last_closure
+
+    def _validate_recovery_cursor_unlocked(self, lease: DeviceLock, reason: str, drain_cursor: int | None) -> None:
+        self._filesystem.require_device_lock(lease)
+        closures = ready_closures.load(self.ready_closures_path)
+        existing = closures[-1] if closures else None
+        try:
+            recovered_closure(
+                existing=None if existing is None else (existing.next_sequence, existing.reason),
+                recovered_frontier=None,
+                reason=reason,
+                drain_cursor=drain_cursor,
+            )
+        except ValueError as error:
+            raise ready_closures.ReadyClosureError(str(error)) from error
+
+    def _pending_prefix_candidates(self, include_unpublished: bool) -> list[tuple[int, Path, AttemptDescriptor]]:
+        if not self.attempts_root.exists():
+            return []
+        _require_regular_directory(self.attempts_root)
+        pending_ids = (
+            {descriptor.attempt_id for descriptor in self.pending_attempts()} if include_unpublished else set()
+        )
+        candidates: list[tuple[int, Path, AttemptDescriptor]] = []
+        for path in tuple(self.attempts_root.iterdir()):
+            if path.is_symlink() or not path.is_dir():
+                raise AttemptStateError("partial staging root contains a non-directory entry")
+            marker = path / _PREFIX_PUBLICATION_NAME
+            terminal_marker = path / _TERMINAL_RETIRED_NAME
+            if terminal_marker.is_symlink():
+                raise AttemptStateError("terminal-retired marker must not be a symlink")
+            if terminal_marker.exists():
+                continue
+            marker_present = marker.exists() or marker.is_symlink()
+            if not marker_present and path.name not in pending_ids:
+                continue
+            if marker_present:
+                _require_regular_file(marker, "recoverable prefix publication marker")
+            descriptor = self._filesystem._read_descriptor(path)
+            candidates.append((descriptor.start_sequence, path, descriptor))
+        return candidates
+
+    def _close_prefix_candidate(
+        self,
+        lease: DeviceLock,
+        descriptor: AttemptDescriptor,
+        reason: str,
+        drain_cursor: int | None,
+        *,
+        defer_drain_commit: bool,
+    ) -> ready_closures.ReadyClosure | None:
+        attempt = self.open_attempt(descriptor.attempt_id)
+        try:
+            attempt.activate_for_resume(lease)
+            prefix = attempt.durable_prefix
+            decision, existing = (None, None)
+            if reason != "drained" or not defer_drain_commit:
+                decision, existing = self._decide_recovered_closure_unlocked(
+                    lease, prefix.next_sequence, reason, drain_cursor
+                )
+            attempt.publish_prefix()
+            attempt.close(durable=True)
+            self.terminalize_prefix_attempt_held(attempt.attempt_id, lease)
+            if reason == "drained" and defer_drain_commit:
+                return None
+            if decision is None:
+                return existing
+            return self._append_ready_closure_unlocked(lease, *decision)
+        finally:
+            attempt.close(durable=True)
+
+    def _preflight_prefix_frontier(self, descriptor: AttemptDescriptor) -> int:
+        attempt = self.open_attempt(descriptor.attempt_id)
+        try:
+            recovery = attempt.recover()
+            recovered_records = max(recovery.valid_records, recovery.raw_bytes // RECORD_SIZE)
+            return descriptor.start_sequence + recovered_records
+        finally:
+            attempt.close()
+
+    def _decide_recovered_closure_unlocked(
+        self, lease: DeviceLock, frontier: int | None, reason: str, drain_cursor: int | None
+    ) -> tuple[tuple[int, str] | None, ready_closures.ReadyClosure | None]:
+        self._filesystem.require_device_lock(lease)
+        closures = ready_closures.load(self.ready_closures_path)
+        existing = closures[-1] if closures else None
+        try:
+            decision = recovered_closure(
+                existing=None if existing is None else (existing.next_sequence, existing.reason),
+                recovered_frontier=frontier,
+                reason=reason,
+                drain_cursor=drain_cursor,
+            )
+        except ValueError as error:
+            raise ready_closures.ReadyClosureError(str(error)) from error
+        closures = ready_closures.coalesce(self.ready_closures_path)
+        existing = closures[-1] if closures else None
+        return decision, existing
+
+    def _merge_recovered_closure_unlocked(
+        self, lease: DeviceLock, frontier: int | None, reason: str, drain_cursor: int | None
+    ) -> ready_closures.ReadyClosure | None:
+        decision, existing = self._decide_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
+        if decision is None:
+            return existing if frontier is not None else None
+        next_sequence, closure_reason = decision
+        return self._append_ready_closure_unlocked(lease, next_sequence, closure_reason)
 
     def _append_ready_closure_unlocked(
         self, lease: DeviceLock, next_sequence: int, reason: str
@@ -504,6 +601,40 @@ class StagingStore:
     def preflight_storage(self) -> None:
         """Validate and durably probe storage before any device operation starts."""
         self._filesystem.preflight_storage()
+        ledger_path = self.confirmed_loss_ledger_path
+        status_snapshot = ledger_path.with_name("operational-status.json")
+        if os.path.lexists(ledger_path):
+            ConfirmedLossLedger(ledger_path).read()
+        elif os.path.lexists(status_snapshot):
+            raise ConfirmedLossError("confirmed-loss ledger is missing after status initialization")
+
+    def initialize_confirmed_loss_ledger(self) -> None:
+        """Initialize only before the first operational snapshot exists."""
+        with self.clock_mutation_lease():
+            status_snapshot = self.confirmed_loss_ledger_path.with_name("operational-status.json")
+            ConfirmedLossLedger(self.confirmed_loss_ledger_path).initialize(
+                allow_create=not os.path.lexists(status_snapshot)
+            )
+
+    @property
+    def confirmed_loss_ledger_path(self) -> Path:
+        return self.device_state_path.parent / "confirmed-loss.json"
+
+    def record_confirmed_loss(
+        self,
+        attempt_id: str,
+        start_sequence: int,
+        end_sequence: int,
+        occurred_at: str,
+    ) -> str:
+        """Durably record one confirmed half-open interval under the device lease."""
+        with self.clock_mutation_lease():
+            return ConfirmedLossLedger(self.confirmed_loss_ledger_path).record(
+                attempt_id,
+                start_sequence,
+                end_sequence,
+                occurred_at,
+            )
 
     def quarantine_pending(self, reason: str) -> tuple[Path, ...]:
         moved = quarantine.quarantine_pending(self._filesystem, reason)

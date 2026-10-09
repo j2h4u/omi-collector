@@ -64,6 +64,24 @@ def test_digest_pinned_container_images_pass(tmp_path: Path) -> None:
     assert _check_container_refs(tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    ("image", "expected_errors"),
+    [
+        (f"python:3.14-slim@sha256:{'a' * 64}", []),
+        ("python:3.14-slim", ["Dockerfile uses python:3.14-slim; pin container images to a sha256 digest"]),
+    ],
+)
+def test_platform_from_images_are_checked_and_named_stages_are_recognized(
+    tmp_path: Path, image: str, expected_errors: list[str]
+) -> None:
+    (tmp_path / "Dockerfile").write_text(
+        f"FROM --platform=$BUILDPLATFORM {image} AS build\nCOPY --from=build /src /src\n",
+        encoding="utf-8",
+    )
+
+    assert _check_container_refs(tmp_path) == expected_errors
+
+
 def test_tagged_external_copy_and_compose_images_fail_with_sources(tmp_path: Path) -> None:
     (tmp_path / "Dockerfile").write_text(
         f"FROM python:3.14-slim@sha256:{'f' * 64}\nCOPY --from=busybox:1.36 /bin/tool /bin/tool\n",

@@ -16,6 +16,7 @@ from scripts.validate_release_notes import main as validate_notes_main
 
 _ROOT = Path(__file__).parents[1]
 _CI_WORKFLOW = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+_SQUASH_WORKFLOW = (_ROOT / ".github" / "workflows" / "squash-contract.yml").read_text(encoding="utf-8")
 _RELEASE_WORKFLOW = (_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
 OVERRIDE = """
@@ -196,6 +197,54 @@ def test_release_notes_override_threshold_and_empty_override() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "feat(api)!: change request format\n\nExplain the migration.",
+        "fix(api): preserve compatibility\n\nBREAKING CHANGE: old requests fail.",
+        "chore(release): set version\n\nRelease-As: 2.0.0",
+    ],
+)
+def test_title_only_squash_requires_override_for_body_release_metadata(message: str) -> None:
+    ok, messages = validate_release_notes("", commit_count=1, require_above=1, messages=[message])
+
+    assert not ok
+    assert "lose release information" in messages[0]
+
+
+def test_release_metadata_override_is_validated() -> None:
+    body = "BEGIN_COMMIT_OVERRIDE\nfeat(api)!: change request format\n\nExplain the migration.\nEND_COMMIT_OVERRIDE"
+    assert validate_release_notes(body, 1, 1, ["feat(api)!: change request format\n\nExplain the migration."])[0]
+
+
+def test_override_must_preserve_breaking_and_release_as_metadata() -> None:
+    body = "BEGIN_COMMIT_OVERRIDE\nfix(api): change request format\nEND_COMMIT_OVERRIDE"
+    ok, problems = validate_release_notes(body, 1, 1, ["feat(api)!: change request format\n\nExplain the migration."])
+    assert not ok
+    assert any("breaking marker" in problem for problem in problems)
+    assert any("explanatory body" in problem for problem in problems)
+
+    ok, problems = validate_release_notes(
+        "BEGIN_COMMIT_OVERRIDE\nchore(release): prepare\n\nRelease-As: 2.1.0\nEND_COMMIT_OVERRIDE",
+        1,
+        1,
+        ["chore(release): prepare\n\nRelease-As: 2.0.0"],
+    )
+    assert not ok
+    assert any("Release-As: 2.0.0" in problem for problem in problems)
+
+
+@pytest.mark.parametrize("footer", ["BREAKING CHANGE:", "BREAKING-CHANGE:", "Details: BREAKING-CHANGE:"])
+def test_override_must_keep_the_breaking_footer(footer: str) -> None:
+    source = f"fix(api): change request format\n\n{footer} old requests fail."
+    body = "BEGIN_COMMIT_OVERRIDE\nfix(api): change request format\nEND_COMMIT_OVERRIDE"
+
+    ok, problems = validate_release_notes(body, 1, 1, [source])
+
+    assert not ok
+    assert any("preserve the breaking-change note" in problem for problem in problems)
+
+
 def test_release_notes_reject_malformed_and_unsupported_subjects() -> None:
     for subject, expected in (
         ("plain text", "not a Conventional Commit subject"),
@@ -328,6 +377,23 @@ def test_release_pr_contract_requires_the_real_release_please_identity() -> None
     assert "github.event.pull_request.user.login || inputs.pr_author" in _CI_WORKFLOW
     assert '"${HEAD_REPO}" == "${GITHUB_REPOSITORY}"' in _CI_WORKFLOW
     assert '"${PR_AUTHOR}" == "github-actions[bot]"' in _CI_WORKFLOW
+    assert "--title-only-squash" in _CI_WORKFLOW
+    assert '--base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}"' in _CI_WORKFLOW
+    assert "workflow_run:" in _SQUASH_WORKFLOW
+    assert "contents: write" in _SQUASH_WORKFLOW
+    assert "pull-requests: read" in _SQUASH_WORKFLOW
+    assert "statuses: write" in _SQUASH_WORKFLOW
+    assert "squash_merge_commit_title" in _SQUASH_WORKFLOW
+    assert "squash_merge_commit_message" in _SQUASH_WORKFLOW
+    assert "PR_TITLE\\tBLANK" in _SQUASH_WORKFLOW
+    assert "GH_TOKEN: ${{ github.token }}" in _SQUASH_WORKFLOW
+    assert "commits/${PR_HEAD_SHA}/pulls" in _SQUASH_WORKFLOW
+    assert 'select(.state == "open" and .base.ref == "main" and .head.sha == $head_sha)' in _SQUASH_WORKFLOW
+    assert "actions/checkout" not in _SQUASH_WORKFLOW
+    assert "github.event.pull_request" not in _SQUASH_WORKFLOW
+    assert "github.event.workflow_run.head_sha" in _SQUASH_WORKFLOW
+    assert '"repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}"' in _SQUASH_WORKFLOW
+    assert "context=squash-contract" in _SQUASH_WORKFLOW
     assert '| jq -r --arg repository "${REPOSITORY}" --arg release_branch "${RELEASE_BRANCH}"' in _RELEASE_WORKFLOW
     assert (
         'select(.head.repo.full_name == $repository and .head.ref == $release_branch and .user.login == "github-actions[bot]")'

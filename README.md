@@ -368,6 +368,10 @@ Release-please opens a release PR from merged Conventional Commits. Use `feat:`
 for a minor release, `fix:` for a patch, and `!` for a breaking release. Run
 `just release-check` before opening a releasable PR; multi-commit squash PRs
 need a `BEGIN_COMMIT_OVERRIDE` / `END_COMMIT_OVERRIDE` block in their body.
+The repository uses the PR title as the squash commit subject and drops commit
+bodies. The release check requires an override block when a discarded commit
+body contains breaking-change or `Release-As` metadata and checks that the
+override preserves it.
 Release-please owns `CHANGELOG.md`, `pyproject.toml`, and `uv.lock` version
 updates; review and merge its release PR to create the tag and GitHub release.
 Published changes are summarized in the [changelog](CHANGELOG.md).

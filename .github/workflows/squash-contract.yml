@@ -1,0 +1,51 @@
+name: Repository squash contract
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: read
+  statuses: write
+
+jobs:
+  squash-contract:
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify title-only squash settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PR_HEAD_SHA}" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]]; then
+            echo "::error::workflow run has no valid PR head SHA"
+            exit 1
+          fi
+          pull_requests="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${PR_HEAD_SHA}/pulls" \
+            | jq -r --arg head_sha "${PR_HEAD_SHA}" \
+              '.[] | select(.state == "open" and .base.ref == "main" and .head.sha == $head_sha) | .number')"
+          if [[ -z "${pull_requests}" ]]; then
+            echo "No open main-branch PR remains at this head SHA."
+            exit 0
+          fi
+          if [[ "${pull_requests}" == *$'\n'* ]]; then
+            echo "::error::more than one open main-branch PR matches the workflow head SHA"
+            exit 1
+          fi
+          publish_status() {
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}" \
+              -f "state=${1}" -f context=squash-contract -f "description=${2}" >/dev/null
+          }
+          publish_status pending "checking repository squash settings"
+          squash_settings="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '[.squash_merge_commit_title, .squash_merge_commit_message] | @tsv')"
+          if [[ "${squash_settings}" != $'PR_TITLE\tBLANK' ]]; then
+            echo "::error::repository squash settings must be PR_TITLE and BLANK (found ${squash_settings})"
+            publish_status failure "repository squash settings do not match the release contract"
+            exit 1
+          fi
+          publish_status success "repository squash settings match the release contract"

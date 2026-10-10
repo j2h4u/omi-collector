@@ -98,12 +98,13 @@ unresolved.
   timestamps. Acceptance: README accurately describes those rules and its
   examples agree with manifest behavior. The clock source and documentation
   diff were checked and accepted by root.
-9. [ ] **Collector cannot traverse the ready-checkpoint parent.** The retained
-  revision in `/srv/pipelines/omi/work/omi-ready-checkpoint.json` is a real ACK
-  dependency. The work parent is `j2h4u:j2h4u` mode `2770` without collector
-  traverse ACL; the checkpoint is UID 10001/GID 1000 mode `0660` without
-  collector read ACL. Repeated `storage_busy_or_io` remains visible, but no
-  syscall trace has confirmed runtime attribution.
+9. [x] **Collector checkpoint access is restored.** The retained revision in
+  `/srv/pipelines/omi/work/omi-ready-checkpoint.json` is a real ACK dependency.
+  The original work parent (`j2h4u:j2h4u`, mode `2770`) lacked collector
+  traversal, and the checkpoint (UID 10001/GID 1000, mode `0660`) lacked
+  collector read access. The live ACL repair preserves ownership and grants
+  only the required parent traversal and checkpoint read permissions. No
+  syscall trace was captured.
 
   Producer PR #33 (main `2d0ebc3`) grants the trusted collector UID a numeric
   read ACL on the temporary checkpoint before fsync and replace; if ACL
@@ -116,17 +117,26 @@ unresolved.
   (33 focused, 265 full), consumer tests (148 with 2 skips), and shared-image
   tests (318) passed with their static, lock-freshness, and CI checks.
 
-  Shared-image PR #42 uses source `58fecbe3282683bb459aa405a4f953cdb2ac7445`.
-  Its isolated candidate image `windmill-universal-worker:1.816.0-acl-58fecbe`
-  built successfully (2,224,728,580 bytes, digest
-  `sha256:6e25f39e693e9c93979331cee3e6ee718bb19e51815f3bcb3f5e69897be2bf34`)
-  from pinned `python:3.13.14-slim-trixie` digest
-  `sha256:69e18bd8d831d88e0ef70239dc7771ab7c28bc296ae78ac75cde71e60aa4434f`.
-  Its UID 1000 ACL/read smoke and Python runtime policies passed. Keep this item
-  open until the live ACL repair, control-only rollout, canonical pipeline
-  publish, two scratch-checkpoint writes read by the actual collector, and
-  publication recovery are verified. Authorization is pending; do not claim a
-  syscall trace or recovered publication backlog.
+  Shared-image PR #42 uses source
+  `58fecbe3282683bb459aa405a4f953cdb2ac7445`. The control-only image
+  `windmill-universal-worker:1.816.0-acl-58fecbe` was rebuilt and rolled to
+  `worker-transcripts-control-1`; its digest is
+  `sha256:5c834c0900e3f9573ab4d93d793284975831158b6f0b80197e97e3c6b6f1d125`
+  (2,224,597,518 bytes), with the image revision label matching the full
+  source SHA. The build-time and live-container ACL checks passed. The control
+  container is running as UID/GID 1000:1000 with all capabilities dropped and
+  zero restarts; the other worker containers kept their prior image IDs.
+
+  The `f/omi/flat_ready` reader was published and its live source hash matches
+  `3400388a9c8e3b1a38257a7dcbd3b4e6cfde35011c5f6b6fa1350d9dc5caceec`.
+  The producer replaced a scratch checkpoint twice in the real work parent.
+  After the second replacement, the actual collector identity (UID 996,
+  GID 981, no supplementary groups) read and asserted the expected state; the
+  scratch file was removed. The existing checkpoint was also opened and read
+  by that identity. This confirms checkpoint access and state visibility; it
+  does not confirm that any pre-existing publication backlog or archived
+  audio was processed. The speech archive schedule remains disabled and its
+  queue was empty during the checks.
 
 ## Release status
 
@@ -136,17 +146,24 @@ and CodeQL passed. Release PR #216 published `v0.11.16` at revision
 zero restarts and readiness; private state files were mode `0600`.
 
 Consumer PRs #217/#218 merged with green CI on main
-`54b1254701b28272ccca10bada848f4d84a66bbc`, published as `v0.11.17`; the
-live service remains on `v0.11.16`. Producer PR #33 and shared-image PR #42
-also merged with fresh CI. Candidate full unit (2,566 passed, 2 skipped), CRAP
-(2,566 passed, 2 skipped; 1,585 functions at or below 30), static checks,
-Docker build, and runtime smoke passed. The isolated image build and runtime
-ACL/read smoke passed; its temporary build worktrees, branches, and 308 MB
-environment were removed. Finding 9 is implemented and verified in code and
-build tests, but remains open pending authorized live ACL repair and end-to-end
-publication recovery.
+`54b1254701b28272ccca10bada848f4d84a66bbc`, published as `v0.11.17`.
+Release PR #220 published `v0.11.18` at
+`ce8ac25ee6d52439b007ff2fd1e5f3570a0184f4`; the service is running that
+release with PID 3767599 and zero restarts. Producer PR #33 and shared-image
+PR #42 also merged with fresh CI. Candidate full unit (2,566 passed, 2
+skipped), CRAP (2,566 passed, 2 skipped; 1,585 functions at or below 30),
+static checks, Docker build, and runtime smoke passed. Finding 9's checkpoint
+access contract is verified live. No claim is made that archived audio or a
+pre-existing publication backlog has been processed.
 
 ## QA follow-up
+
+- [ ] **Verify an end-to-end Omi archive publication.** The reader and
+  checkpoint access checks do not show that a Windmill archive job produced
+  its output and committed the matching ACK, or that any existing work was
+  consumed. No archive publication pass or backlog processing was observed;
+  the speech archive schedule remains disabled and its queue was empty during
+  this audit.
 
 The initial CRAP run's failure was in two source-mode assertions in
 `tests/test_systemd_unit.py`, which compared worktree `stat()` permissions

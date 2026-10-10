@@ -256,6 +256,10 @@ stopping the old service, preflight the service identity's checkpoint access;
 reject symlinks and allow an absent checkpoint. Surface sanitized access,
 storage-I/O, and lock-contention failures separately. An unavailable
 checkpoint blocks publication and retries, while collection continues.
+After deployment, verify parent traversal and checkpoint reads as the actual
+consumer identity, including its supplementary groups. Keep dependent
+processing disabled until those checks pass; checkpoint readability alone
+does not show that an existing publication backlog was processed.
 
 After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
 builds the environment as the dedicated build account, copies dependencies into it,

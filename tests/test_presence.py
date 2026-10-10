@@ -17,10 +17,12 @@ from omi_collector.capture.application.presence import (
     PresenceWake,
 )
 from omi_collector.capture.application.presence_machine import (
+    Advertisement,
     CandidateUnavailable,
     CleanDrain,
     ConnectedInterruption,
     NotConnected,
+    UnexpectedAttemptOutcomeError,
 )
 from omi_collector.config import PresenceConfig
 
@@ -341,6 +343,33 @@ def test_old_scanner_generation_cannot_release_a_later_attempt() -> None:
         await _emit_stable(observer)
         assert (await second).reason == "advertisement"
         await scheduler.close()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        PresenceAdvertisement("private-device-address"),
+        PresenceWake("advertisement", candidate="private-device-address"),
+        Advertisement("private-device-address", observed_at=0.0),
+    ],
+)
+def test_candidate_repr_hides_device_details(value: object) -> None:
+    assert "private-device-address" not in repr(value)
+
+
+def test_unexpected_attempt_outcome_closes_and_forces_scanner_cleanup() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(observer, policy=_test_policy())
+
+        with pytest.raises(UnexpectedAttemptOutcomeError):
+            await scheduler.attempt_finished(CandidateUnavailable())
+
+        assert observer.events == ["stop"]
+        with pytest.raises(RuntimeError, match="closed"):
+            await scheduler.wait_for_attempt()
 
     _run(scenario())
 

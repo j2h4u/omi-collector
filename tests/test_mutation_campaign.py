@@ -89,6 +89,21 @@ def _without_runner_defaults(environment: dict[str, str]) -> dict[str, str]:
     return caller_environment
 
 
+def test_prepare_job_tmp_preserves_directory_when_recorded_identity_drifted(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    scratch = job_root / "tmp"
+    scratch.mkdir(parents=True, mode=0o700)
+    retained = scratch / "pytest_gremlins_sources.py"
+    retained.write_text("retained", encoding="utf-8")
+    details = scratch.lstat()
+    receipt: dict[str, object] = {"tmp_identity": {"device": details.st_dev + 1, "inode": details.st_ino}}
+
+    with pytest.raises(ValueError, match="identity changed"):
+        mutation_campaign._prepare_job_tmp(job_root, receipt)
+
+    assert retained.read_text(encoding="utf-8") == "retained"
+
+
 def _without_outer_job_token(environment: dict[str, str] | None = None) -> dict[str, str]:
     child_environment = (os.environ if environment is None else environment).copy()
     child_environment.pop(mutation_campaign.JOB_TOKEN_ENV, None)

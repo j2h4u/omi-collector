@@ -651,6 +651,14 @@ def test_native_hci_bind_passes_exact_sockaddr_hci_layout(monkeypatch: pytest.Mo
     ]
 
 
+def test_native_hci_bind_rejects_unsupported_platform_before_loading_libc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ble_link_observability.os, "name", "nt")
+    monkeypatch.setattr(ble_link_observability.ctypes, "CDLL", lambda *_args, **_kwargs: pytest.fail("libc loaded"))
+
+    with pytest.raises(OSError, match="native HCI bind requires Linux"):
+        _native_hci_bind(37, 31, 3, 7)
+
+
 def test_native_hci_bind_preserves_errno(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeBind:
         argtypes: object

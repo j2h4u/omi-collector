@@ -80,6 +80,23 @@ def _without_outer_job_token() -> dict[str, str]:
     return environment
 
 
+class _RequestBytes:
+    def __init__(self, payload: bytes, chunk_sizes: tuple[int, ...] = ()) -> None:
+        self.payload = payload
+        self.chunk_sizes = iter(chunk_sizes)
+        self.consumed = 0
+
+    def settimeout(self, _timeout: float | None) -> None:
+        pass
+
+    def recv(self, size: int) -> bytes:
+        chunk_size = min(size, next(self.chunk_sizes, size))
+        chunk = self.payload[:chunk_size]
+        self.payload = self.payload[len(chunk) :]
+        self.consumed += len(chunk)
+        return chunk
+
+
 def test_status_uses_the_owner_socket_and_returns_live_state(
     control_job: tuple[Path, mutation_scope.OwnerControlServer],
     monkeypatch: pytest.MonkeyPatch,
@@ -97,6 +114,53 @@ def test_status_uses_the_owner_socket_and_returns_live_state(
     assert isinstance(owner_pid, int)
     assert owner_pid > 0
     assert mutation_scope.control_socket_path(job).stat().st_mode & 0o777 == 0o600
+
+
+def test_receive_request_rejects_a_newline_at_the_size_limit() -> None:
+    request = b'{"action":"status"}'
+    payload = request + b" " * (mutation_scope.MAX_CONTROL_BYTES - len(request) - 1) + b"\n"
+
+    with pytest.raises(mutation_scope.ScopeError, match="bounded newline terminator"):
+        mutation_scope._receive_request(_RequestBytes(payload), time.monotonic() + 1)  # type: ignore[arg-type]
+
+
+def test_receive_request_does_not_overread_the_size_limit() -> None:
+    payload = b"x" * (mutation_scope.MAX_CONTROL_BYTES + 1024)
+    connection = _RequestBytes(payload, (1024, 1024, 1024, 1023, 1024))
+
+    with pytest.raises(mutation_scope.ScopeError, match="bounded newline terminator"):
+        mutation_scope._receive_request(connection, time.monotonic() + 1)  # type: ignore[arg-type]
+
+    assert connection.consumed == mutation_scope.MAX_CONTROL_BYTES
+
+
+def test_remove_stale_socket_refuses_to_unlink_a_replaced_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    socket_directory = tmp_path / "control"
+    socket_directory.mkdir(mode=0o700)
+    socket_directory.chmod(0o700)
+    monkeypatch.setattr(mutation_scope, "SOCKET_DIRECTORY", socket_directory)
+    socket_path = socket_directory / "stale.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale_socket:
+        stale_socket.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    identity = mutation_scope._socket_identity(socket_path)
+    assert identity is not None
+
+    calls = 0
+
+    def changed_identity(_path: Path) -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        return identity if calls == 1 else (identity[0], identity[1] + 1)
+
+    monkeypatch.setattr(mutation_scope, "_socket_identity", changed_identity)
+
+    with pytest.raises(mutation_scope.ScopeError, match="changed during stale-endpoint check"):
+        mutation_scope.remove_stale_socket(socket_path)
+
+    assert socket_path.exists()
 
 
 def test_pause_reports_paused_only_after_owner_acknowledges_checkpoint_stop(

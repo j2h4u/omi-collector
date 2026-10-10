@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.22](https://github.com/j2h4u/omi-collector/compare/v0.11.21...v0.11.22) (2026-10-10)
+
+
+### Documentation
+
+* archive Omi migration and release status ([#231](https://github.com/j2h4u/omi-collector/issues/231)) ([98739e1](https://github.com/j2h4u/omi-collector/commit/98739e134289e49c8c54028aea5119e48784eb4c))
+
 ## [0.11.21](https://github.com/j2h4u/omi-collector/compare/v0.11.20...v0.11.21) (2026-10-10)
 
 

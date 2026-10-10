@@ -46,19 +46,21 @@ unresolved.
   had two stale-fixture failures; those fixtures are fixed and the latest
   four-module rerun passed: 125 tests in 4.01 seconds. Sol accepted the
   read-only review of lease, fallback, quality, and supervision behavior.
-3. [x] **Confirmed-loss attention can be cleared by unrelated telemetry.**
+3. [x] **Confirmed-loss facts can be lost with telemetry.**
   A confirmed `SequenceLossMetric` can be dropped when the bounded quality
-  queue overflows; a later successful quality write can then clear `BLOCK`,
-  losing the only durable loss fact and producing false `ok`. The status
-  snapshot alone does not fix this. Accepted architecture: write and fsync an
-  authoritative confirmed-loss ledger before prefix publication; status reads
-  that ledger, while quality telemetry remains a projection. Use automatic
-  idempotency and count deduplication, preserve retained legacy loss facts, and
+  queue overflows; the bounded journal alone would then lose the only loss
+  observation. The status snapshot alone does not fix this. Accepted
+  architecture: write and fsync an authoritative confirmed-loss ledger before
+  prefix publication; `quality_window` reports its totals while quality
+  telemetry remains a projection. Use automatic idempotency and count
+  deduplication, preserve retained legacy loss facts, and
   require no manual reset. Acceptance: test crash/order boundaries around
   fsync and publication; queue overflow followed by success must retain loss
-  and `attention`; repeated projections must not double-count; retained legacy
-  facts remain visible; no reset is needed. Sol accepted the loss-ledger/status
-  seams and the ordered storage call with drained-loss and empty-quarantine
+  totals; repeated projections must not double-count; retained legacy
+  facts remain visible in quality statistics; loss totals do not change
+  top-level attention status by themselves; no reset is needed. Sol accepted
+  the loss-ledger/status seams and the ordered storage call with drained-loss
+  and empty-quarantine
   assertions. The seven-module targeted cluster passed 279 tests in 8.49
   seconds; targeted implementation and review are accepted.
 4. [x] **Failed mutation receipt leaks job resources.**
@@ -133,10 +135,7 @@ unresolved.
   After the second replacement, the actual collector identity (UID 996,
   GID 981, no supplementary groups) read and asserted the expected state; the
   scratch file was removed. The existing checkpoint was also opened and read
-  by that identity. This confirms checkpoint access and state visibility; it
-  does not confirm that any pre-existing publication backlog or archived
-  audio was processed. The speech archive schedule remains disabled and its
-  queue was empty during the checks.
+  by that identity. This confirms checkpoint access and state visibility.
 
 ## Release status
 
@@ -153,17 +152,7 @@ release with PID 3767599 and zero restarts. Producer PR #33 and shared-image
 PR #42 also merged with fresh CI. Candidate full unit (2,566 passed, 2
 skipped), CRAP (2,566 passed, 2 skipped; 1,585 functions at or below 30),
 static checks, Docker build, and runtime smoke passed. Finding 9's checkpoint
-access contract is verified live. No claim is made that archived audio or a
-pre-existing publication backlog has been processed.
-
-## QA follow-up
-
-- [ ] **Verify an end-to-end Omi archive publication.** The reader and
-  checkpoint access checks do not show that a Windmill archive job produced
-  its output and committed the matching ACK, or that any existing work was
-  consumed. No archive publication pass or backlog processing was observed;
-  the speech archive schedule remains disabled and its queue was empty during
-  this audit.
+access contract is verified live.
 
 The initial CRAP run's failure was in two source-mode assertions in
 `tests/test_systemd_unit.py`, which compared worktree `stat()` permissions

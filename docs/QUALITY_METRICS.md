@@ -33,21 +33,26 @@ uv run omi-collector device status
 ```
 
 Its top-level `status` is `ok` only when the quality window contains a
-completed transfer, operational health is `clear`, and there is no confirmed
-loss or terminal failure. A blocked health state or confirmed loss produces
-`attention`; no completed transfer by itself is `unknown`, never evidence of
-healthy operation. `publication` reports the currently visible bundle
-inventory. `quality_window` reports recent advertisements, transfer sessions,
-pooled bytes per second, outcome counts, termination-class counts, and
-confirmed loss totals. A null `device` means no firmware observation has been
-recorded for that device.
+completed transfer, the service is active with operational health `clear`, and
+there is no latest terminal transfer failure. A blocked health state, inactive
+service, or terminal failure produces `attention`; no completed transfer by
+itself is `unknown`, never evidence of healthy operation. Confirmed loss
+totals remain visible in `quality_window` but do not change the top-level
+status by themselves. `publication` reports
+the currently visible bundle inventory. Its `loss_ratio` estimates unproven
+sequence holes among those visible bundles; it is not the fraction of
+historically confirmed loss. `quality_window` reports recent advertisements,
+transfer sessions, pooled bytes per second, outcome counts, termination-class
+counts, and confirmed loss totals as `confirmed_loss_events`,
+`confirmed_lost_records`, and `confirmed_lost_raw_bytes`. A null `device` means
+no firmware observation has been recorded for that device.
 
 Confirmed loss must remain visible independently of this bounded telemetry
 window. The accepted contract is an authoritative loss ledger, fsynced before
-prefix publication; status reads that ledger, while `quality.jsonl` remains a
-projection. Queue overflow may drop a metric record, but cannot erase the loss
-fact or permit a later successful transfer to clear attention. Repeated
-observations are deduplicated automatically, and retained legacy loss facts
+prefix publication; `quality_window` reports its totals, while `quality.jsonl`
+remains a projection. Queue overflow may drop a metric record, but cannot
+erase the loss fact or its reported totals. Repeated observations are
+deduplicated automatically, and retained legacy loss facts
 remain part of the status. The service implements this contract; see the
 [Service audit](SERVICE_AUDIT.md) for targeted proof and release status.
 

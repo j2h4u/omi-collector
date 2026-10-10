@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.11.21](https://github.com/j2h4u/omi-collector/compare/v0.11.20...v0.11.21) (2026-10-10)
+
+
+### Fixes
+
+* **release:** attest squash settings before merge ([#230](https://github.com/j2h4u/omi-collector/issues/230)) ([827e2cb](https://github.com/j2h4u/omi-collector/commit/827e2cb5d2811ba79eb0b80e299ea4e1b4a4a7d3))
+* **release:** validate title-only squash metadata ([#228](https://github.com/j2h4u/omi-collector/issues/228)) ([f0b4de7](https://github.com/j2h4u/omi-collector/commit/f0b4de7f9e075e146ef0bb4aa55a6521c7fa8cf6))
+
+
+### Maintenance
+
+* **deps-dev:** bump actionlint-py from 1.7.12.24 to 1.7.12.25 ([#142](https://github.com/j2h4u/omi-collector/issues/142)) ([3aecb51](https://github.com/j2h4u/omi-collector/commit/3aecb51863535e151d436be66797b2f6fedb4518))
+* **deps:** bump the github-actions group across 1 directory with 4 updates ([#143](https://github.com/j2h4u/omi-collector/issues/143)) ([82f1df1](https://github.com/j2h4u/omi-collector/commit/82f1df12e0a2b0c52e228de9ce6f4e35e23c4221))
+* **deps:** bump the python-minor-patch group across 1 directory with 4 updates ([#221](https://github.com/j2h4u/omi-collector/issues/221)) ([7b1e8a1](https://github.com/j2h4u/omi-collector/commit/7b1e8a1b19ce60f45485fba10e540df855282aca))
+
 ## [0.11.20](https://github.com/j2h4u/omi-collector/compare/v0.11.19...v0.11.20) (2026-10-10)
 
 

@@ -219,13 +219,12 @@ release-check title="" body="":
     if [ -z "${title}" ]; then
         title="$(git log -1 --format=%s HEAD)"
     fi
+    head="$(git rev-parse HEAD)"
     uv run python scripts/validate_release_config.py
     uv run python scripts/validate_pr_title.py --title "${title}"
-    uv run python -m scripts.validate_pr_commits --base-sha "${base}" --head-sha "$(git rev-parse HEAD)"
+    uv run python -m scripts.validate_pr_commits --base-sha "${base}" --head-sha "${head}" --title-only-squash
     if [ -n "{{body}}" ]; then
-        uv run python -m scripts.validate_release_notes --body-file "{{body}}" --commit-count "${count}"
-    elif [ "${count}" -gt 1 ]; then
-        printf 'note: %s commits will squash into one.\n' "${count}" >&2
-        printf 'The PR body needs a BEGIN_COMMIT_OVERRIDE block; re-run with body=<file> to check it.\n' >&2
-        exit 1
+        uv run python -m scripts.validate_release_notes --body-file "{{body}}" --commit-count "${count}" --base-sha "${base}" --head-sha "${head}"
+    else
+        printf '' | uv run python -m scripts.validate_release_notes --body-file - --commit-count "${count}" --base-sha "${base}" --head-sha "${head}"
     fi

@@ -124,7 +124,7 @@ jobs:
           set -euo pipefail
           uv run python scripts/validate_release_config.py
           uv run python scripts/validate_pr_title.py --title "${PR_TITLE}"
-          uv run python -m scripts.validate_pr_commits --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}"
+          uv run python -m scripts.validate_pr_commits --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}" --title-only-squash
           if [[ "${HEAD_REF}" == "${RELEASE_BRANCH}" &&
                 "${HEAD_REPO}" == "${GITHUB_REPOSITORY}" &&
                 "${PR_AUTHOR}" == "github-actions[bot]" ]]; then
@@ -132,7 +132,7 @@ jobs:
           fi
           count="$(git rev-list --no-merges --count "${BASE_SHA}..${HEAD_SHA}")"
           printf '%s' "${PR_BODY}" \
-            | uv run python -m scripts.validate_release_notes --body-file - --commit-count "${count}"
+            | uv run python -m scripts.validate_release_notes --body-file - --commit-count "${count}" --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}"
 
   quality:
     runs-on: ubuntu-latest

@@ -38,6 +38,13 @@ def test_validate_commit_messages_accepts_indented_bullets_and_rejects_other_col
         assert any("Markdown bullet at column 0" in problem for problem in problems)
 
 
+def test_title_only_squash_skips_body_bullets_but_keeps_subject_validation() -> None:
+    message = "fix(audio): retain recording metadata\n\n- Keep metadata attached."
+    assert not validate_commit_messages([message])[0]
+    assert validate_commit_messages([message], title_only_squash=True)[0]
+    assert not validate_commit_messages(["wip: unsafe type\n\n- body"], title_only_squash=True)[0]
+
+
 def test_editable_message_discards_comments_and_scissors_but_keeps_body() -> None:
     raw = (
         "fix(audio): preserve capture notes\n\n"

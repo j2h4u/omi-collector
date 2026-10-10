@@ -409,7 +409,7 @@ def test_release_merge_is_bound_to_repository_and_observed_head() -> None:
 
 def test_release_attestation_requires_exact_release_pr_workflow_runs() -> None:
     assert "statuses: write" in _RELEASE_WORKFLOW
-    assert 'contexts=(ci "Analyze Python" dependency-review)' in _RELEASE_WORKFLOW
+    assert 'contexts=(ci "Analyze Python" dependency-review squash-contract)' in _RELEASE_WORKFLOW
     assert '"repos/${REPOSITORY}/statuses/${head_sha}"' in _RELEASE_WORKFLOW
     assert "event=workflow_dispatch&branch=${head_ref}" in _RELEASE_WORKFLOW
     assert "--jq --arg" not in _RELEASE_WORKFLOW
@@ -426,6 +426,19 @@ def test_release_attestation_requires_exact_release_pr_workflow_runs() -> None:
 
 def test_release_attestation_fails_before_auto_merge_and_only_then_succeeds() -> None:
     merge_at = _RELEASE_WORKFLOW.index('gh pr merge "${pr_number}" --auto --squash')
+    squash_check_at = _RELEASE_WORKFLOW.index('if ! squash_settings="$(gh api "repos/${REPOSITORY}"')
+    assert "squash_merge_commit_title" in _RELEASE_WORKFLOW
+    assert "squash_merge_commit_message" in _RELEASE_WORKFLOW
+    assert "PR_TITLE\\tBLANK" in _RELEASE_WORKFLOW
+    assert (
+        _RELEASE_WORKFLOW.index(
+            'publish_status squash-contract failure "repository squash settings could not be verified"'
+        )
+        < merge_at
+    )
+    assert squash_check_at < _RELEASE_WORKFLOW.index(
+        'publish_status "${context}" success "release PR check attestation succeeded"'
+    )
     assert _RELEASE_WORKFLOW.index('publish_status ci failure "release PR CI attestation failed"') < merge_at
     assert (
         _RELEASE_WORKFLOW.index('publish_status "Analyze Python" failure "release PR CodeQL attestation failed"')

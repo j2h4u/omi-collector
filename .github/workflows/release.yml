@@ -170,7 +170,7 @@ jobs:
           pr_body="$(jq -r '.body' <<< "${release_pr}")"
           head_repo="$(jq -r '.head.repo.full_name' <<< "${release_pr}")"
           pr_author="$(jq -r '.user.login' <<< "${release_pr}")"
-          contexts=(ci "Analyze Python" dependency-review)
+          contexts=(ci "Analyze Python" dependency-review squash-contract)
           declare -A dispatch_started_at existing_run_ids
 
           publish_status() {
@@ -273,6 +273,17 @@ jobs:
           fi
           if ! wait_for_workflow dependency-review.yml "Dependency review"; then
             publish_status dependency-review failure "release PR dependency review attestation failed"
+            exit 1
+          fi
+
+          if ! squash_settings="$(gh api "repos/${REPOSITORY}" \
+            --jq '[.squash_merge_commit_title, .squash_merge_commit_message] | @tsv')"; then
+            publish_status squash-contract failure "repository squash settings could not be verified"
+            exit 1
+          fi
+          if [ "${squash_settings}" != $'PR_TITLE\tBLANK' ]; then
+            publish_status squash-contract failure "repository squash settings do not match the release contract"
+            echo "::error::repository squash settings must be PR_TITLE and BLANK (found ${squash_settings})"
             exit 1
           fi
 

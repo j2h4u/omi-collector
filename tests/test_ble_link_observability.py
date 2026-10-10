@@ -1652,6 +1652,108 @@ def test_close_drains_a_full_public_packet_queue_after_callback_releases(
     assert fake.closed
 
 
+def test_close_does_not_report_processor_stopped_after_racing_queue_drain(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _QueueShutdownSocket()
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    extra_packet_queued = threading.Event()
+    records: list[dict[str, object]] = []
+    debug_logger = logging.getLogger("tests.ble_link.public_queue_shutdown_race")
+    config = replace(
+        DEFAULT_CONFIG.ble,
+        observer_queue_max_packets=1,
+        observer_poll_seconds=0.005,
+        observer_join_timeout_seconds=0.5,
+    )
+
+    def terminal_callback(record: dict[str, object]) -> None:
+        records.append(record)
+        callback_entered.set()
+        callback_release.wait()
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        config=config,
+        terminal_callback=terminal_callback,
+        debug_logger=debug_logger,
+    )
+
+    class ReleaseOnFullShutdownQueue(queue.Queue[bytes | None]):
+        intercept = True
+
+        def put_nowait(self, item: bytes | None) -> None:
+            if item is None and self.intercept:
+                self.intercept = False
+                try:
+                    super().put_nowait(item)
+                except queue.Full:
+                    callback_release.set()
+                    assert observer._processor is not None
+                    observer._processor.join(timeout=1.0)
+                    assert not observer._processor.is_alive()
+                    raise
+                return
+            super().put_nowait(item)
+            if item == b"\x04\xff\x00":
+                extra_packet_queued.set()
+
+    observer._queue = ReleaseOnFullShutdownQueue(maxsize=1)
+
+    async def scenario() -> None:
+        closing: asyncio.Task[None] | None = None
+        try:
+            await observer.start()
+            fake.packets.put(_connect())
+            assert await asyncio.to_thread(fake.connect_commands_sent.wait, 1.0)
+            fake.packets.put(_packet(0x05, b"\x00\x42\x00\x13"))
+            assert await asyncio.to_thread(callback_entered.wait, 1.0)
+            fake.packets.put(b"\x04\xff\x00")
+            assert await asyncio.to_thread(fake.extra_packet_returned.wait, 1.0)
+            assert await asyncio.to_thread(extra_packet_queued.wait, 1.0)
+            closing = asyncio.create_task(observer.close())
+            assert await asyncio.to_thread(fake.close_called.wait, 1.0)
+            await asyncio.wait_for(closing, timeout=0.4)
+        finally:
+            callback_release.set()
+            if closing is None:
+                closing = asyncio.create_task(observer.close())
+            await asyncio.wait_for(closing, timeout=1.0)
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        asyncio.run(scenario())
+
+    assert len(records) == 1
+    assert observer._queue.empty()
+    assert observer._processor is None
+    shutdown_errors = {
+        "ble_link_observer_processor_stopped",
+        "ble_link_observer_processor_timeout",
+    }
+    observed = {getattr(record, "debug_event", None) for record in caplog.records if record.name == debug_logger.name}
+    assert not shutdown_errors.intersection(observed)
+    assert fake.closed
+
+
+def test_shutdown_reports_stopped_processor_with_queued_packet(caplog: pytest.LogCaptureFixture) -> None:
+    debug_logger = logging.getLogger("tests.ble_link.stopped_processor_with_queued_packet")
+    observer = BleLinkObserver("01:02:03:04:05:06", debug_logger=debug_logger)
+    observer._queue.put_nowait(b"queued packet")
+    processor = threading.Thread()
+
+    with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
+        asyncio.run(observer._enqueue_shutdown_sentinel(processor, time.monotonic() + 1.0))
+
+    assert any(
+        record.name == debug_logger.name
+        and getattr(record, "debug_event", None) == "ble_link_observer_processor_stopped"
+        for record in caplog.records
+    )
+
+
 def _release_after_timeout(close_returned: threading.Event, callback_release: threading.Event) -> None:
     if not close_returned.wait(timeout=0.2):
         callback_release.set()

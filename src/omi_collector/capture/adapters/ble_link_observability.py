@@ -799,14 +799,16 @@ class BleLinkObserver:
     async def _enqueue_shutdown_sentinel(self, processor: threading.Thread, deadline: float) -> None:
         while True:
             if not processor.is_alive():
-                self._diagnostic("ble_link_observer_processor_stopped")
+                if not self._queue.empty():
+                    self._diagnostic("ble_link_observer_processor_stopped")
                 return
             try:
                 self._queue.put_nowait(None)
                 return
             except queue.Full:
                 if not processor.is_alive():
-                    self._diagnostic("ble_link_observer_processor_stopped")
+                    if not self._queue.empty():
+                        self._diagnostic("ble_link_observer_processor_stopped")
                     return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

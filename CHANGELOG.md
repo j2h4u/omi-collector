@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.19](https://github.com/j2h4u/omi-collector/compare/v0.11.18...v0.11.19) (2026-10-10)
+
+
+### Documentation
+
+* record checkpoint access rollout evidence ([a31a6b2](https://github.com/j2h4u/omi-collector/commit/a31a6b23519ea20b4c46a893bf91f3355a7a0236))
+* separate checkpoint access from publication recovery ([a31a6b2](https://github.com/j2h4u/omi-collector/commit/a31a6b23519ea20b4c46a893bf91f3355a7a0236))
+
 ## [0.11.18](https://github.com/j2h4u/omi-collector/compare/v0.11.17...v0.11.18) (2026-10-09)
 
 

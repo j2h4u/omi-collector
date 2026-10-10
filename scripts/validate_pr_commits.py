@@ -26,7 +26,7 @@ def commit_messages(base_sha: str, head_sha: str) -> list[str]:
     return [message.strip("\n") for message in result.stdout.split(RECORD_SEPARATOR) if message.strip()]
 
 
-def _validate_message(message: str) -> list[str]:
+def _validate_message(message: str, *, title_only_squash: bool = False) -> list[str]:
     problems: list[str] = []
     lines = message.splitlines()
     subject = lines[0].strip() if lines else ""
@@ -40,7 +40,7 @@ def _validate_message(message: str) -> list[str]:
             allowed = ", ".join(sorted(RELEASABLE_TYPES))
             problems.append(f"'{subject}' uses unsupported type '{commit_type}'. Allowed types: {allowed}.")
 
-    bullets = [line for line in lines[1:] if line.startswith(BULLET_MARKERS)]
+    bullets = [] if title_only_squash else [line for line in lines[1:] if line.startswith(BULLET_MARKERS)]
     if bullets:
         problems.append(
             f"'{subject}' has a Markdown bullet at column 0 ({bullets[0]!r}). "
@@ -51,11 +51,13 @@ def _validate_message(message: str) -> list[str]:
     return problems
 
 
-def validate_commit_messages(messages: list[str]) -> tuple[bool, list[str]]:
+def validate_commit_messages(messages: list[str], *, title_only_squash: bool = False) -> tuple[bool, list[str]]:
     if not messages:
         return True, ["No non-merge commits to validate."]
 
-    problems = [problem for message in messages for problem in _validate_message(message)]
+    problems = [
+        problem for message in messages for problem in _validate_message(message, title_only_squash=title_only_squash)
+    ]
     if problems:
         return False, problems
     return True, [f"All {len(messages)} commit message(s) are releasable."]
@@ -77,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument("--base-sha", help="Base commit the PR branches from.")
     source.add_argument("--message-file", help="File holding one commit message.")
     parser.add_argument("--head-sha", help="Head commit of the PR. Required with --base-sha.")
+    parser.add_argument(
+        "--title-only-squash",
+        action="store_true",
+        help="Validate subjects only because GitHub squash merge drops commit bodies.",
+    )
     args = parser.parse_args(argv)
 
     message_file = cast("str | None", args.message_file)
@@ -88,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--head-sha is required with --base-sha")
         messages = commit_messages(cast("str", args.base_sha), head_sha)
 
-    ok, reported = validate_commit_messages(messages)
+    ok, reported = validate_commit_messages(messages, title_only_squash=cast("bool", args.title_only_squash))
     stream = sys.stdout if ok else sys.stderr
     for message in reported:
         print(message, file=stream)

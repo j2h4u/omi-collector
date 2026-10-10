@@ -419,8 +419,6 @@ def _device_status(observation: FirmwareObservation) -> dict[str, object]:
 
 
 def _window_status(quality: _QualityWindow, *, operational_status: dict[str, str]) -> str:
-    if quality.loss_events:
-        return "attention"
     if quality.last_transfer_termination_class in {"cancelled", "fatal_error", "teardown_interrupted"}:
         return "attention"
     if "blocked" in operational_status.values():

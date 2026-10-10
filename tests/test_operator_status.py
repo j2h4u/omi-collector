@@ -126,7 +126,7 @@ def test_confirmed_loss_status_unions_intervals_and_deduplicates_keyed_projectio
     assert quality.missing_raw_bytes == 28 * RECORD_SIZE
 
 
-def test_durable_loss_keeps_attention_after_restart_and_unrelated_quality_append(
+def test_durable_loss_remains_visible_without_degrading_clear_status(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
@@ -160,10 +160,44 @@ def test_durable_loss_keeps_attention_after_restart_and_unrelated_quality_append
         identity=OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001"),
     )
 
+    assert result["status"] == "ok"
+    quality = cast(dict[str, object], result["quality_window"])
+    assert quality["confirmed_loss_events"] == 1
+    assert quality["confirmed_lost_records"] == 10
+    assert quality["confirmed_lost_raw_bytes"] == 10 * RECORD_SIZE
+
+
+def test_confirmed_loss_with_blocked_publication_remains_attention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    ledger = ConfirmedLossLedger(layout.collector.confirmed_loss_ledger)
+    ledger.initialize(allow_create=True)
+    ledger.record("0123456789abcdef0123456789abcdef", 100, 110, "2026-09-08T09:30:00+00:00")
+    identity = _operational_status(layout, {OperationalDimension.PUBLICATION: OperationalSignal.BLOCK})
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
+    journal = layout.collector.root / DEFAULT_CONFIG.observability.quality_metrics.file_name
+    journal.write_text(
+        json.dumps(
+            _transfer("2026-09-08T09:45:00+00:00", outcome="ok", termination_class="completed", written_raw_bytes=444)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = collect_operator_status(
+        layout,
+        hours=24,
+        now=datetime(2026, 9, 8, 10, tzinfo=UTC),
+        identity=identity,
+    )
+
     assert result["status"] == "attention"
     quality = cast(dict[str, object], result["quality_window"])
     assert quality["confirmed_loss_events"] == 1
     assert quality["confirmed_lost_records"] == 10
+    assert quality["confirmed_lost_raw_bytes"] == 10 * RECORD_SIZE
 
 
 def test_status_fails_closed_when_initialized_loss_ledger_is_missing(
@@ -253,7 +287,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
-    assert result["status"] == "attention"
+    assert result["status"] == "unknown"
     quality = cast(dict[str, object], result["quality_window"])
     assert quality["clock_corrections"] == 1
     assert quality["last_clock_correction_at"] == "2026-09-08T09:20:00.000+00:00"

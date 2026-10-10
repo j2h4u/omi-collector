@@ -184,16 +184,20 @@ run:
 sudo -n /usr/local/sbin/omi-collector-status
 ```
 
-Interpret `status=ok` as at least one completed transfer in the window with no
-confirmed loss or terminal failure. `status=attention` is the degraded state:
-confirmed loss or a latest fatal, cancelled, or teardown-interrupted transfer
-was recorded;
-`status=unknown` means the window has no completed transfer to assess. The
+Interpret `status=ok` as at least one completed transfer in the window, an
+active service with clear operational health, and no latest fatal, cancelled,
+or teardown-interrupted transfer. `status=attention` reflects blocked
+operational health, an inactive service, or such a terminal transfer;
+confirmed-loss totals remain visible in `quality_window` and do not change
+status by themselves. `status=unknown` means
+the window has no completed transfer to assess and no attention condition. The
 `publication` object describes currently visible bundles, while
 `quality_window` contains bounded advertisements, transfer throughput,
-outcome and termination-class breakdowns, and loss totals. Use `device metrics`
-for the publication inventory alone and `journalctl -u omi-collector.service`
-or `debug.jsonl` when the summary needs more context.
+outcome and termination-class breakdowns, and the confirmed-loss event, record,
+and raw-byte totals (`confirmed_loss_events`, `confirmed_lost_records`, and
+`confirmed_lost_raw_bytes`). Use `device metrics` for the publication
+inventory alone and `journalctl -u omi-collector.service` or `debug.jsonl` when
+the summary needs more context.
 
 For subsequent updates, select the reviewed revision in the production
 checkout and run:

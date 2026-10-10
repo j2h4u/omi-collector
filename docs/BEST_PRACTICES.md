@@ -369,20 +369,23 @@ which closes or preserves active audio evidence, and the service exits with an
 error instead of claiming healthy status.
 
 Confirmed loss needs its own authoritative durable ledger: append and fsync the
-loss fact before publishing the prefix that exposes the gap, then derive status
-from that ledger. The bounded quality journal is a telemetry projection and
-may lose a queued metric during overflow; a later successful metric must never
-clear confirmed loss. Deduplicate repeated ledger/projection observations
-automatically, preserve retained legacy loss facts, and require no manual reset.
-The service implements this contract; the audit tracker records its targeted
-verification separately from the full release gates.
+loss fact before publishing the prefix that exposes the gap, then include the
+ledger totals in `quality_window`. The bounded quality journal is a telemetry
+projection and may lose a queued metric during overflow; it cannot erase the
+reported loss totals. Deduplicate repeated ledger/projection observations
+automatically and preserve retained legacy loss facts. Loss totals are quality
+statistics and do not change top-level status by themselves. The service
+implements this contract; the audit tracker records its targeted verification
+separately from the full release gates.
 
 Interpret `ok` as requiring a completed transfer in the quality window and
-`clear` operational states, with no confirmed loss or terminal failure.
-Without a completed transfer, status is `unknown` unless a blocked operational
-state or a known stopped service requires `attention`; absence alone is not
-healthy. The quality window includes outcome and termination-class counts. A
-missing `device` object means no firmware observation has been recorded yet.
+`clear` operational states, and no latest terminal transfer failure. Without a
+completed transfer, status is `unknown` unless a blocked operational state or
+a known stopped service requires `attention`; absence alone is not healthy.
+Confirmed-loss totals remain visible in the quality window but do not change
+status by themselves. The quality window includes outcome and
+termination-class counts. A missing `device` object means no firmware
+observation has been recorded yet.
 Treat status as an operational summary: inspect the journal, debug ring, and
 sealed bundles before diagnosing a specific transfer.
 

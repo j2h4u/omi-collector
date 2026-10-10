@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.20](https://github.com/j2h4u/omi-collector/compare/v0.11.19...v0.11.20) (2026-10-10)
+
+
+### Fixes
+
+* **ble:** avoid false shutdown diagnostic after queue drain ([c17c564](https://github.com/j2h4u/omi-collector/commit/c17c5640a96c1c2973a3b445e4fe2b26cadef41b))
+* keep confirmed loss as quality statistics ([#224](https://github.com/j2h4u/omi-collector/issues/224)) ([be213d8](https://github.com/j2h4u/omi-collector/commit/be213d878af1cccd0bbb13c7fb00bfa432d7c62d))
+
+
+### Tests
+
+* cover mutation safety boundaries ([#225](https://github.com/j2h4u/omi-collector/issues/225)) ([1715170](https://github.com/j2h4u/omi-collector/commit/171517097c19ad768634d2cf074b07cd4efda0d9))
+
 ## [0.11.19](https://github.com/j2h4u/omi-collector/compare/v0.11.18...v0.11.19) (2026-10-10)
 
 

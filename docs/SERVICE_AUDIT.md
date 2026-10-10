@@ -129,14 +129,14 @@ unresolved.
 
   The `f/omi/flat_ready` reader was published and its live source hash matches
   `3400388a9c8e3b1a38257a7dcbd3b4e6cfde35011c5f6b6fa1350d9dc5caceec`.
-  Two producer-created scratch checkpoint replacements in the real work
-  parent were read and checked by the actual collector identity (UID 996,
-  GID 981, no supplementary groups); the scratch file was removed. The
-  existing checkpoint was also opened and read by that identity. This confirms
-  checkpoint access and state visibility; it does not confirm that any
-  pre-existing publication backlog or archived audio was processed. The
-  speech archive schedule remains disabled and its queue was empty during the
-  checks.
+  The producer replaced a scratch checkpoint twice in the real work parent.
+  After the second replacement, the actual collector identity (UID 996,
+  GID 981, no supplementary groups) read and asserted the expected state; the
+  scratch file was removed. The existing checkpoint was also opened and read
+  by that identity. This confirms checkpoint access and state visibility; it
+  does not confirm that any pre-existing publication backlog or archived
+  audio was processed. The speech archive schedule remains disabled and its
+  queue was empty during the checks.
 
 ## Release status
 
@@ -157,6 +157,13 @@ access contract is verified live. No claim is made that archived audio or a
 pre-existing publication backlog has been processed.
 
 ## QA follow-up
+
+- [ ] **Verify an end-to-end Omi archive publication.** The reader and
+  checkpoint access checks do not show that a Windmill archive job produced
+  its output and committed the matching ACK, or that any existing work was
+  consumed. No archive publication pass or backlog processing was observed;
+  the speech archive schedule remains disabled and its queue was empty during
+  this audit.
 
 The initial CRAP run's failure was in two source-mode assertions in
 `tests/test_systemd_unit.py`, which compared worktree `stat()` permissions

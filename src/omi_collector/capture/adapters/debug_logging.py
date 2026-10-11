@@ -6,9 +6,11 @@ import json
 import logging
 import re
 import sys
+import traceback
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
 from pathlib import Path
@@ -23,58 +25,297 @@ from .collector_state_db import StateDB, StateKind
 _FILTER_ATTRIBUTE = "_omi_collector_debug_filter"
 _RUNTIME_SINK_ATTRIBUTE = "_omi_collector_runtime_status_sink"
 _EXCEPTION_INFO_LENGTH = 3
-_SENSITIVE_FIELD_PARTS = frozenset(
+_MAX_JOURNAL_CODE_PARTS = 8
+# Journal diagnostics are a projection, not a dump of caller-provided text.
+# Every string that survives this boundary is assembled from fixed code values.
+_JOURNAL_CODE_PARTS = {
+    part: part
+    for part in (
+        "1m",
+        "acquired",
+        "address",
+        "att",
+        "attempt",
+        "auto",
+        "available",
+        "away",
+        "ble",
+        "blocked",
+        "callback",
+        "central",
+        "change",
+        "characteristics",
+        "clean",
+        "clock",
+        "close",
+        "command",
+        "configuration",
+        "connect",
+        "connecting",
+        "connection",
+        "cooldown",
+        "data",
+        "degraded",
+        "deleted",
+        "device",
+        "disable",
+        "disconnect",
+        "download",
+        "drain",
+        "drained",
+        "duplicate",
+        "enable",
+        "enabled",
+        "error",
+        "event",
+        "factory",
+        "failed",
+        "failure",
+        "fatal",
+        "feature",
+        "firmware",
+        "force",
+        "gatt",
+        "hci",
+        "host",
+        "identity",
+        "initiated",
+        "intent",
+        "invalid",
+        "length",
+        "link",
+        "local",
+        "lock",
+        "malformed",
+        "mark",
+        "marker",
+        "metrics",
+        "mismatch",
+        "mtu",
+        "none",
+        "not",
+        "notifications",
+        "observation",
+        "observed",
+        "observer",
+        "operational",
+        "outcome",
+        "overflow",
+        "packet",
+        "parameter",
+        "parser",
+        "partial",
+        "pendant",
+        "peripheral",
+        "phy",
+        "prefix",
+        "preserved",
+        "processor",
+        "progress",
+        "public",
+        "publication",
+        "publish",
+        "published",
+        "quality",
+        "quarantine",
+        "query",
+        "queue",
+        "random",
+        "reading",
+        "ready",
+        "receive",
+        "recovery",
+        "released",
+        "remote",
+        "request",
+        "requested",
+        "required",
+        "resolved",
+        "retired",
+        "retry",
+        "retryable",
+        "returned",
+        "rssi",
+        "scan",
+        "services",
+        "session",
+        "setup",
+        "shutdown",
+        "socket",
+        "start",
+        "started",
+        "status",
+        "stopped",
+        "storage",
+        "success",
+        "sweep",
+        "sync",
+        "teardown",
+        "terminal",
+        "timeout",
+        "transient",
+        "transition",
+        "truncated",
+        "unexpected",
+        "unknown",
+        "unsupported",
+        "update",
+        "validated",
+        "wait",
+        "waiting",
+        "write",
+        "writer",
+    )
+}
+_JOURNAL_TEXT_FIELDS = frozenset(
     {
-        "access_key",
-        "access_token",
-        "api_key",
-        "audio",
-        "authorization",
-        "client_secret",
-        "cookie",
-        "credential",
-        "password",
-        "private_key",
-        "secret",
-        "secret_key",
-        "signature",
-        "token",
+        "detail",
+        "disconnect_class",
+        "disconnect_reason_name",
+        "event",
+        "observer_status",
+        "operation",
+        "peer_address_type",
+        "phase",
+        "phy_policy",
+        "reason",
+        "role",
+        "rx_phy",
+        "status",
+        "status_name",
+        "tx_phy",
     }
 )
-_REDACTION_PATTERNS = (
-    (re.compile(r"(?i)\bbearer\s+[^\s,;]+"), "Bearer <redacted>"),
-    (re.compile(r"(?im)^(\s*(?:authorization|cookie)\s*:\s*)[^\r\n]*$"), r"\1<redacted>"),
-    (
-        re.compile(
-            r"(?i)\b(authorization|cookie|password|secret|token|api[_-]?key|access[_-]?key|access[_-]?token|"
-            r"client[_-]?secret|private[_-]?key|secret[_-]?key|signature)\b\s*([:=])\s*[^\s,;]+"
-        ),
-        r"\1\2<redacted>",
-    ),
-    (
-        re.compile(
-            r"(?i)([?&](?:x-amz-(?:credential|signature|security-token)|x-goog-(?:credential|signature)|signature|sig|token|access_token|refresh_token|id_token|api[_-]?key|awsaccesskeyid|googleaccessid|key-pair-id)=)[^&#\s]+"
-        ),
-        r"\1<redacted>",
-    ),
+_JOURNAL_FIELDS = frozenset(
+    {
+        "attempt_id",
+        "battery_percent",
+        "bytes_per_second",
+        "connection_parameter_requests",
+        "connection_parameter_updates",
+        "connection_rssi_dbm",
+        "data_length",
+        "data_length_transitions",
+        "detail",
+        "disconnect_class",
+        "disconnect_reason_hex",
+        "disconnect_reason_name",
+        "dropped_packets",
+        "duration_seconds",
+        "effective_parameters",
+        "effective_phy",
+        "elapsed_seconds",
+        "error_name",
+        "error_type",
+        "eta_seconds",
+        "event",
+        "fields",
+        "final_connection_parameters",
+        "firmware",
+        "handle",
+        "initial_connection_parameters",
+        "initial_phy_snapshot",
+        "interval_ms",
+        "latency",
+        "lock_context",
+        "max_interval_ms",
+        "max_rx_octets",
+        "max_rx_time",
+        "max_tx_octets",
+        "max_tx_time",
+        "min_interval_ms",
+        "next_attempt_in_seconds",
+        "observer_status",
+        "operation",
+        "packet_bytes",
+        "payload_bytes",
+        "peer_address_type",
+        "peer_address_type_hex",
+        "phase",
+        "phy_policy",
+        "phy_transitions",
+        "phy_update_outcomes",
+        "progress",
+        "reason",
+        "record",
+        "records_completed",
+        "records_per_second",
+        "records_total",
+        "remaining_bytes",
+        "remaining_packets",
+        "retry_seconds",
+        "role",
+        "role_hex",
+        "rssi_dbm",
+        "rx_phy",
+        "source",
+        "status",
+        "status_hex",
+        "status_name",
+        "supervision_timeout_ms",
+        "total_bytes",
+        "tx_phy",
+        "unavailable",
+    }
 )
+_JOURNAL_FIELD_KEYS = {name: name for name in _JOURNAL_FIELDS}
+_JOURNAL_HEX_FIELDS = frozenset({"disconnect_reason_hex", "peer_address_type_hex", "role_hex", "status_hex"})
+_RUNTIME_NUMERIC_FIELDS = frozenset(
+    {
+        "battery_percent",
+        "bytes_per_second",
+        "duration_seconds",
+        "elapsed_seconds",
+        "eta_seconds",
+        "next_attempt_in_seconds",
+        "payload_bytes",
+        "records_completed",
+        "records_per_second",
+        "records_total",
+        "remaining_bytes",
+        "remaining_packets",
+        "retry_seconds",
+        "total_bytes",
+    }
+)
+_RUNTIME_CODE_FIELDS = frozenset({"event", "outcome", "phase", "reason", "status"})
+_RUNTIME_ERROR_TYPES = {
+    part: part
+    for part in (
+        "BleakError",
+        "CollectorTimeoutError",
+        "ConnectionError",
+        "DeviceAlreadyRunningError",
+        "OSError",
+        "PermissionError",
+        "RingTransportDisconnected",
+        "RingTransportUnavailable",
+        "RuntimeError",
+        "TimeoutError",
+        "UnexpectedError",
+    )
+}
+_FIRMWARE_VERSION = re.compile(r"v?\d{1,3}(?:\.\d{1,3}){1,3}")
 
 type ExceptionInfo = bool | BaseException | tuple[type[BaseException], BaseException, TracebackType | None] | None
 type LoggedExceptionInfo = tuple[type[BaseException], BaseException, TracebackType | None] | tuple[None, None, None]
 
 
+@dataclass(frozen=True, slots=True)
+class _SafeTraceback:
+    text: str
+
+
 class _RedactingDebugFilter(logging.Filter):
-    """Sanitize all debug records before they can reach a journal handler."""
+    """Accept only projected fields and internally constructed stack summaries."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        event = _safe_text(getattr(record, "debug_event", None), "debug_event")
-        message = _safe_record_message(record)
-        fields = _safe_record_fields(record)
-        if record.exc_info:
-            traceback = _safe_traceback(logging.Formatter(), record.exc_info)
-            message = f"{message}\n{traceback}"
+        event = _journal_code(getattr(record, "debug_event", None))
+        fields = _journal_fields(getattr(record, "debug_fields", {}))
+        safe_traceback = getattr(record, "debug_traceback", None)
+        detail = safe_traceback.text if isinstance(safe_traceback, _SafeTraceback) else ""
         rendered_fields = json.dumps(fields, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        record.msg = f"{event}: {message} fields={rendered_fields}"
+        record.msg = f"{event}: {detail} fields={rendered_fields}"
         record.args = ()
         record.exc_info = None
         return True
@@ -141,21 +382,20 @@ def _emit_debug_event(
     fields: Mapping[str, object],
     exc_info: ExceptionInfo,
 ) -> None:
-    """Sanitize one event before handing it to any logger or runtime sink."""
+    """Project one event before handing it to a logger or runtime sink."""
     target = logger or logging.getLogger(DEFAULT_CONFIG.observability.debug_log.logger_name)
     _install_filter(target)
-    try:
-        safe_fields = _sanitize_fields(fields)
-    except Exception:  # noqa: BLE001 - diagnostic fields are best effort
-        safe_fields = {"unavailable": True}
-    safe_event = _redact_text(event)
-    safe_message = _redact_text(message or event)
-    if exc_info:
-        safe_message = f"{safe_message}\n{_safe_traceback(logging.Formatter(), _exception_info(exc_info))}"
+    del message  # Caller text is untrusted, even when common credential patterns are redacted.
+    journal_fields = _journal_fields(fields)
+    safe_traceback = _exception_summary(_exception_info(exc_info)) if exc_info else None
     with suppress(Exception):
         target.debug(
-            safe_message,
-            extra={"debug_event": safe_event, "debug_fields": safe_fields},
+            "diagnostic",
+            extra={
+                "debug_event": _journal_code(event),
+                "debug_fields": journal_fields,
+                "debug_traceback": safe_traceback,
+            },
             exc_info=None,
         )
     sink = getattr(target, _RUNTIME_SINK_ATTRIBUTE, None)
@@ -163,7 +403,7 @@ def _emit_debug_event(
         sink = sink()
     if callable(sink) and event in {"sync_progress", "ble_link_rssi_observed"}:
         with suppress(Exception):
-            sink(event, safe_fields, datetime.now(UTC).isoformat(timespec="microseconds"))
+            sink(event, _runtime_fields(event, fields), datetime.now(UTC).isoformat(timespec="microseconds"))
 
 
 def debug_exception(
@@ -174,11 +414,9 @@ def debug_exception(
     logger: logging.Logger | None = None,
     **fields: object,
 ) -> None:
-    """Queue an exception without exposing unsanitized text to stderr or journald."""
-    detail = message or type(error).__name__
-    if not _is_expected_connect_timeout(event, error, fields):
-        detail = f"{detail}\n{_exception_traceback(error)}"
-    _emit_debug_event(event, detail, logger, fields, None)
+    """Log exception type and stack without backend-controlled exception text."""
+    info: ExceptionInfo = None if _is_expected_connect_timeout(event, error, fields) else error
+    _emit_debug_event(event, message, logger, fields, info)
 
 
 def read_runtime_status(state_db: StateDB) -> dict[str, object] | None:
@@ -201,6 +439,7 @@ def merge_runtime_status(
     if parsed is None:
         raise ValueError("runtime status event timestamp is invalid")
     _validate_runtime_event({"event": event, "fields": dict(fields), "timestamp": timestamp})
+    fields = _runtime_fields(event, fields)
     current = current or {
         "battery_observation": None,
         "battery_observed_at": None,
@@ -356,10 +595,6 @@ def _exception_info(value: ExceptionInfo) -> LoggedExceptionInfo:
     return None, None, None
 
 
-def _exception_traceback(error: BaseException) -> str:
-    return _safe_traceback(logging.Formatter(), (type(error), error, error.__traceback__))
-
-
 def _is_expected_connect_timeout(event: str, error: BaseException, fields: Mapping[str, object]) -> bool:
     return (
         event == "session_error"
@@ -368,73 +603,94 @@ def _is_expected_connect_timeout(event: str, error: BaseException, fields: Mappi
     )
 
 
-def _safe_record_message(record: logging.LogRecord) -> str:
-    try:
-        return _safe_text(record.getMessage(), "<message unavailable>")
-    except Exception:  # noqa: BLE001 - user exception __str__ is not trusted
-        return "<message unavailable>"
+def _exception_summary(exc_info: LoggedExceptionInfo) -> _SafeTraceback:
+    error_type, _, traceback_ = exc_info
+    name = error_type.__name__ if error_type is not None else "Exception"
+    package_root = Path(__file__).resolve().parents[2]
+    frames: list[str] = []
+    if traceback_ is not None:
+        for frame in traceback.extract_tb(traceback_, limit=16):
+            try:
+                source = Path(frame.filename).relative_to(package_root).as_posix()
+            except ValueError:
+                source = "<external>"
+            frames.append(f"{source}:{frame.lineno}")
+    return _SafeTraceback(f"{name} at {' <- '.join(frames) if frames else '<no stack>'}")
 
 
-def _safe_traceback(formatter: logging.Formatter, exc_info: LoggedExceptionInfo) -> str:
-    try:
-        return _safe_text(formatter.formatException(exc_info), "<traceback unavailable>")
-    except Exception:  # noqa: BLE001 - user exception __str__ is not trusted
-        return "<traceback unavailable>"
+def _journal_code(value: object) -> str:
+    if not isinstance(value, str):
+        return "<omitted>"
+    if value == "read/reconcile":
+        return "read/reconcile"
+    parts = value.split("_")
+    if not parts or len(parts) > _MAX_JOURNAL_CODE_PARTS or any(part not in _JOURNAL_CODE_PARTS for part in parts):
+        return "<omitted>"
+    return "_".join(_JOURNAL_CODE_PARTS[part] for part in parts)
 
 
-def _safe_record_fields(record: logging.LogRecord) -> dict[str, object]:
-    fields = getattr(record, "debug_fields", {})
+def _journal_fields(fields: object) -> dict[str, object]:
     if not isinstance(fields, Mapping):
         return {}
     try:
-        return _sanitize_fields(fields)
+        return {
+            _JOURNAL_FIELD_KEYS[name]: _journal_value(value, name)
+            for name, value in fields.items()
+            if isinstance(name, str) and name in _JOURNAL_FIELDS and name != "address"
+        }
     except Exception:  # noqa: BLE001 - diagnostic fields are best effort
         return {"unavailable": True}
 
 
-def _sanitize_fields(fields: Mapping[str, object]) -> dict[str, object]:
-    return {
-        _redact_text(_field_name(name)): _sanitize_value(value, _field_name(name)) for name, value in fields.items()
-    }
-
-
-def _sanitize_value(value: object, field_name: str) -> object:
-    if _is_sensitive_field(field_name) or isinstance(value, bytes):
-        result: object = "<redacted>"
-    elif value is None or isinstance(value, bool | int):
-        result = value
-    elif isinstance(value, str):
-        result = _redact_text(value)
+def _journal_value(value: object, field_name: str) -> object:
+    if value is None:
+        result: object = None
+    elif isinstance(value, bool):
+        result = bool(value)
+    elif isinstance(value, int):
+        result = int(value)
     elif isinstance(value, float):
-        result = value if isfinite(value) else str(value)
-    elif isinstance(value, Path):
-        result = _redact_text(str(value))
+        result = float(value) if isfinite(value) else None
     elif isinstance(value, Mapping):
-        result = {
-            _redact_text(_field_name(name)): _sanitize_value(item, _field_name(name)) for name, item in value.items()
-        }
-    elif isinstance(value, Sequence):
-        result = [_sanitize_value(item, field_name) for item in value]
+        result = _journal_fields(value)
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        result = [_journal_value(item, field_name) for item in value]
+    elif isinstance(value, str) and field_name in _JOURNAL_TEXT_FIELDS:
+        result = _journal_code(value)
+    elif isinstance(value, str) and field_name in _JOURNAL_HEX_FIELDS:
+        try:
+            result = int(value, 16) if re.fullmatch(r"0x[0-9a-fA-F]{2}", value) else "<omitted>"
+        except ValueError:
+            result = "<omitted>"
     else:
-        result = f"<{type(value).__name__}>"
+        result = "<omitted>"
     return result
 
 
-def _safe_text(value: object, fallback: str) -> str:
-    return _redact_text(value) if isinstance(value, str) else fallback
+def _runtime_fields(event: str, fields: Mapping[str, object]) -> dict[str, object]:
+    if event == "ble_link_rssi_observed":
+        rssi = fields.get("rssi_dbm")
+        return {"rssi_dbm": rssi} if isinstance(rssi, int) and not isinstance(rssi, bool) else {}
+    progress = fields.get("progress")
+    if event != "sync_progress" or not isinstance(progress, Mapping):
+        return {}
+    safe_progress: dict[str, object] = {}
+    for name, value in progress.items():
+        projected = _runtime_progress_value(name, value)
+        if projected is not None:
+            safe_progress[name] = projected
+    safe_progress.setdefault("status", "unknown")
+    return {"progress": safe_progress}
 
 
-def _field_name(value: object) -> str:
-    return value if isinstance(value, str) else "<non_string>"
-
-
-def _redact_text(value: str) -> str:
-    redacted = value
-    for pattern, replacement in _REDACTION_PATTERNS:
-        redacted = pattern.sub(replacement, redacted)
-    return redacted
-
-
-def _is_sensitive_field(field_name: str) -> bool:
-    normalized = field_name.casefold().replace("-", "_")
-    return any(part in normalized for part in _SENSITIVE_FIELD_PARTS)
+def _runtime_progress_value(name: object, value: object) -> object | None:
+    if name in _RUNTIME_NUMERIC_FIELDS and isinstance(value, int | float) and not isinstance(value, bool):
+        return value if isfinite(value) else None
+    if name in _RUNTIME_CODE_FIELDS:
+        code = _journal_code(value)
+        return code if code != "<omitted>" else None
+    if name == "error_type" and isinstance(value, str):
+        return _RUNTIME_ERROR_TYPES.get(value)
+    if name == "firmware" and isinstance(value, str) and _FIRMWARE_VERSION.fullmatch(value):
+        return value
+    return None

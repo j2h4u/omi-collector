@@ -116,7 +116,7 @@ def test_observer_logs_only_matching_handle_rssi_observations(caplog: pytest.Log
     assert events[0].__dict__["debug_fields"] == {
         "handle": 0x42,
         "rssi_dbm": -47,
-        "status_hex": "0x00",
+        "status_hex": 0,
         "status_name": "success",
     }
 
@@ -1007,7 +1007,7 @@ def test_observer_receive_failure_degrades_and_warns_without_stopping_collection
     assert fake.closed
 
 
-def test_observer_start_failure_keeps_traceback_in_debug_log_and_warning_separate(
+def test_observer_start_failure_keeps_safe_stack_in_debug_log_and_warning_separate(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     debug_logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.ble_link.debug"))
@@ -1027,7 +1027,8 @@ def test_observer_start_failure_keeps_traceback_in_debug_log_and_warning_separat
 
     assert "ble_link_observer_start_failed:" in caplog.text
     assert "PermissionError" in caplog.text
-    assert "raw HCI payload must stay private" in caplog.text
+    assert "ble_link_observability.py:" in caplog.text
+    assert "raw HCI payload must stay private" not in caplog.text
     warning_records = [record for record in caplog.records if record.name == warning_logger.name]
     assert [record.getMessage() for record in warning_records] == ["BLE link observer unavailable"]
     assert all("raw HCI payload must stay private" not in record.getMessage() for record in warning_records)

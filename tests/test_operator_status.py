@@ -433,7 +433,7 @@ def test_status_marks_persistent_runtime_failures_for_attention(
     ]
 
 
-def test_status_preserves_lock_context_from_session_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_status_omits_legacy_lock_context_from_session_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     context = {
         "requested_operation": "capture_batch",
@@ -464,7 +464,10 @@ def test_status_preserves_lock_context_from_session_error(monkeypatch: pytest.Mo
 
     runtime = cast(dict[str, object], result["runtime"])
     error = cast(dict[str, object], runtime["last_error"])
-    assert error["lock_context"] == context
+    assert error["lock_context"] is None
+    assert error["error_message"] is None
+    assert error["error_type"] == "DeviceAlreadyRunningError"
+    assert error["phase"] == "read/reconcile"
 
 
 def test_status_clears_ready_publication_block_after_successful_noop_recovery(
@@ -872,7 +875,9 @@ def test_status_uses_event_timestamps_when_runtime_journal_is_out_of_order(
     runtime = cast(dict[str, object], result["runtime"])
     assert runtime["battery_percent"] == 88
     assert runtime["connection_rssi_dbm"] == -42
-    assert cast(dict[str, object], runtime["last_error"])["error_message"] == "newer"
+    last_error = cast(dict[str, object], runtime["last_error"])
+    assert last_error["error_message"] is None
+    assert last_error["occurred_at"] == "2026-09-08T09:03:00.000+00:00"
     assert runtime["attention_reasons"] == []
 
 
@@ -909,9 +914,7 @@ def test_status_merges_equal_timestamp_runtime_events_into_one_current_projectio
     rows = (
         {
             "event": "sync_progress",
-            "fields": {
-                "progress": {"status": "observed", "event": "pendant_observation", "firmware": "first-firmware"}
-            },
+            "fields": {"progress": {"status": "observed", "event": "pendant_observation", "firmware": "1.0.0"}},
             "timestamp": timestamp,
         },
         {
@@ -920,7 +923,7 @@ def test_status_merges_equal_timestamp_runtime_events_into_one_current_projectio
                 "progress": {
                     "status": "observed",
                     "event": "pendant_observation",
-                    "firmware": "battery-firmware",
+                    "firmware": "1.0.1",
                     "battery_percent": 88,
                 }
             },
@@ -932,7 +935,7 @@ def test_status_merges_equal_timestamp_runtime_events_into_one_current_projectio
                 "progress": {
                     "status": "observed",
                     "event": "pendant_observation",
-                    "firmware": "later-firmware",
+                    "firmware": "1.0.2",
                     "battery_percent": 12,
                 }
             },
@@ -960,9 +963,9 @@ def test_status_merges_equal_timestamp_runtime_events_into_one_current_projectio
 
     runtime = cast(dict[str, object], result["runtime"])
     assert runtime["state"] == "drained"
-    assert runtime["firmware"] == "later-firmware"
+    assert runtime["firmware"] == "1.0.2"
     assert runtime["battery_percent"] == 12
-    assert cast(dict[str, object], runtime["last_error"])["error_message"] == "later-error"
+    assert cast(dict[str, object], runtime["last_error"])["error_message"] is None
     assert runtime["connection_rssi_dbm"] == -70
     rows = _state_db(layout).list(StateKind.RUNTIME_STATUS)
     assert len(rows) == 1

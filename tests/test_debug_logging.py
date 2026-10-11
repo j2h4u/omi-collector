@@ -36,7 +36,7 @@ def test_debug_events_are_redacted_before_they_reach_root_logging(
     try:
         debug_event(
             "unsafe_event",
-            f"Bearer {secret} https://example.test/?access_token={secret}",
+            f"Bearer {secret} https://example.test/?access_token={secret} unlabeled {secret}",
             logger=logger,
             token=secret,
             api_key=secret,
@@ -45,18 +45,21 @@ def test_debug_events_are_redacted_before_they_reach_root_logging(
                 "nested": {"access_key": secret, "signature": secret, f"signature={secret}": "visible"},
                 "path": Path(f"/tmp/api_key={secret}"),
             },
-            visible="safe detail",
+            visible=secret,
+            record={"address": "01:02:03:04:05:06", "handle": 7},
         )
         try:
-            raise RuntimeError(f"password={secret}")
+            raise RuntimeError(f"unlabeled {secret}")
         except RuntimeError as error:
             debug_exception("unsafe_exception", error, logger=logger, exc_info=object())
+        logger.handle(logging.LogRecord(logger.name, logging.DEBUG, __file__, 0, "unlabeled %s", (secret,), None))
     finally:
         close_debug_logging(logger)
 
     assert secret not in caplog.text
-    assert "<redacted>" in caplog.text
-    assert "safe detail" in caplog.text
+    assert "<omitted>" in caplog.text
+    assert '"handle":7' in caplog.text
+    assert "01:02:03:04:05:06" not in caplog.text
     assert "RuntimeError" in caplog.text
     assert "secret-value-123" not in caplog.text
     assert list(tmp_path.iterdir()) == []
@@ -122,6 +125,49 @@ def test_runtime_projection_does_not_store_unrelated_debug_events(tmp_path: Path
         assert writer.close(timeout_seconds=2)
 
     assert read_runtime_status(database) is None
+
+
+def test_runtime_projection_drops_backend_error_text_from_live_and_legacy_events(tmp_path: Path) -> None:
+    secret = "unlabeled secret-value-123"
+    database = StateDB(tmp_path / "collector-state.db")
+    writer = SQLiteQualityMetrics(database, release_version="1.2.3")
+    logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.debug.safe_status"))
+    set_runtime_status_sink(logger, writer.record_runtime_status)
+    try:
+        debug_event(
+            "sync_progress",
+            logger=logger,
+            progress={
+                "status": "session_error",
+                "phase": "connect",
+                "error_type": "UnexpectedError",
+                "error_message": secret,
+                "lock_context": {"visible": secret},
+                "records_completed": 3,
+            },
+        )
+        assert writer.close(timeout_seconds=2)
+    finally:
+        close_debug_logging(logger)
+    live = cast(dict[str, object], read_runtime_status(database))
+    assert secret not in str(live)
+    assert cast(dict[str, object], live["last_error"])["records_completed"] == 3
+    assert cast(dict[str, object], live["last_error"])["error_type"] == "UnexpectedError"
+
+    legacy = StateDB(tmp_path / "legacy-import.db")
+    import_legacy_runtime_status(
+        legacy,
+        [
+            {
+                "event": "sync_progress",
+                "fields": {"progress": {"status": "session_error", "error_message": secret}},
+                "timestamp": "2026-10-11T01:02:03+00:00",
+            }
+        ],
+    )
+    imported = cast(dict[str, object], read_runtime_status(legacy))
+    assert secret not in str(imported)
+    assert cast(dict[str, object], imported["last_error"])["status"] == "session_error"
 
 
 def test_runtime_sink_does_not_retain_a_closed_quality_writer(tmp_path: Path) -> None:

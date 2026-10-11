@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.23](https://github.com/j2h4u/omi-collector/compare/v0.11.22...v0.11.23) (2026-10-11)
+
+
+### Fixes
+
+* **capture:** repeat idle sweeps and serialize clock appends ([#233](https://github.com/j2h4u/omi-collector/issues/233)) ([d55dfa8](https://github.com/j2h4u/omi-collector/commit/d55dfa827eeb5c3e50c4bd293282cd66a994acb0))
+
 ## [0.11.22](https://github.com/j2h4u/omi-collector/compare/v0.11.21...v0.11.22) (2026-10-10)
 
 

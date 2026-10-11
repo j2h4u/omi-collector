@@ -97,37 +97,44 @@ class ClockObservationStore:
         raw_timestamp_hash: str | None = None,
     ) -> ClockObservation:
         """Persist one observation before consumers may use it."""
-        records = self.records()
-        order = records[-1].causal_order + 1 if records else 0
-        parent_observation_id, observation_role = _causal_fields(
-            records,
-            operation_id,
-            observation_role,
-            parent_observation_id,
-            (host_boot_id, info_sequence_min, info_sequence_max, device_epoch),
-        )
-        observation = ClockObservation(
-            _SCHEMA_VERSION,
-            observation_id or uuid4().hex,
-            order,
-            evidence_kind,
-            session_id,
-            host_boot_id,
-            host_realtime_start,
-            host_realtime_end,
-            host_monotonic_start,
-            host_monotonic_end,
-            device_epoch,
-            info_sequence_min,
-            info_sequence_max,
-            operation_id,
-            effective_boundary_sequence,
-            observation_role,
-            parent_observation_id,
-            raw_timestamp,
-            raw_timestamp_hash,
-        )
-        return self._write_new(observation)
+        try:
+            existed = self._root.exists()
+            self._root.mkdir(mode=0o750, parents=True, exist_ok=True)
+            if not existed:
+                _sync_directory(self._root.parent)
+        except OSError as error:
+            raise ClockObservationError("clock observation directory is not durable") from error
+        with _file_lock(self._root / ".lock"):
+            records = self.records()
+            parent_observation_id, observation_role = _causal_fields(
+                records,
+                operation_id,
+                observation_role,
+                parent_observation_id,
+                (host_boot_id, info_sequence_min, info_sequence_max, device_epoch),
+            )
+            observation = ClockObservation(
+                _SCHEMA_VERSION,
+                observation_id or uuid4().hex,
+                records[-1].causal_order + 1 if records else 0,
+                evidence_kind,
+                session_id,
+                host_boot_id,
+                host_realtime_start,
+                host_realtime_end,
+                host_monotonic_start,
+                host_monotonic_end,
+                device_epoch,
+                info_sequence_min,
+                info_sequence_max,
+                operation_id,
+                effective_boundary_sequence,
+                observation_role,
+                parent_observation_id,
+                raw_timestamp,
+                raw_timestamp_hash,
+            )
+            return self._write_new(observation)
 
     def records(self) -> tuple[ClockObservation, ...]:
         if not self._root.exists():
@@ -142,57 +149,24 @@ class ClockObservationStore:
         return records
 
     def _write_new(self, observation: ClockObservation) -> ClockObservation:
-        try:
-            existed = self._root.exists()
-            self._root.mkdir(mode=0o750, parents=True, exist_ok=True)
-            if not existed:
-                _sync_directory(self._root.parent)
-        except OSError as error:
-            raise ClockObservationError("clock observation directory is not durable") from error
         path = self._root / f"{observation.observation_id}.json"
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         payload = _canonical(asdict(observation))
-        with _file_lock(self._root / ".lock"):
-            if path.exists():
-                existing = self._read(path)
-                if not _same_observation(existing, observation):
-                    raise ClockObservationError("clock observation identity conflicts with durable evidence")
-                return existing
-            records = self.records()
-            expected_order = records[-1].causal_order + 1 if records else 0
-            if observation.causal_order != expected_order:
-                observation = ClockObservation(
-                    observation.version,
-                    observation.observation_id,
-                    expected_order,
-                    observation.evidence_kind,
-                    observation.session_id,
-                    observation.host_boot_id,
-                    observation.host_realtime_start,
-                    observation.host_realtime_end,
-                    observation.host_monotonic_start,
-                    observation.host_monotonic_end,
-                    observation.device_epoch,
-                    observation.info_sequence_min,
-                    observation.info_sequence_max,
-                    observation.operation_id,
-                    observation.effective_boundary_sequence,
-                    observation.observation_role,
-                    observation.parent_observation_id,
-                    observation.raw_timestamp,
-                    observation.raw_timestamp_hash,
-                )
-                payload = _canonical(asdict(observation))
-            try:
-                with temporary.open("xb") as stream:
-                    stream.write(payload)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                temporary.replace(path)
-                _sync_directory(self._root)
-            except OSError as error:
-                temporary.unlink(missing_ok=True)
-                raise ClockObservationError("clock observation is not durable") from error
+        if path.exists():
+            existing = self._read(path)
+            if not _same_observation(existing, observation):
+                raise ClockObservationError("clock observation identity conflicts with durable evidence")
+            return existing
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+            _sync_directory(self._root)
+        except OSError as error:
+            temporary.unlink(missing_ok=True)
+            raise ClockObservationError("clock observation is not durable") from error
         return observation
 
     @staticmethod

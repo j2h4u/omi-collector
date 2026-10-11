@@ -855,6 +855,107 @@ def test_presence_startup_state_binds_once_after_a_completed_attempt(tmp_path: P
     _run(scenario())
 
 
+def test_presence_idle_maintenance_repeats_terminal_retention_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        now = 1_000_000_000
+        monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
+        config = CollectorConfig(
+            retry=RetryConfig(maintenance_interval_seconds=0.01),
+            staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+        )
+        store = StagingStore(tmp_path, tmp_path.parent / f"{tmp_path.name}-captures", config=config)
+        _seed_streaming_partial(store, count=1)
+        attempt_id = store.pending_attempts()[0].attempt_id
+        with store.device_lock() as lease:
+            attempt = store.resume_streaming_attempt(lease)
+            assert attempt is not None
+            assert attempt.publish_prefix() is not None
+            attempt.close(durable=True)
+        store.terminalize_prefix_attempt(attempt_id)
+        retired = store.attempts_root / attempt_id
+        expired = threading.Event()
+        sweeps = 0
+        original_sweep = store.sweep_terminal_retired
+
+        def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+            nonlocal now, sweeps
+            sweeps += 1
+            if sweeps == 2:
+                now += 2_000_000_000
+            removed = original_sweep(should_defer=should_defer)
+            if retired in removed:
+                expired.set()
+            return removed
+
+        store.sweep_terminal_retired = sweep  # type: ignore[method-assign]
+        wake_scanner = asyncio.Event()
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                await wake_scanner.wait()
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                return None
+
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
+        bound: list[PendingStartupState] = []
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), bound.append))
+        try:
+            assert await asyncio.to_thread(expired.wait, 2)
+            wake_scanner.set()
+            assert await asyncio.wait_for(owner, timeout=2) == PresenceWake("advertisement")
+            assert sweeps >= 2
+            assert not retired.exists()
+            assert len(bound) == 1
+        finally:
+            wake_scanner.set()
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_presence_idle_interval_cancellation_does_not_wait_for_interval(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                return None
+
+        maintenance = QuarantineMaintenance(
+            _store(tmp_path),
+            None,
+            OpportunisticRuntime(),
+            config=CollectorConfig(retry=RetryConfig(maintenance_interval_seconds=30.0)),
+        )
+
+        async def run_once(_should_defer: Callable[[], bool]) -> None:
+            started.set()
+
+        maintenance.run_once = run_once  # type: ignore[method-assign]
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            owner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(owner, timeout=0.5)
+        finally:
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
 def test_retryable_quarantine_publication_observes_configured_cooldown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

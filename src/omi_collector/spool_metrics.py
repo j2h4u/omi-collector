@@ -9,6 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError
 from omi_collector.capture.adapters.firmware_observations import (
     FirmwareObservation,
     FirmwareObservationError,
@@ -107,13 +108,13 @@ class _ReadyManifest:
 def collect_spool_metrics(
     publication_root: Path,
     *,
-    observation_root: Path | None = None,
+    state_db: StateDB | None = None,
 ) -> SpoolMetrics:
     """Report only authenticated raw bundles visible in the capture root."""
     _require_directory(publication_root, "publication root")
     try:
-        observations = read_firmware_observations(observation_root) if observation_root is not None else ()
-    except FirmwareObservationError as error:
+        observations = read_firmware_observations(state_db) if state_db is not None else ()
+    except (FirmwareObservationError, StateDBError) as error:
         raise SpoolMetricsError(f"firmware observations are invalid: {error}") from error
     measurements = _current_measurements(publication_root)
     current = _aggregate_window(measurements)

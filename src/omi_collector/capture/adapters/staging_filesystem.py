@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import shutil
 import stat
@@ -10,31 +9,33 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from hashlib import sha256
 from json import JSONDecodeError, dumps, loads
 from os import O_DIRECTORY, O_RDONLY, close, fsync, statvfs
 from os import open as os_open
 from pathlib import Path
-from threading import get_ident
+from threading import Lock
 from typing import Final, cast
 from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, DurabilityConfig, ReadyConfig
 from ..domain.ring_protocol import RECORD_SIZE
+from .collector_state_db import StateDB, StateDBError, StateKind
 from .debug_logging import debug_event
 from .staging_contract import (
     _CHECKPOINT_NAME,
     _DESCRIPTOR_NAME,
+    _PREFIX_PUBLICATION_NAME,
+    _RAW_NAME,
+    _TERMINAL_RETIRED_NAME,
     AttemptStateError,
     DeviceAlreadyRunningError,
     DiskSpaceError,
-    LockContext,
     MaintenanceDeferredError,
     StagingError,
     StreamingCheckpoint,
+    _checkpoint_from_json,
     _descriptor_from_json,
-    _read_checkpoint,
     _validate_descriptor,
 )
 
@@ -45,10 +46,58 @@ Statvfs = Callable[[str | Path], object]
 # group class rwx so a parent default ACL can retain its named downstream-user
 # entry and mask; world access remains disabled.
 _SHARED_BUNDLE_DIRECTORY_MODE: Final = 0o770
-_LOCK_SCOPE: Final = "collector_lock"
-_LOCK_METADATA_VERSION: Final = 1
-_LOCK_METADATA_MAX_BYTES: Final = 4096
 _UNKNOWN_OPERATION: Final = "unknown"
+_ATTEMPT_ROW_FIELDS: Final = frozenset({"descriptor", "checkpoint", "prefix_publication", "terminal_retirement"})
+
+
+def legacy_attempt_row(path: Path) -> dict[str, object]:
+    """Read and strictly validate one legacy file-backed attempt row."""
+    _require_regular_directory(path)
+    for filename, label in (
+        (_DESCRIPTOR_NAME, "attempt descriptor"),
+        (_CHECKPOINT_NAME, "streaming checkpoint"),
+        (_RAW_NAME, "attempt raw data"),
+    ):
+        _require_regular_file(path / filename, label)
+    descriptor_value = _read_json(path / _DESCRIPTOR_NAME)
+    checkpoint_value = _read_json(path / _CHECKPOINT_NAME)
+    if not isinstance(descriptor_value, dict) or not isinstance(checkpoint_value, dict):
+        raise AttemptStateError("legacy attempt metadata is malformed")
+    try:
+        descriptor = _descriptor_from_json(descriptor_value)
+        _validate_descriptor(descriptor, descriptor.attempt_id)
+        checkpoint = _checkpoint_from_json(checkpoint_value, descriptor.attempt_id)
+    except (TypeError, ValueError) as error:
+        raise AttemptStateError("legacy attempt metadata is malformed") from error
+    checkpoint_bytes = checkpoint.record_count * RECORD_SIZE
+    if _file_size(path / _RAW_NAME) < checkpoint_bytes:
+        raise AttemptStateError("legacy attempt raw data is shorter than its checkpoint")
+    if _hash_prefix(path / _RAW_NAME, checkpoint_bytes) != checkpoint.raw_sha256:
+        raise AttemptStateError("legacy attempt raw prefix does not match its checkpoint")
+    prefix_path = path / _PREFIX_PUBLICATION_NAME
+    terminal_path = path / _TERMINAL_RETIRED_NAME
+    prefix: dict[str, object] | None = None
+    terminal: dict[str, object] | None = None
+    if os.path.lexists(prefix_path):
+        _require_regular_file(prefix_path, "prefix publication marker")
+        value = _read_json(prefix_path)
+        from .publication import PrefixPublicationEvidence
+
+        prefix = PrefixPublicationEvidence.from_json(value).as_dict()
+    if os.path.lexists(terminal_path):
+        _require_regular_file(terminal_path, "terminal-retired marker")
+        value = _read_json(terminal_path)
+        from .publication import TerminalRetirementEvidence
+
+        terminal = TerminalRetirementEvidence.from_json(value).as_dict()
+        if prefix is None:
+            raise AttemptStateError("legacy terminal marker has no published prefix")
+    return {
+        "descriptor": descriptor_value,
+        "checkpoint": checkpoint_value,
+        "prefix_publication": prefix,
+        "terminal_retirement": terminal,
+    }
 
 
 def _never_defer() -> bool:
@@ -64,7 +113,19 @@ class StagingPaths:
     attempts: Path
     quarantine: Path
     lock: Path
-    device_state: Path
+    state_db_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class StagingIO:
+    """Typed testable I/O dependencies and durable staging configuration."""
+
+    fsync_fn: Fsync = fsync
+    statvfs_fn: Statvfs = statvfs
+    config: CollectorConfig = DEFAULT_CONFIG
+
+
+DEFAULT_STAGING_IO: Final = StagingIO()
 
 
 class StagingFilesystem:
@@ -75,9 +136,8 @@ class StagingFilesystem:
         spool: Path,
         capture_root: Path,
         *,
-        fsync_fn: Fsync = fsync,
-        statvfs_fn: Statvfs = statvfs,
-        config: CollectorConfig = DEFAULT_CONFIG,
+        state_db: StateDB,
+        io: StagingIO = DEFAULT_STAGING_IO,
     ) -> None:
         self._spool_input = Path(spool).absolute()
         self._capture_root_input = Path(capture_root).absolute()
@@ -86,25 +146,29 @@ class StagingFilesystem:
         self.attempts_root = self.spool / "attempts"
         self.quarantine_root = self.spool / "quarantine"
         self.lock_path = self.spool / "collector.lock"
-        self.device_state_path = self.spool / "device.json"
-        self._fsync = fsync_fn
-        self._statvfs = statvfs_fn
-        self._durability: DurabilityConfig = config.durability
-        self._ready: ReadyConfig = config.ready
-        self._terminal_retention_seconds = config.staging_retention.terminal_retention_seconds
+        self.state_db_path = state_db.path
+        self._fsync = io.fsync_fn
+        self.state_db = state_db
+        self._statvfs = io.statvfs_fn
+        self._durability: DurabilityConfig = io.config.durability
+        self._ready: ReadyConfig = io.config.ready
+        self._terminal_retention_seconds = io.config.staging_retention.terminal_retention_seconds
         self._active_lease: DeviceLock | None = None
+        self._lease_mutex = Lock()
         if self.spool == self.capture_root:
             raise StagingError("spool and capture root must be distinct directories")
 
     @classmethod
-    def from_paths(cls, paths: StagingPaths, *, config: CollectorConfig = DEFAULT_CONFIG) -> StagingFilesystem:
-        filesystem = cls(paths.root, paths.capture_root, config=config)
+    def from_paths(
+        cls, paths: StagingPaths, *, state_db: StateDB, io: StagingIO = DEFAULT_STAGING_IO
+    ) -> StagingFilesystem:
+        filesystem = cls(paths.root, paths.capture_root, state_db=state_db, io=io)
         filesystem._spool_input = Path(paths.root).absolute()
         filesystem._capture_root_input = Path(paths.capture_root).absolute()
         filesystem.attempts_root = Path(paths.attempts).absolute()
         filesystem.quarantine_root = Path(paths.quarantine).absolute()
         filesystem.lock_path = Path(paths.lock).absolute()
-        filesystem.device_state_path = Path(paths.device_state).absolute()
+        filesystem.state_db_path = Path(paths.state_db_path).absolute()
         return filesystem
 
     @property
@@ -115,7 +179,7 @@ class StagingFilesystem:
             self.attempts_root,
             self.quarantine_root,
             self.lock_path,
-            self.device_state_path,
+            self.state_db_path,
         )
 
     def preflight_storage(self) -> None:
@@ -175,14 +239,77 @@ class StagingFilesystem:
 
     def _read_descriptor(self, attempt_path: Path):
         _require_regular_directory(attempt_path)
-        _require_regular_file(attempt_path / _DESCRIPTOR_NAME, "attempt descriptor")
-        raw = _read_json(attempt_path / _DESCRIPTOR_NAME)
+        row = self._read_attempt_row(attempt_path.name)
         try:
+            raw = row["descriptor"]
+            if not isinstance(raw, dict):
+                raise TypeError("descriptor")
             descriptor = _descriptor_from_json(raw)
         except (TypeError, ValueError) as error:
             raise AttemptStateError("attempt descriptor is malformed") from error
-        _validate_descriptor(descriptor, attempt_path.name)
+        if attempt_path.parent == self.attempts_root and descriptor.attempt_id != attempt_path.name:
+            raise AttemptStateError("attempt descriptor identity does not match its directory")
+        _validate_descriptor(descriptor, descriptor.attempt_id)
         return descriptor
+
+    def _read_attempt_row(self, attempt_id: str) -> dict[str, object]:
+        row = self._read_attempt_row_if_valid_schema(attempt_id)
+        if row is None:
+            raise AttemptStateError("attempt state is missing or malformed")
+        return row
+
+    def _read_attempt_row_if_valid_schema(self, attempt_id: str) -> dict[str, object] | None:
+        """Return structurally valid attempt state, leaving corrupt rows for quarantine."""
+        try:
+            row = self.state_db.get(StateKind.ATTEMPT, attempt_id)
+        except (OSError, ValueError, StateDBError) as error:
+            raise AttemptStateError("attempt state is unreadable") from error
+        if row is None or set(row) != _ATTEMPT_ROW_FIELDS:
+            return None
+        return row
+
+    def _write_attempt_field(self, attempt_id: str, field: str, value: object) -> None:
+        if field not in _ATTEMPT_ROW_FIELDS:
+            raise AttemptStateError("attempt state field is invalid")
+        row = self._read_attempt_row(attempt_id)
+        self._validate_attempt_row(attempt_id, row)
+        row[field] = value
+        self._validate_attempt_row(attempt_id, row)
+        try:
+            with self.state_db.transaction() as transaction:
+                transaction.put(StateKind.ATTEMPT, attempt_id, row)
+        except (OSError, ValueError, StateDBError) as error:
+            raise AttemptStateError("attempt state could not be written") from error
+
+    def _create_attempt_row(self, attempt_id: str, descriptor: object, checkpoint: object) -> None:
+        row = {
+            "descriptor": descriptor,
+            "checkpoint": checkpoint,
+            "prefix_publication": None,
+            "terminal_retirement": None,
+        }
+        self._validate_attempt_row(attempt_id, row)
+        try:
+            with self.state_db.transaction() as transaction:
+                if transaction.get(StateKind.ATTEMPT, attempt_id) is not None:
+                    raise AttemptStateError("attempt state already exists")
+                transaction.put(StateKind.ATTEMPT, attempt_id, row)
+        except (OSError, ValueError, StateDBError) as error:
+            raise AttemptStateError("attempt state could not be created") from error
+
+    def _validate_attempt_row(self, attempt_id: str, row: dict[str, object]) -> None:
+        if set(row) != _ATTEMPT_ROW_FIELDS:
+            raise AttemptStateError("attempt state schema is invalid")
+        descriptor = row["descriptor"]
+        checkpoint = row["checkpoint"]
+        if not isinstance(descriptor, dict) or not isinstance(checkpoint, dict):
+            raise AttemptStateError("attempt state is malformed")
+        try:
+            parsed_descriptor = _descriptor_from_json(descriptor)
+            _validate_descriptor(parsed_descriptor, parsed_descriptor.attempt_id)
+            _checkpoint_from_json(checkpoint, attempt_id)
+        except (TypeError, ValueError) as error:
+            raise AttemptStateError("attempt state is malformed") from error
 
     def _write_json_atomic(self, path: Path, value: object) -> None:
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
@@ -193,13 +320,11 @@ class StagingFilesystem:
     def _write_checkpoint(
         self, attempt_path: Path, checkpoint: StreamingCheckpoint, *, allow_missing: bool = False
     ) -> None:
-        checkpoint_path = attempt_path / _CHECKPOINT_NAME
-        if checkpoint_path.exists() or checkpoint_path.is_symlink():
-            _require_regular_file(checkpoint_path, "streaming checkpoint")
-            _read_checkpoint(checkpoint_path, checkpoint.attempt_id)
-        elif not allow_missing:
-            raise AttemptStateError("streaming checkpoint is missing")
-        self._write_json_atomic(checkpoint_path, asdict(checkpoint))
+        if attempt_path.name != checkpoint.attempt_id:
+            raise AttemptStateError("checkpoint identity does not match its attempt path")
+        if not allow_missing:
+            self._read_attempt_row(checkpoint.attempt_id)
+        self._write_attempt_field(checkpoint.attempt_id, "checkpoint", asdict(checkpoint))
 
     def _prepare_roots(self) -> None:
         spool_input = _absolute_root(self._spool_input, "spool")
@@ -216,7 +341,7 @@ class StagingFilesystem:
         self.attempts_root = _contained_path(self.attempts_root, self.spool, "attempts root")
         self.quarantine_root = _contained_path(self.quarantine_root, self.spool, "quarantine root")
         self.lock_path = _contained_path(self.lock_path, self.spool, "collector lock")
-        self.device_state_path = _contained_path(self.device_state_path, self.spool, "device state")
+        self.state_db_path = _contained_path(self.state_db_path, self.spool, "collector state database")
         _require_same_filesystem(self.spool, self.capture_root)
 
     def _preflight(self, packet_count: int, *, staged_bytes: int = 0) -> None:
@@ -242,57 +367,35 @@ class StagingFilesystem:
 
     @contextmanager
     def device_lock(self, *, operation: str = _UNKNOWN_OPERATION) -> Iterator[DeviceLock]:
-        self._prepare_roots()
-        self._ensure_directory(self.spool)
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.lock_path, flags, 0o600)
+        if not self._lease_mutex.acquire(blocking=False):
+            raise DeviceAlreadyRunningError("another in-process adapter owns the collector lease")
         lease = DeviceLock(self)
-        locked = False
-        acquired_monotonic_ns: int | None = None
-        metadata_status = "unavailable"
+        acquired_at = time.monotonic()
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise StagingError("device lock is not a regular file")
-            os.fchmod(fd, 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                lock_context = _read_lock_context(fd, operation)
-                cast(Callable[..., None], debug_event)("device_lock_busy", **lock_context.as_dict())
-                raise DeviceAlreadyRunningError(lock_context=lock_context) from error
-            locked = True
-            acquired_monotonic_ns = time.monotonic_ns()
-            metadata_status = _write_lock_metadata(fd, operation, acquired_monotonic_ns)
+            self._prepare_roots()
+            self._ensure_directory(self.spool)
             self._active_lease = lease
             lease._activate()
             debug_event(
                 "device_lock_acquired",
                 operation=operation,
-                scope=_LOCK_SCOPE,
+                scope="in_process",
                 pid=os.getpid(),
-                thread_id=get_ident(),
-                metadata_status=metadata_status,
+                metadata_status="in_process",
             )
             yield lease
         finally:
-            if locked and self._active_lease is lease:
+            if self._active_lease is lease:
                 self._active_lease = None
-            if locked:
-                duration_seconds = None
-                if acquired_monotonic_ns is not None:
-                    duration_seconds = max(0.0, (time.monotonic_ns() - acquired_monotonic_ns) / 1_000_000_000)
-                debug_event(
-                    "device_lock_released",
-                    operation=operation,
-                    scope=_LOCK_SCOPE,
-                    duration_seconds=duration_seconds,
-                    metadata_status=metadata_status,
-                )
-                _clear_lock_metadata(fd)
             lease._release()
-            with suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            debug_event(
+                "device_lock_released",
+                operation=operation,
+                scope="in_process",
+                duration_seconds=max(0.0, time.monotonic() - acquired_at),
+                metadata_status="in_process",
+            )
+            self._lease_mutex.release()
 
     def require_device_lock(self, lease: DeviceLock) -> None:
         if self._active_lease is not lease or not lease._matches(self):
@@ -335,115 +438,6 @@ class DeviceLock:
 
     def _activate(self) -> None:
         self._active = True
-
-
-def _write_lock_metadata(fd: int, operation: str, acquired_monotonic_ns: int) -> str:
-    """Best-effort owner metadata; lock semantics never depend on this write."""
-    metadata = {
-        "version": _LOCK_METADATA_VERSION,
-        "pid": os.getpid(),
-        "process_start": _process_start(),
-        "thread_id": get_ident(),
-        "operation": operation,
-        "scope": _LOCK_SCOPE,
-        "acquired_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
-        "acquired_monotonic_ns": acquired_monotonic_ns,
-    }
-    payload = _json_bytes(metadata)
-    if len(payload) > _LOCK_METADATA_MAX_BYTES:
-        return "oversized"
-    try:
-        os.ftruncate(fd, 0)
-        written = os.pwrite(fd, payload, 0)
-        if written != len(payload):
-            return "write_failed"
-        os.ftruncate(fd, len(payload))
-    except OSError:
-        return "write_failed"
-    return "valid"
-
-
-def _read_lock_context(fd: int, requested_operation: str) -> LockContext:
-    metadata: object = None
-    metadata_status = "valid"
-    try:
-        payload = os.pread(fd, _LOCK_METADATA_MAX_BYTES, 0)
-    except OSError:
-        metadata_status = "unreadable"
-    else:
-        if not payload:
-            metadata_status = "missing"
-        else:
-            try:
-                metadata = cast(object, loads(payload.decode("utf-8")))
-            except JSONDecodeError, UnicodeDecodeError, ValueError:
-                metadata_status = "invalid"
-    if metadata_status != "valid":
-        return LockContext(requested_operation, None, None, None, None, "unknown", metadata_status)
-    if not isinstance(metadata, dict) or metadata.get("version") != _LOCK_METADATA_VERSION:
-        return LockContext(requested_operation, None, None, None, None, "unknown", "invalid")
-    operation = metadata.get("operation")
-    pid = metadata.get("pid")
-    thread_id = metadata.get("thread_id")
-    scope = metadata.get("scope")
-    process_start = metadata.get("process_start")
-    acquired_monotonic_ns = metadata.get("acquired_monotonic_ns")
-    if not (
-        isinstance(operation, str)
-        and isinstance(pid, int)
-        and not isinstance(pid, bool)
-        and pid > 0
-        and isinstance(thread_id, int)
-        and not isinstance(thread_id, bool)
-        and thread_id > 0
-        and isinstance(scope, str)
-        and isinstance(acquired_monotonic_ns, int)
-        and not isinstance(acquired_monotonic_ns, bool)
-        and acquired_monotonic_ns > 0
-    ):
-        return LockContext(requested_operation, None, None, None, None, "unknown", "invalid")
-    age_seconds = max(0.0, (time.monotonic_ns() - acquired_monotonic_ns) / 1_000_000_000)
-    holder_scope = _holder_scope(pid, process_start)
-    if holder_scope == "unknown":
-        return LockContext(requested_operation, None, None, None, None, "unknown", "stale")
-    return LockContext(
-        requested_operation,
-        operation,
-        pid,
-        thread_id,
-        age_seconds,
-        holder_scope,
-        "valid",
-    )
-
-
-def _holder_scope(holder_pid: int, holder_start: object) -> str:
-    if holder_pid != os.getpid():
-        current_start = _process_start(holder_pid)
-        if not isinstance(holder_start, int) or current_start is None or holder_start != current_start:
-            return "unknown"
-        return "other_process"
-    current_start = _process_start()
-    if not isinstance(holder_start, int) or current_start is None:
-        return "unknown"
-    return "current_process" if holder_start == current_start else "unknown"
-
-
-def _process_start(pid: int | None = None) -> int | None:
-    try:
-        stat_path = Path(f"/proc/{pid}/stat") if pid is not None else Path("/proc/self/stat")
-        stat_text = stat_path.read_text(encoding="utf-8")
-        after_comm = stat_text.rsplit(")", 1)[1].split()
-        if pid is not None and after_comm[0] == "Z":
-            return None
-        return int(after_comm[19])
-    except OSError, IndexError, ValueError:
-        return None
-
-
-def _clear_lock_metadata(fd: int) -> None:
-    with suppress(OSError):
-        os.ftruncate(fd, 0)
 
 
 def _json_bytes(value: object, *, newline: bool = False) -> bytes:

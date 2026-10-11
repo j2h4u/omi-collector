@@ -14,23 +14,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from inspect import isawaitable
 from pathlib import Path
-from threading import Thread
 from typing import cast
+from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG
+from ..domain.clock_state import ClockIntent, ClockRange
 from ..domain.ring_protocol import RingInfo, RingStatus
-from .ports import (
-    ClockCorrectionShape,
-    ClockMembershipPort,
-    ClockObservationShape,
-    StorageLeaseFactory,
-)
-from .ports import (
-    ClockDurabilityPort as ClockCorrectionSink,
-)
-from .ports import (
-    ClockObservationPort as ClockObservationSink,
-)
+from .ports import ClockStatePort, StorageLeaseFactory
 
 TIME_SERVICE_UUID = "19b10030-e8f2-537e-4f6c-d104768a1214"
 TIME_WRITE_UUID = "19b10031-e8f2-537e-4f6c-d104768a1214"
@@ -75,14 +65,12 @@ class TelemetryClock:
     """Injectable wall-clock and trust source used by drift correction."""
 
     now: Callable[[], float] = time.time
-    synchronized: Callable[[], bool] | None = None
+    synchronized: Callable[[float], bool] | None = None
     operation_timeout: float = OPTIONAL_OPERATION_TIMEOUT_SECONDS
     host_clock_probe_timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SECONDS
     info_reader: InfoReader | None = None
     status_reader: StatusReader | None = None
-    correction_sink: ClockCorrectionSink | None = None
-    observation_sink: ClockObservationSink | None = None
-    membership_store: ClockMembershipPort | None = None
+    state_store: ClockStatePort | None = None
     monotonic: Callable[[], float] = time.monotonic
     host_boot_id: str = field(default_factory=system_host_boot_id)
     session_id: str = "native"
@@ -129,7 +117,7 @@ async def collect_operational_telemetry(
     Every backend failure is reduced to a stable classification.  No exception
     text, BLE address, characteristic payload, or audio data enters an event.
     """
-    if emit is None and (clock is None or (clock.observation_sink is None and clock.correction_sink is None)):
+    if emit is None and (clock is None or clock.state_store is None):
         return
     telemetry_clock = clock or TelemetryClock()
     if emit is None:
@@ -138,16 +126,7 @@ async def collect_operational_telemetry(
         raise ValueError("optional operation timeout must be positive")
     if telemetry_clock.host_clock_probe_timeout <= 0:
         raise ValueError("host clock probe timeout must be positive")
-    synchronized = telemetry_clock.synchronized or (
-        lambda: system_host_clock_synchronized(telemetry_clock.host_clock_probe_timeout)
-    )
-    observation_sink = (
-        telemetry_clock.observation_sink
-        if telemetry_clock.observation_sink is not None
-        else telemetry_clock.correction_sink.observation_store
-        if telemetry_clock.correction_sink is not None
-        else None
-    )
+    synchronized = telemetry_clock.synchronized or system_host_clock_synchronized
     reader, writer = _optional_accessors(session)
     # Clock evidence is its own bounded stage.  It must not depend on status,
     # metadata, or a potentially slow operational emitter.
@@ -168,13 +147,11 @@ async def collect_operational_telemetry(
         telemetry_clock.host_clock_probe_timeout,
         info,
         telemetry_clock.info_reader,
-        telemetry_clock.correction_sink,
+        telemetry_clock.state_store,
         telemetry_clock.now,
-        observation_sink,
         telemetry_clock.host_boot_id,
         telemetry_clock.session_id,
         telemetry_clock.monotonic,
-        telemetry_clock.membership_store,
     )
     await _sync_clock_with_mutation_lease(sync, telemetry_clock.mutation_lease)
     for event in clock_events:
@@ -278,19 +255,17 @@ class _ClockSync:
     reader: OptionalReader | None
     writer: OptionalWriter | None
     sample: _TimeSample
-    host_clock_synchronized: Callable[[], bool]
+    host_clock_synchronized: Callable[[float], bool]
     emit: OperationalEmitter
     operation_timeout: float
     host_clock_probe_timeout: float
     info_before: RingInfo
     info_reader: InfoReader | None
-    correction_sink: ClockCorrectionSink | None
+    state_store: ClockStatePort | None
     host_time: Callable[[], float]
-    observation_sink: ClockObservationSink | None
     host_boot_id: str
     session_id: str
     host_monotonic: Callable[[], float]
-    membership_store: ClockMembershipPort | None
 
 
 async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: ClockMutationLease | None) -> None:
@@ -350,184 +325,106 @@ async def _sync_clock(sync: _ClockSync) -> None:
         event.update(action="none", outcome="host_unsynchronized")
         sync.emit(event)
         return
-    await _sync_trusted_clock(sync, event, drift)
+    await _sync_trusted_state_clock(sync, event, drift)
 
 
-async def _sync_trusted_clock(sync: _ClockSync, event: dict[str, object], drift: float) -> None:
-    """Persist only clock evidence needed for a correction or reconciliation."""
-    pending_operation = _pending_observation_operation(sync)
-    observation_evidence = _persist_clock_observation(sync, pending_operation)
-    if observation_evidence is None:
+async def _sync_trusted_state_clock(sync: _ClockSync, event: dict[str, object], drift: float) -> None:
+    store = sync.state_store
+    if store is None:
         event.update(action="none", outcome="evidence_persist_failed")
         sync.emit(event)
         return
-    if pending_operation is not None:
-        _reconcile_observation(sync, event, observation_evidence)
+    sample = sync.sample
+    assert sample.epoch is not None
+    midpoint = (sample.before + sample.after) / 2
+    uncertainty = max(1.0, (sample.after - sample.before) / 2 + 1)
+    try:
+        previous = store.state()
+        if previous.intent is not None:
+            _reconcile_pending_state(store, previous.intent, sync.info_before, event)
+        store.observe(
+            sync.info_before,
+            offset_seconds=midpoint - sample.epoch,
+            uncertainty_seconds=uncertainty,
+            source_id=sync.session_id,
+            tolerance_seconds=CLOCK_DRIFT_THRESHOLD_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - a missing durable range must block time writes
+        event.update(action="none", outcome="evidence_persist_failed")
+        sync.emit(event)
+        return
     if abs(drift) <= CLOCK_DRIFT_THRESHOLD_SECONDS:
         event.update(action="none", outcome="within_threshold")
-        await _record_same_session_membership(sync, observation_evidence, sync.info_before.write_sequence)
-        sync.emit(event)
-        return
-    target = int(sync.host_time())
-    if not 0 <= target <= MAX_U32:
-        event.update(action="none", outcome="target_unrepresentable")
-        sync.emit(event)
-        return
-    if sync.writer is None:
-        event.update(action="none", outcome="time_write_missing")
-        sync.emit(event)
-        return
-    correction = _prepare_clock_intent(sync, event, target, drift, observation_evidence)
-    if correction is None:
-        sync.emit(event)
-        return
-    readback = await _write_and_verify(
-        _ClockWrite(
-            sync.reader,
-            sync.writer,
-            target,
-            event,
-            sync.operation_timeout,
-            sync.host_time,
-            sync.host_monotonic,
-        )
-    )
-    info_after = await _read_boundary_after(sync, event)
-    post_observation = _persist_post_clock_observation(
-        sync,
-        correction,
-        info_after,
-        readback,
-    )
-    if (
-        sync.observation_sink is not None
-        and readback is not None
-        and readback.epoch is not None
-        and post_observation is None
-    ):
-        event["outcome"] = "result_persist_failed"
-    elif info_after is not None and post_observation is not None:
-        await _record_same_session_membership(sync, post_observation, info_after.write_sequence)
-    _finish_clock_intent(sync, correction, event, info_after, readback.epoch if readback else None)
+    else:
+        await _correct_drift(sync, store, event, midpoint)
     sync.emit(event)
 
 
-def _persist_clock_observation(sync: _ClockSync, pending_operation: str | None) -> ClockObservationShape | None:
-    sink = sync.observation_sink
-    if sink is None:
-        return None
+async def _correct_drift(sync: _ClockSync, store: ClockStatePort, event: dict[str, object], midpoint: float) -> None:
     sample = sync.sample
-    if sample.epoch is None:
-        return None
-    values: dict[str, object] = {
-        "evidence_kind": "native_trusted",
-        "session_id": sync.session_id,
-        "host_boot_id": sync.host_boot_id,
-        "host_realtime_start": sample.before,
-        "host_realtime_end": sample.after,
-        "host_monotonic_start": sample.monotonic_before,
-        "host_monotonic_end": sample.monotonic_after,
-        "device_epoch": sample.epoch,
-        "info_sequence_min": sync.info_before.read_sequence,
-        "info_sequence_max": sync.info_before.write_sequence,
-    }
-    initial = _initial_observation(sync, pending_operation)
-    if pending_operation is not None and initial is not None:
-        values.update(
-            operation_id=pending_operation,
-            observation_role="later",
-            parent_observation_id=initial.observation_id,
+    assert sample.epoch is not None
+    target = int(sync.host_time())
+    if not 0 <= target <= MAX_U32:
+        event.update(action="none", outcome="target_unrepresentable")
+        return
+    if sync.writer is None:
+        event.update(action="none", outcome="time_write_missing")
+        return
+    intent = ClockIntent(uuid4().hex, "prepared", sample.epoch, target, midpoint, sync.info_before.write_sequence)
+    try:
+        store.prepare(intent)
+    except Exception:  # noqa: BLE001 - no BLE write without a committed intent
+        event.update(action="none", outcome="intent_persist_failed")
+        return
+    readback = await _write_and_verify(
+        _ClockWrite(
+            sync.reader, sync.writer, target, event, sync.operation_timeout, sync.host_time, sync.host_monotonic
         )
-    try:
-        return sink.append(**values)
-    except Exception:  # noqa: BLE001 - no clock mutation without durable evidence
-        return None
-
-
-def _pending_observation_operation(sync: _ClockSync) -> str | None:
-    sink = sync.correction_sink
-    if sink is None:
-        return None
-    try:
-        pending = sink.records()
-    except Exception:  # noqa: BLE001 - operation binding is best effort
-        return None
-    candidates = tuple(
-        item
-        for item in pending
-        if item.state == "unresolved" and item.boundary_sequence_min <= sync.info_before.write_sequence
     )
-    operation_id = candidates[-1].operation_id if candidates else None
-    return operation_id if isinstance(operation_id, str) and operation_id else None
-
-
-def _initial_observation(sync: _ClockSync, operation_id: str | None) -> ClockObservationShape | None:
-    if operation_id is None:
-        return None
-    sink = sync.observation_sink
-    if sink is None:
-        return None
+    if event.get("outcome") in {"target_stale", "time_write_missing"}:
+        try:
+            store.cancel_prepared(intent.operation_id)
+        except Exception:  # noqa: BLE001 - retained prepared intent is conservative
+            event["outcome"] = "result_persist_failed"
+        return
+    info_after = await _read_boundary_after(sync, event)
     try:
-        values = sink.records()
-    except Exception:  # noqa: BLE001 - missing durable linkage leaves evidence unresolved
-        return None
-    return next(
-        (item for item in reversed(values) if item.operation_id == operation_id and item.observation_role == "initial"),
-        None,
-    )
+        _persist_clock_result(sync, intent, readback, info_after, event)
+    except Exception:  # noqa: BLE001 - durable intent remains the recovery authority
+        event["outcome"] = "result_persist_failed"
 
 
-def _persist_post_clock_observation(
-    sync: _ClockSync, correction: ClockCorrectionShape, info_after: RingInfo | None, readback: _ClockReadback | None
-) -> ClockObservationShape | None:
-    sink = sync.observation_sink
-    if sink is None or readback is None or readback.epoch is None:
-        return None
-    boundary = info_after.write_sequence if info_after is not None else sync.info_before.write_sequence
-    effective_boundary = (
-        info_after.write_sequence
-        if info_after is not None and info_after.write_sequence == sync.info_before.write_sequence
-        else None
-    )
-    values: dict[str, object] = {
-        "evidence_kind": "native_trusted",
-        "session_id": sync.session_id,
-        "host_boot_id": sync.host_boot_id,
-        "host_realtime_start": readback.host_realtime_start,
-        "host_realtime_end": readback.host_realtime_end,
-        "host_monotonic_start": readback.host_monotonic_start,
-        "host_monotonic_end": readback.host_monotonic_end,
-        "device_epoch": readback.epoch,
-        "info_sequence_min": sync.info_before.write_sequence,
-        "info_sequence_max": boundary,
-        "operation_id": correction.operation_id,
-        "effective_boundary_sequence": effective_boundary,
-    }
-    operation_id = values["operation_id"]
-    initial = _initial_observation(sync, operation_id if isinstance(operation_id, str) else None)
-    if initial is not None:
-        values.update(
-            observation_role="later",
-            parent_observation_id=initial.observation_id,
-        )
-    try:
-        return sink.append(**values)
-    except Exception:  # noqa: BLE001 - uncertain result remains unresolved
-        return None
-
-
-async def _record_same_session_membership(
-    sync: _ClockSync, observation: ClockObservationShape, start_sequence: int
+def _persist_clock_result(
+    sync: _ClockSync,
+    intent: ClockIntent,
+    readback: _ClockReadback,
+    info_after: RingInfo | None,
+    event: dict[str, object],
 ) -> None:
-    store = sync.membership_store
-    if store is None or sync.info_reader is None:
+    store = sync.state_store
+    assert store is not None
+    store.mark_uncertain(
+        intent.operation_id,
+        write_sequence_after=info_after.write_sequence if info_after is not None else None,
+    )
+    if event.get("outcome") != "verified" or info_after is None or readback.epoch is None:
         return
-    try:
-        later = await _bounded_optional(sync.info_reader(), sync.operation_timeout)
-    except Exception:  # noqa: BLE001 - disconnected sessions never extend membership
-        return
-    if isinstance(later, RingInfo) and later.write_sequence > start_sequence:
-        store.record_membership(observation.observation_id, sync.session_id, start_sequence, later.write_sequence)
+    boundary = sync.info_before.write_sequence
+    ranges = (
+        (ClockRange(boundary, info_after.write_sequence, None, None, "unknown", intent.operation_id),)
+        if info_after.write_sequence > boundary
+        else ()
+    )
+    store.finish(intent.operation_id, ranges)
+    store.observe(
+        info_after,
+        offset_seconds=(readback.host_realtime_start + readback.host_realtime_end) / 2 - readback.epoch,
+        uncertainty_seconds=max(1.0, (readback.host_realtime_end - readback.host_realtime_start) / 2 + 1),
+        source_id=sync.session_id,
+        tolerance_seconds=CLOCK_DRIFT_THRESHOLD_SECONDS,
+    )
+    if ranges:
+        event["boundary_ambiguous"] = True
 
 
 async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> RingInfo | None:
@@ -535,7 +432,7 @@ async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> Ri
         return None
     try:
         info = await _bounded_optional(sync.info_reader(), sync.operation_timeout)
-    except Exception:  # noqa: BLE001 - sequence evidence is best effort
+    except Exception:  # noqa: BLE001 - an unavailable boundary remains uncertain
         return None
     if isinstance(info, RingInfo):
         event["boundary_sequence_max"] = info.write_sequence
@@ -543,108 +440,31 @@ async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> Ri
     return None
 
 
-def _reconcile_observation(
-    sync: _ClockSync, event: dict[str, object], observation: ClockObservationShape | None = None
+def _reconcile_pending_state(
+    store: ClockStatePort, intent: ClockIntent, info: RingInfo, event: dict[str, object]
 ) -> None:
-    sink = sync.correction_sink
-    if sink is None or observation is None:
-        return
-    if observation.operation_id is None or sync.observation_sink is None:
-        event["reconciliation"] = "no_causal_operation"
-        return
-    try:
-        reconciled = sink.reconcile_causal_observation(observation, near_zero_threshold=CLOCK_DRIFT_THRESHOLD_SECONDS)
-    except Exception:  # noqa: BLE001 - unresolved evidence must remain durable
-        event["reconciliation"] = "failed"
-        return
-    if isinstance(reconciled, tuple):
-        event["reconciled_operations"] = len(reconciled)
-
-
-def _prepare_clock_intent(
-    sync: _ClockSync,
-    event: dict[str, object],
-    target: int,
-    drift: float,
-    observation: ClockObservationShape,
-) -> ClockCorrectionShape | None:
-    if sync.correction_sink is None:
-        event.update(action="none", outcome="intent_unavailable")
-        return None
-    assert sync.sample.epoch is not None
-    assert sync.correction_sink is not None
-    try:
-        correction = sync.correction_sink.prepare(sync.sample.epoch, target, drift, sync.info_before.write_sequence)
-        _bind_observation_operation(sync, correction, observation)
-        return sync.correction_sink.mark_unresolved(correction)
-    except Exception:  # noqa: BLE001 - writing without durable intent is unsafe
-        event.update(action="none", outcome="intent_persist_failed")
-        return None
-
-
-def _bind_observation_operation(
-    sync: _ClockSync, correction: ClockCorrectionShape, observation: ClockObservationShape
-) -> None:
-    sink = sync.observation_sink
-    if sink is None:
-        return
-    source = next((item for item in sink.records() if item.observation_id == observation.observation_id), None)
-    if source is None:
-        return
-    if source.operation_id == correction.operation_id and source.observation_role == "initial":
-        return
-    sink.append(
-        evidence_kind=source.evidence_kind,
-        session_id=source.session_id,
-        host_boot_id=source.host_boot_id,
-        host_realtime_start=source.host_realtime_start,
-        host_realtime_end=source.host_realtime_end,
-        host_monotonic_start=source.host_monotonic_start,
-        host_monotonic_end=source.host_monotonic_end,
-        device_epoch=source.device_epoch,
-        info_sequence_min=source.info_sequence_min,
-        info_sequence_max=source.info_sequence_max,
-        operation_id=correction.operation_id,
-        observation_role="initial",
-        parent_observation_id=source.observation_id if source.operation_id is not None else None,
-    )
-
-
-def _finish_clock_intent(
-    sync: _ClockSync,
-    correction: ClockCorrectionShape,
-    event: dict[str, object],
-    info_after: RingInfo | None,
-    verified_epoch: int | None,
-) -> None:
-    assert sync.correction_sink is not None
-    outcome = event.get("outcome")
-    state = (
-        "resolved"
-        if outcome == "verified"
-        and info_after is not None
-        and info_after.write_sequence == sync.info_before.write_sequence
-        else "applied"
-        if outcome == "verified" and info_after is not None
-        else "not_applied"
-        if outcome in {"time_write_missing", "target_stale"}
-        else "unresolved"
-    )
-    try:
-        boundary_max = (
-            info_after.write_sequence
-            if info_after is not None and state in {"applied", "resolved", "not_applied"}
-            else None
+    if info.write_sequence < intent.write_sequence_before:
+        raise ValueError("device sequence regressed across a pending clock write")
+    if intent.phase == "prepared" or intent.write_sequence_after is None:
+        store.mark_uncertain(intent.operation_id, write_sequence_after=info.write_sequence)
+    unknown = (
+        (
+            ClockRange(
+                intent.write_sequence_before,
+                info.write_sequence,
+                None,
+                None,
+                "unknown",
+                intent.operation_id,
+            ),
         )
-        durable_verified_epoch = verified_epoch if state in {"applied", "resolved"} else None
-        sync.correction_sink.finish(
-            correction,
-            state=state,
-            boundary_sequence_max=boundary_max,
-            verified_epoch=durable_verified_epoch,
-        )
-    except Exception:  # noqa: BLE001 - prepared state truthfully records uncertainty
-        event["outcome"] = "result_persist_failed"
+        if info.write_sequence > intent.write_sequence_before
+        else ()
+    )
+    store.finish(intent.operation_id, unknown)
+    event["reconciled_operations"] = 1
+    if unknown:
+        event["boundary_ambiguous"] = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -809,66 +629,20 @@ async def _bounded_optional[T](awaitable: Awaitable[T], timeout: float) -> T:
         raise _OptionalOperationTimeoutError from error
 
 
-def _complete_host_probe(result: asyncio.Future[bool], value: bool | None, error: BaseException | None) -> None:
-    if result.done():
-        return
-    if error is not None:
-        result.set_exception(error)
-    else:
-        result.set_result(bool(value))
-
-
-def _schedule_host_probe_result(
-    loop: asyncio.AbstractEventLoop,
-    result: asyncio.Future[bool],
-    value: bool | None = None,
-    error: BaseException | None = None,
-) -> None:
-    try:
-        loop.call_soon_threadsafe(_complete_host_probe, result, value, error)
-    except RuntimeError:
-        return
-
-
-def _invoke_host_probe(
-    probe: Callable[[], bool], loop: asyncio.AbstractEventLoop, result: asyncio.Future[bool]
-) -> None:
-    try:
-        value = bool(probe())
-    except BaseException as error:  # noqa: BLE001 - classify in the caller
-        _schedule_host_probe_result(loop, result, error=error)
-    else:
-        _schedule_host_probe_result(loop, result, value)
-
-
-async def _run_host_clock_probe(probe: Callable[[], bool], timeout: float) -> bool:
-    """Run an injected synchronous trust probe without blocking the event loop.
-
-    A daemon thread is intentional here.  ``asyncio.to_thread`` leaves its
-    default executor worker alive until ``asyncio.run`` shuts the executor
-    down, which would make a timed-out probe extend the overall preflight.
-    The probe has no GATT ownership; its result is discarded when the bound
-    expires, while the caller proceeds only after this awaitable is cancelled.
-    """
+async def _run_host_clock_probe(probe: Callable[[float], bool], timeout: float) -> bool:
+    """Run a timeout-aware trust probe and join its worker before returning."""
     if timeout <= 0:
         raise _OptionalOperationTimeoutError
-    loop = asyncio.get_running_loop()
-    result: asyncio.Future[bool] = loop.create_future()
+    # Local import avoids the module cycle: session_lifecycle imports this
+    # module to construct TelemetryClock, while this helper is used at runtime.
+    from .session_lifecycle import joined_to_thread
 
-    Thread(
-        target=_invoke_host_probe,
-        args=(probe, loop, result),
-        name="omi-host-clock-probe",
-        daemon=True,
-    ).start()
     try:
-        return await asyncio.wait_for(asyncio.shield(result), timeout)
-    except TimeoutError as error:
-        result.cancel()
-        raise _OptionalOperationTimeoutError from error
-    except asyncio.CancelledError:
-        result.cancel()
+        return bool(await joined_to_thread(probe, timeout))
+    except _OptionalOperationTimeoutError:
         raise
+    except TimeoutError as error:
+        raise _OptionalOperationTimeoutError from error
 
 
 async def _emit(emit: OperationalEmitter, event: dict[str, object]) -> None:

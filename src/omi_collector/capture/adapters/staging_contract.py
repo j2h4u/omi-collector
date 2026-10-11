@@ -12,7 +12,6 @@ from ..domain.ring_protocol import RECORD_SIZE
 _DESCRIPTOR_NAME = "attempt.json"
 _RAW_NAME = "records.bin"
 _MANIFEST_NAME = "manifest.json"
-_RECEIPT_NAME = "receipt.json"
 _CHECKPOINT_NAME = "checkpoint.json"
 _PREFIX_PUBLICATION_NAME = "prefix-publication.json"
 _TERMINAL_RETIRED_NAME = "terminal-retired.json"

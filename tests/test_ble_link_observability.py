@@ -1,7 +1,6 @@
 import asyncio
 import ctypes
 import errno
-import json
 import logging
 import multiprocessing
 import queue
@@ -1008,7 +1007,7 @@ def test_observer_receive_failure_degrades_and_warns_without_stopping_collection
     assert fake.closed
 
 
-def test_observer_start_failure_keeps_traceback_in_debug_ring_and_warning_separate(
+def test_observer_start_failure_keeps_traceback_in_debug_log_and_warning_separate(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     debug_logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.ble_link.debug"))
@@ -1021,23 +1020,17 @@ def test_observer_start_failure_keeps_traceback_in_debug_ring_and_warning_separa
     )
 
     try:
-        with caplog.at_level(logging.WARNING, logger=warning_logger.name):
+        with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
             asyncio.run(observer.start())
     finally:
         close_debug_logging(debug_logger)
 
-    entries = [
-        cast(dict[str, object], json.loads(line)) for line in (tmp_path / "debug.jsonl").read_text().splitlines()
-    ]
-    failure = cast(
-        dict[str, object], next(entry for entry in entries if entry["event"] == "ble_link_observer_start_failed")
-    )
-    traceback = cast(str, failure["traceback"])
-    assert "PermissionError" in traceback
-    assert "raw HCI payload must stay private" in traceback
+    assert "ble_link_observer_start_failed:" in caplog.text
+    assert "PermissionError" in caplog.text
+    assert "raw HCI payload must stay private" in caplog.text
     warning_records = [record for record in caplog.records if record.name == warning_logger.name]
     assert [record.getMessage() for record in warning_records] == ["BLE link observer unavailable"]
-    assert "raw HCI payload must stay private" not in caplog.text
+    assert all("raw HCI payload must stay private" not in record.getMessage() for record in warning_records)
 
 
 def test_observer_restart_refuses_a_live_reader_after_bounded_close() -> None:

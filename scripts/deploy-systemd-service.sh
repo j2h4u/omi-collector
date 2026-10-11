@@ -364,6 +364,56 @@ function validate_candidate_config {
     [[ "$output" == "$expected" ]] || die 'candidate returned an unexpected configuration validation record'
 }
 
+function migrate_stopped_collector_state {
+    # args
+    local -r environment="$1" config_file="$2" state_file="$3" legacy_phy_home="$4"
+    local -r runuser_bin="$5" account_user="$6" account_group="$7"
+    local -r lock_file="${state_file%/*}/collector.lock"
+
+    # code
+    [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
+    "$environment/bin/omi-collector" migrate-state --config "$config_file" \
+        --legacy-phy-state-home "$legacy_phy_home" \
+        || die 'offline Collector state migration failed; service remains stopped'
+    [[ ! -e "$lock_file" && ! -L "$lock_file" ]] \
+        || [[ -f "$lock_file" && ! -L "$lock_file" ]] \
+        || die "Collector singleton lock is not a regular file: ${lock_file}"
+    if [[ ! -e "$state_file" ]]; then
+        return
+    fi
+    [[ -f "$state_file" && ! -L "$state_file" ]] \
+        || die "Collector state database is not a regular file: ${state_file}"
+    [[ -f "$lock_file" && ! -L "$lock_file" ]] \
+        || die "Collector singleton lock is not a regular file: ${lock_file}"
+    chown "$account_user:$account_group" -- "$state_file" \
+        || die 'could not assign Collector state database to the service account'
+    chmod 0600 -- "$state_file" || die 'could not set Collector state database mode'
+    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -r "$state_file" \
+        || die 'service account cannot read Collector state database'
+    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "$state_file" \
+        || die 'service account cannot write Collector state database'
+    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "${state_file%/*}" \
+        || die 'service account cannot write Collector state journal directory'
+}
+
+function prepare_service_singleton_lock {
+    # args
+    local -r lock_file="$1" runuser_bin="$2" account_user="$3" account_group="$4"
+
+    # code
+    [[ ! -L "${lock_file%/*}" ]] || return 1
+    if [[ ! -d "${lock_file%/*}" ]]; then
+        return
+    fi
+    if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+        (set -o noclobber; : > "$lock_file") || return 1
+    fi
+    [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
+    chown "$account_user:$account_group" -- "$lock_file" || return 1
+    chmod 0600 -- "$lock_file" || return 1
+    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "$lock_file"
+}
+
 function read_current_target {
     # args
     local -r current_link="$1" deployments_dir="$2" output_name="$3"
@@ -460,6 +510,7 @@ declare script_dir repo_root source_package source_unit installed_unit config_fi
 declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user account_group build_user build_group
 declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
+declare state_file candidate_state_file legacy_phy_state_home
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
 declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0
@@ -491,6 +542,9 @@ deployments_dir='/var/lib/omi-collector-deployments/releases'
 python_install_dir='/var/lib/omi-collector-deployments/python'
 deployment_lock_file='/var/lib/omi-collector-deployments/.deployment.lock'
 current_link='/var/lib/omi-collector-deployments/current'
+state_file='/srv/pipelines/omi/collector/collector-state.sqlite3'
+candidate_state_file='/srv/pipelines/omi/collector/.collector-state.sqlite3.migrating'
+legacy_phy_state_home='/home/j2h4u/.local/state'
 temporary_link="${deployment_root}/.current.${BASHPID}.${RANDOM}"
 release_path=''
 staged_environment=''
@@ -513,12 +567,28 @@ function cleanup {
 
 function finalize {
     # vars
-    local -i final_status=$? rollback_failed=0
+    local -i final_status=$? rollback_failed=0 forward_only=0
 
     # code
     trap '' INT TERM HUP QUIT USR1 USR2
+    if (( service_quiesced || selection_published )) && [[ -e "$state_file" || -L "$state_file" ]]; then
+        forward_only=1
+    fi
     if (( deployment_committed )); then
         selection_published=0
+    elif (( forward_only )); then
+        if ! systemctl stop "$service_name"; then
+            rollback_failed=1
+        fi
+        if (( ! selection_published )); then
+            if publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"; then
+                selection_published=1
+            else
+                rollback_failed=1
+            fi
+        fi
+        printf 'ERROR: Collector state cutover requires the new release; service is stopped and recovery state retained\n' >&2
+        rollback_failed=1
     elif (( selection_published )); then
         if ! rollback_deployment "$service_name" "$current_link" "$previous_target" "$temporary_link" \
             "$staged_environment" "$deployments_dir"; then
@@ -604,9 +674,16 @@ seal_deployment_environment "$staged_environment" "$deployments_dir" "$sealer_py
     "$python_install_dir"
 write_release_metadata "$staged_environment" "$deployments_dir" "$source_revision"
 validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
+[[ ! -e "$candidate_state_file" && ! -L "$candidate_state_file" ]] \
+    || die "unfinished Collector state migration candidate needs inspection: ${candidate_state_file}"
 
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"
+[[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
+prepare_service_singleton_lock "${state_file%/*}/collector.lock" "$runuser_bin" "$account_user" "$account_group" \
+    || die 'could not prepare the stable Collector singleton lock for migration'
+migrate_stopped_collector_state "$staged_environment" "$config_file" "$state_file" "$legacy_phy_state_home" \
+    "$runuser_bin" "$account_user" "$account_group"
 selection_published=1
 publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"
 systemctl restart "$service_name" || die "could not restart ${service_name}"

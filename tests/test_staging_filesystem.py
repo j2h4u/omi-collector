@@ -5,10 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from errno import EXDEV
-from json import dumps, loads
-from multiprocessing import Event, Process, get_context
+from multiprocessing import get_context
 from multiprocessing.queues import Queue
-from multiprocessing.synchronize import Event as EventType
 from os import PathLike, fsync, mkfifo
 from pathlib import Path
 from shutil import rmtree
@@ -17,14 +15,16 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import staging_filesystem, staging_store
+from omi_collector.capture.adapters.attempts import StagedAttempt
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
     CollisionError,
     DeviceAlreadyRunningError,
     StagingError,
 )
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
+from staging_test_factory import StagingStore, staged_attempt_payload
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -68,10 +68,12 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
     return attempt
 
 
-def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:
-    checkpoint = cast(dict[str, object], loads(path.read_text(encoding="utf-8")))
+def _rewrite_checkpoint(attempt: StagedAttempt, field: str, value: object) -> None:
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    checkpoint = cast(dict[str, object], row["checkpoint"])
     checkpoint[field] = value
-    path.write_text(dumps(checkpoint), encoding="utf-8")
+    attempt._filesystem.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, row)
 
 
 def _replace_with_symlink(path: Path, target: Path, payload: bytes | str) -> None:
@@ -100,12 +102,6 @@ def _guard_rename_to_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(staging_filesystem.os, "rename", guarded_rename)
 
 
-def _hold_device_lock(spool: str, capture_root: str, ready: EventType, release: EventType) -> None:
-    with StagingStore(Path(spool), Path(capture_root)).device_lock(operation="capture_batch"):
-        ready.set()
-        release.wait(10)
-
-
 def _open_attempt_in_child(
     spool: str,
     capture_root: str,
@@ -113,7 +109,7 @@ def _open_attempt_in_child(
     expected_module_path: str,
     results: Queue[tuple[str, str]],
 ) -> None:
-    from omi_collector.capture.adapters.staging_store import StagingStore as ChildStagingStore
+    from staging_test_factory import StagingStore as ChildStagingStore
 
     module_path = str(Path(staging_store.__file__).resolve())
     if module_path != expected_module_path:
@@ -127,360 +123,62 @@ def _open_attempt_in_child(
         results.put(("accepted", module_path))
 
 
-def test_device_lock_contention_attributes_process_holder_and_reacquires(tmp_path: Path) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    ready = Event()
-    release = Event()
-    holder = Process(target=_hold_device_lock, args=(str(spool), str(capture_root), ready, release))
-    holder.start()
-    try:
-        assert ready.wait(10)
-        with (
-            pytest.raises(DeviceAlreadyRunningError) as raised,
-            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
-        ):
-            pass
-        error = raised.value
-        context = error.lock_context
-        assert context is not None
-        assert context.requested_operation == "resume_pending_attempt"
-        assert context.holder_operation == "capture_batch"
-        assert context.holder_pid == holder.pid
-        assert context.holder_thread_id is not None
-        assert context.holder_age_seconds is not None
-        assert context.holder_age_seconds >= 0
-        assert context.holder_scope == "other_process"
-        assert context.metadata_status == "valid"
-    finally:
-        release.set()
-        holder.join(10)
-    assert holder.exitcode == 0
-    with StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"):
-        pass
-    assert (spool / "collector.lock").read_bytes() == b""
-
-
-def test_device_lock_rejects_stale_owner_metadata(tmp_path: Path) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    store = StagingStore(spool, capture_root)
-    with store.device_lock(operation="capture_batch"):
-        (spool / "collector.lock").write_text(
-            dumps(
-                {
-                    "version": 1,
-                    "pid": 999_999_999,
-                    "process_start": 1,
-                    "thread_id": 1,
-                    "operation": "old_operation",
-                    "scope": "collector_lock",
-                    "acquired_monotonic_ns": 1,
-                }
-            ),
-            encoding="utf-8",
-        )
-        with (
-            pytest.raises(DeviceAlreadyRunningError) as raised,
-            StagingStore(spool, capture_root).device_lock(operation="capture_batch"),
-        ):
-            pass
-    context = raised.value.lock_context
-    assert context is not None
-    assert context.metadata_status == "stale"
-    assert context.holder_scope == "unknown"
-    assert context.holder_pid is None
-
-
-def test_device_lock_rejects_same_pid_with_mismatched_process_start(tmp_path: Path) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    store = StagingStore(spool, capture_root)
-    with store.device_lock(operation="capture_batch"):
-        (spool / "collector.lock").write_text(
-            dumps(
-                {
-                    "version": 1,
-                    "pid": staging_filesystem.os.getpid(),
-                    "process_start": 1,
-                    "thread_id": 1,
-                    "operation": "old_operation",
-                    "scope": "collector_lock",
-                    "acquired_monotonic_ns": 1,
-                }
-            ),
-            encoding="utf-8",
-        )
-        with (
-            pytest.raises(DeviceAlreadyRunningError) as raised,
-            StagingStore(spool, capture_root).device_lock(operation="capture_batch"),
-        ):
-            pass
-    context = raised.value.lock_context
-    assert context is not None
-    assert context.metadata_status == "stale"
-    assert context.holder_scope == "unknown"
-    assert context.holder_pid is None
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("payload", b"{"),
-        ("payload", b"\xff"),
-        ("payload", b"[]"),
-        ("version", 2),
-        ("pid", True),
-        ("pid", 0),
-        ("thread_id", False),
-        ("thread_id", 0),
-        ("operation", None),
-        ("scope", 1),
-        ("acquired_monotonic_ns", True),
-        ("acquired_monotonic_ns", 0),
-    ],
-)
-def test_device_lock_contention_keeps_invalid_owner_metadata_unknown(tmp_path: Path, field: str, value: object) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    store = StagingStore(spool, capture_root)
-    lock_path = spool / "collector.lock"
-
-    with store.device_lock(operation="capture_batch"):
-        metadata = cast(dict[str, object], loads(lock_path.read_text(encoding="utf-8")))
-        if field == "payload":
-            lock_path.write_bytes(cast(bytes, value))
-        else:
-            metadata[field] = value
-            lock_path.write_text(dumps(metadata), encoding="utf-8")
-
-        with (
-            pytest.raises(DeviceAlreadyRunningError) as raised,
-            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
-        ):
-            pass
-
-    context = raised.value.lock_context
-    assert context is not None
-    assert context.requested_operation == "resume_pending_attempt"
-    assert context.metadata_status == "invalid"
-    assert context.holder_scope == "unknown"
-    assert context.holder_operation is None
-    assert context.holder_pid is None
-    assert context.holder_thread_id is None
-    assert context.holder_age_seconds is None
-
-
-def test_device_lock_contention_reports_live_owner_and_exact_age(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    store = StagingStore(spool, capture_root)
-
-    with store.device_lock(operation="capture_batch"):
-        metadata = cast(dict[str, object], loads((spool / "collector.lock").read_text(encoding="utf-8")))
-        acquired_ns = cast(int, metadata["acquired_monotonic_ns"])
-        monkeypatch.setattr(staging_filesystem.time, "monotonic_ns", lambda: acquired_ns + 2_000_000_000)
-        with (
-            pytest.raises(DeviceAlreadyRunningError) as raised,
-            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
-        ):
-            pass
-
-    context = raised.value.lock_context
-    assert context is not None
-    assert context.requested_operation == "resume_pending_attempt"
-    assert context.holder_operation == "capture_batch"
-    assert context.holder_pid == staging_filesystem.os.getpid()
-    assert context.holder_thread_id is not None
-    assert context.holder_scope == "current_process"
-    assert context.metadata_status == "valid"
-    assert context.holder_age_seconds == pytest.approx(2.0)
-
-
-def test_device_lock_contention_uses_live_pid_one_metadata(tmp_path: Path) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    store = StagingStore(spool, capture_root)
-    with store.device_lock(operation="capture_batch"):
-        stat_fields = Path("/proc/1/stat").read_text(encoding="ascii").split()
-        lock_path = spool / "collector.lock"
-        lock_path.write_text(
-            dumps(
-                {
-                    "version": 1,
-                    "pid": 1,
-                    "process_start": int(stat_fields[21]),
-                    "thread_id": 1,
-                    "operation": "init",
-                    "scope": "collector_lock",
-                    "acquired_monotonic_ns": 1,
-                }
-            ),
-            encoding="utf-8",
-        )
-        with (
-            pytest.raises(DeviceAlreadyRunningError) as raised,
-            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
-        ):
-            pass
-    context = raised.value.lock_context
-    assert context is not None
-    assert context.metadata_status == "valid"
-    assert context.holder_pid == 1
-    assert context.holder_scope == "other_process"
-
-
-def test_device_lock_contender_preserves_live_owner_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_device_lock_is_in_process_and_reports_lease_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        staging_filesystem,
-        "debug_event",
-        lambda name, **fields: events.append((name, fields)),
-    )
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    store = StagingStore(spool, capture_root)
-    lock_path = spool / "collector.lock"
-
-    with store.device_lock(operation="capture_batch"):
-        before = lock_path.read_bytes()
-        with (
-            pytest.raises(DeviceAlreadyRunningError),
-            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
-        ):
-            pass
-        assert lock_path.read_bytes() == before
-        contender_events = tuple(events)
-        assert not any(
-            name == "device_lock_released" and fields["operation"] == "resume_pending_attempt"
-            for name, fields in contender_events
-        )
-
-    with StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"):
-        pass
-    released_operations = [fields["operation"] for name, fields in events if name == "device_lock_released"]
-    assert released_operations == ["capture_batch", "resume_pending_attempt"]
-
-
-@pytest.mark.parametrize("process_start", [None, "float"])
-def test_device_lock_rejects_noncanonical_process_start_as_stale(tmp_path: Path, process_start: object) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    store = StagingStore(spool, capture_root)
-    with store.device_lock(operation="capture_batch"):
-        lock_path = spool / "collector.lock"
-        metadata = cast(dict[str, object], loads(lock_path.read_text(encoding="utf-8")))
-        actual_start = metadata["process_start"]
-        metadata["process_start"] = None if process_start is None else float(cast(int, actual_start))
-        lock_path.write_text(dumps(metadata), encoding="utf-8")
-        with (
-            pytest.raises(DeviceAlreadyRunningError) as raised,
-            StagingStore(spool, capture_root).device_lock(operation="resume_pending_attempt"),
-        ):
-            pass
-    context = raised.value.lock_context
-    assert context is not None
-    assert context.metadata_status == "stale"
-    assert context.holder_scope == "unknown"
-    assert context.holder_pid is None
-
-
-def test_device_lock_diagnostics_report_bounded_lease_duration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[tuple[str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        staging_filesystem,
-        "debug_event",
-        lambda name, **fields: events.append((name, fields)),
-    )
+    monkeypatch.setattr(staging_filesystem, "debug_event", lambda name, **fields: events.append((name, fields)))
     store = StagingStore(tmp_path / "spool", _capture_root(tmp_path))
-    started = staging_filesystem.time.monotonic_ns()
 
     with store.device_lock(operation="capture_batch"):
+        with pytest.raises(DeviceAlreadyRunningError), store.device_lock(operation="resume_pending_attempt"):
+            pass
+        assert not store.paths.lock.exists()
+
+    with store.device_lock(operation="resume_pending_attempt"):
         pass
-
-    elapsed = (staging_filesystem.time.monotonic_ns() - started) / 1_000_000_000
-    acquired = next(fields for name, fields in events if name == "device_lock_acquired")
-    released = next(fields for name, fields in events if name == "device_lock_released")
-    assert acquired["operation"] == "capture_batch"
-    assert released["operation"] == "capture_batch"
-    assert acquired["metadata_status"] == released["metadata_status"] == "valid"
-    duration = released["duration_seconds"]
-    assert isinstance(duration, float)
-    assert 0 <= duration <= elapsed + 0.1
+    acquired = [fields for name, fields in events if name == "device_lock_acquired"]
+    released = [fields for name, fields in events if name == "device_lock_released"]
+    assert [event["operation"] for event in acquired] == ["capture_batch", "resume_pending_attempt"]
+    assert [event["operation"] for event in released] == ["capture_batch", "resume_pending_attempt"]
+    assert all(event["scope"] == event["metadata_status"] == "in_process" for event in acquired + released)
+    assert isinstance(released[0]["duration_seconds"], float)
 
 
-@pytest.mark.parametrize("fault", ["short", "error"])
-def test_device_lock_metadata_write_failure_is_diagnostic_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
-) -> None:
-    events: list[tuple[str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        staging_filesystem,
-        "debug_event",
-        lambda name, **fields: events.append((name, fields)),
-    )
-    lock_path = tmp_path / "spool" / "collector.lock"
-    real_pwrite = staging_filesystem.os.pwrite
-
-    def injected_pwrite(fd: int, payload: bytes, offset: int) -> int:
-        if Path(f"/proc/self/fd/{fd}").resolve() == lock_path.resolve():
-            if fault == "error":
-                raise OSError("injected diagnostic metadata failure")
-            return 0
-        return real_pwrite(fd, payload, offset)
-
-    monkeypatch.setattr(staging_filesystem.os, "pwrite", injected_pwrite)
-    store = StagingStore(tmp_path / "spool", _capture_root(tmp_path))
-    with store.device_lock(operation="capture_batch"):
-        pass
-
-    acquired = next(fields for name, fields in events if name == "device_lock_acquired")
-    released = next(fields for name, fields in events if name == "device_lock_released")
-    assert acquired["metadata_status"] == released["metadata_status"] == "write_failed"
-    with store.device_lock(operation="retry"):
-        pass
-
-
-def test_public_checkpoint_rejects_missing_checkpoint_without_creating_it(tmp_path: Path) -> None:
+def test_open_rejects_missing_checkpoint_state_without_changing_raw_evidence(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1)
     attempt.accept_chunk(100, _record(1))
-    checkpoint = attempt.path / "checkpoint.json"
-    checkpoint.unlink()
     raw_before = (attempt.path / "records.bin").read_bytes()
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    row["checkpoint"] = None
+    attempt._filesystem.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, row)
+    attempt.close()
 
-    try:
-        with pytest.raises(AttemptStateError, match="checkpoint is missing"):
-            attempt.checkpoint()
+    with pytest.raises(AttemptStateError, match="streaming checkpoint is malformed"):
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
-        assert not checkpoint.exists()
-        assert (attempt.path / "records.bin").read_bytes() == raw_before
-    finally:
-        attempt.close()
+    assert (attempt.path / "records.bin").read_bytes() == raw_before
+    assert staged_attempt_payload(attempt) == row
 
 
 def test_open_rejects_checkpoint_with_nonhex_hash_without_rewriting_raw(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1)
     attempt.accept_chunk(100, _record(1))
     attempt.close()
-    checkpoint = attempt.path / "checkpoint.json"
-    _rewrite_checkpoint(checkpoint, "raw_sha256", "z" * 64)
+    _rewrite_checkpoint(attempt, "raw_sha256", "z" * 64)
     raw_before = (attempt.path / "records.bin").read_bytes()
-    checkpoint_before = checkpoint.read_bytes()
+    state_before = staged_attempt_payload(attempt)
 
     with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
         StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
     assert (attempt.path / "records.bin").read_bytes() == raw_before
-    assert checkpoint.read_bytes() == checkpoint_before
+    assert staged_attempt_payload(attempt) == state_before
 
 
-@pytest.mark.parametrize("fifo_name", ["records.bin", "attempt.json"])
-def test_open_attempt_rejects_fifo_without_blocking(tmp_path: Path, fifo_name: str) -> None:
+def test_open_attempt_rejects_raw_fifo_without_blocking(tmp_path: Path) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1)
     attempt.close()
-    fifo_path = attempt.path / fifo_name
+    fifo_path = attempt.path / "records.bin"
     fifo_path.unlink()
     mkfifo(fifo_path)
     module_path = Path(staging_store.__file__).resolve()
@@ -534,21 +232,20 @@ def test_prefix_collision_preserves_longer_destination_and_source(tmp_path: Path
         attempt.close()
 
 
-def test_public_checkpoint_rejects_corrupt_hash_after_append_without_rewriting_evidence(
+def test_public_checkpoint_rejects_corrupt_state_after_append_without_rewriting_evidence(
     tmp_path: Path,
 ) -> None:
     attempt = _started_streaming_attempt(tmp_path, count=1)
     attempt.accept_chunk(100, _record(1))
-    checkpoint = attempt.path / "checkpoint.json"
-    _rewrite_checkpoint(checkpoint, "raw_sha256", "z" * 64)
-    checkpoint_before = checkpoint.read_bytes()
+    _rewrite_checkpoint(attempt, "raw_sha256", "z" * 64)
+    state_before = staged_attempt_payload(attempt)
     raw_before = (attempt.path / "records.bin").read_bytes()
 
     try:
-        with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
+        with pytest.raises(AttemptStateError, match="attempt state is malformed"):
             attempt.checkpoint()
 
-        assert checkpoint.read_bytes() == checkpoint_before
+        assert staged_attempt_payload(attempt) == state_before
         assert (attempt.path / "records.bin").read_bytes() == raw_before
     finally:
         attempt.close()
@@ -603,7 +300,9 @@ def test_prepare_rejects_existing_non_directory_root(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.write_text("root is unexpectedly a file", encoding="utf-8")
     with pytest.raises(StagingError, match="real directory"):
-        StagingStore(root, root / "captures").prepare_streaming_attempt(1, 1)
+        StagingStore(root, root / "captures", state_db=StateDB(tmp_path / "state.sqlite3")).prepare_streaming_attempt(
+            1, 1
+        )
 
 
 def test_storage_preflight_creates_and_durably_probes_missing_roots(tmp_path: Path) -> None:
@@ -629,7 +328,7 @@ def test_storage_preflight_rejects_symlink_roots(tmp_path: Path, root_name: str)
     (spool if root_name == "spool" else capture_root).symlink_to(target, target_is_directory=True)
 
     with pytest.raises(StagingError, match="real directory"):
-        StagingStore(spool, capture_root).preflight_storage()
+        StagingStore(spool, capture_root, state_db=StateDB(tmp_path / "state.sqlite3")).preflight_storage()
 
 
 def test_storage_preflight_rejects_unwritable_directory_and_preserves_cause(tmp_path: Path) -> None:
@@ -654,9 +353,12 @@ def test_invalid_utf8_descriptor_is_preserved_as_unreadable_evidence(tmp_path: P
     attempt_id = "a" * 32
     attempt_path = tmp_path / "attempts" / attempt_id
     attempt_path.mkdir(parents=True)
-    (attempt_path / "attempt.json").write_bytes(b"\xff")
-    with pytest.raises(AttemptStateError, match=r"cannot read attempt\.json"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id)
+    (attempt_path / "records.bin").write_bytes(b"preserve")
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.state_db.put(StateKind.ATTEMPT, attempt_id, {"descriptor": {"invalid": True}})
+    with pytest.raises(AttemptStateError, match="attempt state is missing or malformed"):
+        store.open_attempt(attempt_id)
+    assert (attempt_path / "records.bin").read_bytes() == b"preserve"
 
 
 def test_statvfs_and_atomic_write_errors_leave_evidence(tmp_path: Path) -> None:
@@ -675,9 +377,10 @@ def test_statvfs_and_atomic_write_errors_leave_evidence(tmp_path: Path) -> None:
             raise OSError("simulated atomic write failure")
         fsync(_)
 
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_descriptor_sync)
     with pytest.raises(OSError, match="atomic write"):
-        StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_descriptor_sync).prepare_streaming_attempt(1, 1)
-    assert list((tmp_path / "attempts").glob("*/.attempt.json.*.tmp"))
+        store.prepare_streaming_attempt(1, 1)
+    assert store.state_db.list(StateKind.ATTEMPT) == ()
 
 
 def test_public_recovery_accepts_matching_temporary_when_destination_is_regular(tmp_path: Path) -> None:

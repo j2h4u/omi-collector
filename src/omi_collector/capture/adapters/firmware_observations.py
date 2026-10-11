@@ -7,21 +7,19 @@ import os
 import stat
 import threading
 from collections.abc import Callable, Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
-from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, FirmwareObservationConfig
 from ..domain.ring_protocol import RingInfo
+from .collector_state_db import StateDB, StateDBError, StateKind
 
 _SCHEMA_VERSION: Final = 3
+_MAX_LEGACY_STATE_BYTES: Final = 65_536
 _U16_MAX: Final = (1 << 16) - 1
 _U32_MAX: Final = (1 << 32) - 1
 _U64_MAX: Final = (1 << 64) - 1
-_LOCKS: dict[str, threading.RLock] = {}
-_LOCKS_GUARD = threading.Lock()
 _ErrorCallback = Callable[[Exception], None]
 
 
@@ -68,10 +66,6 @@ class FirmwareObservation:
         return self.regression_count + 1
 
 
-def _canonical_json(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
 def _validate_ring_info(info: RingInfo) -> None:
     if not isinstance(info, RingInfo):
         raise TypeError("info must be a RingInfo")
@@ -86,167 +80,134 @@ def _validate_ring_info(info: RingInfo) -> None:
             raise ValueError(f"{name} must be an unsigned integer within firmware bounds")
 
 
-def _lock_for(path: Path) -> threading.RLock:
-    with _LOCKS_GUARD:
-        return _LOCKS.setdefault(str(path), threading.RLock())
-
-
-def _parse_object(raw: bytes, path: Path) -> dict[str, object]:
-    try:
-        value = cast(object, json.loads(raw.decode("utf-8")))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise FirmwareObservationError(f"malformed observation JSON: {path.name}") from error
-    if not isinstance(value, dict):
-        raise FirmwareObservationError(f"observation file must be a JSON object: {path.name}")
-    return cast(dict[str, object], value)
-
-
-def _integer(data: Mapping[str, object], key: str, path: Path, maximum: int | None = None) -> int:
+def _integer(data: Mapping[str, object], key: str, maximum: int | None = None) -> int:
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0 or (maximum is not None and value > maximum):
-        raise FirmwareObservationError(f"{key} is outside firmware bounds: {path.name}")
+        raise FirmwareObservationError(f"{key} is outside firmware bounds")
     return value
 
 
-def _decode(document: Mapping[str, object], path: Path) -> FirmwareObservation:
-    if set(document) != {"schema_version", "latest", "metrics"} or document.get("schema_version") != _SCHEMA_VERSION:
-        raise FirmwareObservationError(f"unexpected device state fields: {path.name}")
+def _decode(document: Mapping[str, object]) -> FirmwareObservation:
+    if (
+        set(document) != {"schema_version", "latest", "metrics"}
+        or type(document.get("schema_version")) is not int
+        or document.get("schema_version") != _SCHEMA_VERSION
+    ):
+        raise FirmwareObservationError("unexpected device state fields")
     latest = document.get("latest")
     metrics = document.get("metrics")
     if not isinstance(latest, dict) or not isinstance(metrics, dict):
-        raise FirmwareObservationError(f"device state sections are invalid: {path.name}")
+        raise FirmwareObservationError("device state sections are invalid")
     if set(latest) != {"read_sequence", "write_sequence", "capacity_packets", "dropped_packets", "packet_size"}:
-        raise FirmwareObservationError(f"latest firmware state is invalid: {path.name}")
+        raise FirmwareObservationError("latest firmware state is invalid")
     if set(metrics) != {"observation_count", "initial", "observed_increase", "regression_count"}:
-        raise FirmwareObservationError(f"firmware metrics state is invalid: {path.name}")
+        raise FirmwareObservationError("firmware metrics state is invalid")
     info = RingInfo(
-        _integer(latest, "read_sequence", path, _U64_MAX),
-        _integer(latest, "write_sequence", path, _U64_MAX),
-        _integer(latest, "capacity_packets", path, _U32_MAX),
-        _integer(latest, "dropped_packets", path, _U64_MAX),
-        _integer(latest, "packet_size", path, _U16_MAX),
+        _integer(latest, "read_sequence", _U64_MAX),
+        _integer(latest, "write_sequence", _U64_MAX),
+        _integer(latest, "capacity_packets", _U32_MAX),
+        _integer(latest, "dropped_packets", _U64_MAX),
+        _integer(latest, "packet_size", _U16_MAX),
     )
-    count = _integer(metrics, "observation_count", path)
-    initial = _integer(metrics, "initial", path, _U64_MAX)
-    increase = _integer(metrics, "observed_increase", path, _U64_MAX)
-    regressions = _integer(metrics, "regression_count", path)
+    count = _integer(metrics, "observation_count")
+    initial = _integer(metrics, "initial", _U64_MAX)
+    increase = _integer(metrics, "observed_increase", _U64_MAX)
+    regressions = _integer(metrics, "regression_count")
     if count <= 0:
-        raise FirmwareObservationError(f"firmware metrics state is inconsistent: {path.name}")
+        raise FirmwareObservationError("firmware metrics state is inconsistent")
     return FirmwareObservation(info, count, initial, increase, regressions)
 
 
-def read_firmware_observations(device_state_path: Path) -> tuple[FirmwareObservation, ...]:
-    """Read the one bounded state record; absent state is an empty result."""
-    path = Path(device_state_path)
-    if not path.exists() and not path.is_symlink():
-        return ()
-    _require_regular_file(path)
+def read_firmware_observations(db: StateDB) -> tuple[FirmwareObservation, ...]:
+    """Read the latest bounded state record; absent state is an empty result."""
     try:
-        raw = path.read_bytes()
-    except OSError as error:
-        raise FirmwareObservationError(f"observation file is unreadable: {path.name}") from error
-    document = _parse_object(raw, path)
-    if raw != _canonical_json(document):
-        raise FirmwareObservationError(f"device state JSON is not canonical: {path.name}")
-    return (_decode(document, path),)
+        document = db.get(StateKind.FIRMWARE, "latest")
+    except StateDBError as error:
+        raise FirmwareObservationError("firmware observation database read failed") from error
+    if document is None:
+        return ()
+    return (_decode(document),)
+
+
+def parse_legacy_firmware(path: Path) -> tuple[FirmwareObservation, ...]:
+    """Strictly decode the old device snapshot for the offline state importer."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_LEGACY_STATE_BYTES:
+                raise ValueError("legacy firmware state is not a regular file")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                raw = stream.read(_MAX_LEGACY_STATE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(raw) > _MAX_LEGACY_STATE_BYTES or raw != json.dumps(
+            cast(object, json.loads(raw)), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8"):
+            raise ValueError("legacy firmware JSON is not canonical or is oversized")
+        document = cast(object, json.loads(raw))
+        if not isinstance(document, dict):
+            raise ValueError("legacy firmware state must be an object")
+        return (_decode(cast(dict[str, object], document)),)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise FirmwareObservationError("legacy firmware state is malformed or unsafe") from error
 
 
 class FirmwareObservationStore:
     """Atomically persist one latest snapshot and bounded metric aggregates."""
 
-    def __init__(self, device_state_path: Path) -> None:
-        self._path = Path(device_state_path)
+    def __init__(self, db: StateDB) -> None:
+        self._db = db
 
     def record(self, info: RingInfo) -> bool:
         _validate_ring_info(info)
-        with _lock_for(self._path):
-            _ensure_regular_parent(self._path)
-            persisted = read_firmware_observations(self._path)
-            previous = persisted[0] if persisted else None
-            if previous is not None and previous.info == info:
-                return False
-            if previous is None:
-                state = FirmwareObservation(info, 1, info.dropped_packets, 0, 0)
-            elif previous.dropped_packets == info.dropped_packets:
-                state = FirmwareObservation(
-                    info,
-                    previous.observation_count,
-                    previous.initial,
-                    previous.observed_increase,
-                    previous.regression_count,
-                )
-            else:
-                increase = previous.observed_increase + max(0, info.dropped_packets - previous.dropped_packets)
-                regressions = previous.regression_count + (info.dropped_packets < previous.dropped_packets)
-                state = FirmwareObservation(
-                    info,
-                    previous.observation_count + 1,
-                    previous.initial,
-                    increase,
-                    regressions,
-                )
-            document = {
-                "schema_version": _SCHEMA_VERSION,
-                "latest": {
-                    "read_sequence": state.read_sequence,
-                    "write_sequence": state.write_sequence,
-                    "capacity_packets": state.capacity_packets,
-                    "dropped_packets": state.dropped_packets,
-                    "packet_size": state.packet_size,
-                },
-                "metrics": {
-                    "observation_count": state.observation_count,
-                    "initial": state.initial,
-                    "observed_increase": state.observed_increase,
-                    "regression_count": state.regression_count,
-                },
-            }
-            _write_atomic(self._path, _canonical_json(document))
-            return True
-
-
-def _require_regular_file(path: Path) -> None:
-    try:
-        mode = path.lstat().st_mode
-    except OSError as error:
-        raise FirmwareObservationError(f"observation file is missing or unreadable: {path.name}") from error
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise FirmwareObservationError("observation file must be a regular non-symlink file")
-
-
-def _ensure_regular_parent(path: Path) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mode = path.parent.lstat().st_mode
-    except OSError as error:
-        raise FirmwareObservationError("observation parent is unavailable") from error
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        raise FirmwareObservationError("observation parent must be a regular non-symlink directory")
-    if path.exists() or path.is_symlink():
-        _require_regular_file(path)
-
-
-def _write_atomic(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-        _fsync_directory(path.parent)
-    except OSError as error:
-        with suppress(FileNotFoundError):
-            temporary.unlink()
-        raise FirmwareObservationError(f"cannot publish firmware observation: {path.name}") from error
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        try:
+            with self._db.transaction() as transaction:
+                document = transaction.get(StateKind.FIRMWARE, "latest")
+                persisted = (_decode(document),) if document is not None else ()
+                previous = persisted[0] if persisted else None
+                if previous is not None and previous.info == info:
+                    return False
+                if previous is None:
+                    state = FirmwareObservation(info, 1, info.dropped_packets, 0, 0)
+                elif previous.dropped_packets == info.dropped_packets:
+                    state = FirmwareObservation(
+                        info,
+                        previous.observation_count,
+                        previous.initial,
+                        previous.observed_increase,
+                        previous.regression_count,
+                    )
+                else:
+                    increase = previous.observed_increase + max(0, info.dropped_packets - previous.dropped_packets)
+                    regressions = previous.regression_count + (info.dropped_packets < previous.dropped_packets)
+                    state = FirmwareObservation(
+                        info,
+                        previous.observation_count + 1,
+                        previous.initial,
+                        increase,
+                        regressions,
+                    )
+                document = {
+                    "schema_version": _SCHEMA_VERSION,
+                    "latest": {
+                        "read_sequence": state.read_sequence,
+                        "write_sequence": state.write_sequence,
+                        "capacity_packets": state.capacity_packets,
+                        "dropped_packets": state.dropped_packets,
+                        "packet_size": state.packet_size,
+                    },
+                    "metrics": {
+                        "observation_count": state.observation_count,
+                        "initial": state.initial,
+                        "observed_increase": state.observed_increase,
+                        "regression_count": state.regression_count,
+                    },
+                }
+                transaction.put(StateKind.FIRMWARE, "latest", document)
+                return True
+        except StateDBError as error:
+            raise FirmwareObservationError("firmware observation database write failed") from error
 
 
 class FirmwareObservationWriter:
@@ -279,10 +240,11 @@ class FirmwareObservationWriter:
             self._condition.notify()
 
     def close(self) -> None:
+        """Stop accepting updates and wait until the final bounded DB write exits."""
         with self._condition:
             self._stopping = True
             self._condition.notify()
-        self._thread.join(self._config.close_timeout_seconds)
+        self._thread.join()
 
     def _report_error(self, error: Exception) -> None:
         if self._on_error is None:

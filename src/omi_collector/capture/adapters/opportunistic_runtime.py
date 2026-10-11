@@ -11,7 +11,6 @@ from ...config import FirmwareObservationConfig, WriterConfig
 from ..application.ports import (
     BatchWriterPort,
     CaptureRuntimePort,
-    ClockDurabilityPort,
     DurablePrefixShape,
     ObservationWriterPort,
     QuarantineErrorKind,
@@ -22,11 +21,12 @@ from ..application.ports import (
 from ..domain.operational_status_machine import PublicationOutcome
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .attempt_writer import AttemptWriter, WriterError, WriterFailedError, WriterProgress
-from .clock_corrections import ClockCorrectionStore
+from .clock_state_store import ClockStateStore
 from .debug_logging import debug_event, debug_exception
 from .firmware_observations import FirmwareObservationStore, FirmwareObservationWriter
 from .quarantine_publish import QuarantineOutputCollisionError, QuarantinePublishError, QuarantineSalvageDeferredError
 from .staging_contract import DeviceAlreadyRunningError, StagingError
+from .staging_store import StagingStore
 
 
 class _StagingWriterAdapter:
@@ -183,15 +183,15 @@ class OpportunisticRuntime(CaptureRuntimePort):
     def make_observation_writer(
         self, staging: StagingPort, config: FirmwareObservationConfig, on_error: Callable[[Exception], None]
     ) -> ObservationWriterPort:
-        store = FirmwareObservationStore(staging.device_state_path)
+        store = FirmwareObservationStore(cast(StagingStore, staging).state_db)
         return FirmwareObservationWriter(
             store,
             config,
             on_error=on_error,
         )
 
-    def make_clock_correction_sink(self, staging: StagingPort) -> ClockDurabilityPort:
-        return ClockCorrectionStore(staging.device_state_path, staging.attempts_root)
+    def make_clock_state_store(self, staging: StagingPort) -> ClockStateStore:
+        return ClockStateStore(cast(StagingStore, staging).state_db)
 
     def publish_quarantined_prefix(
         self,

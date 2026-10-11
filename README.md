@@ -36,7 +36,7 @@ Omi Collector provides the narrow first stage:
 - verifies replayed overlap instead of silently skipping records;
 - corrects timestamps around recorded pendant clock changes;
 - atomically finalizes sealed ready bundles with per-range UTC metadata;
-- records operational metrics and recent debug context in local state.
+- records bounded operational metrics and a current runtime snapshot in local state.
 
 It deliberately does **not** transcode, run VAD, transcribe, or call the Omi
 cloud. Windmill owns downstream processing; the collector removes a ready
@@ -171,9 +171,10 @@ The service uses `INFO` journal output for durable operator signals: readiness,
 transfer progress and completion, failures, and recovery. Routine
 `storage_wait` polling and detailed `ble_link_session` records stay out of the
 INFO journal. A diagnostic sync can use `--log-level DEBUG` when those records
-are needed. Every sync callback and BLE link session is also retained in the
-bounded `debug.jsonl` ring under the collector root, so protect that state as
-you would the rest of the private collector data.
+are needed. Current progress, battery/firmware observations, and recent
+transfer-quality events are projected into the shared state database for
+`device status`; detailed diagnostic events are available through the system
+journal when DEBUG logging is enabled.
 
 For one machine-readable operational snapshot of systemd health, current
 transfer progress, last observed battery and firmware, device backlog,
@@ -196,8 +197,8 @@ the window has no completed transfer to assess and no attention condition. The
 outcome and termination-class breakdowns, and the confirmed-loss event, record,
 and raw-byte totals (`confirmed_loss_events`, `confirmed_lost_records`, and
 `confirmed_lost_raw_bytes`). Use `device metrics` for the publication
-inventory alone and `journalctl -u omi-collector.service` or `debug.jsonl` when
-the summary needs more context.
+inventory alone and `journalctl -u omi-collector.service` when the summary
+needs more context.
 
 For subsequent updates, select the reviewed revision in the production
 checkout and run:
@@ -240,6 +241,26 @@ sudo scripts/dev-deploy-release.sh v0.3.0
 Its parent is the storage root. The collector uses `collector` for private
 state, `draft` for unfinished raw audio, and `ready` for immutable published
 bundles. The checked-in systemd unit grants write access to this one fixed root.
+
+All mutable structured Collector state lives in
+`collector/collector-state.sqlite3`; `draft` and `ready` retain authenticated
+audio files and immutable manifests. One stable `collector/collector.lock`
+guards the complete service invocation and each command that can mutate
+Collector state. Read-only `device status` and `device metrics` use read-only
+database access and can run while the service is active. Keep the guard file in
+place; migration replaces the database file but never the guard inode.
+
+The canonical systemd deployment performs the offline cutover in the same
+transaction: it stops the service, runs the staged `migrate-state` command,
+assigns the database and stable lock to the service account, then starts the
+new release. Migration verifies imported state and clock-normalized raw records
+before activating the database and directly removes legacy mutable files. If
+cleanup is interrupted, keep the service stopped and rerun `migrate-state`
+with `--legacy-phy-state-home PATH` when the prior PHY marker lived under a
+user-owned state home. Once the database exists, the deployer keeps the new
+release selected rather than restarting a pre-migration binary. See
+[Best practices](docs/BEST_PRACTICES.md#state-ownership-and-offline-migration)
+for recovery details.
 
 Published bundles are a shared boundary. If another local account consumes
 them, configure either a shared Unix group or a default ACL on the ready root.
@@ -339,8 +360,8 @@ only where the ready manifest supplies a confirmed or explicitly approximate
 mapping. Recheck both behaviors after every firmware upgrade; a new version
 number alone is not proof that either one was fixed.
 
-Clock observations, including healthy reads, are retained in a separate
-immutable evidence ledger. A restart replays native causal observations without
+Clock observations, including healthy reads, are retained in the shared
+Collector state database. A restart replays native causal observations without
 a new BLE visit. Confirmed mappings use verified clock membership; approximate
 mappings use the host midpoint at a trusted RTC read and are explicitly marked
 in the manifest. Records outside every confirmed or approximate segment remain

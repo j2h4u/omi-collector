@@ -12,8 +12,9 @@ import json
 import logging
 import signal
 import sys
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -23,10 +24,11 @@ from bleak.backends.device import BLEDevice
 from ..config import DEFAULT_CONFIG, CollectorConfig
 from ..core import package_version
 from .adapters.bleak_transport import BleakPresenceObserver, BleakRingTransport, Device
+from .adapters.collector_state_db import StateDB
 from .adapters.opportunistic_runtime import OpportunisticRuntime
-from .adapters.phy_guard import ScopedPhyGuard
+from .adapters.phy_guard import PhyStateError, ScopedPhyGuard
 from .adapters.publication import SealResult
-from .adapters.quality_metrics import JsonlQualityMetrics, source_revision_from_release_metadata
+from .adapters.quality_metrics import SQLiteQualityMetrics, source_revision_from_release_metadata
 from .adapters.staging_store import StagingStore
 from .application import collector
 from .application.opportunistic_sync import (
@@ -45,6 +47,7 @@ TRANSFER_TIMEOUTS = collector.TransferTimeouts(
     info=DEFAULT_CONFIG.transfer.info_timeout_seconds,
     transfer=DEFAULT_CONFIG.transfer.collect_timeout_seconds,
 )
+_PHY_STATE_DB: ContextVar[StateDB | None] = ContextVar("omi_phy_state_db", default=None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +146,20 @@ class OperationInterruptedError(RuntimeError):
 
 def make_guard(adapter: str) -> ScopedPhyGuard:
     """Build the production scoped-PHY guard; tests monkeypatch this seam."""
-    return ScopedPhyGuard(adapter)
+    db = _PHY_STATE_DB.get()
+    if db is None:
+        raise PhyStateError("Collector state authority is not configured for PHY changes")
+    return ScopedPhyGuard(adapter, state_db=db)
+
+
+@contextmanager
+def phy_state_context(db: StateDB) -> Iterator[None]:
+    """Bind one Collector state authority to the current command lifecycle."""
+    token = _PHY_STATE_DB.set(db)
+    try:
+        yield
+    finally:
+        _PHY_STATE_DB.reset(token)
 
 
 def make_transport(  # noqa: PLR0913
@@ -345,13 +361,13 @@ def _quality_metrics(
     debug_logger: logging.Logger | None = None,
     *,
     operational_signal: Callable[[OperationalSignal], None] | None = None,
-) -> JsonlQualityMetrics | None:
+) -> SQLiteQualityMetrics | None:
     """Build auxiliary evidence storage without making capture depend on it."""
-    from .adapters.debug_logging import debug_event, debug_exception
+    from .adapters.debug_logging import debug_event, debug_exception, set_runtime_status_sink
 
     try:
-        metrics = JsonlQualityMetrics(
-            staging.paths.root,
+        metrics = SQLiteQualityMetrics(
+            staging.state_db,
             release_version=package_version(),
             source_revision=source_revision_from_release_metadata(),
             config=config.observability.quality_metrics,
@@ -359,6 +375,8 @@ def _quality_metrics(
         )
         if operational_signal is not None:
             metrics.set_operational_signal(operational_signal)
+        runtime_logger = debug_logger or logging.getLogger(config.observability.debug_log.logger_name)
+        set_runtime_status_sink(runtime_logger, metrics.record_runtime_status)
         debug_event("quality_metrics_ready", logger=debug_logger)
         return metrics
     except Exception as error:  # noqa: BLE001 - provenance/journal setup is auxiliary

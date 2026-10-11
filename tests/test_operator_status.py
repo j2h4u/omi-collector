@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 
 import omi_collector.operator_status as status_module
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossLedger, read_confirmed_losses
-from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging, debug_event
+from omi_collector.capture.adapters.debug_logging import (
+    write_runtime_status_event,
+)
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
-from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
+from omi_collector.capture.adapters.quality_metrics import (
+    QualityMetricsError,
+    SQLiteQualityMetrics,
+    import_quality_events,
+    quality_event_id,
+)
 from omi_collector.capture.application.quality_metrics import (
     AdvertisementMetric,
     ClockCorrectionMetric,
@@ -24,10 +31,35 @@ from omi_collector.capture.application.quality_metrics import (
 )
 from omi_collector.capture.domain.operational_status_machine import OperationalDimension, OperationalSignal
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
-from omi_collector.config import DEFAULT_CONFIG, DebugLogConfig, QualityMetricsConfig
+from omi_collector.config import QualityMetricsConfig
 from omi_collector.operator_status import OperatorStatusError, collect_operator_status
 from omi_collector.spool_metrics import FirmwareLifetimeMetrics, SpoolMetrics, SpoolWindowMetrics
+from omi_collector.state_migration import open_runtime_state
 from omi_collector.storage_layout import StorageLayout, load_operator_config
+
+
+def test_legacy_debug_parser_accepts_records_and_rejects_malformed_payload(tmp_path: Path) -> None:
+    path = tmp_path / "debug.jsonl"
+    row = {"timestamp": "2026-01-01T00:00:00+00:00", "event": "ble_link_rssi_observed", "fields": {"rssi_dbm": -71}}
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    assert status_module._debug_rows(path) == [row]
+    assert status_module._decode_connection_rssi(row) == (datetime(2026, 1, 1, tzinfo=UTC), -71)
+
+    path.write_text("{malformed}\n", encoding="utf-8")
+    with pytest.raises(OperatorStatusError, match="malformed JSON"):
+        status_module._debug_rows(path)
+    path.write_text("[]\n", encoding="utf-8")
+    with pytest.raises(OperatorStatusError, match="not an object"):
+        status_module._debug_rows(path)
+
+
+def test_legacy_rssi_projection_rejects_malformed_observation() -> None:
+    baseline = {"timestamp": "2026-01-01T00:00:00+00:00", "event": "ble_link_rssi_observed"}
+    assert status_module._decode_connection_rssi({**baseline, "event": "other"}) is None
+    assert status_module._decode_connection_rssi({**baseline, "fields": {"rssi_dbm": None}}) is None
+    for fields in (None, {"rssi_dbm": True}, {"rssi_dbm": "-70"}):
+        with pytest.raises(OperatorStatusError, match="invalid"):
+            status_module._decode_connection_rssi({**baseline, "fields": fields})
 
 
 def _layout(tmp_path: Path) -> StorageLayout:
@@ -47,12 +79,43 @@ def _spool() -> SpoolMetrics:
     )
 
 
+def _state_db(layout: StorageLayout) -> StateDB:
+    return open_runtime_state(layout)
+
+
+def _put_quality_events(layout: StorageLayout, events: tuple[dict[str, object], ...] | list[dict[str, object]]) -> None:
+    db = _state_db(layout)
+    rows = tuple((quality_event_id(event, suffix=f"{index:08d}"), event) for index, event in enumerate(events))
+    import_quality_events(db, rows)
+
+
+def _put_raw_quality_event(layout: StorageLayout, event: dict[str, object]) -> None:
+    db = _state_db(layout)
+    timestamp_key = str(event.get("recorded_at", event.get("completed_at", event.get("occurred_at", ""))))
+    sortable = datetime.fromisoformat(timestamp_key).astimezone(UTC).strftime("%Y%m%d%H%M%S%f")
+    db.put(StateKind.QUALITY_EVENT, f"{sortable}|malformed", event)
+
+
+def _put_runtime_events(layout: StorageLayout, rows: tuple[dict[str, object], ...] | list[dict[str, object]]) -> None:
+    db = _state_db(layout)
+    for row in rows:
+        if row.get("event") in {"sync_progress", "ble_link_rssi_observed"}:
+            write_runtime_status_event(
+                db, str(row["event"]), cast(dict[str, object], row["fields"]), str(row["timestamp"])
+            )
+
+
+def _put_raw_runtime_projection(layout: StorageLayout, projection: dict[str, object]) -> None:
+    _state_db(layout).put(StateKind.RUNTIME_STATUS, "current", projection)
+
+
 def _operational_status(
     layout: StorageLayout, states: dict[OperationalDimension, OperationalSignal]
 ) -> OperationalIdentity:
     identity = OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001")
-    ConfirmedLossLedger(layout.collector.confirmed_loss_ledger).initialize(allow_create=True)
-    store = OperationalStatusStore(layout.collector.operational_status, identity)
+    db = _state_db(layout)
+    ConfirmedLossLedger(db).initialize(allow_create=True)
+    store = OperationalStatusStore(db, identity)
     store.initialize()
     for dimension, signal in states.items():
         store.update(dimension, signal)
@@ -61,7 +124,7 @@ def _operational_status(
 
 def test_confirmed_loss_status_unions_intervals_and_deduplicates_keyed_projections(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    ledger = ConfirmedLossLedger(layout.collector.confirmed_loss_ledger)
+    ledger = ConfirmedLossLedger(_state_db(layout))
     ledger.initialize(allow_create=True)
     first_id = ledger.record("0123456789abcdef0123456789abcdef", 100, 110, "2026-09-08T09:30:00+00:00")
     extended_id = ledger.record("0123456789abcdef0123456789abcdef", 105, 115, "2026-09-08T09:31:00+00:00")
@@ -111,14 +174,13 @@ def test_confirmed_loss_status_unions_intervals_and_deduplicates_keyed_projectio
             None,
         ).as_dict(),
     ]
-    journal = layout.collector.root / DEFAULT_CONFIG.observability.quality_metrics.file_name
-    journal.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    _put_quality_events(layout, rows)
 
     quality = status_module._quality_window(
-        layout.collector.root,
+        _state_db(layout),
         datetime(2026, 9, 8, 9, tzinfo=UTC),
         datetime(2026, 9, 8, 10, tzinfo=UTC),
-        confirmed_losses=read_confirmed_losses(layout.collector.confirmed_loss_ledger),
+        confirmed_losses=read_confirmed_losses(_state_db(layout)),
     )
 
     assert quality.loss_events == 3
@@ -130,10 +192,10 @@ def test_durable_loss_remains_visible_without_degrading_clear_status(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
-    ledger = ConfirmedLossLedger(layout.collector.confirmed_loss_ledger)
+    ledger = ConfirmedLossLedger(_state_db(layout))
     ledger.initialize(allow_create=True)
     ledger.record("0123456789abcdef0123456789abcdef", 100, 110, "2026-09-08T09:30:00+00:00")
-    assert len(read_confirmed_losses(layout.collector.confirmed_loss_ledger)) == 1
+    assert len(read_confirmed_losses(_state_db(layout))) == 1
     _operational_status(
         layout,
         {
@@ -144,13 +206,9 @@ def test_durable_loss_remains_visible_without_degrading_clear_status(
     )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
     monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
-    journal = layout.collector.root / DEFAULT_CONFIG.observability.quality_metrics.file_name
-    journal.write_text(
-        json.dumps(
-            _transfer("2026-09-08T09:45:00+00:00", outcome="ok", termination_class="completed", written_raw_bytes=444)
-        )
-        + "\n",
-        encoding="utf-8",
+    _put_quality_events(
+        layout,
+        [_transfer("2026-09-08T09:45:00+00:00", outcome="ok", termination_class="completed", written_raw_bytes=444)],
     )
 
     result = collect_operator_status(
@@ -171,19 +229,15 @@ def test_confirmed_loss_with_blocked_publication_remains_attention(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
-    ledger = ConfirmedLossLedger(layout.collector.confirmed_loss_ledger)
+    ledger = ConfirmedLossLedger(_state_db(layout))
     ledger.initialize(allow_create=True)
     ledger.record("0123456789abcdef0123456789abcdef", 100, 110, "2026-09-08T09:30:00+00:00")
     identity = _operational_status(layout, {OperationalDimension.PUBLICATION: OperationalSignal.BLOCK})
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
     monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
-    journal = layout.collector.root / DEFAULT_CONFIG.observability.quality_metrics.file_name
-    journal.write_text(
-        json.dumps(
-            _transfer("2026-09-08T09:45:00+00:00", outcome="ok", termination_class="completed", written_raw_bytes=444)
-        )
-        + "\n",
-        encoding="utf-8",
+    _put_quality_events(
+        layout,
+        [_transfer("2026-09-08T09:45:00+00:00", outcome="ok", termination_class="completed", written_raw_bytes=444)],
     )
 
     result = collect_operator_status(
@@ -205,7 +259,7 @@ def test_status_fails_closed_when_initialized_loss_ledger_is_missing(
 ) -> None:
     layout = _layout(tmp_path)
     _operational_status(layout, {})
-    layout.collector.confirmed_loss_ledger.unlink()
+    _state_db(layout).delete(StateKind.CONFIRMED_LOSS, "ledger")
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
     monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
 
@@ -265,7 +319,7 @@ def _clock_correction(timestamp: str) -> dict[str, object]:
 
 def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    FirmwareObservationStore(layout.collector.device_state).record(RingInfo(10, 25, 100, 2, RECORD_SIZE))
+    FirmwareObservationStore(_state_db(layout)).record(RingInfo(10, 25, 100, 2, RECORD_SIZE))
     events = (
         _advertisement("2026-09-08T09:00:00+00:00"),
         _transfer(
@@ -280,9 +334,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         _loss("2026-09-08T09:15:00+00:00"),
         _clock_correction("2026-09-08T09:20:00+00:00"),
     )
-    (layout.collector.root / "quality.jsonl").write_text(
-        "".join(f"{json.dumps(event)}\n" for event in events), encoding="utf-8"
-    )
+    _put_quality_events(layout, events)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -359,7 +411,7 @@ def test_status_marks_persistent_runtime_failures_for_attention(
             "timestamp": "2026-09-08T09:02:00+00:00",
         },
     )
-    layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    _put_runtime_events(layout, rows)
     identity = _operational_status(
         layout,
         {
@@ -405,7 +457,7 @@ def test_status_preserves_lock_context_from_session_error(monkeypatch: pytest.Mo
         },
         "timestamp": "2026-09-08T09:00:00+00:00",
     }
-    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    _put_runtime_events(layout, [row])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -423,7 +475,7 @@ def test_status_clears_ready_publication_block_after_successful_noop_recovery(
         {"event": "ready_publication_blocked", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
         {"event": "ready_publication_recovered", "fields": {}, "timestamp": "2026-09-08T09:01:00+00:00"},
     )
-    layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    _put_runtime_events(layout, rows)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -442,7 +494,7 @@ def test_status_treats_expected_pendant_absence_as_unknown_without_completed_cle
         "fields": {"progress": {"status": "away"}},
         "timestamp": "2026-09-08T09:00:00+00:00",
     }
-    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    _put_runtime_events(layout, [row])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -459,17 +511,16 @@ def test_status_is_ok_only_after_a_completed_transfer_and_all_current_dimensions
         layout,
         dict.fromkeys(OperationalDimension, OperationalSignal.CLEAR),
     )
-    (layout.collector.root / "quality.jsonl").write_text(
-        json.dumps(
+    _put_quality_events(
+        layout,
+        [
             _transfer(
                 "2026-09-08T09:05:00+00:00",
                 outcome="collected",
                 termination_class="completed",
                 written_raw_bytes=4_440,
             )
-        )
-        + "\n",
-        encoding="utf-8",
+        ],
     )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
@@ -491,7 +542,7 @@ def test_debug_log_history_cannot_override_current_snapshot_state(
         "fields": {},
         "timestamp": "2026-09-08T09:00:00+00:00",
     }
-    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    _put_runtime_events(layout, [row])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC), identity=identity)
@@ -503,10 +554,10 @@ def test_debug_log_history_cannot_override_current_snapshot_state(
 
 def test_status_rejects_malformed_quality_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    (layout.collector.root / "quality.jsonl").write_text("not-json\n", encoding="utf-8")
+    _put_raw_quality_event(layout, {"event": "malformed", "occurred_at": "2026-09-08T09:00:00+00:00"})
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    with pytest.raises(OperatorStatusError, match="malformed JSON"):
+    with pytest.raises(OperatorStatusError, match="quality event history is invalid"):
         collect_operator_status(layout, hours=24)
 
 
@@ -516,7 +567,7 @@ def test_status_accepts_quality_record_without_deployment_revision(
     layout = _layout(tmp_path)
     event = _advertisement("2026-09-08T09:00:00+00:00")
     event["source_revision"] = None
-    (layout.collector.root / "quality.jsonl").write_text(f"{json.dumps(event)}\n", encoding="utf-8")
+    _put_quality_events(layout, [event])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -525,14 +576,14 @@ def test_status_accepts_quality_record_without_deployment_revision(
     assert quality["advertisements"] == 1
 
 
-def test_status_accepts_nul_prefix_before_valid_debug_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_status_uses_current_runtime_projection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     row = {
         "event": "sync_progress",
         "fields": {"progress": {"status": "away"}},
         "timestamp": "2026-09-08T09:00:00+00:00",
     }
-    layout.collector.debug_log.write_bytes(b"\x00" * 2_195 + json.dumps(row).encode() + b"\n")
+    _put_runtime_events(layout, [row])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -550,12 +601,19 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
         },
         {
             "event": "sync_progress",
-            "fields": {"progress": {"event": "pendant_observation", "battery_percent": 96, "firmware": "3.0.21"}},
+            "fields": {
+                "progress": {
+                    "status": "observed",
+                    "event": "pendant_observation",
+                    "battery_percent": 96,
+                    "firmware": "3.0.21",
+                }
+            },
             "timestamp": "2026-09-08T09:00:00+00:00",
         },
         {
             "event": "sync_progress",
-            "fields": {"progress": {"event": "pendant_observation", "firmware": "3.0.22"}},
+            "fields": {"progress": {"status": "observed", "event": "pendant_observation", "firmware": "3.0.22"}},
             "timestamp": "2026-09-08T09:00:01+00:00",
         },
         {
@@ -577,7 +635,7 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
             "timestamp": "2026-09-08T09:00:05+00:00",
         },
     )
-    layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    _put_runtime_events(layout, rows)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 9, 0, 10, tzinfo=UTC))
@@ -598,24 +656,33 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
 
 def test_status_rejects_invalid_runtime_rssi_type(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    row = {
-        "event": "ble_link_rssi_observed",
-        "fields": {"rssi_dbm": "not-an-integer"},
-        "timestamp": "2026-09-08T09:00:00+00:00",
-    }
-    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    _put_raw_runtime_projection(
+        layout,
+        {
+            "battery_observation": None,
+            "battery_observed_at": None,
+            "connection_rssi_dbm": "not-an-integer",
+            "connection_rssi_observed_at": "2026-09-08T09:00:00+00:00",
+            "last_error": None,
+            "last_error_at": None,
+            "observation": None,
+            "observation_at": None,
+            "progress": None,
+            "updated_at": None,
+        },
+    )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    with pytest.raises(OperatorStatusError, match="invalid rssi_dbm"):
+    with pytest.raises(OperatorStatusError, match="invalid connection RSSI"):
         collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("firmware_version", 42, "invalid firmware_version"),
-        ("advertisement_rssi_dbm", True, "invalid advertisement_rssi_dbm"),
-        ("advertisement_rssi_dbm", "not-an-integer", "invalid advertisement_rssi_dbm"),
+        ("firmware_version", 42, "quality event history is invalid"),
+        ("advertisement_rssi_dbm", True, "quality event history is invalid"),
+        ("advertisement_rssi_dbm", "not-an-integer", "quality event history is invalid"),
     ],
 )
 def test_status_rejects_invalid_optional_quality_fields(
@@ -630,14 +697,14 @@ def test_status_rejects_invalid_optional_quality_fields(
         "2026-09-08T09:05:00+00:00", outcome="collected", termination_class="completed", written_raw_bytes=444
     )
     event[field] = value
-    (layout.collector.root / "quality.jsonl").write_text(f"{json.dumps(event)}\n", encoding="utf-8")
+    _put_raw_quality_event(layout, event)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     with pytest.raises(OperatorStatusError, match=message):
         collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
 
-def test_status_reports_exact_limit_quality_journal_from_real_writer(
+def test_status_reports_quality_from_state_db_writer_and_rejects_oversized_event(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
@@ -660,32 +727,24 @@ def test_status_reports_exact_limit_quality_journal_from_real_writer(
         -91,
     )
 
-    def encoded_line(value: TransferSessionMetric) -> bytes:
+    def encoded_record(value: TransferSessionMetric) -> bytes:
         return json.dumps(value.as_dict(), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode() + b"\n"
 
-    padding = limit - len(encoded_line(metric))
+    padding = limit - len(encoded_record(metric))
     assert padding >= 0
     metric = replace(metric, session_id=metric.session_id + "s" * padding)
-    expected_line = encoded_line(metric)
-    assert len(expected_line) == limit
-
-    writer = JsonlQualityMetrics(layout.collector.root, release_version="1.2.3", config=quality_config)
+    assert len(encoded_record(metric)) == limit
+    writer = SQLiteQualityMetrics(_state_db(layout), release_version="1.2.3", config=quality_config)
     writer.record_transfer_session(metric)
     assert writer.close()
-    written_line = writer.path.read_bytes()
-    assert len(written_line) == limit
-    written_event = cast(dict[str, object], json.loads(written_line))
-    assert written_event["event"] == "transfer_session"
-    assert written_event["session_id"] == metric.session_id
-    assert written_event["written_raw_bytes"] == 444
-    monkeypatch.setattr(
-        status_module,
-        "DEFAULT_CONFIG",
-        replace(
-            DEFAULT_CONFIG,
-            observability=replace(DEFAULT_CONFIG.observability, quality_metrics=quality_config),
-        ),
-    )
+    stored = _state_db(layout).list(StateKind.QUALITY_EVENT)
+    assert len(stored) == 1
+    assert stored[0][1]["event"] == "transfer_session"
+    assert stored[0][1]["session_id"] == metric.session_id
+    assert stored[0][1]["written_raw_bytes"] == 444
+
+    with pytest.raises(QualityMetricsError, match="exceeds configured limit"):
+        writer.record_transfer_session(replace(metric, session_id=metric.session_id + "s"))
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -699,12 +758,21 @@ def test_status_rejects_non_mapping_sync_progress_as_handled_status_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
-    row = {
-        "event": "sync_progress",
-        "fields": {"progress": "malformed"},
-        "timestamp": "2026-09-08T09:00:00+00:00",
-    }
-    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    _put_raw_runtime_projection(
+        layout,
+        {
+            "battery_observation": None,
+            "battery_observed_at": None,
+            "connection_rssi_dbm": None,
+            "connection_rssi_observed_at": None,
+            "last_error": None,
+            "last_error_at": None,
+            "observation": None,
+            "observation_at": None,
+            "progress": "malformed",
+            "updated_at": "2026-09-08T09:00:00+00:00",
+        },
+    )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     with pytest.raises(OperatorStatusError, match="invalid progress"):
@@ -732,9 +800,7 @@ def test_status_marks_latest_fatal_transfer_as_attention_and_excludes_future_row
             written_raw_bytes=0,
         ),
     )
-    (layout.collector.root / "quality.jsonl").write_text(
-        "".join(f"{json.dumps(event)}\n" for event in events), encoding="utf-8"
-    )
+    _put_quality_events(layout, events)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -759,7 +825,7 @@ def test_status_rejects_nonpositive_or_boolean_window(hours: object, tmp_path: P
 def test_status_accepts_one_hour_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     event = _advertisement("2026-09-08T09:00:00+00:00")
-    (layout.collector.root / "quality.jsonl").write_text(f"{json.dumps(event)}\n", encoding="utf-8")
+    _put_quality_events(layout, [event])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=1, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -781,7 +847,7 @@ def test_status_uses_event_timestamps_when_runtime_journal_is_out_of_order(
         {"event": "ble_link_rssi_observed", "fields": {"rssi_dbm": -42}, "timestamp": "2026-09-08T09:02:00+00:00"},
         {
             "event": "sync_progress",
-            "fields": {"progress": {"event": "pendant_observation", "battery_percent": 88}},
+            "fields": {"progress": {"status": "observed", "event": "pendant_observation", "battery_percent": 88}},
             "timestamp": "2026-09-08T09:01:00+00:00",
         },
         {"event": "quality_metrics_configuration_error", "fields": {}, "timestamp": "2026-09-08T09:00:00+00:00"},
@@ -794,11 +860,11 @@ def test_status_uses_event_timestamps_when_runtime_journal_is_out_of_order(
         {"event": "ble_link_rssi_observed", "fields": {"rssi_dbm": -70}, "timestamp": "2026-09-08T08:58:00+00:00"},
         {
             "event": "sync_progress",
-            "fields": {"progress": {"event": "pendant_observation", "battery_percent": 12}},
+            "fields": {"progress": {"status": "observed", "event": "pendant_observation", "battery_percent": 12}},
             "timestamp": "2026-09-08T08:57:00+00:00",
         },
     )
-    layout.collector.debug_log.write_text("".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8")
+    _put_runtime_events(layout, rows)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -824,9 +890,7 @@ def test_status_summarizes_latest_quality_events_in_file_order_independently(
         _transfer("2026-09-08T09:00:00+00:00", outcome="older", termination_class="completed", written_raw_bytes=1),
         _clock_correction("2026-09-08T08:59:00+00:00"),
     )
-    (layout.collector.root / "quality.jsonl").write_text(
-        "".join(f"{json.dumps(event)}\n" for event in events), encoding="utf-8"
-    )
+    _put_quality_events(layout, events)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -837,72 +901,72 @@ def test_status_summarizes_latest_quality_events_in_file_order_independently(
     assert quality["last_clock_correction_at"] == "2026-09-08T09:02:00.000+00:00"
 
 
-def test_status_keeps_first_debug_observation_at_equal_millisecond_timestamps(
+def test_status_merges_equal_timestamp_runtime_events_into_one_current_projection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
-    first_timestamp = datetime(2026, 9, 8, 9, tzinfo=UTC)
-    seconds = (0, 0, 0, 1, 1, 2, 2, 3, 3)
-    timestamps = iter((first_timestamp + timedelta(seconds=second)).timestamp() for second in seconds)
-    original_factory = logging.getLogRecordFactory()
-    logger_name = "omi_collector.operator_status_equal_timestamp_test"
-
-    def timestamped_factory(*args: object, **kwargs: object) -> logging.LogRecord:
-        record = original_factory(*args, **kwargs)
-        if record.name == logger_name:
-            record.created = next(timestamps)
-        return record
-
-    debug_config = replace(
-        DEFAULT_CONFIG.observability.debug_log,
-        logger_name=logger_name,
+    timestamp = "2026-09-08T09:00:00+00:00"
+    rows = (
+        {
+            "event": "sync_progress",
+            "fields": {
+                "progress": {"status": "observed", "event": "pendant_observation", "firmware": "first-firmware"}
+            },
+            "timestamp": timestamp,
+        },
+        {
+            "event": "sync_progress",
+            "fields": {
+                "progress": {
+                    "status": "observed",
+                    "event": "pendant_observation",
+                    "firmware": "battery-firmware",
+                    "battery_percent": 88,
+                }
+            },
+            "timestamp": timestamp,
+        },
+        {
+            "event": "sync_progress",
+            "fields": {
+                "progress": {
+                    "status": "observed",
+                    "event": "pendant_observation",
+                    "firmware": "later-firmware",
+                    "battery_percent": 12,
+                }
+            },
+            "timestamp": timestamp,
+        },
+        {
+            "event": "sync_progress",
+            "fields": {"progress": {"status": "session_error", "error_message": "first-error"}},
+            "timestamp": timestamp,
+        },
+        {
+            "event": "sync_progress",
+            "fields": {"progress": {"status": "session_error", "error_message": "later-error"}},
+            "timestamp": timestamp,
+        },
+        {"event": "ble_link_rssi_observed", "fields": {"rssi_dbm": -42}, "timestamp": timestamp},
+        {"event": "ble_link_rssi_observed", "fields": {"rssi_dbm": -70}, "timestamp": timestamp},
+        {"event": "sync_progress", "fields": {"progress": {"status": "away"}}, "timestamp": timestamp},
+        {"event": "sync_progress", "fields": {"progress": {"status": "drained"}}, "timestamp": timestamp},
     )
-    logger = configure_debug_logging(layout.collector.root, debug_config)
-    logging.setLogRecordFactory(timestamped_factory)
-    try:
-        debug_event(
-            "sync_progress",
-            logger=logger,
-            progress={"event": "pendant_observation", "firmware": "first-firmware"},
-        )
-        debug_event(
-            "sync_progress",
-            logger=logger,
-            progress={"event": "pendant_observation", "firmware": "battery-firmware", "battery_percent": 88},
-        )
-        debug_event(
-            "sync_progress",
-            logger=logger,
-            progress={"event": "pendant_observation", "firmware": "later-firmware", "battery_percent": 12},
-        )
-        debug_event(
-            "sync_progress",
-            logger=logger,
-            progress={"status": "session_error", "error_message": "first-error"},
-        )
-        debug_event(
-            "sync_progress",
-            logger=logger,
-            progress={"status": "session_error", "error_message": "later-error"},
-        )
-        debug_event("ble_link_rssi_observed", logger=logger, rssi_dbm=-42)
-        debug_event("ble_link_rssi_observed", logger=logger, rssi_dbm=-70)
-        debug_event("sync_progress", logger=logger, progress={"status": "away"})
-        debug_event("sync_progress", logger=logger, progress={"status": "drained"})
-    finally:
-        logging.setLogRecordFactory(original_factory)
-        assert close_debug_logging(logger) == 0
+    _put_runtime_events(layout, rows)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
     runtime = cast(dict[str, object], result["runtime"])
-    assert result["schema_version"] == 2
-    assert runtime["state"] == "away"
-    assert runtime["firmware"] == "first-firmware"
-    assert runtime["battery_percent"] == 88
-    assert cast(dict[str, object], runtime["last_error"])["error_message"] == "first-error"
-    assert runtime["connection_rssi_dbm"] == -42
+    assert runtime["state"] == "drained"
+    assert runtime["firmware"] == "later-firmware"
+    assert runtime["battery_percent"] == 12
+    assert cast(dict[str, object], runtime["last_error"])["error_message"] == "later-error"
+    assert runtime["connection_rssi_dbm"] == -70
+    rows = _state_db(layout).list(StateKind.RUNTIME_STATUS)
+    assert len(rows) == 1
+    assert rows[0][0] == "current"
 
 
 def test_status_keeps_first_quality_observation_at_equal_timestamps(
@@ -910,54 +974,45 @@ def test_status_keeps_first_quality_observation_at_equal_timestamps(
 ) -> None:
     layout = _layout(tmp_path)
     timestamp = "2026-09-08T09:00:00.000+00:00"
-    writer = JsonlQualityMetrics(layout.collector.root, release_version="1.2.3")
-    try:
-        writer.record_advertisement(AdvertisementMetric(timestamp, "first-ad", -81, "1.2.3", "abcdef123456", "auto"))
-        writer.record_advertisement(AdvertisementMetric(timestamp, "later-ad", -22, "1.2.3", "abcdef123456", "auto"))
-        writer.record_transfer_session(
-            TransferSessionMetric(
-                timestamp,
-                "first-transfer",
-                "first-outcome",
-                "retryable_error",
-                2_000,
-                10,
-                1,
-                1,
-                1,
-                "1.2.3",
-                "abcdef123456",
-                "1.0.0",
-                "auto",
-                -91,
-            )
-        )
-        writer.record_transfer_session(
-            TransferSessionMetric(
-                timestamp,
-                "later-transfer",
-                "later-outcome",
-                "fatal_error",
-                2_000,
-                10,
-                2,
-                2,
-                2,
-                "1.2.3",
-                "abcdef123456",
-                "1.0.0",
-                "auto",
-                -91,
-            )
-        )
-        writer.record_clock_correction(
-            ClockCorrectionMetric(timestamp, "first-clock", 1.25, 1, 4, 4, "1.2.3", None, "1.0.0")
-        )
-        writer.record_clock_correction(
-            ClockCorrectionMetric(timestamp, "later-clock", 2.5, 1, 4, 4, "1.2.3", None, "1.0.0")
-        )
-    finally:
-        assert writer.close()
+    events = (
+        AdvertisementMetric(timestamp, "first-ad", -81, "1.2.3", "abcdef123456", "auto").as_dict(),
+        AdvertisementMetric(timestamp, "later-ad", -22, "1.2.3", "abcdef123456", "auto").as_dict(),
+        TransferSessionMetric(
+            timestamp,
+            "first-transfer",
+            "first-outcome",
+            "retryable_error",
+            2_000,
+            10,
+            1,
+            1,
+            1,
+            "1.2.3",
+            "abcdef123456",
+            "1.0.0",
+            "auto",
+            -91,
+        ).as_dict(),
+        TransferSessionMetric(
+            timestamp,
+            "later-transfer",
+            "later-outcome",
+            "fatal_error",
+            2_000,
+            10,
+            2,
+            2,
+            2,
+            "1.2.3",
+            "abcdef123456",
+            "1.0.0",
+            "auto",
+            -91,
+        ).as_dict(),
+        ClockCorrectionMetric(timestamp, "first-clock", 1.25, 1, 4, 4, "1.2.3", None, "1.0.0").as_dict(),
+        ClockCorrectionMetric(timestamp, "later-clock", 2.5, 1, 4, 4, "1.2.3", None, "1.0.0").as_dict(),
+    )
+    _put_quality_events(layout, events)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -972,60 +1027,28 @@ def test_status_keeps_first_quality_observation_at_equal_timestamps(
     assert result["status"] == "unknown"
 
 
-@pytest.mark.parametrize("journal", ["debug", "quality"])
-def test_status_accepts_exact_configured_record_limit_and_rejects_one_more(
-    journal: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_status_reads_one_current_runtime_projection_from_state_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
-    limit = 1_024
-    config = DEFAULT_CONFIG
-    if journal == "debug":
-        debug_config = DebugLogConfig(
-            max_bytes=2_048,
-            max_record_bytes=limit,
-            logger_name="omi_collector.operator_status_record_limit_test",
-        )
-        config = replace(
-            config,
-            observability=replace(config.observability, debug_log=debug_config),
-        )
-        logger = configure_debug_logging(layout.collector.root, debug_config)
-        try:
-            debug_event("sync_progress", logger=logger, progress={"status": "away"})
-        finally:
-            assert close_debug_logging(logger) == 0
-        path = layout.collector.debug_log
-    else:
-        quality_config = QualityMetricsConfig(max_bytes=2_048, backup_count=1, max_record_bytes=limit)
-        config = replace(
-            config,
-            observability=replace(config.observability, quality_metrics=quality_config),
-        )
-        writer = JsonlQualityMetrics(layout.collector.root, release_version="1.2.3", config=quality_config)
-        try:
-            writer.record_advertisement(
-                AdvertisementMetric("2026-09-08T09:00:00+00:00", "boundary", -91, "1.2.3", None, "auto")
-            )
-        finally:
-            assert writer.close()
-        path = layout.collector.root / "quality.jsonl"
-    monkeypatch.setattr(status_module, "DEFAULT_CONFIG", config)
+    _put_runtime_events(
+        layout,
+        [
+            {
+                "event": "sync_progress",
+                "fields": {"progress": {"status": "away"}},
+                "timestamp": "2026-09-08T09:00:00+00:00",
+            }
+        ],
+    )
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    record = path.read_bytes().removesuffix(b"\n")
-    assert len(record) < limit
-    path.write_bytes(record + b" " * (limit - len(record)) + b"\n")
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
-    assert result["schema_version"] == 2
-    if journal == "debug":
-        assert cast(dict[str, object], result["runtime"])["state"] == "away"
-    else:
-        assert cast(dict[str, object], result["quality_window"])["advertisements"] == 1
-
-    path.write_bytes(record + b" " * (limit + 1 - len(record)) + b"\n")
-    with pytest.raises(OperatorStatusError, match="record exceeds configured size"):
-        collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+    assert cast(dict[str, object], result["runtime"])["state"] == "away"
+    rows = _state_db(layout).list(StateKind.RUNTIME_STATUS)
+    assert len(rows) == 1
+    assert rows[0][0] == "current"
 
 
 def test_status_includes_both_quality_window_edges_and_equal_clock_sequences(
@@ -1037,9 +1060,7 @@ def test_status_includes_both_quality_window_edges_and_equal_clock_sequences(
     correction = _clock_correction("2026-09-08T10:00:00+00:00")
     correction["boundary_sequence_min"] = 4
     correction["boundary_sequence_max"] = 4
-    (layout.collector.root / "quality.jsonl").write_text(
-        "".join(f"{json.dumps(event)}\n" for event in (start, end, correction)), encoding="utf-8"
-    )
+    _put_quality_events(layout, (start, end, correction))
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=1, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -1049,11 +1070,11 @@ def test_status_includes_both_quality_window_edges_and_equal_clock_sequences(
     assert quality["clock_corrections"] == 1
 
 
-def test_status_returns_empty_quality_window_when_collector_root_is_absent(
+def test_status_returns_empty_quality_window_when_no_events_are_stored(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
-    layout.collector.root.rmdir()
+    _state_db(layout)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -1076,7 +1097,7 @@ def test_status_reports_fraction_only_for_positive_integer_totals(
         "fields": {"progress": {"status": "progress", "records_completed": completed, "records_total": total}},
         "timestamp": "2026-09-08T09:03:00+00:00",
     }
-    layout.collector.debug_log.write_text(f"{json.dumps(row)}\n", encoding="utf-8")
+    _put_runtime_events(layout, [row])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
@@ -1112,7 +1133,7 @@ def test_status_rejects_quality_events_with_malformed_field_types(
     layout = _layout(tmp_path)
     event = factory("2026-09-08T09:00:00+00:00")
     event[key] = value
-    (layout.collector.root / "quality.jsonl").write_text(f"{json.dumps(event)}\n", encoding="utf-8")
+    _put_raw_quality_event(layout, event)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
     with pytest.raises(OperatorStatusError, match="invalid"):

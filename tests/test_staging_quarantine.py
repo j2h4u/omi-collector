@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from errno import EXDEV
 from hashlib import sha256
-from json import dumps, loads
+from json import dumps
 from os import PathLike, fsync
 from pathlib import Path
 from shutil import rmtree
@@ -16,6 +16,7 @@ import pytest
 
 from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters import staging_filesystem
+from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
     DeviceAlreadyRunningError,
@@ -23,10 +24,10 @@ from omi_collector.capture.adapters.staging_contract import (
     StagingError,
 )
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.quarantine_machine import QuarantineState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, DurabilityConfig, StagingRetentionConfig
+from staging_test_factory import StagingStore, attempt_payload
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -60,10 +61,32 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
     return attempt
 
 
-def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:
-    checkpoint = cast(dict[str, object], loads(path.read_text(encoding="utf-8")))
-    checkpoint[field] = value
-    path.write_text(dumps(checkpoint), encoding="utf-8")
+def _quarantine_state(store: StagingStore, entry: Path) -> dict[str, object]:
+    row = store.state_db.get(StateKind.QUARANTINE, entry.name)
+    assert row is not None
+    return row
+
+
+def _rewrite_quarantine_state(store: StagingStore, entry: Path, field: str, value: object) -> None:
+    row = _quarantine_state(store, entry)
+    row[field] = value
+    store.state_db.put(StateKind.QUARANTINE, entry.name, row)
+
+
+def _record_retired_ready_ack(store: StagingStore, start_sequence: int, next_sequence: int, raw_sha256: str) -> str:
+    bundle_id = sha256(f"{start_sequence}:{next_sequence}:{raw_sha256}".encode()).hexdigest()
+    store.state_db.put(
+        StateKind.READY_PUBLICATION,
+        bundle_id,
+        {
+            "records_sha256": raw_sha256,
+            "state": "retired",
+            "start_sequence": start_sequence,
+            "next_sequence": next_sequence,
+            "draft_raw_sha256": raw_sha256,
+        },
+    )
+    return bundle_id
 
 
 def _replace_with_symlink(path: Path, target: Path, payload: bytes | str) -> None:
@@ -120,14 +143,15 @@ def test_device_lock_quarantines_hard_crash_publication_leftover(tmp_path: Path)
     payload = _record(1)
     (leftover / "records.bin").write_bytes(payload)
 
-    with StagingStore(spool, capture_root).device_lock():
+    store = StagingStore(spool, capture_root)
+    with store.device_lock():
         pass
 
     assert not leftover.exists()
     quarantined = tuple(path for path in (spool / "quarantine").glob("capture-temporary-*") if path.is_dir())
     assert len(quarantined) == 1
     assert (quarantined[0] / "records.bin").read_bytes() == payload
-    assert (quarantined[0] / "unprocessable.json").is_file()
+    assert _quarantine_state(store, quarantined[0])["terminal_state"] == "unprocessable"
 
 
 def test_device_lock_finalizes_complete_capture_local_publication_temporary(tmp_path: Path) -> None:
@@ -156,20 +180,29 @@ def test_terminal_quarantine_expires_at_exact_retention_and_preserves_live_evide
     config = CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0))
     store = StagingStore(tmp_path, _capture_root(tmp_path), config=config)
     root = tmp_path / "quarantine"
-    published = root / "published-source"
-    unprocessable = root / "unprocessable-source"
-    published.mkdir(parents=True)
-    unprocessable.mkdir()
-    (published / "records.bin").write_bytes(b"published evidence")
-    (unprocessable / "records.bin").write_bytes(b"unprocessable evidence")
+    published_attempt = store.prepare_streaming_attempt(100, 1)
+    published_attempt.record_read_begin(ReadBeginNotification(100, 1))
+    published_attempt.accept_chunk(100, _record(1))
+    published_attempt.checkpoint()
+    published_attempt.close(durable=True)
+    published = store.quarantine_attempt_source(published_attempt.attempt_id)
     store.mark_quarantine_published(published)
+    unprocessable_attempt = store.prepare_streaming_attempt(200, 1)
+    unprocessable_attempt.record_read_begin(ReadBeginNotification(200, 1))
+    unprocessable_attempt.accept_chunk(200, _record(2))
+    unprocessable_attempt.checkpoint()
+    unprocessable_attempt.close(durable=True)
+    unprocessable = store.quarantine_attempt_source(unprocessable_attempt.attempt_id)
     store.mark_quarantine_unprocessable(unprocessable, "strict proof failed")
-    live = root / "live-source"
-    live.mkdir()
-    (live / "records.bin").write_bytes(b"live evidence")
+    live_attempt = store.prepare_streaming_attempt(300, 1)
+    live_attempt.record_read_begin(ReadBeginNotification(300, 1))
+    live_attempt.accept_chunk(300, _record(3))
+    live_attempt.checkpoint()
+    live_attempt.close(durable=True)
+    live = store.quarantine_attempt_source(live_attempt.attempt_id)
     malformed = root / "malformed-source"
     malformed.mkdir()
-    (malformed / "unprocessable.json").write_bytes(b"{")
+    (malformed / "records.bin").write_bytes(b"untracked evidence")
 
     def contents() -> dict[Path, bytes]:
         return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
@@ -185,23 +218,20 @@ def test_terminal_quarantine_expires_at_exact_retention_and_preserves_live_evide
     assert not published.exists()
     assert not unprocessable.exists()
     assert contents() == {
-        path: payload
-        for path, payload in original_contents.items()
-        if path.parts[0] in {"live-source", "malformed-source"}
+        path: payload for path, payload in original_contents.items() if path.parts[0] in {live.name, "malformed-source"}
     }
 
 
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     [
-        ("version", True),
-        ("version", 2),
-        ("state", "published"),
-        ("classified_at_unix_ns", True),
-        ("classified_at_unix_ns", "1000000000"),
-        ("classified_at_unix_ns", -1),
-        ("reason", ""),
-        ("reason", None),
+        ("terminal_state", True),
+        ("terminal_state", "published"),
+        ("terminal_at_unix_ns", True),
+        ("terminal_at_unix_ns", "1000000000"),
+        ("terminal_at_unix_ns", -1),
+        ("terminal_reason", ""),
+        ("terminal_reason", None),
         ("original_name", ""),
         ("original_name", 7),
     ],
@@ -225,153 +255,79 @@ def test_terminal_quarantine_rejects_malformed_marker_fields_without_mutation(
         attempt.close(durable=True)
     entry = store.quarantine_attempt_source(attempt.attempt_id)
     store.mark_quarantine_unprocessable(entry, "authenticated fixture")
-    marker_path = entry / "unprocessable.json"
-    valid_marker = cast(dict[str, object], loads(marker_path.read_text(encoding="utf-8")))
-    marker = {**valid_marker, field: invalid_value}
-    marker_bytes = dumps(marker).encode()
-    marker_path.write_bytes(marker_bytes)
+    _rewrite_quarantine_state(store, entry, field, invalid_value)
+    malformed_row = _quarantine_state(store, entry)
     entry_contents = {path.relative_to(entry): path.read_bytes() for path in entry.rglob("*") if path.is_file()}
     now += 72_000_000_000
 
-    assert store.sweep_terminal_quarantine() == ()
-    assert set(store.quarantined_attempts()) == {entry}
+    with pytest.raises(StagingError, match="quarantine move state is malformed"):
+        store.sweep_terminal_quarantine()
     assert entry.exists()
-    assert marker_path.read_bytes() == marker_bytes
+    assert _quarantine_state(store, entry) == malformed_row
     assert {path.relative_to(entry): path.read_bytes() for path in entry.rglob("*") if path.is_file()} == entry_contents
 
 
-def test_quarantine_sidecar_requires_exact_or_uuid_suffixed_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
+def test_legacy_quarantine_sidecar_requires_exact_or_uuid_suffixed_identity(tmp_path: Path) -> None:
+    from omi_collector.capture.adapters.quarantine import legacy_quarantine_row
+
+    root = tmp_path / "legacy-quarantine"
+    root.mkdir()
+
+    def entry(name: str, original_name: object) -> Path:
+        path = root / name
+        path.mkdir()
+        (path / "records.bin").write_bytes(b"legacy evidence")
+        marker = {
+            "version": 1,
+            "state": "unprocessable",
+            "classified_at_unix_ns": 1,
+            "reason": "legacy classification",
+            "original_name": original_name,
+        }
+        path.with_name(f"{path.name}.json").write_text(dumps(marker), encoding="utf-8")
+        return path
+
+    exact = entry("exact", "exact")
+    suffixed = entry(f"visit-{'a' * 32}", "visit")
+    assert legacy_quarantine_row(exact)["terminal_state"] == "unprocessable"
+    assert legacy_quarantine_row(suffixed)["terminal_state"] == "unprocessable"
+
+    malformed = (
+        entry(f"short-{'a' * 31}", "short"),
+        entry(f"nonhex-{'g' * 32}", "nonhex"),
+        entry("wrong-prefix", "different"),
+        entry("empty-original", ""),
+        entry("nonstring-original", 7),
     )
-    attempts = tmp_path / "attempts"
-    attempts.mkdir()
-    for name in (
-        "valid-exact",
-        "valid-uuid",
-        "wrong-prefix",
-        "short-suffix",
-        "nonhex-suffix",
-        "empty-original",
-        "missing-original",
-        "nonstring-original",
-    ):
-        (attempts / name).write_bytes(f"evidence:{name}".encode())
-    by_original_name = {
-        cast(dict[str, object], loads(Path(f"{entry}.json").read_text(encoding="utf-8")))["original_name"]: entry
-        for entry in store.quarantine_pending("opaque fixture")
-    }
-    valid_exact = by_original_name["valid-exact"]
-    Path(f"{valid_exact}.json").write_text(
-        dumps(
-            {
-                **cast(dict[str, object], loads(Path(f"{valid_exact}.json").read_text(encoding="utf-8"))),
-                "original_name": valid_exact.name,
-            }
-        ),
+    missing_original = root / "missing-original"
+    missing_original.mkdir()
+    (missing_original / "records.bin").write_bytes(b"legacy evidence")
+    (missing_original.with_name(f"{missing_original.name}.json")).write_text(
+        dumps({"version": 1, "state": "unprocessable", "classified_at_unix_ns": 1, "reason": "legacy"}),
         encoding="utf-8",
     )
-
-    by_original_name["short-suffix"].rename(by_original_name["short-suffix"].with_name(f"short-suffix-{'a' * 31}"))
-    Path(f"{by_original_name['short-suffix']}.json").rename(
-        Path(f"{by_original_name['short-suffix'].with_name(f'short-suffix-{"a" * 31}')}.json")
-    )
-    by_original_name["nonhex-suffix"].rename(by_original_name["nonhex-suffix"].with_name(f"nonhex-suffix-{'g' * 32}"))
-    Path(f"{by_original_name['nonhex-suffix']}.json").rename(
-        Path(f"{by_original_name['nonhex-suffix'].with_name(f'nonhex-suffix-{"g" * 32}')}.json")
-    )
-    for original_name, marker_value in {
-        "wrong-prefix": "different-prefix",
-        "empty-original": "",
-        "nonstring-original": 7,
-    }.items():
-        marker_path = Path(f"{by_original_name[original_name]}.json")
-        marker_path.write_text(
-            dumps(
-                {
-                    **cast(dict[str, object], loads(marker_path.read_text(encoding="utf-8"))),
-                    "original_name": marker_value,
-                }
-            ),
-            encoding="utf-8",
-        )
-    Path(f"{by_original_name['missing-original']}.json").write_text(
-        dumps(
-            {
-                key: value
-                for key, value in cast(
-                    dict[str, object],
-                    loads(Path(f"{by_original_name['missing-original']}.json").read_text(encoding="utf-8")),
-                ).items()
-                if key != "original_name"
-            }
-        ),
-        encoding="utf-8",
-    )
-    invalid_entries = {
-        original_name: (
-            by_original_name[original_name].with_name(f"short-suffix-{'a' * 31}")
-            if original_name == "short-suffix"
-            else by_original_name[original_name].with_name(f"nonhex-suffix-{'g' * 32}")
-            if original_name == "nonhex-suffix"
-            else by_original_name[original_name]
-        )
-        for original_name in (
-            "wrong-prefix",
-            "short-suffix",
-            "nonhex-suffix",
-            "empty-original",
-            "missing-original",
-            "nonstring-original",
-        )
-    }
-    invalid_bytes = {
-        entry: (entry.read_bytes(), Path(f"{entry}.json").read_bytes()) for entry in invalid_entries.values()
-    }
-    now += 72_000_000_000
-
-    assert set(store.sweep_terminal_quarantine()) == {valid_exact, by_original_name["valid-uuid"]}
-    assert not valid_exact.exists()
-    assert not Path(f"{valid_exact}.json").exists()
-    assert not by_original_name["valid-uuid"].exists()
-    assert {
-        entry: (entry.read_bytes(), Path(f"{entry}.json").read_bytes()) for entry in invalid_entries.values()
-    } == invalid_bytes
+    for path in (*malformed, missing_original):
+        with pytest.raises(AttemptStateError, match="legacy quarantine"):
+            legacy_quarantine_row(path)
 
 
-def test_contradictory_quarantine_markers_remain_live_at_expiry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
-    )
-    entry = tmp_path / "quarantine" / "contradictory"
+def test_legacy_contradictory_quarantine_markers_are_rejected(tmp_path: Path) -> None:
+    from omi_collector.capture.adapters.quarantine import legacy_quarantine_row
+
+    root = tmp_path / "legacy-quarantine"
+    entry = root / "contradictory"
     entry.mkdir(parents=True)
-    evidence = entry / "records.bin"
-    evidence.write_bytes(b"contradictory evidence")
-    published = entry / "published.json"
-    published.write_text(dumps({"version": 1, "state": "published", "published_at_unix_ns": now}), encoding="utf-8")
-    unprocessable = entry / "unprocessable.json"
-    unprocessable.write_text(
-        dumps({"version": 1, "state": "unprocessable", "classified_at_unix_ns": now, "reason": "unverified"}),
+    (entry / "records.bin").write_bytes(b"contradictory evidence")
+    (entry / "published.json").write_text(
+        dumps({"version": 1, "state": "published", "published_at_unix_ns": 1}), encoding="utf-8"
+    )
+    (entry / "unprocessable.json").write_text(
+        dumps({"version": 1, "state": "unprocessable", "classified_at_unix_ns": 1, "reason": "conflict"}),
         encoding="utf-8",
     )
-    original = {path: path.read_bytes() for path in (evidence, published, unprocessable)}
-    now += 72_000_000_000
 
-    assert store.sweep_terminal_quarantine() == ()
-    assert set(store.quarantined_attempts()) == {entry}
-    assert {path: path.read_bytes() for path in (evidence, published, unprocessable)} == original
+    with pytest.raises(AttemptStateError, match="contradictory"):
+        legacy_quarantine_row(entry)
 
 
 def test_device_lock_rejects_symlink_publishing_root(tmp_path: Path) -> None:
@@ -408,13 +364,22 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
     attempt.close(durable=True)
     store.terminalize_prefix_attempt(attempt.attempt_id)
 
-    marker = cast(dict[str, object], loads((attempt.path / "terminal-retired.json").read_text(encoding="utf-8")))
+    attempt_state = attempt_payload(store, attempt.attempt_id)
+    assert attempt_state is not None
+    marker = cast(dict[str, object], attempt_state["terminal_retirement"])
     assert marker == {
         "version": 1,
         "state": "terminal-retired",
         "terminalized_at_unix_ns": now,
     }
     rmtree(result.bundle_path)
+    checkpoint = cast(dict[str, object], attempt_state["checkpoint"])
+    _record_retired_ready_ack(
+        store,
+        attempt.descriptor.start_sequence,
+        attempt.descriptor.start_sequence + cast(int, checkpoint["record_count"]),
+        cast(str, checkpoint["raw_sha256"]),
+    )
     active = store.prepare_streaming_attempt(200, 1)
     quarantine = tmp_path / "quarantine"
     quarantine.mkdir(parents=True)
@@ -431,7 +396,43 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
     assert preserved.read_text(encoding="utf-8") == "evidence"
 
 
-def test_terminal_retired_sweep_does_not_rehash_records_before_delete(
+@pytest.mark.parametrize("acknowledgement", ["absent", "mismatched"])
+def test_terminal_retired_missing_destination_without_exact_ack_is_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, acknowledgement: str
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
+    store = StagingStore(
+        tmp_path,
+        _capture_root(tmp_path),
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    attempt = store.prepare_streaming_attempt(100, 2)
+    attempt.record_read_begin(ReadBeginNotification(100, 2))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    result = attempt.publish_prefix()
+    assert result is not None
+    attempt.close(durable=True)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
+    rmtree(result.bundle_path)
+    if acknowledgement == "mismatched":
+        state = attempt_payload(store, attempt.attempt_id)
+        assert state is not None
+        checkpoint = cast(dict[str, object], state["checkpoint"])
+        _record_retired_ready_ack(
+            store,
+            attempt.descriptor.start_sequence,
+            attempt.descriptor.start_sequence + cast(int, checkpoint["record_count"]) + 1,
+            cast(str, checkpoint["raw_sha256"]),
+        )
+    now += 1_000_000_000
+
+    assert store.sweep_terminal_retired() == ()
+    assert attempt.path.exists()
+
+
+def test_terminal_retired_sweep_revalidates_checkpointed_records_before_delete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -452,13 +453,46 @@ def test_terminal_retired_sweep_does_not_rehash_records_before_delete(
     attempt.close(durable=True)
     store.terminalize_prefix_attempt(attempt.attempt_id)
     now += 1_000_000_000
-    monkeypatch.setattr(
-        quarantine_module,
-        "_published_prefix",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("retired records were rehashed")),
-    )
+    original_published_prefix = quarantine_module._published_prefix
+    reads: list[int] = []
+
+    def count_prefix_validation(*args: object, **kwargs: object) -> object:
+        reads.append(1)
+        return original_published_prefix(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(quarantine_module, "_published_prefix", count_prefix_validation)
     assert store.sweep_terminal_retired() == (attempt.path,)
+    assert reads == [1]
     assert not attempt.path.exists()
+
+
+def test_terminal_retired_sweep_keeps_attempt_with_checkpoint_digest_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
+    store = StagingStore(
+        tmp_path,
+        _capture_root(tmp_path),
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    assert attempt.publish_prefix() is not None
+    attempt.close(durable=True)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
+
+    state = attempt_payload(store, attempt.attempt_id)
+    assert state is not None
+    checkpoint = cast(dict[str, object], state["checkpoint"])
+    checkpoint["raw_sha256"] = "0" * 64
+    store.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, state)
+    now += 1_000_000_000
+
+    assert store.sweep_terminal_retired() == ()
+    assert attempt.path.exists()
 
 
 def test_quarantine_attempt_source_preserves_only_existing_attempt_files(tmp_path: Path) -> None:
@@ -503,39 +537,49 @@ def test_pending_attempts_fail_closed_on_unattributed_malformed_evidence(tmp_pat
     with pytest.raises(PendingAttemptError, match="blocks another READ"):
         store.assert_no_pending()
 
-    malformed = tmp_path / "attempts" / ("f" * 32)
+    malformed = tmp_path / "attempts" / "unattributed-entry"
     malformed.mkdir()
-    (malformed / "attempt.json").write_text("{", encoding="utf-8")
+    (malformed / "records.bin").write_bytes(b"unattributed raw evidence")
     with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
         store.pending_attempts()
     moved = store.quarantine_pending("unattributed malformed evidence")
     assert len(moved) == 2
     assert not matching.path.exists()
     assert not malformed.exists()
+    moved_rows = {_quarantine_state(store, entry)["source_name"]: _quarantine_state(store, entry) for entry in moved}
+    assert moved_rows[malformed.name]["attempt_id"] is None
 
 
 def test_pending_attempts_fail_closed_on_invalid_malformed_attribution(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir(parents=True)
-    (malformed / "attempt.json").write_text(
-        dumps({"attempt_id": malformed.name, "schema_version": 2}), encoding="utf-8"
-    )
+    (malformed / "records.bin").write_bytes(b"preserve malformed typed state")
+    state = {
+        "descriptor": {"attempt_id": malformed.name, "schema_version": 2},
+        "checkpoint": None,
+        "prefix_publication": None,
+        "terminal_retirement": None,
+    }
+    store.state_db.put(StateKind.ATTEMPT, malformed.name, state)
 
     with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
         store.pending_attempts()
     moved = store.quarantine_pending("invalid descriptor attribution")
     assert len(moved) == 1
     assert not malformed.exists()
-    assert (moved[0].with_name(f"{moved[0].name}.json")).is_file()
+    quarantine_row = _quarantine_state(store, moved[0])
+    assert quarantine_row["opaque"] is True
+    assert quarantine_row["terminal_state"] == "unprocessable"
+    assert quarantine_row["attempt_id"] == malformed.name
+    assert attempt_payload(store, malformed.name) is None
+    assert (moved[0] / "records.bin").read_bytes() == b"preserve malformed typed state"
 
 
 def test_attributable_malformed_evidence_is_quarantined_without_read_authorization(tmp_path: Path) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir(parents=True)
-    descriptor = dumps({"attempt_id": malformed.name, "schema_version": 2})
-    (malformed / "attempt.json").write_text(descriptor, encoding="utf-8")
     (malformed / "records.bin").write_bytes(b"unverified bytes")
     before = {path.name: path.read_bytes() for path in malformed.iterdir()}
 
@@ -545,7 +589,11 @@ def test_attributable_malformed_evidence_is_quarantined_without_read_authorizati
 
     assert len(moved) == 1
     assert not malformed.exists()
-    assert {path.name: path.read_bytes() for path in moved[0].iterdir() if path.name != "unprocessable.json"} == before
+    assert {path.name: path.read_bytes() for path in moved[0].iterdir()} == before
+    quarantine_row = _quarantine_state(store, moved[0])
+    assert quarantine_row["opaque"] is True
+    assert quarantine_row["terminal_state"] == "unprocessable"
+    assert quarantine_row["attempt_id"] == malformed.name
     store.assert_no_pending()
 
 
@@ -559,7 +607,7 @@ def test_quarantine_pending_moves_all_blockers_and_preserves_retired(tmp_path: P
     store.terminalize_prefix_attempt(published.attempt_id)
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir()
-    (malformed / "attempt.json").write_text("{", encoding="utf-8")
+    (malformed / "records.bin").write_bytes(b"unattributed malformed evidence")
 
     moved = store.quarantine_pending("manual recovery")
 
@@ -568,7 +616,8 @@ def test_quarantine_pending_moves_all_blockers_and_preserves_retired(tmp_path: P
     assert not malformed.exists()
     assert not unrelated.path.exists()
     assert published.path.exists()
-    assert (published.path / "terminal-retired.json").is_file()
+    published_state = attempt_payload(store, published.attempt_id)
+    assert published_state is not None and published_state["terminal_retirement"] is not None
     assert store.pending_attempts() == ()
 
 
@@ -706,7 +755,6 @@ def test_pending_sealed_looking_partial_requires_the_real_destination_bundle(tmp
     attempt.checkpoint()
     raw_hash = sha256(_record(1)).hexdigest()
     (attempt.path / "manifest.json").write_text(dumps(attempt._manifest(raw_hash)), encoding="utf-8")
-    (attempt.path / "receipt.json").write_text(dumps(attempt._receipt(raw_hash)), encoding="utf-8")
 
     with pytest.raises(PendingAttemptError):
         StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
@@ -721,9 +769,7 @@ def test_pending_partial_with_a_corrupt_destination_bundle_remains_blocking(tmp_
     destination.mkdir(parents=True)
     (destination / "records.bin").write_bytes(_record(9))
     (destination / "manifest.json").write_text(dumps(attempt._manifest(raw_hash)), encoding="utf-8")
-    (destination / "receipt.json").write_text(dumps(attempt._receipt(raw_hash)), encoding="utf-8")
     (attempt.path / "manifest.json").write_text(dumps(attempt._manifest(raw_hash)), encoding="utf-8")
-    (attempt.path / "receipt.json").write_text(dumps(attempt._receipt(raw_hash)), encoding="utf-8")
 
     with pytest.raises(PendingAttemptError):
         StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
@@ -845,9 +891,12 @@ def test_terminal_quarantine_sweep_defers_without_touching_aged_evidence(
         _capture_root(tmp_path),
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    entry = tmp_path / "quarantine" / "aged-evidence"
-    entry.mkdir(parents=True)
-    (entry / "records.bin").write_bytes(b"terminal evidence")
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt.accept_chunk(100, _record(1))
+    attempt.checkpoint()
+    attempt.close(durable=True)
+    entry = store.quarantine_attempt_source(attempt.attempt_id)
     store.mark_quarantine_unprocessable(entry, "not publishable")
     now += 1_000_000_000
     before = {path.relative_to(entry): path.read_bytes() for path in entry.rglob("*") if path.is_file()}
@@ -899,43 +948,6 @@ def test_quarantine_state_classifies_non_directory_as_invalid_evidence(tmp_path:
     assert opaque.read_text(encoding="utf-8") == "preserved evidence"
 
 
-def test_sidecar_plus_one_internal_quarantine_marker_remains_live_at_expiry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
-    entry = tmp_path / "quarantine" / "sidecar-conflict"
-    entry.mkdir(parents=True)
-    raw = entry / "records.bin"
-    raw.write_bytes(b"preserve contradictory evidence")
-    store.mark_quarantine_published(entry)
-    sidecar = entry.with_name(f"{entry.name}.json")
-    sidecar.write_text(
-        dumps(
-            {
-                "version": 1,
-                "state": "unprocessable",
-                "classified_at_unix_ns": now,
-                "reason": "preserve conflicting attribution",
-                "original_name": entry.name,
-            }
-        ),
-        encoding="utf-8",
-    )
-    marker = entry / "published.json"
-    before = {raw: raw.read_bytes(), marker: marker.read_bytes(), sidecar: sidecar.read_bytes()}
-    now += 1_000_000_000
-
-    assert store.sweep_terminal_quarantine() == ()
-    assert set(store.quarantined_attempts()) == {entry}
-    assert {path: path.read_bytes() for path in before} == before
-
-
 def test_published_quarantine_marker_with_extra_field_is_retained_for_reauthentication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -946,18 +958,23 @@ def test_published_quarantine_marker_with_extra_field_is_retained_for_reauthenti
         _capture_root(tmp_path),
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    entry = tmp_path / "quarantine" / "extra-published-field"
-    entry.mkdir(parents=True)
-    (entry / "records.bin").write_bytes(b"published but malformed marker")
+    attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    raw = _record(1)
+    attempt.accept_chunk(100, raw)
+    attempt.checkpoint()
+    attempt.close(durable=True)
+    entry = store.quarantine_attempt_source(attempt.attempt_id)
     store.mark_quarantine_published(entry)
-    marker = entry / "published.json"
-    _rewrite_checkpoint(marker, "unexpected", True)
-    original = marker.read_bytes()
+    _rewrite_quarantine_state(store, entry, "unexpected", True)
+    original = store.state_db.get(StateKind.QUARANTINE, entry.name)
     now += 1_000_000_000
 
-    assert store.sweep_terminal_quarantine() == ()
-    assert set(store.quarantined_attempts()) == {entry}
-    assert marker.read_bytes() == original
+    with pytest.raises(StagingError, match="quarantine move state is malformed"):
+        store.sweep_terminal_quarantine()
+    assert entry.exists()
+    assert store.state_db.get(StateKind.QUARANTINE, entry.name) == original
+    assert (entry / "records.bin").read_bytes() == raw
 
 
 def test_zero_timestamp_opaque_quarantine_expires_but_fresh_evidence_remains(
@@ -982,9 +999,9 @@ def test_zero_timestamp_opaque_quarantine_expires_but_fresh_evidence_remains(
 
     assert set(store.sweep_terminal_quarantine()) == {aged}
     assert not aged.exists()
-    assert not Path(f"{aged}.json").exists()
+    assert store.state_db.get(StateKind.QUARANTINE, aged.name) is None
     assert fresh.exists()
-    assert Path(f"{fresh}.json").exists()
+    assert store.state_db.get(StateKind.QUARANTINE, fresh.name) is not None
 
 
 def test_invalid_prefix_publication_marker_stays_pending_and_blocks_read(tmp_path: Path) -> None:
@@ -994,21 +1011,20 @@ def test_invalid_prefix_publication_marker_stays_pending_and_blocks_read(tmp_pat
     attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     attempt.close(durable=True)
-    marker = attempt.path / "prefix-publication.json"
-    marker.write_bytes(b'{"version":99}')
-    original = {path.name: path.read_bytes() for path in attempt.path.iterdir() if path.is_file()}
+    state = attempt_payload(store, attempt.attempt_id)
+    assert state is not None
+    state["prefix_publication"] = {"version": 99}
+    store.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, state)
+    original = attempt_payload(store, attempt.attempt_id)
 
     assert store.pending_attempts() == (attempt.descriptor,)
     with pytest.raises(PendingAttemptError):
         store.assert_no_pending()
 
-    assert {path.name: path.read_bytes() for path in attempt.path.iterdir() if path.is_file()} == original
+    assert attempt_payload(store, attempt.attempt_id) == original
 
 
-@pytest.mark.parametrize("collision_kind", ["destination", "sidecar"])
-def test_quarantine_name_allocation_skips_existing_destination_or_sidecar(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collision_kind: str
-) -> None:
+def test_quarantine_name_allocation_skips_existing_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     attempts = tmp_path / "attempts"
     attempts.mkdir()
@@ -1017,7 +1033,7 @@ def test_quarantine_name_allocation_skips_existing_destination_or_sidecar(
     quarantine_root = tmp_path / "quarantine"
     quarantine_root.mkdir()
     first_name = f"opaque-entry-{'a' * 32}"
-    collision_path = quarantine_root / (first_name if collision_kind == "destination" else f"{first_name}.json")
+    collision_path = quarantine_root / first_name
     collision_path.write_bytes(b"pre-existing collision evidence")
     choices = iter(("a" * 32, "b" * 32))
     monkeypatch.setattr(quarantine_module, "uuid4", lambda: SimpleNamespace(hex=next(choices)))
@@ -1027,9 +1043,9 @@ def test_quarantine_name_allocation_skips_existing_destination_or_sidecar(
     expected = quarantine_root / f"opaque-entry-{'b' * 32}"
     assert moved == (expected,)
     assert collision_path.read_bytes() == b"pre-existing collision evidence"
-    sidecar = expected.with_name(f"{expected.name}.json")
-    marker = cast(dict[str, object], loads(sidecar.read_text(encoding="utf-8")))
+    marker = _quarantine_state(store, expected)
     assert marker["original_name"] == "opaque-entry"
+    assert marker["physical_name"] == expected.name
 
 
 def test_quarantine_pending_reuses_existing_root_and_rejects_non_directory_root(tmp_path: Path) -> None:
@@ -1068,7 +1084,7 @@ def test_quarantine_pending_reuses_existing_root_and_rejects_non_directory_root(
 
 
 @pytest.mark.parametrize("entry_kind", ["symlink", "file"])
-def test_device_lock_quarantines_unsafe_capture_temporary_with_sidecar_only(tmp_path: Path, entry_kind: str) -> None:
+def test_device_lock_quarantines_unsafe_capture_temporary_in_typed_state(tmp_path: Path, entry_kind: str) -> None:
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     capture_root = _capture_root(tmp_path)
     capture_root.mkdir(parents=True)
@@ -1085,13 +1101,12 @@ def test_device_lock_quarantines_unsafe_capture_temporary_with_sidecar_only(tmp_
     with store.device_lock():
         pass
 
-    moved = tuple((tmp_path / "quarantine").glob("capture-temporary-*.tmp*"))
-    evidence = next(path for path in moved if not path.name.endswith(".json"))
-    sidecar = evidence.with_name(f"{evidence.name}.json")
-    marker = cast(dict[str, object], loads(sidecar.read_text(encoding="utf-8")))
+    evidence = next((tmp_path / "quarantine").glob("capture-temporary-*.tmp*"))
+    marker = _quarantine_state(store, evidence)
     assert not temporary.exists() and not temporary.is_symlink()
     assert marker["original_name"] == temporary.name
-    assert not (evidence / "unprocessable.json").exists()
+    assert marker["opaque"] is True
+    assert marker["terminal_state"] == "unprocessable"
     if entry_kind == "symlink":
         assert evidence.is_symlink()
         assert evidence.readlink() == outside

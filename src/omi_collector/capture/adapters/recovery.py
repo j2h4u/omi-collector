@@ -9,12 +9,11 @@ from pathlib import Path
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RECORD_SIZE
 from .staging_contract import (
-    _CHECKPOINT_NAME,
     _RAW_NAME,
     AttemptDescriptor,
     AttemptStateError,
     DurablePrefix,
-    _read_checkpoint,
+    _checkpoint_from_json,
 )
 from .staging_filesystem import StagingFilesystem, _hash_prefix, _never_defer, _require_regular_file
 
@@ -39,10 +38,12 @@ def _published_prefix(
     should_defer: Callable[[], bool] = _never_defer,
 ) -> DurablePrefix:
     raw_path = source / _RAW_NAME
-    checkpoint_path = source / _CHECKPOINT_NAME
     _require_regular_file(raw_path, "published partial raw")
-    _require_regular_file(checkpoint_path, "published partial checkpoint")
-    checkpoint = _read_checkpoint(checkpoint_path, descriptor.attempt_id)
+    row = filesystem._read_attempt_row(descriptor.attempt_id)
+    checkpoint_value = row["checkpoint"]
+    if not isinstance(checkpoint_value, dict):
+        raise AttemptStateError("published partial checkpoint is malformed")
+    checkpoint = _checkpoint_from_json(checkpoint_value, descriptor.attempt_id)
     raw_size = raw_path.stat().st_size
     if raw_size % RECORD_SIZE or checkpoint.record_count > descriptor.packet_count:
         raise AttemptStateError("published partial range is invalid")

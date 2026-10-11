@@ -16,12 +16,58 @@ import pytest
 from omi_collector.capture.adapters import ready_bundles, ready_closures
 from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_segments import ClockSegment, ClockSegmentMap
-from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG, ReadyConfig
+from staging_test_factory import StagingStore, closure_rows
 from test_publication_fsm import _count_raw_reads
 
 _finalize_impl = ready_bundles.finalize_drafts
+
+
+def _state_db(root: Path) -> StateDB:
+    root.mkdir(parents=True, exist_ok=True)
+    return StateDB(root / "collector-state.sqlite3")
+
+
+def _ledger_state(state_db: StateDB) -> dict[str, object]:
+    rows = dict(state_db.list(StateKind.READY_PUBLICATION))
+    frontier_row = rows.pop("frontier", {"value": 0})
+    frontier = frontier_row.get("value") if isinstance(frontier_row, dict) else None
+    return {"bundles": rows, "frontier": frontier}
+
+
+def _bundle_state(state_db: StateDB, bundle_id: str) -> dict[str, object]:
+    bundles = _ledger_state(state_db)["bundles"]
+    assert isinstance(bundles, dict)
+    row = bundles.get(bundle_id)
+    assert isinstance(row, dict)
+    return cast(dict[str, object], row)
+
+
+def _ledger_bytes(state_db: StateDB) -> bytes:
+    return dumps(state_db.list(StateKind.READY_PUBLICATION), sort_keys=True).encode()
+
+
+def _set_ledger_state(state_db: StateDB, document: dict[str, object]) -> None:
+    bundles = document.get("bundles")
+    frontier = document.get("frontier", 0)
+    with state_db.transaction() as transaction:
+        for bundle_id, _ in transaction.list(StateKind.READY_PUBLICATION):
+            transaction.delete(StateKind.READY_PUBLICATION, bundle_id)
+        transaction.put(StateKind.READY_PUBLICATION, "frontier", {"value": frontier})
+        if isinstance(bundles, dict):
+            for bundle_id, entry in bundles.items():
+                payload = entry if isinstance(entry, dict) else {}
+                transaction.put(StateKind.READY_PUBLICATION, str(bundle_id), payload)
+        else:
+            # A non-object bundles field cannot exist in StateDB. Preserve the
+            # invalid-ledger behavior as one malformed row that the reader rejects.
+            transaction.put(StateKind.READY_PUBLICATION, "invalid-ledger-shape", {})
+
+
+def _has_ledger(state_db: StateDB) -> bool:
+    return bool(state_db.list(StateKind.READY_PUBLICATION))
 
 
 def _finalize_drafts(*args: object, **kwargs: object) -> tuple[ready_bundles.ReadyBundleResult, ...]:
@@ -94,7 +140,7 @@ def test_drained_frontier_publishes_all_accumulated_audio_in_one_bundle(tmp_path
     config = ReadyConfig(target_audio_seconds=0.039)
 
     first_result = _finalize_drafts(
-        draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()), config=config
+        draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()), config=config
     )
 
     assert len(first_result) == 1
@@ -113,7 +159,7 @@ def test_target_without_a_drained_frontier_never_publishes(tmp_path: Path) -> No
     result = _finalize_impl(
         draft_root,
         tmp_path / "ready",
-        tmp_path / "ledger.json",
+        _state_db(tmp_path),
         ClockSegmentMap(()),
         config=ReadyConfig(target_audio_seconds=0.02),
     )
@@ -130,7 +176,7 @@ def test_drain_without_a_frontier_is_rejected_before_publication(tmp_path: Path)
         _finalize_impl(
             draft_root,
             tmp_path / "ready",
-            tmp_path / "ledger.json",
+            _state_db(tmp_path),
             ClockSegmentMap(()),
             config=ReadyConfig(target_audio_seconds=0.02),
             drained=True,
@@ -148,7 +194,7 @@ def test_closed_frontier_publishes_all_eligible_contiguous_drafts_and_keeps_futu
     result = _finalize_drafts(
         draft_root,
         tmp_path / "ready",
-        tmp_path / "ledger.json",
+        _state_db(tmp_path),
         ClockSegmentMap(()),
         config=ReadyConfig(target_audio_seconds=0.02),
         frontier=12,
@@ -163,7 +209,7 @@ def test_closed_frontier_does_not_cleanup_replay_overlap_from_a_future_draft(tmp
     draft_root = tmp_path / "draft"
     _audio_draft(draft_root, sequence=10)
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()), frontier=11)
     future = _audio_draft(draft_root, sequence=10)
 
@@ -180,7 +226,7 @@ def test_sequence_gap_publishes_actual_records_and_canonical_ledger_geometry(tmp
     outcome = _finalize_impl(
         draft_root,
         tmp_path / "ready",
-        tmp_path / "ledger.json",
+        _state_db(tmp_path),
         ClockSegmentMap(()),
         config=ReadyConfig(target_audio_seconds=0.02),
         frontier=13,
@@ -195,9 +241,7 @@ def test_sequence_gap_publishes_actual_records_and_canonical_ledger_geometry(tmp
     assert published.record_count == 2
     expected_id = sha256(f"10:13:{manifest['draft_raw_sha256']}:11-12".encode()).hexdigest()
     assert published.bundle_id == expected_id
-    entries = cast(
-        dict[str, dict[str, object]], loads((tmp_path / "ledger.json").read_text(encoding="utf-8"))["bundles"]
-    )
+    entries = cast(dict[str, dict[str, object]], _ledger_state(_state_db(tmp_path))["bundles"])
     entry = entries[expected_id]
     assert entry["gaps"] == [[11, 12]]
     assert not first.exists() and not second.exists()
@@ -214,7 +258,7 @@ def test_contiguous_overflow_break_publishes_byte_exact_independent_bundles(tmp_
     )
     source = _records_draft(draft_root, records, start_sequence=10)
 
-    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    published = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert [(item.next_sequence - item.record_count, item.next_sequence) for item in published] == [
         (10, 12),
@@ -230,7 +274,7 @@ def test_contiguous_overflow_break_between_drafts_creates_independent_bundles(tm
     _records_draft(draft_root, (_overflow_record(100, 99, 1),), start_sequence=10)
     _records_draft(draft_root, (_sized_record(24_496, 121, 2),), start_sequence=11)
 
-    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    published = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert [(item.next_sequence - item.record_count, item.next_sequence) for item in published] == [(10, 11), (11, 12)]
 
@@ -243,7 +287,7 @@ def test_matching_overflow_continuation_remains_one_bundle(tmp_path: Path) -> No
         start_sequence=10,
     )
 
-    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    published = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert len(published) == 1
     assert published[0].record_count == 2
@@ -270,13 +314,13 @@ def test_split_publication_keeps_source_until_every_child_is_durable(
 
     monkeypatch.setattr(ready_bundles, "_finalize_group", interrupted)
     with pytest.raises(OSError, match="interrupted"):
-        _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+        _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert source.exists()
     assert len(tuple((tmp_path / "ready").iterdir())) == 1
 
     monkeypatch.setattr(ready_bundles, "_finalize_group", original)
-    published = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    published = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert len(published) == 1
     assert source.exists() is False
@@ -294,7 +338,7 @@ def test_below_threshold_waits_and_clock_segments_are_preserved(tmp_path: Path) 
     result = _finalize_drafts(
         draft_root,
         tmp_path / "ready",
-        tmp_path / "ledger.json",
+        _state_db(tmp_path),
         segments,
         config=ReadyConfig(target_audio_seconds=60),
     )
@@ -329,7 +373,7 @@ def test_drafts_accumulate_across_drained_visits_and_publish_after_restart(tmp_p
     assert len(result) == 1
     assert result[0].record_count == 2
     assert not first.exists()
-    assert loads(restarted.ready_closures_path.read_text())["closures"] == []
+    assert closure_rows(restarted) == []
 
 
 def test_interrupted_new_nondrained_closure_blocks_older_drained_frontier(tmp_path: Path) -> None:
@@ -346,7 +390,7 @@ def test_interrupted_new_nondrained_closure_blocks_older_drained_frontier(tmp_pa
 
     assert store.recover_and_publish().state is ready_bundles.ReadyOutcomeState.WAITING
     assert not tuple(ready_root.iterdir())
-    assert ready_closures.load(store.ready_closures_path) == (ready_closures.ReadyClosure(12, "restart_interrupted"),)
+    assert ready_closures.load(store.state_db) == (ready_closures.ReadyClosure(12, "restart_interrupted"),)
 
 
 def test_group_recovery_after_ledger_write_finishes_source_cleanup(
@@ -360,11 +404,9 @@ def test_group_recovery_after_ledger_write_finishes_source_cleanup(
     monkeypatch.setattr(ready_bundles, "_remove_draft", lambda _: (_ for _ in ()).throw(OSError("crash")))
 
     with pytest.raises(OSError, match="crash"):
-        _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()), config=config)
+        _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()), config=config)
     monkeypatch.setattr(ready_bundles, "_remove_draft", remove)
-    result = _finalize_drafts(
-        draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()), config=config
-    )
+    result = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()), config=config)
 
     assert result == ()
     assert not first.exists() and not second.exists()
@@ -418,21 +460,21 @@ def _checkpoint(
 
 def _published_bundle_with_valid_ack(
     root: Path, *, timestamps: tuple[int, ...] = (100,)
-) -> tuple[Path, Path, Path, ready_bundles.ReadyBundleResult]:
+) -> tuple[Path, StateDB, Path, ready_bundles.ReadyBundleResult]:
     draft_root = root / "draft"
     ready_root = root / "ready"
-    ledger = root / "collector" / "ready-publications.json"
+    ledger = _state_db(root / "collector")
     _draft(draft_root, timestamps, start_sequence=100)
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
     checkpoint = _checkpoint(root, [(published.bundle_id, published.records_sha256)])
     return ready_root, ledger, checkpoint, published
 
 
-def _retirement_snapshot(published: ready_bundles.ReadyBundleResult, ledger: Path) -> dict[str, bytes]:
+def _retirement_snapshot(published: ready_bundles.ReadyBundleResult, ledger: StateDB) -> dict[str, bytes]:
     return {
         "records": (published.path / "records.bin").read_bytes(),
         "manifest": (published.path / "manifest.json").read_bytes(),
-        "ledger": ledger.read_bytes(),
+        "ledger": _ledger_bytes(ledger),
     }
 
 
@@ -483,7 +525,7 @@ def test_finalization_rewrites_only_confirmed_timestamp_ranges(tmp_path: Path) -
     original = (draft / "records.bin").read_bytes()
     segments = ClockSegmentMap((ClockSegment("observation", 11, 12, 0.6, 0.1),))
 
-    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", segments)
+    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", _state_db(tmp_path), segments)
 
     assert len(result) == 1
     ready = result[0].path
@@ -512,14 +554,14 @@ def test_finalization_refuses_ready_root_without_group_traversal(tmp_path: Path)
     (tmp_path / "ready").chmod(0o750)
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="not group-readable and setgid"):
-        _finalize_drafts(tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+        _finalize_drafts(tmp_path / "draft", tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
 
 def test_existing_ready_bundle_completes_crash_replay_before_draft_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     draft = _draft(tmp_path / "draft", (100,))
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     monkeypatch.setattr(ready_bundles, "_record_ready", lambda *_: (_ for _ in ()).throw(OSError("interrupted")))
     with pytest.raises(OSError, match="interrupted"):
@@ -535,16 +577,15 @@ def test_existing_ready_bundle_completes_crash_replay_before_draft_cleanup(
     manifest = cast(
         dict[str, object], loads(next((tmp_path / "ready").iterdir()).joinpath("manifest.json").read_text())
     )
-    assert (
-        loads(ledger.read_text(encoding="utf-8"))["bundles"][manifest["bundle_id"]]["records_sha256"]
-        == manifest["records_sha256"]
-    )
+    bundle_id = manifest.get("bundle_id")
+    assert isinstance(bundle_id, str)
+    assert _bundle_state(ledger, bundle_id)["records_sha256"] == manifest["records_sha256"]
 
 
 def test_unledgered_ready_reconciles_before_overlap_and_can_later_retire(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     ready_root = tmp_path / "ready"
     _draft(tmp_path / "draft", tuple(range(10)), start_sequence=100)
     monkeypatch.setattr(ready_bundles, "_record_ready", lambda *_: (_ for _ in ()).throw(OSError("interrupted")))
@@ -559,7 +600,7 @@ def test_unledgered_ready_reconciles_before_overlap_and_can_later_retire(
         path for path in ready_root.iterdir() if (path / "records.bin").stat().st_size == 10 * RECORD_SIZE
     )
     original_manifest = cast(dict[str, object], loads((original_path / "manifest.json").read_text()))
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     bundles = cast(dict[str, dict[str, object]], state["bundles"])
     original_id = cast(str, original_manifest["bundle_id"])
     original_hash = cast(str, original_manifest["records_sha256"])
@@ -573,7 +614,7 @@ def test_unknown_time_finalizes_without_changing_device_timestamps(tmp_path: Pat
     draft = _draft(tmp_path / "draft", (100, 101))
     original = (draft / "records.bin").read_bytes()
 
-    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert (result[0].path / "records.bin").read_bytes() == original
 
@@ -585,7 +626,7 @@ def test_timestamp_overflow_publishes_unchanged_unknown_range(tmp_path: Path) ->
     result = _finalize_drafts(
         tmp_path / "draft",
         tmp_path / "ready",
-        tmp_path / "ledger.json",
+        _state_db(tmp_path),
         ClockSegmentMap((ClockSegment("observation", 10, 12, 1.0, 0.1),)),
     )
 
@@ -607,7 +648,7 @@ def test_overflow_preflight_keeps_only_the_unrepresentable_record_range_unknown(
         )
     )
 
-    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", segments)
+    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), segments)
 
     manifest = cast(dict[str, object], loads((published.path / "manifest.json").read_text(encoding="utf-8")))
     records = (published.path / "records.bin").read_bytes()
@@ -637,7 +678,7 @@ def test_finalization_preserves_uint32_endpoints_and_clears_underflow_mapping(
     original_record = (original / "records.bin").read_bytes()
     segments = ClockSegmentMap((ClockSegment("boundary", 10, 11, offset, 0.0),))
 
-    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", segments)
+    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), segments)
 
     manifest = cast(dict[str, object], loads((published.path / "manifest.json").read_text(encoding="utf-8")))
     ready_record = (published.path / "records.bin").read_bytes()
@@ -659,7 +700,7 @@ def test_time_ranges_ignore_segments_outside_the_draft_interval(tmp_path: Path) 
         )
     )
 
-    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", segments)
+    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), segments)
 
     manifest = cast(dict[str, object], loads((published.path / "manifest.json").read_text(encoding="utf-8")))
     assert manifest["time_ranges"] == [
@@ -675,7 +716,7 @@ def test_approximate_clock_range_is_marked_in_ready_manifest(tmp_path: Path) -> 
     _draft(tmp_path / "draft", (100,))
     segments = ClockSegmentMap((ClockSegment("observation", 10, 11, 0.6, 0.1, "approximate"),))
 
-    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", tmp_path / "ledger.json", segments)
+    result = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", _state_db(tmp_path), segments)
 
     manifest = cast(dict[str, object], loads((result[0].path / "manifest.json").read_text(encoding="utf-8")))
     assert manifest["time_ranges"] == [
@@ -695,7 +736,7 @@ def test_approximate_clock_range_is_marked_in_ready_manifest(tmp_path: Path) -> 
 def test_replayed_published_bundle_keeps_its_original_time_mapping(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     _draft(draft_root, (100,), start_sequence=100)
     first = _finalize_drafts(
         draft_root, ready_root, ledger, ClockSegmentMap((ClockSegment("old", 100, 101, 1.0, 1.1),))
@@ -716,7 +757,7 @@ def test_replayed_published_bundle_keeps_its_original_time_mapping(tmp_path: Pat
 def test_contained_replay_uses_ready_payloads_without_creating_a_second_bundle(tmp_path: Path) -> None:
     start = 8_942_873
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", tuple(range(30)), start_sequence=start)
     _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
     duplicate = _draft(tmp_path / "draft", tuple(range(5, 25)), start_sequence=start + 5, marker_start=6)
@@ -730,7 +771,7 @@ def test_contained_replay_uses_ready_payloads_without_creating_a_second_bundle(t
 
 def test_replay_prefix_publishes_only_its_unique_suffix(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", tuple(range(10)), start_sequence=100)
     _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
     _draft(tmp_path / "draft", tuple(range(15)), start_sequence=100)
@@ -745,7 +786,7 @@ def test_replay_prefix_publishes_only_its_unique_suffix(tmp_path: Path) -> None:
 
 def test_conflicting_ready_overlap_keeps_draft_and_fails_closed(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", tuple(range(10)), start_sequence=100)
     _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
     draft = _draft(tmp_path / "draft", tuple(range(15)), start_sequence=100, marker_start=99)
@@ -759,7 +800,7 @@ def test_conflicting_ready_overlap_keeps_draft_and_fails_closed(tmp_path: Path) 
 
 def test_sequence_reuse_without_stream_epoch_is_never_silently_suppressed(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", tuple(range(10)), start_sequence=100)
     _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
     reset = _draft(tmp_path / "draft", tuple(range(10)), start_sequence=100, marker_start=99)
@@ -777,7 +818,7 @@ def test_sequence_gap_does_not_split_accumulated_audio(tmp_path: Path) -> None:
     outcome = ready_bundles.finalize_drafts(
         tmp_path / "draft",
         tmp_path / "ready",
-        tmp_path / "ledger.json",
+        _state_db(tmp_path),
         ClockSegmentMap(()),
         config=ReadyConfig(target_audio_seconds=0.02),
         frontier=131,
@@ -791,7 +832,7 @@ def test_sequence_gap_does_not_split_accumulated_audio(tmp_path: Path) -> None:
 
 def test_retired_exact_replay_is_removed_but_partial_retired_overlap_fails_closed(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", tuple(range(10)), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
@@ -811,7 +852,7 @@ def test_ack_retirement_records_ledger_before_unlink_and_recovers_after_each_bou
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
@@ -822,7 +863,7 @@ def test_ack_retirement_records_ledger_before_unlink_and_recovers_after_each_bou
     )
     with pytest.raises(OSError, match="before unlink"):
         ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
-    assert loads(ledger.read_text(encoding="utf-8"))["bundles"][published.bundle_id]["state"] == "retired"
+    assert _bundle_state(ledger, published.bundle_id)["state"] == "retired"
     assert published.path.exists()
 
     monkeypatch.setattr(ready_bundles, "_remove_retired_ready", original_remove)
@@ -845,7 +886,7 @@ def test_new_closure_recovers_retirement_committed_before_unlink(
 ) -> None:
     drafts = tmp_path / "draft"
     ready = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(drafts, (100,), start_sequence=100)
     old = _finalize_drafts(drafts, ready, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(old.bundle_id, old.records_sha256)])
@@ -873,14 +914,14 @@ def test_new_closure_recovers_retirement_committed_before_unlink(
     assert [item.next_sequence for item in published] == [102]
     assert not old.path.exists()
     assert open_draft.exists()
-    assert loads(ledger.read_text())["bundles"][old.bundle_id]["state"] == "retired"
+    assert _bundle_state(ledger, old.bundle_id)["state"] == "retired"
     assert store.recover_and_publish().state is ready_bundles.ReadyOutcomeState.WAITING
     assert open_draft.exists()
 
 
 def test_forged_or_open_tail_ack_never_deletes_ready_bundle(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     forged = _checkpoint(tmp_path, [(published.bundle_id, "b" * 64)])
@@ -911,7 +952,7 @@ def test_forged_or_open_tail_ack_never_deletes_ready_bundle(tmp_path: Path) -> N
 )
 def test_malformed_open_tail_never_mutates_acknowledged_bundle(tmp_path: Path, tail: dict[str, object]) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
@@ -921,7 +962,7 @@ def test_malformed_open_tail_never_mutates_acknowledged_bundle(tmp_path: Path, t
     before = {
         "records": (published.path / "records.bin").read_bytes(),
         "manifest": (published.path / "manifest.json").read_bytes(),
-        "ledger": ledger.read_bytes(),
+        "ledger": _ledger_bytes(ledger),
     }
 
     with pytest.raises(ready_bundles.ReadyBundleError):
@@ -930,12 +971,12 @@ def test_malformed_open_tail_never_mutates_acknowledged_bundle(tmp_path: Path, t
     assert published.path.exists()
     assert (published.path / "records.bin").read_bytes() == before["records"]
     assert (published.path / "manifest.json").read_bytes() == before["manifest"]
-    assert ledger.read_bytes() == before["ledger"]
+    assert _ledger_bytes(ledger) == before["ledger"]
 
 
 def test_valid_empty_open_tail_allows_acknowledged_bundle_retirement(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
@@ -952,7 +993,7 @@ def test_valid_empty_open_tail_allows_acknowledged_bundle_retirement(tmp_path: P
 @pytest.mark.parametrize("extra_fields", [False, True])
 def test_matching_open_tail_identity_blocks_ack_even_with_extra_fields(tmp_path: Path, extra_fields: bool) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
@@ -965,18 +1006,18 @@ def test_matching_open_tail_identity_blocks_ack_even_with_extra_fields(tmp_path:
         identity["annotation"] = "allowed by the subset contract"
     data["open_speech_tail"] = {"entries": [identity], "opened_at": 1, "outputs": []}
     checkpoint.write_text(dumps(data), encoding="utf-8")
-    before = ledger.read_bytes()
+    before = _ledger_bytes(ledger)
 
     with pytest.raises(ready_bundles.ReadyBundleError):
         ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
 
     assert published.path.exists()
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
 
 
 def test_nonmatching_open_tail_identity_allows_ack_with_extra_fields(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
@@ -996,7 +1037,7 @@ def test_nonmatching_open_tail_identity_allows_ack_with_extra_fields(tmp_path: P
 
 def test_ack_identity_retires_exact_bundle_without_reading_decision_contents(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     exact = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [(exact.bundle_id, exact.records_sha256)], decisions=[])
@@ -1015,19 +1056,19 @@ def test_ack_identity_retires_exact_bundle_without_reading_decision_contents(tmp
 
 def test_mixed_ack_batch_preflights_every_identity_before_retiring_any_bundle(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     _draft(tmp_path / "draft", (200,), start_sequence=101)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
     valid = (published[0].bundle_id, published[0].records_sha256)
     forged = ("f" * 64, "e" * 64)
     checkpoint = _checkpoint(tmp_path, [valid, forged])
-    before = ledger.read_bytes()
+    before = _ledger_bytes(ledger)
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="published ready bundle"):
         ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
 
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
     assert all(item.path.exists() for item in published)
 
 
@@ -1077,7 +1118,7 @@ def test_invalid_ready_utc_mapping_blocks_ack_retirement_without_mutation(tmp_pa
 )
 def test_invalid_ready_ledger_blocks_ack_retirement_without_mutation(tmp_path: Path, damage: str) -> None:
     ready_root, ledger, checkpoint, published = _published_bundle_with_valid_ack(tmp_path)
-    document = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    document = cast(dict[str, object], _ledger_state(ledger))
     if damage == "frontier-bool":
         document["frontier"] = True
     elif damage == "frontier-string":
@@ -1100,7 +1141,7 @@ def test_invalid_ready_ledger_blocks_ack_retirement_without_mutation(tmp_path: P
             entry["records_sha256"] = "z" * 64
         else:
             entry["draft_raw_sha256"] = "z" * 64
-    ledger.write_text(dumps(document), encoding="utf-8")
+    _set_ledger_state(ledger, document)
     before = _retirement_snapshot(published, ledger)
 
     with pytest.raises(ready_bundles.ReadyBundleError):
@@ -1141,19 +1182,18 @@ def test_invalid_ready_time_ranges_block_ack_retirement_without_mutation(tmp_pat
 def test_empty_zero_frontier_ledger_allows_empty_acknowledgement(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
     ready_root.mkdir()
-    ledger = tmp_path / "collector" / "ready-publications.json"
-    ledger.parent.mkdir()
-    ledger.write_text(dumps({"bundles": {}, "frontier": 0}), encoding="utf-8")
+    ledger = _state_db(tmp_path / "collector")
+    _set_ledger_state(ledger, {"bundles": {}, "frontier": 0})
     checkpoint = _checkpoint(tmp_path, [])
 
     assert ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint) == ()
-    assert loads(ledger.read_text(encoding="utf-8")) == {"bundles": {}, "frontier": 0}
+    assert _ledger_state(ledger) == {"bundles": {}, "frontier": 0}
 
 
 def test_contiguous_utc_ranges_with_zero_values_allow_ack_retirement(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(draft_root, (100, 101), start_sequence=100)
     segments = ClockSegmentMap(
         (
@@ -1190,7 +1230,7 @@ def test_contiguous_utc_ranges_with_zero_values_allow_ack_retirement(tmp_path: P
 
 def test_checkpoint_without_ack_does_not_delete_ready_bundle(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     _draft(tmp_path / "draft", (100,), start_sequence=100)
     published = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))[0]
     checkpoint = _checkpoint(tmp_path, [])
@@ -1214,7 +1254,7 @@ def test_ready_output_preserves_setgid_parent_without_setting_it_at_runtime(
 
     monkeypatch.setattr(Path, "chmod", restricted_chmod)
 
-    published = _finalize_drafts(tmp_path / "draft", ready_root, tmp_path / "ledger.json", ClockSegmentMap(()))[0]
+    published = _finalize_drafts(tmp_path / "draft", ready_root, _state_db(tmp_path), ClockSegmentMap(()))[0]
 
     assert S_IMODE(ready_root.stat().st_mode) == 0o2750
     assert S_IMODE(published.path.stat().st_mode) == 0o2750
@@ -1230,7 +1270,7 @@ def test_finalize_rejects_symlinked_draft_directory_without_touching_external_dr
     link.symlink_to(external, target_is_directory=True)
     original = {path.name: path.read_bytes() for path in external.iterdir()}
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="unsafe entry"):
         ready_bundles.finalize_drafts(
@@ -1240,7 +1280,7 @@ def test_finalize_rejects_symlinked_draft_directory_without_touching_external_dr
     assert link.is_symlink()
     assert {path.name: path.read_bytes() for path in external.iterdir()} == original
     assert not tuple(ready_root.iterdir())
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
 
 
 @pytest.mark.parametrize("damage", ("raw-size", "raw-digest"))
@@ -1264,7 +1304,7 @@ def test_finalize_rejects_authenticated_draft_record_mismatch(tmp_path: Path, da
         raw = bytes((raw[0] ^ 1,)) + raw[1:]
     raw_path.write_bytes(raw)
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="draft bundle records"):
         ready_bundles.finalize_drafts(
@@ -1274,7 +1314,7 @@ def test_finalize_rejects_authenticated_draft_record_mismatch(tmp_path: Path, da
     assert draft.exists()
     assert raw_path.read_bytes() == raw
     assert not tuple(ready_root.iterdir())
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
 
 
 def test_zero_start_draft_publishes_and_retires_through_public_contracts(tmp_path: Path) -> None:
@@ -1282,11 +1322,11 @@ def test_zero_start_draft_publishes_and_retires_through_public_contracts(tmp_pat
     draft = _draft(draft_root, (100,), start_sequence=0)
     original = (draft / "records.bin").read_bytes()
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
     manifest = cast(dict[str, object], loads((published.path / "manifest.json").read_text(encoding="utf-8")))
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
 
     assert (manifest["start_sequence"], manifest["next_sequence"]) == (0, 1)
@@ -1312,20 +1352,20 @@ def test_ready_reconciliation_rejects_overlap_and_accepts_adjacent_or_separate_r
         draft_root.parent.mkdir()
         _draft(draft_root, timestamps, start_sequence=start, marker_start=marker_start)
         local_ready = draft_root.parent / "ready"
-        (published,) = _finalize_drafts(draft_root, local_ready, draft_root.parent / "ledger.json", ClockSegmentMap(()))
+        (published,) = _finalize_drafts(draft_root, local_ready, _state_db(draft_root.parent), ClockSegmentMap(()))
         published_paths.append(published.path)
     for path in published_paths:
         path.rename(ready_root / path.name)
     draft_root = tmp_path / "empty-draft"
-    ledger = tmp_path / "common-ledger.json"
+    ledger = _state_db(tmp_path)
 
     if second_start == 101:
         with pytest.raises(ready_bundles.ReadyBundleError, match="ranges overlap"):
             _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
-        assert not ledger.exists()
+        assert not _has_ledger(ledger)
     else:
         assert _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(())) == ()
-        state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+        state = cast(dict[str, object], _ledger_state(ledger))
         assert len(cast(dict[str, object], state["bundles"])) == 2
 
     assert len(tuple(ready_root.iterdir())) == 2
@@ -1341,13 +1381,13 @@ def test_replay_after_two_ready_prefixes_publishes_only_the_unique_suffix(tmp_pa
         draft_root.parent.mkdir()
         _draft(draft_root, (sequence,), start_sequence=sequence, marker_start=marker)
         local_ready = draft_root.parent / "ready"
-        (published,) = _finalize_drafts(draft_root, local_ready, draft_root.parent / "ledger.json", ClockSegmentMap(()))
+        (published,) = _finalize_drafts(draft_root, local_ready, _state_db(draft_root.parent), ClockSegmentMap(()))
         prefix_records.append((published.bundle_id, (published.path / "records.bin").read_bytes()))
         published.path.rename(ready_root / published.path.name)
     draft_root = tmp_path / "replay-draft"
     replay = _draft(draft_root, (100, 101, 102), start_sequence=100, marker_start=10)
     replay_records = (replay / "records.bin").read_bytes()
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
 
     (suffix,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
 
@@ -1400,7 +1440,7 @@ def test_finalize_rejects_ready_path_that_disagrees_with_manifest_identity(tmp_p
     ready_root, ledger, _checkpoint_path, published = _published_bundle_with_valid_ack(tmp_path)
     original_records = (published.path / "records.bin").read_bytes()
     original_manifest = (published.path / "manifest.json").read_bytes()
-    original_ledger = ledger.read_bytes()
+    original_ledger = _ledger_bytes(ledger)
     moved = ready_root / "renamed-ready-bundle"
     published.path.rename(moved)
 
@@ -1410,7 +1450,7 @@ def test_finalize_rejects_ready_path_that_disagrees_with_manifest_identity(tmp_p
     assert moved.is_dir()
     assert (moved / "records.bin").read_bytes() == original_records
     assert (moved / "manifest.json").read_bytes() == original_manifest
-    assert ledger.read_bytes() == original_ledger
+    assert _ledger_bytes(ledger) == original_ledger
 
 
 def test_retirement_rejects_symlinked_manifest_without_touching_target(tmp_path: Path) -> None:
@@ -1446,13 +1486,13 @@ def test_finalize_rejects_self_consistent_zero_count_ready_bundle(tmp_path: Path
         },
         b"",
     )
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="manifest range"):
         _finalize_drafts(tmp_path / "empty-drafts", ready_root, ledger, ClockSegmentMap(()))
 
     assert (bundle / "records.bin").read_bytes() == b""
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
 
 
 @pytest.mark.parametrize(("start", "next_sequence"), ((-1, 0), (True, 2)))
@@ -1474,13 +1514,13 @@ def test_finalize_rejects_negative_or_boolean_ready_range_start(
         },
         record,
     )
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="metadata integer"):
         _finalize_drafts(tmp_path / "empty-drafts", ready_root, ledger, ClockSegmentMap(()))
 
     assert (bundle / "records.bin").read_bytes() == record
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
 
 
 @pytest.mark.parametrize("draft_digest", ("short", "g" * 64))
@@ -1502,13 +1542,13 @@ def test_finalize_rejects_malformed_ready_draft_digest_before_recording_ledger(
         },
         record,
     )
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="metadata digest"):
         _finalize_drafts(tmp_path / "empty-drafts", ready_root, ledger, ClockSegmentMap(()))
 
     assert (bundle / "manifest.json").is_file()
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
 
 
 def test_retirement_rejects_zero_interval_before_valid_full_time_coverage(tmp_path: Path) -> None:
@@ -1534,14 +1574,13 @@ def test_finalize_accepts_an_empty_zero_frontier_ledger_without_ack_shortcut(tmp
     ready_root = tmp_path / "ready"
     ready_root.mkdir(mode=0o2750)
     ready_root.chmod(0o2750)
-    ledger = tmp_path / "collector" / "ready-publications.json"
-    ledger.parent.mkdir()
-    ledger.write_text(dumps({"bundles": {}, "frontier": 0}), encoding="utf-8")
-    before = ledger.read_bytes()
+    ledger = _state_db(tmp_path / "collector")
+    _set_ledger_state(ledger, {"bundles": {}, "frontier": 0})
+    before = _ledger_bytes(ledger)
 
     assert _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(())) == ()
 
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
     assert draft_root.is_dir()
 
 
@@ -1562,8 +1601,7 @@ def test_finalize_rejects_unreferenced_malformed_ledger_entry_with_empty_roots(
     ready_root = tmp_path / "ready"
     ready_root.mkdir(mode=0o2750)
     ready_root.chmod(0o2750)
-    ledger = tmp_path / "collector" / "ready-publications.json"
-    ledger.parent.mkdir()
+    ledger = _state_db(tmp_path / "collector")
     entry: object = {
         "records_sha256": "b" * 64,
         "state": "ready",
@@ -1582,13 +1620,13 @@ def test_finalize_rejects_unreferenced_malformed_ledger_entry_with_empty_roots(
         cast(dict[str, object], entry)["draft_raw_sha256"] = expected
     elif damage == "boolean-start":
         cast(dict[str, object], entry)["start_sequence"] = expected
-    ledger.write_text(dumps({"bundles": {bundle_id: entry}, "frontier": 1}), encoding="utf-8")
-    before = ledger.read_bytes()
+    _set_ledger_state(ledger, {"bundles": {bundle_id: entry}, "frontier": 1})
+    before = _ledger_bytes(ledger)
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="publication ledger"):
         _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
 
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
     assert not tuple(ready_root.iterdir())
     assert draft_root.is_dir()
 
@@ -1601,7 +1639,7 @@ def test_finalize_validates_unreferenced_ledger_ranges_through_public_reader(
     ready_root = tmp_path / "ready"
     ready_root.mkdir(mode=0o2750)
     ready_root.chmod(0o2750)
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     entry = {
         "records_sha256": "b" * 64,
         "state": "ready",
@@ -1610,8 +1648,8 @@ def test_finalize_validates_unreferenced_ledger_ranges_through_public_reader(
         "draft_raw_sha256": "c" * 64,
     }
     bundle_id = sha256(f"{start}:{next_sequence}:{'c' * 64}".encode()).hexdigest() if valid else "a" * 64
-    ledger.write_text(dumps({"bundles": {bundle_id: entry}, "frontier": 1}), encoding="utf-8")
-    before = ledger.read_bytes()
+    _set_ledger_state(ledger, {"bundles": {bundle_id: entry}, "frontier": 1})
+    before = _ledger_bytes(ledger)
 
     if valid:
         assert _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(())) == ()
@@ -1619,7 +1657,7 @@ def test_finalize_validates_unreferenced_ledger_ranges_through_public_reader(
         with pytest.raises(ready_bundles.ReadyBundleError, match="publication ledger"):
             _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
 
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
 
 
 def test_finalize_rejects_insufficient_legacy_ledger_without_touching_ready(tmp_path: Path) -> None:
@@ -1627,29 +1665,29 @@ def test_finalize_rejects_insufficient_legacy_ledger_without_touching_ready(tmp_
     draft = _draft(draft_root, (100,), start_sequence=100)
     original_records = (draft / "records.bin").read_bytes()
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
 
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
-    initial = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    initial = cast(dict[str, object], _ledger_state(ledger))
     bundles = cast(dict[str, object], initial["bundles"])
     bundles[published.bundle_id] = {"records_sha256": published.records_sha256, "state": "ready"}
-    ledger.write_text(dumps(initial), encoding="utf-8")
+    _set_ledger_state(ledger, initial)
 
-    before = ledger.read_bytes()
+    before = _ledger_bytes(ledger)
     with pytest.raises(ready_bundles.ReadyBundleError, match="publication ledger"):
         _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
 
     assert initial["frontier"] == published.next_sequence
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
     assert (published.path / "records.bin").read_bytes() == original_records
 
 
-def test_finalize_creates_missing_storage_roots_and_nested_ledger_parent(tmp_path: Path) -> None:
+def test_finalize_creates_missing_draft_root_with_nested_state_db(tmp_path: Path) -> None:
     draft_root = tmp_path / "nested" / "drafts"
     ready_root = tmp_path / "ready"
     ready_root.mkdir(mode=0o2750)
     ready_root.chmod(0o2750)
-    ledger = tmp_path / "ledger-parent" / "nested" / "ready.json"
+    ledger = _state_db(tmp_path / "ledger-parent" / "nested")
 
     assert _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(())) == ()
     assert draft_root.is_dir()
@@ -1657,7 +1695,7 @@ def test_finalize_creates_missing_storage_roots_and_nested_ledger_parent(tmp_pat
     draft = _draft(draft_root, (100,), start_sequence=10)
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
 
-    assert ledger.is_file()
+    assert ledger.path.is_file()
     assert published.path.is_dir()
     assert not draft.exists()
 
@@ -1674,7 +1712,7 @@ def test_finalize_rejects_symlinked_ready_root_without_writing_to_target(tmp_pat
     sentinel.write_bytes(b"outside ready root")
     ready_root = tmp_path / "ready-link"
     ready_root.symlink_to(external_ready, target_is_directory=True)
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="storage root is unsafe"):
         _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
@@ -1683,7 +1721,7 @@ def test_finalize_rejects_symlinked_ready_root_without_writing_to_target(tmp_pat
     assert tuple(external_ready.iterdir()) == (sentinel,)
     assert sentinel.read_bytes() == b"outside ready root"
     assert draft.exists()
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
 
 
 def test_publication_propagates_ready_parent_fsync_failure_and_retries(
@@ -1694,7 +1732,7 @@ def test_publication_propagates_ready_parent_fsync_failure_and_retries(
     original_records = (draft / "records.bin").read_bytes()
     ready_root = tmp_path / "ready"
     ready_root.chmod(0o2750)
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     sentinel = OSError("ready parent fsync sentinel")
     original_fsync = ready_bundles.os.fsync
     failed = False
@@ -1721,10 +1759,10 @@ def test_publication_propagates_ready_parent_fsync_failure_and_retries(
     assert draft.exists()
     (published_path,) = tuple(ready_root.iterdir())
     assert (published_path / "records.bin").read_bytes() == original_records
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
     assert _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(())) == ()
     assert not draft.exists()
-    assert loads(ledger.read_text(encoding="utf-8"))["bundles"]
+    assert _ledger_state(ledger)["bundles"]
 
 
 @pytest.mark.parametrize("field", ("start_sequence", "next_sequence", "draft_raw_sha256"))
@@ -1733,11 +1771,11 @@ def test_replay_rejects_conflicting_retired_ledger_identity(tmp_path: Path, fiel
     original = _draft(draft_root, (100, 101), start_sequence=100)
     original_records = (original / "records.bin").read_bytes()
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "collector" / "ready-publications.json"
+    ledger = _state_db(tmp_path / "collector")
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
     ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     bundles = cast(dict[str, object], state["bundles"])
     entry = cast(dict[str, object], bundles[published.bundle_id])
     if field == "start_sequence":
@@ -1746,8 +1784,8 @@ def test_replay_rejects_conflicting_retired_ledger_identity(tmp_path: Path, fiel
         entry[field] = 103
     else:
         entry[field] = "d" * 64
-    ledger.write_text(dumps(state), encoding="utf-8")
-    before = ledger.read_bytes()
+    _set_ledger_state(ledger, state)
+    before = _ledger_bytes(ledger)
     replay = _draft(draft_root, (100, 101), start_sequence=100)
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="publication ledger"):
@@ -1755,7 +1793,7 @@ def test_replay_rejects_conflicting_retired_ledger_identity(tmp_path: Path, fiel
 
     assert replay.exists()
     assert (replay / "records.bin").read_bytes() == original_records
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
     assert not tuple(ready_root.iterdir())
 
 
@@ -1763,7 +1801,7 @@ def test_replay_republishes_ready_ledger_entry_when_its_payload_directory_is_mis
     draft_root = tmp_path / "draft"
     _draft(draft_root, (100,), start_sequence=100)
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
     original_records = (published.path / "records.bin").read_bytes()
     published.path.rename(tmp_path / "parked-ready")
@@ -1771,7 +1809,7 @@ def test_replay_republishes_ready_ledger_entry_when_its_payload_directory_is_mis
 
     result = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
 
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     assert len(result) == 1
     assert result[0].bundle_id == published.bundle_id
     assert (result[0].path / "records.bin").read_bytes() == original_records
@@ -1782,7 +1820,7 @@ def test_replay_republishes_ready_ledger_entry_when_its_payload_directory_is_mis
 
 def test_older_draft_is_ordering_blocked_and_retired_overlap_keeps_sources(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     _draft(tmp_path / "draft", (101,), start_sequence=101)
     (published,) = _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
     ready_bundles.retire_acknowledged(
@@ -1794,21 +1832,21 @@ def test_older_draft_is_ordering_blocked_and_retired_overlap_keeps_sources(tmp_p
         _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
     assert adjacent.exists()
     overlapping = _draft(tmp_path / "draft", (101, 102), start_sequence=101)
-    before_ledger = ledger.read_bytes()
+    before_ledger = _ledger_bytes(ledger)
     with pytest.raises(ready_bundles.ReadyBundleError, match="retired range"):
         _finalize_drafts(tmp_path / "draft", ready_root, ledger, ClockSegmentMap(()))
 
     assert overlapping.exists()
-    assert ledger.read_bytes() == before_ledger
+    assert _ledger_bytes(ledger) == before_ledger
 
 
 @pytest.mark.parametrize("damage", ("corrupt-intact", "partial-cleanup"))
 def test_resume_retired_authenticates_intact_bundle_and_finishes_partial_cleanup(tmp_path: Path, damage: str) -> None:
     ready_root, ledger, _checkpoint_path, published = _published_bundle_with_valid_ack(tmp_path)
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     entry = cast(dict[str, object], cast(dict[str, object], state["bundles"])[published.bundle_id])
     entry["state"] = "retired"
-    ledger.write_text(dumps(state), encoding="utf-8")
+    _set_ledger_state(ledger, state)
     records_path = published.path / "records.bin"
     manifest_path = published.path / "manifest.json"
     original_records = records_path.read_bytes()
@@ -1826,17 +1864,17 @@ def test_resume_retired_authenticates_intact_bundle_and_finishes_partial_cleanup
         ready_bundles.resume_retired(ready_root, ledger)
         assert not published.path.exists()
         assert not manifest_path.exists()
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     entry = cast(dict[str, object], cast(dict[str, object], state["bundles"])[published.bundle_id])
     assert entry["state"] == "retired"
 
 
 def test_resume_retired_rejects_symlinked_bundle_directory_without_touching_target(tmp_path: Path) -> None:
     ready_root, ledger, _checkpoint_path, published = _published_bundle_with_valid_ack(tmp_path)
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     entry = cast(dict[str, object], cast(dict[str, object], state["bundles"])[published.bundle_id])
     entry["state"] = "retired"
-    ledger.write_text(dumps(state), encoding="utf-8")
+    _set_ledger_state(ledger, state)
     external = tmp_path / "external-ready"
     (published.path / "records.bin").unlink()
     published.path.rename(external)
@@ -1853,10 +1891,10 @@ def test_resume_retired_rejects_symlinked_bundle_directory_without_touching_targ
 
 def test_finalize_refuses_active_ready_directory_marked_retired_in_ledger(tmp_path: Path) -> None:
     ready_root, ledger, _checkpoint_path, published = _published_bundle_with_valid_ack(tmp_path)
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     entry = cast(dict[str, object], cast(dict[str, object], state["bundles"])[published.bundle_id])
     entry["state"] = "retired"
-    ledger.write_text(dumps(state), encoding="utf-8")
+    _set_ledger_state(ledger, state)
     before = _retirement_snapshot(published, ledger)
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="not active"):
@@ -1927,7 +1965,7 @@ def test_identical_contained_and_partial_draft_overlaps_publish_each_record_once
 
     monkeypatch.setattr(ready_bundles, "_remove_draft", track_remove)
 
-    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert published.record_count == 5
     assert (published.path / "records.bin").read_bytes() == expected
@@ -1941,7 +1979,7 @@ def test_duplicate_packets_do_not_meet_threshold_and_conflict_preserves_all_sour
     duplicate = first.with_name("duplicate")
     copytree(first, duplicate)
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     config = ReadyConfig(target_audio_seconds=0.08)
 
     waiting = _finalize_impl(
@@ -1961,7 +1999,7 @@ def test_duplicate_packets_do_not_meet_threshold_and_conflict_preserves_all_sour
     with pytest.raises(ready_bundles.ConflictingOverlapError, match="conflicting record bytes"):
         _finalize_impl(draft_root, ready_root, ledger, ClockSegmentMap(()), config=config, frontier=103, drained=True)
     assert all(path.exists() for path in (first, duplicate, conflict))
-    assert not ledger.exists()
+    assert not _has_ledger(ledger)
 
 
 def test_overlap_normalization_compares_record_against_two_retained_slices(tmp_path: Path) -> None:
@@ -1970,7 +2008,7 @@ def test_overlap_normalization_compares_record_against_two_retained_slices(tmp_p
     _draft(draft_root, tuple(range(101, 110)), start_sequence=101, marker_start=2)
     _draft(draft_root, (104, 105), start_sequence=104, marker_start=5)
 
-    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", tmp_path / "ledger.json", ClockSegmentMap(()))
+    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", _state_db(tmp_path), ClockSegmentMap(()))
 
     assert published.record_count == 10
     assert (published.path / "records.bin").read_bytes() == b"".join(
@@ -1981,7 +2019,7 @@ def test_overlap_normalization_compares_record_against_two_retained_slices(tmp_p
 def test_sparse_replay_uses_physical_offsets_and_blocks_late_hole_fill(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     _draft(draft_root, (100,), start_sequence=10)
     _draft(draft_root, (102, 103), start_sequence=12, marker_start=2)
     (sparse,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
@@ -1994,24 +2032,24 @@ def test_sparse_replay_uses_physical_offsets_and_blocks_late_hole_fill(tmp_path:
     assert not replay.exists()
 
     hole = _draft(draft_root, (101,), start_sequence=11)
-    before = ledger.read_bytes()
+    before = _ledger_bytes(ledger)
     with pytest.raises(ready_bundles.ReadyBundleError, match="ordering is blocked"):
         _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
     assert hole.exists() and sparse.path.exists()
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before
 
 
 def test_sparse_ack_retirement_keeps_gap_geometry_and_blocks_late_fill(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     _draft(draft_root, (100,), start_sequence=10)
     _draft(draft_root, (102,), start_sequence=12)
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
 
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
     (retired,) = ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
-    entries = cast(dict[str, dict[str, object]], loads(ledger.read_text(encoding="utf-8"))["bundles"])
+    entries = cast(dict[str, dict[str, object]], _ledger_state(ledger)["bundles"])
     entry = entries[published.bundle_id]
     assert retired.record_count == 2
     assert entry["state"] == "retired" and entry["gaps"] == [[11, 12]]
@@ -2028,7 +2066,7 @@ def test_sparse_ready_destination_reconciles_ledger_before_source_cleanup(
 ) -> None:
     draft_root = tmp_path / "draft"
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     first = _draft(draft_root, (100,), start_sequence=10)
     second = _draft(draft_root, (102,), start_sequence=12)
     original = ready_bundles._record_ready
@@ -2046,7 +2084,7 @@ def test_sparse_ready_destination_reconciles_ledger_before_source_cleanup(
     assert _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(())) == ()
     assert not first.exists() and not second.exists()
     (destination,) = tuple(ready_root.iterdir())
-    assert loads(ledger.read_text(encoding="utf-8"))["bundles"][destination.name]["gaps"] == [[11, 12]]
+    assert _bundle_state(ledger, destination.name)["gaps"] == [[11, 12]]
 
 
 def test_cached_conflicting_overlap_survives_unrelated_ack_without_raw_reread(
@@ -2054,7 +2092,7 @@ def test_cached_conflicting_overlap_survives_unrelated_ack_without_raw_reread(
 ) -> None:
     draft_root = tmp_path / "draft"
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     _draft(draft_root, (10,), start_sequence=10)
     (older,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
     first = _draft(draft_root, (100, 101), start_sequence=100)
@@ -2132,7 +2170,7 @@ def test_sparse_identity_binds_hole_geometry_but_ignores_utc_splits(tmp_path: Pa
         else:
             _draft(draft_root, (100, 101), start_sequence=10)
             _draft(draft_root, (102,), start_sequence=13, marker_start=3)
-        return _finalize_drafts(draft_root, root / "ready", root / "ledger.json", segments)[0]
+        return _finalize_drafts(draft_root, root / "ready", _state_db(root), segments)[0]
 
     plain = publish(tmp_path / "plain", 11, ClockSegmentMap(()))
     split = publish(tmp_path / "split", 11, ClockSegmentMap((ClockSegment("clock", 13, 14, 0.5, 0.1),)))
@@ -2151,19 +2189,19 @@ def test_sparse_identity_binds_hole_geometry_but_ignores_utc_splits(tmp_path: Pa
 def test_sparse_ledger_gap_tampering_blocks_ack_without_source_mutation(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     ready_root = tmp_path / "ready"
-    ledger = tmp_path / "ledger.json"
+    ledger = _state_db(tmp_path)
     _draft(draft_root, (100,), start_sequence=10)
     _draft(draft_root, (102,), start_sequence=12)
     (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
     checkpoint = _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
-    state = cast(dict[str, object], loads(ledger.read_text(encoding="utf-8")))
+    state = cast(dict[str, object], _ledger_state(ledger))
     bundles = cast(dict[str, dict[str, object]], state["bundles"])
     bundles[published.bundle_id]["gaps"] = [[11, 13]]
-    ledger.write_text(dumps(state), encoding="utf-8")
-    before = ledger.read_bytes()
+    _set_ledger_state(ledger, state)
+    before = _ledger_bytes(ledger)
 
     with pytest.raises(ready_bundles.ReadyBundleError, match="publication ledger"):
         ready_bundles.retire_acknowledged(ready_root, ledger, checkpoint)
 
     assert published.path.exists()
-    assert ledger.read_bytes() == before
+    assert _ledger_bytes(ledger) == before

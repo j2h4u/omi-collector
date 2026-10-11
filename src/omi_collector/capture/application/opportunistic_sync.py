@@ -85,7 +85,7 @@ async def run_opportunistic_collector(
         except RuntimeError:
             return
 
-    options = _configure_clock_sinks(options, staging, runtime)
+    options = _configure_clock_state(options, staging, runtime)
     maintenance = QuarantineMaintenance(staging, options.activity, runtime, config=options.config)
     if options.clock_lease is None:
         options = replace(options, clock_lease=staging.clock_mutation_lease)
@@ -130,24 +130,11 @@ async def run_opportunistic_collector(
                     _close_quality_metrics(run)
 
 
-def _configure_clock_sinks(
+def _configure_clock_state(
     options: OpportunisticOptions, staging: StagingPort, runtime: CaptureRuntimePort
 ) -> OpportunisticOptions:
-    """Keep correction and observation capabilities typed and causally paired."""
-    correction = options.clock_correction_sink
-    if correction is None:
-        correction = runtime.make_clock_correction_sink(staging)
-    observation = options.clock_observation_sink
-    if observation is None:
-        observation = correction.observation_store
-    elif observation is not correction.observation_store:
-        raise ValueError("clock observation sink must belong to the clock correction sink")
-    return replace(
-        options,
-        clock_correction_sink=correction,
-        clock_observation_sink=observation,
-        clock_membership_store=options.clock_membership_store or staging.clock_membership_store,
-    )
+    """Supply the one active clock state capability to each session."""
+    return replace(options, clock_state_store=options.clock_state_store or runtime.make_clock_state_store(staging))
 
 
 def _validate_composition(staging: object, runtime: object) -> None:
@@ -259,7 +246,7 @@ def _consume_observation_task(task: asyncio.Task[None]) -> None:
 
 
 async def _close_observation_writer(run: _Run, *, unwinding: bool) -> None:
-    """Close the run-scoped writer without changing collection outcomes."""
+    """Join the writer before lock release; the timeout records a slow close."""
     timeout = run.options.config.firmware_observations.close_timeout_seconds
     try:
         await _bounded(joined_to_thread(run.observation_writer.close), timeout)
@@ -275,11 +262,12 @@ async def _close_observation_writer(run: _Run, *, unwinding: bool) -> None:
 
 
 def _close_quality_metrics(run: _Run) -> None:
-    """Stop auxiliary metric storage with its own bounded daemon join."""
+    """Join auxiliary storage before the outer Collector guard is released."""
     close = getattr(run.options.quality_metrics, "close", None)
     if close is None:
         return
     try:
         close()
-    except Exception as error:  # noqa: BLE001 - metrics teardown is best effort
+    except Exception as error:
         run.runtime.debug_exception("quality_metrics_writer_error", error, operation="close")
+        raise

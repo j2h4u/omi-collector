@@ -5,22 +5,21 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError
-from json import dumps, loads
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 
 from omi_collector.capture.adapters.attempts import StagedAttempt
+from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.publication import TerminalRetirementEvidence
 from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
     DurablePrefix,
     StreamingCheckpoint,
 )
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from staging_test_factory import StagingStore, staged_attempt_payload
 
 
 def test_contract_validation_is_filesystem_independent() -> None:
@@ -57,6 +56,13 @@ def _store(tmp_path: Path) -> StagingStore:
     return StagingStore(tmp_path, tmp_path.parent / f"{tmp_path.name}-captures")
 
 
+def _replace_attempt_field(attempt: StagedAttempt, field: str, value: dict[str, object]) -> None:
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    row[field] = value
+    attempt._filesystem.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, row)
+
+
 def _ample_statvfs(_: str | Path) -> object:
     return SimpleNamespace(f_bavail=10**15, f_frsize=1)
 
@@ -83,10 +89,12 @@ def test_durable_staging_values_are_immutable(
 def test_open_persisted_attempt_accepts_protocol_maximum_without_capacity_preflight(tmp_path: Path) -> None:
     attempt = _attempt(tmp_path)
     attempt.close()
-    descriptor_path = attempt.path / "attempt.json"
-    descriptor = cast(dict[str, object], loads(descriptor_path.read_text(encoding="utf-8")))
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    descriptor = row["descriptor"]
+    assert isinstance(descriptor, dict)
     descriptor["packet_count"] = (1 << 32) - 1
-    descriptor_path.write_text(dumps(descriptor), encoding="utf-8")
+    _replace_attempt_field(attempt, "descriptor", descriptor)
 
     reopened = _store(tmp_path).open_attempt(attempt.attempt_id)
 
@@ -113,16 +121,20 @@ def test_open_rejects_invalid_persisted_counts_without_rewriting_evidence(
 ) -> None:
     attempt = _attempt(tmp_path)
     attempt.close()
-    descriptor_path = attempt.path / "attempt.json"
-    descriptor = cast(dict[str, object], loads(descriptor_path.read_text(encoding="utf-8")))
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    descriptor = row["descriptor"]
+    assert isinstance(descriptor, dict)
     descriptor["packet_count"] = invalid_count
-    descriptor_path.write_text(dumps(descriptor), encoding="utf-8")
+    _replace_attempt_field(attempt, "descriptor", descriptor)
     evidence = {path.name: path.read_bytes() for path in attempt.path.iterdir()}
+    state_before = staged_attempt_payload(attempt)
 
     with pytest.raises(AttemptStateError):
         _store(tmp_path).open_attempt(attempt.attempt_id)
 
     assert {path.name: path.read_bytes() for path in attempt.path.iterdir()} == evidence
+    assert staged_attempt_payload(attempt) == state_before
 
 
 @pytest.mark.parametrize("invalid_id", ["g" * 32, "a" * 31])
@@ -141,16 +153,20 @@ def test_open_rejects_malformed_attempt_id_without_touching_attempts(tmp_path: P
 def test_open_rejects_descriptor_identity_mismatch_without_rewriting_evidence(tmp_path: Path) -> None:
     attempt = _attempt(tmp_path)
     attempt.close()
-    descriptor_path = attempt.path / "attempt.json"
-    descriptor = cast(dict[str, object], loads(descriptor_path.read_text(encoding="utf-8")))
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    descriptor = row["descriptor"]
+    assert isinstance(descriptor, dict)
     descriptor["attempt_id"] = "b" * 32
-    descriptor_path.write_text(dumps(descriptor), encoding="utf-8")
+    _replace_attempt_field(attempt, "descriptor", descriptor)
     evidence = {path.name: path.read_bytes() for path in attempt.path.iterdir()}
+    state_before = staged_attempt_payload(attempt)
 
-    with pytest.raises(AttemptStateError, match="identity or record size"):
+    with pytest.raises(AttemptStateError, match="identity does not match"):
         _store(tmp_path).open_attempt(attempt.attempt_id)
 
     assert {path.name: path.read_bytes() for path in attempt.path.iterdir()} == evidence
+    assert staged_attempt_payload(attempt) == state_before
 
 
 @pytest.mark.parametrize("persisted_id", ["g" * 32, "a" * 31])
@@ -159,22 +175,27 @@ def test_open_rejects_invalid_persisted_descriptor_id_without_rewriting_evidence
 ) -> None:
     attempt = _attempt(tmp_path)
     attempt.close()
-    descriptor_path = attempt.path / "attempt.json"
-    invalid_path = attempt.path.with_name(persisted_id)
-    descriptor = cast(dict[str, object], loads(descriptor_path.read_text(encoding="utf-8")))
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    descriptor = row["descriptor"]
+    checkpoint = row["checkpoint"]
+    assert isinstance(descriptor, dict)
+    assert isinstance(checkpoint, dict)
     descriptor["attempt_id"] = persisted_id
-    descriptor_path.write_text(dumps(descriptor), encoding="utf-8")
-    checkpoint_path = attempt.path / "checkpoint.json"
-    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
     checkpoint["attempt_id"] = persisted_id
-    checkpoint_path.write_text(dumps(checkpoint), encoding="utf-8")
-    attempt.path.rename(invalid_path)
-    evidence = {path.name: path.read_bytes() for path in invalid_path.iterdir()}
+    _replace_attempt_field(attempt, "descriptor", descriptor)
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    row["checkpoint"] = checkpoint
+    attempt._filesystem.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, row)
+    evidence = {path.name: path.read_bytes() for path in attempt.path.iterdir()}
+    state_before = staged_attempt_payload(attempt)
 
     with pytest.raises(AttemptStateError):
-        _store(tmp_path).open_attempt(persisted_id)
+        _store(tmp_path).open_attempt(attempt.attempt_id)
 
-    assert {path.name: path.read_bytes() for path in invalid_path.iterdir()} == evidence
+    assert {path.name: path.read_bytes() for path in attempt.path.iterdir()} == evidence
+    assert staged_attempt_payload(attempt) == state_before
 
 
 def test_open_rejects_negative_checkpoint_count_with_valid_empty_hash_and_raw_record(tmp_path: Path) -> None:
@@ -184,19 +205,21 @@ def test_open_rejects_negative_checkpoint_count_with_valid_empty_hash_and_raw_re
     attempt.record_read_begin(ReadBeginNotification(10, 2))
     attempt.accept_chunk(10, b"x" * RECORD_SIZE)
     attempt.close()
-    checkpoint_path = attempt.path / "checkpoint.json"
-    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    checkpoint = row["checkpoint"]
+    assert isinstance(checkpoint, dict)
     checkpoint["record_count"] = -1
     checkpoint["raw_sha256"] = sha256(b"").hexdigest()
-    checkpoint_path.write_text(dumps(checkpoint), encoding="utf-8")
+    _replace_attempt_field(attempt, "checkpoint", checkpoint)
     raw_before = (attempt.path / "records.bin").read_bytes()
-    checkpoint_before = checkpoint_path.read_bytes()
+    state_before = staged_attempt_payload(attempt)
 
     with pytest.raises(AttemptStateError, match="checkpoint is malformed"):
         _store(tmp_path).open_attempt(attempt.attempt_id)
 
     assert (attempt.path / "records.bin").read_bytes() == raw_before
-    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert staged_attempt_payload(attempt) == state_before
 
 
 @pytest.mark.parametrize("field,value", [("record_count", -1), ("raw_sha256", "x" * 64)])
@@ -205,13 +228,17 @@ def test_open_rejects_malformed_checkpoint_without_rewriting_evidence(
 ) -> None:
     attempt = _attempt(tmp_path)
     attempt.close()
-    checkpoint_path = attempt.path / "checkpoint.json"
-    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
+    row = staged_attempt_payload(attempt)
+    assert row is not None
+    checkpoint = row["checkpoint"]
+    assert isinstance(checkpoint, dict)
     checkpoint[field] = value
-    checkpoint_path.write_text(dumps(checkpoint), encoding="utf-8")
+    _replace_attempt_field(attempt, "checkpoint", checkpoint)
     evidence = {path.name: path.read_bytes() for path in attempt.path.iterdir()}
+    state_before = staged_attempt_payload(attempt)
 
     with pytest.raises(AttemptStateError, match="streaming checkpoint is malformed"):
         _store(tmp_path).open_attempt(attempt.attempt_id)
 
     assert {path.name: path.read_bytes() for path in attempt.path.iterdir()} == evidence
+    assert staged_attempt_payload(attempt) == state_before

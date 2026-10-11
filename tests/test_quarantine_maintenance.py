@@ -6,7 +6,6 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import Context
-from json import dumps, loads
 from pathlib import Path
 from struct import pack
 from typing import cast
@@ -14,11 +13,11 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import quarantine as quarantine_module
+from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
-from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError, StagingError
 from omi_collector.capture.application.ports import StagingPort
 from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
 from omi_collector.capture.application.quarantine_maintenance import (
@@ -28,6 +27,7 @@ from omi_collector.capture.application.quarantine_maintenance import (
 )
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 from omi_collector.config import CollectorConfig, RetryConfig, StagingRetentionConfig
+from staging_test_factory import StagingStore, closure_rows
 
 
 def _run(coro: object) -> object:
@@ -71,8 +71,49 @@ def _quarantine_sources(store: StagingStore, counts: tuple[int, ...]) -> tuple[P
     return store.quarantined_attempts()
 
 
+def _corrupt_quarantined_checkpoint(store: StagingStore, source: Path) -> None:
+    quarantine_row = store.state_db.get(StateKind.QUARANTINE, source.name)
+    assert quarantine_row is not None
+    attempt_id = cast(str, quarantine_row["attempt_id"])
+    attempt_row = store.state_db.get(StateKind.ATTEMPT, attempt_id)
+    assert attempt_row is not None
+    cast(dict[str, object], attempt_row["checkpoint"])["raw_sha256"] = "z" * 64
+    store.state_db.put(StateKind.ATTEMPT, attempt_id, attempt_row)
+
+
 def _source_snapshot(source: Path) -> dict[str, bytes]:
     return {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+
+
+def _terminal_state(store: StagingStore, source: Path) -> object:
+    row = store.state_db.get(StateKind.QUARANTINE, source.name)
+    assert row is not None
+    return row["terminal_state"]
+
+
+def _register_quarantine_file(store: StagingStore, path: Path) -> None:
+    metadata = path.lstat()
+    store.state_db.put(
+        StateKind.QUARANTINE,
+        path.name,
+        {
+            "physical_name": path.name,
+            "source_name": path.name,
+            "source_root": "spool",
+            "original_name": path.name,
+            "attempt_id": None,
+            "reason": "preexisting quarantine entry",
+            "opaque": False,
+            "entry_kind": "file",
+            "move_committed": True,
+            "source_device": metadata.st_dev,
+            "source_inode": metadata.st_ino,
+            "deletion_pending": False,
+            "terminal_state": None,
+            "terminal_at_unix_ns": None,
+            "terminal_reason": None,
+        },
+    )
 
 
 class _BlockedRecovery:
@@ -127,9 +168,7 @@ def test_attributable_malformed_startup_evidence_is_quarantined_before_collectio
     store = _store(tmp_path)
     malformed = tmp_path / "attempts" / ("f" * 32)
     malformed.mkdir(parents=True)
-    (malformed / "attempt.json").write_text(
-        dumps({"attempt_id": malformed.name, "schema_version": 2}), encoding="utf-8"
-    )
+    store.state_db.put(StateKind.ATTEMPT, malformed.name, {"malformed": True})
     (malformed / "records.bin").write_bytes(b"preserve")
 
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
@@ -138,8 +177,9 @@ def test_attributable_malformed_startup_evidence_is_quarantined_before_collectio
     assert state == PendingStartupState(None, None)
     assert not malformed.exists()
     quarantined = tuple((tmp_path / "quarantine").iterdir())
-    assert len(quarantined) == 2
-    source = next(path for path in quarantined if path.is_dir())
+    assert len(quarantined) == 1
+    source = quarantined[0]
+    assert source.is_dir()
     assert (source / "records.bin").read_bytes() == b"preserve"
 
 
@@ -306,14 +346,14 @@ def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) 
         expected = _seed_streaming_partial(store, count=2)
         attempt_id = next((tmp_path / "attempts").iterdir()).name
         source = store.quarantine_attempt_source(attempt_id)
-        before = {path.name: path.read_bytes() for path in source.iterdir()}
+        before = _source_snapshot(source)
 
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         await maintenance.run_once(lambda: True)
 
         assert {path.name: path.read_bytes() for path in source.iterdir()} == before
         await maintenance.run_once(lambda: False)
-        assert (source / "published.json").is_file()
+        assert _terminal_state(store, source) == "published"
         bundles = tuple((store.capture_root).iterdir())
         assert len(bundles) == 1
         assert (bundles[0] / "records.bin").read_bytes() == expected
@@ -349,11 +389,8 @@ def test_run_once_salvages_two_real_sources_and_marks_each_publication(
             await maintenance.close()
 
         assert calls == list(sources)
-        assert all((source / "published.json").is_file() for source in sources)
-        assert all(
-            _source_snapshot(source) == before[source] | {"published.json": (source / "published.json").read_bytes()}
-            for source in sources
-        )
+        assert all(_terminal_state(store, source) == "published" for source in sources)
+        assert all(_source_snapshot(source) == before[source] for source in sources)
         bundles = tuple(store.capture_root.iterdir())
         assert len(bundles) == 2
         assert {bundle.joinpath("records.bin").read_bytes() for bundle in bundles} == {
@@ -373,7 +410,7 @@ def test_run_once_continues_after_unprocessable_source_and_preserves_its_evidenc
         store = _store(case)
         sources = _quarantine_sources(store, (1, 2))
         first, second = sources
-        (first / "checkpoint.json").write_bytes(b"{invalid checkpoint")
+        _corrupt_quarantined_checkpoint(store, first)
         first_before = _source_snapshot(first)
         second_before = _source_snapshot(second)
         runtime = OpportunisticRuntime()
@@ -409,13 +446,8 @@ def test_run_once_continues_after_unprocessable_source_and_preserves_its_evidenc
         assert publish_calls == list(sources)
         assert unprocessable_marks == [first]
         assert all((first / name).read_bytes() == value for name, value in first_before.items())
-        assert not (first / "published.json").exists()
-        assert (
-            not (first / "unprocessable.json").exists()
-            if fail_unprocessable_marker
-            else (first / "unprocessable.json").is_file()
-        )
-        assert (second / "published.json").is_file()
+        assert _terminal_state(store, first) == (None if fail_unprocessable_marker else "unprocessable")
+        assert _terminal_state(store, second) == "published"
         assert all((second / name).read_bytes() == value for name, value in second_before.items())
         assert len(tuple(store.capture_root.iterdir())) == 1
 
@@ -462,8 +494,7 @@ def test_run_once_stops_after_retryable_or_deferred_source_without_touching_the_
 
         assert calls == [sources[0]]
         assert all(_source_snapshot(source) == before[source] for source in sources)
-        assert all(not (source / "published.json").exists() for source in sources)
-        assert all(not (source / "unprocessable.json").exists() for source in sources)
+        assert all(_terminal_state(store, source) is None for source in sources)
         assert tuple(store.capture_root.iterdir()) == ()
 
     _run(scenario())
@@ -507,15 +538,14 @@ def test_run_once_retries_quarantine_only_at_exact_monotonic_backoff_deadline(
             now = 101.0
             await maintenance.run_once(lambda: False)
             assert calls == [sources[0]]
-            assert not (sources[0] / "published.json").exists()
-            assert not (sources[1] / "published.json").exists()
+            assert all(_terminal_state(store, source) is None for source in sources)
             now = 105.0
             await maintenance.run_once(lambda: False)
         finally:
             await maintenance.close()
 
         assert calls == [sources[0], sources[0], sources[1]]
-        assert all((source / "published.json").is_file() for source in sources)
+        assert all(_terminal_state(store, source) == "published" for source in sources)
         assert len(tuple(store.capture_root.iterdir())) == 2
 
     _run(scenario())
@@ -543,7 +573,7 @@ def test_failed_quarantine_published_marker_is_retried_after_restart(
 
     assert failures == 1
     assert source.is_dir()
-    assert not (source / "published.json").exists()
+    assert _terminal_state(store, source) is None
     bundles = tuple(store.capture_root.iterdir())
     assert len(bundles) == 1
     assert (bundles[0] / "records.bin").read_bytes() == expected
@@ -551,14 +581,12 @@ def test_failed_quarantine_published_marker_is_retried_after_restart(
     restarted = StagingStore(tmp_path, store.capture_root)
     _run(QuarantineMaintenance(restarted, None, OpportunisticRuntime()).run_once(lambda: False))
 
-    assert (source / "published.json").is_file()
+    assert _terminal_state(restarted, source) == "published"
     assert tuple(restarted.capture_root.iterdir()) == bundles
     assert (bundles[0] / "records.bin").read_bytes() == expected
 
 
-def test_invalid_terminal_marker_is_reauthenticated_but_never_replaced_or_expired(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_legacy_terminal_sidecar_is_ignored_in_favor_of_database_state(tmp_path: Path) -> None:
     store = _store(tmp_path)
     expected = _seed_streaming_partial(store, count=2)
     attempt_id = next((tmp_path / "attempts").iterdir()).name
@@ -573,6 +601,7 @@ def test_invalid_terminal_marker_is_reauthenticated_but_never_replaced_or_expire
     assert len(bundles) == 1
     assert (bundles[0] / "records.bin").read_bytes() == expected
     assert invalid_marker.read_bytes() == original_marker
+    assert _terminal_state(store, source) == "published"
     assert source.is_dir()
 
     restarted = StagingStore(tmp_path, store.capture_root)
@@ -580,62 +609,39 @@ def test_invalid_terminal_marker_is_reauthenticated_but_never_replaced_or_expire
     assert tuple(restarted.capture_root.iterdir()) == bundles
     assert invalid_marker.read_bytes() == original_marker
 
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: 10**18)
-    assert restarted.sweep_terminal_quarantine() == ()
-    assert source.is_dir()
 
-
-def test_terminal_state_must_match_marker_filename_before_retention(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_malformed_quarantine_terminal_row_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
     _seed_streaming_partial(store, count=1)
     attempt_id = next((tmp_path / "attempts").iterdir()).name
     source = store.quarantine_attempt_source(attempt_id)
-    marker = source / "published.json"
-    marker.write_text(
-        dumps(
-            {
-                "version": 1,
-                "state": "unprocessable",
-                "classified_at_unix_ns": 1,
-                "reason": "wrong marker file",
-            }
-        ),
-        encoding="utf-8",
-    )
-    original_marker = marker.read_bytes()
+    row = store.state_db.get(StateKind.QUARANTINE, source.name)
+    assert row is not None
+    row.update(terminal_state="published", terminal_at_unix_ns=True)
+    store.state_db.put(StateKind.QUARANTINE, source.name, row)
+    original_row = store.state_db.get(StateKind.QUARANTINE, source.name)
     monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: 10**18)
 
-    assert store.sweep_terminal_quarantine() == ()
+    with pytest.raises(StagingError, match="quarantine move state is malformed"):
+        store.sweep_terminal_quarantine()
     assert source.is_dir()
-    assert marker.read_bytes() == original_marker
+    assert store.state_db.get(StateKind.QUARANTINE, source.name) == original_row
 
 
-def test_sidecar_must_match_quarantined_entry_and_integer_version(tmp_path: Path) -> None:
+def test_quarantine_state_must_match_physical_entry(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    root = tmp_path / "quarantine"
-    root.mkdir()
-    source = root / f"opaque-entry-{'a' * 32}"
-    source.mkdir()
-    sidecar = source.with_name(f"{source.name}.json")
-    sidecar.write_text(
-        dumps(
-            {
-                "version": True,
-                "state": "unprocessable",
-                "classified_at_unix_ns": 0,
-                "reason": "wrong source",
-                "original_name": "someone-elses-entry",
-            }
-        ),
-        encoding="utf-8",
-    )
-    original_sidecar = sidecar.read_bytes()
+    _seed_streaming_partial(store, count=1)
+    source = store.quarantine_attempt_source(store.pending_attempts()[0].attempt_id)
+    row = store.state_db.get(StateKind.QUARANTINE, source.name)
+    assert row is not None
+    row["physical_name"] = "someone-elses-entry"
+    store.state_db.put(StateKind.QUARANTINE, source.name, row)
+    original_row = store.state_db.get(StateKind.QUARANTINE, source.name)
 
-    assert store.sweep_terminal_quarantine() == ()
+    with pytest.raises(StagingError, match="quarantine move state is malformed"):
+        store.sweep_terminal_quarantine()
     assert source.is_dir()
-    assert sidecar.read_bytes() == original_sidecar
+    assert store.state_db.get(StateKind.QUARANTINE, source.name) == original_row
 
 
 def test_directly_classified_unsafe_quarantine_entry_expires_after_retention(
@@ -653,10 +659,14 @@ def test_directly_classified_unsafe_quarantine_entry_expires_after_retention(
     unsafe.write_bytes(b"preserve until terminal retention")
     name_collision = tmp_path / "quarantine" / "published"
     name_collision.write_bytes(b"same-name sidecar collision")
+    _register_quarantine_file(store, unsafe)
+    _register_quarantine_file(store, name_collision)
 
     assert store.sweep_terminal_quarantine() == ()
-    assert unsafe.with_name("unsafe-entry.json").is_file()
-    assert name_collision.with_name("published.json").is_file()
+    assert _terminal_state(store, unsafe) == "unprocessable"
+    assert _terminal_state(store, name_collision) == "unprocessable"
+    assert not unsafe.with_name("unsafe-entry.json").exists()
+    assert not name_collision.with_name("published.json").exists()
     now += 72_000_000_000
 
     assert set(store.sweep_terminal_quarantine()) == {unsafe, name_collision}
@@ -664,9 +674,7 @@ def test_directly_classified_unsafe_quarantine_entry_expires_after_retention(
     assert not name_collision.exists()
 
 
-def test_terminal_marker_named_like_its_parent_is_not_mistaken_for_sidecar(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_terminal_quarantine_state_is_retained_then_deleted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_000_000_000
     monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
     store = StagingStore(
@@ -674,8 +682,8 @@ def test_terminal_marker_named_like_its_parent_is_not_mistaken_for_sidecar(
         tmp_path.parent / f"{tmp_path.name}-captures",
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
     )
-    source = tmp_path / "quarantine" / "published"
-    source.mkdir(parents=True)
+    _seed_streaming_partial(store, count=1)
+    source = store.quarantine_attempt_source(store.pending_attempts()[0].attempt_id)
     store.mark_quarantine_published(source)
     now += 72_000_000_000
 
@@ -711,7 +719,9 @@ def test_pending_startup_establishes_aligned_tail_under_a_lease_before_binding(t
     attempt.checkpoint()
     attempt.accept_chunk(101, second)
     attempt.close(durable=True)
-    checkpoint = (attempt.path / "checkpoint.json").read_text(encoding="utf-8")
+    checkpoint = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+    assert checkpoint is not None
+    checkpoint = checkpoint["checkpoint"]
     raw = (attempt.path / "records.bin").read_bytes()
 
     state = cast(
@@ -720,8 +730,10 @@ def test_pending_startup_establishes_aligned_tail_under_a_lease_before_binding(t
     )
 
     assert state.durable_next == 102
-    assert (attempt.path / "checkpoint.json").read_text(encoding="utf-8") != checkpoint
-    assert loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8"))["record_count"] == 2
+    current = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+    assert current is not None
+    assert current["checkpoint"] != checkpoint
+    assert cast(dict[str, object], current["checkpoint"])["record_count"] == 2
     assert (attempt.path / "records.bin").read_bytes() == raw
 
 
@@ -736,7 +748,9 @@ def test_pending_startup_uses_authenticated_aligned_tail_when_promotion_lock_is_
     attempt.checkpoint()
     attempt.accept_chunk(101, second)
     attempt.close(durable=True)
-    checkpoint_before = (attempt.path / "checkpoint.json").read_bytes()
+    attempt_row = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+    assert attempt_row is not None
+    checkpoint_before = attempt_row["checkpoint"]
     raw_before = (attempt.path / "records.bin").read_bytes()
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
 
@@ -750,8 +764,10 @@ def test_pending_startup_uses_authenticated_aligned_tail_when_promotion_lock_is_
     assert type(state.durable_next) is int
     assert state.durable_next == 102
     assert (attempt.path / "records.bin").read_bytes() == raw_before == first + second
-    assert (attempt.path / "checkpoint.json").read_bytes() == checkpoint_before
-    assert loads(checkpoint_before.decode("utf-8"))["record_count"] == 1
+    unchanged = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+    assert unchanged is not None
+    assert unchanged["checkpoint"] == checkpoint_before
+    assert cast(dict[str, object], checkpoint_before)["record_count"] == 1
 
 
 @pytest.mark.parametrize("promotion_busy", [False, True])
@@ -762,7 +778,9 @@ def test_complete_pending_startup_keeps_authenticated_tail_at_packet_count_bound
     expected = _seed_streaming_partial(store, count=2)
     attempt_id = next((tmp_path / "attempts").iterdir()).name
     attempt_path = tmp_path / "attempts" / attempt_id
-    checkpoint_before = (attempt_path / "checkpoint.json").read_bytes()
+    attempt_row = store.state_db.get(StateKind.ATTEMPT, attempt_id)
+    assert attempt_row is not None
+    checkpoint_before = attempt_row["checkpoint"]
     raw_before = (attempt_path / "records.bin").read_bytes()
     original_lock = store.device_lock
 
@@ -786,9 +804,13 @@ def test_complete_pending_startup_keeps_authenticated_tail_at_packet_count_bound
         assert raw_before == expected
         assert (attempt_path / "records.bin").read_bytes() == raw_before
         if promotion_busy:
-            assert (attempt_path / "checkpoint.json").read_bytes() == checkpoint_before
+            unchanged = store.state_db.get(StateKind.ATTEMPT, attempt_id)
+            assert unchanged is not None
+            assert unchanged["checkpoint"] == checkpoint_before
         else:
-            assert loads((attempt_path / "checkpoint.json").read_text(encoding="utf-8"))["record_count"] == 2
+            updated = store.state_db.get(StateKind.ATTEMPT, attempt_id)
+            assert updated is not None
+            assert cast(dict[str, object], updated["checkpoint"])["record_count"] == 2
         assert not (tmp_path / "quarantine").exists()
 
         monkeypatch.setattr(store, "device_lock", original_lock)
@@ -816,8 +838,10 @@ def test_pending_startup_requests_prefix_closure_without_mutating_visit(tmp_path
     )
 
     assert state == PendingStartupState(None, None, "needs_interrupted_close")
-    assert not (attempt.path / "terminal-retired.json").exists()
-    assert not store.ready_closures_path.exists()
+    attempt_row = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+    assert attempt_row is not None
+    assert attempt_row["terminal_retirement"] is None
+    assert not closure_rows(store)
 
 
 def test_presence_startup_state_binds_once_after_a_completed_attempt(tmp_path: Path) -> None:
@@ -990,11 +1014,11 @@ def test_retryable_quarantine_publication_observes_configured_cooldown(
     now = 101.0
     _run(maintenance.run_once(lambda: False))
     assert failures == 1
-    assert not (source / "published.json").exists()
+    assert _terminal_state(store, source) is None
     now = 105.0
     _run(maintenance.run_once(lambda: False))
     assert failures == 2
-    assert (source / "published.json").is_file()
+    assert _terminal_state(store, source) == "published"
     bundles = tuple((store.capture_root).iterdir())
     assert (bundles[0] / "records.bin").read_bytes() == expected
 
@@ -1203,12 +1227,12 @@ def test_quarantine_pending_keeps_valid_partial_salvageable_and_expires_opaque(
 
     source = next(path for path in moved if path.name.startswith(attempt_id))
     opaque = next(path for path in moved if path != source)
-    assert not (source.with_name(f"{source.name}.json")).exists()
-    assert (opaque.with_name(f"{opaque.name}.json")).is_file()
+    assert _terminal_state(store, source) is None
+    assert _terminal_state(store, opaque) == "unprocessable"
     assert store.quarantined_attempts() == (source,)
 
     _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).run_once(lambda: False))
-    assert (source / "published.json").is_file()
+    assert _terminal_state(store, source) == "published"
     bundles = tuple((store.capture_root).iterdir())
     assert len(bundles) == 1
     assert (bundles[0] / "records.bin").read_bytes() == expected
@@ -1562,11 +1586,11 @@ def test_visit_begin_failure_releases_capture_priority(tmp_path: Path, monkeypat
         with pytest.raises(OSError, match="storage unavailable"):
             await maintenance.enter_capture_priority()
         assert store.publication_wake_admitted()
-        assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "drained"
+        assert closure_rows(store)[0]["reason"] == "drained"
 
         monkeypatch.setattr(store, "begin_ready_visit", original)
         await maintenance.enter_capture_priority()
-        assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "collecting"
+        assert closure_rows(store)[0]["reason"] == "collecting"
         maintenance.exit_capture_priority()
         await maintenance.close()
 
@@ -1601,7 +1625,7 @@ def test_cancelled_visit_begin_joins_storage_before_releasing_gate(
             with pytest.raises(asyncio.CancelledError):
                 await entering
             assert store.publication_wake_admitted()
-            assert loads(store.ready_closures_path.read_text())["closures"][0]["reason"] == "collecting"
+            assert closure_rows(store)[0]["reason"] == "collecting"
         finally:
             release.set()
             await asyncio.gather(entering, return_exceptions=True)
@@ -1893,16 +1917,12 @@ def test_salvage_skips_source_made_terminal_after_inventory_and_continues(
 
     assert marked == [first]
     assert store.quarantine_state(first).name.upper() == terminal_marker.upper()
-    assert _source_snapshot(first) == first_before | {
-        "published.json" if terminal_marker == "published" else "unprocessable.json": (
-            first / ("published.json" if terminal_marker == "published" else "unprocessable.json")
-        ).read_bytes()
-    }
+    assert _source_snapshot(first) == first_before
     assert publish_calls == [second]
     assert unprocessable_marks == (
         [(first, "concurrent terminal classification")] if terminal_marker == "unprocessable" else []
     )
-    assert (second / "published.json").is_file()
+    assert _terminal_state(store, second) == "published"
     assert len(tuple(store.capture_root.iterdir())) >= 1
 
 
@@ -1942,8 +1962,8 @@ def test_published_marker_failure_keeps_first_bundle_and_still_processes_second_
 
     assert failed == [sources[0]]
     assert _source_snapshot(sources[0]) == before[sources[0]]
-    assert not (sources[0] / "published.json").exists()
-    assert (sources[1] / "published.json").is_file()
+    assert _terminal_state(store, sources[0]) is None
+    assert _terminal_state(store, sources[1]) == "published"
     bundles = tuple(store.capture_root.iterdir())
     assert len(bundles) == 2
     assert {bundle.joinpath("records.bin").read_bytes() for bundle in bundles} == {
@@ -1987,8 +2007,7 @@ def test_quarantine_retry_backoff_stays_at_last_delay_after_repeated_failures(
         _run(maintenance.close())
 
     assert calls == [sources[0]] * total_attempts
-    assert all(not (source / "published.json").exists() for source in sources)
-    assert all(not (source / "unprocessable.json").exists() for source in sources)
+    assert all(_terminal_state(store, source) is None for source in sources)
     assert tuple(store.capture_root.iterdir()) == ()
 
 

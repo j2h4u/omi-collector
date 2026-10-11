@@ -18,11 +18,11 @@ from bleak.backends.device import BLEDevice
 from typer.testing import CliRunner
 
 from fakes import ScriptedRingSession, WriteStep
+from omi_collector import cli as operator_cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.publication import SealResult
-from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
+from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.collector import CollectionResult, ProgressEvent
 from omi_collector.capture.application.presence import PresenceScheduler
 from omi_collector.capture.application.ring_transport import (
@@ -48,6 +48,12 @@ from omi_collector.capture.domain.ring_protocol import (
 )
 from omi_collector.cli import app
 from omi_collector.config import BleConfig, CollectorConfig, PresenceConfig, RetryConfig, TransferConfig
+from staging_test_factory import StagingStore
+
+
+@pytest.fixture(autouse=True)
+def _isolate_installed_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(operator_cli, "DEFAULT_CONFIG_PATH", tmp_path / "absent-installed-config.toml")
 
 
 class FakeGuard:
@@ -93,10 +99,10 @@ def _layout(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def _cleanup_cli_quality_metrics(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    created: list[JsonlQualityMetrics] = []
-    factory = cast(Callable[..., JsonlQualityMetrics | None], device_cli._quality_metrics)
+    created: list[SQLiteQualityMetrics] = []
+    factory = cast(Callable[..., SQLiteQualityMetrics | None], device_cli._quality_metrics)
 
-    def track_factory(*args: object, **kwargs: object) -> JsonlQualityMetrics | None:
+    def track_factory(*args: object, **kwargs: object) -> SQLiteQualityMetrics | None:
         metrics = factory(*args, **kwargs)
         if metrics is not None:
             created.append(metrics)
@@ -167,10 +173,13 @@ def _info(write_sequence: int = 11) -> bytes:
     return pack(">BQQIQH", 0x02, 10, write_sequence, 100, 0, RECORD_SIZE)
 
 
-def test_production_factories_construct_monkeypatched_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_production_factories_construct_monkeypatched_dependencies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     class Guard:
-        def __init__(self, adapter: str) -> None:
+        def __init__(self, adapter: str, *, state_db: object) -> None:
             self.adapter = adapter
+            self.state_db = state_db
 
     class Transport:
         def __init__(self, address: str, **kwargs: object) -> None:
@@ -180,11 +189,14 @@ def test_production_factories_construct_monkeypatched_dependencies(monkeypatch: 
     monkeypatch.setattr(device_cli, "ScopedPhyGuard", Guard)
     monkeypatch.setattr(device_cli, "BleakRingTransport", Transport)
 
-    guard = device_cli.make_guard("hci0")
+    store = _store(tmp_path)
+    with device_cli.phy_state_context(store.state_db):
+        guard = device_cli.make_guard("hci0")
     transport = device_cli.make_transport("AA:BB")
 
     assert isinstance(guard, Guard)
     assert guard.adapter == "hci0"
+    assert guard.state_db is store.state_db
     assert isinstance(transport, Transport)
     assert transport.address == "AA:BB"
     assert (
@@ -742,12 +754,13 @@ def test_collect_does_not_read_while_sync_writer_holds_the_device_lock(
 
     monkeypatch.setattr(device_cli, "make_transport", make_blocking_transport)
     monkeypatch.setattr(device_cli, "make_guard", tracked_guard)
+    store = _store(tmp_path)
 
     async def contend() -> None:
-        syncing = asyncio.create_task(device_cli.sync("AA:BB", "hci0", _store(tmp_path)))
+        syncing = asyncio.create_task(device_cli.sync("AA:BB", "hci0", store))
         await entered.wait()
         with pytest.raises(DeviceAlreadyRunningError):
-            await device_cli.collect("AA:BB", "hci0", _store(tmp_path), 1)
+            await device_cli.collect("AA:BB", "hci0", store, 1)
         assert calls == 1, "competing collection must fail before opening BLE"
         assert guards == []
         syncing.cancel()
@@ -905,11 +918,14 @@ def test_operational_callback_delivers_event_to_reporter() -> None:
 
 def test_quality_metrics_factory_returns_configured_sink(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     class MetricsSink:
-        def __init__(self, root: Path, **kwargs: object) -> None:
-            self.root = root
+        def __init__(self, state_db: object, **kwargs: object) -> None:
+            self.state_db = state_db
             self.kwargs = kwargs
 
-    monkeypatch.setattr(device_cli, "JsonlQualityMetrics", MetricsSink)
+        def record_runtime_status(self, _event: dict[str, object]) -> None:
+            return
+
+    monkeypatch.setattr(device_cli, "SQLiteQualityMetrics", MetricsSink)
     monkeypatch.setattr(device_cli, "package_version", lambda: "1.2.3")
     monkeypatch.setattr(device_cli, "source_revision_from_release_metadata", lambda: "a" * 40)
     staging = _store(tmp_path)
@@ -917,7 +933,7 @@ def test_quality_metrics_factory_returns_configured_sink(monkeypatch: pytest.Mon
     metrics = device_cli._quality_metrics(staging, device_cli.DEFAULT_CONFIG)
 
     assert isinstance(metrics, MetricsSink)
-    assert metrics.root == staging.paths.root
+    assert metrics.state_db is staging.state_db
     assert metrics.kwargs["release_version"] == "1.2.3"
     assert metrics.kwargs["source_revision"] == "a" * 40
 

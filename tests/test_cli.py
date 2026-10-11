@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Coroutine
 from pathlib import Path
 from shutil import rmtree
@@ -12,21 +13,29 @@ from typer.testing import CliRunner
 
 from omi_collector import cli
 from omi_collector.capture import cli as device_cli
+from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
-from omi_collector.capture.adapters.operational_status import OperationalIdentity
+from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.staging_contract import StagingError
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
+from omi_collector.capture.domain.clock_state import ClockIntent
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
 from omi_collector.config import DebugLogConfig
 from omi_collector.core import package_version
 from omi_collector.operator_status import OperatorStatusError
 from omi_collector.spool_metrics import SpoolMetricsError
+from omi_collector.state_migration import StateMigrationError
 from omi_collector.storage_layout import load_operator_config
 
 _CAPTURE_ROOTS: set[Path] = set()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_installed_host_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "absent-installed-config.toml")
 
 
 def _capture_root(tmp_path: Path) -> Path:
@@ -44,6 +53,63 @@ def _layout(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def test_mutating_cli_rejects_alternate_root_for_same_adapter_with_different_pendant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    installed = _layout(tmp_path)
+    alternate = tmp_path / "alternate" / "config.toml"
+    alternate.parent.mkdir()
+    alternate.write_text(
+        '[pendant]\naddress = "11:22:33:44:55:66"\n[ready]\ntarget_audio_seconds = 3600.0\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", installed)
+
+    with pytest.raises(StateMigrationError, match="Bluetooth adapter is bound"):
+        cli._require_host_singleton(load_operator_config(alternate))
+
+
+def test_migrate_state_cli_requires_stopped_installed_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    calls: list[object] = []
+    monkeypatch.setattr("omi_collector.state_migration.migrate_state", lambda *_args, **_kwargs: calls.append(True))
+    monkeypatch.setattr(
+        cli,
+        "_systemd_service_status",
+        lambda: {"available": True, "active_state": "active"},
+    )
+
+    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "confirm the Collector service is stopped" in result.output
+    assert calls == []
+
+
+def test_migrate_state_cli_passes_operator_phy_home_after_stop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
+    captured: list[tuple[object, object]] = []
+
+    def fake_migrate(layout: object, *, legacy_phy_state_homes: object) -> dict[str, int]:
+        captured.append((layout, legacy_phy_state_homes))
+        return {"removed_files": 3}
+
+    monkeypatch.setattr("omi_collector.state_migration.migrate_state", fake_migrate)
+    old_home = tmp_path / "old-state"
+
+    result = CliRunner().invoke(
+        app,
+        ["migrate-state", "--config", str(config_path), "--legacy-phy-state-home", str(old_home)],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"removed_files": 3}
+    assert captured[0][1] == (Path("/var/lib/omi-collector"), old_home)
 
 
 def test_version_flag_reports_package_version() -> None:
@@ -174,7 +240,7 @@ def test_device_status_fetches_systemd_invocation_before_collecting_snapshot(
     assert observed[0].invocation_id == "00000000000000000000000000000003"
 
 
-def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(tmp_path: Path) -> None:
+def test_ble_link_record_is_redacted_before_journal_logging(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     info_lines: list[str] = []
     debug_lines: list[str] = []
     debug_reporter = cli.SyncProgressReporter(cli.SyncLogLevel.DEBUG, emit=debug_lines.append)
@@ -182,16 +248,15 @@ def test_ble_link_record_is_persisted_before_info_filtering_and_debug_emits_it(t
     record = {"event": "ble_link_session", "address": "AA:BB", "handle": 7}
     logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.debug.ble_link_report"))
     try:
-        info_reporter = cli.SyncProgressReporter(emit=info_lines.append, debug_logger=logger)
-        info_reporter.report_ble_link(record)
+        with caplog.at_level(logging.DEBUG, logger="tests.debug.ble_link_report"):
+            info_reporter = cli.SyncProgressReporter(emit=info_lines.append, debug_logger=logger)
+            info_reporter.report_ble_link(record)
     finally:
         close_debug_logging(logger)
 
     assert info_lines == []
-    debug_entry = cast(dict[str, object], json.loads((tmp_path / "debug.jsonl").read_text(encoding="utf-8")))
-    debug_fields = cast(dict[str, object], debug_entry["fields"])
-    assert debug_entry["event"] == "ble_link_session"
-    assert debug_fields["record"] == {"event": "ble_link_session", "handle": 7}
+    assert 'fields={"record":{"event":"ble_link_session","handle":7}}' in caplog.text
+    assert "AA:BB" not in caplog.text
 
     debug_reporter.report_ble_link(record)
     assert [json.loads(line) for line in debug_lines] == [{"event": "ble_link_session", "handle": 7}]
@@ -284,7 +349,8 @@ def test_systemd_service_status_parses_text_and_handles_nonzero_exit(
     }
 
 
-def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
     events: list[tuple[str, str]] = []
 
     async def fake_phy_check(adapter: str) -> None:
@@ -297,8 +363,8 @@ def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.Monke
     monkeypatch.setattr(device_cli, "recover_phy", fake_recover_phy)
     runner = CliRunner()
 
-    phy_result = runner.invoke(app, ["device", "phy-check", "--confirm-host-change"])
-    recover_result = runner.invoke(app, ["device", "recover-phy", "--adapter", "hci1"])
+    phy_result = runner.invoke(app, ["device", "phy-check", "--config", str(config_path), "--confirm-host-change"])
+    recover_result = runner.invoke(app, ["device", "recover-phy", "--config", str(config_path), "--adapter", "hci1"])
 
     assert phy_result.exit_code == 0
     assert json.loads(phy_result.output) == {"status": "phy_restored"}
@@ -307,7 +373,8 @@ def test_phy_check_and_recover_commands_report_success(monkeypatch: pytest.Monke
     assert events == [("check", "hci0"), ("recover", "hci1")]
 
 
-def test_device_operation_interruption_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_device_operation_interruption_is_reported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
     created_operations: list[Coroutine[object, object, None]] = []
 
     async def fake_phy_check(_adapter: str) -> None:
@@ -326,7 +393,7 @@ def test_device_operation_interruption_is_reported(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(device_cli, "run", interrupted)
 
     try:
-        result = CliRunner().invoke(app, ["device", "phy-check", "--confirm-host-change"])
+        result = CliRunner().invoke(app, ["device", "phy-check", "--config", str(config_path), "--confirm-host-change"])
     finally:
         for operation in created_operations:
             operation.close()
@@ -336,7 +403,9 @@ def test_device_operation_interruption_is_reported(monkeypatch: pytest.MonkeyPat
     assert result.stderr.strip() == "interrupted safely"
 
 
-def test_device_operation_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_device_operation_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+
     async def fake_phy_check(_adapter: str) -> None:
         return
 
@@ -347,7 +416,7 @@ def test_device_operation_failure_is_reported_on_stderr(monkeypatch: pytest.Monk
     monkeypatch.setattr(device_cli, "phy_check", fake_phy_check)
     monkeypatch.setattr(device_cli, "run", failed)
 
-    result = CliRunner().invoke(app, ["device", "phy-check", "--confirm-host-change"])
+    result = CliRunner().invoke(app, ["device", "phy-check", "--config", str(config_path), "--confirm-host-change"])
 
     assert result.exit_code == 1
     assert result.stdout == ""
@@ -373,7 +442,7 @@ def test_device_host_change_and_read_routes_refuse_without_confirmation(
     monkeypatch.setattr(device_cli, "info", fake_operation)
     monkeypatch.setattr(device_cli, "collect", fake_operation)
     monkeypatch.setattr(device_cli, "run", must_not_run)
-    monkeypatch.setattr(cli, "_staging", lambda _loaded: object())
+    monkeypatch.setattr(cli, "_staging", lambda _loaded, **_kwargs: object())
     monkeypatch.setattr(cli, "_preflight_storage", lambda _staging: None)
     commands = (
         (["device", "phy-check"], "--confirm-host-change"),
@@ -495,7 +564,7 @@ def test_collect_preflight_failure_is_reported_on_stderr(monkeypatch: pytest.Mon
     async def must_not_collect(*_args: object) -> device_cli.collector.NoDataResult:
         raise AssertionError("collect must not start after preflight failure")
 
-    monkeypatch.setattr(cli, "_staging", lambda _loaded: FailingStaging())
+    monkeypatch.setattr(cli, "_staging", lambda _loaded, **_kwargs: FailingStaging())
     monkeypatch.setattr(device_cli, "collect", must_not_collect)
     result = CliRunner().invoke(
         app,
@@ -508,11 +577,14 @@ def test_collect_preflight_failure_is_reported_on_stderr(monkeypatch: pytest.Mon
 
 
 def test_device_metrics_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    cli._staging(load_operator_config(config_path))
+
     def failed(*_args: object, **_kwargs: object) -> object:
         raise SpoolMetricsError("manifest is malformed")
 
     monkeypatch.setattr(cli, "collect_spool_metrics", failed)
-    result = CliRunner().invoke(app, ["device", "metrics", "--config", str(_layout(tmp_path))])
+    result = CliRunner().invoke(app, ["device", "metrics", "--config", str(config_path)])
 
     assert result.exit_code == 1
     assert result.stdout == ""
@@ -601,22 +673,71 @@ def test_sync_reporter_info_emits_verified_clock_correction_to_system_journal() 
     assert all(journal_event[key] == value for key, value in correction.items())
 
 
-def test_sync_reporter_persists_filtered_debug_callback(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"outcome": "verified"}, True),
+        ({"outcome": "verified", "boundary_ambiguous": True}, False),
+        ({"outcome": "verified", "reconciliation": "pending"}, False),
+        ({"outcome": "verified", "reconciled_operations": 0}, True),
+        ({"outcome": "verified", "reconciled_operations": False}, False),
+        ({"outcome": "verified", "reconciled_operations": -1}, False),
+    ],
+)
+def test_clock_reconciliation_only_accepts_conclusive_event(event: dict[str, object], expected: bool) -> None:
+    assert cli._clock_reconciliation_is_conclusive(event) is expected
+
+
+def test_clock_status_clears_only_after_conclusive_reconciliation_without_pending_intent(tmp_path: Path) -> None:
+    staging = cli._staging(load_operator_config(_layout(tmp_path)))
+    status = OperationalStatusStore(
+        staging.state_db,
+        OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001"),
+    )
+    status.initialize()
+    reporter = cli.SyncProgressReporter(operational_status=status, staging=staging, emit=lambda _line: None)
+
+    reporter(
+        _sync_progress(
+            state="operational", operational_event={"event": "pendant_clock_sync", "outcome": "intent_persist_failed"}
+        )
+    )
+    assert status.as_dict()["clock"] == "blocked"
+    reporter(
+        _sync_progress(
+            state="operational",
+            operational_event={"event": "pendant_clock_sync", "outcome": "verified", "boundary_ambiguous": True},
+        )
+    )
+    assert status.as_dict()["clock"] == "blocked"
+
+    clock = ClockStateStore(staging.state_db)
+    clock.prepare(ClockIntent("pending", "prepared", 100, 200, 150.0, 7))
+    reporter(
+        _sync_progress(state="operational", operational_event={"event": "pendant_clock_sync", "outcome": "verified"})
+    )
+    assert status.as_dict()["clock"] == "blocked"
+    clock.cancel_prepared("pending")
+    reporter(
+        _sync_progress(state="operational", operational_event={"event": "pendant_clock_sync", "outcome": "verified"})
+    )
+    assert status.as_dict() == {"quality": "unknown", "publication": "unknown", "clock": "clear"}
+    status.close()
+
+
+def test_sync_reporter_logs_filtered_debug_callback(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     lines: list[str] = []
     logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.debug.progress"))
     try:
-        reporter = cli.SyncProgressReporter(emit=lines.append, debug_logger=logger)
-        reporter(_sync_progress(state="away"))
+        with caplog.at_level(logging.DEBUG, logger="tests.debug.progress"):
+            reporter = cli.SyncProgressReporter(emit=lines.append, debug_logger=logger)
+            reporter(_sync_progress(state="away"))
     finally:
         close_debug_logging(logger)
 
-    entry = cast(dict[str, object], json.loads((tmp_path / "debug.jsonl").read_text()))
-    fields = cast(dict[str, object], entry["fields"])
-    progress = cast(dict[str, object], fields["progress"])
-
     assert lines == []
-    assert entry["event"] == "sync_progress"
-    assert progress["status"] == "away"
+    assert any('"status":"away"' in record.message for record in caplog.records)
+    assert not (tmp_path / "debug.jsonl").exists()
 
 
 def test_sync_reporter_info_emits_clean_drain_cooldown_event() -> None:

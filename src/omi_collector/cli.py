@@ -6,8 +6,8 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import Callable, Coroutine, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Coroutine, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, suppress
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Protocol, cast
@@ -20,6 +20,7 @@ from omi_collector.core import package_version
 from omi_collector.storage_layout import DEFAULT_CONFIG_PATH
 
 if TYPE_CHECKING:
+    from omi_collector.capture.adapters.collector_state_db import StateDB
     from omi_collector.capture.adapters.operational_status import OperationalStatusStore
     from omi_collector.capture.adapters.staging_store import StagingStore
     from omi_collector.capture.cli import DownloadProgress
@@ -33,6 +34,8 @@ class _CaptureCli(Protocol):
     MAX_RECORDS: int
     SUPPORTED_ADAPTER: str
     OperationInterruptedError: type[BaseException]
+
+    def phy_state_context(self, state_db: object) -> AbstractContextManager[None]: ...
 
     def run(self, operation: Coroutine[object, object, object]) -> object: ...
 
@@ -129,11 +132,19 @@ def _load_config(path: Path) -> OperatorConfig:
         raise typer.Exit(code=2) from error
 
 
-def _staging(operator_config: OperatorConfig) -> StagingStore:
-    from omi_collector.capture.adapters.staging_filesystem import StagingPaths
+def _staging(operator_config: OperatorConfig, *, state_db: StateDB | None = None) -> StagingStore:
+    from omi_collector.capture.adapters.collector_state_db import StateDBError
+    from omi_collector.capture.adapters.staging_filesystem import StagingIO, StagingPaths
     from omi_collector.capture.adapters.staging_store import StagingStore
+    from omi_collector.state_migration import StateMigrationError, open_runtime_state
 
     layout = operator_config.storage
+    if state_db is None:
+        try:
+            state_db = open_runtime_state(layout)
+        except (StateMigrationError, StateDBError) as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=1) from error
     return StagingStore.from_paths(
         StagingPaths(
             layout.collector.root,
@@ -141,11 +152,45 @@ def _staging(operator_config: OperatorConfig) -> StagingStore:
             layout.collector.attempts,
             layout.collector.quarantine,
             layout.collector.lock,
-            layout.collector.device_state,
+            layout.collector.state_db,
         ),
+        state_db=state_db,
         publication_root=layout.publication.root,
-        config=operator_config.config,
+        io=StagingIO(config=operator_config.config),
     )
+
+
+@contextmanager
+def _command_state(loaded: OperatorConfig) -> Iterator[StateDB]:
+    """Hold the one Collector guard before any writable state or BLE work."""
+    from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
+    from omi_collector.capture.adapters.collector_state_db import StateDBError
+    from omi_collector.state_migration import StateMigrationError, open_runtime_state
+
+    try:
+        _require_host_singleton(loaded)
+        with collector_guard(loaded.storage.collector.lock):
+            state_db = open_runtime_state(loaded.storage)
+            with _capture_cli().phy_state_context(state_db):
+                yield state_db
+    except (CollectorGuardError, StateMigrationError, StateDBError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+
+
+def _require_host_singleton(loaded: OperatorConfig) -> None:
+    """Do not let another state root control the installed Bluetooth adapter."""
+    if loaded.path == DEFAULT_CONFIG_PATH:
+        return
+    from omi_collector.storage_layout import StorageLayoutError, load_operator_config
+
+    try:
+        load_operator_config(DEFAULT_CONFIG_PATH)
+    except StorageLayoutError:
+        return
+    from omi_collector.state_migration import StateMigrationError
+
+    raise StateMigrationError("this Bluetooth adapter is bound to the installed Collector state root")
 
 
 class SyncLogLevel(StrEnum):
@@ -259,16 +304,14 @@ class SyncProgressReporter:
         elif outcome in {"verified", "within_threshold"} and _clock_reconciliation_is_conclusive(event):
             signal = OperationalSignal.UNCHANGED
             if self._staging is not None:
-                from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+                from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 
                 try:
-                    records = ClockCorrectionStore(
-                        self._staging.device_state_path, self._staging.attempts_root
-                    ).records()
+                    pending = ClockStateStore(self._staging.state_db).state().intent
                 except Exception:  # noqa: BLE001 - unreadable evidence cannot prove recovery
                     pass
                 else:
-                    if not any(record.state in {"prepared", "unresolved", "unknown"} for record in records):
+                    if pending is None:
                         signal = OperationalSignal.CLEAR
         else:
             signal = OperationalSignal.UNCHANGED
@@ -334,6 +377,8 @@ class SyncProgressReporter:
 
 
 def _clock_reconciliation_is_conclusive(event: Mapping[str, object]) -> bool:
+    if event.get("boundary_ambiguous") is True:
+        return False
     if "reconciliation" in event:
         return False
     count = event.get("reconciled_operations")
@@ -366,13 +411,47 @@ def config_check(
     )
 
 
+@app.command("migrate-state")
+def migrate_collector_state(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
+    legacy_phy_state_home: Annotated[
+        Path | None, typer.Option("--legacy-phy-state-home", help="Prior operator PHY state home.")
+    ] = None,
+) -> None:
+    """Cut over stopped Collector control state to its single SQLite database."""
+    from omi_collector.capture.adapters.collector_state_db import StateDBError
+    from omi_collector.state_migration import StateMigrationError, migrate_state
+
+    loaded = _load_config(config_path)
+    try:
+        _require_host_singleton(loaded)
+        service_state = _systemd_service_status()
+        if loaded.path == DEFAULT_CONFIG_PATH and (
+            not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}
+        ):
+            raise StateMigrationError("confirm the Collector service is stopped before state migration")
+        homes = None
+        if legacy_phy_state_home is not None:
+            homes = (Path("/var/lib/omi-collector"), legacy_phy_state_home)
+        result = migrate_state(loaded.storage, legacy_phy_state_homes=homes)
+    except (StateMigrationError, StateDBError, OSError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
+
+
 @app.command()
 def service(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Run the long-lived single-pendant collector."""
     loaded = _load_config(config_path)
-    staging = _staging(loaded)
+    with _command_state(loaded) as state_db:
+        _service_locked(loaded, state_db)
+
+
+def _service_locked(loaded: OperatorConfig, state_db: StateDB) -> None:
+    staging = _staging(loaded, state_db=state_db)
     _preflight_storage(staging)
     from omi_collector.capture.adapters.operational_status import (
         OperationalIdentity,
@@ -391,10 +470,7 @@ def service(
         invocation_id = uuid4().hex
     operational_status: OperationalStatusStore | None = None
     try:
-        operational_status = OperationalStatusStore(
-            loaded.storage.collector.operational_status,
-            OperationalIdentity(boot_id, invocation_id),
-        )
+        operational_status = OperationalStatusStore(staging.state_db, OperationalIdentity(boot_id, invocation_id))
         staging.initialize_confirmed_loss_ledger()
         operational_status.initialize()
     except (OperationalStatusError, StagingError) as error:
@@ -425,6 +501,7 @@ def service(
 
 @device.command("phy-check")
 def device_phy_check(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     adapter: Annotated[
         str, typer.Option("--adapter", help="Bluetooth adapter to scope temporarily.")
     ] = DEFAULT_CONFIG.ble.adapter_name,
@@ -435,18 +512,23 @@ def device_phy_check(
 ) -> None:
     """Enter and restore the PHY guard without connecting a pendant."""
     _require_confirmation(confirm_host_change, "--confirm-host-change")
-    _run_device_operation(_capture_cli().phy_check(adapter))
+    loaded = _load_config(config_path)
+    with _command_state(loaded):
+        _run_device_operation(_capture_cli().phy_check(adapter))
     typer.echo('{"status": "phy_restored"}')
 
 
 @device.command("recover-phy")
 def device_recover_phy(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     adapter: Annotated[
         str, typer.Option("--adapter", help="Bluetooth adapter with a stale PHY marker.")
     ] = DEFAULT_CONFIG.ble.adapter_name,
 ) -> None:
     """Restore a stale PHY snapshot from an interrupted Omi operation."""
-    _run_device_operation(_capture_cli().recover_phy(adapter))
+    loaded = _load_config(config_path)
+    with _command_state(loaded):
+        _run_device_operation(_capture_cli().recover_phy(adapter))
     typer.echo('{"status": "phy_recovered"}')
 
 
@@ -461,7 +543,8 @@ def device_probe(
     """Read cached ring status without issuing a ring control command."""
     _require_confirmation(confirm_host_change, "--confirm-host-change")
     loaded = _load_config(config_path)
-    result = _run_device_operation(_capture_cli().probe(loaded.pendant.address, DEFAULT_CONFIG.ble.adapter_name))
+    with _command_state(loaded):
+        result = _run_device_operation(_capture_cli().probe(loaded.pendant.address, DEFAULT_CONFIG.ble.adapter_name))
     typer.echo(_capture_cli().render_status(cast(object, result)))
 
 
@@ -476,7 +559,8 @@ def device_info(
     """Read safe ring sequence metadata without requesting audio records."""
     _require_confirmation(confirm_host_change, "--confirm-host-change")
     loaded = _load_config(config_path)
-    result = _run_device_operation(_capture_cli().info(loaded.pendant.address, DEFAULT_CONFIG.ble.adapter_name))
+    with _command_state(loaded):
+        result = _run_device_operation(_capture_cli().info(loaded.pendant.address, DEFAULT_CONFIG.ble.adapter_name))
     typer.echo(_capture_cli().render_info(cast(object, result)))
 
 
@@ -499,19 +583,20 @@ def device_collect(
     """Durably stage a bounded READ; output contains bundle metadata only."""
     _require_confirmation(confirm_read, "--confirm-read")
     loaded = _load_config(config_path)
-    staging = _staging(loaded)
-    _preflight_storage(staging)
-    _initialize_confirmed_loss_ledger(staging)
-    started = time.monotonic()
-    result = _run_device_operation(
-        _capture_cli().collect(
-            loaded.pendant.address,
-            _capture_cli().SUPPORTED_ADAPTER,
-            staging,
-            max_records,
+    with _command_state(loaded) as state_db:
+        staging = _staging(loaded, state_db=state_db)
+        _preflight_storage(staging)
+        _initialize_confirmed_loss_ledger(staging)
+        started = time.monotonic()
+        result = _run_device_operation(
+            _capture_cli().collect(
+                loaded.pendant.address,
+                _capture_cli().SUPPORTED_ADAPTER,
+                staging,
+                max_records,
+            )
         )
-    )
-    metrics = _capture_cli().download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
+        metrics = _capture_cli().download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
     typer.echo(_capture_cli().render_collect(cast(object, result), metrics))
 
 
@@ -545,10 +630,11 @@ def device_sync(
     """Sync using normal PHY negotiation, or explicit temporary LE 1M fallback."""
     _require_confirmation(confirm_sync, "--confirm-sync")
     loaded = _load_config(config_path)
-    staging = _staging(loaded)
-    _preflight_storage(staging)
-    _initialize_confirmed_loss_ledger(staging)
-    _sync(loaded, staging, force_1m=force_1m, log_level=log_level)
+    with _command_state(loaded) as state_db:
+        staging = _staging(loaded, state_db=state_db)
+        _preflight_storage(staging)
+        _initialize_confirmed_loss_ledger(staging)
+        _sync(loaded, staging, force_1m=force_1m, log_level=log_level)
 
 
 def _sync(
@@ -567,9 +653,7 @@ def _sync(
         debug_exception,
     )
 
-    debug_logger = configure_debug_logging(
-        loaded.storage.collector.root, file_name=loaded.storage.collector.debug_log.name
-    )
+    debug_logger = configure_debug_logging(loaded.storage.collector.root)
     try:
         report_progress = SyncProgressReporter(
             log_level,
@@ -670,7 +754,9 @@ def device_metrics(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Report metrics for the source bundles currently visible to the collector."""
+    from omi_collector.capture.adapters.collector_state_db import StateDBError
     from omi_collector.spool_metrics import SpoolMetricsError
+    from omi_collector.state_migration import StateMigrationError, open_runtime_state
 
     try:
         loaded = _load_config(config_path)
@@ -679,9 +765,9 @@ def device_metrics(
             from omi_collector.spool_metrics import collect_spool_metrics as metrics
         result = cast(Callable[..., object], metrics)(
             loaded.storage.publication.root,
-            observation_root=loaded.storage.collector.device_state,
+            state_db=open_runtime_state(loaded.storage, read_only=True),
         )
-    except SpoolMetricsError as error:
+    except (SpoolMetricsError, StateDBError, StateMigrationError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(json.dumps(cast(_JsonResult, result).as_dict(), sort_keys=True, separators=(",", ":")))

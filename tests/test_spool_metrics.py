@@ -17,7 +17,11 @@ from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
+from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
+from omi_collector.capture.application.quality_metrics import SequenceLossMetric
 from omi_collector.capture.domain.ring_protocol import RingInfo
 from omi_collector.spool_metrics import SpoolMetricsError, collect_spool_metrics
 
@@ -35,8 +39,16 @@ def _capture_root(tmp_path: Path) -> Path:
     return root
 
 
+def _state_db_path(root: Path) -> Path:
+    return root.parent / f"{root.name}-collector-state.sqlite3"
+
+
+def _state_db(root: Path, *, read_only: bool = False) -> StateDB:
+    return StateDB(_state_db_path(root), read_only=read_only)
+
+
 def _firmware_observations(root: Path, counters: tuple[int, ...]) -> None:
-    store = FirmwareObservationStore(root / "device.json")
+    store = FirmwareObservationStore(_state_db(root))
     for counter in counters:
         assert store.record(RingInfo(10, 20, 100, counter, RECORD_SIZE))
 
@@ -103,7 +115,7 @@ def _collect_spool_metrics_in_child(root: str, result: Connection) -> None:
 
 
 def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
-    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path)
 
     assert result.as_dict() == {
         "current_window": {
@@ -241,7 +253,7 @@ def test_empty_capture_device_still_reports_spool_firmware_observations(tmp_path
     capture_root.mkdir()
     _firmware_observations(spool, (4, 9))
 
-    result = collect_spool_metrics(capture_root, observation_root=spool / "device.json")
+    result = collect_spool_metrics(capture_root, state_db=_state_db(spool, read_only=True))
 
     assert result.current_window.bundle_count == 0
     assert result.firmware_lifetime.observation_count == 2
@@ -363,8 +375,30 @@ def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path)
     _firmware_observations(tmp_path, (4, 9, 12))
     ready_root = tmp_path / "ready"
     ready_root.mkdir()
+    state_db = _state_db(tmp_path)
+    quality_writer = SQLiteQualityMetrics(state_db, release_version="1.2.3")
+    quality_writer.record_sequence_loss(
+        SequenceLossMetric("2026-10-11T01:02:03+00:00", "session", 1, RECORD_SIZE, "test", "1.2.3", None, None)
+    )
+    assert quality_writer.close()
+    ClockStateStore(state_db).observe(
+        RingInfo(10, 20, 100, 12, RECORD_SIZE),
+        offset_seconds=0.0,
+        uncertainty_seconds=0.01,
+        source_id="test",
+        tolerance_seconds=0.1,
+    )
+    reader = _state_db(tmp_path, read_only=True)
+    state_kinds = (
+        StateKind.FIRMWARE,
+        StateKind.CLOCK,
+        StateKind.QUALITY_EVENT,
+        StateKind.QUALITY_EVENT_BUDGET,
+    )
+    before = {kind: reader.list(kind) for kind in state_kinds}
 
-    result = collect_spool_metrics(ready_root, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(ready_root, state_db=reader)
+    after = {kind: reader.list(kind) for kind in state_kinds}
 
     assert result.firmware_lifetime.observation_count == 3
     assert result.firmware_lifetime.initial == 4
@@ -375,6 +409,10 @@ def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path)
     assert result.current_window.lost_records == 0
     assert result.current_window.lost_raw_bytes == 0
     assert result.current_window.loss_ratio == 0.0
+    assert before == after
+    assert before[StateKind.CLOCK]
+    assert before[StateKind.QUALITY_EVENT]
+    assert before[StateKind.QUALITY_EVENT_BUDGET]
 
 
 def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
@@ -382,7 +420,7 @@ def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
     ready_root = tmp_path / "ready"
     ready_root.mkdir()
 
-    result = collect_spool_metrics(ready_root, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(ready_root, state_db=_state_db(tmp_path, read_only=True))
 
     assert result.firmware_lifetime.observation_count == 5
     assert result.firmware_lifetime.initial == 4
@@ -395,11 +433,11 @@ def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
 
 def test_malformed_firmware_observation_chain_fails_closed(tmp_path: Path) -> None:
     _firmware_observations(tmp_path, (4, 9))
-    state = tmp_path / "device.json"
-    state.write_text(state.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    state_db = _state_db(tmp_path)
+    state_db.put(StateKind.FIRMWARE, "latest", {"unexpected": True})
 
     with pytest.raises(SpoolMetricsError, match="firmware observations are invalid"):
-        collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+        collect_spool_metrics(tmp_path, state_db=_state_db(tmp_path, read_only=True))
 
 
 def test_sequence_discontinuity_is_aggregated_between_real_bundles(tmp_path: Path) -> None:
@@ -407,7 +445,7 @@ def test_sequence_discontinuity_is_aggregated_between_real_bundles(tmp_path: Pat
     _bundle(device, "first", (_record(1), _record(2)))
     _bundle(device, "second", (_record(4), _record(5)), start=13)
 
-    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path)
 
     assert result.current_window.lost_records == 1
     assert result.current_window.lost_raw_bytes == RECORD_SIZE
@@ -432,7 +470,7 @@ def test_conflicting_overlapping_ranges_fail_closed(tmp_path: Path) -> None:
     _bundle(device, "overlap", (_record(3), _record(4)), start=11)
 
     with pytest.raises(SpoolMetricsError, match="sequence ranges overlap"):
-        collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+        collect_spool_metrics(tmp_path)
 
 
 def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
@@ -450,7 +488,7 @@ def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
 
     monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
 
-    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path)
 
     assert result.current_window.downloaded_records == 2
 
@@ -462,12 +500,12 @@ def test_partial_and_symlink_artifacts_are_not_counted(tmp_path: Path) -> None:
     target.mkdir()
     (device / "symlink").symlink_to(target, target_is_directory=True)
 
-    result = collect_spool_metrics(tmp_path, observation_root=tmp_path / "device.json")
+    result = collect_spool_metrics(tmp_path)
 
     assert result.current_window.bundle_count == 0
 
 
-def test_observation_path_is_optional_when_state_file_is_not_available(tmp_path: Path) -> None:
+def test_firmware_observations_are_optional_without_a_state_database(tmp_path: Path) -> None:
     result = collect_spool_metrics(tmp_path)
 
     assert result.firmware_lifetime.observation_count == 0
@@ -475,15 +513,15 @@ def test_observation_path_is_optional_when_state_file_is_not_available(tmp_path:
     assert result.firmware_lifetime.latest is None
 
 
-def test_observation_path_rejects_directory_and_symlink(tmp_path: Path) -> None:
-    observation_directory = tmp_path / "collector"
-    observation_directory.mkdir()
+def test_spool_metrics_rejects_a_state_database_path_replaced_by_directory_or_symlink(tmp_path: Path) -> None:
+    database = _state_db(tmp_path)
+    reader = _state_db(tmp_path, read_only=True)
+    database.path.unlink()
+    database.path.mkdir()
     with pytest.raises(SpoolMetricsError, match="firmware observations are invalid"):
-        collect_spool_metrics(tmp_path, observation_root=observation_directory)
-
-    target = tmp_path / "state-target.json"
-    target.write_text("{}", encoding="utf-8")
-    observation_symlink = tmp_path / "device.json"
-    observation_symlink.symlink_to(target)
+        collect_spool_metrics(tmp_path, state_db=reader)
+    database.path.rmdir()
+    target = StateDB(tmp_path.parent / f"{tmp_path.name}-state-target.sqlite3")
+    database.path.symlink_to(target.path)
     with pytest.raises(SpoolMetricsError, match="firmware observations are invalid"):
-        collect_spool_metrics(tmp_path, observation_root=observation_symlink)
+        collect_spool_metrics(tmp_path, state_db=reader)

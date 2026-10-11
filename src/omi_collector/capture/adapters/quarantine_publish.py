@@ -14,15 +14,15 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RECORD_SIZE
-from .bundle_contract import BundleManifest, SealedReceipt
-from .staging_filesystem import _SHARED_BUNDLE_DIRECTORY_MODE, StagingPaths
-from .staging_store import StagingStore
+from .bundle_contract import BundleManifest
+from .collector_state_db import StateDB, StateKind
+from .staging_contract import AttemptStateError
+from .staging_filesystem import _SHARED_BUNDLE_DIRECTORY_MODE, DeviceLock, StagingFilesystem
 
 _ATTEMPT_NAME: Final = "attempt.json"
 _CHECKPOINT_NAME: Final = "checkpoint.json"
 _RAW_NAME: Final = "records.bin"
 _MANIFEST_NAME: Final = "manifest.json"
-_RECEIPT_NAME: Final = "receipt.json"
 _ATTEMPT_KEYS: Final = frozenset(
     {
         "attempt_id",
@@ -94,24 +94,24 @@ class _Prefix:
 
 def publish_quarantined_prefix(
     source: Path,
-    paths: StagingPaths,
+    filesystem: StagingFilesystem,
+    lease: DeviceLock,
     *,
     should_defer: Callable[[], bool] = _never_defer,
 ) -> QuarantinePublication:
-    """Publish one checkpoint-bound prefix under the device spool lock."""
-    with StagingStore.from_paths(paths).device_lock(
-        recover_capture_temporaries=False, operation="publish_quarantined_prefix"
-    ):
-        return _publish_quarantined_prefix(source, paths, should_defer=should_defer)
+    """Publish one checkpoint-bound prefix under the caller's active spool lease."""
+    filesystem.require_device_lock(lease)
+    return _publish_quarantined_prefix(source, filesystem, should_defer=should_defer)
 
 
 def _publish_quarantined_prefix(
     source: Path,
-    paths: StagingPaths,
+    filesystem: StagingFilesystem,
     *,
     should_defer: Callable[[], bool],
 ) -> QuarantinePublication:
     """Publish one checkpoint-bound prefix while leaving ``source`` untouched."""
+    paths = filesystem.paths
     source, spool = _validate_quarantine_source(
         source,
         paths.root,
@@ -119,8 +119,9 @@ def _publish_quarantined_prefix(
     )
     capture_root = paths.capture_root.absolute()
     _defer_if_requested(should_defer)
-    prefix, raw_path, attempt_id = _read_authenticated_prefix(
+    prefix, raw_path, _attempt_id = _read_authenticated_prefix(
         source,
+        state_db=filesystem.state_db,
         should_defer=should_defer,
     )
 
@@ -143,12 +144,10 @@ def _publish_quarantined_prefix(
             RECORD_SIZE,
             prefix.raw_sha256,
         ).as_dict()
-        receipt = SealedReceipt(attempt_id, prefix.raw_sha256).as_dict()
         if os.path.lexists(destination):
             if _destination_matches(
                 destination,
                 manifest,
-                receipt,
                 raw_path,
                 prefix.record_count * RECORD_SIZE,
                 should_defer=should_defer,
@@ -158,7 +157,6 @@ def _publish_quarantined_prefix(
         _publish_atomic(
             destination,
             manifest,
-            receipt,
             raw_path,
             prefix.record_count * RECORD_SIZE,
             should_defer=should_defer,
@@ -173,27 +171,88 @@ def _publish_quarantined_prefix(
 def _read_authenticated_prefix(
     source: Path,
     *,
+    state_db: StateDB,
     should_defer: Callable[[], bool],
 ) -> tuple[_Prefix, Path, str]:
     """Read and authenticate the checkpoint-bound prefix from one attempt."""
-    attempt = _read_attempt(source / _ATTEMPT_NAME, source.name)
-    checkpoint = _read_checkpoint(source / _CHECKPOINT_NAME, cast(str, attempt["attempt_id"]))
+    attempt_id = _authenticated_quarantine_attempt_id(source, state_db)
+    prefix = _read_authenticated_state_prefix(state_db, source.name, attempt_id)
+    raw_path = source / _RAW_NAME
+    _authenticate_raw_prefix(raw_path, prefix, should_defer=should_defer)
+    return prefix, raw_path, attempt_id
+
+
+def _authenticated_quarantine_attempt_id(source: Path, state_db: StateDB) -> str:
+    from .quarantine import _validate_quarantine_payload
+
+    try:
+        raw_quarantine_row = state_db.get(StateKind.QUARANTINE, source.name)
+        if raw_quarantine_row is None:
+            raise QuarantinePublishError("quarantine state is missing or incomplete")
+        quarantine_row = _validate_quarantine_payload(source.name, raw_quarantine_row)
+    except (OSError, AttemptStateError, ValueError) as error:
+        raise QuarantinePublishError("quarantine state is missing or malformed") from error
+
+    _validate_quarantine_source_identity(source, quarantine_row)
+    attempt_id = quarantine_row.get("attempt_id")
+    if not isinstance(attempt_id, str):
+        raise QuarantinePublishError("quarantine attempt identity is missing")
+    return attempt_id
+
+
+def _validate_quarantine_source_identity(source: Path, row: dict[str, object]) -> None:
+    try:
+        identity = source.lstat()
+    except OSError as error:
+        raise QuarantinePublishError("quarantine source cannot be inspected") from error
+    if stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
+        raise QuarantinePublishError("quarantine state is missing or incomplete")
+    _validate_quarantine_row_identity(identity, row)
+
+
+def _validate_quarantine_row_identity(identity: os.stat_result, row: dict[str, object]) -> None:
+    if row["move_committed"] is not True:
+        raise QuarantinePublishError("quarantine state is missing or incomplete")
+    if row["entry_kind"] != "directory":
+        raise QuarantinePublishError("quarantine state is missing or incomplete")
+    if (identity.st_dev, identity.st_ino) != (row["source_device"], row["source_inode"]):
+        raise QuarantinePublishError("quarantine state is missing or incomplete")
+    if row["opaque"] is not False:
+        raise QuarantinePublishError("quarantine state is missing or incomplete")
+    if row["terminal_state"] is not None:
+        raise QuarantinePublishError("quarantine state is missing or incomplete")
+
+
+def _read_authenticated_state_prefix(state_db: StateDB, source_name: str, attempt_id: str) -> _Prefix:
+    attempt_row = state_db.get(StateKind.ATTEMPT, attempt_id)
+    if attempt_row is None:
+        raise QuarantinePublishError("attempt state is missing")
+    raw_attempt = attempt_row.get("descriptor")
+    raw_checkpoint = attempt_row.get("checkpoint")
+    if not isinstance(raw_attempt, dict) or not isinstance(raw_checkpoint, dict):
+        raise QuarantinePublishError("attempt state is malformed")
+    attempt = _validate_attempt(raw_attempt, source_name)
+    checkpoint = _validate_checkpoint(raw_checkpoint, attempt_id)
     record_count = cast(int, checkpoint["record_count"])
     if record_count <= 0 or record_count > cast(int, attempt["packet_count"]):
         raise QuarantinePublishError("checkpoint record count is outside the attempt range")
+    return _Prefix(cast(int, attempt["start_sequence"]), record_count, cast(str, checkpoint["raw_sha256"]))
 
-    raw_path = source / _RAW_NAME
+
+def _authenticate_raw_prefix(
+    raw_path: Path,
+    prefix: _Prefix,
+    *,
+    should_defer: Callable[[], bool],
+) -> None:
     _require_regular_file(raw_path, _RAW_NAME)
     actual_hash = _hash_prefix(
         raw_path,
-        record_count * RECORD_SIZE,
+        prefix.record_count * RECORD_SIZE,
         should_defer=should_defer,
     )
-    expected_hash = cast(str, checkpoint["raw_sha256"])
-    if actual_hash != expected_hash:
+    if actual_hash != prefix.raw_sha256:
         raise QuarantinePublishError("records.bin prefix SHA-256 does not match checkpoint")
-    prefix = _Prefix(cast(int, attempt["start_sequence"]), record_count, expected_hash)
-    return prefix, raw_path, cast(str, attempt["attempt_id"])
 
 
 def _result(
@@ -264,6 +323,10 @@ def _validate_quarantine_source(source: Path, spool: Path, *, quarantine_root: P
 
 def _read_attempt(path: Path, source_name: str) -> dict[str, object]:
     raw = _read_object(path, _ATTEMPT_NAME)
+    return _validate_attempt(raw, source_name)
+
+
+def _validate_attempt(raw: dict[str, object], source_name: str) -> dict[str, object]:
     if frozenset(raw) != _ATTEMPT_KEYS:
         raise QuarantinePublishError("attempt.json schema is not exact")
     _validate_attempt_identity(raw, source_name)
@@ -306,6 +369,10 @@ def _validate_read_begin(raw: dict[str, object]) -> None:
 def _read_checkpoint(path: Path, attempt_id: str) -> dict[str, object]:
     _require_regular_file(path, _CHECKPOINT_NAME)
     raw = _read_object(path, _CHECKPOINT_NAME)
+    return _validate_checkpoint(raw, attempt_id)
+
+
+def _validate_checkpoint(raw: dict[str, object], attempt_id: str) -> dict[str, object]:
     if frozenset(raw) != _CHECKPOINT_KEYS:
         raise QuarantinePublishError("checkpoint.json schema is not exact")
     if _nonnegative_int(raw, "version") != 1 or _string(raw, "attempt_id") != attempt_id:
@@ -340,10 +407,9 @@ def _hash_prefix(
     return digest.hexdigest()
 
 
-def _destination_matches(  # noqa: PLR0913
+def _destination_matches(
     destination: Path,
     manifest: dict[str, object],
-    receipt: dict[str, object],
     raw_source: Path,
     prefix_size: int,
     *,
@@ -354,32 +420,26 @@ def _destination_matches(  # noqa: PLR0913
         names = {entry.name for entry in destination.iterdir()}
     except OSError as error:
         raise OSError("ordinary bundle destination cannot be inspected") from error
-    if names != {_RAW_NAME, _MANIFEST_NAME, _RECEIPT_NAME}:
+    if names != {_RAW_NAME, _MANIFEST_NAME}:
         raise OSError("ordinary bundle destination is not yet canonical")
     existing_manifest = _read_object(destination / _MANIFEST_NAME, _MANIFEST_NAME)
-    existing_receipt = _read_object(destination / _RECEIPT_NAME, _RECEIPT_NAME)
     try:
         canonical_manifest = BundleManifest.from_json(existing_manifest).as_dict()
     except ValueError as error:
         raise QuarantineOutputCollisionError(f"ordinary bundle collision at {destination}") from error
-    if (
-        canonical_manifest != manifest
-        or existing_receipt != receipt
-        or not _files_equal_prefix(
-            destination / _RAW_NAME,
-            raw_source,
-            prefix_size,
-            should_defer=should_defer,
-        )
+    if canonical_manifest != manifest or not _files_equal_prefix(
+        destination / _RAW_NAME,
+        raw_source,
+        prefix_size,
+        should_defer=should_defer,
     ):
         raise QuarantineOutputCollisionError(f"ordinary bundle collision at {destination}")
     return True
 
 
-def _publish_atomic(  # noqa: PLR0913
+def _publish_atomic(
     destination: Path,
     manifest: dict[str, object],
-    receipt: dict[str, object],
     raw_source: Path,
     prefix_size: int,
     *,
@@ -408,11 +468,6 @@ def _publish_atomic(  # noqa: PLR0913
             _json_bytes(manifest),
             should_defer=should_defer,
         )
-        _write_file(
-            temporary / _RECEIPT_NAME,
-            _json_bytes(receipt),
-            should_defer=should_defer,
-        )
         _defer_if_requested(should_defer)
         _fsync_directory(temporary)
         _defer_if_requested(should_defer)
@@ -424,7 +479,6 @@ def _publish_atomic(  # noqa: PLR0913
             if _destination_matches(
                 destination,
                 manifest,
-                receipt,
                 raw_source,
                 prefix_size,
                 should_defer=_never_defer,

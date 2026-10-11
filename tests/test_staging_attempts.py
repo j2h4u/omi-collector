@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from errno import EXDEV
 from hashlib import sha256
-from json import dumps, loads
 from os import PathLike, fsync
 from pathlib import Path
 from shutil import rmtree
@@ -20,11 +19,12 @@ from omi_collector.capture.adapters.attempts import (
     RecordMismatchError,
     RecordRegressionError,
 )
+from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.staging_contract import AttemptStateError, DiskSpaceError
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, DurabilityConfig, StagingRetentionConfig
+from staging_test_factory import StagingStore
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -76,10 +76,24 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
     return attempt
 
 
-def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:
-    checkpoint = cast(dict[str, object], loads(path.read_text(encoding="utf-8")))
+def _attempt_row(attempt: object) -> dict[str, object]:
+    return cast(dict[str, object], attempt._filesystem._read_attempt_row(attempt.attempt_id))  # type: ignore[attr-defined]
+
+
+def _checkpoint(attempt: object) -> dict[str, object]:
+    return cast(dict[str, object], _attempt_row(attempt)["checkpoint"])
+
+
+def _write_row_field(attempt: object, field: str, value: object) -> None:
+    row = _attempt_row(attempt)
+    row[field] = value
+    attempt._filesystem.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, row)  # type: ignore[attr-defined]
+
+
+def _rewrite_checkpoint(attempt: object, field: str, value: object) -> None:
+    checkpoint = _checkpoint(attempt)
     checkpoint[field] = value
-    path.write_text(dumps(checkpoint), encoding="utf-8")
+    _write_row_field(attempt, "checkpoint", checkpoint)
 
 
 def _replace_with_symlink(path: Path, target: Path, payload: bytes | str) -> None:
@@ -154,7 +168,7 @@ def test_prepare_persists_descriptor_before_returning(tmp_path: Path) -> None:
 
     assert attempt.path.parent == tmp_path / "attempts"
     assert attempt.path.name == attempt.attempt_id
-    assert (attempt.path / "attempt.json").is_file()
+    assert _attempt_row(attempt)["descriptor"] is not None
     assert (
         StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id).descriptor.start_sequence
         == 100
@@ -207,7 +221,7 @@ def test_streaming_chunk_crossing_hash_boundary_persists_the_boundary_prefix(tmp
     attempt.accept_chunk(100, b"".join(records[:1023]))
     attempt.accept_chunk(1123, b"".join(records[1023:]))
 
-    checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+    checkpoint = _checkpoint(attempt)
     assert checkpoint["record_count"] == 1024
     assert checkpoint["raw_sha256"] == sha256(b"".join(records[:1024])).hexdigest()
     assert attempt.durable_prefix.next_sequence == 1124
@@ -239,7 +253,7 @@ def test_streaming_chunk_hash_advances_once_across_checkpoint_boundary(
         attempt._stream_hash = _NonEmptyDigest(attempt._stream_hash, observe_update)
         attempt.accept_chunk(100, records)
 
-        checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+        checkpoint = _checkpoint(attempt)
         boundary_bytes = 2 * RECORD_SIZE
         assert checkpoint["record_count"] == 2
         assert checkpoint["raw_sha256"] == real_sha256(records[:boundary_bytes]).hexdigest()
@@ -271,8 +285,8 @@ def test_streaming_accept_chunk_matches_per_record_hash_and_checkpoint(tmp_path:
     chunked.accept_chunk(100, records)
 
     assert (per_record.path / "records.bin").read_bytes() == (chunked.path / "records.bin").read_bytes()
-    per_checkpoint = cast(dict[str, object], loads((per_record.path / "checkpoint.json").read_text()))
-    chunk_checkpoint = cast(dict[str, object], loads((chunked.path / "checkpoint.json").read_text()))
+    per_checkpoint = _checkpoint(per_record)
+    chunk_checkpoint = _checkpoint(chunked)
     assert per_checkpoint["record_count"] == chunk_checkpoint["record_count"] == 1024
     assert per_checkpoint["raw_sha256"] == chunk_checkpoint["raw_sha256"]
     assert per_record.durable_prefix == chunked.durable_prefix
@@ -318,14 +332,14 @@ def test_streaming_checkpoint_is_bounded_and_flushes_an_explicit_tail(tmp_path: 
     assert sync_calls == before_records
 
     attempt.accept_chunk(1123, _record(1024 % 256))
-    # A streaming checkpoint now durably publishes both the raw fsync and its
-    # atomic checkpoint file (temporary-file fsync plus attempt-directory fsync).
-    assert sync_calls == before_records + 3
+    # The checkpoint row commits in SQLite; the injectable filesystem sync is
+    # used only for the raw file boundary.
+    assert sync_calls == before_records + 1
     attempt.accept_chunk(1124, _record(1025 % 256))
-    assert sync_calls == before_records + 3
+    assert sync_calls == before_records + 1
 
     attempt.checkpoint()
-    assert sync_calls == before_records + 6
+    assert sync_calls == before_records + 2
     assert (attempt.path / "records.bin").stat().st_size == 1025 * RECORD_SIZE
     attempt.close()
 
@@ -365,7 +379,7 @@ def test_durability_config_projects_headroom_overhead_and_checkpoint_batching(tm
     attempt.accept_chunk(100, _record(1))
     attempt.accept_chunk(101, _record(2))
 
-    checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text()))
+    checkpoint = _checkpoint(attempt)
     assert expected_required == 3330
     assert checkpoint["record_count"] == 2
 
@@ -437,8 +451,8 @@ def test_writer_close_failure_preserves_recoverable_prefix_without_terminal_mark
     monkeypatch.setattr(attempt, "close", original_close)
     attempt.close(durable=True)
 
-    assert (attempt.path / "prefix-publication.json").is_file()
-    assert not (attempt.path / "terminal-retired.json").exists()
+    assert _attempt_row(attempt)["prefix_publication"] is not None
+    assert _attempt_row(attempt)["terminal_retirement"] is None
     assert store.sweep_terminal_retired() == ()
     assert attempt.path.exists()
 
@@ -463,20 +477,20 @@ def test_terminal_marker_write_failure_leaves_only_recoverable_prefix(
     attempt.checkpoint()
     assert attempt.publish_prefix() is not None
     attempt.close(durable=True)
-    write_json_atomic = store._filesystem._write_json_atomic
+    write_attempt_field = store._filesystem._write_attempt_field
 
-    def fail_after_terminal_marker_write(path: Path, value: object) -> None:
-        write_json_atomic(path, value)
-        if path.name == "terminal-retired.json":
+    def fail_terminal_marker_write(attempt_id: str, field: str, value: object) -> None:
+        if field == "terminal_retirement":
             raise OSError("simulated terminal marker fsync failure")
+        write_attempt_field(attempt_id, field, value)
 
-    monkeypatch.setattr(store._filesystem, "_write_json_atomic", fail_after_terminal_marker_write)
+    monkeypatch.setattr(store._filesystem, "_write_attempt_field", fail_terminal_marker_write)
     with pytest.raises(OSError, match="terminal marker fsync failure"):
         store.terminalize_prefix_attempt(attempt.attempt_id)
 
     now += 1_000_000_000
-    assert (attempt.path / "prefix-publication.json").is_file()
-    assert not (attempt.path / "terminal-retired.json").exists()
+    assert _attempt_row(attempt)["prefix_publication"] is not None
+    assert _attempt_row(attempt)["terminal_retirement"] is None
     assert store.sweep_terminal_retired() == ()
     assert attempt.path.exists()
 
@@ -515,7 +529,7 @@ def test_streaming_resume_promotes_only_an_aligned_post_checkpoint_tail(tmp_path
     attempt.checkpoint()
     attempt.accept_chunk(101, second)
     attempt.close(durable=True)
-    checkpoint_before = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+    checkpoint_before = _checkpoint(attempt)
 
     restarted = StagingStore(tmp_path, _capture_root(tmp_path))
     with restarted.device_lock() as lease:
@@ -523,7 +537,7 @@ def test_streaming_resume_promotes_only_an_aligned_post_checkpoint_tail(tmp_path
         assert resumed is not None
         assert resumed.durable_prefix.record_count == 2
         assert resumed.durable_prefix.raw_sha256 == sha256(first + second).hexdigest()
-        assert loads((resumed.path / "checkpoint.json").read_text(encoding="utf-8"))["record_count"] == 2
+        assert _checkpoint(resumed)["record_count"] == 2
         resumed.close()
 
     assert checkpoint_before["record_count"] == 1
@@ -619,7 +633,7 @@ def test_prefix_publication_fsyncs_raw_evidence_before_bundle_is_visible(tmp_pat
     assert len(raw_sync_paths) == 2
     assert raw_sync_paths[0] == attempt.path / "records.bin"
     assert attempt.path.exists()
-    assert not (attempt.path / "prefix-publication.json").exists()
+    assert _attempt_row(attempt)["prefix_publication"] is None
 
 
 def test_seal_requires_raw_fsync_before_publishing_bundle(tmp_path: Path) -> None:
@@ -685,7 +699,7 @@ def test_resume_fsync_failure_does_not_promote_uncheckpointed_tail(tmp_path: Pat
     attempt.checkpoint()
     attempt.accept_chunk(101, _record(2))
     attempt.close(durable=True)
-    checkpoint = (attempt.path / "checkpoint.json").read_bytes()
+    checkpoint = _checkpoint(attempt).copy()
     raw = _record(1) + _record(2)
     fail_raw_sync = True
 
@@ -693,7 +707,7 @@ def test_resume_fsync_failure_does_not_promote_uncheckpointed_tail(tmp_path: Pat
     with pytest.raises(OSError, match="tail promotion sync failed"), restarted.device_lock() as lease:
         restarted.resume_streaming_attempt(lease)
 
-    assert (attempt.path / "checkpoint.json").read_bytes() == checkpoint
+    assert _checkpoint(attempt) == checkpoint
     assert (attempt.path / "records.bin").read_bytes() == raw
     assert attempt.path.is_dir()
 
@@ -705,9 +719,8 @@ def test_empty_published_prefix_with_wrong_empty_digest_still_blocks_terminaliza
     attempt.checkpoint()
     assert attempt.publish_prefix() is None
     attempt.close(durable=True)
-    checkpoint = attempt.path / "checkpoint.json"
-    _rewrite_checkpoint(checkpoint, "raw_sha256", "f" * 64)
-    corrupted = checkpoint.read_bytes()
+    _rewrite_checkpoint(attempt, "raw_sha256", "f" * 64)
+    corrupted = _checkpoint(attempt).copy()
 
     with pytest.raises(AttemptStateError):
         store.open_attempt(attempt.attempt_id)
@@ -715,9 +728,9 @@ def test_empty_published_prefix_with_wrong_empty_digest_still_blocks_terminaliza
     with pytest.raises(AttemptStateError):
         store.terminalize_prefix_attempt(attempt.attempt_id)
 
-    assert checkpoint.read_bytes() == corrupted
-    assert (attempt.path / "prefix-publication.json").is_file()
-    assert not (attempt.path / "terminal-retired.json").exists()
+    assert _checkpoint(attempt) == corrupted
+    assert _attempt_row(attempt)["prefix_publication"] is not None
+    assert _attempt_row(attempt)["terminal_retirement"] is None
     assert attempt.path.exists()
 
 
@@ -764,8 +777,6 @@ def test_large_resume_hashes_raw_evidence_in_one_streaming_pass(
         "short",
         "unaligned",
         "oversized",
-        "symlink",
-        "nonregular",
         "raw_symlink",
         "raw_nonregular",
     ],
@@ -777,20 +788,17 @@ def test_streaming_resume_rejects_damaged_checkpoint_or_raw_evidence(tmp_path: P
     attempt.accept_chunk(100, _record(1))
     attempt.checkpoint()
     attempt.close(durable=True)
-    checkpoint = attempt.path / "checkpoint.json"
     raw = attempt.path / "records.bin"
 
     actions: dict[str, Callable[[], object]] = {
-        "missing": checkpoint.unlink,
-        "malformed": lambda: checkpoint.write_text("{", encoding="utf-8"),
-        "version": lambda: _rewrite_checkpoint(checkpoint, "version", 2),
-        "identity": lambda: _rewrite_checkpoint(checkpoint, "attempt_id", "f" * 32),
-        "hash": lambda: _rewrite_checkpoint(checkpoint, "raw_sha256", "0" * 64),
+        "missing": lambda: _write_row_field(attempt, "checkpoint", None),
+        "malformed": lambda: _write_row_field(attempt, "checkpoint", []),
+        "version": lambda: _rewrite_checkpoint(attempt, "version", 2),
+        "identity": lambda: _rewrite_checkpoint(attempt, "attempt_id", "f" * 32),
+        "hash": lambda: _rewrite_checkpoint(attempt, "raw_sha256", "0" * 64),
         "short": lambda: raw.write_bytes(b""),
         "unaligned": lambda: raw.write_bytes(raw.read_bytes() + b"torn"),
         "oversized": lambda: raw.write_bytes(raw.read_bytes() + _record(2) + _record(3)),
-        "symlink": lambda: _replace_with_symlink(checkpoint, tmp_path / "outside-checkpoint", "{}"),
-        "nonregular": lambda: (checkpoint.unlink(), checkpoint.mkdir()),
         "raw_symlink": lambda: _replace_with_symlink(raw, tmp_path / "outside-raw", _record(1)),
         "raw_nonregular": lambda: (raw.unlink(), raw.mkdir()),
     }
@@ -799,7 +807,7 @@ def test_streaming_resume_rejects_damaged_checkpoint_or_raw_evidence(tmp_path: P
     with pytest.raises(AttemptStateError):
         store.open_attempt(attempt.attempt_id)
     assert attempt.path.exists()
-    assert (attempt.path / "attempt.json").exists()
+    assert _attempt_row(attempt)["descriptor"] is not None
 
 
 def test_reopen_rejects_unaligned_or_out_of_bounds_streaming_bytes(tmp_path: Path) -> None:
@@ -820,11 +828,9 @@ def test_reopen_rejects_unaligned_or_out_of_bounds_streaming_bytes(tmp_path: Pat
     [("attempt_id", 7), ("start_sequence", "100"), ("read_begin_start", True)],
 )
 def test_open_rejects_malformed_descriptor_fields(tmp_path: Path, field: str, value: object) -> None:
-    attempt_id = "a" * 32
-    attempt_path = tmp_path / "attempts" / attempt_id
-    attempt_path.mkdir(parents=True)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
     payload: dict[str, object] = {
-        "attempt_id": attempt_id,
+        "attempt_id": attempt.attempt_id,
         "schema_version": 2,
         "start_sequence": 100,
         "packet_count": 2,
@@ -833,18 +839,16 @@ def test_open_rejects_malformed_descriptor_fields(tmp_path: Path, field: str, va
         "read_begin_count": None,
     }
     payload[field] = value
-    (attempt_path / "attempt.json").write_text(dumps(payload), encoding="utf-8")
+    _write_row_field(attempt, "descriptor", payload)
 
     with pytest.raises(AttemptStateError, match="malformed"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id)
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
 
 def test_open_rejects_non_object_and_invalid_descriptor_identity(tmp_path: Path) -> None:
-    attempt_id = "a" * 32
-    attempt_path = tmp_path / "attempts" / attempt_id
-    attempt_path.mkdir(parents=True)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
     descriptor = {
-        "attempt_id": attempt_id,
+        "attempt_id": attempt.attempt_id,
         "schema_version": 2,
         "start_sequence": 100,
         "packet_count": 2,
@@ -852,20 +856,20 @@ def test_open_rejects_non_object_and_invalid_descriptor_identity(tmp_path: Path)
         "read_begin_start": None,
         "read_begin_count": None,
     }
-    (attempt_path / "attempt.json").write_text("[]", encoding="utf-8")
-    with pytest.raises(AttemptStateError, match="must contain a JSON object"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id)
+    _write_row_field(attempt, "descriptor", [])
+    with pytest.raises(AttemptStateError, match="malformed"):
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
     descriptor["record_size"] = RECORD_SIZE + 1
-    (attempt_path / "attempt.json").write_text(dumps(descriptor), encoding="utf-8")
+    _write_row_field(attempt, "descriptor", descriptor)
     with pytest.raises(AttemptStateError, match="identity or record size"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id)
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
     descriptor["record_size"] = RECORD_SIZE
     descriptor["attempt_id"] = "b" * 32
-    (attempt_path / "attempt.json").write_text(dumps(descriptor), encoding="utf-8")
-    with pytest.raises(AttemptStateError, match="identity or record size"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id)
+    _write_row_field(attempt, "descriptor", descriptor)
+    with pytest.raises(AttemptStateError, match="identity does not match"):
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
 
 @pytest.mark.parametrize(
@@ -875,11 +879,9 @@ def test_open_rejects_non_object_and_invalid_descriptor_identity(tmp_path: Path)
 def test_open_rejects_invalid_persisted_read_begin(
     tmp_path: Path, read_begin_start: int, read_begin_count: int | None, message: str
 ) -> None:
-    attempt_id = "a" * 32
-    attempt_path = tmp_path / "attempts" / attempt_id
-    attempt_path.mkdir(parents=True)
+    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
     descriptor = {
-        "attempt_id": attempt_id,
+        "attempt_id": attempt.attempt_id,
         "schema_version": 2,
         "start_sequence": 100,
         "packet_count": 2,
@@ -887,10 +889,10 @@ def test_open_rejects_invalid_persisted_read_begin(
         "read_begin_start": read_begin_start,
         "read_begin_count": read_begin_count,
     }
-    (attempt_path / "attempt.json").write_text(dumps(descriptor), encoding="utf-8")
+    _write_row_field(attempt, "descriptor", descriptor)
 
     with pytest.raises(AttemptStateError, match=message):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id)
+        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
 
 def test_read_begin_is_idempotent_and_rejects_mismatch(tmp_path: Path) -> None:
@@ -987,34 +989,37 @@ def test_failure_latch_rejects_followup_data_after_short_write(tmp_path: Path) -
 
 def test_failure_latch_rejects_followup_data_after_checkpoint_fsync_error(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sync_state = {"armed": False, "calls": 0}
+    sync_order: list[str] = []
 
-    def fail_checkpoint_sync(fd: int) -> None:
-        if sync_state["armed"]:
-            sync_state["calls"] += 1
-            if sync_state["calls"] == 2:
-                raise OSError("simulated checkpoint fsync failure")
+    def track_raw_sync(fd: int) -> None:
+        if Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin":
+            sync_order.append("raw_fsync")
         fsync(fd)
 
     config = CollectorConfig(durability=DurabilityConfig(checkpoint_records=1))
-    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_checkpoint_sync, config=config)
+    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=track_raw_sync, config=config)
     attempt = store.prepare_streaming_attempt(100, 2)
     attempt.record_read_begin(ReadBeginNotification(100, 2))
-    sync_state["armed"] = True
 
-    with pytest.raises(OSError, match="checkpoint fsync failure"):
+    def fail_checkpoint(*_args: object, **_kwargs: object) -> None:
+        sync_order.append("checkpoint_db_commit")
+        raise OSError("simulated checkpoint commit failure")
+
+    monkeypatch.setattr(store._filesystem, "_write_checkpoint", fail_checkpoint)
+
+    with pytest.raises(OSError, match="checkpoint commit failure"):
         attempt.accept_chunk(100, _record(1))
+    assert sync_order[-2:] == ["raw_fsync", "checkpoint_db_commit"]
 
     raw_path = attempt.path / "records.bin"
-    checkpoint_path = attempt.path / "checkpoint.json"
     preserved = raw_path.read_bytes()
-    checkpoint = cast(dict[str, object], loads(checkpoint_path.read_text(encoding="utf-8")))
+    checkpoint = _checkpoint(attempt)
     assert preserved == _record(1)
     assert checkpoint["record_count"] == 0
-    # The raw fsync succeeded and the in-memory frontier advanced before the
-    # atomic checkpoint fsync failed; the persisted checkpoint remains the
-    # only restart authority, so this live attempt must stop consuming data.
+    # The raw fsync and in-memory frontier advance precede the failed DB write;
+    # the persisted row remains the only restart authority.
     assert attempt.durable_prefix.record_count == 1
     with pytest.raises(AttemptStateError, match="preserved partial evidence"):
         attempt.accept_chunk(101, _record(2))

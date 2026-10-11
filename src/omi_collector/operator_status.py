@@ -12,12 +12,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, ConfirmedLossFact, read_confirmed_losses
+from omi_collector.capture.adapters.debug_logging import read_runtime_status
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservation, read_firmware_observations
 from omi_collector.capture.adapters.operational_status import (
     OperationalIdentity,
     OperationalStatusError,
     read_operational_status,
+)
+from omi_collector.capture.adapters.quality_metrics import (
+    QualityMetricsError,
+    read_quality_events,
+    validate_quality_event,
 )
 from omi_collector.capture.application.operational_telemetry import system_host_boot_id
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
@@ -230,26 +237,36 @@ def collect_operator_status(
     if end.tzinfo is None:
         raise OperatorStatusError("status clock must be timezone-aware")
     start = end.astimezone(UTC) - timedelta(hours=hours)
+    from omi_collector.state_migration import StateMigrationError, open_runtime_state
+
     try:
-        observations = read_firmware_observations(layout.collector.device_state)
+        db = open_runtime_state(layout, read_only=True)
+        observations = read_firmware_observations(db)
         spool = collect_spool_metrics(
             layout.publication.root,
-            observation_root=layout.collector.device_state,
+            state_db=db,
         )
         confirmed_losses = read_confirmed_losses(
-            layout.collector.confirmed_loss_ledger,
-            allow_missing=not os.path.lexists(layout.collector.operational_status),
+            db,
+            allow_missing=db.get(StateKind.OPERATIONAL_STATUS, "current") is None,
         )
         quality = _quality_window(
-            layout.collector.root,
+            db,
             start,
             end.astimezone(UTC),
             confirmed_losses=confirmed_losses,
         )
         current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
-        operational_status = read_operational_status(layout.collector.operational_status, current_identity)
-        runtime = _runtime_status(layout.collector.debug_log, end.astimezone(UTC), operational_status)
-    except (ConfirmedLossError, ValueError, OperationalStatusError) as error:
+        operational_status = read_operational_status(db, current_identity)
+        runtime = _runtime_status(db, end.astimezone(UTC), operational_status)
+    except (
+        ConfirmedLossError,
+        QualityMetricsError,
+        StateDBError,
+        ValueError,
+        OperationalStatusError,
+        StateMigrationError,
+    ) as error:
         raise OperatorStatusError(str(error)) from error
     device = _device_status(observations[0]) if observations else None
     window_status = _window_status(quality, operational_status=operational_status)
@@ -267,34 +284,17 @@ def collect_operator_status(
     }
 
 
-def _runtime_status(path: Path, now: datetime, operational_status: dict[str, str]) -> dict[str, object]:
-    latest: tuple[datetime, dict[str, object]] | None = None
-    observation: tuple[datetime, dict[str, object]] | None = None
-    battery_observation: tuple[datetime, dict[str, object]] | None = None
-    error: tuple[datetime, dict[str, object]] | None = None
-    connection_rssi: tuple[datetime, int] | None = None
-    if _path_exists(path, "debug journal"):
-        for row in _debug_rows(path):
-            connection_rssi = _newest_connection_rssi(connection_rssi, _decode_connection_rssi(row))
-            decoded = _decode_sync_progress(row)
-            if decoded is None:
-                continue
-            timestamp, progress = decoded
-            if latest is None or timestamp > latest[0]:
-                latest = decoded
-            if progress.get("event") == "pendant_observation" and (observation is None or timestamp > observation[0]):
-                observation = decoded
-            if (
-                progress.get("event") == "pendant_observation"
-                and isinstance(progress.get("battery_percent"), int)
-                and (battery_observation is None or timestamp > battery_observation[0])
-            ):
-                battery_observation = decoded
-            if progress.get("status") == "session_error" and (error is None or timestamp > error[0]):
-                error = decoded
+def _runtime_status(db: StateDB, now: datetime, operational_status: dict[str, str]) -> dict[str, object]:
+    projection = read_runtime_status(db) or {}
+    latest = _dated_projection(projection, "progress", "updated_at")
+    observation = _dated_projection(projection, "observation", "observation_at")
+    battery_observation = _dated_projection(projection, "battery_observation", "battery_observed_at")
+    error = _dated_projection(projection, "last_error", "last_error_at")
     current = latest[1] if latest else {}
     observed = observation[1] if observation else {}
     battery = battery_observation[1] if battery_observation else {}
+    rssi = projection.get("connection_rssi_dbm")
+    rssi_at = projection.get("connection_rssi_observed_at")
     state = current.get("status", "unknown")
     active = state == "progress"
     return {
@@ -303,8 +303,8 @@ def _runtime_status(path: Path, now: datetime, operational_status: dict[str, str
         ),
         "battery_percent": battery.get("battery_percent"),
         "battery_observed_at": _iso(battery_observation[0]) if battery_observation else None,
-        "connection_rssi_dbm": connection_rssi[1] if connection_rssi else None,
-        "connection_rssi_observed_at": _iso(connection_rssi[0]) if connection_rssi else None,
+        "connection_rssi_dbm": rssi,
+        "connection_rssi_observed_at": _iso(datetime.fromisoformat(rssi_at)) if isinstance(rssi_at, str) else None,
         "firmware": observed.get("firmware"),
         "last_error": _runtime_error(error),
         "operational_status": operational_status,
@@ -313,6 +313,16 @@ def _runtime_status(path: Path, now: datetime, operational_status: dict[str, str
         "updated_age_seconds": max(0, int((now - latest[0]).total_seconds())) if latest else None,
         "transfer": _active_transfer(current) if active else None,
     }
+
+
+def _dated_projection(
+    projection: dict[str, object], value_key: str, time_key: str
+) -> tuple[datetime, dict[str, object]] | None:
+    value = projection.get(value_key)
+    timestamp = projection.get(time_key)
+    if not isinstance(value, dict) or not isinstance(timestamp, str):
+        return None
+    return datetime.fromisoformat(timestamp), cast(dict[str, object], value)
 
 
 def _decode_connection_rssi(row: dict[str, object]) -> tuple[datetime, int] | None:
@@ -431,7 +441,7 @@ def _window_status(quality: _QualityWindow, *, operational_status: dict[str, str
 
 
 def _quality_window(
-    root: Path,
+    db: StateDB,
     start: datetime,
     end: datetime,
     *,
@@ -440,7 +450,7 @@ def _quality_window(
     accumulator = _QualityAccumulator()
     facts_by_id = {fact.loss_id: fact for fact in confirmed_losses}
     _accumulate_confirmed_loss_facts(accumulator, confirmed_losses, start, end)
-    for row in _quality_rows(root):
+    for row in read_quality_events(db, start, end):
         event = _decode_quality_event(row)
         if event.loss_id is not None:
             _validate_loss_projection(event, facts_by_id)
@@ -635,6 +645,7 @@ def _require_regular_file(path: Path, *, max_bytes: int, label: str = "quality j
 
 
 def _decode_quality_event(row: dict[str, object]) -> _QualityEvent:
+    validate_quality_event(row)
     event = row.get("event")
     if event == "advertisement_observation":
         return _decode_advertisement(row)

@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, local
 from typing import IO
 
 import pytest
 
 from omi_collector.capture.adapters import clock_observations
-from omi_collector.capture.adapters.clock_observations import ClockObservationError, ClockObservationStore
+from omi_collector.capture.adapters.clock_observations import (
+    ClockObservation,
+    ClockObservationError,
+    ClockObservationStore,
+)
 from omi_collector.capture.adapters.clock_segments import ClockSegmentMap, segments_with_estimates
 
 # Dynamic malformed-schema fixtures intentionally cross the JSON boundary.
@@ -399,26 +405,46 @@ def test_first_append_rejects_parent_directory_sync_failure(tmp_path: Path, monk
     assert not tuple((tmp_path / "new" / "clock-observations").glob("*.json"))
 
 
-def test_concurrent_public_appends_repair_causal_order_after_initial_reads(
+def test_concurrent_public_appends_choose_order_and_causal_parent_under_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ClockObservationStore(tmp_path / "device.json")
+    seed = store.append(evidence_kind="native_trusted", **_values())
     barrier = Barrier(2)
-    original_causal_fields = clock_observations._causal_fields
+    initial_written = Event()
+    caller = local()
+    original_file_lock = clock_observations._file_lock
 
-    def synchronize_initial_reads(*args: object, **kwargs: object) -> tuple[str | None, str]:
+    @contextmanager
+    def contend_at_lock(path: Path) -> Iterator[None]:
         barrier.wait(timeout=5)
-        return original_causal_fields(*args, **kwargs)  # type: ignore[arg-type]
+        if caller.role == "later":
+            assert initial_written.wait(timeout=10)
+        with original_file_lock(path):
+            yield
 
-    monkeypatch.setattr(clock_observations, "_causal_fields", synchronize_initial_reads)
+    monkeypatch.setattr(clock_observations, "_file_lock", contend_at_lock)
+
+    def append(role: str, values: dict[str, object]) -> ClockObservation:
+        caller.role = role
+        item = store.append(evidence_kind="native_trusted", operation_id="op-a", observation_role=role, **values)
+        if role == "initial":
+            initial_written.set()
+        return item
+
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(store.append, evidence_kind="native_trusted", **_values()) for _ in range(2)]
+        futures = [
+            pool.submit(append, "initial", _values()),
+            pool.submit(append, "later", {**_values(), "host_boot_id": "boot-b"}),
+        ]
         appended = [future.result(timeout=10) for future in futures]
 
     reopened = ClockObservationStore(tmp_path / "device.json").records()
-    assert sorted(item.causal_order for item in appended) == [0, 1]
-    assert [item.causal_order for item in reopened] == [0, 1]
-    assert {item.observation_id for item in reopened} == {item.observation_id for item in appended}
+    assert sorted(item.causal_order for item in appended) == [1, 2]
+    assert [item.causal_order for item in reopened] == [0, 1, 2]
+    assert {item.observation_id for item in reopened[1:]} == {item.observation_id for item in appended}
+    assert (reopened[1].parent_observation_id, reopened[1].observation_role) == (seed.observation_id, "initial")
+    assert (reopened[2].parent_observation_id, reopened[2].observation_role) == (reopened[1].observation_id, "later")
 
 
 def test_temporary_file_creation_failure_uses_typed_store_error(

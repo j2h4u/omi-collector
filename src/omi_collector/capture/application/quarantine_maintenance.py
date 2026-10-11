@@ -316,18 +316,33 @@ class QuarantineMaintenance:
             # any filesystem maintenance is scheduled.
             await asyncio.sleep(0)
             maintenance_task = asyncio.create_task(self._prepare_and_run(defer_requested, bind_startup_state))
-            done, _ = await asyncio.wait({presence_task, maintenance_task}, return_when=asyncio.FIRST_COMPLETED)
-            if presence_task in done:
-                wake = presence_task.result()
-                # A scanner wake is not permission to open BLE while local
-                # clock publication is still retrying.
-                await self.ensure_publication_ready()
-                permit_returned = True
-                defer_requested.set()
-                await join_owned(maintenance_task)
-                return wake
-            maintenance_task.result()
-            return await presence_task
+            while True:
+                if maintenance_task is None:
+                    done, _ = await asyncio.wait(
+                        {presence_task},
+                        timeout=self._config.retry.maintenance_interval_seconds,
+                    )
+                    if presence_task in done:
+                        wake = presence_task.result()
+                        await self.ensure_publication_ready()
+                        permit_returned = True
+                        defer_requested.set()
+                        return wake
+                    maintenance_task = asyncio.create_task(self.run_once(defer_requested.is_set))
+                    continue
+
+                done, _ = await asyncio.wait({presence_task, maintenance_task}, return_when=asyncio.FIRST_COMPLETED)
+                if presence_task in done:
+                    wake = presence_task.result()
+                    # A scanner wake is not permission to open BLE while local
+                    # clock publication is still retrying.
+                    await self.ensure_publication_ready()
+                    permit_returned = True
+                    defer_requested.set()
+                    await join_owned(maintenance_task)
+                    return wake
+                maintenance_task.result()
+                maintenance_task = None
         except BaseException as error:
             primary = error
             defer_requested.set()

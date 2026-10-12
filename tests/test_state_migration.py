@@ -465,6 +465,7 @@ def test_cleanup_marker_rejects_paths_outside_known_legacy_inventory(tmp_path: P
         "phase": "cleanup_pending",
         "files": [[str(allowed), "a" * 64]],
         "state_sha256": "b" * 64,
+        "custody": None,
     }
     assert migration._marker_fingerprints(marker, layout, ()) == ((str(allowed), "a" * 64),)
 

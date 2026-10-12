@@ -275,6 +275,12 @@ stopped and rerun `migrate-state`; the incomplete marker blocks runtime and
 mutating commands until cleanup and the final complete marker are verified.
 Changed or unclassified legacy files fail closed and require inspection.
 Never remove or replace `collector.lock` during migration.
+The known October 7 sparse recovery package is separately retained under the
+storage root. Migration authenticates its passport and raw SHA, preserves its
+physical sequence order and explicit unknown gaps, and imports the clock
+mapping needed by its retained records even when the current firmware frontier
+has moved past them. Runtime clock updates preserve existing ranges; there is
+no clock-range pruning path. The package is never part of legacy-file deletion.
 After database activation, do not restart an old release that reads the JSON
 control files; the deployer keeps the staged release selected on failure.
 

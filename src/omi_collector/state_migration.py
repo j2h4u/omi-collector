@@ -10,6 +10,7 @@ import os
 import re
 import stat
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
@@ -57,6 +58,7 @@ _MIGRATION_VERSION = 1
 _SHA256_HEX_LENGTH = 64
 _FINGERPRINT_PAIR_LENGTH = 2
 _CANDIDATE_NAME = ".collector-state.sqlite3.migrating"
+_RETAINED_RECOVERY = Path("recovery/10890392-13085638/rescue-manifest.json")
 _LEGACY_PHY_NAME = re.compile(r"(hci[0-9]+)\.phy(?:\.lock|-recovery\.json)\Z")
 _LEGACY_SINGLETONS = (
     "device.json",
@@ -85,6 +87,14 @@ _QUARANTINE_STATE_NAMES = (
 
 class StateMigrationError(RuntimeError):
     """Legacy state is unsafe, incomplete, or cannot be shown equivalent."""
+
+
+@dataclass(frozen=True)
+class _RetainedRecovery:
+    manifest_sha256: str
+    records_sha256: str
+    intervals: tuple[tuple[int, int], ...]
+    sources: tuple[tuple[Path, int, int, int], ...]
 
 
 def open_runtime_state(layout: StorageLayout, *, read_only: bool = False) -> StateDB:
@@ -118,6 +128,8 @@ def migrate_state(
     """Import, verify, activate, and directly remove legacy control files."""
     root = layout.collector.root
     if not root.exists():
+        if _path_present(_recovery_manifest_path(layout).parent):
+            raise StateMigrationError("retained recovery exists without Collector directory")
         phy_paths = _legacy_phy_paths(layout, DEFAULT_CONFIG.ble.adapter_name, legacy_phy_state_homes)
         if any(_path_present(path.lock_path) or _path_present(path.marker_path) for path in phy_paths):
             raise StateMigrationError("legacy PHY state exists without Collector directory")
@@ -152,6 +164,7 @@ def _migrate_locked(layout: StorageLayout, legacy_phy_locks: tuple[Path, ...]) -
         return _resume_cleanup(layout, StateDB(canonical), legacy_phy_locks)
     if candidate.exists() or candidate.is_symlink():
         raise StateMigrationError("an unfinished candidate database needs inspection before retry")
+    recovery = _load_retained_recovery(layout)
     if not _has_legacy_state(layout) and not any(_path_present(path) for path in legacy_phy_locks):
         if _has_collector_data(layout):
             raise StateMigrationError("Collector data exists without recognized control state")
@@ -162,7 +175,7 @@ def _migrate_locked(layout: StorageLayout, legacy_phy_locks: tuple[Path, ...]) -
     db: StateDB | None = None
     try:
         db = StateDB(candidate)
-        _import_legacy(layout, db)
+        _import_legacy(layout, db, recovery)
         state_sha256 = _state_digest(db)
         db.put(
             StateKind.MIGRATION,
@@ -172,12 +185,14 @@ def _migrate_locked(layout: StorageLayout, legacy_phy_locks: tuple[Path, ...]) -
                 "phase": "cleanup_pending",
                 "files": [list(item) for item in fingerprints],
                 "state_sha256": state_sha256,
+                "custody": _recovery_marker(recovery),
             },
         )
         reopened = StateDB(candidate, read_only=True)
         reopened.integrity_check()
-        _validate_parity(layout, reopened)
+        _validate_parity(layout, reopened, recovery=recovery)
         _verify_fingerprints(fingerprints)
+        _verify_retained_recovery(layout, recovery)
         candidate.replace(canonical)
         _fsync_directory(root)
     except BaseException:
@@ -196,6 +211,7 @@ def _resume_cleanup(layout: StorageLayout, db: StateDB, legacy_phy_locks: tuple[
             raise StateMigrationError("legacy state reappeared after migration")
         return {"removed_files": 0}
     fingerprints = _marker_fingerprints(marker, layout, legacy_phy_locks)
+    _verify_recovery_marker(layout, marker)
     assert marker is not None
     if _state_digest(db) != marker["state_sha256"]:
         raise StateMigrationError("Collector state changed before migration cleanup")
@@ -327,6 +343,8 @@ def _has_staging_control_files(parent: Path) -> bool:
 
 
 def _has_collector_data(layout: StorageLayout) -> bool:
+    if _path_present(_recovery_manifest_path(layout).parent):
+        return True
     for parent in (layout.collector.attempts, layout.collector.quarantine, layout.draft, layout.publication.root):
         if parent.is_dir() and any(parent.iterdir()):
             return True
@@ -450,7 +468,7 @@ def _verify_fingerprints(fingerprints: tuple[tuple[str, str], ...], *, allow_mis
 def _marker_fingerprints(
     marker: dict[str, object] | None, layout: StorageLayout, legacy_phy_locks: tuple[Path, ...]
 ) -> tuple[tuple[str, str], ...]:
-    if marker is None or set(marker) != {"version", "phase", "files", "state_sha256"}:
+    if marker is None or set(marker) != {"version", "phase", "files", "state_sha256", "custody"}:
         raise StateMigrationError("migration cleanup marker is unsupported")
     if marker["version"] != _MIGRATION_VERSION or marker["phase"] != "cleanup_pending":
         raise StateMigrationError("migration cleanup marker is unsupported")
@@ -476,6 +494,26 @@ def _marker_fingerprints(
     if len(set(result)) != len(result):
         raise StateMigrationError("migration cleanup inventory is duplicated")
     return tuple(result)
+
+
+def _recovery_marker(recovery: _RetainedRecovery | None) -> dict[str, str] | None:
+    if recovery is None:
+        return None
+    return {"manifest_sha256": recovery.manifest_sha256, "records_sha256": recovery.records_sha256}
+
+
+def _verify_recovery_marker(layout: StorageLayout, marker: dict[str, object] | None) -> None:
+    assert marker is not None
+    recorded = marker.get("custody")
+    if recorded is not None and (
+        not isinstance(recorded, dict)
+        or set(recorded) != {"manifest_sha256", "records_sha256"}
+        or not all(_is_sha256(value) for value in recorded.values())
+    ):
+        raise StateMigrationError("migration custody fingerprint is malformed")
+    recovery = _load_retained_recovery(layout)
+    if recorded != _recovery_marker(recovery):
+        raise StateMigrationError("retained recovery changed before migration cleanup")
 
 
 def _is_sha256(value: object) -> bool:
@@ -520,6 +558,151 @@ def _read_object(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise StateMigrationError(f"legacy state is not an object: {path.name}")
     return cast(dict[str, object], value)
+
+
+def _recovery_manifest_path(layout: StorageLayout) -> Path:
+    return layout.root / _RETAINED_RECOVERY
+
+
+def _load_retained_recovery(layout: StorageLayout) -> _RetainedRecovery | None:
+    """Authenticate the known, separately retained sparse rescue package."""
+    manifest_path = _recovery_manifest_path(layout)
+    if not _path_present(manifest_path):
+        if _path_present(manifest_path.parent) or layout.root == Path("/srv/pipelines/omi"):
+            raise StateMigrationError("the retained recovery passport is missing")
+        return None
+    _require_directory(manifest_path.parent.parent)
+    _require_directory(manifest_path.parent)
+    document = _read_object(manifest_path)
+    window = document.get("source_window")
+    counts = document.get("counts")
+    publication = document.get("publication")
+    expected = {
+        "format": "omi-recovery-v1",
+        "package_kind": "retained_sparse_sequence_recovery",
+        "records_file": "records.bin",
+        "record_size": RECORD_SIZE,
+        "record_order": "ascending original physical sequence; exact byte-identical overlaps retained once",
+    }
+    if (
+        any(document.get(key) != value for key, value in expected.items())
+        or document.get("complete") is not True
+        or publication
+        != {"consumer_compatibility_asserted": False, "ready_bundle": False, "ready_ledger_written": False}
+        or not _is_sha256(document.get("records_sha256"))
+    ):
+        raise StateMigrationError("retained recovery passport is unsupported")
+    if not isinstance(window, dict) or not isinstance(counts, dict):
+        raise StateMigrationError("retained recovery passport is unsupported")
+    ranges = _recovery_ranges(document, window, counts)
+    records_path = manifest_path.parent / "records.bin"
+    expected_digest = cast(str, document["records_sha256"])
+    if (
+        records_path.stat(follow_symlinks=False).st_size != counts["output_bytes"]
+        or _hash_regular_file(records_path) != expected_digest
+    ):
+        raise StateMigrationError("retained recovery records differ from passport")
+    return _RetainedRecovery(
+        _hash_regular_file(manifest_path),
+        expected_digest,
+        tuple((start, end) for start, end, _ in ranges),
+        tuple((records_path, start, end - start, offset) for start, end, offset in ranges),
+    )
+
+
+def _recovery_ranges(
+    document: dict[str, object], window: dict[str, object], counts: dict[str, object]
+) -> tuple[tuple[int, int, int], ...]:
+    raw_ranges, raw_gaps = document.get("output_ranges"), document.get("sequence_gaps")
+    start, end = window.get("start_sequence"), window.get("closure_next_sequence")
+    expected_count, expected_bytes = counts.get("unique_retained_records"), counts.get("output_bytes")
+    if not isinstance(raw_ranges, list) or not raw_ranges or not isinstance(raw_gaps, list):
+        raise StateMigrationError("retained recovery range inventory is invalid")
+    if not _valid_interval(start, end) or type(expected_count) is not int or type(expected_bytes) is not int:
+        raise StateMigrationError("retained recovery range inventory is invalid")
+    intervals: list[tuple[int, int, int]] = []
+    next_offset = 0
+    for row in raw_ranges:
+        lower, upper, offset = _parse_recovery_range(row, next_offset)
+        if intervals and lower < intervals[-1][1]:
+            raise StateMigrationError("retained recovery raw sequence order is invalid")
+        intervals.append((lower, upper, offset))
+        next_offset += (upper - lower) * RECORD_SIZE
+    if next_offset != expected_bytes or sum(upper - lower for lower, upper, _ in intervals) != expected_count:
+        raise StateMigrationError("retained recovery record count is invalid")
+    _validate_recovery_gaps(intervals, raw_gaps, cast(int, start), cast(int, end), document)
+    return tuple(intervals)
+
+
+def _parse_recovery_range(row: object, expected_offset: int) -> tuple[int, int, int]:
+    if not isinstance(row, dict):
+        raise StateMigrationError("retained recovery range inventory is invalid")
+    lower, upper, count, offset = (
+        row.get("start_sequence"),
+        row.get("next_sequence"),
+        row.get("record_count"),
+        row.get("records_file_offset_bytes"),
+    )
+    if not _valid_interval(lower, upper) or type(count) is not int or count != cast(int, upper) - cast(int, lower):
+        raise StateMigrationError("retained recovery range inventory is invalid")
+    if (
+        type(offset) is not int
+        or offset != expected_offset
+        or not _is_sha256(row.get("source_sha256"))
+        or not isinstance(row.get("source_path"), str)
+    ):
+        raise StateMigrationError("retained recovery range inventory is invalid")
+    return cast(int, lower), cast(int, upper), cast(int, offset)
+
+
+def _valid_interval(start: object, end: object) -> bool:
+    return type(start) is int and type(end) is int and 0 <= start < end
+
+
+def _validate_recovery_gaps(
+    ranges: list[tuple[int, int, int]],
+    gaps: list[object],
+    start: int,
+    end: int,
+    document: dict[str, object],
+) -> None:
+    pieces = [(lower, upper) for lower, upper, _ in ranges]
+    missing = 0
+    for row in gaps:
+        if not isinstance(row, dict):
+            raise StateMigrationError("retained recovery gap inventory is invalid")
+        lower, upper, count = row.get("start_sequence"), row.get("next_sequence"), row.get("record_count")
+        if (
+            not _valid_interval(lower, upper)
+            or row.get("cause") != "unknown"
+            or type(count) is not int
+            or count != cast(int, upper) - cast(int, lower)
+        ):
+            raise StateMigrationError("retained recovery gap inventory is invalid")
+        lower, upper = cast(int, lower), cast(int, upper)
+        pieces.append((lower, upper))
+        missing += count
+    pieces.sort()
+    if (
+        pieces[0][0] != start
+        or pieces[-1][1] != end
+        or any(left[1] != right[0] for left, right in pairwise(pieces))
+        or type(document.get("missing_sequence_count")) is not int
+        or document.get("missing_sequence_count") != missing
+    ):
+        raise StateMigrationError("retained recovery sparse sequence order is invalid")
+
+
+def _verify_retained_recovery(layout: StorageLayout, recovery: _RetainedRecovery | None) -> None:
+    if recovery is None:
+        if _path_present(_recovery_manifest_path(layout).parent):
+            raise StateMigrationError("retained recovery appeared during migration")
+        return
+    if (
+        _hash_regular_file(_recovery_manifest_path(layout)) != recovery.manifest_sha256
+        or _hash_regular_file(recovery.sources[0][0]) != recovery.records_sha256
+    ):
+        raise StateMigrationError("retained recovery changed during migration")
 
 
 def _validate_obsolete_clock_metadata(root: Path) -> None:
@@ -573,13 +756,15 @@ def _validate_clock_import_receipts(import_root: Path) -> None:
             raise StateMigrationError("historical clock import receipt is unsupported")
 
 
-def _legacy_rows(layout: StorageLayout) -> dict[tuple[StateKind, str], dict[str, object]]:
+def _legacy_rows(
+    layout: StorageLayout, recovery: _RetainedRecovery | None = None
+) -> dict[tuple[StateKind, str], dict[str, object]]:
     rows: dict[tuple[StateKind, str], dict[str, object]] = {}
     _snapshot_rows(layout.collector.root, rows)
     _publication_rows(layout.collector.root, rows)
     _attempt_rows(layout.collector.attempts, rows)
     _quarantine_rows(layout.collector.quarantine, rows)
-    clock_state = _legacy_clock_state(layout, rows)
+    clock_state = _legacy_clock_state(layout, rows, recovery)
     if clock_state is not None:
         rows[StateKind.CLOCK, "current"] = clock_state.to_payload()
     return rows
@@ -637,7 +822,7 @@ def _add_attempt_row(rows: dict[tuple[StateKind, str], dict[str, object]], row: 
 
 
 def _legacy_clock_state(
-    layout: StorageLayout, rows: dict[tuple[StateKind, str], dict[str, object]]
+    layout: StorageLayout, rows: dict[tuple[StateKind, str], dict[str, object]], recovery: _RetainedRecovery | None
 ) -> ClockState | None:
     clock = read_legacy_clock(layout.collector.root)
     observations = clock.observations
@@ -645,7 +830,7 @@ def _legacy_clock_state(
     if any(item.state in {"prepared", "unresolved"} for item in corrections):
         raise StateMigrationError("resolve the pending legacy clock write before migration")
     old_map = clock.segments
-    intervals = _protected_intervals(layout, rows)
+    intervals = _protected_intervals(layout, rows, recovery)
     state = ClockState()
     for correction in corrections:
         if correction.state != "unknown" or correction.boundary_sequence_max is None:
@@ -680,7 +865,9 @@ def _legacy_clock_state(
 
 
 def _protected_intervals(
-    layout: StorageLayout, rows: dict[tuple[StateKind, str], dict[str, object]]
+    layout: StorageLayout,
+    rows: dict[tuple[StateKind, str], dict[str, object]],
+    recovery: _RetainedRecovery | None = None,
 ) -> tuple[tuple[int, int], ...]:
     intervals: list[tuple[int, int]] = []
     firmware = rows.get((StateKind.FIRMWARE, "latest"))
@@ -698,6 +885,8 @@ def _protected_intervals(
     if layout.draft.is_dir() and layout.publication.root.is_dir():
         inventory = authenticated_inventory(layout.draft, layout.publication.root, None)
         intervals.extend((item.manifest.start_sequence, item.manifest.next_sequence) for item in inventory.drafts)
+    if recovery is not None:
+        intervals.extend(recovery.intervals)
     return tuple(intervals)
 
 
@@ -719,8 +908,8 @@ def _state_digest(db: StateDB) -> str:
     return sha256(data).hexdigest()
 
 
-def _import_legacy(layout: StorageLayout, db: StateDB) -> None:
-    rows = _legacy_rows(layout)
+def _import_legacy(layout: StorageLayout, db: StateDB, recovery: _RetainedRecovery | None) -> None:
+    rows = _legacy_rows(layout, recovery)
     with db.transaction() as transaction:
         for (kind, item_id), payload in rows.items():
             transaction.put(kind, item_id, payload)
@@ -736,7 +925,13 @@ def _import_legacy(layout: StorageLayout, db: StateDB) -> None:
         import_legacy_runtime_status(db, _debug_rows(debug_path))
 
 
-def _validate_parity(layout: StorageLayout, db: StateDB, *, allow_removed: bool = False) -> None:
+def _validate_parity(
+    layout: StorageLayout,
+    db: StateDB,
+    *,
+    allow_removed: bool = False,
+    recovery: _RetainedRecovery | None = None,
+) -> None:
     db.integrity_check()
     read_firmware_observations(db)
     read_confirmed_losses(db, allow_missing=db.get(StateKind.CONFIRMED_LOSS, "ledger") is None)
@@ -747,11 +942,11 @@ def _validate_parity(layout: StorageLayout, db: StateDB, *, allow_removed: bool 
         authenticated_inventory(layout.draft, layout.publication.root, None)
     if allow_removed:
         return
-    legacy_rows = _legacy_rows(layout)
+    legacy_rows = _legacy_rows(layout, recovery)
     for (kind, item_id), expected in legacy_rows.items():
         if db.get(kind, item_id) != expected:
             raise StateMigrationError(f"legacy {kind.value} state changed during import")
-    _validate_clock_projection_parity(layout, db, legacy_rows)
+    _validate_clock_projection_parity(layout, db, legacy_rows, recovery)
     quality = _quality_rows(layout.collector.root)
     imported = tuple(payload for _, payload in db.list(StateKind.QUALITY_EVENT))
     if sorted(map(_canonical, imported)) != sorted(map(_canonical, quality)):
@@ -766,6 +961,7 @@ def _validate_clock_projection_parity(
     layout: StorageLayout,
     db: StateDB,
     rows: dict[tuple[StateKind, str], dict[str, object]],
+    recovery: _RetainedRecovery | None,
 ) -> None:
     """Compare old and new publication projections over every reachable interval."""
     old_map = read_legacy_clock(layout.collector.root).segments
@@ -773,7 +969,7 @@ def _validate_clock_projection_parity(
     new_map = ClockSegmentMap.from_state(
         ClockState.from_payload(new_payload) if new_payload is not None else ClockState()
     )
-    for start, end in _protected_intervals(layout, rows):
+    for start, end in _protected_intervals(layout, rows, recovery):
         boundaries = {start, end}
         for segment in (*old_map.segments, *new_map.segments):
             if start < segment.next_sequence and segment.start_sequence < end:
@@ -785,6 +981,9 @@ def _validate_clock_projection_parity(
                 raise StateMigrationError("clock time_ranges differ after import")
     for source in _reachable_raw_sources(layout):
         _validate_raw_clock_parity(source, old_map, new_map)
+    if recovery is not None:
+        for source in recovery.sources:
+            _validate_raw_clock_parity(source, old_map, new_map)
 
 
 def _reachable_raw_sources(layout: StorageLayout) -> Iterator[tuple[Path, int, int, int]]:

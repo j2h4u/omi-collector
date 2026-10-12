@@ -48,6 +48,8 @@ Statvfs = Callable[[str | Path], object]
 _SHARED_BUNDLE_DIRECTORY_MODE: Final = 0o770
 _UNKNOWN_OPERATION: Final = "unknown"
 _ATTEMPT_ROW_FIELDS: Final = frozenset({"descriptor", "checkpoint", "prefix_publication", "terminal_retirement"})
+_ATTEMPT_CLEANUP_FIELD: Final = "cleanup_intent"
+_ATTEMPT_CLEANUP_INTENT: Final = {"version": 1, "state": "pending"}
 
 
 def legacy_attempt_row(path: Path) -> dict[str, object]:
@@ -264,12 +266,14 @@ class StagingFilesystem:
             row = self.state_db.get(StateKind.ATTEMPT, attempt_id)
         except (OSError, ValueError, StateDBError) as error:
             raise AttemptStateError("attempt state is unreadable") from error
-        if row is None or set(row) != _ATTEMPT_ROW_FIELDS:
+        if row is None or set(row) not in (_ATTEMPT_ROW_FIELDS, _ATTEMPT_ROW_FIELDS | {_ATTEMPT_CLEANUP_FIELD}):
+            return None
+        if _ATTEMPT_CLEANUP_FIELD in row and row[_ATTEMPT_CLEANUP_FIELD] != _ATTEMPT_CLEANUP_INTENT:
             return None
         return row
 
     def _write_attempt_field(self, attempt_id: str, field: str, value: object) -> None:
-        if field not in _ATTEMPT_ROW_FIELDS:
+        if field not in _ATTEMPT_ROW_FIELDS | {_ATTEMPT_CLEANUP_FIELD}:
             raise AttemptStateError("attempt state field is invalid")
         row = self._read_attempt_row(attempt_id)
         self._validate_attempt_row(attempt_id, row)
@@ -298,8 +302,10 @@ class StagingFilesystem:
             raise AttemptStateError("attempt state could not be created") from error
 
     def _validate_attempt_row(self, attempt_id: str, row: dict[str, object]) -> None:
-        if set(row) != _ATTEMPT_ROW_FIELDS:
+        if set(row) not in (_ATTEMPT_ROW_FIELDS, _ATTEMPT_ROW_FIELDS | {_ATTEMPT_CLEANUP_FIELD}):
             raise AttemptStateError("attempt state schema is invalid")
+        if _ATTEMPT_CLEANUP_FIELD in row and row[_ATTEMPT_CLEANUP_FIELD] != _ATTEMPT_CLEANUP_INTENT:
+            raise AttemptStateError("attempt cleanup intent is invalid")
         descriptor = row["descriptor"]
         checkpoint = row["checkpoint"]
         if not isinstance(descriptor, dict) or not isinstance(checkpoint, dict):

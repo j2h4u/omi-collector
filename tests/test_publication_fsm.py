@@ -198,7 +198,7 @@ def test_success_reports_once_and_repeated_wakes_do_not_reopen_audio(
     assert tuple(counts) == initial
 
 
-def test_partial_replay_does_not_reopen_unchanged_raw_after_unrelated_ack(
+def test_partial_replay_reopens_raw_to_enrich_lineage_after_unrelated_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path, threshold=0.04)
@@ -233,14 +233,15 @@ def test_partial_replay_does_not_reopen_unchanged_raw_after_unrelated_ack(
         encoding="utf-8",
     )
     assert store.recover_and_publish().state is ReadyOutcomeState.WAITING
-    assert tuple(counts) == first
+    after_ack = tuple(counts)
+    assert after_ack[0] > first[0] and after_ack[1] > first[1]
 
     _draft(store, "suffix", 103)
     store.append_ready_closure(104, "drained")
     published = store.recover_and_publish()
     assert published.state is ReadyOutcomeState.PUBLISHED
     assert published.published[0].record_count == 2
-    assert counts[1] > first[1]
+    assert counts[1] > after_ack[1]
 
 
 def test_transient_deadline_is_one_timer_and_no_immediate_retry(

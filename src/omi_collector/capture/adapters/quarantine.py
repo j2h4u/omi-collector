@@ -24,13 +24,11 @@ from .collector_state_db import StateDBError, StateKind
 from .publication import (
     PrefixPublicationEvidence,
     TerminalRetirementEvidence,
-    _prefix_destination_for,
     _prefix_publication_matches,
     _recoverable_prefix_marker_matches,
     _terminal_retired_marker_matches,
     is_published_attempt,
 )
-from .ready_bundles import ReadyBundleError, _bundle_id, _BundleFacts, _read_ledger
 from .recovery import _published_prefix
 from .staging_contract import (
     _MANIFEST_NAME,
@@ -44,8 +42,6 @@ from .staging_contract import (
     AttemptDescriptor,
     AttemptStateError,
     CollisionError,
-    DurablePrefix,
-    MaintenanceDeferredError,
     PendingAttemptError,
     StagingError,
     _descriptor_from_json,
@@ -194,103 +190,13 @@ def _terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: 
 def sweep_terminal_retired(
     filesystem: StagingFilesystem,
     *,
+    ready_root: Path | None = None,
     should_defer: Callable[[], bool] = _never_defer,
 ) -> tuple[Path, ...]:
-    """Delete only aged terminal-retired partial directories."""
-    retention_ns = _seconds_to_nanoseconds(filesystem._terminal_retention_seconds)
-    now_unix_ns = _wall_clock_ns()
-    _validate_terminalized_at(now_unix_ns)
-    removed: list[Path] = []
-    with filesystem.device_lock(operation="sweep_terminal_retired"):
-        try:
-            if not os.path.lexists(filesystem.attempts_root):
-                return ()
-            if filesystem.attempts_root.is_symlink() or not filesystem.attempts_root.is_dir():
-                raise StagingError("terminal-retired partial root is not a directory")
-            entries = tuple(filesystem.attempts_root.iterdir())
-        except OSError as error:
-            raise StagingError("terminal-retired partials cannot be inspected") from error
-        for entry in entries:
-            if should_defer():
-                break
-            try:
-                expired = _terminal_retired_expired(
-                    filesystem,
-                    entry,
-                    now_unix_ns,
-                    retention_ns,
-                )
-            except MaintenanceDeferredError:
-                break
-            except OSError, StagingError:
-                continue
-            if not expired:
-                continue
-            if should_defer():
-                break
-            shutil.rmtree(entry)
-            _sync_directory(filesystem.attempts_root, filesystem._fsync)
-            with filesystem.state_db.transaction() as transaction:
-                transaction.delete(StateKind.ATTEMPT, entry.name)
-            removed.append(entry)
-    return tuple(removed)
+    """Remove terminal raw only after its complete payload is durable elsewhere."""
+    from .attempt_cleanup import sweep_terminal_redundant
 
-
-def _terminal_retired_expired(
-    filesystem: StagingFilesystem,
-    entry: Path,
-    now_unix_ns: int,
-    retention_ns: int,
-) -> bool:
-    mode = entry.lstat().st_mode
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        return False
-    descriptor = filesystem._read_descriptor(entry)
-    _published_prefix(entry, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
-    attempt_state = filesystem._read_attempt_row(descriptor.attempt_id)
-    raw_prefix = attempt_state["prefix_publication"]
-    if not isinstance(raw_prefix, dict):
-        return False
-    prefix_marker = PrefixPublicationEvidence.from_json(raw_prefix)
-    if not _prefix_publication_matches(
-        entry,
-        descriptor,
-        prefix_marker,
-        filesystem=filesystem,
-        io_chunk_bytes=filesystem._durability.io_chunk_bytes,
-    ):
-        prefix = _published_prefix(entry, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
-        destination = _prefix_destination_for(filesystem.capture_root, prefix)
-        if os.path.lexists(destination) or not _retired_ready_publication_matches(filesystem, prefix):
-            return False
-    terminalized_at = _terminal_retired_at(filesystem, descriptor.attempt_id)
-    return terminalized_at is not None and now_unix_ns - terminalized_at >= retention_ns
-
-
-def _retired_ready_publication_matches(filesystem: StagingFilesystem, prefix: DurablePrefix) -> bool:
-    """Authenticate the exact source prefix through its durable downstream ACK."""
-    if prefix.record_count == 0:
-        return True
-    facts = _BundleFacts(
-        prefix.start_sequence,
-        prefix.next_sequence,
-        prefix.record_count,
-        prefix.raw_sha256,
-    )
-    try:
-        bundles = _read_ledger(filesystem.state_db)["bundles"]
-    except OSError, ReadyBundleError, StateDBError, ValueError:
-        return False
-    assert isinstance(bundles, dict)
-    entry = bundles.get(_bundle_id(facts))
-    return (
-        isinstance(entry, dict)
-        and entry.get("state") == "retired"
-        and entry.get("start_sequence") == prefix.start_sequence
-        and entry.get("next_sequence") == prefix.next_sequence
-        and entry.get("draft_raw_sha256") == prefix.raw_sha256
-        and "gaps" not in entry
-    )
+    return sweep_terminal_redundant(filesystem, ready_root, should_defer=should_defer)
 
 
 def quarantined_attempts(

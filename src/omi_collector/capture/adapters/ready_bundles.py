@@ -24,7 +24,7 @@ from ..domain.ready_machine import ReadyCommand, decide_ready
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
 from .bundle_contract import BundleManifest
 from .clock_segments import ClockSegmentMap
-from .collector_state_db import StateDB, StateDBError, StateKind
+from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction
 
 
 class ReadyBundleError(RuntimeError):
@@ -117,6 +117,9 @@ class _BundleFacts:
     gaps: tuple[tuple[int, int], ...] = ()
 
 
+SourceLineage = tuple[int, int, str]
+
+
 @dataclass(frozen=True, slots=True)
 class _DraftAudio:
     packet_count: int
@@ -131,6 +134,7 @@ class _ReadySource:
 
     result: ReadyBundleResult
     facts: _BundleFacts
+    time_ranges: tuple[Mapping[str, object], ...]
 
 
 @dataclass(slots=True)
@@ -163,6 +167,7 @@ _SHA256_HEX_LENGTH = 64
 _GAP_ENDPOINT_COUNT = 2
 _LEDGER_FIELDS = frozenset({"bundles", "frontier"})
 _LEDGER_ENTRY_FIELDS = frozenset({"records_sha256", "state", "start_sequence", "next_sequence", "draft_raw_sha256"})
+_LEDGER_SOURCE_FIELDS = frozenset({"start_sequence", "next_sequence", "raw_sha256"})
 _WINDMILL_CHECKPOINT_FIELDS = frozenset({"analysis_cursor", "vad_decisions", "open_speech_tail", "acknowledged"})
 _WINDMILL_TAIL_FIELDS = frozenset({"entries", "opened_at", "outputs"})
 
@@ -192,7 +197,7 @@ def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publ
     results: list[ReadyBundleResult] = []
     finalization = _Finalization(ready_root, state_db, ledger, clock_segments)
     inventory = authenticated_inventory(draft_root, ready_root, inventory)
-    _reconcile_ready_ledger(finalization, inventory.ready)
+    _reconcile_ready_ledger(finalization, inventory.ready, inventory.drafts)
     eligible, replayed_paths = _eligible_drafts(inventory, frontier)
     eligible = _normalize_drafts(eligible, inventory)
     if not eligible:
@@ -445,7 +450,7 @@ def _finalize_group(
     bundle_id = _bundle_id(facts)
     retired = _retired_entry(finalization.ledger, bundle_id)
     if retired is not None:
-        _validate_retired_duplicate(retired, facts)
+        _validate_retired_duplicate(retired, facts, group.drafts)
         for path in source_paths:
             _remove_draft(path)
         return None
@@ -457,14 +462,14 @@ def _finalize_group(
         if ready.facts != facts:
             raise ReadyBundleError("ready destination conflicts with its draft group")
         result = ready.result
-        _record_ready(finalization.state_db, finalization.ledger, result, facts)
+        _record_ready(finalization.state_db, finalization.ledger, result, facts, _draft_lineage(group.drafts))
         for path in source_paths:
             _remove_draft(path)
         return result
     ranges = _time_ranges(facts, finalization.clock_segments)
     ranges = _clear_unrepresentable_ranges(group, ranges)
     result = _write_ready_group(group, destination, ranges)
-    _record_ready(finalization.state_db, finalization.ledger, result, facts)
+    _record_ready(finalization.state_db, finalization.ledger, result, facts, _draft_lineage(group.drafts))
     for path in source_paths:
         _remove_draft(path)
     return result
@@ -509,7 +514,7 @@ def _unique_slices(draft: _Draft, ready: tuple[_ReadySource, ...]) -> tuple[_Dra
                 cursor = min(run_start, end)
             overlap_end = min(run_end, end)
             if cursor < overlap_end:
-                _validate_replayed_payload(draft, source, cursor, overlap_end, ready_offset + cursor - run_start)
+                _validate_replayed_payload(draft, source, (cursor, overlap_end), ready_offset + cursor - run_start)
                 cursor = overlap_end
             ready_offset += run_end - run_start
             if cursor == end:
@@ -587,21 +592,26 @@ def _compare_draft_overlap(left: _Draft, right: _Draft, start: int, end: int) ->
             remaining -= size
 
 
-def _reconcile_ready_ledger(finalization: _Finalization, ready: tuple[_ReadySource, ...]) -> None:
+def _reconcile_ready_ledger(
+    finalization: _Finalization, ready: tuple[_ReadySource, ...], drafts: tuple[_Draft, ...]
+) -> None:
     for source in ready:
-        _reconcile_ready_source(finalization, source)
+        _reconcile_ready_source(finalization, source, drafts)
 
 
-def _reconcile_ready_source(finalization: _Finalization, source: _ReadySource) -> None:
+def _reconcile_ready_source(finalization: _Finalization, source: _ReadySource, drafts: tuple[_Draft, ...]) -> None:
     bundles = finalization.ledger["bundles"]
     assert isinstance(bundles, dict)
     entry = bundles.get(source.result.bundle_id)
+    lineage = _matching_draft_lineage(source, drafts)
     if entry is None:
-        _record_ready(finalization.state_db, finalization.ledger, source.result, source.facts)
+        _record_ready(finalization.state_db, finalization.ledger, source.result, source.facts, lineage)
         return
     if not isinstance(entry, dict) or entry.get("state") != "ready":
         raise ReadyBundleError("ready bundle is not active in the publication ledger")
     _validate_ready_ledger_entry(entry, source)
+    if lineage is not None:
+        _record_ready(finalization.state_db, finalization.ledger, source.result, source.facts, lineage)
 
 
 def _visible_children(root: Path) -> tuple[Path, ...]:
@@ -647,7 +657,8 @@ def _read_ready_source(path: Path) -> _ReadySource:
         or _digest(raw) != records_sha256
     ):
         raise ReadyBundleError("ready records do not match manifest")
-    return _ReadySource(ReadyBundleResult(bundle_id, path, next_sequence, count, records_sha256), facts)
+    ranges = cast(list[dict[str, object]], value["time_ranges"])
+    return _ReadySource(ReadyBundleResult(bundle_id, path, next_sequence, count, records_sha256), facts, tuple(ranges))
 
 
 def _validate_ready_ranges(value: object, start: int, next_sequence: int, count: int) -> tuple[tuple[int, int], ...]:
@@ -738,18 +749,38 @@ def _overlaps(source: BundleManifest, ready: _ReadySource) -> bool:
 
 
 def _validate_replayed_payload(
-    draft: _Draft, ready: _ReadySource, start: int, next_sequence: int, ready_record_offset: int
+    draft: _Draft,
+    ready: _ReadySource,
+    sequence_range: tuple[int, int],
+    ready_record_offset: int,
+    *,
+    exact_time: bool = False,
 ) -> None:
+    start, next_sequence = sequence_range
     draft_offset = draft.byte_offset + (start - draft.manifest.start_sequence) * RECORD_SIZE
     with (draft.path / _RAW_NAME).open("rb") as raw, (ready.result.path / _RAW_NAME).open("rb") as published:
         raw.seek(draft_offset)
         published.seek(ready_record_offset * RECORD_SIZE)
-        for _ in range(next_sequence - start):
+        range_index = 0
+        for sequence in range(start, next_sequence):
             original, converted = raw.read(RECORD_SIZE), published.read(RECORD_SIZE)
+            if exact_time:
+                while range_index < len(ready.time_ranges) and sequence >= cast(
+                    int, ready.time_ranges[range_index]["next_sequence"]
+                ):
+                    range_index += 1
+                if range_index == len(ready.time_ranges) or sequence < cast(
+                    int, ready.time_ranges[range_index]["start_sequence"]
+                ):
+                    raise ReadyBundleError("ready overlap has no UTC mapping")
             if (
                 len(original) != RECORD_SIZE
                 or len(converted) != RECORD_SIZE
-                or original[TIMESTAMP_SIZE:] != converted[TIMESTAMP_SIZE:]
+                or (
+                    _convert_record(original, ready.time_ranges[range_index]) != converted
+                    if exact_time
+                    else original[TIMESTAMP_SIZE:] != converted[TIMESTAMP_SIZE:]
+                )
             ):
                 raise ReadyBundleError("ready overlap conflicts with original payload")
 
@@ -849,8 +880,7 @@ def _convert_record(record: bytes, time_range: Mapping[str, object]) -> bytes:
     if utc is None:
         return record
     assert isinstance(utc, Mapping)
-    offset = utc["offset_seconds"]
-    assert isinstance(offset, float)
+    offset = _finite_number(utc["offset_seconds"])
     timestamp = int.from_bytes(record[:TIMESTAMP_SIZE], "big")
     normalized = math.floor(timestamp + offset + 0.5)
     if not 0 <= normalized <= _UINT32_MAX:
@@ -910,33 +940,63 @@ def _ready_manifest(
 
 
 def _record_ready(
-    state_db: StateDB, ledger: dict[str, object], result: ReadyBundleResult, source: _BundleFacts
+    state_db: StateDB,
+    ledger: dict[str, object],
+    result: ReadyBundleResult,
+    source: _BundleFacts,
+    lineage: tuple[SourceLineage, ...] | None = None,
 ) -> None:
     bundles = ledger["bundles"]
     assert isinstance(bundles, dict)
-    entry = _ledger_entry(result.records_sha256, "ready", source)
-    existing = bundles.get(result.bundle_id)
-    if existing == entry:
+    entry = _ledger_entry(result.records_sha256, "ready", source, lineage)
+    target = _ready_entry_target(bundles.get(result.bundle_id), entry, lineage)
+    if target is None:
         return
-    if existing is not None:
-        raise ReadyBundleError("ready publication ledger conflicts with bundle")
     frontier = ledger["frontier"]
     assert isinstance(frontier, int)
     updated_frontier = max(frontier, result.next_sequence)
     try:
         with state_db.transaction() as transaction:
-            current = transaction.get(StateKind.READY_PUBLICATION, result.bundle_id)
-            if current is not None and current != entry:
-                raise ReadyBundleError("ready publication ledger conflicts with bundle")
-            transaction.put(StateKind.READY_PUBLICATION, result.bundle_id, entry)
+            target = _transaction_ready_target(transaction, result.bundle_id, target, lineage)
+            if target is None:
+                return
+            transaction.put(StateKind.READY_PUBLICATION, result.bundle_id, target)
             transaction.put(StateKind.READY_PUBLICATION, "frontier", {"value": updated_frontier})
     except (OSError, ValueError, StateDBError) as error:
         raise ReadyBundleError("ready publication ledger could not be written") from error
-    bundles[result.bundle_id] = entry
+    bundles[result.bundle_id] = target
     ledger["frontier"] = updated_frontier
 
 
-def _ledger_entry(records_sha256: str, state: str, source: _BundleFacts) -> dict[str, object]:
+def _ready_entry_target(
+    existing: object, entry: dict[str, object], lineage: tuple[SourceLineage, ...] | None
+) -> dict[str, object] | None:
+    if existing is None:
+        return entry
+    if not isinstance(existing, dict) or not _same_ledger_identity(existing, entry):
+        raise ReadyBundleError("ready publication ledger conflicts with bundle")
+    existing_lineage = source_lineage(existing) if "sources" in existing else None
+    if existing_lineage is not None and lineage is not None and existing_lineage != lineage:
+        raise ReadyBundleError("ready publication ledger source lineage conflicts with bundle")
+    return None if existing_lineage is not None or lineage is None else entry
+
+
+def _transaction_ready_target(
+    transaction: StateTransaction,
+    bundle_id: str,
+    entry: dict[str, object],
+    lineage: tuple[SourceLineage, ...] | None,
+) -> dict[str, object] | None:
+    current = transaction.get(StateKind.READY_PUBLICATION, bundle_id)
+    return _ready_entry_target(current, entry, lineage) if current is not None else entry
+
+
+def _ledger_entry(
+    records_sha256: str,
+    state: str,
+    source: _BundleFacts,
+    lineage: tuple[SourceLineage, ...] | None = None,
+) -> dict[str, object]:
     return {
         "records_sha256": records_sha256,
         "state": state,
@@ -944,7 +1004,77 @@ def _ledger_entry(records_sha256: str, state: str, source: _BundleFacts) -> dict
         "next_sequence": source.next_sequence,
         "draft_raw_sha256": source.raw_sha256,
         **({"gaps": [list(gap) for gap in source.gaps]} if source.gaps else {}),
+        **(
+            {
+                "sources": [
+                    {"start_sequence": start, "next_sequence": end, "raw_sha256": raw_sha256}
+                    for start, end, raw_sha256 in lineage
+                ]
+            }
+            if lineage is not None
+            else {}
+        ),
     }
+
+
+def _same_ledger_identity(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+    return all(left.get(field) == right.get(field) for field in _LEDGER_ENTRY_FIELDS | {"gaps"})
+
+
+def _draft_lineage(drafts: tuple[_Draft, ...]) -> tuple[SourceLineage, ...]:
+    return tuple(
+        (draft.manifest.start_sequence, draft.manifest.next_sequence, draft.manifest.raw_sha256) for draft in drafts
+    )
+
+
+def _matching_draft_lineage(source: _ReadySource, drafts: tuple[_Draft, ...]) -> tuple[SourceLineage, ...] | None:
+    candidates = tuple(
+        sorted(
+            (draft for draft in drafts if _overlaps(draft.manifest, source)),
+            key=lambda item: (item.manifest.start_sequence, str(item.path)),
+        )
+    )
+    if not candidates:
+        return None
+    return _lineage_for_runs(source, _normalize_matching_drafts(candidates))
+
+
+def _normalize_matching_drafts(candidates: tuple[_Draft, ...]) -> tuple[_Draft, ...]:
+    normalized: list[_Draft] = []
+    ends: list[int] = []
+    for draft in candidates:
+        for unique in _unique_against_drafts(draft, normalized, bisect_right(ends, draft.manifest.start_sequence)):
+            position = bisect_right(ends, unique.manifest.start_sequence)
+            normalized.insert(position, unique)
+            ends.insert(position, unique.manifest.next_sequence)
+    return tuple(normalized)
+
+
+def _lineage_for_runs(source: _ReadySource, normalized: tuple[_Draft, ...]) -> tuple[SourceLineage, ...] | None:
+    selected: list[_Draft] = []
+    ready_offset = 0
+    for run_start, run_end in _physical_runs(source.facts):
+        cursor = run_start
+        for draft in normalized:
+            draft_start, draft_end = draft.manifest.start_sequence, draft.manifest.next_sequence
+            if draft_end <= cursor:
+                continue
+            if draft_start >= run_end:
+                break
+            if draft_start > cursor:
+                return None
+            overlap_end = min(draft_end, run_end)
+            if cursor < overlap_end:
+                slice_ = _crop_draft(draft, cursor, overlap_end)
+                _validate_replayed_payload(
+                    draft, source, (cursor, overlap_end), ready_offset + cursor - run_start, exact_time=True
+                )
+                selected.append(slice_)
+                cursor = overlap_end
+        if cursor != run_end:
+            return None
+        ready_offset += run_end - run_start
+    return _draft_lineage(tuple(selected))
 
 
 def _retired_entry(ledger: Mapping[str, object], bundle_id: str) -> dict[str, object] | None:
@@ -956,7 +1086,9 @@ def _retired_entry(ledger: Mapping[str, object], bundle_id: str) -> dict[str, ob
     return None
 
 
-def _validate_retired_duplicate(entry: Mapping[str, object], source: _BundleFacts) -> None:
+def _validate_retired_duplicate(
+    entry: Mapping[str, object], source: _BundleFacts, drafts: tuple[_Draft, ...] | None = None
+) -> None:
     if (
         entry.get("start_sequence") != source.start_sequence
         or entry.get("next_sequence") != source.next_sequence
@@ -964,6 +1096,8 @@ def _validate_retired_duplicate(entry: Mapping[str, object], source: _BundleFact
         or _entry_gaps(entry) != source.gaps
     ):
         raise ReadyBundleError("retired ledger entry conflicts with draft")
+    if "sources" in entry and drafts is not None and source_lineage(entry) != _draft_lineage(drafts):
+        raise ReadyBundleError("retired ledger source lineage conflicts with draft")
 
 
 def _reject_retired_overlap(ledger: Mapping[str, object], source: _BundleFacts) -> None:
@@ -1006,10 +1140,44 @@ def resume_retired(ready_root: Path, state_db: StateDB) -> None:
         _remove_retired_ready(destination)
 
 
-def retire_acknowledged(ready_root: Path, state_db: StateDB, checkpoint_path: Path) -> tuple[ReadyBundleResult, ...]:
+def legacy_ready_retirement_ranges(
+    ready_root: Path, state_db: StateDB, acknowledged: tuple[tuple[str, str], ...]
+) -> tuple[tuple[int, int], ...]:
+    """Return legacy ready spans whose physical proof is about to disappear."""
+    bundles = _read_ledger(state_db)["bundles"]
+    assert isinstance(bundles, dict)
+    endangered: set[tuple[int, int]] = set()
+    for bundle_id, _ in acknowledged:
+        entry = bundles.get(bundle_id)
+        if isinstance(entry, dict) and entry.get("state") == "ready" and "sources" not in entry:
+            endangered.add((cast(int, entry["start_sequence"]), cast(int, entry["next_sequence"])))
+    for bundle_id, entry in bundles.items():
+        if (
+            isinstance(entry, dict)
+            and entry.get("state") == "retired"
+            and "sources" not in entry
+            and os.path.lexists(ready_root / bundle_id)
+        ):
+            endangered.add((cast(int, entry["start_sequence"]), cast(int, entry["next_sequence"])))
+    return tuple(sorted(endangered))
+
+
+def acknowledged_ready(checkpoint_path: Path) -> tuple[tuple[str, str], ...]:
+    """Pin one validated consumer ACK snapshot across cleanup and retirement."""
+    return _windmill_acknowledged(checkpoint_path)
+
+
+def retire_acknowledged(
+    ready_root: Path,
+    state_db: StateDB,
+    checkpoint_path: Path,
+    *,
+    acknowledged: tuple[tuple[str, str], ...] | None = None,
+) -> tuple[ReadyBundleResult, ...]:
     """Retire only Windmill bundles durably ACKed outside an open speech tail."""
     _prepare_directory(ready_root)
-    acknowledged = _windmill_acknowledged(checkpoint_path)
+    if acknowledged is None:
+        acknowledged = acknowledged_ready(checkpoint_path)
     if not acknowledged:
         return ()
     ledger = _read_ledger(state_db)
@@ -1050,7 +1218,8 @@ def _retire_one(
     if state == "ready":
         source = _read_ready_source(destination)
         _validate_ready_ledger_entry(entry, source)
-        retired_entry = _ledger_entry(records_sha256, "retired", source.facts)
+        lineage = source_lineage(entry) if "sources" in entry else None
+        retired_entry = _ledger_entry(records_sha256, "retired", source.facts, lineage)
         try:
             with state_db.transaction() as transaction:
                 transaction.put(StateKind.READY_PUBLICATION, bundle_id, retired_entry)
@@ -1267,7 +1436,13 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
         return False
     start, end = entry.get("start_sequence"), entry.get("next_sequence")
     if (
-        set(entry) not in (_LEDGER_ENTRY_FIELDS, _LEDGER_ENTRY_FIELDS | {"gaps"})
+        set(entry)
+        not in (
+            _LEDGER_ENTRY_FIELDS,
+            _LEDGER_ENTRY_FIELDS | {"gaps"},
+            _LEDGER_ENTRY_FIELDS | {"sources"},
+            _LEDGER_ENTRY_FIELDS | {"gaps", "sources"},
+        )
         or entry.get("state") not in {"ready", "retired"}
         or not _valid_range(start, end)
         or not _is_sha256(entry.get("draft_raw_sha256"))
@@ -1279,7 +1454,10 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
         return False
     digest = entry["draft_raw_sha256"]
     assert isinstance(digest, str)
-    return bundle_id == _bundle_id(_BundleFacts(start, end, end - start - sum(b - a for a, b in gaps), digest, gaps))
+    facts = _BundleFacts(start, end, end - start - sum(b - a for a, b in gaps), digest, gaps)
+    return bundle_id == _bundle_id(facts) and (
+        "sources" not in entry or _parse_sources(entry["sources"], facts) is not None
+    )
 
 
 def _parse_ledger_gaps(entry: Mapping[str, object], start: int, end: int) -> tuple[tuple[int, int], ...] | None:
@@ -1300,6 +1478,60 @@ def _parse_ledger_gaps(entry: Mapping[str, object], start: int, end: int) -> tup
         gaps.append((left, right))
         cursor = right
     return tuple(gaps)
+
+
+def source_lineage(entry: Mapping[str, object]) -> tuple[SourceLineage, ...]:
+    """Read and strictly validate source slices from a ready ledger entry."""
+    if "sources" not in entry:
+        return ()
+    start, end, digest = entry.get("start_sequence"), entry.get("next_sequence"), entry.get("draft_raw_sha256")
+    if not _valid_range(start, end) or not _is_sha256(digest):
+        raise ReadyBundleError("ready publication ledger source lineage is invalid")
+    assert isinstance(start, int) and isinstance(end, int) and isinstance(digest, str)
+    gaps = _parse_ledger_gaps(entry, start, end)
+    if gaps is None:
+        raise ReadyBundleError("ready publication ledger source lineage is invalid")
+    facts = _BundleFacts(start, end, end - start - sum(b - a for a, b in gaps), digest, gaps)
+    lineage = _parse_sources(entry["sources"], facts)
+    if lineage is None:
+        raise ReadyBundleError("ready publication ledger source lineage is invalid")
+    return lineage
+
+
+def _parse_sources(value: object, facts: _BundleFacts) -> tuple[SourceLineage, ...] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    sources: list[SourceLineage] = []
+    previous_end: int | None = None
+    for item in value:
+        if not isinstance(item, dict) or set(item) != _LEDGER_SOURCE_FIELDS:
+            return None
+        start, end, digest = item.get("start_sequence"), item.get("next_sequence"), item.get("raw_sha256")
+        if not _valid_range(start, end) or not _is_sha256(digest):
+            return None
+        assert isinstance(start, int) and isinstance(end, int) and isinstance(digest, str)
+        if previous_end is not None and start < previous_end:
+            return None
+        sources.append((start, end, digest))
+        previous_end = end
+    if not _sources_cover_runs(tuple(sources), facts):
+        return None
+    return tuple(sources)
+
+
+def _sources_cover_runs(sources: tuple[SourceLineage, ...], facts: _BundleFacts) -> bool:
+    runs = _physical_runs(facts)
+    run_index = 0
+    cursor = runs[0][0]
+    for start, end, _ in sources:
+        while run_index < len(runs) and cursor == runs[run_index][1]:
+            run_index += 1
+            if run_index < len(runs):
+                cursor = runs[run_index][0]
+        if run_index == len(runs) or start != cursor or end > runs[run_index][1]:
+            return False
+        cursor = end
+    return run_index == len(runs) - 1 and cursor == runs[-1][1]
 
 
 def _entry_gaps(entry: Mapping[str, object]) -> tuple[tuple[int, int], ...]:

@@ -152,6 +152,164 @@ def test_drained_frontier_publishes_all_accumulated_audio_in_one_bundle(tmp_path
     assert remainder.exists() is False
 
 
+def test_aggregate_ready_ledger_records_each_draft_source_lineage(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    first = _audio_draft(draft_root, sequence=10)
+    second = _audio_draft(draft_root, sequence=11)
+    first_digest = cast(dict[str, object], loads((first / "manifest.json").read_text()))["raw_sha256"]
+    second_digest = cast(dict[str, object], loads((second / "manifest.json").read_text()))["raw_sha256"]
+    ledger = _state_db(tmp_path)
+
+    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", ledger, ClockSegmentMap(()))
+
+    entry = _bundle_state(ledger, published.bundle_id)
+    assert entry["sources"] == [
+        {"start_sequence": 10, "next_sequence": 11, "raw_sha256": first_digest},
+        {"start_sequence": 11, "next_sequence": 12, "raw_sha256": second_digest},
+    ]
+    assert ready_bundles.source_lineage(entry) == ((10, 11, first_digest), (11, 12, second_digest))
+
+
+def test_ack_retirement_preserves_source_lineage_after_ready_files_are_removed(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    first = _audio_draft(draft_root, sequence=10)
+    second = _audio_draft(draft_root, sequence=11)
+    first_digest = cast(dict[str, object], loads((first / "manifest.json").read_text()))["raw_sha256"]
+    second_digest = cast(dict[str, object], loads((second / "manifest.json").read_text()))["raw_sha256"]
+    ready_root = tmp_path / "ready"
+    ledger = _state_db(tmp_path)
+    (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
+
+    ready_bundles.retire_acknowledged(
+        ready_root, ledger, _checkpoint(tmp_path, [(published.bundle_id, published.records_sha256)])
+    )
+
+    assert not published.path.exists()
+    entry = _bundle_state(ledger, published.bundle_id)
+    assert entry["state"] == "retired"
+    assert ready_bundles.source_lineage(entry) == ((10, 11, first_digest), (11, 12, second_digest))
+
+
+def test_ready_file_replay_enriches_reconciled_ledger_with_source_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draft_root = tmp_path / "draft"
+    draft = _audio_draft(draft_root, sequence=10)
+    ledger = _state_db(tmp_path)
+    digest = cast(dict[str, object], loads((draft / "manifest.json").read_text()))["raw_sha256"]
+    original_record = ready_bundles._record_ready
+    monkeypatch.setattr(
+        ready_bundles,
+        "_record_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("crash")),
+    )
+
+    with pytest.raises(OSError, match="crash"):
+        _finalize_drafts(draft_root, tmp_path / "ready", ledger, ClockSegmentMap(()))
+
+    monkeypatch.setattr(ready_bundles, "_record_ready", original_record)
+    _finalize_drafts(draft_root, tmp_path / "ready", ledger, ClockSegmentMap(()))
+
+    bundle_id = next(
+        bundle_id for bundle_id in dict(ledger.list(StateKind.READY_PUBLICATION)) if bundle_id != "frontier"
+    )
+    assert ready_bundles.source_lineage(_bundle_state(ledger, bundle_id)) == ((10, 11, digest),)
+
+
+def test_replayed_ready_with_wrong_normalized_time_cannot_gain_source_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draft_root = tmp_path / "draft"
+    draft = _audio_draft(draft_root, sequence=10)
+    ledger = _state_db(tmp_path)
+    record_ready = ready_bundles._record_ready
+    monkeypatch.setattr(
+        ready_bundles, "_record_ready", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("crash"))
+    )
+    with pytest.raises(OSError, match="crash"):
+        _finalize_drafts(draft_root, tmp_path / "ready", ledger, ClockSegmentMap(()))
+    monkeypatch.setattr(ready_bundles, "_record_ready", record_ready)
+
+    ready_path = next((tmp_path / "ready").iterdir())
+    raw_path = ready_path / "records.bin"
+    original = raw_path.read_bytes()
+    changed = (101).to_bytes(4, "big") + original[4:]
+    raw_path.write_bytes(changed)
+    manifest_path = ready_path / "manifest.json"
+    manifest = cast(dict[str, object], loads(manifest_path.read_text(encoding="utf-8")))
+    manifest["records_sha256"] = sha256(changed).hexdigest()
+    manifest_path.write_text(dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="overlap conflicts"):
+        _finalize_drafts(draft_root, tmp_path / "ready", ledger, ClockSegmentMap(()))
+    assert draft.exists()
+    assert ready_path.exists()
+    assert not ledger.list(StateKind.READY_PUBLICATION)
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [
+        [],
+        [{"start_sequence": 100, "next_sequence": 102, "raw_sha256": "z" * 64}],
+        [{"start_sequence": 101, "next_sequence": 102, "raw_sha256": "a" * 64}],
+        [
+            {"start_sequence": 100, "next_sequence": 101, "raw_sha256": "a" * 64},
+            {"start_sequence": 100, "next_sequence": 102, "raw_sha256": "b" * 64},
+        ],
+    ],
+)
+def test_malformed_source_lineage_is_rejected(tmp_path: Path, sources: list[dict[str, object]]) -> None:
+    ledger = _state_db(tmp_path)
+    _draft(tmp_path / "draft", (100, 101), start_sequence=100)
+    (published,) = _finalize_drafts(tmp_path / "draft", tmp_path / "ready", ledger, ClockSegmentMap(()))
+    document = cast(dict[str, object], _ledger_state(ledger))
+    entry = cast(dict[str, object], cast(dict[str, object], document["bundles"])[published.bundle_id])
+    entry["sources"] = sources
+    _set_ledger_state(ledger, document)
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="publication ledger"):
+        ready_bundles._read_ledger(ledger)
+
+
+def test_source_lineage_must_cover_each_physical_run_around_gaps(tmp_path: Path) -> None:
+    draft_root = tmp_path / "draft"
+    _draft(draft_root, (100,), start_sequence=10)
+    _draft(draft_root, (102,), start_sequence=12)
+    ledger = _state_db(tmp_path)
+    (published,) = _finalize_drafts(draft_root, tmp_path / "ready", ledger, ClockSegmentMap(()))
+    document = cast(dict[str, object], _ledger_state(ledger))
+    entry = cast(dict[str, object], cast(dict[str, object], document["bundles"])[published.bundle_id])
+    entry["sources"] = [{"start_sequence": 10, "next_sequence": 13, "raw_sha256": "a" * 64}]
+    _set_ledger_state(ledger, document)
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="publication ledger"):
+        ready_bundles._read_ledger(ledger)
+
+
+def test_conflicting_source_lineage_is_never_overwritten_on_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draft_root = tmp_path / "draft"
+    draft = _draft(draft_root, (100,), start_sequence=100)
+    ready_root = tmp_path / "ready"
+    ledger = _state_db(tmp_path)
+    remove_draft = ready_bundles._remove_draft
+    monkeypatch.setattr(ready_bundles, "_remove_draft", lambda _path: None)
+    (published,) = _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
+    monkeypatch.setattr(ready_bundles, "_remove_draft", remove_draft)
+    document = cast(dict[str, object], _ledger_state(ledger))
+    bundles = cast(dict[str, object], document["bundles"])
+    entry = cast(dict[str, object], bundles[published.bundle_id])
+    entry["sources"] = [{"start_sequence": 100, "next_sequence": 101, "raw_sha256": "b" * 64}]
+    _set_ledger_state(ledger, document)
+
+    with pytest.raises(ready_bundles.ReadyBundleError, match="source lineage"):
+        _finalize_drafts(draft_root, ready_root, ledger, ClockSegmentMap(()))
+    assert draft.exists()
+    assert cast(dict[str, object], _bundle_state(ledger, published.bundle_id))["sources"] == entry["sources"]
+
+
 def test_target_without_a_drained_frontier_never_publishes(tmp_path: Path) -> None:
     draft_root = tmp_path / "draft"
     draft = _audio_draft(draft_root, sequence=10)

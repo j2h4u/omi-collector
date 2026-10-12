@@ -7,7 +7,7 @@ from dataclasses import FrozenInstanceError
 from errno import EXDEV
 from multiprocessing import get_context
 from multiprocessing.queues import Queue
-from os import PathLike, fsync, mkfifo
+from os import PathLike, fsync, getgid, mkfifo, umask
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
@@ -66,6 +66,45 @@ def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Call
     attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
+
+
+def test_new_attempt_and_published_audio_remain_group_readable(tmp_path: Path) -> None:
+    spool = tmp_path / "collector"
+    draft = _capture_root(tmp_path)
+    for root in (spool, draft):
+        root.mkdir()
+        root.chmod(0o2750)
+    previous_umask = umask(0o027)
+    attempt = None
+    result = None
+    try:
+        store = StagingStore(spool, draft)
+        attempt = store.prepare_streaming_attempt(100, 1)
+        attempt.record_read_begin(ReadBeginNotification(100, 1))
+        attempt.accept_chunk(100, _record(7))
+        attempt.checkpoint()
+        result = attempt.publish_prefix()
+    finally:
+        umask(previous_umask)
+        if attempt is not None:
+            attempt.close()
+
+    assert attempt is not None and result is not None
+    assert (attempt.path / "records.bin").read_bytes() == _record(7)
+    assert (result.bundle_path / "records.bin").read_bytes() == _record(7)
+    assert (result.bundle_path / "manifest.json").read_bytes()
+    assert StateDB(spool / "collector-state.sqlite3", read_only=True).get(StateKind.ATTEMPT, attempt.attempt_id)
+    for directory in (spool / "attempts", attempt.path, draft, result.bundle_path):
+        assert directory.stat().st_gid == getgid()
+        assert directory.stat().st_mode & 0o7777 == 0o2750
+    for file in (
+        spool / "collector-state.sqlite3",
+        attempt.path / "records.bin",
+        result.bundle_path / "records.bin",
+        result.bundle_path / "manifest.json",
+    ):
+        assert file.stat().st_gid == getgid()
+        assert file.stat().st_mode & 0o777 == 0o640
 
 
 def _rewrite_checkpoint(attempt: StagedAttempt, field: str, value: object) -> None:

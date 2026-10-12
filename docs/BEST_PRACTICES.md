@@ -218,6 +218,18 @@ Initial setup is deliberately small. Keep the checkout root-owned under
 system account and state ownership, protects the configuration, validates the
 staged unit, and restores the prior unit if installation cannot be reloaded or
 enabled. It never starts the service without `--restart`.
+It also provisions the fixed Collector data roots as
+`omi-collector:j2h4u` mode `2750`. The setgid bit keeps newly created attempts,
+quarantine entries, drafts, and ready bundles in the operator's read group.
+Each deployment reapplies these root modes and sets the SQLite state database
+to `omi-collector:j2h4u` mode `0640`; the singleton lock remains private
+`omi-collector:omi-collector` mode `0600`. This operator access is read-only:
+service control and deployment use their separate bounded commands. Older
+nested data and retained root-owned recovery packages require a one-time,
+audited group-read repair; do not recursively chown unrelated pipeline state.
+The installed sudo policy permits `j2h4u` to start, stop, or restart only
+`omi-collector.service`, alongside the existing fixed status and release
+wrappers.
 
 The installer also installs the root-owned
 `/usr/local/sbin/omi-collector-deploy-release` wrapper and its fixed sudo

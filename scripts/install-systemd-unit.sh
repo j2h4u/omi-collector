@@ -43,6 +43,34 @@ function ensure_service_account {
         || die "state directory must be ${account_user}:${account_group} 0750: ${state_dir}"
 }
 
+function provision_operator_data_access {
+    # args
+    local -r storage_root="$1" account_user="$2" operator_group="$3"
+
+    # vars
+    local directory
+    local -a directories=(
+        "${storage_root}/collector"
+        "${storage_root}/collector/attempts"
+        "${storage_root}/collector/quarantine"
+        "${storage_root}/draft"
+        "${storage_root}/ready"
+    )
+
+    # code
+    # assert: only the fixed Collector data roots may receive operator read access
+    [[ "$storage_root" == '/srv/pipelines/omi' ]] || die 'unexpected Collector storage root'
+    getent group "$operator_group" &> /dev/null || die "operator group is missing: ${operator_group}"
+    for directory in "${directories[@]}"; do
+        # assert: do not follow an existing data-root symlink
+        [[ ! -L "$directory" ]] || die "Collector data root must not be a symlink: ${directory}"
+        install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory" \
+            || die "could not provision Collector data root: ${directory}"
+        [[ $(stat -c '%U:%G:%a' -- "$directory") == "${account_user}:${operator_group}:2750" ]] \
+            || die "Collector data root has unexpected ownership or mode: ${directory}"
+    done
+}
+
 function validate_operator_config_file {
     # args
     local -r config_file="$1" account_group="$2"
@@ -175,7 +203,7 @@ function validate_staged_unit {
 
 declare script_dir repo_root source_unit source_bluetooth_ready source_status source_status_sudoers source_deploy_release source_deploy_release_sudoers
 declare config_file storage_root publication_work_dir unit_target bluetooth_ready_target status_target status_sudoers_target deploy_release_target deploy_release_sudoers_target service_name
-declare account_user account_group state_dir staged_status staged_status_sudoers staged_deploy_release staged_deploy_release_sudoers staged_unit staged_bluetooth_ready
+declare account_user account_group operator_group state_dir staged_status staged_status_sudoers staged_deploy_release staged_deploy_release_sudoers staged_unit staged_bluetooth_ready
 declare status_backup status_sudoers_backup deploy_release_backup deploy_release_sudoers_backup unit_backup bluetooth_ready_backup
 declare -i restart_requested=0
 
@@ -199,6 +227,7 @@ deploy_release_sudoers_target='/etc/sudoers.d/omi-collector-deploy-release'
 service_name='omi-collector.service'
 account_user='omi-collector'
 account_group='omi-collector'
+operator_group='j2h4u'
 state_dir='/var/lib/omi-collector'
 staged_status=''
 staged_status_sudoers=''
@@ -273,6 +302,7 @@ command -v systemctl &> /dev/null || die 'systemctl is required'
 ensure_service_account "$account_user" "$account_group" "$state_dir"
 [[ -d "$storage_root" && ! -L "$storage_root" ]] \
     || die "storage root is missing or unsafe: ${storage_root}"
+provision_operator_data_access "$storage_root" "$account_user" "$operator_group"
 provision_publication_checkpoint_traversal "$publication_work_dir" "$account_user" "$account_group"
 validate_operator_config_file "$config_file" "$account_group"
 /usr/sbin/visudo -cf "$source_status_sudoers" || die 'status sudo policy is invalid'

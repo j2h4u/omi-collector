@@ -9,6 +9,7 @@ from threading import Thread
 from typing import Literal, Protocol, runtime_checkable
 
 from ...config import FirmwareObservationConfig, WriterConfig
+from ..domain.clock_state import ClockIntent, ClockRange, ClockState
 from ..domain.quarantine_machine import QuarantineState
 from ..domain.ring_protocol import DoneNotification, ReadBeginNotification, RingInfo
 
@@ -69,128 +70,28 @@ class PublicationOutcomeShape(Protocol):
     def retry_after_seconds(self) -> float | None: ...
 
 
-class ClockCorrectionShape(Protocol):
-    @property
-    def operation_id(self) -> str: ...
+class ClockStatePort(Protocol):
+    """The one durable active clock projection used by runtime telemetry."""
 
-    @property
-    def state(self) -> str: ...
+    def state(self) -> ClockState: ...
 
-    @property
-    def boundary_sequence_min(self) -> int: ...
-
-
-class ClockObservationShape(Protocol):
-    @property
-    def observation_id(self) -> str: ...
-
-    @property
-    def evidence_kind(self) -> str: ...
-
-    @property
-    def session_id(self) -> str: ...
-
-    @property
-    def host_boot_id(self) -> str: ...
-
-    @property
-    def host_realtime_start(self) -> float: ...
-
-    @property
-    def host_realtime_end(self) -> float: ...
-
-    @property
-    def host_monotonic_start(self) -> float: ...
-
-    @property
-    def host_monotonic_end(self) -> float: ...
-
-    @property
-    def device_epoch(self) -> int: ...
-
-    @property
-    def info_sequence_min(self) -> int: ...
-
-    @property
-    def info_sequence_max(self) -> int: ...
-
-    @property
-    def operation_id(self) -> str | None: ...
-
-    @property
-    def effective_boundary_sequence(self) -> int | None: ...
-
-    @property
-    def observation_role(self) -> str: ...
-
-    @property
-    def parent_observation_id(self) -> str | None: ...
-
-
-class ClockObservationPort(Protocol):
-    """Durable clock-evidence ledger used by collection telemetry."""
-
-    def append(  # noqa: PLR0913 - the durable schema is intentionally explicit
+    def observe(
         self,
+        info: RingInfo,
         *,
-        evidence_kind: str,
-        session_id: str,
-        host_boot_id: str,
-        host_realtime_start: float,
-        host_realtime_end: float,
-        host_monotonic_start: float,
-        host_monotonic_end: float,
-        device_epoch: int,
-        info_sequence_min: int,
-        info_sequence_max: int,
-        operation_id: str | None = None,
-        effective_boundary_sequence: int | None = None,
-        observation_id: str | None = None,
-        observation_role: str = "standalone",
-        parent_observation_id: str | None = None,
-    ) -> ClockObservationShape: ...
+        offset_seconds: float,
+        uncertainty_seconds: float,
+        source_id: str,
+        tolerance_seconds: float,
+    ) -> ClockState: ...
 
-    def records(self) -> tuple[ClockObservationShape, ...]: ...
+    def prepare(self, intent: ClockIntent) -> ClockState: ...
 
+    def mark_uncertain(self, operation_id: str, *, write_sequence_after: int | None = None) -> ClockState: ...
 
-class ClockMembershipPort(Protocol):
-    def record_membership(
-        self, observation_id: str, session_id: str, start_sequence: int, next_sequence: int
-    ) -> None: ...
+    def cancel_prepared(self, operation_id: str) -> ClockState: ...
 
-
-class ClockCorrectionPort(Protocol):
-    """Durable clock-intent and reconciliation ledger."""
-
-    def note_transport_closed(self) -> None: ...
-
-    def prepare(
-        self, observed_epoch: int, target_epoch: int, drift_seconds: float, boundary_sequence_min: int
-    ) -> ClockCorrectionShape: ...
-
-    def mark_unresolved(self, correction: ClockCorrectionShape) -> ClockCorrectionShape: ...
-
-    def finish(
-        self,
-        correction: ClockCorrectionShape,
-        *,
-        state: str,
-        boundary_sequence_max: int | None,
-        verified_epoch: int | None,
-    ) -> ClockCorrectionShape: ...
-
-    def reconcile_causal_observation(
-        self, observation: ClockObservationShape, *, near_zero_threshold: float
-    ) -> tuple[ClockCorrectionShape, ...]: ...
-
-    def records(self) -> tuple[ClockCorrectionShape, ...]: ...
-
-
-class ClockDurabilityPort(ClockCorrectionPort, Protocol):
-    """The complete required clock capability supplied in production."""
-
-    @property
-    def observation_store(self) -> ClockObservationPort: ...
+    def finish(self, operation_id: str, ranges: tuple[ClockRange, ...]) -> ClockState: ...
 
 
 class RecoveryShape(Protocol):
@@ -307,12 +208,6 @@ class StagingPort(Protocol):
     def attempts_root(self) -> Path: ...
 
     @property
-    def device_state_path(self) -> Path: ...
-
-    @property
-    def clock_membership_store(self) -> ClockMembershipPort: ...
-
-    @property
     def paths(self) -> object: ...
 
     def clock_mutation_lease(self) -> StorageLeaseContext: ...
@@ -406,7 +301,7 @@ class CaptureRuntimePort(Protocol):
         self, staging: StagingPort, config: FirmwareObservationConfig, on_error: Callable[[Exception], None]
     ) -> ObservationWriterPort: ...
 
-    def make_clock_correction_sink(self, staging: StagingPort) -> ClockDurabilityPort: ...
+    def make_clock_state_store(self, staging: StagingPort) -> ClockStatePort: ...
 
     def publish_quarantined_prefix(
         self,

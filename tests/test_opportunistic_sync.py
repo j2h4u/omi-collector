@@ -6,6 +6,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import FrozenInstanceError, replace
+from datetime import UTC, datetime
 from functools import partial, wraps
 from hashlib import sha256
 from json import loads
@@ -19,11 +20,13 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakDBusError, BleakError
 
 from fakes import DelayedNotification, ScriptedRingSession, WriteStep
+from omi_collector.capture.adapters import ready_closures
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError, WriterProgress
-from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
-from omi_collector.capture.adapters.quality_metrics import JsonlQualityMetrics
+from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics, read_quality_events
 from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import (
@@ -33,6 +36,7 @@ from omi_collector.capture.adapters.staging_contract import (
     LockContext,
     StagingError,
 )
+from omi_collector.capture.adapters.staging_filesystem import StagingIO
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application import batch_reconciliation, session_lifecycle
@@ -173,6 +177,41 @@ def _capture_root(tmp_path: Path) -> Path:
         rmtree(root, ignore_errors=True)
         _CAPTURE_ROOTS.add(tmp_path)
     return root
+
+
+_test_state_databases: dict[Path, StateDB] = {}
+
+
+def _staging_store(
+    spool: Path,
+    capture_root: Path,
+    *,
+    config: CollectorConfig = DEFAULT_CONFIG,
+) -> StagingStore:
+    """Build staging fixtures with their required state database."""
+    spool = Path(spool)
+    spool.mkdir(parents=True, exist_ok=True)
+    state_db = _test_state_databases.get(spool)
+    if state_db is None or not state_db.path.is_file():
+        state_db = StateDB(spool / "collector-state.sqlite3")
+        _test_state_databases[spool] = state_db
+    return StagingStore(spool, capture_root, state_db=state_db, io=StagingIO(config=config))
+
+
+def _quality_metrics(state_db: StateDB) -> SQLiteQualityMetrics:
+    return SQLiteQualityMetrics(state_db, release_version="test-version", source_revision="a" * 40)
+
+
+def _quality_events(journal: SQLiteQualityMetrics, state_db: StateDB) -> tuple[dict[str, object], ...]:
+    assert journal.close()
+    return read_quality_events(state_db, datetime.min.replace(tzinfo=UTC), datetime.max.replace(tzinfo=UTC))
+
+
+def _ready_closure_rows(store: StagingStore) -> list[dict[str, object]]:
+    return [
+        {"next_sequence": closure.next_sequence, "reason": closure.reason}
+        for closure in ready_closures.load(store.state_db)
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -457,7 +496,7 @@ async def _real_batch_writer(
 
 @_async_test
 async def test_real_runtime_writer_start_persists_pending_attempt_before_leg_work(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 2, prepared=False) as writer:
         pending = store.pending_attempts()
         assert len(pending) == 1
@@ -470,7 +509,7 @@ async def test_real_runtime_writer_start_persists_pending_attempt_before_leg_wor
 
 @_async_test
 async def test_real_runtime_writer_barrier_returns_persisted_durable_prefix(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     record = _record(100)
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(RECORD_SIZE)
@@ -481,7 +520,9 @@ async def test_real_runtime_writer_barrier_returns_persisted_durable_prefix(tmp_
         assert durable.record_count == 1
         attempt_path = store.attempts_root / writer.attempt_id
         assert (attempt_path / "records.bin").read_bytes() == record
-        checkpoint = cast(dict[str, object], loads((attempt_path / "checkpoint.json").read_text(encoding="utf-8")))
+        attempt_state = store.state_db.get(StateKind.ATTEMPT, writer.attempt_id)
+        assert attempt_state is not None
+        checkpoint = cast(dict[str, object], attempt_state["checkpoint"])
         assert checkpoint["record_count"] == 1
         assert checkpoint["raw_sha256"] == sha256(record).hexdigest()
         assert durable.raw_sha256 == checkpoint["raw_sha256"]
@@ -489,7 +530,7 @@ async def test_real_runtime_writer_barrier_returns_persisted_durable_prefix(tmp_
 
 @_async_test
 async def test_real_runtime_writer_retains_seal_bundle_result(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     records = _records(100, 2)
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(len(records))
@@ -531,7 +572,7 @@ async def test_incomplete_staging_composition_is_rejected_before_provider_open()
 async def test_coordinator_wires_clock_telemetry_to_storage_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     lease_entries: list[str] = []
     original_lease = store.clock_mutation_lease
 
@@ -556,26 +597,26 @@ async def test_coordinator_wires_clock_telemetry_to_storage_lease(
 
 
 @_async_test
-async def test_coordinator_wires_real_clock_observation_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+async def test_coordinator_wires_real_clock_state_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     observed: list[object] = []
 
     async def observe_options(self: SessionLifecycle) -> NoDataResult:
-        observed.extend((self.run.options.clock_correction_sink, self.run.options.clock_observation_sink))
+        observed.append(self.run.options.clock_state_store)
         return NoDataResult(RingInfo(0, 0, 0, 0, RECORD_SIZE))
 
     monkeypatch.setattr(SessionLifecycle, "run_direct", observe_options)
 
     await run_opportunistic_collector(Provider([]), store, _options())
 
-    correction, observation = observed
-    assert isinstance(correction, ClockCorrectionStore)
-    assert observation is correction.observation_store
+    [clock_state_store] = observed
+    assert isinstance(clock_state_store, ClockStateStore)
+    assert clock_state_store.db is store.state_db
 
 
 @_async_test
 async def test_empty_pending_startup_disposition_cannot_be_rewritten(tmp_path: Path) -> None:
-    staging = StagingStore(tmp_path / "spool", tmp_path / "captures")
+    staging = _staging_store(tmp_path / "spool", tmp_path / "captures")
     maintenance = QuarantineMaintenance(staging, None, _runtime())
     try:
         initial = await maintenance.prepare_pending_startup()
@@ -594,53 +635,20 @@ async def test_empty_pending_startup_disposition_cannot_be_rewritten(tmp_path: P
 
 
 @_async_test
-async def test_coordinator_derives_observation_store_from_supplied_correction_sink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    correction = ClockCorrectionStore(tmp_path / "provided-device.json")
+async def test_coordinator_keeps_supplied_clock_state_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    clock_state_store = ClockStateStore(store.state_db)
     observed: list[object] = []
 
     async def observe_options(self: SessionLifecycle) -> NoDataResult:
-        observed.append(self.run.options.clock_observation_sink)
+        observed.append(self.run.options.clock_state_store)
         return NoDataResult(RingInfo(0, 0, 0, 0, RECORD_SIZE))
 
     monkeypatch.setattr(SessionLifecycle, "run_direct", observe_options)
 
-    await run_opportunistic_collector(Provider([]), store, replace(_options(), clock_correction_sink=correction))
+    await run_opportunistic_collector(Provider([]), store, replace(_options(), clock_state_store=clock_state_store))
 
-    assert observed == [correction.observation_store]
-
-
-@_async_test
-async def test_coordinator_rejects_observation_store_from_another_correction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    correction = ClockCorrectionStore(tmp_path / "provided-device.json")
-    other_correction = ClockCorrectionStore(tmp_path / "other-device.json")
-    lifecycle_started = False
-
-    async def observe_options(self: SessionLifecycle) -> NoDataResult:
-        del self
-        nonlocal lifecycle_started
-        lifecycle_started = True
-        return NoDataResult(RingInfo(0, 0, 0, 0, RECORD_SIZE))
-
-    monkeypatch.setattr(SessionLifecycle, "run_direct", observe_options)
-
-    with pytest.raises(ValueError, match="must belong"):
-        await run_opportunistic_collector(
-            Provider([]),
-            store,
-            replace(
-                _options(),
-                clock_correction_sink=correction,
-                clock_observation_sink=other_correction.observation_store,
-            ),
-        )
-
-    assert not lifecycle_started
+    assert observed == [clock_state_store]
 
 
 @_async_test
@@ -754,7 +762,7 @@ async def test_delayed_read_reports_progress_before_done(tmp_path: Path) -> None
     task = asyncio.create_task(
         run_opportunistic_collector(
             Provider([session]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             replace(_options(), progress=report),
         )
     )
@@ -802,7 +810,7 @@ def _patch_observation_writer(
 
 
 def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: int = 100) -> bytes:
-    store = StagingStore(root, _capture_root(root))
+    store = _staging_store(root, _capture_root(root))
     attempt = store.prepare_streaming_attempt(start, count)
     attempt.record_read_begin(ReadBeginNotification(start, count))
     records = _records(start, count)
@@ -859,7 +867,7 @@ async def test_drained_info_reaches_observation_writer_and_writer_closes_once(
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, NoDataResult)
@@ -917,7 +925,7 @@ async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
         config=config,
     )
     result = await asyncio.wait_for(
-        run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options),
+        run_opportunistic_collector(Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), options),
         timeout=2.0,
     )
 
@@ -958,7 +966,7 @@ async def test_successful_info_values_reach_observation_writer_across_batch_life
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -1004,7 +1012,7 @@ async def test_observation_writer_failures_do_not_block_collection(
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -1029,7 +1037,7 @@ async def test_observation_close_cancellation_does_not_mask_primary_failure(
         def provider(_candidate: object | None = None) -> AbstractAsyncContextManager[RingSession]:
             raise primary
 
-        call = run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
+        call = run_opportunistic_collector(provider, _staging_store(tmp_path, _capture_root(tmp_path)), _options())
     else:
         session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
 
@@ -1038,7 +1046,7 @@ async def test_observation_close_cancellation_does_not_mask_primary_failure(
 
         monkeypatch.setattr(BatchReconciler, "finalize_active", fail_finalization)
         call = run_opportunistic_collector(
-            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+            Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
         )
 
     with pytest.raises(RuntimeError) as raised:
@@ -1077,7 +1085,7 @@ async def test_cancellation_during_observation_close_propagates(
     monkeypatch.setattr(OpportunisticRuntime, "make_observation_writer", make_blocking_observation_writer)
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
     task = asyncio.create_task(
-        run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options())
+        run_opportunistic_collector(Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options())
     )
 
     try:
@@ -1093,7 +1101,7 @@ async def test_cancellation_during_observation_close_propagates(
 @_async_test
 @pytest.mark.parametrize("kind", ["single", "multiple"])
 async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path: Path, kind: str) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     if kind == "single":
         store.prepare_streaming_attempt(100, 2)
     else:
@@ -1112,19 +1120,29 @@ async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path:
 async def test_malformed_resume_evidence_is_quarantined_before_provider(tmp_path: Path, damage: str) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
     partial = next((tmp_path / "attempts").iterdir())
-    evidence = partial / ("checkpoint.json" if damage == "checkpoint" else "records.bin")
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    attempt_state = store.state_db.get(StateKind.ATTEMPT, partial.name)
+    assert attempt_state is not None
+    evidence = partial / "records.bin"
     if damage == "checkpoint":
-        evidence.write_text("{malformed", encoding="utf-8")
+        attempt_state["checkpoint"] = {"version": "malformed"}
+        store.state_db.put(StateKind.ATTEMPT, partial.name, attempt_state)
     else:
         evidence.write_bytes(evidence.read_bytes() + b"torn")
     cursor = 101 if damage == "raw" else 100
     provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(cursor, cursor),)),))])
-    result = await run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
+    result = await run_opportunistic_collector(provider, _staging_store(tmp_path, _capture_root(tmp_path)), _options())
 
     assert isinstance(result, NoDataResult)
     assert provider.opened == 1
     assert not partial.exists()
     assert not evidence.exists()
+    retained_state = store.state_db.get(StateKind.ATTEMPT, partial.name)
+    if damage == "checkpoint":
+        assert retained_state is None
+    else:
+        assert retained_state is not None
+        assert cast(dict[str, object], retained_state["checkpoint"])["record_count"] == 1
     assert list((tmp_path / "quarantine").iterdir())
 
 
@@ -1137,7 +1155,7 @@ async def test_resumed_complete_prefix_at_device_end_seals_without_read_or_advan
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -1160,7 +1178,7 @@ async def test_collect_mode_seals_without_advance_or_second_info(tmp_path: Path)
     options = _options(batch_records=1)
     options = replace(options, policy=replace(options.policy, advance_enabled=False))
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), options
     )
 
     assert isinstance(result, CollectionResult)
@@ -1188,7 +1206,7 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
 
     result = await run_opportunistic_collector(
         Provider([session]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         _options(),
     )
 
@@ -1228,7 +1246,7 @@ async def test_live_partial_ahead_of_fresh_cursor_resumes_at_durable_prefix(tmp_
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=end - start)
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options(batch_records=end - start)
     )
 
     assert isinstance(result, CollectionResult)
@@ -1240,7 +1258,7 @@ async def test_live_partial_ahead_of_fresh_cursor_resumes_at_durable_prefix(tmp_
 @_async_test
 async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     with store.device_lock() as lease:
         sealed = store.resume_streaming_attempt(lease)
         assert sealed is not None
@@ -1258,7 +1276,7 @@ async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -1284,7 +1302,7 @@ async def test_post_seal_cursor_ahead_keeps_old_bundle_and_starts_at_fresh_curso
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -1309,7 +1327,7 @@ async def test_acknowledged_advance_with_ahead_cursor_is_not_reported_confirmed(
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
     )
 
     assert isinstance(result, CollectionResult)
@@ -1319,7 +1337,7 @@ async def test_acknowledged_advance_with_ahead_cursor_is_not_reported_confirmed(
 @_async_test
 async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=3, persisted=1)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
@@ -1344,7 +1362,7 @@ async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor
 @_async_test
 async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_current_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
@@ -1367,10 +1385,12 @@ async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_curren
     prefix_bundles = tuple(path for path in (_capture_root(tmp_path)).iterdir() if path.name.startswith("100-101-"))
     assert len(prefix_bundles) == 1
     assert not (prefix_bundles[0] / "gap.json").exists()
-    assert "gap_sha256" not in loads((prefix_bundles[0] / "receipt.json").read_text(encoding="utf-8"))
+    assert not (prefix_bundles[0] / "receipt.json").exists()
     retired = tuple((tmp_path / "attempts").iterdir())
     assert len(retired) == 1
-    assert loads((retired[0] / "terminal-retired.json").read_text(encoding="utf-8"))["state"] == "terminal-retired"
+    retired_state = store.state_db.get(StateKind.ATTEMPT, retired[0].name)
+    assert retired_state is not None
+    assert cast(dict[str, object], retired_state["terminal_retirement"])["state"] == "terminal-retired"
 
 
 @_async_test
@@ -1383,7 +1403,7 @@ async def test_startup_sweep_removes_only_aged_terminal_retired_partials(
         return now
 
     monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", wall_clock_ns)
-    store = StagingStore(
+    store = _staging_store(
         tmp_path,
         _capture_root(tmp_path),
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
@@ -1421,7 +1441,7 @@ async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startu
 
     monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", wall_clock_ns)
     monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: maintenance_now)
-    store = StagingStore(
+    store = _staging_store(
         tmp_path,
         _capture_root(tmp_path),
         config=CollectorConfig(
@@ -1471,7 +1491,7 @@ async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startu
 async def test_terminal_retired_sweep_failure_is_structured_and_does_not_stop_collection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     events: list[tuple[str, BaseException, dict[str, object]]] = []
 
     def fail_sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
@@ -1540,7 +1560,7 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
             self.closed = True
 
     presence = BlockingPresence()
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
 
     async def slow_maintenance(
         _maintenance: QuarantineMaintenance,
@@ -1561,7 +1581,7 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
 
     monkeypatch.setattr(QuarantineMaintenance, "run_once", slow_maintenance)
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
-    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
+    journal = _quality_metrics(store.state_db)
     task = asyncio.create_task(
         run_opportunistic_collector(
             OrderedProvider([session]),
@@ -1585,9 +1605,7 @@ async def test_startup_scan_wake_defers_and_joins_quarantine_before_provider(
         assert isinstance(task.result(), NoDataResult)
         assert maintenance_stopped.is_set()
         assert presence.closed
-        [advertisement] = [
-            cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()
-        ]
+        [advertisement] = _quality_events(journal, store.state_db)
         assert advertisement["event"] == "advertisement_observation"
         assert advertisement["recorded_at"] == "1970-01-01T00:16:40.000+00:00"
         assert advertisement["advertisement_rssi_dbm"] == -72
@@ -1652,7 +1670,7 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
     task = asyncio.create_task(
         run_opportunistic_collector(
             Provider([]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             replace(_options(), presence=cast(PresenceScheduler, presence)),
         )
     )
@@ -1689,7 +1707,7 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
 @_async_test
 async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_and_drains(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
@@ -1756,7 +1774,7 @@ async def test_three_storage_not_ready_infos_reconnect_before_read(tmp_path: Pat
 
     result = await run_opportunistic_collector(
         ClosingProvider([first, second]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
             _options().timeouts,
             RetryPolicy(backoff=config.retry.rapid_backoff, batch_records=1, stop_after_drained=True),
@@ -1794,7 +1812,7 @@ async def test_resume_cursor_matrix(
     tmp_path: Path, read: int, write: int, persisted: int, error: type[Exception] | None
 ) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=persisted)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     read_start = max(read, 100 + persisted)
@@ -1852,7 +1870,7 @@ async def test_resume_cursor_matrix(
 async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     attempt = store.prepare_streaming_attempt(100, 3)
     attempt.record_read_begin(ReadBeginNotification(100, 3))
     attempt.accept_chunk(100, _record(100))
@@ -1870,7 +1888,9 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
         max_bytes: int,
         record_size: int = RECORD_SIZE,
     ) -> TransferArena:
-        checkpoint = cast(dict[str, object], loads((attempt.path / "checkpoint.json").read_text(encoding="utf-8")))
+        attempt_state = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+        assert attempt_state is not None
+        checkpoint = cast(dict[str, object], attempt_state["checkpoint"])
         checkpoint_counts_at_allocation.append(cast(int, checkpoint["record_count"]))
         return original_arena(start_sequence, total_records, max_bytes=max_bytes, record_size=record_size)
 
@@ -1897,7 +1917,7 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
 @_async_test
 async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
@@ -1923,12 +1943,12 @@ async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_curs
 @_async_test
 async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audio(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=4, persisted=0)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     activity: list[ActivityEvent] = []
     operational_events: list[dict[str, object]] = []
-    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
+    journal = _quality_metrics(store.state_db)
 
     def fail_operational(event: Mapping[str, object]) -> None:
         operational_events.append(dict(event))
@@ -1964,7 +1984,7 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     assert encode_read_command(101, 3) in session.writes
     assert ActivityEvent("prefix_retired") in activity
     assert any(event.get("event") == "loss_detected" for event in operational_events)
-    metrics = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
+    metrics = _quality_events(journal, store.state_db)
     loss = next(item for item in metrics if item["event"] == "sequence_loss")
     loss_id = loss["loss_id"]
     assert isinstance(loss_id, str) and len(loss_id) == 64
@@ -2017,7 +2037,7 @@ async def test_quality_metrics_failure_does_not_change_completed_audio_collectio
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), options
     )
 
     assert isinstance(result, CollectionResult)
@@ -2028,15 +2048,16 @@ async def test_quality_metrics_failure_does_not_change_completed_audio_collectio
 async def test_completed_read_emits_one_terminal_transfer_session_with_raw_counters(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    journal = _quality_metrics(store.state_db)
     metric_threads: list[threading.Thread] = []
-    original_append = journal._append
+    original_put = journal._put_quality_event
 
-    def observe_append(value: bytes) -> None:
+    def observe_put(item_id: str, value: dict[str, object]) -> None:
         metric_threads.append(threading.current_thread())
-        original_append(value)
+        original_put(item_id, value)
 
-    monkeypatch.setattr(journal, "_append", observe_append)
+    monkeypatch.setattr(journal, "_put_quality_event", observe_put)
     session = ScriptedRingSession(
         _status(),
         (
@@ -2055,12 +2076,10 @@ async def test_completed_read_emits_one_terminal_transfer_session_with_raw_count
         phy_policy="force_1m",
     )
 
-    result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
-    )
+    result = await run_opportunistic_collector(Provider([session]), store, options)
 
     assert isinstance(result, CollectionResult)
-    [metric] = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
+    [metric] = _quality_events(journal, store.state_db)
     assert metric["event"] == "transfer_session"
     assert metric["completed_at"] == "1970-01-01T00:16:40.000+00:00"
     assert metric["outcome"] == "collected"
@@ -2080,7 +2099,7 @@ async def test_completed_read_emits_one_terminal_transfer_session_with_raw_count
 async def test_real_ring_cursor_ahead_publishes_hash_bound_prefix_and_continues(tmp_path: Path) -> None:
     start, end, prefix_end, cursor, write = 1560520, 1564616, 1561108, 1561130, 1570627
     _seed_streaming_partial(tmp_path, count=end - start, persisted=prefix_end - start, start=start)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     operational_events: list[dict[str, object]] = []
@@ -2100,10 +2119,9 @@ async def test_real_ring_cursor_ahead_publishes_hash_bound_prefix_and_continues(
     prefix_bytes = _records(start, prefix_end - start)
     prefix_hash = sha256(prefix_bytes).hexdigest()
     prefix_bundle = _capture_root(tmp_path) / f"{start}-{prefix_end}-{prefix_hash[:16]}"
-    receipt = cast(dict[str, object], loads(prefix_bundle.joinpath("receipt.json").read_text()))
     assert prefix_bundle.joinpath("records.bin").read_bytes() == prefix_bytes
     assert not prefix_bundle.joinpath("gap.json").exists()
-    assert "gap_sha256" not in receipt
+    assert not prefix_bundle.joinpath("receipt.json").exists()
     loss_events = [event for event in operational_events if event.get("event") == "loss_detected"]
     assert loss_events == [
         {
@@ -2136,7 +2154,7 @@ async def test_durable_prefix_resume_never_replays_old_records(tmp_path: Path) -
 
     result = await run_opportunistic_collector(
         Provider([session]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         replace(_options(), operational=emit_operational),
     )
 
@@ -2168,7 +2186,7 @@ async def test_clean_drain_disconnects_before_exactly_300_second_cooldown(tmp_pa
     with pytest.raises(StopAfterSleepError):
         await run_opportunistic_collector(
             lambda _candidate: Context(),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             OpportunisticOptions(
                 TransferTimeouts(1, 1),
                 RetryPolicy(backoff=(1,), drain_cooldown_seconds=300),
@@ -2210,7 +2228,7 @@ async def test_clean_drain_reports_full_cooldown_after_callback_work(tmp_path: P
     with pytest.raises(StopAfterSleepError):
         await run_opportunistic_collector(
             lambda _candidate: Context(),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             OpportunisticOptions(
                 TransferTimeouts(1, 1),
                 RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
@@ -2282,7 +2300,7 @@ async def test_presence_clean_drain_reports_actual_remaining_cooldown(tmp_path: 
             async with watchdog:
                 await run_opportunistic_collector(
                     lambda _candidate: Context(),
-                    StagingStore(tmp_path, _capture_root(tmp_path)),
+                    _staging_store(tmp_path, _capture_root(tmp_path)),
                     OpportunisticOptions(
                         TransferTimeouts(1, 1),
                         RetryPolicy(backoff=(1,), drain_cooldown_seconds=cooldown_seconds),
@@ -2323,7 +2341,7 @@ async def test_absence_backoff_stops_at_30_and_never_uses_drain_cooldown(tmp_pat
 
     result = await run_opportunistic_collector(
         provider,
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
             TransferTimeouts(1, 1),
             RetryPolicy(backoff=(1, 2, 4, 8, 16, 30), stop_after_drained=True),
@@ -2377,7 +2395,7 @@ async def test_notification_overflow_checkpoints_and_reconnects_with_fresh_info(
             return context()
 
     result = await run_opportunistic_collector(
-        ClosingProvider([first, second]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        ClosingProvider([first, second]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -2430,7 +2448,7 @@ async def test_presence_coordinator_forwards_exact_wake_candidate(tmp_path: Path
         async with asyncio.timeout(5.0) as watchdog:
             result = await run_opportunistic_collector(
                 provider,
-                StagingStore(tmp_path, _capture_root(tmp_path)),
+                _staging_store(tmp_path, _capture_root(tmp_path)),
                 OpportunisticOptions(
                     TransferTimeouts(1, 1),
                     RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
@@ -2490,7 +2508,7 @@ async def test_stale_candidate_restarts_scan_for_next_stable_candidate(tmp_path:
         async with asyncio.timeout(5.0) as watchdog:
             result = await run_opportunistic_collector(
                 provider,
-                StagingStore(tmp_path, _capture_root(tmp_path)),
+                _staging_store(tmp_path, _capture_root(tmp_path)),
                 OpportunisticOptions(
                     TransferTimeouts(1, 1),
                     RetryPolicy(backoff=(1,), drain_cooldown_seconds=1, stop_after_drained=True),
@@ -2567,7 +2585,7 @@ async def _run_teardown_failure_case(tmp_path: Path, *, with_batch: bool) -> Non
         async with asyncio.timeout(5.0) as watchdog:
             result = await run_opportunistic_collector(
                 provider,
-                StagingStore(tmp_path, _capture_root(tmp_path)),
+                _staging_store(tmp_path, _capture_root(tmp_path)),
                 OpportunisticOptions(
                     timeouts,
                     RetryPolicy(
@@ -2622,7 +2640,7 @@ async def test_three_batches_share_one_presence_no_double_info_and_defer_tail(tm
     )
 
     provider = Provider([session])
-    result = await run_opportunistic_collector(provider, StagingStore(tmp_path, _capture_root(tmp_path)), _options())
+    result = await run_opportunistic_collector(provider, _staging_store(tmp_path, _capture_root(tmp_path)), _options())
 
     assert isinstance(result, CollectionResult)
     assert result.next_sequence == 16
@@ -2682,14 +2700,14 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
     durable_after_visit: list[int] = []
     published_after_visit: list[int] = []
 
+    store = _staging_store(tmp_path, capture_root)
+
     def observe(event: ActivityEvent) -> None:
         if event.state != "away":
             return
-        checkpoints = tuple(tmp_path.rglob("checkpoint.json"))
-        assert len(checkpoints) == 1
-        checkpoint_value = cast(object, loads(checkpoints[0].read_text(encoding="utf-8")))
-        assert isinstance(checkpoint_value, dict)
-        checkpoint = cast(dict[str, object], checkpoint_value)
+        attempts = store.state_db.list(StateKind.ATTEMPT)
+        assert len(attempts) == 1
+        checkpoint = cast(dict[str, object], attempts[0][1]["checkpoint"])
         durable_after_visit.append(cast(int, checkpoint["record_count"]))
         device_root = capture_root
         published_after_visit.append(
@@ -2699,7 +2717,7 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
     provider = Provider([first, second, third])
     result = await run_opportunistic_collector(
         provider,
-        StagingStore(tmp_path, capture_root),
+        store,
         replace(_options(batch_records=6), activity=observe),
     )
 
@@ -2736,7 +2754,7 @@ async def test_default_preflight_skips_cached_status_without_telemetry(tmp_path:
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), options
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), options
     )
 
     assert isinstance(result, CollectionResult)
@@ -2813,12 +2831,12 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(
     result = await asyncio.wait_for(
         run_opportunistic_collector(
             Provider([session]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             OpportunisticOptions(
                 TransferTimeouts(info=30.0, transfer=600.0),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
                 operational=emit,
-                host_clock_synchronized=lambda: False,
+                host_clock_synchronized=lambda _timeout: False,
                 config=config,
             ),
         ),
@@ -2860,16 +2878,18 @@ async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path)
         ),
     )
 
-    def blocking_trust_probe() -> bool:
+    def blocking_trust_probe(timeout: float) -> bool:
         started.set()
-        release.wait()
+        if not release.wait(timeout):
+            finished.set()
+            raise TimeoutError
         finished.set()
         return False
 
     collection = asyncio.create_task(
         run_opportunistic_collector(
             Provider([session]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             OpportunisticOptions(
                 TransferTimeouts(info=30.0, transfer=600.0),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
@@ -2881,11 +2901,11 @@ async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path)
     )
     try:
         assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=5.0)
-        # Collection must finish after the configured preflight bound expires,
-        # even though this trust probe remains blocked until the test releases it.
+        # The callback honors its own supplied timeout and the joined worker
+        # finishes before collection proceeds.
         result = await asyncio.wait_for(collection, timeout=5.0)
         assert not release.is_set()
-        assert not finished.is_set()
+        assert finished.is_set()
     finally:
         release.set()
         assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=5.0)
@@ -2928,10 +2948,12 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
     config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02), retry=RetryConfig(rapid_backoff=(0.001,)))
+    initial_store = _staging_store(tmp_path / "spool", _capture_root(tmp_path))
     store = StagingStore.from_paths(
-        StagingStore(tmp_path / "spool", _capture_root(tmp_path)).paths,
+        initial_store.paths,
+        state_db=initial_store.state_db,
         publication_root=ready,
-        config=config,
+        io=StagingIO(config=config),
     )
     events: list[str] = []
     original_publish = store._recover_and_publish_unlocked
@@ -2959,9 +2981,7 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
 
     async def close_visit(reconciler: BatchReconciler, reason: str, drain_cursor: int | None = None) -> None:
         await original_closure(reconciler, reason, drain_cursor)
-        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-            {"next_sequence": 11, "reason": "drained"}
-        ]
+        assert _ready_closure_rows(store) == [{"next_sequence": 11, "reason": "drained"}]
         events.append("closure")
 
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
@@ -2970,7 +2990,6 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
 
     session = _PublicationClockSession(
         (
-            WriteStep(b"\x10", (_info(10, 11),)),
             WriteStep(b"\x10", (_info(10, 11),)),
             WriteStep(
                 encode_read_command(10, 1),
@@ -2994,7 +3013,7 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
             _options(batch_records=1),
             operational=lambda _event: None,
             host_time=lambda: 10_000.0,
-            host_clock_synchronized=lambda: True,
+            host_clock_synchronized=lambda _timeout: True,
             activity=activity,
             config=config,
         ),
@@ -3002,10 +3021,10 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
 
     assert isinstance(result, CollectionResult)
     assert session.clock_read
-    assert any(
-        item.device_epoch == 10_000
-        for item in ClockCorrectionStore(store.device_state_path).observation_store.records()
-    )
+    clock_state = ClockStateStore(store.state_db).state()
+    assert clock_state.intent is None
+    assert clock_state.anchor is not None
+    assert clock_state.anchor.sequence_frontier == 11
     assert events == ["read", "closure", "publication_transient", "retry"]
     assert len(tuple(ready.iterdir())) == 1
 
@@ -3047,7 +3066,7 @@ async def test_disconnect_next_day_replays_overlap_and_progress_counts_unique_by
 
     result = await run_opportunistic_collector(
         AwayProvider([first, *unavailable, complete]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
             _options().timeouts,
             RetryPolicy(backoff=(1, 2, 4, 8, 16, 30), batch_records=2, stop_after_drained=True),
@@ -3097,11 +3116,12 @@ async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -
             self.value += 1
             return current
 
-    journal = JsonlQualityMetrics(tmp_path, release_version="test-version", source_revision="a" * 40)
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    journal = _quality_metrics(store.state_db)
     clock = ReadClock()
     result = await run_opportunistic_collector(
         Provider([first, complete]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        store,
         OpportunisticOptions(
             _options().timeouts,
             RetryPolicy(backoff=(0.001,), batch_records=2, stop_after_drained=True),
@@ -3111,9 +3131,10 @@ async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -
             quality_metrics=journal,
         ),
     )
-    assert journal.close()
-
-    metrics = [cast(dict[str, object], loads(line)) for line in journal.path.read_text(encoding="utf-8").splitlines()]
+    metrics = sorted(
+        _quality_events(journal, store.state_db),
+        key=lambda metric: metric["outcome"] != "connected_interrupted",
+    )
     assert isinstance(result, CollectionResult)
     assert result.packet_count == 2
     assert [metric["requested_record_count"] for metric in metrics] == [2, 1]
@@ -3163,7 +3184,7 @@ async def test_same_process_recovery_disconnect_rebinds_original_read_begin_for_
         ),
     )
 
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     result = await run_opportunistic_collector(
@@ -3208,7 +3229,7 @@ async def test_storage_not_ready_info_after_disconnect_retries_on_same_session(t
 
     result = await run_opportunistic_collector(
         Provider([first, recovered]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         _options(clock=clock, activity=activity),
     )
 
@@ -3241,7 +3262,7 @@ async def test_storage_not_ready_read_ack_reconnects_and_continues_collection(tm
     )
 
     result = await run_opportunistic_collector(
-        Provider([first, recovered]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([first, recovered]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
     )
 
     assert isinstance(result, CollectionResult)
@@ -3319,12 +3340,12 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
         ]
     second = ScriptedRingSession(_status(), tuple(steps))
 
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     result = await run_opportunistic_collector(Provider([first, second]), store, _options(batch_records=3))
     assert isinstance(result, (CollectionResult, NoDataResult))
-    assert not StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts()
+    assert not _staging_store(tmp_path, _capture_root(tmp_path)).pending_attempts()
     assert second.writes[0] == b"\x10"
     quarantine = tmp_path / "quarantine"
     if case == "gap":
@@ -3336,11 +3357,10 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
         assert len(destinations) == 1
         destination = destinations[0]
         assert destination.is_dir()
-        assert {path.name for path in destination.iterdir()} == {
-            "attempt.json",
-            "records.bin",
-            "checkpoint.json",
-        }
+        assert {path.name for path in destination.iterdir()} == {"records.bin"}
+        quarantine_rows = store.state_db.list(StateKind.QUARANTINE)
+        assert len(quarantine_rows) == 1
+        assert quarantine_rows[0][1]["move_committed"] is True
         assert ordering.index("close") < ordering.index("quarantine")
 
 
@@ -3368,18 +3388,18 @@ async def test_startup_discontinuity_defers_quarantine_salvage_until_next_mainte
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
+        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
     )
 
     assert isinstance(result, CollectionResult)
     quarantine = tmp_path / "quarantine"
     destinations = tuple(quarantine.iterdir())
     assert len(destinations) == 1
-    assert {path.name for path in destinations[0].iterdir()} == {
-        "attempt.json",
-        "records.bin",
-        "checkpoint.json",
-    }
+    assert {path.name for path in destinations[0].iterdir()} == {"records.bin"}
+    state_db = _staging_store(tmp_path, _capture_root(tmp_path)).state_db
+    quarantine_rows = state_db.list(StateKind.QUARANTINE)
+    assert len(quarantine_rows) == 1
+    assert quarantine_rows[0][1]["move_committed"] is True
 
 
 @_async_test
@@ -3401,10 +3421,10 @@ async def test_admission_prefix_mismatch_closes_writer_and_releases_lease(
 
     with pytest.raises(CursorConsistencyError, match="prepared durable prefix"):
         await run_opportunistic_collector(
-            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options()
+            Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
         )
 
-    assert StagingStore(tmp_path, _capture_root(tmp_path)).pending_attempts()
+    assert _staging_store(tmp_path, _capture_root(tmp_path)).pending_attempts()
     assert not ({thread for thread in threading.enumerate() if thread.name == "omi-attempt-writer"} - original_threads)
 
 
@@ -3421,14 +3441,14 @@ async def test_cursor_regression_after_advance_ack_rejects_drain_and_keeps_bundl
         ),
     )
 
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     with pytest.raises(CursorConsistencyError, match=r"INFO after ADVANCE acknowledgment classified.*expired"):
         await run_opportunistic_collector(Provider([session]), store, _options(batch_records=3))
 
     assert session.writes.count(encode_advance_command(102)) == 1
     assert tuple(store.capture_root.glob("100-102-*"))
     assert not store.pending_attempts()
-    assert not store.ready_closures_path.exists()
+    assert _ready_closure_rows(store) == []
 
 
 @_async_test
@@ -3448,7 +3468,7 @@ async def test_seal_failure_never_advances(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr("omi_collector.capture.adapters.attempts.StagedAttempt.seal", fail_seal)
     with pytest.raises(OSError, match="disk fault"):
         await run_opportunistic_collector(
-            Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
+            Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     assert encode_advance_command(11) not in session.writes
 
@@ -3472,7 +3492,7 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
         return None
 
     reconciler = BatchReconciler(
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         _options(),
         _runtime(),
         quarantine,
@@ -3495,7 +3515,7 @@ def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) 
         return None
 
     reconciler = BatchReconciler(
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         _options(),
         _runtime(),
         quarantine,
@@ -3507,7 +3527,7 @@ def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) 
     assert reconciler.durable_progress() == 101
 
     empty_reconciler = BatchReconciler(
-        StagingStore(tmp_path / "empty", _capture_root(tmp_path / "empty")),
+        _staging_store(tmp_path / "empty", _capture_root(tmp_path / "empty")),
         _options(),
         _runtime(),
         quarantine,
@@ -3527,10 +3547,10 @@ def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) 
 
 @_async_test
 async def test_close_visit_absence_publishes_partial_prefix_before_terminal_closure(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(RECORD_SIZE)
-        attempt_path = store.attempts_root / writer.attempt_id
+        attempt_id = writer.attempt_id
         batch = batch_reconciliation._Batch(
             RingInfo(100, 102, 10000, 0, RECORD_SIZE),
             100,
@@ -3549,16 +3569,16 @@ async def test_close_visit_absence_publishes_partial_prefix_before_terminal_clos
         assert reconciler._state.batch is None
         assert reconciler.durable_progress() == 0
         assert not writer.thread.is_alive()
-        assert (attempt_path / "prefix-publication.json").is_file()
-        assert (attempt_path / "terminal-retired.json").is_file()
-        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-            {"next_sequence": 101, "reason": "absence"}
-        ]
+        attempt_state = store.state_db.get(StateKind.ATTEMPT, attempt_id)
+        assert attempt_state is not None
+        assert attempt_state["prefix_publication"] == {"version": 1, "state": "published"}
+        assert cast(dict[str, object], attempt_state["terminal_retirement"])["state"] == "terminal-retired"
+        assert _ready_closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
 
 
 @_async_test
 async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_close(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(RECORD_SIZE * 2)
         seal = await writer.seal(DoneNotification(0, 102))
@@ -3581,14 +3601,12 @@ async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_cl
 
         assert not writer.thread.is_alive()
         assert seal.bundle_path.is_dir()
-        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-            {"next_sequence": 102, "reason": "absence"}
-        ]
+        assert _ready_closure_rows(store) == [{"next_sequence": 102, "reason": "absence"}]
 
 
 @_async_test
 async def test_close_visit_empty_batch_closes_writer_without_creating_visit_closure(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 1) as writer:
         batch = batch_reconciliation._Batch(
             RingInfo(100, 100, 10000, 0, RECORD_SIZE),
@@ -3607,12 +3625,12 @@ async def test_close_visit_empty_batch_closes_writer_without_creating_visit_clos
 
         assert reconciler._state.batch is None
         assert not writer.thread.is_alive()
-        assert not store.ready_closures_path.exists()
+        assert _ready_closure_rows(store) == []
 
 
 @_async_test
 async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 1) as writer:
         assert writer.publish(RECORD_SIZE)
         seal = await writer.seal(DoneNotification(0, 101))
@@ -3675,7 +3693,7 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
             return None
 
         reconciler = BatchReconciler(
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             _options(),
             _runtime(),
             quarantine,
@@ -3751,7 +3769,7 @@ async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tm
             return None
 
         reconciler = BatchReconciler(
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             replace(_options(), timeouts=TransferTimeouts(1, 0.01)),
             _runtime(),
             quarantine,
@@ -3805,13 +3823,13 @@ async def test_uncertain_advance_reconciles_cursor_safely(
         with pytest.raises(error):
             await run_opportunistic_collector(
                 Provider([first, second]),
-                StagingStore(tmp_path, _capture_root(tmp_path)),
+                _staging_store(tmp_path, _capture_root(tmp_path)),
                 _options(activity=activity),
             )
     else:
         result = await run_opportunistic_collector(
             Provider([first, second]),
-            StagingStore(tmp_path, _capture_root(tmp_path)),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
             _options(activity=activity),
         )
         assert isinstance(result, CollectionResult)
@@ -3866,28 +3884,21 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
             WriteStep(b"\x10", (_info(11, 11),)),
         ),
     )
-    task = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([first]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
-        )
-    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    task = asyncio.create_task(run_opportunistic_collector(Provider([first]), store, _options(batch_records=1)))
     await entered.wait()
     contender = Provider([second])
     with pytest.raises(DeviceAlreadyRunningError) as raised:
-        await run_opportunistic_collector(
-            contender, StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
-        )
+        await run_opportunistic_collector(contender, store, _options(batch_records=1))
     assert contender.opened == 0
     assert second.writes == []
-    context = raised.value.lock_context
-    assert context is not None
-    assert context.requested_operation == "inspect_recovery"
-    assert context.holder_operation == "capture_batch"
+    # In-process lease contention has no cross-process holder attribution.
+    assert raised.value.lock_context is None
     task.cancel()
     with pytest.raises(CollectionPreservedCancelledError):
         await task
     result = await run_opportunistic_collector(
-        Provider([recovered]), StagingStore(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
+        Provider([recovered]), _staging_store(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
     )
     assert isinstance(result, CollectionResult)
     assert recovered.writes == [
@@ -3902,7 +3913,7 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
 @_async_test
 async def test_machine_closes_published_restart_prefix_before_waiting_without_device(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     attempt = store.open_attempt(next((tmp_path / "attempts").iterdir()).name)
     with store.device_lock() as lease:
         attempt.activate_for_resume(lease)
@@ -3931,7 +3942,9 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
         scan_ready.result()
         assert not task.done()
         assert provider.opened == 0
-        assert (attempt.path / "terminal-retired.json").is_file()
+        attempt_state = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+        assert attempt_state is not None
+        assert cast(dict[str, object], attempt_state["terminal_retirement"])["state"] == "terminal-retired"
         assert store.pending_attempts() == ()
         assert (attempt.path / "records.bin").read_bytes() == records
         assert not store.inspect_recovery()[1], "durable closure must cover retained drafts"
@@ -3992,7 +4005,7 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
         ),
     )
     task = asyncio.create_task(
-        run_opportunistic_collector(Provider([session]), StagingStore(tmp_path, _capture_root(tmp_path)), _options())
+        run_opportunistic_collector(Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options())
     )
     try:
         await asyncio.wait_for(entered.wait(), 5)
@@ -4085,7 +4098,7 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
         task = tasks.create_task(
             run_opportunistic_collector(
                 Provider([session]),
-                StagingStore(tmp_path, _capture_root(tmp_path)),
+                _staging_store(tmp_path, _capture_root(tmp_path)),
                 _options(batch_records=1, activity=activity),
             )
         )
@@ -4115,7 +4128,7 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
     assert len(closed_writers) == 1
     assert await asyncio.to_thread(closed_writers[0].thread.join, 1) is None
     assert not closed_writers[0].thread.is_alive()
-    with StagingStore(tmp_path, _capture_root(tmp_path)).device_lock():
+    with _staging_store(tmp_path, _capture_root(tmp_path)).device_lock():
         pass
 
 
@@ -4130,7 +4143,7 @@ async def test_no_data_async_activity_timeout_retry_and_policy_validation(tmp_pa
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
     result = await run_opportunistic_collector(
         Provider([session]),
-        StagingStore(tmp_path, _capture_root(tmp_path)),
+        _staging_store(tmp_path, _capture_root(tmp_path)),
         OpportunisticOptions(
             TransferTimeouts(1, 1), RetryPolicy(backoff=(0.001,), stop_after_drained=True), activity=activity
         ),
@@ -4142,7 +4155,7 @@ async def test_no_data_async_activity_timeout_retry_and_policy_validation(tmp_pa
         with pytest.raises(ValueError, match="policy"):
             await run_opportunistic_collector(
                 Provider([]),
-                StagingStore(tmp_path / str(policy), tmp_path / f"{policy}-captures"),
+                _staging_store(tmp_path / str(policy), tmp_path / f"{policy}-captures"),
                 OpportunisticOptions(TransferTimeouts(1, 1), policy),
             )
 
@@ -4150,7 +4163,7 @@ async def test_no_data_async_activity_timeout_retry_and_policy_validation(tmp_pa
     drained = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
     result = await run_opportunistic_collector(
         Provider([timed_out, drained]),
-        StagingStore(tmp_path / "timeout", tmp_path / "timeout-captures"),
+        _staging_store(tmp_path / "timeout", tmp_path / "timeout-captures"),
         OpportunisticOptions(
             TransferTimeouts(0.01, 1), RetryPolicy(backoff=(0.001,), stop_after_drained=True), sleep=asyncio.sleep
         ),

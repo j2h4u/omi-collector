@@ -1,4 +1,4 @@
-"""Capture publication identity, receipts, atomic temporary recovery, and deduplication."""
+"""Capture publication identity, atomic temporary recovery, and deduplication."""
 
 from __future__ import annotations
 
@@ -12,12 +12,11 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG
 from ..domain.ring_protocol import RECORD_SIZE
-from .bundle_contract import BundleManifest, SealedReceipt
+from .bundle_contract import BundleManifest
 from .recovery import _published_prefix
 from .staging_contract import (
     _MANIFEST_NAME,
     _RAW_NAME,
-    _RECEIPT_NAME,
     _TERMINAL_RETIRED_STATE,
     _TERMINAL_RETIREMENT_VERSION,
     _UUID_HEX_LENGTH,
@@ -111,20 +110,18 @@ class TerminalRetirementEvidence:
         }
 
 
-def publish_prefix_directory(  # noqa: PLR0913
+def publish_prefix_directory(
     filesystem: StagingFilesystem,
     *,
     destination: Path,
     raw_source: Path,
     prefix_size: int,
     manifest: dict[str, object],
-    receipt: dict[str, object],
 ) -> None:
-    """Write and atomically publish a checkpoint-authenticated prefix bundle."""
+    """Write and atomically publish a manifest-authenticated prefix bundle."""
     capture_fd, temporary_name, temporary = _prepare_capture_temporary(filesystem, destination)
     try:
         _write_synced(temporary / _MANIFEST_NAME, _json_bytes(manifest), filesystem._fsync)
-        _write_synced(temporary / _RECEIPT_NAME, _json_bytes(receipt), filesystem._fsync)
         _copy_prefix_synced(
             raw_source,
             temporary / _RAW_NAME,
@@ -146,7 +143,7 @@ def publish_full_directory(filesystem: StagingFilesystem, source: Path, destinat
     """Publish only the completed bundle contract, never attempt-local state."""
     capture_fd, temporary_name, temporary = _prepare_capture_temporary(filesystem, destination)
     try:
-        for name in (_MANIFEST_NAME, _RECEIPT_NAME, _RAW_NAME):
+        for name in (_MANIFEST_NAME, _RAW_NAME):
             entry = source / name
             if entry.is_symlink() or not entry.is_file():
                 raise StagingError(f"full publication source entry is not a regular file: {entry.name}")
@@ -189,7 +186,7 @@ def recover_capture_temporaries(filesystem: StagingFilesystem) -> tuple[tuple[Pa
             unsafe.append((temporary, capture_root, "capture temporary is unsafe"))
             continue
         try:
-            destination, manifest, receipt = _authenticated_capture_temporary(filesystem, temporary)
+            destination, manifest = _authenticated_capture_temporary(filesystem, temporary)
         except (OSError, AttemptStateError) as error:
             unsafe.append((temporary, capture_root, str(error)))
             continue
@@ -199,7 +196,6 @@ def recover_capture_temporaries(filesystem: StagingFilesystem) -> tuple[tuple[Pa
                 temporary=temporary,
                 destination=destination,
                 manifest=manifest,
-                receipt=receipt,
             )
         except OSError, StagingError:
             continue
@@ -234,21 +230,18 @@ def _discard_capture_temporary(filesystem: StagingFilesystem, device_fd: int, te
         filesystem._fsync(device_fd)
 
 
-def _authenticated_capture_temporary(
-    filesystem: StagingFilesystem, temporary: Path
-) -> tuple[Path, dict[str, object], dict[str, object]]:
+def _authenticated_capture_temporary(filesystem: StagingFilesystem, temporary: Path) -> tuple[Path, dict[str, object]]:
     _require_regular_directory(temporary)
-    for entry in temporary.iterdir():
+    entries = tuple(temporary.iterdir())
+    if {entry.name for entry in entries} != {_RAW_NAME, _MANIFEST_NAME}:
+        raise AttemptStateError("capture temporary inventory is not canonical")
+    for entry in entries:
         _require_regular_file(entry, "capture temporary entry")
     raw_path = temporary / _RAW_NAME
     _require_regular_file(raw_path, _RAW_NAME)
     _require_regular_file(temporary / _MANIFEST_NAME, _MANIFEST_NAME)
-    _require_regular_file(temporary / _RECEIPT_NAME, _RECEIPT_NAME)
     manifest = _read_json(temporary / _MANIFEST_NAME)
     start, next_sequence, raw_hash = _validate_capture_temporary_manifest(filesystem, manifest, raw_path)
-    receipt = _read_json(temporary / _RECEIPT_NAME)
-    if not _receipt_matches(receipt, manifest):
-        raise AttemptStateError("capture temporary receipt is not canonical")
     destination = filesystem.capture_root / f"{start}-{next_sequence}-{raw_hash[:16]}"
     nonce = temporary.name.removeprefix(f".{destination.name}.").removesuffix(".tmp")
     if (
@@ -257,7 +250,7 @@ def _authenticated_capture_temporary(
         or not all(character in "0123456789abcdef" for character in nonce)
     ):
         raise AttemptStateError("capture temporary name does not bind its canonical destination")
-    return destination, manifest, receipt
+    return destination, manifest
 
 
 def _validate_capture_temporary_manifest(
@@ -281,19 +274,18 @@ def _finalize_capture_temporary(
     temporary: Path,
     destination: Path,
     manifest: dict[str, object],
-    receipt: dict[str, object],
 ) -> bool:
     capture_fd = filesystem.validate_capture_destination(destination)
     try:
         if os.path.lexists(destination):
-            if _capture_temporary_matches(filesystem, destination, temporary, manifest, receipt):
+            if _capture_temporary_matches(filesystem, destination, temporary, manifest):
                 _discard_capture_temporary(filesystem, capture_fd, temporary)
                 return True
             return False
         try:
             os.rename(temporary.name, destination.name, src_dir_fd=capture_fd, dst_dir_fd=capture_fd)
         except FileExistsError:
-            if _capture_temporary_matches(filesystem, destination, temporary, manifest, receipt):
+            if _capture_temporary_matches(filesystem, destination, temporary, manifest):
                 _discard_capture_temporary(filesystem, capture_fd, temporary)
                 return True
             return False
@@ -308,14 +300,13 @@ def _capture_temporary_matches(
     destination: Path,
     temporary: Path,
     manifest: dict[str, object],
-    receipt: dict[str, object],
 ) -> bool:
     try:
         _require_regular_directory(destination)
-        for name in (_RAW_NAME, _MANIFEST_NAME, _RECEIPT_NAME):
+        for name in (_RAW_NAME, _MANIFEST_NAME):
             _require_regular_file(destination / name, f"published {name}")
         existing_manifest = BundleManifest.from_json(_read_json(destination / _MANIFEST_NAME)).as_dict()
-        if existing_manifest != manifest or _read_json(destination / _RECEIPT_NAME) != receipt:
+        if existing_manifest != manifest:
             return False
         return _files_equal(
             destination / _RAW_NAME, temporary / _RAW_NAME, chunk_size=filesystem._durability.io_chunk_bytes
@@ -332,23 +323,19 @@ def _bundle_matches(
     io_chunk_bytes: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
 ) -> bool:
     try:
+        if {entry.name for entry in bundle_path.iterdir()} != {_RAW_NAME, _MANIFEST_NAME}:
+            return False
         existing = BundleManifest.from_json(_read_json(bundle_path / _MANIFEST_NAME)).as_dict()
-        receipt = _read_json(bundle_path / _RECEIPT_NAME)
     except AttemptStateError, ValueError:
         return False
-    return (
-        existing == manifest
-        and _receipt_matches(receipt, manifest)
-        and _files_equal(bundle_path / _RAW_NAME, raw_path, chunk_size=io_chunk_bytes)
-    )
+    return existing == manifest and _files_equal(bundle_path / _RAW_NAME, raw_path, chunk_size=io_chunk_bytes)
 
 
 def is_published_attempt(source: Path, descriptor: AttemptDescriptor, filesystem: StagingFilesystem) -> bool:
     """Authenticate a complete source against its canonical capture bundle."""
     manifest_path = source / _MANIFEST_NAME
-    receipt_path = source / _RECEIPT_NAME
     raw_path = source / _RAW_NAME
-    if not manifest_path.exists() or not receipt_path.exists() or not raw_path.exists():
+    if not manifest_path.exists() or not raw_path.exists():
         return False
     start = descriptor.read_begin_start
     count = descriptor.read_begin_count
@@ -415,15 +402,14 @@ def _prefix_destination_matches(
     if destination.is_symlink():
         return False
     try:
+        if {entry.name for entry in destination.iterdir()} != {_RAW_NAME, _MANIFEST_NAME}:
+            return False
         existing_manifest = BundleManifest.from_json(_read_json(destination / _MANIFEST_NAME)).as_dict()
-        receipt = _read_json(destination / _RECEIPT_NAME)
         _require_regular_file(destination / _RAW_NAME, "published raw")
     except AttemptStateError, OSError, ValueError:
         return False
-    return (
-        existing_manifest == manifest
-        and _receipt_matches(receipt, manifest)
-        and _files_equal_prefix(destination / _RAW_NAME, raw_source, prefix_size, chunk_size=io_chunk_bytes)
+    return existing_manifest == manifest and _files_equal_prefix(
+        destination / _RAW_NAME, raw_source, prefix_size, chunk_size=io_chunk_bytes
     )
 
 
@@ -440,12 +426,3 @@ def _manifest_for_prefix(prefix: DurablePrefix) -> dict[str, object]:
         RECORD_SIZE,
         prefix.raw_sha256,
     ).as_dict()
-
-
-def _receipt_matches(receipt: dict[str, object], manifest: dict[str, object]) -> bool:
-    """Check a sealed receipt without tying an exact duplicate to this attempt ID."""
-    try:
-        parsed = SealedReceipt.from_json(receipt)
-    except ValueError:
-        return False
-    return parsed.raw_sha256 == manifest.get("raw_sha256")

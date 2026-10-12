@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import errno
-import fcntl
 import json
 import os
 import re
 import stat
-import tempfile
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -23,6 +19,7 @@ from ..domain.operational_status_machine import (
     PublicationOutcome,
     transition,
 )
+from .collector_state_db import StateDB, StateDBError, StateKind
 
 _MAX_SNAPSHOT_BYTES = 8_192
 _BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
@@ -55,11 +52,10 @@ class OperationalIdentity:
 class OperationalStatusStore:
     """Thread-safe service writer for one bounded, atomic status snapshot."""
 
-    def __init__(self, path: Path, identity: OperationalIdentity) -> None:
-        self.path = Path(path)
+    def __init__(self, db: StateDB, identity: OperationalIdentity) -> None:
+        self.db = db
         self.identity = identity
         self._lock = Lock()
-        self._lease_fd = _acquire_writer_lease(self.path.with_name(f"{self.path.name}.lock"))
         self._closed = False
         self._states: dict[OperationalDimension, OperationalState] = dict.fromkeys(
             _DIMENSIONS, OperationalState.UNKNOWN
@@ -71,8 +67,11 @@ class OperationalStatusStore:
         """Load only a safe prior snapshot, then publish this invocation's state."""
         with self._lock:
             if self._closed:
-                raise OperationalStatusError("operational status writer lease is closed")
-            previous = _read_snapshot(self.path)
+                raise OperationalStatusError("operational status writer is closed")
+            try:
+                previous = _read_snapshot(self.db)
+            except StateDBError as error:
+                raise OperationalStatusError("operational status database read failed") from error
             if previous is not None:
                 prior_identity, prior_states = previous
                 if prior_identity == self.identity:
@@ -116,11 +115,7 @@ class OperationalStatusStore:
 
     def close(self) -> None:
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
-            fcntl.flock(self._lease_fd, fcntl.LOCK_UN)
-            os.close(self._lease_fd)
 
     def __enter__(self) -> OperationalStatusStore:
         return self
@@ -166,12 +161,20 @@ class OperationalStatusStore:
             "schema_version": 1,
             "states": {name.value: state.value for name, state in self._states.items()},
         }
-        _write_snapshot(self.path, json.dumps(document, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+        if len(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()) > _MAX_SNAPSHOT_BYTES:
+            raise OperationalStatusError("operational status snapshot is oversized")
+        try:
+            self.db.put(StateKind.OPERATIONAL_STATUS, "current", document)
+        except StateDBError as error:
+            raise OperationalStatusError("operational status database write failed") from error
 
 
-def read_operational_status(path: Path, identity: OperationalIdentity) -> dict[str, str]:
+def read_operational_status(db: StateDB, identity: OperationalIdentity) -> dict[str, str]:
     """Read a bounded snapshot, degrading stale clear evidence to unknown."""
-    previous = _read_snapshot(path)
+    try:
+        previous = _read_snapshot(db)
+    except StateDBError as error:
+        raise OperationalStatusError("operational status database read failed") from error
     if previous is None:
         return {name.value: OperationalState.UNKNOWN.value for name in _DIMENSIONS}
     prior_identity, states = previous
@@ -184,45 +187,55 @@ def read_operational_status(path: Path, identity: OperationalIdentity) -> dict[s
 
 
 def _read_snapshot(
-    path: Path,
+    db: StateDB,
 ) -> tuple[OperationalIdentity, dict[OperationalDimension, OperationalState]] | None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
+    document = db.get(StateKind.OPERATIONAL_STATUS, "current")
+    if document is None:
         return None
-    except OSError as error:
-        raise OperationalStatusError("operational status snapshot is unsafe or unreadable") from error
     try:
-        try:
-            info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_SNAPSHOT_BYTES:
-                raise OperationalStatusError("operational status snapshot is unsafe or oversized")
-            with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                payload = stream.read(_MAX_SNAPSHOT_BYTES + 1)
-        except OSError as error:
-            raise OperationalStatusError("operational status snapshot is unsafe or unreadable") from error
-    finally:
-        os.close(descriptor)
-    if len(payload) > _MAX_SNAPSHOT_BYTES:
-        raise OperationalStatusError("operational status snapshot is oversized")
-    try:
-        document = _decode_snapshot_document(payload)
+        if len(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()) > _MAX_SNAPSHOT_BYTES:
+            raise ValueError("snapshot is oversized")
+        _validate_snapshot_document(document)
         identity = _decode_snapshot_identity(document)
         states = _decode_snapshot_states(document["states"])
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise OperationalStatusError("operational status snapshot is malformed") from error
     return identity, states
 
 
-def _decode_snapshot_document(payload: bytes) -> dict[str, object]:
-    decoded = cast(object, json.loads(payload))
+def _validate_snapshot_document(decoded: object) -> None:
     if not isinstance(decoded, dict):
         raise ValueError("snapshot must be an object")
     document = cast(dict[str, object], decoded)
     _validate_snapshot_shape(document)
     _validate_snapshot_identity(document)
     _validate_snapshot_state_keys(document)
-    return document
+
+
+def parse_legacy_operational_status(
+    path: Path,
+) -> tuple[OperationalIdentity, dict[OperationalDimension, OperationalState]] | None:
+    """Strictly decode the old status snapshot for the offline state importer."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_SNAPSHOT_BYTES:
+                raise ValueError("legacy status snapshot is unsafe or oversized")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                payload = stream.read(_MAX_SNAPSHOT_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(payload) > _MAX_SNAPSHOT_BYTES:
+            raise ValueError("legacy status snapshot is oversized")
+        document = cast(object, json.loads(payload))
+        _validate_snapshot_document(document)
+        typed_document = cast(dict[str, object], document)
+        identity = _decode_snapshot_identity(typed_document)
+        states = _decode_snapshot_states(typed_document["states"])
+        return identity, states
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise OperationalStatusError("legacy operational status is malformed or unsafe") from error
 
 
 def _validate_snapshot_shape(document: dict[str, object]) -> None:
@@ -272,56 +285,6 @@ def _decode_snapshot_identity(document: dict[str, object]) -> OperationalIdentit
     assert isinstance(boot_id, str)
     assert invocation_id is None or isinstance(invocation_id, str)
     return OperationalIdentity(boot_id, invocation_id)
-
-
-def _write_snapshot(path: Path, payload: bytes) -> None:
-    temporary: str | None = None
-    try:
-        path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        with os.fdopen(descriptor, "wb") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        Path(temporary).replace(path)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError as error:
-        if temporary is not None:
-            with suppress(OSError):
-                Path(temporary).unlink()
-        raise OperationalStatusError("operational status snapshot write failed") from error
-
-
-def _acquire_writer_lease(path: Path) -> int:
-    try:
-        path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-        descriptor = os.open(
-            path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-    except OSError as error:
-        raise OperationalStatusError("operational status writer lease is unsafe or unavailable") from error
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-            raise OperationalStatusError("operational status writer lease is unsafe")
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.fchmod(descriptor, 0o600)
-    except OSError as error:
-        os.close(descriptor)
-        if error.errno in {errno.EACCES, errno.EAGAIN}:
-            raise OperationalStatusError("operational status writer is already active") from error
-        raise OperationalStatusError("operational status writer lease is unsafe or unavailable") from error
-    except OperationalStatusError:
-        os.close(descriptor)
-        raise
-    return descriptor
 
 
 def _set_failure(future: asyncio.Future[OperationalStatusError], error: OperationalStatusError) -> None:

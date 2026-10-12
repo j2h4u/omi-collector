@@ -22,8 +22,9 @@ from ...config import ReadyConfig
 from ..domain.opus_duration import inspect_20ms_record
 from ..domain.ready_machine import ReadyCommand, decide_ready
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
-from .bundle_contract import BundleManifest, SealedReceipt
+from .bundle_contract import BundleManifest
 from .clock_segments import ClockSegmentMap
+from .collector_state_db import StateDB, StateDBError, StateKind
 
 
 class ReadyBundleError(RuntimeError):
@@ -148,14 +149,13 @@ class ReadyInventory:
 @dataclass(frozen=True, slots=True)
 class _Finalization:
     ready_root: Path
-    ledger_path: Path
+    state_db: StateDB
     ledger: dict[str, object]
     clock_segments: ClockSegmentMap
 
 
 _MANIFEST_NAME = "manifest.json"
 _RAW_NAME = "records.bin"
-_RECEIPT_NAME = "receipt.json"
 _READY_DIRECTORY_MODE = 0o750
 _READY_FILE_MODE = 0o640
 _UINT32_MAX = (1 << 32) - 1
@@ -170,7 +170,7 @@ _WINDMILL_TAIL_FIELDS = frozenset({"entries", "opened_at", "outputs"})
 def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publication boundary stay visible
     draft_root: Path,
     ready_root: Path,
-    ledger_path: Path,
+    state_db: StateDB,
     clock_segments: ClockSegmentMap,
     *,
     config: ReadyConfig,
@@ -188,9 +188,9 @@ def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publ
     _prepare_directory(draft_root)
     _prepare_directory(ready_root)
     _require_shared_ready_directory(ready_root)
-    ledger = _read_ledger(ledger_path)
+    ledger = _read_ledger(state_db)
     results: list[ReadyBundleResult] = []
-    finalization = _Finalization(ready_root, ledger_path, ledger, clock_segments)
+    finalization = _Finalization(ready_root, state_db, ledger, clock_segments)
     inventory = authenticated_inventory(draft_root, ready_root, inventory)
     _reconcile_ready_ledger(finalization, inventory.ready)
     eligible, replayed_paths = _eligible_drafts(inventory, frontier)
@@ -327,14 +327,13 @@ def _read_draft(path: Path) -> _Draft:
         raise ReadyBundleError("draft root contains an unsafe entry")
     try:
         manifest = BundleManifest.from_json(_read_json(path / _MANIFEST_NAME))
-        receipt = SealedReceipt.from_json(_read_json(path / _RECEIPT_NAME))
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, StateDBError) as error:
         raise ReadyBundleError("draft bundle manifest is invalid") from error
     raw = path / _RAW_NAME
     if raw.is_symlink() or not raw.is_file() or raw.stat().st_size != manifest.record_count * RECORD_SIZE:
         raise ReadyBundleError("draft bundle records are invalid")
-    if _digest(raw) != manifest.raw_sha256 or receipt.raw_sha256 != manifest.raw_sha256:
-        raise ReadyBundleError("draft bundle records do not match its receipt")
+    if _digest(raw) != manifest.raw_sha256:
+        raise ReadyBundleError("draft bundle records do not match its manifest")
     return _Draft(path, manifest)
 
 
@@ -458,14 +457,14 @@ def _finalize_group(
         if ready.facts != facts:
             raise ReadyBundleError("ready destination conflicts with its draft group")
         result = ready.result
-        _record_ready(finalization.ledger_path, finalization.ledger, result, facts)
+        _record_ready(finalization.state_db, finalization.ledger, result, facts)
         for path in source_paths:
             _remove_draft(path)
         return result
     ranges = _time_ranges(facts, finalization.clock_segments)
     ranges = _clear_unrepresentable_ranges(group, ranges)
     result = _write_ready_group(group, destination, ranges)
-    _record_ready(finalization.ledger_path, finalization.ledger, result, facts)
+    _record_ready(finalization.state_db, finalization.ledger, result, facts)
     for path in source_paths:
         _remove_draft(path)
     return result
@@ -480,14 +479,13 @@ def _drafts(root: Path) -> tuple[_Draft, ...]:
             raise ReadyBundleError("draft root contains an unsafe entry")
         try:
             manifest = BundleManifest.from_json(_read_json(path / _MANIFEST_NAME))
-            receipt = SealedReceipt.from_json(_read_json(path / _RECEIPT_NAME))
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, StateDBError) as error:
             raise ReadyBundleError("draft bundle manifest is invalid") from error
         raw = path / _RAW_NAME
         if raw.is_symlink() or not raw.is_file() or raw.stat().st_size != manifest.record_count * RECORD_SIZE:
             raise ReadyBundleError("draft bundle records are invalid")
-        if _digest(raw) != manifest.raw_sha256 or receipt.raw_sha256 != manifest.raw_sha256:
-            raise ReadyBundleError("draft bundle records do not match its receipt")
+        if _digest(raw) != manifest.raw_sha256:
+            raise ReadyBundleError("draft bundle records do not match its manifest")
         drafts.append(_Draft(path, manifest))
     drafts.sort(key=lambda item: item.manifest.start_sequence)
     return tuple(drafts)
@@ -599,7 +597,7 @@ def _reconcile_ready_source(finalization: _Finalization, source: _ReadySource) -
     assert isinstance(bundles, dict)
     entry = bundles.get(source.result.bundle_id)
     if entry is None:
-        _record_ready(finalization.ledger_path, finalization.ledger, source.result, source.facts)
+        _record_ready(finalization.state_db, finalization.ledger, source.result, source.facts)
         return
     if not isinstance(entry, dict) or entry.get("state") != "ready":
         raise ReadyBundleError("ready bundle is not active in the publication ledger")
@@ -912,7 +910,7 @@ def _ready_manifest(
 
 
 def _record_ready(
-    ledger_path: Path, ledger: dict[str, object], result: ReadyBundleResult, source: _BundleFacts
+    state_db: StateDB, ledger: dict[str, object], result: ReadyBundleResult, source: _BundleFacts
 ) -> None:
     bundles = ledger["bundles"]
     assert isinstance(bundles, dict)
@@ -922,11 +920,20 @@ def _record_ready(
         return
     if existing is not None:
         raise ReadyBundleError("ready publication ledger conflicts with bundle")
-    bundles[result.bundle_id] = entry
     frontier = ledger["frontier"]
     assert isinstance(frontier, int)
-    ledger["frontier"] = max(frontier, result.next_sequence)
-    _write_file_atomic(ledger_path, _canonical(ledger))
+    updated_frontier = max(frontier, result.next_sequence)
+    try:
+        with state_db.transaction() as transaction:
+            current = transaction.get(StateKind.READY_PUBLICATION, result.bundle_id)
+            if current is not None and current != entry:
+                raise ReadyBundleError("ready publication ledger conflicts with bundle")
+            transaction.put(StateKind.READY_PUBLICATION, result.bundle_id, entry)
+            transaction.put(StateKind.READY_PUBLICATION, "frontier", {"value": updated_frontier})
+    except (OSError, ValueError, StateDBError) as error:
+        raise ReadyBundleError("ready publication ledger could not be written") from error
+    bundles[result.bundle_id] = entry
+    ledger["frontier"] = updated_frontier
 
 
 def _ledger_entry(records_sha256: str, state: str, source: _BundleFacts) -> dict[str, object]:
@@ -984,10 +991,10 @@ def _reject_out_of_order(ledger: Mapping[str, object], source: _BundleFacts, bun
         raise ReadyBundleError("draft ordering is blocked by an already published bundle")
 
 
-def resume_retired(ready_root: Path, ledger_path: Path) -> None:
+def resume_retired(ready_root: Path, state_db: StateDB) -> None:
     """Finish already committed retirements before reconciling new publication."""
     _prepare_directory(ready_root)
-    bundles = _read_ledger(ledger_path)["bundles"]
+    bundles = _read_ledger(state_db)["bundles"]
     assert isinstance(bundles, dict)
     retired: list[Path] = []
     for bundle_id, entry in bundles.items():
@@ -999,18 +1006,18 @@ def resume_retired(ready_root: Path, ledger_path: Path) -> None:
         _remove_retired_ready(destination)
 
 
-def retire_acknowledged(ready_root: Path, ledger_path: Path, checkpoint_path: Path) -> tuple[ReadyBundleResult, ...]:
+def retire_acknowledged(ready_root: Path, state_db: StateDB, checkpoint_path: Path) -> tuple[ReadyBundleResult, ...]:
     """Retire only Windmill bundles durably ACKed outside an open speech tail."""
     _prepare_directory(ready_root)
     acknowledged = _windmill_acknowledged(checkpoint_path)
     if not acknowledged:
         return ()
-    ledger = _read_ledger(ledger_path)
+    ledger = _read_ledger(state_db)
     for bundle_id, records_sha256 in acknowledged:
         _preflight_retirement(ready_root, ledger, bundle_id, records_sha256)
     retired: list[ReadyBundleResult] = []
     for bundle_id, records_sha256 in acknowledged:
-        retired.append(_retire_one(ready_root, ledger_path, ledger, bundle_id, records_sha256))
+        retired.append(_retire_one(ready_root, state_db, ledger, bundle_id, records_sha256))
     return tuple(retired)
 
 
@@ -1031,7 +1038,7 @@ def _preflight_retirement(ready_root: Path, ledger: Mapping[str, object], bundle
 
 
 def _retire_one(
-    ready_root: Path, ledger_path: Path, ledger: dict[str, object], bundle_id: str, records_sha256: str
+    ready_root: Path, state_db: StateDB, ledger: dict[str, object], bundle_id: str, records_sha256: str
 ) -> ReadyBundleResult:
     bundles = ledger["bundles"]
     assert isinstance(bundles, dict)
@@ -1043,8 +1050,13 @@ def _retire_one(
     if state == "ready":
         source = _read_ready_source(destination)
         _validate_ready_ledger_entry(entry, source)
-        bundles[bundle_id] = _ledger_entry(records_sha256, "retired", source.facts)
-        _write_file_atomic(ledger_path, _canonical(ledger))
+        retired_entry = _ledger_entry(records_sha256, "retired", source.facts)
+        try:
+            with state_db.transaction() as transaction:
+                transaction.put(StateKind.READY_PUBLICATION, bundle_id, retired_entry)
+        except (OSError, ValueError, StateDBError) as error:
+            raise ReadyBundleError("ready retirement could not be recorded") from error
+        bundles[bundle_id] = retired_entry
     elif state == "retired":
         _resume_retirement(destination, entry)
     else:
@@ -1173,19 +1185,60 @@ def _windmill_identities(value: object, label: str) -> list[tuple[str, str]]:
     return identities
 
 
-def _read_ledger(path: Path) -> dict[str, object]:
-    if not path.exists():
-        return {"bundles": {}, "frontier": 0}
+def _read_ledger(state_db: StateDB) -> dict[str, object]:
+    try:
+        rows = state_db.list(StateKind.READY_PUBLICATION)
+    except (OSError, ValueError, StateDBError) as error:
+        raise ReadyBundleError("ready publication ledger is unreadable") from error
+    bundles: dict[str, object] = {}
+    frontier = 0
+    for bundle_id, entry in rows:
+        if bundle_id == "frontier":
+            if set(entry) != {"value"}:
+                raise ReadyBundleError("ready publication ledger is invalid")
+            value = entry["value"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ReadyBundleError("ready publication ledger is invalid")
+            frontier = value
+            continue
+        bundles[bundle_id] = entry
+    _validate_ledger_values(bundles, frontier)
+    _validate_ledger_entries(bundles)
+    return {"bundles": bundles, "frontier": frontier}
+
+
+def legacy_ready_publications(path: Path) -> dict[str, dict[str, object]]:
+    """Read and strictly validate the former JSON ledger as typed DB rows."""
+    if not os.path.lexists(path):
+        return {"frontier": {"value": 0}}
     value = _read_json(path)
     if not isinstance(value, dict):
         raise ReadyBundleError("ready publication ledger is invalid")
+    bundles, frontier = _legacy_ledger_parts(value)
+    rows: dict[str, dict[str, object]] = {"frontier": {"value": frontier}}
+    rows.update(_legacy_bundle_rows(bundles))
+    return rows
+
+
+def _legacy_ledger_parts(value: dict[str, object]) -> tuple[dict[str, object], int]:
     _validate_ledger_header(value)
-    bundles = value["bundles"]
-    frontier = value["frontier"]
-    assert isinstance(bundles, dict)
-    assert isinstance(frontier, int)
+    raw_bundles = value["bundles"]
+    assert isinstance(raw_bundles, dict)
+    if any(not isinstance(bundle_id, str) for bundle_id in raw_bundles):
+        raise ReadyBundleError("ready publication ledger is invalid")
+    bundles = cast(dict[str, object], raw_bundles)
     _validate_ledger_entries(bundles)
-    return value
+    frontier = value["frontier"]
+    assert isinstance(frontier, int)
+    return bundles, frontier
+
+
+def _legacy_bundle_rows(bundles: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    for bundle_id, entry in bundles.items():
+        assert isinstance(bundle_id, str) and isinstance(entry, dict)
+        rows[bundle_id] = entry
+    return rows
 
 
 def _validate_ledger_header(value: dict[str, object]) -> None:
@@ -1201,7 +1254,7 @@ def _validate_ledger_values(bundles: object, frontier: object) -> None:
         raise ReadyBundleError("ready publication ledger is invalid")
 
 
-def _validate_ledger_entries(bundles: dict[object, object]) -> None:
+def _validate_ledger_entries(bundles: Mapping[str, object]) -> None:
     for bundle_id, entry in bundles.items():
         if not _valid_ledger_entry(bundle_id, entry):
             raise ReadyBundleError("ready publication ledger is invalid")

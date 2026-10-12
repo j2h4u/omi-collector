@@ -174,7 +174,8 @@ model's enums and unions so new variants force a test update.
 Foreground attempt and closure effects own priority over background publication
 retries. Join any running retry before admission and defer new retries until
 the foreground scope exits. Inline clock publication uses the explicitly
-transferred clock lease; it must not reacquire the same filesystem lock.
+transferred in-process clock lease; it must not acquire another filesystem
+lock. The stable outer `collector.lock` remains held for the entire invocation.
 
 `INFO` is the source of truth for unread state. Automatic service and sync
 admission requires a current exact-address scanner candidate that has remained
@@ -245,6 +246,43 @@ Its fixed parent `/srv/pipelines/omi` is the storage root; `collector`,
 `draft`, and `ready` are derived beneath it. The base unit grants the
 service write access to that root. Use filesystem ownership or ACLs on the
 derived directories when a downstream account also needs access.
+
+### State ownership and offline migration
+
+All mutable structured Collector state lives in
+`collector/collector-state.sqlite3`, using SQLite's DELETE rollback journal,
+`synchronous=EXTRA`, and a bounded busy timeout. Raw audio and authenticated
+draft/ready manifests remain filesystem artifacts; ready bundles contain only
+`records.bin` and `manifest.json`. Keep the separate, zero-content
+`collector/collector.lock` stable: the service holds its flock for the full
+invocation, and every state-mutating manual command and migration takes that
+same guard before opening writable state or performing BLE work. Read-only
+`device status` and `device metrics` may read the database while the service
+is active.
+
+The canonical systemd deployer stops the service and runs the staged
+`omi-collector migrate-state --config PATH --legacy-phy-state-home PATH`
+before restart, then assigns the database and stable lock to the unprivileged
+service account. For recovery after an interrupted cutover, keep the service
+stopped and rerun that command from the staged release while systemd reports
+inactive or failed. Migration acquires the canonical guard, restores
+any recognized legacy PHY marker, imports and validates the old state,
+checks raw and clock-normalization parity, activates the database, then
+deletes verified legacy mutable files directly. It does not create an archive
+or change ready audio/manifests. A validation or parity failure prevents
+activation. If cleanup is interrupted after activation, leave the service
+stopped and rerun `migrate-state`; the incomplete marker blocks runtime and
+mutating commands until cleanup and the final complete marker are verified.
+Changed or unclassified legacy files fail closed and require inspection.
+Never remove or replace `collector.lock` during migration.
+The known October 7 sparse recovery package is separately retained under the
+storage root. Migration authenticates its passport and raw SHA, preserves its
+physical sequence order and explicit unknown gaps, and imports the clock
+mapping needed by its retained records even when the current firmware frontier
+has moved past them. Runtime clock updates preserve existing ranges; there is
+no clock-range pruning path. The package is never part of legacy-file deletion.
+After database activation, do not restart an old release that reads the JSON
+control files; the deployer keeps the staged release selected on failure.
 
 The retained ready-bundle ACK checkpoint under `work` is a real publication
 dependency. The producer must grant the trusted collector UID a numeric read
@@ -346,37 +384,35 @@ Use the system journal for the small operational stream. The default `INFO`
 level shows readiness, transfer outcomes, failures, and recovery; it suppresses
 repeated `storage_wait` polling and detailed `ble_link_session` records. Use
 `--log-level DEBUG` for a diagnostic foreground sync when link negotiation or
-polling detail is required. The bounded `debug.jsonl` ring receives sync
-callbacks and link diagnostics separately from the journal; keep its private
-permissions and inspect it only for an active investigation.
+polling detail is required. Detailed events go to the system journal; there is
+no rotating debug JSONL state file. Current runtime progress and the latest
+firmware observation are projected into the shared StateDB.
 
 The read-only `device status` command joins systemd health, the latest runtime
 progress and battery observation, firmware state, published-bundle metrics,
-and the selected recent window from `quality.jsonl`:
+and the retained recent quality-event window in the shared StateDB:
 
 ```bash
 sudo -n /usr/local/sbin/omi-collector-status
 ```
 
 The operational snapshot stores low-rate `unknown`, `clear`, or `blocked`
-states for quality, publication, and clock health. It is separate from the
-rotating debug ring and is scoped to the host boot ID and systemd invocation
-ID: a new identity degrades old `clear` state to `unknown`, while old
+states for quality, publication, and clock health in the shared StateDB. It is
+scoped to the host boot ID and systemd invocation ID: a new identity degrades
+old `clear` state to `unknown`, while old
 `blocked` state remains attention until the service records recovery. State
 changes, not arbitrary heartbeats or TTLs, update the snapshot. A failed
 snapshot write is supervised: collection is cancelled through its finalizer,
 which closes or preserves active audio evidence, and the service exits with an
 error instead of claiming healthy status.
 
-Confirmed loss needs its own authoritative durable ledger: append and fsync the
-loss fact before publishing the prefix that exposes the gap, then include the
-ledger totals in `quality_window`. The bounded quality journal is a telemetry
-projection and may lose a queued metric during overflow; it cannot erase the
-reported loss totals. Deduplicate repeated ledger/projection observations
-automatically and preserve retained legacy loss facts. Loss totals are quality
-statistics and do not change top-level status by themselves. The service
-implements this contract; the audit tracker records its targeted verification
-separately from the full release gates.
+Confirmed loss has its own authoritative StateDB rows, committed before the
+prefix publication that exposes the gap, and `quality_window` reports those
+totals independently of retained telemetry. Quality events are a bounded,
+best-effort projection in the same database; a full queue or failed event write
+can lose a telemetry event, but cannot erase the confirmed-loss rows. Migration
+deduplicates retained legacy loss facts. Loss totals are quality statistics and
+do not change top-level status by themselves.
 
 Interpret `ok` as requiring a completed transfer in the quality window and
 `clear` operational states, and no latest terminal transfer failure. Without a
@@ -386,8 +422,8 @@ Confirmed-loss totals remain visible in the quality window but do not change
 status by themselves. The quality window includes outcome and
 termination-class counts. A missing `device` object means no firmware
 observation has been recorded yet.
-Treat status as an operational summary: inspect the journal, debug ring, and
-sealed bundles before diagnosing a specific transfer.
+Treat status as an operational summary: inspect the journal and sealed bundles
+before diagnosing a specific transfer.
 
 ## Documentation hygiene
 

@@ -9,14 +9,12 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from logging import getLogger
-from os import fsync, statvfs
 from pathlib import Path
 from threading import Lock
 from time import monotonic
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
-from ...config import DEFAULT_CONFIG, CollectorConfig
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from ..domain.quarantine_machine import QuarantineState
 from ..domain.ready_machine import (
@@ -43,10 +41,8 @@ from ..domain.ready_machine import (
 from ..domain.ring_protocol import RECORD_SIZE
 from . import publication, quarantine, ready_closures
 from .attempts import StagedAttempt
-from .clock_corrections import ClockCorrectionError, ClockCorrectionStore
-from .clock_memberships import ClockMembershipError, ClockMembershipStore
-from .clock_observations import ClockObservationError
-from .clock_segments import ClockSegmentError, ClockSegmentMap, segments_with_estimates
+from .clock_segments import ClockSegmentError, ClockSegmentMap
+from .collector_state_db import StateDB, StateKind
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
 from .debug_logging import debug_event
 from .ready_bundles import (
@@ -62,10 +58,7 @@ from .ready_bundles import (
     source_revision,
 )
 from .staging_contract import (
-    _DESCRIPTOR_NAME,
-    _PREFIX_PUBLICATION_NAME,
     _RAW_NAME,
-    _TERMINAL_RETIRED_NAME,
     AttemptDescriptor,
     AttemptStateError,
     DeviceAlreadyRunningError,
@@ -76,15 +69,15 @@ from .staging_contract import (
     _validate_int,
 )
 from .staging_filesystem import (
+    DEFAULT_STAGING_IO,
     DeviceLock,
-    Fsync,
     StagingFilesystem,
+    StagingIO,
     StagingPaths,
-    Statvfs,
     _create_empty_synced,
     _never_defer,
     _require_regular_directory,
-    _require_regular_file,
+    _sync_directory,
 )
 
 if TYPE_CHECKING:
@@ -136,17 +129,16 @@ class StagingStore:
         spool: Path,
         capture_root: Path,
         *,
-        fsync_fn: Fsync = fsync,
-        statvfs_fn: Statvfs = statvfs,
-        config: CollectorConfig = DEFAULT_CONFIG,
+        state_db: StateDB,
+        io: StagingIO = DEFAULT_STAGING_IO,
     ) -> None:
-        self._config = config
+        self._config = io.config
+        self._state_db = state_db
         self._filesystem = StagingFilesystem(
             spool,
             capture_root,
-            fsync_fn=fsync_fn,
-            statvfs_fn=statvfs_fn,
-            config=config,
+            state_db=state_db,
+            io=io,
         )
         self._validated_attempts: dict[str, StagedAttempt] = {}
         self._publication_root: Path | None = None
@@ -159,13 +151,15 @@ class StagingStore:
         cls,
         paths: StagingPaths,
         *,
-        config: CollectorConfig = DEFAULT_CONFIG,
+        state_db: StateDB,
+        io: StagingIO = DEFAULT_STAGING_IO,
         publication_root: Path | None = None,
     ) -> StagingStore:
         """Build a store from the external layout authority."""
         store = cls.__new__(cls)
-        store._config = config
-        store._filesystem = StagingFilesystem.from_paths(paths, config=config)
+        store._config = io.config
+        store._state_db = state_db
+        store._filesystem = StagingFilesystem.from_paths(paths, state_db=state_db, io=io)
         store._validated_attempts = {}
         store._publication_root = publication_root
         store._publication_lock = Lock()
@@ -297,15 +291,13 @@ class StagingStore:
             return self._publication_outcome(next_command)
         return outcome
 
-    def _publication_revision(self) -> tuple[tuple[str, int, int, int, int, int], ...]:
+    def _publication_revision(self) -> object:
         if self._publication_root is None:
             return ()
-        ledger_path = self.device_state_path.parent / "ready-publications.json"
         checkpoint_path = self._publication_root.parent / "work" / "omi-ready-checkpoint.json"
-        return source_revision(
-            self.capture_root,
-            self._publication_root,
-            extras=(ledger_path, checkpoint_path, self.ready_closures_path),
+        return (
+            self._state_db.get_generation(),
+            source_revision(self.capture_root, self._publication_root, extras=(checkpoint_path,)),
         )
 
     def publication_retry_schedule(self) -> tuple[int, float] | None:
@@ -362,19 +354,21 @@ class StagingStore:
                 for path in self.attempts_root.iterdir():
                     if path.is_symlink() or not path.is_dir():
                         raise AttemptStateError("partial staging root contains a non-directory entry")
-                    if (path / _TERMINAL_RETIRED_NAME).exists():
+                    row = self._filesystem._read_attempt_row_if_valid_schema(path.name)
+                    if row is None:
+                        # Let pending-attempt inspection classify attributable
+                        # corruption so startup can move it to quarantine while
+                        # retaining the raw evidence.
                         continue
-                    if (path / _PREFIX_PUBLICATION_NAME).exists():
+                    if row["terminal_retirement"] is not None:
+                        continue
+                    if row["prefix_publication"] is not None:
                         recoverable_prefix = True
                         break
             frontier = self._cached_draft_frontier()
-            closures = ready_closures.coalesce(self.ready_closures_path)
+            closures = ready_closures.coalesce(self._state_db)
             unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
             return recoverable_prefix, unclosed_drafts
-
-    @property
-    def ready_closures_path(self) -> Path:
-        return self.device_state_path.parent / "ready-closures.json"
 
     def append_ready_closure(self, next_sequence: int, reason: str) -> ready_closures.ReadyClosure:
         """Durably close one physical visit before allowing ready publication."""
@@ -390,9 +384,9 @@ class StagingStore:
         active = self._filesystem._active_lease
         if active is not None:
             self._filesystem.require_device_lock(active)
-            return ready_closures.begin_visit(self.ready_closures_path)
+            return ready_closures.begin_visit(self._state_db)
         with self.device_lock(recover_capture_temporaries=False, operation="ready_visit_begin"):
-            return ready_closures.begin_visit(self.ready_closures_path)
+            return ready_closures.begin_visit(self._state_db)
 
     def close_orphaned_drafts(
         self, reason: str, *, drain_cursor: int | None = None
@@ -456,7 +450,7 @@ class StagingStore:
 
     def _validate_recovery_cursor_unlocked(self, lease: DeviceLock, reason: str, drain_cursor: int | None) -> None:
         self._filesystem.require_device_lock(lease)
-        closures = ready_closures.load(self.ready_closures_path)
+        closures = ready_closures.load(self._state_db)
         existing = closures[-1] if closures else None
         try:
             recovered_closure(
@@ -479,17 +473,12 @@ class StagingStore:
         for path in tuple(self.attempts_root.iterdir()):
             if path.is_symlink() or not path.is_dir():
                 raise AttemptStateError("partial staging root contains a non-directory entry")
-            marker = path / _PREFIX_PUBLICATION_NAME
-            terminal_marker = path / _TERMINAL_RETIRED_NAME
-            if terminal_marker.is_symlink():
-                raise AttemptStateError("terminal-retired marker must not be a symlink")
-            if terminal_marker.exists():
+            row = self._filesystem._read_attempt_row(path.name)
+            if row["terminal_retirement"] is not None:
                 continue
-            marker_present = marker.exists() or marker.is_symlink()
+            marker_present = row["prefix_publication"] is not None
             if not marker_present and path.name not in pending_ids:
                 continue
-            if marker_present:
-                _require_regular_file(marker, "recoverable prefix publication marker")
             descriptor = self._filesystem._read_descriptor(path)
             candidates.append((descriptor.start_sequence, path, descriptor))
         return candidates
@@ -536,7 +525,7 @@ class StagingStore:
         self, lease: DeviceLock, frontier: int | None, reason: str, drain_cursor: int | None
     ) -> tuple[tuple[int, str] | None, ready_closures.ReadyClosure | None]:
         self._filesystem.require_device_lock(lease)
-        closures = ready_closures.load(self.ready_closures_path)
+        closures = ready_closures.load(self._state_db)
         existing = closures[-1] if closures else None
         try:
             decision = recovered_closure(
@@ -547,7 +536,7 @@ class StagingStore:
             )
         except ValueError as error:
             raise ready_closures.ReadyClosureError(str(error)) from error
-        closures = ready_closures.coalesce(self.ready_closures_path)
+        closures = ready_closures.coalesce(self._state_db)
         existing = closures[-1] if closures else None
         return decision, existing
 
@@ -564,7 +553,7 @@ class StagingStore:
         self, lease: DeviceLock, next_sequence: int, reason: str
     ) -> ready_closures.ReadyClosure:
         self._filesystem.require_device_lock(lease)
-        closure = ready_closures.append(self.ready_closures_path, next_sequence, reason)
+        closure = ready_closures.append(self._state_db, next_sequence, reason)
         self._publication_event(InputChanged())
         return closure
 
@@ -572,25 +561,16 @@ class StagingStore:
         publication_root = self._publication_root
         if publication_root is None:
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
-        ledger_path = self.device_state_path.parent / "ready-publications.json"
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
-        corrections = ClockCorrectionStore(self.device_state_path)
         try:
-            corrections.recover_prepared()
-            corrections.reconcile_recovered_observations(
-                near_zero_threshold=DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds
-            )
-            observations = corrections.observation_store.records()
-            verified_operations = frozenset(
-                item.operation_id for item in corrections.records() if item.state in {"applied", "resolved"}
-            )
-            confirmed = ClockMembershipStore(self.device_state_path).segments(observations)
-            segments = segments_with_estimates(observations, confirmed, verified_operations)
-        except (ClockCorrectionError, ClockObservationError, ClockMembershipError, ClockSegmentError) as error:
+            from .clock_state_store import ClockStateStore
+
+            segments = ClockStateStore(self._state_db).segment_map()
+        except (ClockSegmentError, ValueError) as error:
             _LOGGER.warning("clock metadata unavailable; publishing ready audio without UTC normalization: %s", error)
             segments = ClockSegmentMap(())
-        resume_retired(publication_root, ledger_path)
-        closures = ready_closures.coalesce(self.ready_closures_path)
+        resume_retired(publication_root, self._state_db)
+        closures = ready_closures.coalesce(self._state_db)
         outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_closed_frontier")
         if not closures:
             self._authenticated_ready_inventory(publication_root)
@@ -601,7 +581,7 @@ class StagingStore:
                 outcome = finalize_drafts(
                     self.capture_root,
                     publication_root,
-                    ledger_path,
+                    self._state_db,
                     segments,
                     config=self._filesystem._ready,
                     frontier=closure.next_sequence,
@@ -617,8 +597,8 @@ class StagingStore:
                 if pending:
                     outcome = replace(outcome, remaining_at_frontier=True, inventory=inventory)
                 else:
-                    ready_closures.remove(self.ready_closures_path, closure)
-        retired = retire_acknowledged(publication_root, ledger_path, checkpoint_path)
+                    ready_closures.remove(self._state_db, closure)
+        retired = retire_acknowledged(publication_root, self._state_db, checkpoint_path)
         if retired and outcome.state is ReadyOutcomeState.WAITING:
             outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="ack_retired")
         return outcome
@@ -632,12 +612,8 @@ class StagingStore:
         return self._filesystem.attempts_root
 
     @property
-    def device_state_path(self) -> Path:
-        return self._filesystem.device_state_path
-
-    @property
-    def clock_membership_store(self) -> ClockMembershipStore:
-        return ClockMembershipStore(self.device_state_path)
+    def state_db(self) -> StateDB:
+        return self._state_db
 
     @property
     def paths(self) -> StagingPaths:
@@ -647,24 +623,17 @@ class StagingStore:
     def preflight_storage(self) -> None:
         """Validate and durably probe storage before any device operation starts."""
         self._filesystem.preflight_storage()
-        ledger_path = self.confirmed_loss_ledger_path
-        status_snapshot = ledger_path.with_name("operational-status.json")
-        if os.path.lexists(ledger_path):
-            ConfirmedLossLedger(ledger_path).read()
-        elif os.path.lexists(status_snapshot):
+        if self._state_db.get(StateKind.CONFIRMED_LOSS, "ledger") is not None:
+            ConfirmedLossLedger(self._state_db).read()
+        elif self._state_db.get(StateKind.OPERATIONAL_STATUS, "current") is not None:
             raise ConfirmedLossError("confirmed-loss ledger is missing after status initialization")
 
     def initialize_confirmed_loss_ledger(self) -> None:
         """Initialize only before the first operational snapshot exists."""
         with self.clock_mutation_lease():
-            status_snapshot = self.confirmed_loss_ledger_path.with_name("operational-status.json")
-            ConfirmedLossLedger(self.confirmed_loss_ledger_path).initialize(
-                allow_create=not os.path.lexists(status_snapshot)
+            ConfirmedLossLedger(self._state_db).initialize(
+                allow_create=self._state_db.get(StateKind.OPERATIONAL_STATUS, "current") is None
             )
-
-    @property
-    def confirmed_loss_ledger_path(self) -> Path:
-        return self.device_state_path.parent / "confirmed-loss.json"
 
     def record_confirmed_loss(
         self,
@@ -675,7 +644,7 @@ class StagingStore:
     ) -> str:
         """Durably record one confirmed half-open interval under the device lease."""
         with self.clock_mutation_lease():
-            return ConfirmedLossLedger(self.confirmed_loss_ledger_path).record(
+            return ConfirmedLossLedger(self._state_db).record(
                 attempt_id,
                 start_sequence,
                 end_sequence,
@@ -722,7 +691,7 @@ class StagingStore:
         )
 
     def quarantine_state(self, source: Path) -> QuarantineState:
-        return quarantine._quarantine_state(source)
+        return quarantine._quarantine_state(self._filesystem, source)
 
     def mark_quarantine_published(self, source: Path) -> None:
         quarantine.mark_quarantine_published(
@@ -737,11 +706,18 @@ class StagingStore:
             reason,
         )
 
-    def publish_quarantined_prefix(self, source: Path, *, should_defer: Callable[[], bool]) -> QuarantinePublication:
+    def publish_quarantined_prefix(
+        self, source: Path, *, should_defer: Callable[[], bool] = _never_defer
+    ) -> QuarantinePublication:
         """Salvage one quarantined prefix through this store's explicit paths capability."""
         from .quarantine_publish import publish_quarantined_prefix
 
-        published = publish_quarantined_prefix(source, self.paths, should_defer=should_defer)
+        active_lease = self._filesystem._active_lease
+        if active_lease is None:
+            with self.device_lock(recover_capture_temporaries=False, operation="publish_quarantined_prefix") as lease:
+                published = publish_quarantined_prefix(source, self._filesystem, lease, should_defer=should_defer)
+        else:
+            published = publish_quarantined_prefix(source, self._filesystem, active_lease, should_defer=should_defer)
         self.publication_input_changed()
         return published
 
@@ -770,12 +746,12 @@ class StagingStore:
         )
         attempt_path = self.attempts_root / descriptor.attempt_id
         self._filesystem._ensure_directory(attempt_path)
-        self._filesystem._write_json_atomic(attempt_path / _DESCRIPTOR_NAME, asdict(descriptor))
         _create_empty_synced(attempt_path / _RAW_NAME, self._filesystem._fsync)
-        self._filesystem._write_checkpoint(
-            attempt_path,
-            StreamingCheckpoint(1, descriptor.attempt_id, 0, sha256(b"").hexdigest()),
-            allow_missing=True,
+        _sync_directory(attempt_path, self._filesystem._fsync)
+        self._filesystem._create_attempt_row(
+            descriptor.attempt_id,
+            asdict(descriptor),
+            asdict(StreamingCheckpoint(1, descriptor.attempt_id, 0, sha256(b"").hexdigest())),
         )
         return StagedAttempt(self._filesystem, attempt_path, descriptor)
 

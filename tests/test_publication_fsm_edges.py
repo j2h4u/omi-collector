@@ -17,7 +17,7 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import staging_store as staging_store_module
-from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
+from omi_collector.capture.adapters.bundle_contract import BundleManifest
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import (
     ConflictingOverlapError,
@@ -27,9 +27,9 @@ from omi_collector.capture.adapters.ready_bundles import (
 )
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
+from staging_test_factory import StagingStore
 from test_publication_fsm import _count_raw_reads, _draft, _store
 
 
@@ -43,14 +43,13 @@ def _conflicting_overlap(store: StagingStore) -> Path:
     (overlap / "manifest.json").write_text(
         dumps(BundleManifest(2, 101, 102, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
     )
-    (overlap / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
     return overlap
 
 
 def _replace_draft_files(store: StagingStore, path: Path, start: int, count: int) -> int:
     replacement = _draft(store, "replacement", start, count)
     previous_inode = (path / "records.bin").stat().st_ino
-    for name in ("records.bin", "manifest.json", "receipt.json"):
+    for name in ("records.bin", "manifest.json"):
         (replacement / name).replace(path / name)
     replacement.rmdir()
     return previous_inode
@@ -289,7 +288,7 @@ def test_secondary_revision_access_denial_preserves_effect_error_context(
     revision_calls = [0]
     original_revision = store._publication_revision
 
-    def fail_after_initial_revision() -> tuple[tuple[str, int, int, int, int, int], ...]:
+    def fail_after_initial_revision() -> object:
         revision_calls[0] += 1
         if revision_calls[0] > 1:
             raise PermissionError(errno.EACCES, "test access denied", str(failure_path))

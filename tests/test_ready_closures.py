@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from hashlib import sha256
-from json import dumps, loads
+from json import dumps
 from pathlib import Path
 from struct import pack
 
 import pytest
 
 from omi_collector.capture.adapters.attempts import StagedAttempt
-from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
+from omi_collector.capture.adapters.bundle_contract import BundleManifest
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_closures import (
     ReadyClosure,
@@ -20,13 +20,14 @@ from omi_collector.capture.adapters.ready_closures import (
     append,
     begin_visit,
     coalesce,
+    legacy_closures,
     load,
     remove,
 )
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
+from staging_test_factory import StagingStore, attempt_payload, closure_rows
 
 
 def _record(sequence: int) -> bytes:
@@ -43,8 +44,12 @@ def _partial(tmp_path: Path) -> tuple[StagingStore, StagedAttempt]:
     return store, attempt
 
 
+def _state_db(path: Path) -> StateDB:
+    return StateDB(path.with_suffix(".sqlite3"))
+
+
 def test_closures_coalesce_to_latest_watermark_and_keep_equal_drain(tmp_path: Path) -> None:
-    path = tmp_path / "ready-closures.json"
+    path = _state_db(tmp_path / "ready-closures.json")
 
     first = append(path, 10, "absence")
     assert append(path, 10, "recovery_exhausted") == first
@@ -57,7 +62,7 @@ def test_closures_coalesce_to_latest_watermark_and_keep_equal_drain(tmp_path: Pa
 
     remove(path, drained)
     assert load(path) == ()
-    assert loads(path.read_text(encoding="utf-8"))["version"] == 1
+    assert path.get(StateKind.READY_CLOSURE, "current") == {"version": 1, "closures": []}
 
 
 def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: Path) -> None:
@@ -75,14 +80,13 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
     (draft / "manifest.json").write_text(
         dumps(BundleManifest(2, 10, 11, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
     )
-    (draft / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
     store.append_ready_closure(11, "drained")
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
 
     async def visit() -> None:
         await maintenance.enter_capture_priority()
         try:
-            assert load(store.ready_closures_path)[0].reason == "collecting"
+            assert load(store.state_db)[0].reason == "collecting"
             assert store.publish_ready().reason == "capture_active"
         finally:
             maintenance.exit_capture_priority()
@@ -110,20 +114,26 @@ def test_visit_begin_reuses_active_writer_lease_across_threads(tmp_path: Path) -
 
 
 def test_closures_reject_malformed_state(tmp_path: Path) -> None:
-    path = tmp_path / "ready-closures.json"
-    path.write_text('{"closures":[{"next_sequence":20,"reason":"absence"}],"version":1}', encoding="utf-8")
+    path = _state_db(tmp_path / "ready-closures.json")
+    path.put(
+        StateKind.READY_CLOSURE, "current", {"version": 1, "closures": [{"next_sequence": 20, "reason": "absence"}]}
+    )
 
     with pytest.raises(ReadyClosureError, match="regressed"):
         append(path, 10, "absence")
 
-    path.write_text(
-        '{"closures":[{"next_sequence":20,"reason":"absence"},{"next_sequence":10,"reason":"absence"}],"version":1}',
-        encoding="utf-8",
+    path.put(
+        StateKind.READY_CLOSURE,
+        "current",
+        {
+            "version": 1,
+            "closures": [{"next_sequence": 20, "reason": "absence"}, {"next_sequence": 10, "reason": "absence"}],
+        },
     )
     with pytest.raises(ReadyClosureError, match="out of order"):
         load(path)
 
-    path.write_text('{"closures":[{"next_sequence":20}],"version":1}', encoding="utf-8")
+    path.put(StateKind.READY_CLOSURE, "current", {"version": 1, "closures": [{"next_sequence": 20}]})
     with pytest.raises(ReadyClosureError, match="entry schema"):
         load(path)
 
@@ -136,50 +146,96 @@ def test_closures_reject_malformed_state(tmp_path: Path) -> None:
     ],
 )
 def test_load_rejects_missing_or_extra_top_level_fields(tmp_path: Path, state: dict[str, object]) -> None:
-    path = tmp_path / "ready-closures.json"
-    path.write_text(dumps(state), encoding="utf-8")
+    path = _state_db(tmp_path / "ready-closures.json")
+    path.put(StateKind.READY_CLOSURE, "current", state)
 
     with pytest.raises(ReadyClosureError, match="schema is invalid"):
         load(path)
 
 
+def test_legacy_closure_reader_validates_and_normalizes_fifo(tmp_path: Path) -> None:
+    path = tmp_path / "ready-closures.json"
+    path.write_text(dumps({"version": 1, "closures": [{"next_sequence": 4, "reason": "absence"}]}), encoding="utf-8")
+
+    assert legacy_closures(path) == {
+        "version": 1,
+        "closures": [{"next_sequence": 4, "reason": "absence"}],
+    }
+    assert legacy_closures(tmp_path / "missing.json") is None
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"version": 2, "closures": []}, "schema"),
+        ({"version": 1, "closures": [{"next_sequence": True, "reason": "absence"}]}, "frontier"),
+        (
+            {
+                "version": 1,
+                "closures": [
+                    {"next_sequence": 5, "reason": "absence"},
+                    {"next_sequence": 4, "reason": "absence"},
+                ],
+            },
+            "out of order",
+        ),
+    ],
+)
+def test_legacy_closure_reader_rejects_invalid_fifo(tmp_path: Path, document: object, message: str) -> None:
+    path = tmp_path / "ready-closures.json"
+    path.write_text(dumps(document), encoding="utf-8")
+
+    with pytest.raises(ReadyClosureError, match=message):
+        legacy_closures(path)
+
+
+def test_legacy_closure_reader_rejects_symlinks(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text(dumps({"version": 1, "closures": []}), encoding="utf-8")
+    link = tmp_path / "ready-closures.json"
+    link.symlink_to(target)
+
+    with pytest.raises(ReadyClosureError, match="symlink"):
+        legacy_closures(link)
+
+
 def test_append_creates_missing_nested_parent_directories(tmp_path: Path) -> None:
-    path = tmp_path / "missing" / "nested" / "ready-closures.json"
+    path = _state_db(tmp_path / "missing" / "nested" / "ready-closures.json")
 
     closure = append(path, 10, "absence")
 
-    assert path.parent.is_dir()
+    assert path.path.parent.is_dir()
     assert load(path) == (closure,)
 
 
 @pytest.mark.parametrize("next_sequence", [-1, True, 1.5, "1"])
 def test_append_rejects_invalid_frontier_without_changing_queue(tmp_path: Path, next_sequence: object) -> None:
-    path = tmp_path / "ready-closures.json"
+    path = _state_db(tmp_path / "ready-closures.json")
     original = append(path, 0, "absence")
-    original_bytes = path.read_bytes()
+    original_payload = path.get(StateKind.READY_CLOSURE, "current")
 
     with pytest.raises(ReadyClosureError, match="frontier is invalid"):
         append(path, next_sequence, "restart_interrupted")  # type: ignore[arg-type]
 
-    assert path.read_bytes() == original_bytes
+    assert path.get(StateKind.READY_CLOSURE, "current") == original_payload
     assert load(path) == (original,)
 
 
 @pytest.mark.parametrize("reason", ["", 1, None])
 def test_append_rejects_invalid_reason_without_changing_queue(tmp_path: Path, reason: object) -> None:
-    path = tmp_path / "ready-closures.json"
+    path = _state_db(tmp_path / "ready-closures.json")
     original = append(path, 0, "absence")
-    original_bytes = path.read_bytes()
+    original_payload = path.get(StateKind.READY_CLOSURE, "current")
 
     with pytest.raises(ReadyClosureError, match="reason is invalid"):
         append(path, 1, reason)  # type: ignore[arg-type]
 
-    assert path.read_bytes() == original_bytes
+    assert path.get(StateKind.READY_CLOSURE, "current") == original_payload
     assert load(path) == (original,)
 
 
 def test_coalesce_keeps_latest_legacy_closure_and_handles_missing_or_singleton(tmp_path: Path) -> None:
-    path = tmp_path / "ready-closures.json"
+    path = _state_db(tmp_path / "ready-closures.json")
     legacy = {
         "version": 1,
         "closures": [
@@ -187,40 +243,39 @@ def test_coalesce_keeps_latest_legacy_closure_and_handles_missing_or_singleton(t
             {"next_sequence": 20, "reason": "restart_interrupted"},
         ],
     }
-    path.write_text(dumps(legacy), encoding="utf-8")
+    path.put(StateKind.READY_CLOSURE, "current", legacy)
     newest = ReadyClosure(20, "restart_interrupted")
 
     assert coalesce(path) == (newest,)
     assert load(path) == (newest,)
-    assert loads(path.read_text(encoding="utf-8"))["closures"] == [
-        {"next_sequence": 20, "reason": "restart_interrupted"}
-    ]
+    persisted = path.get(StateKind.READY_CLOSURE, "current")
+    assert persisted is not None
+    assert persisted["closures"] == [{"next_sequence": 20, "reason": "restart_interrupted"}]
 
-    missing = tmp_path / "missing.json"
+    missing = _state_db(tmp_path / "missing.json")
     assert coalesce(missing) == ()
-    assert not missing.exists()
+    assert missing.get(StateKind.READY_CLOSURE, "current") is None
 
-    singleton = tmp_path / "singleton.json"
+    singleton = _state_db(tmp_path / "singleton.json")
     only = append(singleton, 30, "absence")
-    singleton_bytes = singleton.read_bytes()
+    singleton_payload = singleton.get(StateKind.READY_CLOSURE, "current")
     assert coalesce(singleton) == (only,)
     assert load(singleton) == (only,)
-    assert singleton.read_bytes() == singleton_bytes
+    assert singleton.get(StateKind.READY_CLOSURE, "current") == singleton_payload
 
 
 def test_coalesce_accepts_legacy_fifo_with_equal_frontiers(tmp_path: Path) -> None:
-    path = tmp_path / "equal-frontiers.json"
-    path.write_text(
-        dumps(
-            {
-                "version": 1,
-                "closures": [
-                    {"next_sequence": 30, "reason": "absence"},
-                    {"next_sequence": 30, "reason": "recovery_exhausted"},
-                ],
-            }
-        ),
-        encoding="utf-8",
+    path = _state_db(tmp_path / "equal-frontiers.json")
+    path.put(
+        StateKind.READY_CLOSURE,
+        "current",
+        {
+            "version": 1,
+            "closures": [
+                {"next_sequence": 30, "reason": "absence"},
+                {"next_sequence": 30, "reason": "recovery_exhausted"},
+            ],
+        },
     )
     first = ReadyClosure(30, "absence")
     newest = ReadyClosure(30, "recovery_exhausted")
@@ -233,43 +288,43 @@ def test_coalesce_accepts_legacy_fifo_with_equal_frontiers(tmp_path: Path) -> No
 def test_singleton_coalesce_succeeds_when_durable_rewrite_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "ready-closures.json"
+    path = _state_db(tmp_path / "ready-closures.json")
     only = append(path, 30, "absence")
-    original_bytes = path.read_bytes()
+    original_payload = path.get(StateKind.READY_CLOSURE, "current")
 
     def reject_fsync(_fd: int) -> None:
         raise OSError("unexpected rewrite")
 
-    monkeypatch.setattr(os, "fsync", reject_fsync)
+    monkeypatch.setattr("omi_collector.capture.adapters.ready_closures._write", lambda *_: reject_fsync(0))
 
     assert coalesce(path) == (only,)
-    assert path.read_bytes() == original_bytes
+    assert path.get(StateKind.READY_CLOSURE, "current") == original_payload
 
 
 def test_begin_visit_returns_existing_non_drained_closure_unchanged(tmp_path: Path) -> None:
-    path = tmp_path / "ready-closures.json"
+    path = _state_db(tmp_path / "ready-closures.json")
     previous = append(path, 30, "absence")
-    original_bytes = path.read_bytes()
+    original_payload = path.get(StateKind.READY_CLOSURE, "current")
 
     assert begin_visit(path) == previous
-    assert path.read_bytes() == original_bytes
+    assert path.get(StateKind.READY_CLOSURE, "current") == original_payload
 
 
 @pytest.mark.parametrize("queue_state", ["empty", "mismatched_head"])
 def test_remove_rejects_empty_or_mismatched_queue_without_changing_bytes(tmp_path: Path, queue_state: str) -> None:
-    path = tmp_path / "ready-closures.json"
+    path = _state_db(tmp_path / "ready-closures.json")
     queued = append(path, 30, "absence")
     if queue_state == "empty":
         remove(path, queued)
         rejected = queued
     else:
         rejected = ReadyClosure(31, "absence")
-    original_bytes = path.read_bytes()
+    original_payload = path.get(StateKind.READY_CLOSURE, "current")
 
     with pytest.raises(ReadyClosureError):
         remove(path, rejected)
 
-    assert path.read_bytes() == original_bytes
+    assert path.get(StateKind.READY_CLOSURE, "current") == original_payload
 
 
 def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_path: Path) -> None:
@@ -288,9 +343,7 @@ def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_pa
     assert store.recover_and_publish().state == "waiting"
     assert publication.bundle_path.exists()
     assert not tuple(ready.iterdir())
-    assert loads(store.ready_closures_path.read_text())["closures"] == [
-        {"next_sequence": 11, "reason": "legacy_prefix_publication"}
-    ]
+    assert closure_rows(store) == [{"next_sequence": 11, "reason": "legacy_prefix_publication"}]
 
 
 def test_interrupted_close_publishes_ordinary_pending_prefix(tmp_path: Path) -> None:
@@ -299,6 +352,7 @@ def test_interrupted_close_publishes_ordinary_pending_prefix(tmp_path: Path) -> 
     closure = store.close_pending_prefix("absence")
 
     assert closure is not None and closure.next_sequence == 11
-    assert (attempt.path / "prefix-publication.json").is_file()
-    assert (attempt.path / "terminal-retired.json").is_file()
+    attempt_state = attempt_payload(store, attempt.attempt_id)
+    assert attempt_state is not None and attempt_state["prefix_publication"] is not None
+    assert attempt_state["terminal_retirement"] is not None
     assert store.pending_attempts() == ()

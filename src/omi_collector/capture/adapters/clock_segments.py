@@ -5,8 +5,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from itertools import pairwise
+from typing import TYPE_CHECKING
 
-from .clock_observations import ClockObservation
+from ..domain.clock_state import ClockRange, ClockState
+
+if TYPE_CHECKING:
+    from .legacy_clock_import import ClockObservation
 
 _RTC_QUANTIZATION_UNCERTAINTY_SECONDS = 1.0
 
@@ -103,6 +107,16 @@ class ClockSegmentMap:
             left.next_sequence > right.start_sequence for left, right in pairwise(ordered)
         ):
             raise ClockSegmentError("clock segments overlap or are unordered")
+
+    @classmethod
+    def from_state(cls, state: ClockState) -> ClockSegmentMap:
+        segments = tuple(
+            segment
+            for item in state.ranges
+            if item.offset_seconds is not None
+            for segment in _project_range(item, state)
+        )
+        return cls(segments)
 
     def utc_for(self, sequence: int, raw_timestamp: int) -> float | None:
         """Return UTC only when one confirmed segment owns the record."""
@@ -225,3 +239,33 @@ def _slice(segment: ClockSegment, start: int, end: int) -> ClockSegment:
         segment.uncertainty_seconds,
         segment.confidence,
     )
+
+
+def _segment(item: ClockRange) -> ClockSegment:
+    if item.offset_seconds is None or item.uncertainty_seconds is None:
+        raise ClockSegmentError("unknown range cannot be projected")
+    return ClockSegment(
+        item.source_id,
+        item.start_sequence,
+        item.next_sequence,
+        item.offset_seconds,
+        item.uncertainty_seconds,
+        "approximate" if item.confidence == "approximate" else "confirmed",
+    )
+
+
+def _project_range(item: ClockRange, state: ClockState) -> tuple[ClockSegment, ...]:
+    segment = _segment(item)
+    intent = state.intent
+    if intent is None or intent.phase != "uncertain":
+        return (segment,)
+    start = intent.write_sequence_before
+    end = intent.write_sequence_after
+    if item.next_sequence <= start or (end is not None and item.start_sequence >= end):
+        return (segment,)
+    result: list[ClockSegment] = []
+    if item.start_sequence < start:
+        result.append(_slice(segment, item.start_sequence, start))
+    if end is not None and item.next_sequence > end:
+        result.append(_slice(segment, end, item.next_sequence))
+    return tuple(result)

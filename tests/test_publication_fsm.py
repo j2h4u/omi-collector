@@ -15,15 +15,15 @@ from typing import IO
 
 import pytest
 
-from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
+from omi_collector.capture.adapters.bundle_contract import BundleManifest
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import CollectorConfig, ReadyConfig, RetryConfig
+from staging_test_factory import StagingStore
 
 
 def _store(tmp_path: Path, *, threshold: float = 0.02, backoff: float = 0.05) -> StagingStore:
@@ -51,7 +51,6 @@ def _draft(store: StagingStore, name: str, start: int, count: int = 1) -> Path:
     (path / "records.bin").write_bytes(raw)
     manifest = BundleManifest(2, start, start + count, count, RECORD_SIZE, digest)
     (path / "manifest.json").write_text(dumps(manifest.as_dict()), encoding="utf-8")
-    (path / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
     return path
 
 
@@ -113,7 +112,6 @@ def test_conflicting_overlap_stays_flat_across_real_driver_wakes_and_new_input(
     (conflict / "manifest.json").write_text(
         dumps(BundleManifest(2, 100, 101, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
     )
-    (conflict / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
     store.append_ready_closure(101, "drained")
     counts = _count_raw_reads(monkeypatch)
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
@@ -133,9 +131,6 @@ def test_conflicting_overlap_stays_flat_across_real_driver_wakes_and_new_input(
         (conflict / "records.bin").write_bytes(repaired)
         (conflict / "manifest.json").write_text(
             dumps(BundleManifest(2, 100, 101, 1, RECORD_SIZE, repaired_digest).as_dict()), encoding="utf-8"
-        )
-        (conflict / "receipt.json").write_text(
-            dumps(SealedReceipt("a" * 32, repaired_digest).as_dict()), encoding="utf-8"
         )
         assert store.recover_and_publish().state is ReadyOutcomeState.PUBLISHED
         assert counts[1] > first[1]
@@ -160,7 +155,7 @@ def test_corrupt_raw_verdict_is_reused_until_same_path_is_repaired(
 
     blocked = store.recover_and_publish()
     assert blocked.state is ReadyOutcomeState.BLOCKED
-    assert blocked.reason == "draft bundle records do not match its receipt"
+    assert blocked.reason == "draft bundle records do not match its manifest"
     initial = tuple(counts)
     assert initial[0] > 0 and initial[1] > 0
     for _ in range(3):
@@ -172,7 +167,7 @@ def test_corrupt_raw_verdict_is_reused_until_same_path_is_repaired(
     assert tuple(counts) == initial
 
     replacement = _draft(store, "replacement", 100)
-    for name in ("records.bin", "manifest.json", "receipt.json"):
+    for name in ("records.bin", "manifest.json"):
         (replacement / name).replace(corrupt / name)
     replacement.rmdir()
     published = store.recover_and_publish()

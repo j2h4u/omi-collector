@@ -6,8 +6,6 @@ import json
 import os
 import re
 import stat
-import tempfile
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -15,6 +13,7 @@ from pathlib import Path
 from typing import cast
 
 from ..domain.ring_protocol import RECORD_SIZE
+from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction
 from .staging_contract import StagingError
 
 _SCHEMA_VERSION = 1
@@ -66,48 +65,65 @@ class ConfirmedLossFact:
 class ConfirmedLossLedger:
     """Atomic bounded snapshot ledger; callers serialize writers with the spool lease."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, db: StateDB) -> None:
+        self.db = db
 
     def initialize(self, *, allow_create: bool) -> None:
         """Create an empty first-use ledger, never recreating one after status was initialized."""
-        ledger_exists = os.path.lexists(self.path)
-        if ledger_exists:
-            self._read_ledger()
-            return
-        if not allow_create:
-            raise ConfirmedLossError("confirmed-loss ledger is missing after status initialization")
-        self._write_ledger(())
+        try:
+            with self.db.transaction() as transaction:
+                document = transaction.get(StateKind.CONFIRMED_LOSS, "ledger")
+                if document is not None:
+                    self._decode_ledger(document)
+                    return
+                if not allow_create:
+                    raise ConfirmedLossError("confirmed-loss ledger is missing after status initialization")
+                self._write_ledger((), transaction)
+        except StateDBError as error:
+            raise ConfirmedLossError("confirmed-loss database initialization failed") from error
 
     def read(self) -> tuple[ConfirmedLossFact, ...]:
-        return self._read_ledger()
+        try:
+            return self._read_ledger()
+        except StateDBError as error:
+            raise ConfirmedLossError("confirmed-loss database read failed") from error
 
     def record(self, attempt_id: str, start_sequence: int, end_sequence: int, occurred_at: str) -> str:
-        facts = self._read_ledger()
-        loss_id = _loss_id(attempt_id, start_sequence, end_sequence)
-        count = end_sequence - start_sequence
-        fact = ConfirmedLossFact(
-            loss_id=loss_id,
-            attempt_id=attempt_id,
-            start_sequence=start_sequence,
-            end_sequence=end_sequence,
-            occurred_at=occurred_at,
-            missing_record_count=count,
-            missing_raw_bytes=count * RECORD_SIZE,
-        )
-        _validate_fact(fact)
-        if any(existing.loss_id == loss_id for existing in facts):
-            return loss_id
-        self._write_ledger((*facts, fact))
-        return loss_id
-
-    def _read_ledger(self) -> tuple[ConfirmedLossFact, ...]:
-        payload = _read_bounded_regular_file(self.path, _MAX_LEDGER_BYTES)
         try:
-            document = cast(object, json.loads(payload))
-            if not isinstance(document, dict):
-                raise ValueError
-            ledger = cast(dict[str, object], document)
+            with self.db.transaction() as transaction:
+                facts = self._read_ledger(transaction)
+                loss_id = _loss_id(attempt_id, start_sequence, end_sequence)
+                count = end_sequence - start_sequence
+                fact = ConfirmedLossFact(
+                    loss_id=loss_id,
+                    attempt_id=attempt_id,
+                    start_sequence=start_sequence,
+                    end_sequence=end_sequence,
+                    occurred_at=occurred_at,
+                    missing_record_count=count,
+                    missing_raw_bytes=count * RECORD_SIZE,
+                )
+                _validate_fact(fact)
+                if any(existing.loss_id == loss_id for existing in facts):
+                    return loss_id
+                self._write_ledger((*facts, fact), transaction)
+                return loss_id
+        except StateDBError as error:
+            raise ConfirmedLossError("confirmed-loss database write failed") from error
+
+    def _read_ledger(self, transaction: StateTransaction | None = None) -> tuple[ConfirmedLossFact, ...]:
+        document = (
+            transaction.get(StateKind.CONFIRMED_LOSS, "ledger")
+            if transaction is not None
+            else self.db.get(StateKind.CONFIRMED_LOSS, "ledger")
+        )
+        if document is None:
+            raise ConfirmedLossError("confirmed-loss ledger is missing")
+        return self._decode_ledger(document)
+
+    @staticmethod
+    def _decode_ledger(ledger: dict[str, object]) -> tuple[ConfirmedLossFact, ...]:
+        try:
             if set(ledger) != {"schema_version", "losses"}:
                 raise ValueError
             if type(ledger["schema_version"]) is not int or ledger["schema_version"] != _SCHEMA_VERSION:
@@ -122,71 +138,45 @@ class ConfirmedLossLedger:
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise ConfirmedLossError("confirmed-loss ledger is malformed") from error
 
-    def _write_ledger(self, facts: tuple[ConfirmedLossFact, ...]) -> None:
-        self._atomic_write(
-            self.path,
-            json.dumps(
-                {"schema_version": _SCHEMA_VERSION, "losses": [fact.as_dict() for fact in facts]},
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-            + b"\n",
-        )
-
-    def _atomic_write(self, target: Path, payload: bytes) -> None:
-        temporary: str | None = None
-        try:
-            if len(payload) > _MAX_LEDGER_BYTES:
-                raise ConfirmedLossError("confirmed-loss ledger reached its configured size limit")
-            target.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-            descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-            with os.fdopen(descriptor, "wb") as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            Path(temporary).replace(target)
-            directory = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except ConfirmedLossError:
-            raise
-        except OSError as error:
-            if temporary is not None:
-                with suppress(OSError):
-                    Path(temporary).unlink()
-            raise ConfirmedLossError("confirmed-loss ledger write failed") from error
+    def _write_ledger(self, facts: tuple[ConfirmedLossFact, ...], transaction: StateTransaction) -> None:
+        document = {"schema_version": _SCHEMA_VERSION, "losses": [fact.as_dict() for fact in facts]}
+        if len(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()) > _MAX_LEDGER_BYTES:
+            raise ConfirmedLossError("confirmed-loss ledger reached its configured size limit")
+        transaction.put(StateKind.CONFIRMED_LOSS, "ledger", document)
 
 
-def read_confirmed_losses(path: Path, *, allow_missing: bool = False) -> tuple[ConfirmedLossFact, ...]:
+def read_confirmed_losses(db: StateDB, *, allow_missing: bool = False) -> tuple[ConfirmedLossFact, ...]:
     """Read only initialized, bounded, strict durable evidence."""
-    if not os.path.lexists(path):
-        if allow_missing:
-            return ()
-        raise ConfirmedLossError("confirmed-loss ledger is missing")
-    return ConfirmedLossLedger(path).read()
+    try:
+        if db.get(StateKind.CONFIRMED_LOSS, "ledger") is None:
+            if allow_missing:
+                return ()
+            raise ConfirmedLossError("confirmed-loss ledger is missing")
+        return ConfirmedLossLedger(db).read()
+    except StateDBError as error:
+        raise ConfirmedLossError("confirmed-loss database read failed") from error
 
 
-def _read_bounded_regular_file(path: Path, maximum: int) -> bytes:
+def parse_legacy_confirmed_loss(path: Path) -> tuple[ConfirmedLossFact, ...]:
+    """Strictly decode the old bounded ledger for the offline state importer."""
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as error:
-        raise ConfirmedLossError("confirmed-loss ledger is missing or unsafe") from error
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
-            raise ConfirmedLossError("confirmed-loss ledger is unsafe or oversized")
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            payload = stream.read(maximum + 1)
-    except OSError as error:
-        raise ConfirmedLossError("confirmed-loss ledger is unreadable") from error
-    finally:
-        os.close(descriptor)
-    if len(payload) > maximum:
-        raise ConfirmedLossError("confirmed-loss ledger is oversized")
-    return payload
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_LEDGER_BYTES:
+                raise ValueError("legacy loss ledger is unsafe or oversized")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                payload = stream.read(_MAX_LEDGER_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(payload) > _MAX_LEDGER_BYTES:
+            raise ValueError("legacy loss ledger is oversized")
+        document = cast(object, json.loads(payload))
+        if not isinstance(document, dict):
+            raise ValueError("legacy ledger must be an object")
+        return ConfirmedLossLedger._decode_ledger(cast(dict[str, object], document))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ConfirmedLossError("legacy confirmed-loss ledger is malformed or unsafe") from error
 
 
 def _decode_fact(value: object) -> ConfirmedLossFact:

@@ -9,9 +9,9 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter, StagingWriterStateError, ThreadAffinityError
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
+from staging_test_factory import StagingStore, attempt_payload
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -39,12 +39,14 @@ def _begin(writer: StagingWriter, start: int = 100, count: int = 2) -> None:
 
 def test_construction_does_not_touch_disk(tmp_path: Path) -> None:
     root = tmp_path / "staging"
+    store = StagingStore(root, _capture_root(tmp_path))
+    entries_before = tuple(root.iterdir())
 
-    writer = StagingWriter(StagingStore(root, _capture_root(tmp_path)), 100, 2)
+    writer = StagingWriter(store, 100, 2)
 
-    assert not root.exists()
+    assert tuple(root.iterdir()) == entries_before
     writer.close()
-    assert not root.exists()
+    assert tuple(root.iterdir()) == entries_before
 
 
 def test_writer_maps_arena_offsets_and_owns_streaming_mutations(tmp_path: Path) -> None:
@@ -149,19 +151,19 @@ def test_target_rejects_direct_cross_thread_calls_after_first_call(tmp_path: Pat
 
 
 def test_prepare_is_idempotent_and_data_waits_for_each_read_begin(tmp_path: Path) -> None:
-    writer = StagingWriter(_store(tmp_path), 100, 3)
+    store = _store(tmp_path)
+    writer = StagingWriter(store, 100, 3)
     try:
         descriptor = writer.prepare()
         assert writer.prepare() == descriptor
         raw = tmp_path / "attempts" / descriptor.attempt_id / "records.bin"
-        checkpoint = raw.with_name("checkpoint.json")
-        before = (raw.read_bytes(), checkpoint.read_bytes())
+        before = (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id))
 
         with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
             writer.append_chunk(0, memoryview(_record(1)))
         with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
             writer.checkpoint()
-        assert (raw.read_bytes(), checkpoint.read_bytes()) == before
+        assert (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id)) == before
 
         prefix = writer.prepare_leg(100, 3)
         assert prefix.record_count == 0
@@ -187,20 +189,20 @@ def test_prepare_is_idempotent_and_data_waits_for_each_read_begin(tmp_path: Path
 
 
 def test_invalid_append_scalars_and_empty_data_leave_persisted_bytes_unchanged(tmp_path: Path) -> None:
-    writer = StagingWriter(_store(tmp_path), 100, 2)
+    store = _store(tmp_path)
+    writer = StagingWriter(store, 100, 2)
     try:
         descriptor = writer.prepare()
         writer.read_begin(ReadBeginNotification(100, 2))
         raw = tmp_path / "attempts" / descriptor.attempt_id / "records.bin"
-        checkpoint = raw.with_name("checkpoint.json")
-        before = (raw.read_bytes(), checkpoint.read_bytes())
+        before = (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id))
 
         for offset, error in ((True, TypeError), ("0", TypeError), (-1, ValueError)):
             with pytest.raises(error):
                 writer.append_chunk(cast(int, offset), memoryview(_record(1)))
         with pytest.raises(ValueError, match="positive multiple"):
             writer.append_chunk(0, memoryview(b""))
-        assert (raw.read_bytes(), checkpoint.read_bytes()) == before
+        assert (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id)) == before
     finally:
         writer.close()
 
@@ -255,14 +257,13 @@ def test_close_flushes_raw_before_releasing_lease_and_resume_adopts_raw_tail(tmp
         descriptor = writer.prepare()
         writer.read_begin(ReadBeginNotification(100, 1))
         writer.append_chunk(0, memoryview(_record(1)))
-        checkpoint = tmp_path / "attempts" / descriptor.attempt_id / "checkpoint.json"
-        checkpoint_before_close = checkpoint.read_bytes()
+        state_before_close = attempt_payload(store, descriptor.attempt_id)
         writer.close()
     finally:
         writer.close()
 
     assert lock_checks == [True]
-    assert checkpoint.read_bytes() == checkpoint_before_close
+    assert attempt_payload(store, descriptor.attempt_id) == state_before_close
     with store.device_lock(operation="post_close_probe"):
         pass
 

@@ -7,8 +7,9 @@ import shutil
 import stat
 import time
 from collections.abc import Callable
-from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 from ..domain.quarantine_machine import (
@@ -19,23 +20,23 @@ from ..domain.quarantine_machine import (
 from ..domain.quarantine_machine import (
     transition as quarantine_transition,
 )
+from .collector_state_db import StateDBError, StateKind
 from .publication import (
     PrefixPublicationEvidence,
     TerminalRetirementEvidence,
+    _prefix_destination_for,
     _prefix_publication_matches,
     _recoverable_prefix_marker_matches,
     _terminal_retired_marker_matches,
     is_published_attempt,
 )
+from .ready_bundles import ReadyBundleError, _bundle_id, _BundleFacts, _read_ledger
 from .recovery import _published_prefix
 from .staging_contract import (
     _MANIFEST_NAME,
-    _PREFIX_PUBLICATION_NAME,
     _PUBLISHED_QUARANTINE_NAME,
     _PUBLISHED_QUARANTINE_STATE,
     _RAW_NAME,
-    _RECEIPT_NAME,
-    _TERMINAL_RETIRED_NAME,
     _TERMINAL_RETIREMENT_VERSION,
     _UNPROCESSABLE_QUARANTINE_NAME,
     _UNPROCESSABLE_QUARANTINE_STATE,
@@ -43,10 +44,13 @@ from .staging_contract import (
     AttemptDescriptor,
     AttemptStateError,
     CollisionError,
+    DurablePrefix,
     MaintenanceDeferredError,
     PendingAttemptError,
     StagingError,
+    _descriptor_from_json,
     _validate_attempt_id,
+    _validate_descriptor,
     _validate_terminalized_at,
 )
 from .staging_filesystem import (
@@ -66,6 +70,26 @@ def _wall_clock_ns() -> int:
 
 def _seconds_to_nanoseconds(seconds: float) -> int:
     return int(seconds * 1_000_000_000)
+
+
+@dataclass(frozen=True, slots=True)
+class _QuarantineMoveIntent:
+    source: Path
+    destination: Path
+    attempt_id: str | None
+    opaque: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MoveSourceLocation:
+    """Observed source details needed to replay one interrupted move."""
+
+    name: str
+    root: str
+    path: Path
+    exists: bool
+    destination_matches: bool
 
 
 def quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tuple[Path, ...]:
@@ -104,9 +128,14 @@ def quarantine_attempt_source(filesystem: StagingFilesystem, attempt_id: str) ->
         destination_root = filesystem.quarantine_root
         _ensure_quarantine_directory(filesystem, destination_root)
         destination = _quarantine_source_path(destination_root, path.name)
+        _begin_quarantine_move(
+            filesystem,
+            _QuarantineMoveIntent(path, destination, descriptor.attempt_id, False, "attempt source preserved"),
+        )
         path.replace(destination)
         _sync_directory(destination.parent, filesystem._fsync)
         _sync_directory(filesystem.attempts_root, filesystem._fsync)
+        _finish_quarantine_move(filesystem, destination)
         return destination
 
 
@@ -132,13 +161,15 @@ def terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: s
 def _terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: str) -> None:
     path = filesystem.attempts_root / attempt_id
     descriptor = filesystem._read_descriptor(path)
-    if _is_terminal_retired_attempt(path):
+    if _is_terminal_retired_attempt(filesystem, path):
         return
-    if _has_terminal_retirement_marker(path):
+    if _has_terminal_retirement_marker(filesystem, path):
         raise AttemptStateError("terminal-retired marker is invalid")
-    prefix_marker = path / _PREFIX_PUBLICATION_NAME
-    _require_regular_file(prefix_marker, "recoverable prefix publication marker")
-    marker = PrefixPublicationEvidence.from_json(_read_json(prefix_marker))
+    state = filesystem._read_attempt_row(attempt_id)
+    raw_marker = state["prefix_publication"]
+    if not isinstance(raw_marker, dict):
+        raise AttemptStateError("recoverable prefix publication marker is missing")
+    marker = PrefixPublicationEvidence.from_json(raw_marker)
     if not _prefix_publication_matches(
         path,
         descriptor,
@@ -150,19 +181,13 @@ def _terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: 
     _published_prefix(path, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
     terminalized_at_unix_ns = _wall_clock_ns()
     _validate_terminalized_at(terminalized_at_unix_ns)
-    terminal_marker = path / _TERMINAL_RETIRED_NAME
     try:
         _sync_directory(path, filesystem._fsync)
-        filesystem._write_json_atomic(
-            terminal_marker,
-            TerminalRetirementEvidence(terminalized_at_unix_ns).as_dict(),
+        filesystem._write_attempt_field(
+            attempt_id, "terminal_retirement", TerminalRetirementEvidence(terminalized_at_unix_ns).as_dict()
         )
         _sync_directory(path, filesystem._fsync)
     except BaseException:
-        with suppress(OSError):
-            terminal_marker.unlink()
-        with suppress(OSError):
-            _sync_directory(path, filesystem._fsync)
         raise
 
 
@@ -205,6 +230,8 @@ def sweep_terminal_retired(
                 break
             shutil.rmtree(entry)
             _sync_directory(filesystem.attempts_root, filesystem._fsync)
+            with filesystem.state_db.transaction() as transaction:
+                transaction.delete(StateKind.ATTEMPT, entry.name)
             removed.append(entry)
     return tuple(removed)
 
@@ -218,9 +245,52 @@ def _terminal_retired_expired(
     mode = entry.lstat().st_mode
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         return False
-    filesystem._read_descriptor(entry)
-    terminalized_at = _terminal_retired_at(entry)
+    descriptor = filesystem._read_descriptor(entry)
+    _published_prefix(entry, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
+    attempt_state = filesystem._read_attempt_row(descriptor.attempt_id)
+    raw_prefix = attempt_state["prefix_publication"]
+    if not isinstance(raw_prefix, dict):
+        return False
+    prefix_marker = PrefixPublicationEvidence.from_json(raw_prefix)
+    if not _prefix_publication_matches(
+        entry,
+        descriptor,
+        prefix_marker,
+        filesystem=filesystem,
+        io_chunk_bytes=filesystem._durability.io_chunk_bytes,
+    ):
+        prefix = _published_prefix(entry, descriptor, filesystem, io_chunk_bytes=filesystem._durability.io_chunk_bytes)
+        destination = _prefix_destination_for(filesystem.capture_root, prefix)
+        if os.path.lexists(destination) or not _retired_ready_publication_matches(filesystem, prefix):
+            return False
+    terminalized_at = _terminal_retired_at(filesystem, descriptor.attempt_id)
     return terminalized_at is not None and now_unix_ns - terminalized_at >= retention_ns
+
+
+def _retired_ready_publication_matches(filesystem: StagingFilesystem, prefix: DurablePrefix) -> bool:
+    """Authenticate the exact source prefix through its durable downstream ACK."""
+    if prefix.record_count == 0:
+        return True
+    facts = _BundleFacts(
+        prefix.start_sequence,
+        prefix.next_sequence,
+        prefix.record_count,
+        prefix.raw_sha256,
+    )
+    try:
+        bundles = _read_ledger(filesystem.state_db)["bundles"]
+    except OSError, ReadyBundleError, StateDBError, ValueError:
+        return False
+    assert isinstance(bundles, dict)
+    entry = bundles.get(_bundle_id(facts))
+    return (
+        isinstance(entry, dict)
+        and entry.get("state") == "retired"
+        and entry.get("start_sequence") == prefix.start_sequence
+        and entry.get("next_sequence") == prefix.next_sequence
+        and entry.get("draft_raw_sha256") == prefix.raw_sha256
+        and "gaps" not in entry
+    )
 
 
 def quarantined_attempts(
@@ -229,7 +299,20 @@ def quarantined_attempts(
     should_defer: Callable[[], bool] = _never_defer,
 ) -> tuple[Path, ...]:
     """Return regular quarantined attempt directories without creating roots."""
+    active_lease = filesystem._active_lease
+    if active_lease is not None:
+        filesystem.require_device_lock(active_lease)
+        return _quarantined_attempts_held(filesystem, should_defer)
+    with filesystem.device_lock(operation="quarantined_attempts"):
+        return _quarantined_attempts_held(filesystem, should_defer)
+
+
+def _quarantined_attempts_held(
+    filesystem: StagingFilesystem,
+    should_defer: Callable[[], bool],
+) -> tuple[Path, ...]:
     quarantine_root = filesystem.quarantine_root
+    _reconcile_quarantine_moves(filesystem)
     try:
         mode = quarantine_root.lstat().st_mode
     except FileNotFoundError:
@@ -252,7 +335,7 @@ def quarantined_attempts(
             raise StagingError("quarantine entry cannot be inspected") from error
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
             continue
-        action = quarantine_transition(_quarantine_state(entry), QuarantineEvent.INSPECT).action
+        action = quarantine_transition(_quarantine_state(filesystem, entry), QuarantineEvent.INSPECT).action
         if action not in {QuarantineAction.SALVAGE, QuarantineAction.REAUTHENTICATE}:
             continue
         result.append(entry)
@@ -264,7 +347,6 @@ def mark_quarantine_published(filesystem: StagingFilesystem, source: Path) -> No
     _mark_quarantine(
         filesystem,
         source,
-        _PUBLISHED_QUARANTINE_NAME,
         {
             "version": _TERMINAL_RETIREMENT_VERSION,
             "state": _PUBLISHED_QUARANTINE_STATE,
@@ -280,7 +362,6 @@ def mark_quarantine_unprocessable(filesystem: StagingFilesystem, source: Path, r
     _mark_quarantine(
         filesystem,
         source,
-        _UNPROCESSABLE_QUARANTINE_NAME,
         {
             "version": _TERMINAL_RETIREMENT_VERSION,
             "state": _UNPROCESSABLE_QUARANTINE_STATE,
@@ -290,7 +371,7 @@ def mark_quarantine_unprocessable(filesystem: StagingFilesystem, source: Path, r
     )
 
 
-def _mark_quarantine(filesystem: StagingFilesystem, source: Path, marker_name: str, payload: dict[str, object]) -> None:
+def _mark_quarantine(filesystem: StagingFilesystem, source: Path, payload: dict[str, object]) -> None:
     with filesystem.device_lock(operation="mark_quarantine"):
         root = filesystem.quarantine_root
         try:
@@ -300,12 +381,18 @@ def _mark_quarantine(filesystem: StagingFilesystem, source: Path, marker_name: s
         if len(relative.parts) != 1:
             raise AttemptStateError("quarantine source is not an immediate child")
         _require_regular_directory(source)
-        if any(
-            os.path.lexists(source / existing_name)
-            for existing_name in (_PUBLISHED_QUARANTINE_NAME, _UNPROCESSABLE_QUARANTINE_NAME)
-        ):
+        row = _quarantine_row(filesystem, source)
+        if row["terminal_state"] is not None:
             raise AttemptStateError("quarantine terminal evidence already exists")
-        filesystem._write_json_atomic(source / marker_name, payload)
+        if payload["state"] == _PUBLISHED_QUARANTINE_STATE:
+            row.update(terminal_state="published", terminal_at_unix_ns=payload["published_at_unix_ns"])
+        else:
+            row.update(
+                terminal_state="unprocessable",
+                terminal_at_unix_ns=payload["classified_at_unix_ns"],
+                terminal_reason=payload["reason"],
+            )
+        _put_quarantine_row(filesystem, source.name, row)
 
 
 def sweep_terminal_quarantine(
@@ -320,6 +407,7 @@ def sweep_terminal_quarantine(
     now_unix_ns = _wall_clock_ns()
     removed: list[Path] = []
     with filesystem.device_lock(operation="sweep_terminal_quarantine"):
+        _reconcile_quarantine_moves(filesystem)
         root = filesystem.quarantine_root
         try:
             mode = root.lstat().st_mode
@@ -344,19 +432,25 @@ def _sweep_terminal_quarantine_entry(
     now_unix_ns: int,
     retention_ns: int,
 ) -> bool:
-    if _is_quarantine_sidecar(root, entry):
-        return False
-    state = _quarantine_state(entry)
+    state = _quarantine_state(filesystem, entry)
     if state not in {QuarantineState.PUBLISHED, QuarantineState.UNPROCESSABLE}:
         _classify_unsafe_quarantine_entry(filesystem, entry, now_unix_ns)
         return False
-    terminalized_at = _terminal_quarantine_at(entry)
+    terminalized_at = _terminal_quarantine_at(filesystem, entry)
     if terminalized_at is None or now_unix_ns - terminalized_at < retention_ns:
         return False
     if quarantine_transition(state, QuarantineEvent.RETENTION_EXPIRED).action is not QuarantineAction.DELETE:
         return False
+    row = _quarantine_row(filesystem, entry)
+    row["deletion_pending"] = True
+    _put_quarantine_row(filesystem, entry.name, row)
     _remove_terminal_quarantine_entry(entry)
     _sync_directory(root, filesystem._fsync)
+    with filesystem.state_db.transaction() as transaction:
+        transaction.delete(StateKind.QUARANTINE, entry.name)
+        attempt_id = row["attempt_id"]
+        if isinstance(attempt_id, str):
+            transaction.delete(StateKind.ATTEMPT, attempt_id)
     return True
 
 
@@ -364,12 +458,8 @@ def _remove_terminal_quarantine_entry(entry: Path) -> None:
     mode = entry.lstat().st_mode
     if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
         shutil.rmtree(entry)
-        with suppress(FileNotFoundError):
-            entry.with_name(f"{entry.name}.json").unlink()
     else:
         entry.unlink()
-        with suppress(FileNotFoundError):
-            entry.with_name(f"{entry.name}.json").unlink()
 
 
 def _is_quarantine_sidecar(root: Path, entry: Path) -> bool:
@@ -387,98 +477,255 @@ def _classify_unsafe_quarantine_entry(filesystem: StagingFilesystem, entry: Path
         return
     if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
         return
-    marker = entry.with_name(f"{entry.name}.json")
-    if os.path.lexists(marker):
+    try:
+        row = _quarantine_row(filesystem, entry)
+    except AttemptStateError:
         return
-    filesystem._write_json_atomic(
-        marker,
-        {
-            "version": _TERMINAL_RETIREMENT_VERSION,
-            "state": _UNPROCESSABLE_QUARANTINE_STATE,
-            "classified_at_unix_ns": now_unix_ns,
-            "reason": "quarantine entry is not a regular directory",
-            "original_name": entry.name,
-        },
+    if row["terminal_state"] is not None:
+        return
+    row.update(
+        terminal_state="unprocessable",
+        terminal_at_unix_ns=now_unix_ns,
+        terminal_reason="quarantine entry is not a regular directory",
     )
+    _put_quarantine_row(filesystem, entry.name, row)
 
 
-def _terminal_quarantine_at(entry: Path) -> int | None:
-    """Return the retention timestamp for published or unprocessable evidence."""
-    try:
-        mode = entry.lstat().st_mode
-    except OSError:
-        return None
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        marker_paths = (entry.with_name(f"{entry.name}.json"),)
+_QUARANTINE_FIELDS = frozenset(
+    {
+        "physical_name",
+        "source_name",
+        "source_root",
+        "original_name",
+        "attempt_id",
+        "reason",
+        "opaque",
+        "entry_kind",
+        "move_committed",
+        "source_device",
+        "source_inode",
+        "deletion_pending",
+        "terminal_state",
+        "terminal_at_unix_ns",
+        "terminal_reason",
+    }
+)
+
+
+def legacy_quarantine_row(path: Path) -> dict[str, object]:
+    """Parse one legacy quarantined path, rejecting ambiguous marker state."""
+    mode = path.lstat().st_mode
+    is_directory = stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
+    sidecar = path.with_name(f"{path.name}.json")
+    sidecar_present = os.path.lexists(sidecar)
+    marker_state, marker_value = _legacy_quarantine_terminal(path, is_directory, sidecar, sidecar_present)
+    attempt_id = _legacy_quarantine_attempt_id(path) if is_directory else None
+    if attempt_id is not None:
+        from .staging_filesystem import legacy_attempt_row
+
+        legacy_attempt = legacy_attempt_row(path)
+        raw_descriptor = legacy_attempt["descriptor"]
+        assert isinstance(raw_descriptor, dict)
+        if raw_descriptor.get("attempt_id") != attempt_id:
+            raise AttemptStateError("legacy quarantine attempt identity is inconsistent")
+    original_name = marker_value.get("original_name") if marker_value is not None else attempt_id
+    if not isinstance(original_name, str) or not original_name:
+        original_name = path.name
+    terminal_at = None
+    terminal_reason = None
+    if marker_state == _PUBLISHED_QUARANTINE_STATE:
+        if marker_value is None:
+            raise AttemptStateError("legacy quarantine marker is malformed")
+        terminal_state = "published"
+        terminal_at = marker_value["published_at_unix_ns"]
+    elif marker_state == _UNPROCESSABLE_QUARANTINE_STATE:
+        if marker_value is None:
+            raise AttemptStateError("legacy quarantine marker is malformed")
+        terminal_state = "unprocessable"
+        terminal_at = marker_value["classified_at_unix_ns"]
+        terminal_reason = marker_value["reason"]
     else:
-        marker_paths = (
-            entry / _PUBLISHED_QUARANTINE_NAME,
-            entry / _UNPROCESSABLE_QUARANTINE_NAME,
-            entry.with_name(f"{entry.name}.json"),
-        )
-    for marker_path in marker_paths:
-        if marker_path == entry / _PUBLISHED_QUARANTINE_NAME:
-            expected_state = _PUBLISHED_QUARANTINE_STATE
-        else:
-            expected_state = _UNPROCESSABLE_QUARANTINE_STATE
-        timestamp = _terminal_marker_at(
-            marker_path,
-            expected_state=expected_state,
-            sidecar_entry=entry if marker_path == entry.with_name(f"{entry.name}.json") else None,
-        )
-        if timestamp is not None:
-            return timestamp
-    return None
+        terminal_state = None
+    return {
+        "physical_name": path.name,
+        "source_name": original_name,
+        "source_root": "attempts",
+        "original_name": original_name,
+        "attempt_id": attempt_id,
+        "reason": terminal_reason or "legacy quarantine entry",
+        "opaque": sidecar_present,
+        "entry_kind": "symlink" if stat.S_ISLNK(mode) else "directory" if is_directory else "file",
+        "move_committed": True,
+        "source_device": path.lstat().st_dev,
+        "source_inode": path.lstat().st_ino,
+        "deletion_pending": False,
+        "terminal_state": terminal_state,
+        "terminal_at_unix_ns": terminal_at,
+        "terminal_reason": terminal_reason,
+    }
 
 
-def _quarantine_state(entry: Path) -> QuarantineState:
-    """Classify marker evidence; malformed or contradictory markers stay live."""
+def _legacy_quarantine_terminal(
+    path: Path,
+    is_directory: bool,
+    sidecar: Path,
+    sidecar_present: bool,
+) -> tuple[str | None, dict[str, object] | None]:
+    markers = []
+    if is_directory:
+        markers.extend(
+            (state, path / filename)
+            for state, filename in (
+                (_PUBLISHED_QUARANTINE_STATE, _PUBLISHED_QUARANTINE_NAME),
+                (_UNPROCESSABLE_QUARANTINE_STATE, _UNPROCESSABLE_QUARANTINE_NAME),
+            )
+            if os.path.lexists(path / filename)
+        )
+    if sidecar_present:
+        markers.append((_UNPROCESSABLE_QUARANTINE_STATE, sidecar))
+    if len(markers) > 1 or (not is_directory and not sidecar_present):
+        raise AttemptStateError("legacy quarantine markers are missing or contradictory")
+    if not markers:
+        return None, None
+    state, marker_path = markers[0]
+    sidecar_entry = path if marker_path == sidecar else None
+    if _terminal_marker_at(marker_path, expected_state=state, sidecar_entry=sidecar_entry) is None:
+        raise AttemptStateError("legacy quarantine marker is malformed")
+    value = _read_json(marker_path)
+    if not isinstance(value, dict):
+        raise AttemptStateError("legacy quarantine marker is malformed")
+    return state, value
+
+
+def _legacy_quarantine_attempt_id(path: Path) -> str | None:
+    descriptor_path = path / "attempt.json"
+    if not os.path.lexists(descriptor_path):
+        return None
+    _require_regular_file(descriptor_path, "legacy quarantine descriptor")
+    raw = _read_json(descriptor_path)
+    try:
+        if not isinstance(raw, dict):
+            raise ValueError("descriptor")
+        descriptor = _descriptor_from_json(raw)
+        _validate_descriptor(descriptor, descriptor.attempt_id)
+        return descriptor.attempt_id
+    except (AttemptStateError, TypeError, ValueError) as error:
+        raise AttemptStateError("legacy quarantine descriptor is malformed") from error
+
+
+def _quarantine_row(filesystem: StagingFilesystem, entry: Path) -> dict[str, object]:
+    try:
+        row = filesystem.state_db.get(StateKind.QUARANTINE, entry.name)
+    except (OSError, ValueError, StateDBError) as error:
+        raise AttemptStateError("quarantine state is unreadable") from error
+    if row is None:
+        raise AttemptStateError("quarantine state is missing or malformed")
+    return _validate_quarantine_payload(entry.name, row)
+
+
+def _validate_quarantine_payload(entry_name: str, row: dict[str, object]) -> dict[str, object]:
+    if set(row) != _QUARANTINE_FIELDS:
+        raise AttemptStateError("quarantine state is missing or malformed")
+    if not _valid_quarantine_identity(entry_name, row):
+        raise AttemptStateError("quarantine state is malformed")
+    _validate_quarantine_terminal(row)
+    return row
+
+
+def _validate_quarantine_terminal(row: dict[str, object]) -> None:
+    attempt_id = row["attempt_id"]
+    if attempt_id is not None:
+        if not isinstance(attempt_id, str):
+            raise AttemptStateError("quarantine attempt identity is malformed")
+        try:
+            _validate_attempt_id(attempt_id)
+        except (TypeError, ValueError) as error:
+            raise AttemptStateError("quarantine attempt identity is malformed") from error
+    terminal_state = row["terminal_state"]
+    terminal_at = row["terminal_at_unix_ns"]
+    terminal_reason = row["terminal_reason"]
+    if terminal_state is None:
+        if terminal_at is not None or terminal_reason is not None:
+            raise AttemptStateError("quarantine terminal evidence is contradictory")
+    elif terminal_state == "published":
+        if (
+            isinstance(terminal_at, bool)
+            or not isinstance(terminal_at, int)
+            or terminal_at < 0
+            or terminal_reason is not None
+        ):
+            raise AttemptStateError("quarantine terminal evidence is malformed")
+    elif terminal_state == "unprocessable":
+        if (
+            isinstance(terminal_at, bool)
+            or not isinstance(terminal_at, int)
+            or terminal_at < 0
+            or not isinstance(terminal_reason, str)
+            or not terminal_reason
+        ):
+            raise AttemptStateError("quarantine terminal evidence is malformed")
+    else:
+        raise AttemptStateError("quarantine terminal evidence is invalid")
+
+
+def _valid_quarantine_identity(entry_name: str, row: dict[str, object]) -> bool:
+    return (
+        row["physical_name"] == entry_name
+        and isinstance(row["source_name"], str)
+        and bool(row["source_name"])
+        and row["source_root"] in {"attempts", "spool", "capture"}
+        and isinstance(row["original_name"], str)
+        and bool(row["original_name"])
+        and isinstance(row["reason"], str)
+        and bool(row["reason"])
+        and isinstance(row["opaque"], bool)
+        and row["entry_kind"] in {"directory", "file", "symlink"}
+        and isinstance(row["move_committed"], bool)
+        and not isinstance(row["source_device"], bool)
+        and isinstance(row["source_device"], int)
+        and not isinstance(row["source_inode"], bool)
+        and isinstance(row["source_inode"], int)
+        and isinstance(row["deletion_pending"], bool)
+    )
+
+
+def _put_quarantine_row(filesystem: StagingFilesystem, item_id: str, row: dict[str, object]) -> None:
+    if set(row) != _QUARANTINE_FIELDS:
+        raise AttemptStateError("quarantine state schema is invalid")
+    try:
+        with filesystem.state_db.transaction() as transaction:
+            transaction.put(StateKind.QUARANTINE, item_id, row)
+    except (OSError, ValueError, StateDBError) as error:
+        raise AttemptStateError("quarantine state could not be written") from error
+
+
+def _terminal_quarantine_at(filesystem: StagingFilesystem, entry: Path) -> int | None:
+    """Return the retention timestamp for published or unprocessable evidence."""
+    row = _quarantine_row(filesystem, entry)
+    terminal_at = row["terminal_at_unix_ns"]
+    return (
+        terminal_at
+        if row["terminal_state"] in {"published", "unprocessable"} and isinstance(terminal_at, int)
+        else None
+    )
+
+
+def _quarantine_state(filesystem: StagingFilesystem, entry: Path) -> QuarantineState:
+    """Classify typed database evidence; missing or contradictory state stays live."""
+    result = QuarantineState.INVALID_EVIDENCE
     try:
         mode = entry.lstat().st_mode
-    except OSError:
-        return QuarantineState.INVALID_EVIDENCE
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        return _opaque_quarantine_state(entry)
-    return _directory_quarantine_state(entry)
-
-
-def _opaque_quarantine_state(entry: Path) -> QuarantineState:
-    marker = entry.with_name(f"{entry.name}.json")
-    valid = _terminal_marker_at(
-        marker,
-        expected_state=_UNPROCESSABLE_QUARANTINE_STATE,
-        sidecar_entry=entry,
-    )
-    if valid is not None:
-        return QuarantineState.UNPROCESSABLE
-    return QuarantineState.INVALID_EVIDENCE
-
-
-def _directory_quarantine_state(entry: Path) -> QuarantineState:
-    published_path = entry / _PUBLISHED_QUARANTINE_NAME
-    unprocessable_path = entry / _UNPROCESSABLE_QUARANTINE_NAME
-    sidecar_path = entry.with_name(f"{entry.name}.json")
-    published = _terminal_marker_at(published_path, expected_state=_PUBLISHED_QUARANTINE_STATE)
-    unprocessable = _terminal_marker_at(unprocessable_path, expected_state=_UNPROCESSABLE_QUARANTINE_STATE)
-    sidecar = _terminal_marker_at(
-        sidecar_path,
-        expected_state=_UNPROCESSABLE_QUARANTINE_STATE,
-        sidecar_entry=entry,
-    )
-    has_published = os.path.lexists(published_path)
-    has_unprocessable = os.path.lexists(unprocessable_path)
-    has_sidecar = os.path.lexists(sidecar_path)
-    if (has_sidecar and sidecar is None) or (sidecar is not None and (has_published or has_unprocessable)):
-        return QuarantineState.INVALID_EVIDENCE
-    if sidecar is not None:
-        return QuarantineState.UNPROCESSABLE
-    if published is not None and not has_unprocessable:
-        return QuarantineState.PUBLISHED
-    if unprocessable is not None and not has_published:
-        return QuarantineState.UNPROCESSABLE
-    if has_published or has_unprocessable:
-        return QuarantineState.INVALID_EVIDENCE
-    return QuarantineState.RETRYABLE
+        row = _quarantine_row(filesystem, entry)
+        entry_kind = "symlink" if stat.S_ISLNK(mode) else "directory" if stat.S_ISDIR(mode) else "file"
+        if row["move_committed"] and row["entry_kind"] == entry_kind:
+            result = {
+                "published": QuarantineState.PUBLISHED,
+                "unprocessable": QuarantineState.UNPROCESSABLE,
+                None: QuarantineState.RETRYABLE,
+            }.get(row["terminal_state"], QuarantineState.INVALID_EVIDENCE)
+    except AttemptStateError, OSError:
+        pass
+    return result
 
 
 def _terminal_marker_at(
@@ -536,43 +783,46 @@ def _sidecar_name_matches(entry_name: str, original_name: object) -> bool:
     return len(suffix) == _UUID_HEX_LENGTH and all(character in "0123456789abcdef" for character in suffix)
 
 
-def _terminal_retired_at(path: Path) -> int | None:
-    marker_path = path / _TERMINAL_RETIRED_NAME
-    if not marker_path.exists():
-        return None
+def _terminal_retired_at(filesystem: StagingFilesystem, attempt_id: str) -> int | None:
     try:
-        _require_regular_file(marker_path, "terminal-retired marker")
-        recoverable_marker_path = path / _PREFIX_PUBLICATION_NAME
-        _require_regular_file(recoverable_marker_path, "recoverable prefix publication marker")
-        recoverable_marker = PrefixPublicationEvidence.from_json(_read_json(recoverable_marker_path))
-        if not _recoverable_prefix_marker_matches(
-            recoverable_marker,
-        ):
+        row = filesystem._read_attempt_row(attempt_id)
+        raw_terminal = row["terminal_retirement"]
+        raw_prefix = row["prefix_publication"]
+        if not isinstance(raw_terminal, dict) or not isinstance(raw_prefix, dict):
             return None
-        return _terminal_retired_marker_matches(TerminalRetirementEvidence.from_json(_read_json(marker_path)))
-    except OSError, StagingError, AttemptStateError:
+        prefix = PrefixPublicationEvidence.from_json(raw_prefix)
+        terminal = TerminalRetirementEvidence.from_json(raw_terminal)
+        if not _recoverable_prefix_marker_matches(prefix):
+            return None
+        return _terminal_retired_marker_matches(terminal)
+    except OSError, StagingError, AttemptStateError, TypeError, ValueError:
         return None
 
 
-def _has_terminal_retirement_marker(path: Path) -> bool:
-    return os.path.lexists(path / _TERMINAL_RETIRED_NAME)
+def _has_terminal_retirement_marker(filesystem: StagingFilesystem, path: Path) -> bool:
+    row = filesystem._read_attempt_row(path.name)
+    return row["terminal_retirement"] is not None
 
 
-def _is_terminal_retired_attempt(path: Path) -> bool:
-    return _terminal_retired_at(path) is not None
+def _is_terminal_retired_attempt(filesystem: StagingFilesystem, path: Path) -> bool:
+    descriptor = filesystem._read_descriptor(path)
+    return _terminal_retired_at(filesystem, descriptor.attempt_id) is not None
 
 
 def is_nonblocking_attempt(filesystem: StagingFilesystem, path: Path, descriptor: AttemptDescriptor) -> bool:
-    if _has_terminal_retirement_marker(path):
-        return _is_terminal_retired_attempt(path)
+    if _has_terminal_retirement_marker(filesystem, path):
+        return _is_terminal_retired_attempt(filesystem, path)
     return _is_published_attempt(filesystem, path, descriptor)
 
 
 def _is_published_attempt(filesystem: StagingFilesystem, path: Path, descriptor: AttemptDescriptor) -> bool:
-    prefix_marker = path / _PREFIX_PUBLICATION_NAME
-    if prefix_marker.exists():
+    state = filesystem._read_attempt_row(descriptor.attempt_id)
+    raw_prefix = state["prefix_publication"]
+    if raw_prefix is not None:
         try:
-            marker = PrefixPublicationEvidence.from_json(_read_json(prefix_marker))
+            if not isinstance(raw_prefix, dict):
+                return False
+            marker = PrefixPublicationEvidence.from_json(raw_prefix)
             return _prefix_publication_matches(
                 path,
                 descriptor,
@@ -583,9 +833,8 @@ def _is_published_attempt(filesystem: StagingFilesystem, path: Path, descriptor:
         except OSError, StagingError, TypeError:
             return False
     manifest_path = path / _MANIFEST_NAME
-    receipt_path = path / _RECEIPT_NAME
     raw_path = path / _RAW_NAME
-    if not manifest_path.exists() or not receipt_path.exists() or not raw_path.exists():
+    if not manifest_path.exists() or not raw_path.exists():
         return False
     return is_published_attempt(path, descriptor, filesystem)
 
@@ -638,44 +887,222 @@ def _quarantine_attempts_root(filesystem: StagingFilesystem, reason: str) -> Pat
 
     destination_root = filesystem.quarantine_root
     _ensure_quarantine_directory(filesystem, destination_root)
-    destination, sidecar = _quarantine_paths(destination_root, filesystem.attempts_root.name)
+    destination = _quarantine_source_path(destination_root, filesystem.attempts_root.name)
+    _begin_quarantine_move(
+        filesystem,
+        _QuarantineMoveIntent(filesystem.attempts_root, destination, None, True, reason),
+    )
     filesystem.attempts_root.replace(destination)
     _sync_directory(destination.parent, filesystem._fsync)
+    _sync_directory(filesystem.spool, filesystem._fsync)
+    _finish_quarantine_move(filesystem, destination)
     filesystem._ensure_directory(filesystem.attempts_root)
-    filesystem._write_json_atomic(
-        sidecar,
-        {
-            "version": _TERMINAL_RETIREMENT_VERSION,
-            "state": _UNPROCESSABLE_QUARANTINE_STATE,
-            "classified_at_unix_ns": _wall_clock_ns(),
-            "reason": reason,
-            "original_name": filesystem.attempts_root.name,
-        },
-    )
     return destination
 
 
 def _move_to_quarantine(filesystem: StagingFilesystem, root: Path, entry: Path, reason: str, *, opaque: bool) -> Path:
-    if opaque:
-        destination, sidecar = _quarantine_paths(root, entry.name)
-    else:
-        destination = _quarantine_source_path(root, entry.name)
-        sidecar = None
+    destination = _quarantine_source_path(root, entry.name)
+    attempt_id: str | None = None
+    if not opaque:
+        attempt_id = filesystem._read_descriptor(entry).attempt_id
+    elif root == filesystem.quarantine_root and entry.parent == filesystem.attempts_root:
+        try:
+            mode = entry.lstat().st_mode
+            if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+                _validate_attempt_id(entry.name)
+                attempt_id = entry.name
+        except OSError, AttemptStateError:
+            pass
+    _begin_quarantine_move(filesystem, _QuarantineMoveIntent(entry, destination, attempt_id, opaque, reason))
     entry.replace(destination)
     _sync_directory(destination.parent, filesystem._fsync)
     _sync_directory(filesystem.attempts_root, filesystem._fsync)
-    if sidecar is not None:
-        filesystem._write_json_atomic(
-            sidecar,
-            {
-                "version": _TERMINAL_RETIREMENT_VERSION,
-                "state": _UNPROCESSABLE_QUARANTINE_STATE,
-                "classified_at_unix_ns": _wall_clock_ns(),
-                "reason": reason,
-                "original_name": entry.name,
-            },
-        )
+    _finish_quarantine_move(filesystem, destination)
     return destination
+
+
+def _begin_quarantine_move(
+    filesystem: StagingFilesystem,
+    intent: _QuarantineMoveIntent,
+) -> None:
+    source = intent.source
+    destination = intent.destination
+    attempt_id = intent.attempt_id
+    opaque = intent.opaque
+    reason = intent.reason
+    now = _wall_clock_ns() if opaque else None
+    source_mode = source.lstat().st_mode
+    entry_kind = "symlink" if stat.S_ISLNK(source_mode) else "directory" if stat.S_ISDIR(source_mode) else "file"
+    row: dict[str, object] = {
+        "physical_name": destination.name,
+        "source_name": source.name,
+        "source_root": (
+            "spool"
+            if source == filesystem.attempts_root
+            else "capture"
+            if source.parent == filesystem.capture_root
+            else "attempts"
+        ),
+        "original_name": source.name,
+        "attempt_id": attempt_id,
+        "reason": reason,
+        "opaque": opaque,
+        "entry_kind": entry_kind,
+        "move_committed": False,
+        "source_device": source.lstat().st_dev,
+        "source_inode": source.lstat().st_ino,
+        "deletion_pending": False,
+        "terminal_state": "unprocessable" if opaque else None,
+        "terminal_at_unix_ns": now,
+        "terminal_reason": reason if opaque else None,
+    }
+    try:
+        with filesystem.state_db.transaction() as transaction:
+            if transaction.get(StateKind.QUARANTINE, destination.name) is not None:
+                raise AttemptStateError("quarantine identity already exists")
+            transaction.put(StateKind.QUARANTINE, destination.name, row)
+    except (OSError, ValueError, StateDBError) as error:
+        raise AttemptStateError("quarantine move intent could not be recorded") from error
+
+
+def _finish_quarantine_move(filesystem: StagingFilesystem, destination: Path) -> None:
+    row = _quarantine_row(filesystem, destination)
+    row["move_committed"] = True
+    attempt_id = row["attempt_id"]
+    try:
+        with filesystem.state_db.transaction() as transaction:
+            if isinstance(attempt_id, str):
+                attempt_state = transaction.get(StateKind.ATTEMPT, attempt_id)
+                if attempt_state is not None:
+                    try:
+                        filesystem._validate_attempt_row(attempt_id, attempt_state)
+                    except AttemptStateError, TypeError, ValueError:
+                        # Quarantine owns the raw evidence now. Drop positively
+                        # identified malformed typed state so it cannot poison
+                        # future resume scans or be mistaken for usable data.
+                        transaction.delete(StateKind.ATTEMPT, attempt_id)
+            transaction.put(StateKind.QUARANTINE, destination.name, row)
+    except (OSError, ValueError, StateDBError) as error:
+        raise AttemptStateError("quarantine move could not be committed") from error
+
+
+def _reconcile_quarantine_moves(filesystem: StagingFilesystem) -> None:
+    for item_id, row in filesystem.state_db.list(StateKind.QUARANTINE):
+        _reconcile_quarantine_move(filesystem, item_id, row)
+
+
+def _reconcile_quarantine_move(filesystem: StagingFilesystem, item_id: str, row: dict[str, object]) -> None:
+    source_name, source_root = _validate_move_identity(item_id, row)
+    source_base = {
+        "attempts": filesystem.attempts_root,
+        "spool": filesystem.spool,
+        "capture": filesystem.capture_root,
+    }[source_root]
+    source = source_base / source_name
+    destination = filesystem.quarantine_root / item_id
+    source_exists = os.path.lexists(source)
+    destination_exists = os.path.lexists(destination)
+    destination_matches = destination_exists and _matches_quarantine_identity(row, destination)
+    if destination_exists and not destination_matches:
+        raise StagingError("quarantine destination identity changed")
+    source_exists = _resolve_source_identity(
+        filesystem, row, _MoveSourceLocation(source_name, source_root, source, source_exists, destination_matches)
+    )
+    if row.get("move_committed") is True:
+        _reconcile_committed_move(filesystem, item_id, row, source_exists, destination_exists)
+        return
+    if source_exists == destination_exists:
+        raise StagingError("quarantine move location is ambiguous")
+    if source_exists:
+        source.replace(destination)
+        _sync_directory(destination.parent, filesystem._fsync)
+        _sync_directory(source.parent, filesystem._fsync)
+    _finish_quarantine_move(filesystem, destination)
+
+
+def _resolve_source_identity(
+    filesystem: StagingFilesystem,
+    row: dict[str, object],
+    location: _MoveSourceLocation,
+) -> bool:
+    if not location.exists or _matches_quarantine_identity(row, location.path):
+        return location.exists
+    recreated_root = (
+        row.get("move_committed") is True
+        and location.root == "spool"
+        and location.name == filesystem.attempts_root.name
+        and location.path.is_dir()
+        and not location.path.is_symlink()
+    )
+    if recreated_root or (not row.get("move_committed") and location.destination_matches):
+        return False
+    raise StagingError("quarantine source identity changed")
+
+
+def _validate_move_identity(item_id: str, row: dict[str, object]) -> tuple[str, str]:
+    if not _valid_component(item_id):
+        raise StagingError("quarantine move state is malformed")
+    try:
+        _validate_quarantine_payload(item_id, row)
+    except AttemptStateError as error:
+        raise StagingError("quarantine move state is malformed") from error
+    source_name, source_root = row.get("source_name"), row.get("source_root")
+    if not isinstance(source_name, str) or not _valid_component(source_name):
+        raise StagingError("quarantine move source identity is malformed")
+    if source_root not in {"attempts", "spool", "capture"}:
+        raise StagingError("quarantine move source root is malformed")
+    return source_name, cast(str, source_root)
+
+
+def _reconcile_committed_move(
+    filesystem: StagingFilesystem,
+    item_id: str,
+    row: dict[str, object],
+    source_exists: bool,
+    destination_exists: bool,
+) -> None:
+    if destination_exists and not source_exists:
+        return
+    if not destination_exists and not source_exists:
+        if _terminal_deletion_expired(filesystem, row):
+            _forget_deleted_quarantine(filesystem, item_id, row)
+            return
+        raise StagingError("quarantine source disappeared without durable deletion intent")
+    raise StagingError("quarantine move location is ambiguous")
+
+
+def _terminal_deletion_expired(filesystem: StagingFilesystem, row: dict[str, object]) -> bool:
+    terminal_at = row.get("terminal_at_unix_ns")
+    retention_ns = _seconds_to_nanoseconds(filesystem._terminal_retention_seconds)
+    return (
+        row.get("deletion_pending") is True
+        and row.get("terminal_state") in {"published", "unprocessable"}
+        and isinstance(terminal_at, int)
+        and _wall_clock_ns() - terminal_at >= retention_ns
+    )
+
+
+def _forget_deleted_quarantine(filesystem: StagingFilesystem, item_id: str, row: dict[str, object]) -> None:
+    _sync_directory(filesystem.quarantine_root, filesystem._fsync)
+    with filesystem.state_db.transaction() as transaction:
+        transaction.delete(StateKind.QUARANTINE, item_id)
+        if isinstance(row.get("attempt_id"), str):
+            transaction.delete(StateKind.ATTEMPT, cast(str, row["attempt_id"]))
+
+
+def _valid_component(value: str) -> bool:
+    return bool(value) and value not in {".", ".."} and "/" not in value and "\0" not in value
+
+
+def _matches_quarantine_identity(row: dict[str, object], path: Path) -> bool:
+    try:
+        identity = path.lstat()
+    except OSError:
+        return False
+    kind = "symlink" if stat.S_ISLNK(identity.st_mode) else "directory" if stat.S_ISDIR(identity.st_mode) else "file"
+    return (identity.st_dev, identity.st_ino) == (row.get("source_device"), row.get("source_inode")) and row.get(
+        "entry_kind"
+    ) == kind
 
 
 def _quarantine_paths(root: Path, entry_name: str) -> tuple[Path, Path]:
@@ -745,17 +1172,9 @@ def quarantine_capture_temporary(
     """Move one unsafe capture temporary into quarantine with retryable evidence."""
     destination_root = filesystem.quarantine_root
     _ensure_quarantine_directory(filesystem, destination_root)
-    destination, sidecar = _quarantine_paths(destination_root, f"capture-temporary-{temporary.name}")
+    destination = _quarantine_source_path(destination_root, f"capture-temporary-{temporary.name}")
+    _begin_quarantine_move(filesystem, _QuarantineMoveIntent(temporary, destination, None, True, reason))
     temporary.replace(destination)
     _sync_directory(destination.parent, filesystem._fsync)
     _sync_directory(capture_root, filesystem._fsync)
-    payload = {
-        "version": _TERMINAL_RETIREMENT_VERSION,
-        "state": _UNPROCESSABLE_QUARANTINE_STATE,
-        "classified_at_unix_ns": _wall_clock_ns(),
-        "reason": reason,
-    }
-    if destination.is_dir() and not destination.is_symlink():
-        filesystem._write_json_atomic(destination / _UNPROCESSABLE_QUARANTINE_NAME, payload)
-    else:
-        filesystem._write_json_atomic(sidecar, payload | {"original_name": temporary.name})
+    _finish_quarantine_move(filesystem, destination)

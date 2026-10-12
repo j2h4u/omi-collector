@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import BinaryIO, Protocol, cast
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from .bundle_contract import BundleManifest, SealedReceipt
+from .bundle_contract import BundleManifest
+from .collector_state_db import StateKind
 from .publication import (
     PrefixPublicationEvidence,
     SealResult,
@@ -22,18 +23,14 @@ from .publication import (
 )
 from .recovery import Recovery
 from .staging_contract import (
-    _CHECKPOINT_NAME,
-    _DESCRIPTOR_NAME,
     _MANIFEST_NAME,
-    _PREFIX_PUBLICATION_NAME,
     _RAW_NAME,
-    _RECEIPT_NAME,
     AttemptDescriptor,
     AttemptStateError,
     CollisionError,
     DurablePrefix,
     StreamingCheckpoint,
-    _read_checkpoint,
+    _checkpoint_from_json,
     _validate_count,
     _validate_int,
 )
@@ -128,7 +125,7 @@ class StagedAttempt:
             read_begin_start=notice.transfer_start_sequence,
             read_begin_count=notice.packet_count,
         )
-        self._filesystem._write_json_atomic(self.path / _DESCRIPTOR_NAME, asdict(descriptor))
+        self._filesystem._write_attempt_field(self.attempt_id, "descriptor", asdict(descriptor))
         self.descriptor = descriptor
 
     def prepare_leg(self, start: int, count: int) -> DurablePrefix:
@@ -256,14 +253,14 @@ class StagedAttempt:
                 io_chunk_bytes=self._filesystem._durability.io_chunk_bytes,
             ):
                 self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
-                self._filesystem._write_json_atomic(self.path / _RECEIPT_NAME, self._receipt(raw_hash))
                 return SealResult(bundle_path, True)
             raise CollisionError(f"bundle collision preserved at {self.path}; destination is {bundle_path}")
         self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
-        self._filesystem._write_json_atomic(self.path / _RECEIPT_NAME, self._receipt(raw_hash))
         publish_full_directory(self._filesystem, self.path, bundle_path)
         shutil.rmtree(self.path)
         _sync_directory(self._filesystem.attempts_root, self._filesystem._fsync)
+        with self._filesystem.state_db.transaction() as transaction:
+            transaction.delete(StateKind.ATTEMPT, self.attempt_id)
         return SealResult(bundle_path, False)
 
     def publish_prefix(self) -> SealResult | None:
@@ -289,9 +286,8 @@ class StagedAttempt:
         ):
             raise AttemptStateError("streaming prefix hash does not match raw bytes")
         if not prefix.record_count:
-            self._filesystem._write_json_atomic(
-                self.path / _PREFIX_PUBLICATION_NAME,
-                PrefixPublicationEvidence().as_dict(),
+            self._filesystem._write_attempt_field(
+                self.attempt_id, "prefix_publication", PrefixPublicationEvidence().as_dict()
             )
             return None
 
@@ -305,9 +301,8 @@ class StagedAttempt:
                 manifest,
                 io_chunk_bytes=self._filesystem._durability.io_chunk_bytes,
             ):
-                self._filesystem._write_json_atomic(
-                    self.path / _PREFIX_PUBLICATION_NAME,
-                    PrefixPublicationEvidence().as_dict(),
+                self._filesystem._write_attempt_field(
+                    self.attempt_id, "prefix_publication", PrefixPublicationEvidence().as_dict()
                 )
                 return SealResult(destination, True)
             raise CollisionError(f"prefix collision preserved at {self.path}; destination is {destination}")
@@ -317,11 +312,9 @@ class StagedAttempt:
             raw_source=self.path / _RAW_NAME,
             prefix_size=prefix_size,
             manifest=manifest,
-            receipt=self._receipt(prefix.raw_sha256),
         )
-        self._filesystem._write_json_atomic(
-            self.path / _PREFIX_PUBLICATION_NAME,
-            PrefixPublicationEvidence().as_dict(),
+        self._filesystem._write_attempt_field(
+            self.attempt_id, "prefix_publication", PrefixPublicationEvidence().as_dict()
         )
         return SealResult(destination, False)
 
@@ -402,10 +395,15 @@ class StagedAttempt:
     def _hydrate_streaming_prefix(self) -> None:
         """Authenticate the checkpoint prefix while hashing raw evidence once."""
         raw_path = self.path / _RAW_NAME
-        checkpoint_path = self.path / _CHECKPOINT_NAME
         _require_regular_file(raw_path, "streaming raw file")
-        _require_regular_file(checkpoint_path, "streaming checkpoint")
-        checkpoint = _read_checkpoint(checkpoint_path, self.attempt_id)
+        row = self._filesystem._read_attempt_row(self.attempt_id)
+        raw_checkpoint = row["checkpoint"]
+        if not isinstance(raw_checkpoint, dict):
+            raise AttemptStateError("streaming checkpoint is malformed")
+        try:
+            checkpoint = _checkpoint_from_json(raw_checkpoint, self.attempt_id)
+        except (TypeError, ValueError) as error:
+            raise AttemptStateError("streaming checkpoint is malformed") from error
         raw_size = raw_path.stat().st_size
         if raw_size % RECORD_SIZE:
             raise AttemptStateError("streaming raw file is not record aligned")
@@ -628,6 +626,3 @@ class StagedAttempt:
             RECORD_SIZE,
             prefix.raw_sha256,
         ).as_dict()
-
-    def _receipt(self, raw_hash: str) -> dict[str, object]:
-        return SealedReceipt(self.attempt_id, raw_hash).as_dict()

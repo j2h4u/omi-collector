@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import wraps
-from json import loads
+from json import dumps
 from pathlib import Path
 from struct import pack
 from threading import Thread
@@ -20,7 +20,6 @@ from omi_collector.capture.adapters.attempt_writer import WriterError, WriterFai
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, read_confirmed_losses
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_contract import AttemptDescriptor, StagingError
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application.batch_reconciliation import BatchReconciler, CursorConsistencyError
 from omi_collector.capture.application.collector import (
@@ -53,6 +52,7 @@ from omi_collector.capture.domain.ring_protocol import (
     RingStatus,
 )
 from omi_collector.config import DEFAULT_CONFIG, WriterConfig
+from staging_test_factory import StagingStore, attempt_payload, closure_payload, closure_rows
 
 
 def _record(value: int) -> bytes:
@@ -78,12 +78,20 @@ def _seed_partial(spool: Path, capture_root: Path) -> tuple[StagingStore, Path, 
     assert prefix.next_sequence == 101
     descriptor = store.pending_attempts()[0]
     attempt_path = store.attempts_root / descriptor.attempt_id
+    persisted = attempt_payload(store, descriptor.attempt_id)
+    assert persisted is not None
     return (
         store,
         attempt_path,
         (attempt_path / "records.bin").read_bytes(),
-        (attempt_path / "checkpoint.json").read_bytes(),
+        dumps(persisted, sort_keys=True).encode(),
     )
+
+
+def _attempt_state_bytes(store: StagingStore, attempt_id: str) -> bytes:
+    persisted = attempt_payload(store, attempt_id)
+    assert persisted is not None
+    return dumps(persisted, sort_keys=True).encode()
 
 
 @_async_test
@@ -123,9 +131,7 @@ async def test_regressed_pending_prefix_keeps_authenticated_visit_frontier(tmp_p
         assert reconciler.pending_descriptor is None
         assert reconciler.durable_progress() == 101
         await reconciler.close_visit("absence")
-        assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-            {"next_sequence": 101, "reason": "absence"}
-        ]
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
     finally:
         if not task.done():
             task.cancel()
@@ -206,30 +212,32 @@ def test_restart_interrupted_preserves_unpublished_partial_and_clears_visit(tmp_
     asyncio.run(reconciler.close_visit("restart_interrupted"))
 
     assert (attempt_path / "records.bin").read_bytes() == raw_before
-    assert (attempt_path / "checkpoint.json").read_bytes() == checkpoint_before
-    assert not (attempt_path / "prefix-publication.json").exists()
-    assert not (attempt_path / "terminal-retired.json").exists()
+    assert _attempt_state_bytes(store, descriptor.attempt_id) == checkpoint_before
+    attempt_state = attempt_payload(store, descriptor.attempt_id)
+    assert attempt_state is not None
+    assert attempt_state["prefix_publication"] is None
+    assert attempt_state["terminal_retirement"] is None
     assert store.pending_attempts() == (descriptor,)
-    assert not store.ready_closures_path.exists()
+    assert closure_payload(store) is None
     assert reconciler.pending_descriptor is None
     assert reconciler.pending_durable_next is None
     assert reconciler.durable_progress() == 0
 
 
 def test_absence_publishes_authenticated_partial_and_closes_visit(tmp_path: Path) -> None:
-    store, attempt_path, _raw_before, _checkpoint_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store, _attempt_path, _raw_before, _checkpoint_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
     descriptor = store.pending_attempts()[0]
     durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
     reconciler = _reconciler(store, descriptor, durable_next)
 
     asyncio.run(reconciler.close_visit("absence"))
 
-    assert (attempt_path / "prefix-publication.json").is_file()
-    assert (attempt_path / "terminal-retired.json").is_file()
+    attempt_state = attempt_payload(store, descriptor.attempt_id)
+    assert attempt_state is not None
+    assert attempt_state["prefix_publication"] is not None
+    assert attempt_state["terminal_retirement"] is not None
     assert store.pending_attempts() == ()
-    assert loads(store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-        {"next_sequence": 101, "reason": "absence"}
-    ]
+    assert closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
     assert reconciler.pending_descriptor is None
     assert reconciler.pending_durable_next is None
     assert reconciler.durable_progress() == 0
@@ -264,7 +272,7 @@ async def test_empty_positive_admission_cancellation_creates_no_absence_closure(
             raise AssertionError("positive admission should still be waiting for DATA")
         await reconciler.close_visit("absence")
         assert reconciler.durable_progress() == 0
-        assert not store.ready_closures_path.exists()
+        assert closure_payload(store) is None
         assert not tuple(store.capture_root.iterdir())
         assert not runtime.proxies[0].thread.is_alive()
         with store.device_lock():
@@ -515,7 +523,7 @@ def _install_confirmed_loss_retry_observers(
 
 
 def _assert_confirmed_loss(store: StagingStore, loss_id: str) -> None:
-    [fact] = read_confirmed_losses(store.confirmed_loss_ledger_path)
+    [fact] = read_confirmed_losses(store.state_db)
     assert fact.loss_id == loss_id
     assert (fact.start_sequence, fact.end_sequence) == (101, 103)
     assert fact.missing_record_count == 2
@@ -565,9 +573,7 @@ async def _assert_confirmed_loss_retry_completion(
     assert result.next_sequence == 101
     assert result.advance_confirmed is False
     await scenario.reconciler.close_visit("drained", drain_cursor=scenario.current.read_sequence)
-    assert loads(scenario.store.ready_closures_path.read_text(encoding="utf-8"))["closures"] == [
-        {"next_sequence": 101, "reason": "drained"}
-    ]
+    assert closure_rows(scenario.store) == [{"next_sequence": 101, "reason": "drained"}]
 
 
 @_async_test
@@ -650,8 +656,10 @@ async def test_confirmed_loss_write_failure_preserves_unpublished_audio(
 
     assert store.pending_attempts() == (descriptor,)
     assert (attempt_path / "records.bin").read_bytes() == raw_before
-    assert (attempt_path / "checkpoint.json").read_bytes() == checkpoint_before
-    assert not (attempt_path / "prefix-publication.json").exists()
+    assert _attempt_state_bytes(store, descriptor.attempt_id) == checkpoint_before
+    attempt_state = attempt_payload(store, descriptor.attempt_id)
+    assert attempt_state is not None
+    assert attempt_state["prefix_publication"] is None
     assert not tuple(store.capture_root.iterdir())
 
 
@@ -1183,7 +1191,7 @@ async def test_finalize_does_not_checkpoint_empty_positive_admission(tmp_path: P
         assert result.close_error is None
         assert proxy.checkpoint_calls == 0
         assert proxy.seal_result_calls == 2
-        assert not store.ready_closures_path.exists()
+        assert closure_payload(store) is None
     finally:
         if not task.done():
             task.cancel()

@@ -12,12 +12,11 @@ import pytest
 from omi_collector.capture.adapters.opportunistic_runtime import _StagingWriterAdapter
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.ready_closures import ReadyClosure
-from omi_collector.capture.adapters.ready_closures import load as load_ready_closures
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
+from staging_test_factory import StagingStore, attempt_payload, closure_payload
 
 
 def _store(tmp_path: Path) -> StagingStore:
@@ -76,7 +75,10 @@ def test_restart_closes_and_persists_the_frontier_of_an_orphaned_sealed_draft(tm
 
     expected = ReadyClosure(101, "restart_interrupted")
     assert store.close_orphaned_drafts("restart_interrupted") == expected
-    assert load_ready_closures(store.ready_closures_path) == (expected,)
+    assert closure_payload(store) == {
+        "version": 1,
+        "closures": [{"next_sequence": expected.next_sequence, "reason": expected.reason}],
+    }
     drafts = tuple(store.capture_root.iterdir())
     assert len(drafts) == 1
     assert (drafts[0] / "records.bin").read_bytes() == _record(100)
@@ -92,14 +94,16 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     writer.read_begin(ReadBeginNotification(100, 1))
     writer.append_chunk(0, memoryview(_record(100)))
     writer.checkpoint()
-    attempt_path = store.attempts_root / writer.attempt_id
+    attempt_id = writer.attempt_id
 
     retired: list[bool] = []
     original = store.terminalize_prefix_attempt_held
 
     def observe_terminalization(attempt_id: str, lease: DeviceLock) -> None:
         lease.require_active()
-        retired.append((attempt_path / "prefix-publication.json").is_file())
+        attempt_state = attempt_payload(store, attempt_id)
+        assert attempt_state is not None
+        retired.append(attempt_state["prefix_publication"] is not None)
         original(attempt_id, lease)
 
     monkeypatch.setattr(store, "terminalize_prefix_attempt_held", observe_terminalization)
@@ -109,7 +113,14 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     writer.close()
 
     assert retired == [True]
-    assert (attempt_path / "terminal-retired.json").is_file()
+    attempt_state = attempt_payload(store, attempt_id)
+    assert attempt_state is not None
+    terminal = attempt_state["terminal_retirement"]
+    assert isinstance(terminal, dict)
+    assert terminal["version"] == 1
+    assert terminal["state"] == "terminal-retired"
+    terminalized_at = terminal["terminalized_at_unix_ns"]
+    assert isinstance(terminalized_at, int) and not isinstance(terminalized_at, bool)
     writer.close()
     store.append_ready_closure(101, "drained")
     assert store.publish_ready() is not None

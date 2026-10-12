@@ -14,7 +14,8 @@ from typing import Literal, Never, cast
 import pytest
 
 from omi_collector.capture.adapters import ready_closures
-from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+from omi_collector.capture.adapters.collector_state_db import StateDB
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
@@ -27,7 +28,7 @@ from omi_collector.capture.application.collector import (
     TransferInterruptedError,
     TransferTimeouts,
 )
-from omi_collector.capture.application.operational_telemetry import TIME_READ_UUID, ClockCorrectionSink, TelemetryClock
+from omi_collector.capture.application.operational_telemetry import TIME_READ_UUID, TelemetryClock
 from omi_collector.capture.application.ports import CaptureRuntimePort
 from omi_collector.capture.application.presence import (
     PresenceAdvertisement,
@@ -67,7 +68,6 @@ from omi_collector.capture.application.session_lifecycle import (
     recoverable_session_outcome,
     report_session_error,
     storage_not_ready_delay,
-    teardown_was_interrupted,
     validate_policy,
 )
 from omi_collector.capture.application.visit_machine import DrainConfirmed, RecoveryDisposition
@@ -359,14 +359,17 @@ def test_validate_policy_accepts_exact_fit_large_integer_capacity() -> None:
 def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         events: list[str] = []
-        bootstrap = StagingStore(tmp_path / "spool", tmp_path / "captures")
+        spool = tmp_path / "spool"
+        spool.mkdir()
+        state_db = StateDB(spool / "collector-state.sqlite3")
+        bootstrap = StagingStore(spool, tmp_path / "captures", state_db=state_db)
         ready = tmp_path / "ready"
         ready.mkdir(mode=0o2750)
         ready.chmod(0o2750)
-        store = StagingStore.from_paths(bootstrap.paths, publication_root=ready)
+        store = StagingStore.from_paths(bootstrap.paths, state_db=state_db, publication_root=ready)
 
         def publish() -> ReadyOutcome:
-            assert ready_closures.load(store.ready_closures_path)[-1].reason == "drained"
+            assert ready_closures.load(store.state_db)[-1].reason == "drained"
             events.append("publish")
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_eligible_drafts")
 
@@ -800,65 +803,12 @@ def test_battery_refresh_failure_does_not_interrupt_successful_drain(monkeypatch
     assert order == ["drained", "battery", "disconnect"]
 
 
-def test_clock_transport_fence_requires_error_free_context_close(monkeypatch: pytest.MonkeyPatch) -> None:
-    receipts: list[str] = []
-
-    class Context:
-        def __init__(self, *, fails_close: bool) -> None:
-            self.fails_close = fails_close
-
-        async def __aenter__(self) -> RingSession:
-            return cast(RingSession, object())
-
-        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
-            if self.fails_close:
-                raise RingTransportUnavailableError("disconnect failed")
-
-    async def ignore_session_error(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    async def scenario() -> None:
-        monkeypatch.setattr(
-            "omi_collector.capture.application.session_lifecycle.report_session_error", ignore_session_error
-        )
-        retryable_failed_close_interrupted = await teardown_was_interrupted(
-            Context(fails_close=True),
-            None,
-            1.0,
-            None,
-            OpportunisticRuntime(),
-            on_transport_closed=lambda: receipts.append("retryable-failed"),
-        )
-        failed_close_interrupted = await teardown_was_interrupted(
-            Context(fails_close=True),
-            RuntimeError("transfer already failed"),
-            1.0,
-            None,
-            OpportunisticRuntime(),
-            on_transport_closed=lambda: receipts.append("failed"),
-        )
-        successful_close_interrupted = await teardown_was_interrupted(
-            Context(fails_close=False),
-            None,
-            1.0,
-            None,
-            OpportunisticRuntime(),
-            on_transport_closed=lambda: receipts.append("closed"),
-        )
-
-        assert retryable_failed_close_interrupted is True
-        assert failed_close_interrupted is False
-        assert successful_close_interrupted is False
-
-    _run(scenario())
-    assert receipts == ["closed"]
-
-
-def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_clock_state_store_and_mutation_lease_reach_telemetry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     info = RingInfo(10, 10, 100, 0, 512)
     activity: list[object] = []
-    observed: list[tuple[object, float, object]] = []
+    observed: list[tuple[object, float, object, object]] = []
     errors: list[BaseException] = []
+    store = ClockStateStore(StateDB(tmp_path / "collector-state.sqlite3"))
 
     class Context:
         async def __aenter__(self) -> RingSession:
@@ -877,15 +827,10 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
         return info
 
     async def telemetry(*_args: object, clock: TelemetryClock, **_kwargs: object) -> None:
-        observed.append((clock.mutation_lease, clock.host_clock_probe_timeout, clock.synchronized))
+        observed.append((clock.mutation_lease, clock.host_clock_probe_timeout, clock.synchronized, clock.state_store))
 
     async def observe_error(_activity: object, _phase: object, error: BaseException, _runtime: object) -> None:
         errors.append(error)
-
-    class CorrectionSink:
-        @staticmethod
-        def note_transport_closed() -> None:
-            return None
 
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=_noop,
@@ -899,7 +844,7 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
         TransferTimeouts(1, 1),
         RetryPolicy(backoff=(1,), stop_after_drained=True),
         activity=activity.append,
-        clock_correction_sink=cast(ClockCorrectionSink, CorrectionSink()),
+        clock_state_store=store,
         clock_lease=lambda: _Lease(),
         config=CollectorConfig(telemetry=TelemetryConfig(host_clock_probe_timeout_seconds=0.25)),
     )
@@ -920,7 +865,7 @@ def test_clock_mutation_lease_is_passed_to_telemetry(monkeypatch: pytest.MonkeyP
 
     _run(scenario())
     assert activity == [], errors
-    assert observed == [(options.clock_lease, 0.25, None)]
+    assert observed == [(options.clock_lease, 0.25, None, store)]
 
 
 def test_connected_step_cancellation_identity_reaches_context_exit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1286,7 +1231,9 @@ def test_validate_policy_accepts_exact_fit_batch_capacity() -> None:
 
 
 def test_recoverable_session_outcome_keeps_contended_device_lease_retryable(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path / "spool", tmp_path / "captures")
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    store = StagingStore(spool, tmp_path / "captures", state_db=StateDB(spool / "collector-state.sqlite3"))
     activity: list[ActivityEvent] = []
     options = OpportunisticOptions(TransferTimeouts(1, 1), activity=activity.append)
     runtime = OpportunisticRuntime()
@@ -1439,16 +1386,16 @@ def test_run_session_records_only_verified_clock_corrections(
         drained_result=lambda: NoDataResult(info),
     )
     metrics = _RecordingLifecycleMetrics()
-    correction_store = ClockCorrectionStore(tmp_path / "device.json")
+    clock_state_store = ClockStateStore(StateDB(tmp_path / "collector-state.sqlite3"))
     options = OpportunisticOptions(
         TransferTimeouts(1, 1),
         RetryPolicy(backoff=(0.01,), stop_after_drained=True),
         operational=lambda event: emitted.append(dict(event)),
         activity=activity.append,
         host_time=lambda: 1000.0,
-        host_clock_synchronized=lambda: clock_case == "verified",
+        host_clock_synchronized=lambda _timeout: clock_case == "verified",
         quality_metrics=metrics,  # type: ignore[arg-type]
-        clock_correction_sink=correction_store,
+        clock_state_store=clock_state_store,
     )
     run = SessionLifecycleRun(lambda _candidate: context, options, OpportunisticRuntime(), callbacks)
 

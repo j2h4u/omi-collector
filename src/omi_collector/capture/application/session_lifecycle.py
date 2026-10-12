@@ -21,14 +21,12 @@ from ...config import DEFAULT_CONFIG, CollectorConfig, RetryConfig
 from ..domain.ring_protocol import RECORD_SIZE, STATUS_STORAGE_NOT_READY, RingInfo, RingStatus, encode_stop_command
 from . import collector
 from .operational_telemetry import (
-    ClockCorrectionSink,
-    ClockObservationSink,
     OperationalEmitter,
     TelemetryClock,
     collect_battery_observation,
     collect_operational_telemetry,
 )
-from .ports import CaptureRuntimePort, ClockMembershipPort, StorageLeaseFactory
+from .ports import CaptureRuntimePort, ClockStatePort, StorageLeaseFactory
 from .presence import PresenceEnd, PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
@@ -167,14 +165,12 @@ class OpportunisticOptions:
     activity: ActivityCallback | None = None
     operational: OperationalEmitter | None = None
     host_time: Callable[[], float] = time.time
-    host_clock_synchronized: Callable[[], bool] | None = None
+    host_clock_synchronized: Callable[[float], bool] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], object] = asyncio.sleep
     presence: PresenceSchedulerPort | None = None
     quality_metrics: QualityMetricsPort | None = None
-    clock_correction_sink: ClockCorrectionSink | None = None
-    clock_observation_sink: ClockObservationSink | None = None
-    clock_membership_store: ClockMembershipPort | None = None
+    clock_state_store: ClockStatePort | None = None
     clock_lease: StorageLeaseFactory | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
@@ -550,14 +546,13 @@ class SessionLifecycle:
         finally:
             if execution.session is not None:
                 require_session_command(execution.machine, SessionCommand.TEARDOWN)
-                correction_sink = self.run.options.clock_correction_sink
                 execution.teardown_error = await teardown_was_interrupted(
                     context,
                     execution.primary,
                     self.run.options.timeouts.info,
                     self.run.options.activity,
                     self.run.runtime,
-                    on_transport_closed=(correction_sink.note_transport_closed if correction_sink else None),
+                    on_transport_closed=None,
                 )
                 execution.machine = transition_session(execution.machine, TeardownResolved(execution.teardown_error))
 
@@ -691,7 +686,7 @@ class SessionLifecycle:
         self, session: RingSession, info: RingInfo, phase: SessionPhaseState
     ) -> Literal["disabled", "completed", "degraded"]:
         options = self.run.options
-        if options.operational is None and options.clock_correction_sink is None:
+        if options.operational is None and options.clock_state_store is None:
             return "disabled"
         deadline = asyncio.get_running_loop().time() + options.config.retry.presence_preflight_budget_seconds
         phase.value = "telemetry"
@@ -720,9 +715,7 @@ class SessionLifecycle:
                             host_clock_probe_timeout=options.config.telemetry.host_clock_probe_timeout_seconds,
                             info_reader=lambda: self._info(session),
                             status_reader=session.read_status if options.operational is not None else None,
-                            correction_sink=options.clock_correction_sink,
-                            observation_sink=options.clock_observation_sink,
-                            membership_store=options.clock_membership_store,
+                            state_store=options.clock_state_store,
                             monotonic=options.clock,
                             session_id=phase.quality.session_id if phase.quality is not None else "native",
                             mutation_lease=options.clock_lease,

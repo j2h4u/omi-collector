@@ -25,8 +25,9 @@ from omi_collector.capture.adapters.attempts import (
     RecordMismatchError,
     RecordRegressionError,
 )
-from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
-from omi_collector.capture.adapters.clock_corrections import ClockCorrectionStore
+from omi_collector.capture.adapters.bundle_contract import BundleManifest
+from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import (
@@ -34,10 +35,11 @@ from omi_collector.capture.adapters.staging_contract import (
     DeviceAlreadyRunningError,
     PendingAttemptError,
 )
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
+from omi_collector.capture.domain.clock_state import ClockAnchor, ClockRange, ClockState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, StagingRetentionConfig
+from staging_test_factory import StagingStore, closure_bytes
 
 _CAPTURE_ROOTS: set[Path] = set()
 _ACCEPTANCE_FIRST_BOUNDARY = 7_192_026
@@ -77,7 +79,6 @@ def _one_record_bundle(root: Path, sequence: int, timestamp: int) -> Path:
     (bundle / "manifest.json").write_text(
         dumps(BundleManifest(2, sequence, sequence + 1, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
     )
-    (bundle / "receipt.json").write_text(dumps(SealedReceipt("a" * 32, digest).as_dict()), encoding="utf-8")
     return bundle
 
 
@@ -89,70 +90,54 @@ def _bundle_bytes(root: Path) -> dict[str, bytes]:
     return {bundle.name: (bundle / "records.bin").read_bytes() for bundle in root.iterdir() if bundle.is_dir()}
 
 
-def _seed_acceptance_clock_state(tmp_path: Path) -> ClockCorrectionStore:
-    corrections = ClockCorrectionStore(tmp_path / "device.json")
-    first_operation = corrections.mark_unresolved(corrections.prepare(43, 72, -29.0, _ACCEPTANCE_FIRST_BOUNDARY))
-    corrections.finish(
-        first_operation, state="applied", boundary_sequence_max=_ACCEPTANCE_SECOND_BOUNDARY, verified_epoch=72
+def _seed_acceptance_clock_state(store: StagingStore) -> ClockStateStore:
+    clock = ClockStateStore(store.state_db)
+    clock.db.put(
+        StateKind.CLOCK,
+        "current",
+        ClockState(
+            ranges=(
+                ClockRange(
+                    _ACCEPTANCE_FIRST_BOUNDARY,
+                    _ACCEPTANCE_SECOND_BOUNDARY,
+                    0.0,
+                    1.0,
+                    "confirmed",
+                    "verified-correction",
+                ),
+                ClockRange(
+                    _ACCEPTANCE_SECOND_BOUNDARY,
+                    _ACCEPTANCE_FRONTIER + 1,
+                    0.0,
+                    1.0,
+                    "approximate",
+                    "restart-anchor",
+                ),
+            ),
+            anchor=ClockAnchor(_ACCEPTANCE_FRONTIER + 1, 0.0, 1.0, "approximate", "restart-anchor"),
+        ).to_payload(),
     )
-    second_id = "b" * 32
-    (tmp_path / "clock-corrections").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "clock-corrections" / f"{second_id}.json").write_text(
-        dumps(
-            {
-                "version": 2,
-                "operation_id": second_id,
-                "state": "prepared",
-                "observed_epoch": 43,
-                "target_epoch": 72,
-                "drift_seconds": -29.0,
-                "boundary_sequence_min": _ACCEPTANCE_SECOND_BOUNDARY,
-                "boundary_sequence_max": None,
-                "verified_epoch": None,
-            }
-        ),
-        encoding="utf-8",
-    )
-    second_operation = corrections.mark_unresolved(
-        corrections.prepare(43, 72, -29.0, _ACCEPTANCE_SECOND_BOUNDARY, operation_id=second_id)
-    )
-    initial = corrections.observation_store.append(
-        evidence_kind="native_trusted",
-        session_id="restart-session",
-        host_boot_id="boot",
-        host_realtime_start=43.0,
-        host_realtime_end=43.0,
-        host_monotonic_start=1.0,
-        host_monotonic_end=1.0,
-        device_epoch=43,
-        info_sequence_min=_ACCEPTANCE_SECOND_BOUNDARY,
-        info_sequence_max=_ACCEPTANCE_SECOND_BOUNDARY,
-        operation_id=second_operation.operation_id,
-        observation_role="initial",
-    )
-    corrections.observation_store.append(
-        evidence_kind="native_trusted",
-        session_id="restart-session",
-        host_boot_id="boot",
-        host_realtime_start=72.0,
-        host_realtime_end=72.0,
-        host_monotonic_start=2.0,
-        host_monotonic_end=2.0,
-        device_epoch=72,
-        info_sequence_min=_ACCEPTANCE_SECOND_BOUNDARY,
-        info_sequence_max=_ACCEPTANCE_FRONTIER,
-        operation_id=second_operation.operation_id,
-        effective_boundary_sequence=_ACCEPTANCE_SECOND_BOUNDARY,
-        observation_role="later",
-        parent_observation_id=initial.observation_id,
-    )
-    return corrections
+    return clock
 
 
 def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
     attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
+
+
+def _attempt_row(attempt: object) -> dict[str, object]:
+    return cast(dict[str, object], attempt._filesystem._read_attempt_row(attempt.attempt_id))  # type: ignore[attr-defined]
+
+
+def _checkpoint(attempt: object) -> dict[str, object]:
+    return cast(dict[str, object], _attempt_row(attempt)["checkpoint"])
+
+
+def _write_row_field(attempt: object, field: str, value: object) -> None:
+    row = _attempt_row(attempt)
+    row[field] = value
+    attempt._filesystem.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, row)  # type: ignore[attr-defined]
 
 
 def test_open_attempt_reports_only_checkpointed_prefix_and_preserves_uncheckpointed_tail(tmp_path: Path) -> None:
@@ -165,15 +150,14 @@ def test_open_attempt_reports_only_checkpointed_prefix_and_preserves_uncheckpoin
     raw_path = attempt.path / "records.bin"
     raw_path.write_bytes(checkpointed + uncheckpointed)
     raw_before = raw_path.read_bytes()
-    checkpoint_path = attempt.path / "checkpoint.json"
-    checkpoint_before = checkpoint_path.read_bytes()
+    checkpoint_before = _checkpoint(attempt).copy()
 
     recovered = StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
     state = recovered.recover()
 
     assert (state.valid_records, state.raw_bytes, state.clean) == (1, 2 * RECORD_SIZE, False)
     assert raw_path.read_bytes() == raw_before
-    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert _checkpoint(attempt) == checkpoint_before
     recovered.close()
 
 
@@ -187,60 +171,26 @@ def test_open_rejects_checkpointed_prefix_damage_without_rewriting_evidence(tmp_
     raw_path = attempt.path / "records.bin"
     raw_path.write_bytes(b"" if damage == "truncate" else _record(3))
     damaged_raw = raw_path.read_bytes()
-    checkpoint_path = attempt.path / "checkpoint.json"
-    checkpoint = checkpoint_path.read_bytes()
-    descriptor = (attempt.path / "attempt.json").read_bytes()
+    checkpoint = _checkpoint(attempt).copy()
+    descriptor = _attempt_row(attempt)["descriptor"]
 
     with pytest.raises(AttemptStateError, match=r"shorter than its checkpoint|hash does not match"):
         StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
 
     assert raw_path.read_bytes() == damaged_raw
-    assert checkpoint_path.read_bytes() == checkpoint
-    assert (attempt.path / "attempt.json").read_bytes() == descriptor
+    assert _checkpoint(attempt) == checkpoint
+    assert _attempt_row(attempt)["descriptor"] == descriptor
 
 
-def test_startup_reconciles_native_clock_evidence_without_captured_bundles(tmp_path: Path) -> None:
+def test_startup_without_audio_does_not_create_clock_state(tmp_path: Path) -> None:
     store = StagingStore.from_paths(
         StagingStore(tmp_path, _capture_root(tmp_path)).paths,
         publication_root=_shared_ready(tmp_path / "published"),
     )
-    correction_store = ClockCorrectionStore(store.device_state_path)
-    correction = correction_store.mark_unresolved(correction_store.prepare(1302, 1002, 300.0, 7717545))
-    initial = correction_store.observation_store.append(
-        evidence_kind="native_trusted",
-        session_id="session",
-        host_boot_id="boot",
-        host_realtime_start=1000.0,
-        host_realtime_end=1000.0,
-        host_monotonic_start=1.0,
-        host_monotonic_end=1.0,
-        device_epoch=1302,
-        info_sequence_min=7717545,
-        info_sequence_max=7717545,
-        operation_id=correction.operation_id,
-        observation_role="initial",
-    )
-    correction_store.observation_store.append(
-        evidence_kind="native_trusted",
-        session_id="session",
-        host_boot_id="boot",
-        host_realtime_start=1002.0,
-        host_realtime_end=1002.0,
-        host_monotonic_start=2.0,
-        host_monotonic_end=2.0,
-        device_epoch=1002,
-        info_sequence_min=7717545,
-        info_sequence_max=7717545,
-        operation_id=correction.operation_id,
-        effective_boundary_sequence=7717545,
-        observation_role="later",
-        parent_observation_id=initial.observation_id,
-    )
-
     result = store.recover_and_publish()
 
     assert result.state == "waiting"
-    assert correction_store.records()[0].state == "applied"
+    assert store.state_db.get(StateKind.CLOCK, "current") is None
     assert tuple(store.capture_root.iterdir()) == ()
 
 
@@ -250,9 +200,10 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
     sequences = _acceptance_sequences()
     for sequence in sequences:
         _one_record_bundle(drafts, sequence, 43 if sequence < _ACCEPTANCE_SECOND_BOUNDARY else 72)
-    corrections = _seed_acceptance_clock_state(tmp_path)
+    bootstrap = StagingStore(tmp_path, drafts)
+    clock = _seed_acceptance_clock_state(bootstrap)
     store = StagingStore.from_paths(
-        StagingStore(tmp_path, drafts).paths,
+        bootstrap.paths,
         publication_root=published,
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
@@ -265,13 +216,12 @@ def test_restart_finalizes_raw_drafts_without_ble(tmp_path: Path) -> None:
     assert len(ready_bundles) == 1
     assert loads((ready_bundles[0] / "manifest.json").read_text(encoding="utf-8"))["record_count"] == len(sequences)
     assert tuple(drafts.iterdir()) == ()
-    assert sorted(item.boundary_sequence_min for item in corrections.records()) == [
+    ranges = clock.state().ranges
+    assert sorted(item.start_sequence for item in ranges) == [
         _ACCEPTANCE_FIRST_BOUNDARY,
         _ACCEPTANCE_SECOND_BOUNDARY,
     ]
-    assert [item.state for item in corrections.records()] == ["applied", "applied"]
-    later = next(item for item in corrections.observation_store.records() if item.observation_role == "later")
-    assert later.info_sequence_max == _ACCEPTANCE_FRONTIER
+    assert [item.confidence for item in ranges] == ["confirmed", "approximate"]
     assert all(loads((bundle / "manifest.json").read_text(encoding="utf-8"))["time_ranges"] for bundle in ready_bundles)
     second_result = store.recover_and_publish()
     assert second_result.state == "waiting"
@@ -290,9 +240,7 @@ def test_corrupt_clock_ledger_does_not_block_closed_audio_publication(
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
     store.append_ready_closure(101, "drained")
-    observations = tmp_path / "clock-observations"
-    observations.mkdir()
-    (observations / "broken.json").write_text("{", encoding="utf-8")
+    store.state_db.put(StateKind.CLOCK, "current", {"broken": True})
 
     result = store.recover_and_publish()
 
@@ -344,10 +292,10 @@ def test_recovery_retires_only_durable_windmill_acknowledgements(tmp_path: Path)
 
     assert store.recover_and_publish().state == "waiting"
     assert tuple(published.iterdir()) == ()
-    ledger = cast(dict[str, object], loads((tmp_path / "ready-publications.json").read_text(encoding="utf-8")))
-    bundles = cast(dict[str, dict[str, object]], ledger["bundles"])
     bundle_id = cast(str, manifest["bundle_id"])
-    assert bundles[bundle_id]["state"] == "retired"
+    publication = store.state_db.get(StateKind.READY_PUBLICATION, bundle_id)
+    assert publication is not None
+    assert publication["state"] == "retired"
 
 
 def test_scheduled_maintenance_publishes_closed_draft_without_pendant(tmp_path: Path) -> None:
@@ -417,9 +365,9 @@ def test_acknowledged_group_recovery_cleans_child_drafts_before_retirement(
     assert restarted.recover_and_publish().state == "waiting"
     assert tuple(drafts.iterdir()) == ()
     assert tuple(published.iterdir()) == ()
-    ledger = cast(dict[str, object], loads((tmp_path / "ready-publications.json").read_text(encoding="utf-8")))
-    bundles = cast(dict[str, dict[str, object]], ledger["bundles"])
-    assert bundles[bundle_id]["state"] == "retired"
+    publication = restarted.state_db.get(StateKind.READY_PUBLICATION, bundle_id)
+    assert publication is not None
+    assert publication["state"] == "retired"
 
 
 def _publication_store(tmp_path: Path) -> StagingStore:
@@ -544,7 +492,7 @@ def test_inspect_recovery_rejects_symlinked_attempt_entry(tmp_path: Path) -> Non
     store = _publication_store(tmp_path)
     external = tmp_path / "external-attempt"
     external.mkdir()
-    marker = external / "prefix-publication.json"
+    marker = external / "untrusted-file"
     marker.write_text("{}", encoding="utf-8")
     store.attempts_root.mkdir(parents=True, exist_ok=True)
     entry = store.attempts_root / ("a" * 32)
@@ -579,22 +527,16 @@ def test_clean_drain_closes_older_authenticated_orphan_at_existing_frontier_and_
         config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
     )
     existing = store.append_ready_closure(102, "absence")
-    original_queue = store.ready_closures_path.read_bytes()
+    original_queue = closure_bytes(store)
 
     assert store.close_orphaned_drafts("absence") == existing
     assert store.close_orphaned_drafts("absence") == existing
-    assert store.ready_closures_path.read_bytes() == original_queue
-    with pytest.raises(ready_bundles.ReadyBundleError):
-        (draft / "receipt.json").write_text("{}", encoding="utf-8")
-        store.close_orphaned_drafts("absence")
-    (draft / "receipt.json").write_text(
-        dumps(SealedReceipt("a" * 32, sha256((draft / "records.bin").read_bytes()).hexdigest()).as_dict()),
-        encoding="utf-8",
-    )
+    assert closure_bytes(store) == original_queue
+    assert not (draft / "receipt.json").exists()
 
     with pytest.raises(ValueError, match="cursor"):
         store.close_orphaned_drafts("drained", drain_cursor=101)
-    assert store.ready_closures_path.read_bytes() == original_queue
+    assert closure_bytes(store) == original_queue
     assert draft.is_dir()
 
     closure = store.close_orphaned_drafts("drained", drain_cursor=102)
@@ -613,21 +555,20 @@ def test_prefix_recovery_validates_drain_before_mutating_marker_or_closure(tmp_p
     attempt.checkpoint()
     attempt.publish_prefix()
     attempt.close(durable=True)
-    marker = attempt.path / "prefix-publication.json"
-    marker_before = marker.read_bytes()
+    marker_before = _attempt_row(attempt)["prefix_publication"]
     existing = store.append_ready_closure(102, "absence")
-    closure_before = store.ready_closures_path.read_bytes()
+    closure_before = closure_bytes(store)
 
     with pytest.raises(ValueError, match="cursor"):
         store.close_pending_prefix("drained", drain_cursor=101)
 
-    assert marker.read_bytes() == marker_before
-    assert not (attempt.path / "terminal-retired.json").exists()
-    assert store.ready_closures_path.read_bytes() == closure_before
+    assert _attempt_row(attempt)["prefix_publication"] == marker_before
+    assert _attempt_row(attempt)["terminal_retirement"] is None
+    assert closure_bytes(store) == closure_before
 
     closure = store.close_pending_prefix("drained", drain_cursor=102)
     assert closure is not None and (closure.next_sequence, closure.reason) == (102, "drained")
-    assert (attempt.path / "terminal-retired.json").is_file()
+    assert _attempt_row(attempt)["terminal_retirement"] is not None
     assert existing.next_sequence == closure.next_sequence
 
 
@@ -640,22 +581,22 @@ def test_multiple_prefix_markers_preflight_the_highest_frontier_before_drain_com
         attempt.checkpoint()
         attempt.publish_prefix()
         attempt.close(durable=True)
-    markers = {attempt.attempt_id: (attempt.path / "prefix-publication.json").read_bytes() for attempt in attempts}
+    markers = {attempt.attempt_id: _attempt_row(attempt)["prefix_publication"] for attempt in attempts}
     existing = store.append_ready_closure(102, "absence")
-    queue = store.ready_closures_path.read_bytes()
+    queue = closure_bytes(store)
 
     with pytest.raises(ValueError, match="recovered closure frontier"):
         store.close_pending_prefix("drained", drain_cursor=102)
 
-    assert store.ready_closures_path.read_bytes() == queue
+    assert closure_bytes(store) == queue
     for attempt in attempts:
-        assert (attempt.path / "prefix-publication.json").read_bytes() == markers[attempt.attempt_id]
-        assert not (attempt.path / "terminal-retired.json").exists()
+        assert _attempt_row(attempt)["prefix_publication"] == markers[attempt.attempt_id]
+        assert _attempt_row(attempt)["terminal_retirement"] is None
 
     closure = store.close_pending_prefix("drained", drain_cursor=103)
     assert closure is not None and (closure.next_sequence, closure.reason) == (103, "drained")
     assert existing.next_sequence == 102
-    assert all((attempt.path / "terminal-retired.json").is_file() for attempt in attempts)
+    assert all(_attempt_row(attempt)["terminal_retirement"] is not None for attempt in attempts)
 
 
 def test_prefix_recovery_authenticates_existing_bundle_even_when_closure_is_kept(tmp_path: Path) -> None:
@@ -667,18 +608,17 @@ def test_prefix_recovery_authenticates_existing_bundle_even_when_closure_is_kept
     published = attempt.publish_prefix()
     assert published is not None
     attempt.close(durable=True)
-    marker = attempt.path / "prefix-publication.json"
-    marker_before = marker.read_bytes()
-    (published.bundle_path / "receipt.json").write_text("{}", encoding="utf-8")
+    marker_before = _attempt_row(attempt)["prefix_publication"]
+    (published.bundle_path / "manifest.json").write_text("{}", encoding="utf-8")
     existing = store.append_ready_closure(200, "absence")
-    queue_before = store.ready_closures_path.read_bytes()
+    queue_before = closure_bytes(store)
 
     with pytest.raises(CollisionError):
         store.close_pending_prefix("absence")
 
-    assert store.ready_closures_path.read_bytes() == queue_before
-    assert marker.read_bytes() == marker_before
-    assert not (attempt.path / "terminal-retired.json").exists()
+    assert closure_bytes(store) == queue_before
+    assert _attempt_row(attempt)["prefix_publication"] == marker_before
+    assert _attempt_row(attempt)["terminal_retirement"] is None
     assert existing.next_sequence == 200
 
 
@@ -695,17 +635,16 @@ def test_prefix_close_preflights_later_orphan_before_drained_queue_upgrade(tmp_p
     attempt.checkpoint()
     attempt.publish_prefix()
     attempt.close(durable=True)
-    marker = attempt.path / "prefix-publication.json"
-    marker_before = marker.read_bytes()
+    marker_before = _attempt_row(attempt)["prefix_publication"]
     store.append_ready_closure(102, "absence")
-    queue_before = store.ready_closures_path.read_bytes()
+    queue_before = closure_bytes(store)
 
     with pytest.raises(ValueError, match="recovered closure frontier"):
         store.close_pending_prefix("drained", drain_cursor=102)
 
-    assert store.ready_closures_path.read_bytes() == queue_before
-    assert marker.read_bytes() == marker_before
-    assert not (attempt.path / "terminal-retired.json").exists()
+    assert closure_bytes(store) == queue_before
+    assert _attempt_row(attempt)["prefix_publication"] == marker_before
+    assert _attempt_row(attempt)["terminal_retirement"] is None
 
 
 def test_close_pending_prefix_rejects_symlinked_attempt_even_when_unpublished_is_excluded(
@@ -714,7 +653,8 @@ def test_close_pending_prefix_rejects_symlinked_attempt_even_when_unpublished_is
     store = StagingStore(tmp_path, _capture_root(tmp_path))
     external = tmp_path / "external-attempt"
     external.mkdir()
-    (external / "terminal-retired.json").write_text('{"terminalized_at_unix_ns": 1}', encoding="utf-8")
+    sentinel = external / "untrusted-file"
+    sentinel.write_text("preserve", encoding="utf-8")
     store.attempts_root.mkdir(parents=True)
     entry = store.attempts_root / ("a" * 32)
     entry.symlink_to(external, target_is_directory=True)
@@ -723,7 +663,7 @@ def test_close_pending_prefix_rejects_symlinked_attempt_even_when_unpublished_is
         store.close_pending_prefix("cleanup only", include_unpublished=False)
 
     assert entry.is_symlink()
-    assert (external / "terminal-retired.json").is_file()
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
 
 
 def test_close_pending_prefix_preserves_source_if_durable_close_fails(tmp_path: Path) -> None:
@@ -751,8 +691,8 @@ def test_close_pending_prefix_preserves_source_if_durable_close_fails(tmp_path: 
     with pytest.raises(OSError, match="durable_close"):
         store.close_pending_prefix("recovery")
 
-    assert (attempt.path / "prefix-publication.json").is_file()
-    assert not (attempt.path / "terminal-retired.json").exists()
+    assert _attempt_row(attempt)["prefix_publication"] is not None
+    assert _attempt_row(attempt)["terminal_retirement"] is None
     assert attempt.path.is_dir()
 
 
@@ -782,7 +722,7 @@ def test_close_pending_prefix_retries_durable_cleanup_after_publication_sync_fai
 
     assert raw_sync_count == 2
     assert attempt.path.is_dir()
-    assert not (attempt.path / "terminal-retired.json").exists()
+    assert _attempt_row(attempt)["terminal_retirement"] is None
 
 
 def test_public_quarantine_gc_releases_hydrated_retained_attempt(tmp_path: Path) -> None:
@@ -815,9 +755,7 @@ def test_resume_rejects_multiple_public_pending_attempts_without_changing_eviden
         attempt.checkpoint()
         attempt.close(durable=True)
     before = {
-        attempt.attempt_id: {
-            name: (attempt.path / name).read_bytes() for name in ("attempt.json", "records.bin", "checkpoint.json")
-        }
+        attempt.attempt_id: {name: (attempt.path / name).read_bytes() for name in ("records.bin",)}
         for attempt in attempts
     }
 
@@ -825,9 +763,7 @@ def test_resume_rejects_multiple_public_pending_attempts_without_changing_eviden
         store.resume_streaming_attempt(lease)
 
     after = {
-        attempt.attempt_id: {
-            name: (attempt.path / name).read_bytes() for name in ("attempt.json", "records.bin", "checkpoint.json")
-        }
+        attempt.attempt_id: {name: (attempt.path / name).read_bytes() for name in ("records.bin",)}
         for attempt in attempts
     }
     assert after == before
@@ -852,20 +788,15 @@ def test_concurrent_publish_ready_rejects_promptly_while_publication_is_active(
     entered = Event()
     release = Event()
     outcome: list[BaseException | object | None] = []
-    original_fsync = fsync
+    publish_unlocked = store._recover_and_publish_unlocked
 
-    def block_publication_ledger(fd: int) -> None:
-        try:
-            path = Path(f"/proc/self/fd/{fd}").resolve()
-        except OSError:
-            path = Path()
-        if path.name.startswith(".ready-publications.json."):
-            entered.set()
-            if not release.wait(5):
-                raise TimeoutError("publication test barrier was not released")
-        original_fsync(fd)
+    def block_publication() -> ReadyOutcome:
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("publication test barrier was not released")
+        return publish_unlocked()
 
-    monkeypatch.setattr(staging_filesystem.os, "fsync", block_publication_ledger)
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", block_publication)
 
     def publish() -> None:
         try:
@@ -892,12 +823,6 @@ def test_concurrent_publish_ready_rejects_promptly_while_publication_is_active(
         if second is not None:
             second.join(5)
             assert not second.is_alive(), "concurrent publication did not leave the active-call boundary"
-
-
-def _rewrite_checkpoint(path: Path, field: str, value: object) -> None:
-    checkpoint = cast(dict[str, object], loads(path.read_text(encoding="utf-8")))
-    checkpoint[field] = value
-    path.write_text(dumps(checkpoint), encoding="utf-8")
 
 
 def _replace_with_symlink(path: Path, target: Path, payload: bytes | str) -> None:
@@ -983,12 +908,12 @@ def test_terminal_retired_recognition_requires_checkpoint(tmp_path: Path, monkey
     attempt.close(durable=True)
     store.terminalize_prefix_attempt(attempt.attempt_id)
 
-    (attempt.path / "checkpoint.json").unlink()
+    _write_row_field(attempt, "checkpoint", None)
 
     now += 1_000_000_000
-    assert store.pending_attempts() == ()
-    assert store.sweep_terminal_retired() == (attempt.path,)
-    assert not attempt.path.exists()
+    assert store.sweep_terminal_retired() == ()
+    assert attempt.path.is_dir()
+    assert _attempt_row(attempt)["terminal_retirement"] is not None
 
 
 def test_malformed_terminal_retired_marker_blocks_admission(tmp_path: Path) -> None:
@@ -1001,7 +926,7 @@ def test_malformed_terminal_retired_marker_blocks_admission(tmp_path: Path) -> N
     attempt.close(durable=True)
     store.terminalize_prefix_attempt(attempt.attempt_id)
 
-    (attempt.path / "terminal-retired.json").write_text("{}", encoding="utf-8")
+    _write_row_field(attempt, "terminal_retirement", [])
 
     assert store.pending_attempts() == (attempt.descriptor,)
 

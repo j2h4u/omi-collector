@@ -4,7 +4,6 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from omi_collector.capture.adapters.clock_observations import ClockObservation
 from omi_collector.capture.adapters.clock_segments import (
     ClockEpochMembership,
     ClockSegment,
@@ -12,6 +11,7 @@ from omi_collector.capture.adapters.clock_segments import (
     ClockSegmentMap,
     segments_with_estimates,
 )
+from omi_collector.capture.adapters.legacy_clock_import import ClockObservation
 
 
 def _observation() -> ClockObservation:

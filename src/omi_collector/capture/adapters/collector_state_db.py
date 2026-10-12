@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 _SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5_000
+_STATE_DB_MODE = 0o640
 
 
 class StateKind(StrEnum):
@@ -210,8 +211,8 @@ class StateDB(_Operations):
             _validate_schema(connection)
             connection.commit()
             mode = stat.S_IMODE(self.path.stat().st_mode)
-            if mode & 0o077:
-                self.path.chmod(0o600)
+            if mode != _STATE_DB_MODE:
+                self.path.chmod(_STATE_DB_MODE)
         except (OSError, sqlite3.DatabaseError) as error:
             connection.rollback()
             raise StateDBError("state database initialization failed") from error

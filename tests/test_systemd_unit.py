@@ -291,7 +291,12 @@ def test_operator_status_command_has_no_arguments_or_extra_privilege() -> None:
     assert "(( $# != 0 ))" in command
     assert "runuser --user omi-collector" in command
     assert "device status --config /srv/pipelines/omi/config.toml --hours 24" in command.replace("\\\n", "")
-    assert policy == '%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-status ""\n'
+    assert policy.splitlines() == [
+        '%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-status ""',
+        "j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl start omi-collector.service",
+        "j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl stop omi-collector.service",
+        "j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl restart omi-collector.service",
+    ]
 
 
 def test_shell_scripts_are_syntactically_clean() -> None:
@@ -755,6 +760,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
 
     current_link = context.deployment_root / "current"
     state_file = tmp_path / "pipeline" / "omi" / "collector" / "collector-state.sqlite3"
+    state_file.parent.parent.mkdir(parents=True)
     deployer = _DEPLOYER.read_text(encoding="utf-8")
     replacements = (
         ("/etc/systemd/system/omi-collector.service", str(installed_unit)),
@@ -778,6 +784,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         ("/var/lib/omi-collector-build", str(context.build_state)),
         ("account_user='omi-collector'", f"account_user={shlex.quote(context.account_user)}"),
         ("account_group='omi-collector'", f"account_group={shlex.quote(context.account_group)}"),
+        ("operator_group='j2h4u'", f"operator_group={shlex.quote(context.account_group)}"),
         ("build_user='omi-collector-build'", f"build_user={shlex.quote(context.build_user)}"),
         ("build_group='omi-collector-build'", f"build_group={shlex.quote(context.build_group)}"),
         ("sealer_owner='0:0'", f"sealer_owner='{os.getuid()}:{os.getgid()}'"),
@@ -856,7 +863,10 @@ def test_deployer_builds_validates_selects_and_seals_one_release(tmp_path: Path)
     assert "uv cwd=" in commands
     assert "args=sync --project" in commands
     assert "config check --config" in commands
-    assert "runuser service args=" not in commands
+    lock = Path(harness.environment["DEPLOY_STATE_FILE"]).parent / "collector.lock"
+    assert [line for line in commands.splitlines() if line.startswith("runuser service args=")] == [
+        f"runuser service args=test -w {lock}"
+    ]
     assert "systemctl args=stop omi-collector.service" in commands
     assert "systemctl args=restart omi-collector.service" in commands
     assert f"config={harness.config_file}" in result.stdout
@@ -873,12 +883,15 @@ def test_deployer_checks_existing_publication_checkpoint_as_service_before_stop(
     assert result.returncode == 0, result.stderr
     commands = harness.log.read_text(encoding="utf-8")
     service_checks = [line for line in commands.splitlines() if line.startswith("runuser service args=")]
+    lock = Path(harness.environment["DEPLOY_STATE_FILE"]).parent / "collector.lock"
     assert service_checks == [
         f"runuser service args=test -x {harness.publication_work_dir}",
         f"runuser service args=test -r {checkpoint}",
+        f"runuser service args=test -w {lock}",
     ]
     stop = commands.index("systemctl args=stop omi-collector.service")
-    assert all(commands.index(check) < stop for check in service_checks)
+    assert all(commands.index(check) < stop for check in service_checks[:2])
+    assert stop < commands.index(service_checks[2])
 
 
 def test_deployer_allows_existing_work_without_first_checkpoint(tmp_path: Path) -> None:
@@ -893,7 +906,11 @@ def test_deployer_allows_existing_work_without_first_checkpoint(tmp_path: Path) 
         for line in harness.log.read_text(encoding="utf-8").splitlines()
         if line.startswith("runuser service args=")
     ]
-    assert service_checks == [f"runuser service args=test -x {harness.publication_work_dir}"]
+    lock = Path(harness.environment["DEPLOY_STATE_FILE"]).parent / "collector.lock"
+    assert service_checks == [
+        f"runuser service args=test -x {harness.publication_work_dir}",
+        f"runuser service args=test -w {lock}",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -942,7 +959,9 @@ def test_deployer_verifies_candidate_as_builder_before_root_seals_or_restarts(tm
 
     assert result.returncode == 0, result.stderr
     commands = harness.log.read_text(encoding="utf-8")
-    builder_runs = [line for line in commands.splitlines() if line.startswith("runuser args=")]
+    builder_runs = [
+        line for line in commands.splitlines() if line.startswith("runuser args=--user omi-collector-build-test ")
+    ]
     assert len(builder_runs) == 6
     assert all("--user omi-collector-build-test --group omi-collector-build-test --" in line for line in builder_runs)
     assert "python find --managed-python --no-python-downloads --no-project 3.14" in builder_runs[0]
@@ -1356,7 +1375,8 @@ def test_deployer_restores_previous_release_when_readiness_fails(tmp_path: Path)
 
 def test_deployer_migrates_stopped_state_before_service_restart(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(migration_activates=True))
-    Path(harness.environment["DEPLOY_STATE_FILE"]).parent.mkdir(parents=True)
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    state_file.parent.mkdir(parents=True)
 
     result = _run_deployer(harness)
 
@@ -1368,6 +1388,17 @@ def test_deployer_migrates_stopped_state_before_service_restart(tmp_path: Path) 
     )
     assert "runuser service args=test -w" in commands
     assert "collector.lock" in commands
+    assert stat.S_IMODE(state_file.stat().st_mode) == 0o640
+    assert stat.S_IMODE((state_file.parent / "collector.lock").stat().st_mode) == 0o600
+    data_roots = (
+        state_file.parent,
+        state_file.parent / "attempts",
+        state_file.parent / "quarantine",
+        state_file.parent.parent / "draft",
+        state_file.parent.parent / "ready",
+    )
+    for root in data_roots:
+        assert root.stat().st_mode & 0o7777 == 0o2750
 
 
 def test_deployer_prepares_lock_for_empty_existing_collector_root(tmp_path: Path) -> None:

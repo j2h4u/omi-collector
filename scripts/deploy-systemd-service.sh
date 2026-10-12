@@ -367,7 +367,7 @@ function validate_candidate_config {
 function migrate_stopped_collector_state {
     # args
     local -r environment="$1" config_file="$2" state_file="$3" legacy_phy_home="$4"
-    local -r runuser_bin="$5" account_user="$6" account_group="$7"
+    local -r runuser_bin="$5" account_user="$6" account_group="$7" operator_group="$8"
     local -r lock_file="${state_file%/*}/collector.lock"
 
     # code
@@ -385,15 +385,43 @@ function migrate_stopped_collector_state {
         || die "Collector state database is not a regular file: ${state_file}"
     [[ -f "$lock_file" && ! -L "$lock_file" ]] \
         || die "Collector singleton lock is not a regular file: ${lock_file}"
-    chown "$account_user:$account_group" -- "$state_file" \
+    chown "$account_user:$operator_group" -- "$state_file" \
         || die 'could not assign Collector state database to the service account'
-    chmod 0600 -- "$state_file" || die 'could not set Collector state database mode'
+    chmod 0640 -- "$state_file" || die 'could not set Collector state database mode'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -r "$state_file" \
         || die 'service account cannot read Collector state database'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "$state_file" \
         || die 'service account cannot write Collector state database'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "${state_file%/*}" \
         || die 'service account cannot write Collector state journal directory'
+}
+
+function provision_operator_data_access {
+    # args
+    local -r storage_root="$1" account_user="$2" operator_group="$3"
+
+    # vars
+    local directory
+    local -a directories=(
+        "${storage_root}/collector"
+        "${storage_root}/collector/attempts"
+        "${storage_root}/collector/quarantine"
+        "${storage_root}/draft"
+        "${storage_root}/ready"
+    )
+
+    # code
+    # assert: the state path's parent is an existing real pipeline storage root
+    [[ -d "$storage_root" && ! -L "$storage_root" ]] || die 'Collector storage root is missing or unsafe'
+    getent group "$operator_group" &> /dev/null || die "operator group is missing: ${operator_group}"
+    for directory in "${directories[@]}"; do
+        # assert: never change a symlinked data root
+        [[ ! -L "$directory" ]] || die "Collector data root must not be a symlink: ${directory}"
+        install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory" \
+            || die "could not provision Collector data root: ${directory}"
+        [[ $(stat -c '%U:%G:%a' -- "$directory") == "${account_user}:${operator_group}:2750" ]] \
+            || die "Collector data root has unexpected ownership or mode: ${directory}"
+    done
 }
 
 function prepare_service_singleton_lock {
@@ -507,7 +535,7 @@ function require_clean_source_tree {
 }
 
 declare script_dir repo_root source_package source_unit installed_unit config_file publication_work_dir service_name
-declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user account_group build_user build_group
+declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user account_group operator_group build_user build_group
 declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
 declare state_file candidate_state_file legacy_phy_state_home
@@ -533,6 +561,7 @@ sealer_script="${script_dir}/seal_deployment_tree.py"
 sealer_owner='0:0'
 account_user='omi-collector'
 account_group='omi-collector'
+operator_group='j2h4u'
 build_user='omi-collector-build'
 build_group='omi-collector-build'
 build_state_dir='/var/lib/omi-collector-build'
@@ -674,6 +703,7 @@ seal_deployment_environment "$staged_environment" "$deployments_dir" "$sealer_py
     "$python_install_dir"
 write_release_metadata "$staged_environment" "$deployments_dir" "$source_revision"
 validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
+provision_operator_data_access "${state_file%/collector/collector-state.sqlite3}" "$account_user" "$operator_group"
 [[ ! -e "$candidate_state_file" && ! -L "$candidate_state_file" ]] \
     || die "unfinished Collector state migration candidate needs inspection: ${candidate_state_file}"
 
@@ -683,7 +713,7 @@ systemctl stop "$service_name" || die "could not stop ${service_name} before sel
 prepare_service_singleton_lock "${state_file%/*}/collector.lock" "$runuser_bin" "$account_user" "$account_group" \
     || die 'could not prepare the stable Collector singleton lock for migration'
 migrate_stopped_collector_state "$staged_environment" "$config_file" "$state_file" "$legacy_phy_state_home" \
-    "$runuser_bin" "$account_user" "$account_group"
+    "$runuser_bin" "$account_user" "$account_group" "$operator_group"
 selection_published=1
 publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"
 systemctl restart "$service_name" || die "could not restart ${service_name}"

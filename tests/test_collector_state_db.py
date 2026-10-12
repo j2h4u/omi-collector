@@ -159,6 +159,20 @@ def test_write_mode_creates_missing_directory_chain_without_following_symlinks(t
         StateDB(linked_directory / "nested" / "state.sqlite3")
 
 
+@pytest.mark.parametrize("mode", [0o600, 0o666, 0o777])
+def test_write_mode_corrects_database_permissions_and_read_only_does_not_mutate(tmp_path: Path, mode: int) -> None:
+    path = tmp_path / "state.sqlite3"
+    StateDB(path)
+    path.chmod(mode)
+
+    StateDB(path)
+    assert path.stat().st_mode & 0o777 == 0o640
+
+    path.chmod(0o600)
+    StateDB(path, read_only=True)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
 def test_write_does_not_overwrite_a_malformed_existing_payload(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     db = StateDB(path)

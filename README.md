@@ -125,8 +125,6 @@ sudo install -d -o root -g root -m 0755 /srv/pipelines/omi
 sudo install -o root -g root -m 0644 config/config.toml.example /srv/pipelines/omi/config.toml
 sudoedit /srv/pipelines/omi/config.toml
 sudo scripts/install-systemd-unit.sh
-sudo install -d -o omi-collector -g omi-collector -m 0750 \
-  /srv/pipelines/omi/collector /srv/pipelines/omi/draft /srv/pipelines/omi/ready
 sudo systemctl enable --now bluetooth.service
 sudo -u omi-collector bluetoothctl show
 sudo scripts/deploy-systemd-service.sh
@@ -249,6 +247,14 @@ guards the complete service invocation and each command that can mutate
 Collector state. Read-only `device status` and `device metrics` use read-only
 database access and can run while the service is active. Keep the guard file in
 place; migration replaces the database file but never the guard inode.
+
+The installer and every deployment keep the `collector`, `draft`, `ready`,
+`collector/attempts`, and `collector/quarantine` roots owned by the service with
+setgid group `j2h4u` and mode `2750`. New data inherits that group; the SQLite
+state database is `0640`, while the singleton lock remains private at `0600`.
+This gives the local operator password-free read and inventory access without
+allowing edits to Collector state. Existing nested files from older releases
+need a one-time ownership/mode repair before the operator can read them.
 
 The canonical systemd deployment performs the offline cutover in the same
 transaction: it stops the service, runs the staged `migrate-state` command,

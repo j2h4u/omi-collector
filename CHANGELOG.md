@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/j2h4u/omi-collector/compare/v0.12.0...v0.12.1) (2026-10-12)
+
+
+### Fixes
+
+* **state:** accept unavailable RSSI during legacy cutover ([#237](https://github.com/j2h4u/omi-collector/issues/237)) ([9800f47](https://github.com/j2h4u/omi-collector/commit/9800f475919dfee2d36201566b3ad350182f4470))
+
 ## [0.12.0](https://github.com/j2h4u/omi-collector/compare/v0.11.23...v0.12.0) (2026-10-12)
 
 

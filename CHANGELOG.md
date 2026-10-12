@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.0](https://github.com/j2h4u/omi-collector/compare/v0.11.23...v0.12.0) (2026-10-12)
+
+
+### Features
+
+* **state:** consolidate Collector mutable state in SQLite ([b35fa57](https://github.com/j2h4u/omi-collector/commit/b35fa57c3becef609c5d22c351d56c1085c65a25))
+
+
+### Fixes
+
+* **security:** project safe collector diagnostics before logging ([b35fa57](https://github.com/j2h4u/omi-collector/commit/b35fa57c3becef609c5d22c351d56c1085c65a25))
+* **state:** retain sparse recovery clock custody at cutover ([b35fa57](https://github.com/j2h4u/omi-collector/commit/b35fa57c3becef609c5d22c351d56c1085c65a25))
+
 ## [0.11.23](https://github.com/j2h4u/omi-collector/compare/v0.11.22...v0.11.23) (2026-10-11)
 
 

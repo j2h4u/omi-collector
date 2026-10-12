@@ -242,6 +242,45 @@ def test_legacy_runtime_projection_matches_import_and_preserves_source_timestamp
     assert expected["connection_rssi_observed_at"] == "2026-10-11T03:02:05.000000+00:00"
 
 
+def test_unavailable_rssi_does_not_replace_a_numeric_observation(tmp_path: Path) -> None:
+    database = StateDB(tmp_path / "collector-state.db")
+    rows = (
+        {
+            "event": "ble_link_rssi_observed",
+            "fields": {"rssi_dbm": None, "status_name": "success", "status_hex": "0x00"},
+            "timestamp": "2026-10-11T03:02:03+00:00",
+        },
+        {
+            "event": "ble_link_rssi_observed",
+            "fields": {"rssi_dbm": -68},
+            "timestamp": "2026-10-11T03:02:04+00:00",
+        },
+        {
+            "event": "ble_link_rssi_observed",
+            "fields": {"rssi_dbm": None, "status_name": "success", "status_hex": "0x00"},
+            "timestamp": "2026-10-11T03:02:05+00:00",
+        },
+    )
+    assert legacy_runtime_projection(rows[:1]) is None
+    import_legacy_runtime_status(database, rows)
+    projection = cast(dict[str, object], read_runtime_status(database))
+    assert projection["connection_rssi_dbm"] == -68
+    assert projection["connection_rssi_observed_at"] == "2026-10-11T03:02:04+00:00"
+
+
+def test_live_unavailable_rssi_keeps_status_absent(tmp_path: Path) -> None:
+    database = StateDB(tmp_path / "collector-state.db")
+    writer = SQLiteQualityMetrics(database, release_version="1.2.3")
+    logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.debug.unavailable_rssi"))
+    set_runtime_status_sink(logger, writer.record_runtime_status)
+    try:
+        debug_event("ble_link_rssi_observed", logger=logger, rssi_dbm=None, status_name="success")
+        assert writer.close(timeout_seconds=2)
+    finally:
+        close_debug_logging(logger)
+    assert read_runtime_status(database) is None
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -321,6 +360,14 @@ def test_legacy_runtime_projection_matches_import_and_preserves_source_timestamp
                 "timestamp": "2026-10-11T01:02:03+00:00",
             },
             id="text-rssi-is-not-an-integer-reading",
+        ),
+        pytest.param(
+            {
+                "event": "ble_link_rssi_observed",
+                "fields": {},
+                "timestamp": "2026-10-11T01:02:03+00:00",
+            },
+            id="missing-rssi-is-not-an-unavailable-reading",
         ),
         pytest.param(
             {

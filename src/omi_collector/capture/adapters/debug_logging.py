@@ -440,6 +440,8 @@ def merge_runtime_status(
         raise ValueError("runtime status event timestamp is invalid")
     _validate_runtime_event({"event": event, "fields": dict(fields), "timestamp": timestamp})
     fields = _runtime_fields(event, fields)
+    if event == "ble_link_rssi_observed" and fields["rssi_dbm"] is None:
+        return current
     current = current or {
         "battery_observation": None,
         "battery_observed_at": None,
@@ -468,8 +470,8 @@ def merge_runtime_status(
             current["last_error"] = progress
             current["last_error_at"] = timestamp
     elif event == "ble_link_rssi_observed":
-        rssi = cast(int, fields["rssi_dbm"])
-        if _is_newer(timestamp, current.get("connection_rssi_observed_at")):
+        rssi = fields["rssi_dbm"]
+        if isinstance(rssi, int) and _is_newer(timestamp, current.get("connection_rssi_observed_at")):
             current["connection_rssi_dbm"] = rssi
             current["connection_rssi_observed_at"] = timestamp
     _validate_runtime_projection(current)
@@ -534,7 +536,7 @@ def _validate_runtime_event(value: Mapping[str, object]) -> None:
             raise ValueError("runtime firmware observation is invalid")
     elif event == "ble_link_rssi_observed":
         rssi = fields.get("rssi_dbm")
-        if isinstance(rssi, bool) or not isinstance(rssi, int):
+        if "rssi_dbm" not in fields or isinstance(rssi, bool) or (rssi is not None and not isinstance(rssi, int)):
             raise ValueError("runtime RSSI event is invalid")
     else:
         raise ValueError("runtime status event type is unsupported")
@@ -669,8 +671,10 @@ def _journal_value(value: object, field_name: str) -> object:
 
 def _runtime_fields(event: str, fields: Mapping[str, object]) -> dict[str, object]:
     if event == "ble_link_rssi_observed":
+        if "rssi_dbm" not in fields:
+            return {}
         rssi = fields.get("rssi_dbm")
-        return {"rssi_dbm": rssi} if isinstance(rssi, int) and not isinstance(rssi, bool) else {}
+        return {"rssi_dbm": rssi} if rssi is None or (isinstance(rssi, int) and not isinstance(rssi, bool)) else {}
     progress = fields.get("progress")
     if event != "sync_progress" or not isinstance(progress, Mapping):
         return {}

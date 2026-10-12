@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.2](https://github.com/j2h4u/omi-collector/compare/v0.12.1...v0.12.2) (2026-10-12)
+
+
+### Fixes
+
+* **capture:** reclaim authenticated retired attempt raw ([0154746](https://github.com/j2h4u/omi-collector/commit/0154746e6f41c64862e2cecd7198b76cbe14b5a5))
+* **ops:** grant operator read access across deployments ([0154746](https://github.com/j2h4u/omi-collector/commit/0154746e6f41c64862e2cecd7198b76cbe14b5a5))
+
+
+### Documentation
+
+* audit Collector file necessity and retention ([0154746](https://github.com/j2h4u/omi-collector/commit/0154746e6f41c64862e2cecd7198b76cbe14b5a5))
+
 ## [0.12.1](https://github.com/j2h4u/omi-collector/compare/v0.12.0...v0.12.1) (2026-10-12)
 
 

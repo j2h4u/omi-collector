@@ -50,9 +50,11 @@ from .ready_bundles import (
     ReadyInventory,
     ReadyOutcome,
     ReadyOutcomeState,
+    acknowledged_ready,
     authenticated_inventory,
     draft_frontier,
     finalize_drafts,
+    legacy_ready_retirement_ranges,
     resume_retired,
     retire_acknowledged,
     source_revision,
@@ -557,11 +559,22 @@ class StagingStore:
         self._publication_event(InputChanged())
         return closure
 
+    def _guard_legacy_ready_retirement(self, publication_root: Path, acknowledged: tuple[tuple[str, str], ...]) -> None:
+        legacy_ranges = legacy_ready_retirement_ranges(publication_root, self._state_db, acknowledged)
+        if not legacy_ranges:
+            return
+        from .attempt_cleanup import terminal_attempts_overlap
+
+        self.sweep_terminal_retired()
+        if terminal_attempts_overlap(self._filesystem, legacy_ranges):
+            raise ReadyBundleError("legacy ready retirement still has terminal raw without durable lineage")
+
     def _recover_and_publish_unlocked(self) -> ReadyOutcome:
         publication_root = self._publication_root
         if publication_root is None:
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
+        acknowledged = acknowledged_ready(checkpoint_path)
         try:
             from .clock_state_store import ClockStateStore
 
@@ -569,6 +582,7 @@ class StagingStore:
         except (ClockSegmentError, ValueError) as error:
             _LOGGER.warning("clock metadata unavailable; publishing ready audio without UTC normalization: %s", error)
             segments = ClockSegmentMap(())
+        self._guard_legacy_ready_retirement(publication_root, acknowledged)
         resume_retired(publication_root, self._state_db)
         closures = ready_closures.coalesce(self._state_db)
         outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_closed_frontier")
@@ -598,7 +612,8 @@ class StagingStore:
                     outcome = replace(outcome, remaining_at_frontier=True, inventory=inventory)
                 else:
                     ready_closures.remove(self._state_db, closure)
-        retired = retire_acknowledged(publication_root, self._state_db, checkpoint_path)
+        self._guard_legacy_ready_retirement(publication_root, acknowledged)
+        retired = retire_acknowledged(publication_root, self._state_db, checkpoint_path, acknowledged=acknowledged)
         if retired and outcome.state is ReadyOutcomeState.WAITING:
             outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="ack_retired")
         return outcome
@@ -681,6 +696,7 @@ class StagingStore:
     def sweep_terminal_retired(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
         return quarantine.sweep_terminal_retired(
             self._filesystem,
+            ready_root=self._publication_root,
             should_defer=should_defer or _never_defer,
         )
 

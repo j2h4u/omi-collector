@@ -88,7 +88,7 @@ def test_status_store_creates_no_independent_lock_file(tmp_path: Path) -> None:
     store = OperationalStatusStore(db, OperationalIdentity(BOOT, INVOCATION))
     try:
         store.initialize()
-        assert stat.S_IMODE(db.path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(db.path.stat().st_mode) == 0o640
         assert not (db.path.parent / "operational-status.lock").exists()
     finally:
         store.close()

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Coroutine
+from contextlib import contextmanager
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
@@ -110,6 +111,42 @@ def test_migrate_state_cli_passes_operator_phy_home_after_stop(monkeypatch: pyte
     assert result.exit_code == 0
     assert json.loads(result.output) == {"removed_files": 3}
     assert captured[0][1] == (Path("/var/lib/omi-collector"), old_home)
+
+
+def test_cleanup_attempts_requires_stopped_installed_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "active"})
+
+    result = CliRunner().invoke(app, ["cleanup-attempts", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "stop the Collector service" in result.output
+
+
+def test_cleanup_attempts_runs_guarded_sweep(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_command_state(_loaded: object):
+        calls.append("guard-enter")
+        yield object()
+        calls.append("guard-exit")
+
+    class FakeStaging:
+        def sweep_terminal_retired(self) -> tuple[Path, ...]:
+            calls.append("sweep")
+            return (tmp_path / "retired",)
+
+    monkeypatch.setattr(cli, "_command_state", fake_command_state)
+    monkeypatch.setattr(cli, "_staging", lambda *_args, **_kwargs: FakeStaging())
+
+    result = CliRunner().invoke(app, ["cleanup-attempts", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"removed": 1}
+    assert calls == ["guard-enter", "sweep", "guard-exit"]
 
 
 def test_version_flag_reports_package_version() -> None:

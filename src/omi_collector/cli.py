@@ -440,6 +440,23 @@ def migrate_collector_state(
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
+@app.command("cleanup-attempts")
+def cleanup_attempts(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Sweep authenticated terminal raw while the service is stopped."""
+    loaded = _load_config(config_path)
+    service_state = _systemd_service_status()
+    if loaded.path == DEFAULT_CONFIG_PATH and (
+        not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}
+    ):
+        typer.echo("stop the Collector service before terminal attempt cleanup", err=True)
+        raise typer.Exit(code=1)
+    with _command_state(loaded) as state_db:
+        removed = _staging(loaded, state_db=state_db).sweep_terminal_retired()
+    typer.echo(json.dumps({"removed": len(removed)}, sort_keys=True, separators=(",", ":")))
+
+
 @app.command()
 def service(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,

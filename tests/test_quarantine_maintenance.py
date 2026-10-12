@@ -879,7 +879,7 @@ def test_presence_startup_state_binds_once_after_a_completed_attempt(tmp_path: P
     _run(scenario())
 
 
-def test_presence_idle_maintenance_repeats_terminal_retention_sweep(
+def test_presence_idle_maintenance_removes_confirmed_terminal_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
@@ -906,8 +906,6 @@ def test_presence_idle_maintenance_repeats_terminal_retention_sweep(
         def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
             nonlocal now, sweeps
             sweeps += 1
-            if sweeps == 2:
-                now += 2_000_000_000
             removed = original_sweep(should_defer=should_defer)
             if retired in removed:
                 expired.set()
@@ -931,7 +929,7 @@ def test_presence_idle_maintenance_repeats_terminal_retention_sweep(
             assert await asyncio.to_thread(expired.wait, 2)
             wake_scanner.set()
             assert await asyncio.wait_for(owner, timeout=2) == PresenceWake("advertisement")
-            assert sweeps >= 2
+            assert sweeps >= 1
             assert not retired.exists()
             assert len(bound) == 1
         finally:

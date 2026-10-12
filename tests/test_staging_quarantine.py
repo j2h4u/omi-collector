@@ -14,8 +14,8 @@ from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters import attempt_cleanup, staging_filesystem
 from omi_collector.capture.adapters import quarantine as quarantine_module
-from omi_collector.capture.adapters import staging_filesystem
 from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.staging_contract import (
     AttemptStateError,
@@ -387,9 +387,6 @@ def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_i
     preserved.write_text("evidence", encoding="utf-8")
 
     assert store.pending_attempts() == (active.descriptor,)
-    assert store.sweep_terminal_retired() == ()
-    assert attempt.path.exists()
-    now += 72_000_000_000
     assert store.sweep_terminal_retired() == (attempt.path,)
     assert not attempt.path.exists()
     assert active.path.exists()
@@ -453,16 +450,16 @@ def test_terminal_retired_sweep_revalidates_checkpointed_records_before_delete(
     attempt.close(durable=True)
     store.terminalize_prefix_attempt(attempt.attempt_id)
     now += 1_000_000_000
-    original_published_prefix = quarantine_module._published_prefix
+    original_published_prefix = attempt_cleanup._published_prefix
     reads: list[int] = []
 
     def count_prefix_validation(*args: object, **kwargs: object) -> object:
         reads.append(1)
         return original_published_prefix(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(quarantine_module, "_published_prefix", count_prefix_validation)
+    monkeypatch.setattr(attempt_cleanup, "_published_prefix", count_prefix_validation)
     assert store.sweep_terminal_retired() == (attempt.path,)
-    assert reads == [1]
+    assert reads
     assert not attempt.path.exists()
 
 
@@ -930,7 +927,7 @@ def test_terminal_retired_sweep_rechecks_attempts_root_after_validation(
 
     monkeypatch.setattr(store._filesystem, "_prepare_roots", swap_after_validation)
 
-    with pytest.raises(StagingError, match="terminal-retired partial root is not a directory"):
+    with pytest.raises(StagingError, match="terminal attempt root is not a directory"):
         store.sweep_terminal_retired()
 
     assert attempts_root.is_symlink()

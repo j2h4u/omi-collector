@@ -125,7 +125,8 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     store.append_ready_closure(101, "drained")
     assert store.publish_ready() is not None
     assert not tuple(store.capture_root.iterdir())
-    assert store.sweep_terminal_retired() == ()
+    assert store.sweep_terminal_retired() == (store.paths.attempts / attempt_id,)
+    assert attempt_payload(store, attempt_id) is None
 
 
 def test_child_task_publishes_after_writer_releases(tmp_path: Path) -> None:

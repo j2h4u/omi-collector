@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.3](https://github.com/j2h4u/omi-collector/compare/v0.12.2...v0.12.3) (2026-10-13)
+
+
+### Fixes
+
+* **state:** allow retired rescue after authenticated cleanup ([#244](https://github.com/j2h4u/omi-collector/issues/244)) ([c4b7863](https://github.com/j2h4u/omi-collector/commit/c4b786349ff17b7ac7f7a6dc60433225da34f787))
+
 ## [0.12.2](https://github.com/j2h4u/omi-collector/compare/v0.12.1...v0.12.2) (2026-10-12)
 
 

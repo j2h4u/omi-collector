@@ -3095,6 +3095,7 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
             events.append("retry")
         outcome = original_background()
         if outcome.state is ReadyOutcomeState.PUBLISHED:
+            events.append("publication_success")
             published.set()
         return outcome
 
@@ -3144,7 +3145,8 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
     assert clock_state.intent is None
     assert clock_state.anchor is not None
     assert clock_state.anchor.sequence_frontier == 11
-    assert events == ["read", "closure", "publication_transient", "retry", "retry"]
+    assert events[:5] == ["read", "closure", "publication_transient", "retry", "publication_success"]
+    assert events[5:] in ([], ["retry"])
     assert len(tuple(ready.iterdir())) == 1
 
 

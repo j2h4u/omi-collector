@@ -302,6 +302,36 @@ def test_confirmed_clock_ranges_change_only_published_timestamps(
     assert [item["utc"] is not None for item in ranges] == [False, True, False]
 
 
+def test_clock_overflow_preserves_every_timestamp_in_the_affected_range(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    _state_db, store = audio_store
+    ready = _ready_root(tmp_path)
+    maximum = (1 << 32) - 1
+    records = (_record(0, 1), _record(maximum, 2), _record(maximum - 1, 3))
+    source = _source(store, "a" * 32, 10, records)
+    segments = ClockSegmentMap((ClockSegment("overflow", 10, 12, 1.0, 0.0), ClockSegment("boundary", 12, 13, 1.0, 0.0)))
+
+    (published,) = finalize_typed_sources(
+        store,
+        (source,),
+        ready,
+        config=ReadyConfig(target_audio_seconds=0.02),
+        clock_segments=segments,
+        frontier=13,
+        drained=True,
+    ).published
+
+    output = (published.path / "records.bin").read_bytes()
+    assert output == records[0] + records[1] + _record(maximum, 3)
+    manifest = cast(dict[str, object], loads((published.path / "manifest.json").read_text()))
+    ranges = cast(list[dict[str, object]], manifest["time_ranges"])
+    assert [(item["start_sequence"], item["next_sequence"], item["utc"] is not None) for item in ranges] == [
+        (10, 12, False),
+        (12, 13, True),
+    ]
+
+
 def test_sql_bundle_lineage_survives_ack_retirement(
     tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
 ) -> None:

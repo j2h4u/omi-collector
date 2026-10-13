@@ -221,6 +221,8 @@ enabled. It never starts the service without `--restart`.
 It also provisions the fixed Collector data roots as
 `omi-collector:j2h4u` mode `2750`. The setgid bit keeps new ready bundles and
 service-created files in the operator's read group.
+The operator group must also have a same-named operator account: stopped
+migration checks that account's effective read-only access before completion.
 Each deployment reapplies these root modes and sets the SQLite state database
 to `omi-collector:j2h4u` mode `0640`; the singleton lock remains private
 `omi-collector:omi-collector` mode `0600`. This operator access is read-only:
@@ -283,7 +285,8 @@ headroom, then records a source receipt. It builds and verifies a v2 candidate
 on the same filesystem, activates it, deletes only inventoried old private
 files, verifies service and operator access, and marks the receipt complete
 last. The command does not archive old raw audio or alter public ready bundles.
-An attributable or spool-rooted v1 quarantine, terminal-retired attempt, or unknown private
+An attributable or spool-rooted v1 quarantine, terminal-retired attempt,
+attempt with private bytes but no recorded READ_BEGIN, or unknown private
 artifact fails before the receipt; resolve custody manually instead of
 discarding it. Any later source change fails before activation. A validation
 or parity failure leaves the service

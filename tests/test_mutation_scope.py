@@ -591,10 +591,13 @@ def _process_stopped(pid: int) -> bool:
     return False
 
 
-def test_pidfd_zombie_race_is_safe_only_for_the_same_process_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("terminal_state", ["Z", "X"])
+def test_pidfd_exit_race_is_safe_only_for_the_same_process_identity(
+    monkeypatch: pytest.MonkeyPatch, terminal_state: str
+) -> None:
     pid = 12345
     ticks = "42"
-    monkeypatch.setattr(mutation_campaign, "_proc_identity", lambda _pid: (1, ticks, "Z"))
+    monkeypatch.setattr(mutation_campaign, "_proc_identity", lambda _pid: (1, ticks, terminal_state))
 
     with pytest.raises(ProcessLookupError) as zombie:
         mutation_campaign._open_pidfd(pid, ticks)

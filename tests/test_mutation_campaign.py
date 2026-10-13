@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TypedDict, Unpack, cast
 
 import pytest
@@ -323,6 +325,96 @@ def test_stop_owned_processes_rejects_esrch_when_pid_is_still_live(
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("boundary", ["uid", "identity", "cmdline"])
+@pytest.mark.parametrize("error_number", [errno.ESRCH, errno.EIO])
+def test_process_scan_skips_only_a_disappeared_proc_entry(
+    monkeypatch: pytest.MonkeyPatch, boundary: str, error_number: int
+) -> None:
+    proc = Path(f"/proc/{os.getpid()}")
+    monkeypatch.setattr(Path, "iterdir", lambda _path: iter((proc,)))
+    target = proc if boundary == "uid" else proc / ("stat" if boundary == "identity" else "cmdline")
+
+    def raise_at_boundary(path: Path, *_args: object, **_kwargs: object) -> object:
+        if path == target:
+            raise OSError(error_number, os.strerror(error_number))
+        if boundary == "uid":
+            return original_stat(path)
+        if boundary == "identity":
+            return original_text(path, encoding="ascii")
+        return original_bytes(path)
+
+    original_stat = Path.stat
+    original_text = Path.read_text
+    original_bytes = Path.read_bytes
+    method = {"uid": "stat", "identity": "read_text", "cmdline": "read_bytes"}[boundary]
+    monkeypatch.setattr(Path, method, raise_at_boundary)
+
+    if error_number == errno.ESRCH:
+        assert mutation_campaign._process_table(None) == {}
+    else:
+        with pytest.raises(OSError) as failed:
+            mutation_campaign._process_table(None)
+        assert failed.value.errno == errno.EIO
+
+
+@pytest.mark.parametrize("error_number", [errno.ESRCH, errno.EIO])
+def test_token_scan_preserves_unexpected_proc_environ_error(monkeypatch: pytest.MonkeyPatch, error_number: int) -> None:
+    proc_environ = Path(f"/proc/{os.getpid()}/environ")
+    original_bytes = Path.read_bytes
+
+    def read_bytes(path: Path) -> bytes:
+        if path == proc_environ:
+            raise OSError(error_number, os.strerror(error_number))
+        return original_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    if error_number == errno.ESRCH:
+        assert not mutation_campaign._has_job_token(os.getpid(), "test-token", set())
+    else:
+        with pytest.raises(OSError) as failed:
+            mutation_campaign._has_job_token(os.getpid(), "test-token", set())
+        assert failed.value.errno == errno.EIO
+
+
+@pytest.mark.parametrize("after_ticks,after_state", [("42", "X"), ("43", "S")])
+def test_pidfd_post_open_identity_check_closes_fd(
+    monkeypatch: pytest.MonkeyPatch, after_ticks: str, after_state: str
+) -> None:
+    identities = iter(((1, "42", "S"), (1, after_ticks, after_state)))
+    monkeypatch.setattr(mutation_campaign, "_proc_identity", lambda _pid: next(identities))
+    opened: list[int] = []
+
+    def pidfd_open(_pid: int, _flags: int) -> int:
+        fd = os.open(os.devnull, os.O_RDONLY)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(
+        mutation_campaign.ctypes, "CDLL", lambda *_args, **_kwargs: SimpleNamespace(pidfd_open=pidfd_open)
+    )
+    with pytest.raises(ProcessLookupError) as rejected:
+        mutation_campaign._open_pidfd(12345, "42")
+    assert rejected.value.errno == (errno.ESRCH if after_state == "X" else None)
+    with pytest.raises(OSError) as closed:
+        os.fstat(opened[0])
+    assert closed.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("terminal_state", ["Z", "X"])
+def test_terminal_processes_do_not_survive_token_scan_or_stop_wait(
+    monkeypatch: pytest.MonkeyPatch, terminal_state: str
+) -> None:
+    pid, ticks = 12345, "42"
+    monkeypatch.setattr(mutation_campaign, "_process_table", lambda _root_pid: {pid: (1, ticks, terminal_state, "")})
+    monkeypatch.setattr(mutation_campaign, "_has_job_token", lambda *_args: True)
+    assert mutation_campaign._token_pids("test-token") == {}
+
+    monkeypatch.setattr(mutation_campaign, "_proc_identity", lambda _pid: (1, ticks, terminal_state))
+    owned = {pid: (ticks, "terminal process")}
+    assert mutation_campaign._wait_pidfds(owned, 0.1)
+    assert mutation_campaign._owned_tree_stopped(owned)
 
 
 def _job_directories(audit_root: Path) -> list[Path]:

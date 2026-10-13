@@ -72,6 +72,7 @@ STABLE_PROCESS_SCANS = 2
 UNRESOLVED_EXIT_STATUS = 3
 FIXED_ENV = ("COVERAGE_CORE", "COVERAGE_FILE", "PYTEST_ADDOPTS", "UV_LINK_MODE")
 PROC_STAT_START_TICKS = 19
+EXITED_PROCESS_STATES = frozenset({"Z", "X"})
 RELEVANT_ENV = (
     *FIXED_ENV,
     "COVERAGE_PROCESS_START",
@@ -445,10 +446,26 @@ def _write_owner(job_root: Path, receipt: dict[str, object]) -> None:
 
 def _proc_identity(pid: int) -> tuple[int, str, str]:
     proc = Path(f"/proc/{pid}")
-    fields = proc.joinpath("stat").read_text(encoding="ascii").rsplit(")", 1)[-1].split()
+    try:
+        fields = proc.joinpath("stat").read_text(encoding="ascii").rsplit(")", 1)[-1].split()
+    except OSError as exc:
+        if exc.errno != errno.ESRCH:
+            raise
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(proc / "stat")) from exc
     if len(fields) <= PROC_STAT_START_TICKS:
         raise ValueError(f"cannot parse process identity for PID {pid}")
     return int(fields[1]), fields[PROC_STAT_START_TICKS], fields[0]
+
+
+def _proc_cmdline(proc: Path) -> str | None:
+    try:
+        return proc.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
+    except PermissionError:
+        return ""
+    except OSError as exc:
+        if exc.errno not in {errno.ENOENT, errno.ESRCH}:
+            raise
+        return None
 
 
 def _process_table(root_pid: int | None) -> dict[int, tuple[int, str, str, str]]:
@@ -461,18 +478,17 @@ def _process_table(root_pid: int | None) -> dict[int, tuple[int, str, str, str]]
             if proc.stat().st_uid != os.getuid():
                 continue
             parent, start_ticks, state = _proc_identity(pid)
-        except FileNotFoundError:
-            continue
         except PermissionError as exc:
             if pid == root_pid:
                 raise ValueError(f"cannot verify the owned root PID {pid}") from exc
             continue
-        try:
-            cmdline = proc.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
-        except FileNotFoundError:
+        except OSError as exc:
+            if exc.errno not in {errno.ENOENT, errno.ESRCH}:
+                raise
             continue
-        except PermissionError:
-            cmdline = ""
+        cmdline = _proc_cmdline(proc)
+        if cmdline is None:
+            continue
         processes[pid] = (parent, start_ticks, state, cmdline)
     return processes
 
@@ -494,10 +510,12 @@ def _descendants(processes: dict[int, tuple[int, str, str, str]], root_pid: int,
 def _has_job_token(pid: int, token: str, descendants: set[int]) -> bool:
     try:
         environ = Path(f"/proc/{pid}/environ").read_bytes()
-    except FileNotFoundError:
-        return False
     except PermissionError:
         return pid in descendants
+    except OSError as exc:
+        if exc.errno not in {errno.ENOENT, errno.ESRCH}:
+            raise
+        return False
     return JOB_TOKEN_ENV.encode() + b"=" + token.encode() in environ.split(b"\0")
 
 
@@ -508,7 +526,7 @@ def _token_pids(token: str, root_pid: int | None = None, root_ticks: str | None 
         descendants = _descendants(processes, root_pid, root_ticks)
     matches: dict[int, tuple[str, str]] = {}
     for pid, (_parent, start_ticks, state, cmdline) in processes.items():
-        if state == "Z":
+        if state in EXITED_PROCESS_STATES:
             continue
         if _has_job_token(pid, token, descendants) or pid in descendants:
             matches[pid] = (start_ticks, cmdline)
@@ -519,7 +537,7 @@ def _open_pidfd(pid: int, expected_ticks: str) -> int:
     _parent, current_ticks, state = _proc_identity(pid)
     if current_ticks != expected_ticks:
         raise ProcessLookupError(pid)
-    if state == "Z":
+    if state in EXITED_PROCESS_STATES:
         raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
     libc = ctypes.CDLL(None, use_errno=True)
     try:
@@ -537,7 +555,7 @@ def _open_pidfd(pid: int, expected_ticks: str) -> int:
         _parent, current_ticks, state = _proc_identity(pid)
         if current_ticks != expected_ticks:
             raise ProcessLookupError(pid)
-        if state == "Z":
+        if state in EXITED_PROCESS_STATES:
             raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
     except BaseException:
         os.close(pidfd)
@@ -552,7 +570,7 @@ def _verified_process_exit_race(error: OSError, pid: int, expected_ticks: str) -
         _parent, current_ticks, state = _proc_identity(pid)
     except FileNotFoundError:
         return True
-    return current_ticks == expected_ticks and state == "Z"
+    return current_ticks == expected_ticks and state in EXITED_PROCESS_STATES
 
 
 def _pidfd_signal(pidfd: int, sig: signal.Signals) -> None:
@@ -578,7 +596,7 @@ def _wait_pidfds(pids: dict[int, tuple[str, str]], timeout: float) -> bool:
                 _parent, current_ticks, state = _proc_identity(pid)
             except FileNotFoundError:
                 continue
-            if current_ticks == ticks and state != "Z":
+            if current_ticks == ticks and state not in EXITED_PROCESS_STATES:
                 remaining.append(pid)
         if not remaining:
             return True
@@ -778,7 +796,7 @@ def _stop_direct_launcher(
         if process.poll() is not None:
             return
         raise
-    if state == "Z":
+    if state in EXITED_PROCESS_STATES:
         return
     try:
         pidfd = _open_pidfd(process.pid, ticks)
@@ -803,7 +821,7 @@ def _owned_tree_stopped(owned: dict[int, tuple[str, str]]) -> bool:
             _parent, current_ticks, state = _proc_identity(pid)
         except FileNotFoundError:
             continue
-        if current_ticks != ticks or state not in {"T", "t", "Z"}:
+        if current_ticks != ticks or state not in {"T", "t", *EXITED_PROCESS_STATES}:
             return False
     return True
 

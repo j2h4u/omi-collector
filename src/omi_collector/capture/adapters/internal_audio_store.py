@@ -881,12 +881,21 @@ class InternalAudioStore:
         return self._append_replay(source, suffix, expected_sha256, tail)
 
     def _prefix_digest(self, source_id: str, count: int) -> str:
-        page = self.read_record_page(source_id, -1, count)
-        if len(page) != count or tuple(row.ordinal for row in page) != tuple(range(count)):
-            raise InternalAudioStoreError("replay prefix is not contiguous")
         digest = hashlib.sha256()
-        for record in page:
-            digest.update(record.raw_bytes)
+        after_ordinal = -1
+        hashed_count = 0
+        while hashed_count < count:
+            page = self.read_record_page(
+                source_id,
+                after_ordinal,
+                min(self.chunk_limit, count - hashed_count),
+            )
+            if not page or any(record.ordinal != hashed_count + index for index, record in enumerate(page)):
+                raise InternalAudioStoreError("replay prefix is not contiguous")
+            for record in page:
+                digest.update(record.raw_bytes)
+            hashed_count += len(page)
+            after_ordinal = page[-1].ordinal
         return digest.hexdigest()
 
     def _commit_replay_tail(
@@ -1489,7 +1498,12 @@ def _validate_tail(tail: CaptureTail | None, source: CaptureSource, new_count: i
         or tail.complete_high_water > new_count
     ):
         raise InternalAudioStoreError("tail complete frontier does not match drain")
-    if type(tail.received_high_water) is not int or tail.received_high_water < 0:
+    leg_byte_limit = (source.current_leg_start - source.sequence_start + source.current_leg_count) * AUDIO_RECORD_SIZE
+    if (
+        type(tail.received_high_water) is not int
+        or tail.received_high_water < 0
+        or tail.received_high_water > leg_byte_limit
+    ):
         raise InternalAudioStoreError("tail received frontier is invalid")
     if type(tail.byte_offset) is not int or tail.byte_offset != tail.complete_high_water * AUDIO_RECORD_SIZE:
         raise InternalAudioStoreError("tail byte offset is invalid")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from omi_collector.capture.adapters.debug_logging import (
     write_runtime_status_event,
 )
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
+from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.quality_metrics import (
     QualityMetricsError,
@@ -226,6 +228,35 @@ def test_durable_loss_remains_visible_without_degrading_clear_status(
     assert quality["confirmed_loss_events"] == 1
     assert quality["confirmed_lost_records"] == 10
     assert quality["confirmed_lost_raw_bytes"] == 10 * RECORD_SIZE
+
+
+def test_status_counts_persistent_ready_conflict_holds_without_changing_health(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    db = _state_db(layout)
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    now = datetime(2026, 9, 8, 10, tzinfo=UTC)
+    assert collect_operator_status(layout, hours=24, now=now)["ready_conflict_holds"] == 0
+
+    with InternalAudioStore(db) as store:
+        store.create_source("a" * 32, "attempt", 100, 101)
+        store.create_source("b" * 32, "attempt", 101, 102)
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "UPDATE capture_source SET source_type='quarantine', lifecycle='blocked', "
+            "block_reason='ready_overlap_conflict' WHERE source_id=?",
+            ("a" * 32,),
+        )
+        connection.execute(
+            "UPDATE capture_source SET source_type='quarantine', lifecycle='blocked', "
+            "block_reason='other' WHERE source_id=?",
+            ("b" * 32,),
+        )
+
+    result = collect_operator_status(layout, hours=24, now=now)
+    assert result["ready_conflict_holds"] == 1
+    assert result["status"] == "unknown"
 
 
 def test_confirmed_loss_with_blocked_publication_remains_attention(

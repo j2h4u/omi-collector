@@ -698,7 +698,7 @@ class StagingStore:
                         f"WHERE source_type = 'attempt' AND lifecycle IN {lifecycles} ORDER BY source_id"
                     ).fetchall(),
                 )
-        except (OSError, StateDBError) as error:
+        except (OSError, sqlite3.DatabaseError, StateDBError) as error:
             raise AttemptStateError("typed attempt inventory is unreadable") from error
         sources: list[CaptureSource] = []
         try:

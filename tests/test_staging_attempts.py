@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 import pytest
 
@@ -42,6 +42,25 @@ def _attempt(store: StagingStore, count: int = 2) -> SqliteStagedAttempt:
     attempt.prepare_leg(100, count)
     attempt.record_read_begin(ReadBeginNotification(100, count))
     return attempt
+
+
+def test_typed_attempt_inventory_wraps_raw_sqlite_read_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+
+    class BrokenCursor:
+        def fetchall(self) -> NoReturn:
+            raise sqlite3.DatabaseError("injected read failure")
+
+    class BrokenConnection:
+        def execute(self, _query: str) -> BrokenCursor:
+            return BrokenCursor()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(store.state_db, "open_connection", lambda **_kwargs: BrokenConnection())
+    with pytest.raises(AttemptStateError, match="typed attempt inventory is unreadable"):
+        store._typed_attempt_sources()
 
 
 def test_typed_attempt_commits_records_and_exposes_bounded_source_pages(tmp_path: Path) -> None:

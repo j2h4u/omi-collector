@@ -592,6 +592,30 @@ def test_short_exact_replay_authenticates_its_durable_prefix(tmp_path: Path) -> 
             )
 
 
+def test_long_prefix_replay_digest_reads_bounded_pages(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    records = [_record(index, index % 251) for index in range(130)]
+    with InternalAudioStore(db) as store:
+        source_id = _source(store, limit=len(records))
+        first_digest = hashlib.sha256(b"".join(records[:128])).hexdigest()
+        full_digest = hashlib.sha256(b"".join(records)).hexdigest()
+        assert store.commit_drain(source_id, 0, records[:128], DrainCheckpoint(1, expected_sha256=first_digest)) == 128
+        assert store.commit_drain(source_id, 128, records[128:], DrainCheckpoint(1, expected_sha256=full_digest)) == 130
+        before = store.get_source(source_id)
+        prefix_digest = hashlib.sha256(b"".join(records[:129])).hexdigest()
+
+        assert (
+            store.commit_drain(
+                source_id,
+                128,
+                [records[128]],
+                DrainCheckpoint(1, expected_sha256=prefix_digest),
+            )
+            == 130
+        )
+        assert store.get_source(source_id) == before
+
+
 def test_tail_checkpoint_requires_the_current_durable_read_leg(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     with InternalAudioStore(db) as store:
@@ -720,6 +744,43 @@ def test_tail_geometry_is_strict(tmp_path: Path) -> None:
         source_id = _source(store)
         with pytest.raises(InternalAudioStoreError, match="byte offset"):
             store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1, CaptureTail(1, 1, 444, 443, b"x"), digest))
+
+
+def test_tail_past_read_leg_is_refused_without_mutation(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    first = _record(1, 1)
+    second = _record(2, 2)
+    source_id = "a" * 32
+    with InternalAudioStore(db) as store:
+        store.create_source(source_id, "attempt", 0, 2)
+        store.prepare_leg(source_id, 0, 2)
+        store.record_read_begin(source_id, 0, 2)
+        store.commit_drain(
+            source_id,
+            0,
+            [first],
+            DrainCheckpoint(1, expected_sha256=hashlib.sha256(first).hexdigest()),
+        )
+        store.interrupt(source_id)
+        store.prepare_leg(source_id, 1, 1)
+        store.record_read_begin(source_id, 1, 1)
+        before = store.get_source(source_id)
+        tail = CaptureTail(2, 2, 2 * AUDIO_RECORD_SIZE + 1, 2 * AUDIO_RECORD_SIZE, b"x")
+
+        with pytest.raises(InternalAudioStoreError, match="received frontier"):
+            store.commit_drain(
+                source_id,
+                1,
+                [second],
+                DrainCheckpoint(2, tail, hashlib.sha256(first + second).hexdigest()),
+            )
+
+        assert store.get_source(source_id) == before
+        assert tuple(record.raw_bytes for record in store.read_record_page(source_id)) == (first,)
+    with closing(db.open_connection(read_only=True)) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM capture_tail WHERE source_id = ?", (source_id,)).fetchone()[0] == 0
+        )
 
 
 def test_typed_sql_checks_reject_malformed_canonical_values(tmp_path: Path) -> None:

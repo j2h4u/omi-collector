@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import stat
 from collections.abc import Iterable
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -259,6 +261,7 @@ def collect_operator_status(
         current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
         operational_status = read_operational_status(db, current_identity)
         runtime = _runtime_status(db, end.astimezone(UTC), operational_status)
+        ready_conflict_holds = _ready_conflict_hold_count(db)
     except (
         ConfirmedLossError,
         QualityMetricsError,
@@ -277,11 +280,31 @@ def collect_operator_status(
         "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
         "publication": spool.current_window.as_dict(),
         "quality_window": quality.as_dict(),
+        "ready_conflict_holds": ready_conflict_holds,
         "runtime": runtime,
         "schema_version": 2,
         "status": window_status,
         "window_hours": hours,
     }
+
+
+def _ready_conflict_hold_count(db: StateDB) -> int:
+    """Count SQL audio held indefinitely after an unresolved READY custody conflict."""
+    try:
+        with closing(db.open_connection(read_only=True)) as connection:
+            row = cast(
+                sqlite3.Row | None,
+                connection.execute(
+                    "SELECT COUNT(*) FROM capture_source WHERE source_type='quarantine' "
+                    "AND lifecycle='blocked' AND block_reason='ready_overlap_conflict'"
+                ).fetchone(),
+            )
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise OperatorStatusError("READY conflict hold inventory is unreadable") from error
+    count = None if row is None else cast(object, row[0])
+    if type(count) is not int:
+        raise OperatorStatusError("READY conflict hold inventory is invalid")
+    return cast(int, count)
 
 
 def _runtime_status(db: StateDB, now: datetime, operational_status: dict[str, str]) -> dict[str, object]:

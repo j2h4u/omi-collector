@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -115,13 +116,24 @@ def _check_canonical_access(path: Path, *, read_only: bool) -> None:
     descriptor = os.open(path, flags)
     os.close(descriptor)
     journal = path.parent / f"{path.name}-journal"
-    if journal.exists() or journal.is_symlink():
-        if not stat.S_ISREG(journal.lstat().st_mode):
+    try:
+        descriptor = os.open(journal, flags | os.O_NONBLOCK)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        if error.errno == errno.ELOOP:
             raise InternalAudioCutoverRequiredError(
                 "Collector SQLite journal is unsafe; stopped-service repair required"
-            )
-        descriptor = os.open(journal, flags)
-        os.close(descriptor)
+            ) from error
+        raise
+    else:
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise InternalAudioCutoverRequiredError(
+                    "Collector SQLite journal is unsafe; stopped-service repair required"
+                )
+        finally:
+            os.close(descriptor)
     if not read_only and not os.access(path.parent, os.W_OK | os.X_OK, effective_ids=True):
         raise PermissionError("Collector SQLite journal directory is not writable")
 

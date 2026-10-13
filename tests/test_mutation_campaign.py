@@ -341,14 +341,11 @@ def test_process_scan_skips_only_a_disappeared_proc_entry(
             raise OSError(error_number, os.strerror(error_number))
         if boundary == "uid":
             return original_stat(path)
-        if boundary == "identity":
-            return original_text(path, encoding="ascii")
         return original_bytes(path)
 
     original_stat = Path.stat
-    original_text = Path.read_text
     original_bytes = Path.read_bytes
-    method = {"uid": "stat", "identity": "read_text", "cmdline": "read_bytes"}[boundary]
+    method = {"uid": "stat", "identity": "read_bytes", "cmdline": "read_bytes"}[boundary]
     monkeypatch.setattr(Path, method, raise_at_boundary)
 
     if error_number == errno.ESRCH:
@@ -357,6 +354,22 @@ def test_process_scan_skips_only_a_disappeared_proc_entry(
         with pytest.raises(OSError) as failed:
             mutation_campaign._process_table(None)
         assert failed.value.errno == errno.EIO
+
+
+def test_process_identity_ignores_non_ascii_comm_but_validates_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc_stat = Path(f"/proc/{os.getpid()}/stat")
+    suffix = b" S 42 " + b"0 " * 17 + b"9876 0\n"
+    raw = b"123 (worker ) \xff)" + suffix
+    original_read_bytes = Path.read_bytes
+
+    def read_stat(path: Path) -> bytes:
+        return raw if path == proc_stat else original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_stat)
+    assert mutation_campaign._proc_identity(os.getpid()) == (42, "9876", "S")
+    raw = b"123 (worker) \xff 42 " + b"0 " * 17 + b"9876 0\n"
+    with pytest.raises(ValueError, match="cannot parse process identity"):
+        mutation_campaign._proc_identity(os.getpid())
 
 
 @pytest.mark.parametrize("error_number", [errno.ESRCH, errno.EIO])

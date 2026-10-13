@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import sqlite3
 from contextlib import closing
 from hashlib import sha256
@@ -9,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from omi_collector import state_migration
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.state_migration import (
     InternalAudioCutoverRequiredError,
@@ -154,6 +157,59 @@ def test_identified_canonical_access_denial_requires_stopped_repair(tmp_path: Pa
             open_runtime_state(layout)
     finally:
         layout.collector.state_db.chmod(0o640)
+
+
+def test_optional_journal_disappearance_does_not_mask_canonical_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "collector.sqlite3"
+    database.write_bytes(b"database")
+    journal = tmp_path / "collector.sqlite3-journal"
+    real_open = os.open
+    seen: list[Path] = []
+
+    def open_with_disappearing_journal(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if Path(path) == journal:
+            seen.append(journal)
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(journal))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(state_migration.os, "open", open_with_disappearing_journal)
+    state_migration._check_canonical_access(database, read_only=True)
+    assert seen == [journal]
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO])
+def test_optional_journal_access_error_is_not_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int
+) -> None:
+    database = tmp_path / "collector.sqlite3"
+    database.write_bytes(b"database")
+    journal = tmp_path / "collector.sqlite3-journal"
+    real_open = os.open
+
+    def open_with_journal_error(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if Path(path) == journal:
+            raise OSError(error_number, os.strerror(error_number), str(journal))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(state_migration.os, "open", open_with_journal_error)
+    with pytest.raises(OSError) as failure:
+        state_migration._check_canonical_access(database, read_only=True)
+    assert failure.value.errno == error_number
+
+
+def test_optional_journal_refuses_symlink_and_fifo(tmp_path: Path) -> None:
+    database = tmp_path / "collector.sqlite3"
+    database.write_bytes(b"database")
+    journal = tmp_path / "collector.sqlite3-journal"
+    journal.symlink_to(database)
+    with pytest.raises(InternalAudioCutoverRequiredError, match="journal is unsafe"):
+        state_migration._check_canonical_access(database, read_only=True)
+    journal.unlink()
+    os.mkfifo(journal)
+    with pytest.raises(InternalAudioCutoverRequiredError, match="journal is unsafe"):
+        state_migration._check_canonical_access(database, read_only=True)
 
 
 def test_unsupported_database_does_not_auto_upgrade(tmp_path: Path) -> None:

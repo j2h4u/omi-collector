@@ -447,14 +447,24 @@ def _write_owner(job_root: Path, receipt: dict[str, object]) -> None:
 def _proc_identity(pid: int) -> tuple[int, str, str]:
     proc = Path(f"/proc/{pid}")
     try:
-        fields = proc.joinpath("stat").read_text(encoding="ascii").rsplit(")", 1)[-1].split()
+        raw = proc.joinpath("stat").read_bytes()
     except OSError as exc:
         if exc.errno != errno.ESRCH:
             raise
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(proc / "stat")) from exc
+    try:
+        fields = raw.rsplit(b")", 1)[-1].decode("ascii").split() if b")" in raw else []
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"cannot parse process identity for PID {pid}") from exc
     if len(fields) <= PROC_STAT_START_TICKS:
         raise ValueError(f"cannot parse process identity for PID {pid}")
-    return int(fields[1]), fields[PROC_STAT_START_TICKS], fields[0]
+    try:
+        parent = int(fields[1])
+    except ValueError as exc:
+        raise ValueError(f"cannot parse process identity for PID {pid}") from exc
+    if parent < 0 or len(fields[0]) != 1 or not fields[PROC_STAT_START_TICKS].isdecimal():
+        raise ValueError(f"cannot parse process identity for PID {pid}")
+    return parent, fields[PROC_STAT_START_TICKS], fields[0]
 
 
 def _proc_cmdline(proc: Path) -> str | None:

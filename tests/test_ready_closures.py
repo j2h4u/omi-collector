@@ -97,7 +97,12 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
     assert attempt_source(restarted, attempt_id) is not None
     assert not tuple(ready.iterdir())
     restarted.append_ready_closure(11, "drained")
-    assert restarted.recover_and_publish().state == "published"
+    published = restarted.recover_and_publish()
+    source = attempt_source(restarted, attempt_id)
+    assert published.state == "published"
+    assert published.retirement_pending
+    assert source is not None and source.lifecycle == "retiring"
+    assert restarted.recover_and_publish().retirement_pending
     assert attempt_source(restarted, attempt_id) is None
 
 

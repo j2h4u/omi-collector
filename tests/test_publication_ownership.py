@@ -138,7 +138,12 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     assert attempt_source(store, attempt_id) is not None
     writer.close()
     store.append_ready_closure(101, "drained")
-    assert store.publish_ready() is not None
+    published = store.publish_ready()
+    source = attempt_source(store, attempt_id)
+    assert published.state is ReadyOutcomeState.PUBLISHED
+    assert published.retirement_pending
+    assert source is not None and source.lifecycle == "retiring"
+    assert store.publish_ready().retirement_pending
     assert attempt_source(store, attempt_id) is None
 
 
@@ -218,8 +223,13 @@ def test_failed_sealed_publication_retains_capture_for_retry(tmp_path: Path, mon
 
     assert writer._lease is not None
     store._append_ready_closure_unlocked(writer._lease, 101, "drained")
-    assert writer.publish_ready().state is ReadyOutcomeState.PUBLISHED
+    published = writer.publish_ready()
+    source = attempt_source(store, writer.attempt_id)
+    assert published.state is ReadyOutcomeState.PUBLISHED
+    assert published.retirement_pending
+    assert source is not None and source.lifecycle == "retiring"
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
+    assert writer.publish_ready().retirement_pending
     assert attempt_source(store, writer.attempt_id) is None
     writer.close()
 
@@ -240,7 +250,12 @@ def test_writer_seal_keeps_draft_until_closed_visit(tmp_path: Path) -> None:
     assert not tuple((tmp_path / "ready").iterdir())
     writer.close()
     store.append_ready_closure(101, "drained")
-    assert store.publish_ready().state is ReadyOutcomeState.PUBLISHED
+    published = store.publish_ready()
+    source = attempt_source(store, attempt_id)
+    assert published.state is ReadyOutcomeState.PUBLISHED
+    assert published.retirement_pending
+    assert source is not None and source.lifecycle == "retiring"
+    assert store.publish_ready().retirement_pending
     assert attempt_source(store, attempt_id) is None
 
 

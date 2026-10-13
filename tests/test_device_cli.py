@@ -21,6 +21,7 @@ from fakes import ScriptedRingSession, WriteStep
 from omi_collector import cli as operator_cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.attempts import DurableSqliteSeal
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
@@ -49,6 +50,7 @@ from omi_collector.capture.domain.ring_protocol import (
 )
 from omi_collector.cli import app
 from omi_collector.config import BleConfig, CollectorConfig, PresenceConfig, RetryConfig, TransferConfig
+from omi_collector.storage_layout import load_operator_config
 from staging_test_factory import StagingStore
 
 
@@ -95,6 +97,11 @@ def _layout(tmp_path: Path) -> Path:
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
+    layout = load_operator_config(path).storage
+    if not layout.collector.state_db.exists():
+        db = StateDB(layout.collector.state_db)
+        db.put(StateKind.MIGRATION, "current", {"version": 1, "phase": "complete"})
+        db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return path
 
 

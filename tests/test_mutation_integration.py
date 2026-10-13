@@ -54,6 +54,7 @@ def test_runner_preserves_mutant_outcomes_with_fixture_and_parametrization(tmp_p
     env = os.environ.copy()
     env["COVERAGE_CORE"] = "ctrace"
     env["CANARY_MARKER_DIR"] = str(markers)
+    env["PYTEST_ADDOPTS"] = ""
     result = subprocess.run(
         [
             "ionice",

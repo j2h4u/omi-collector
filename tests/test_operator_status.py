@@ -80,6 +80,9 @@ def _spool() -> SpoolMetrics:
 
 
 def _state_db(layout: StorageLayout) -> StateDB:
+    if not layout.collector.state_db.exists():
+        database = StateDB(layout.collector.state_db)
+        database.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return open_runtime_state(layout)
 
 

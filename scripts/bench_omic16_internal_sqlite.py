@@ -118,6 +118,19 @@ class ObservedStagingWriter(StagingWriter):
 
     actual_pragmas: tuple[str, int, int] | None = None
 
+    def __init__(self, store: StagingStore, start_sequence: int, packet_count: int) -> None:
+        super().__init__(store, start_sequence, packet_count)
+        self.commit_ms_by_record_count: dict[int, list[float]] = {1: [], MAX_CHUNK_RECORDS: []}
+
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        record_count = chunk.nbytes // RECORD_SIZE
+        started = time.perf_counter()
+        try:
+            super().append_chunk(offset, chunk, tail)
+        finally:
+            if record_count in self.commit_ms_by_record_count:
+                self.commit_ms_by_record_count[record_count].append((time.perf_counter() - started) * 1000)
+
     def prepare(self) -> AttemptDescriptor:
         descriptor = super().prepare()
         assert self._attempt is not None
@@ -543,6 +556,8 @@ def publication_metrics(context: BenchmarkContext) -> dict[str, object]:
 
 def benchmark_metrics(context: BenchmarkContext, capture: CaptureResult) -> dict[str, object]:
     queue_latency = capture.queue_latency
+    full_k_commits = sorted(context.target.commit_ms_by_record_count[MAX_CHUNK_RECORDS])
+    one_record_commits = sorted(context.target.commit_ms_by_record_count[1])
     return {
         "root": str(context.root),
         "records": capture.count,
@@ -553,6 +568,16 @@ def benchmark_metrics(context: BenchmarkContext, capture: CaptureResult) -> dict
         "queue_latency_p50_ms": statistics.median(queue_latency),
         "queue_latency_p95_ms": sorted(queue_latency)[max(0, int(len(queue_latency) * 0.95) - 1)],
         "queue_latency_max_ms": max(queue_latency),
+        "full_K_commit_samples": len(full_k_commits),
+        "full_K_commit_p95_ms": (
+            full_k_commits[max(0, int(len(full_k_commits) * 0.95) - 1)] if full_k_commits else None
+        ),
+        "full_K_commit_max_ms": max(full_k_commits) if full_k_commits else None,
+        "one_record_commit_samples": len(one_record_commits),
+        "one_record_commit_p95_ms": (
+            one_record_commits[max(0, int(len(one_record_commits) * 0.95) - 1)] if one_record_commits else None
+        ),
+        "one_record_commit_max_ms": max(one_record_commits) if one_record_commits else None,
         "barrier_ms": capture.barrier_ms,
         "q_peak_bytes": capture.q_peak,
         "q_peak_records": capture.q_peak // RECORD_SIZE,

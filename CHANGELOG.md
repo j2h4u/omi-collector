@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.4](https://github.com/j2h4u/omi-collector/compare/v0.12.3...v0.12.4) (2026-10-13)
+
+
+### Documentation
+
+* accept internal SQLite implementation plan ([#246](https://github.com/j2h4u/omi-collector/issues/246)) ([571c319](https://github.com/j2h4u/omi-collector/commit/571c3198d630fa6ef49eaceadc7cae93e8be9ec7))
+
 ## [0.12.3](https://github.com/j2h4u/omi-collector/compare/v0.12.2...v0.12.3) (2026-10-13)
 
 

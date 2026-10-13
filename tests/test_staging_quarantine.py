@@ -256,7 +256,7 @@ def test_salvaged_prefix_remains_in_sql_until_below_threshold_packaging(
         tmp_path,
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    attempt = _attempt(store, count=1)
+    attempt = _attempt(store, count=2)
     try:
         raw = _record(1)
         residual_tail = b"residual-tail"
@@ -508,7 +508,7 @@ def test_terminal_quarantine_obeys_retention_deadline_and_keeps_unterminalized_s
         tmp_path,
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
     )
-    aged = _attempt(store, 100, 1)
+    aged = _attempt(store, 100, 2)
     live = _attempt(store, 200, 1)
     try:
         residual = _record(3)
@@ -566,7 +566,7 @@ def test_terminal_quarantine_sweep_k1_bounds_children_and_converges(
         writer=WriterConfig(chunk_records=1),
     )
     store = _store(tmp_path, config=config)
-    attempt = _attempt(store, count=3)
+    attempt = _attempt(store, count=4)
     try:
         for ordinal in range(3):
             attempt.accept_chunk(100 + ordinal, _record(ordinal + 1), b"tail" if ordinal == 2 else b"")
@@ -620,7 +620,7 @@ def test_terminal_quarantine_sweep_preserves_referenced_canonical_record(
         writer=WriterConfig(chunk_records=1),
     )
     store = _store(tmp_path, config=config)
-    attempt = _attempt(store, count=1)
+    attempt = _attempt(store, count=2)
     try:
         raw = _record(1)
         attempt.accept_chunk(100, raw, b"tail")

@@ -169,9 +169,9 @@ def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
         publication_root=ready,
         config=config,
     )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.prepare_leg(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt = store.prepare_streaming_attempt(100, 2)
+    attempt.prepare_leg(100, 2)
+    attempt.record_read_begin(ReadBeginNotification(100, 2))
     raw = _record(100)
     attempt.accept_chunk(100, raw, b"retained-tail")
     source_id = store.quarantine_attempt_source(attempt.attempt_id)
@@ -253,9 +253,9 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
         publication_root=ready,
         config=config,
     )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.prepare_leg(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
+    attempt = store.prepare_streaming_attempt(100, 2)
+    attempt.prepare_leg(100, 2)
+    attempt.record_read_begin(ReadBeginNotification(100, 2))
     raw = _record(100)
     attempt.accept_chunk(100, raw, b"retained-tail")
     source_id = store.quarantine_attempt_source(attempt.attempt_id)

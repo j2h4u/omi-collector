@@ -3494,34 +3494,6 @@ def _typed_proposed_ledger(proposal: _FinalCommit) -> dict[str, object]:
 
 def _apply_typed_coverage(connection: sqlite3.Connection, coverage: tuple[_SourceCoverage, ...]) -> None:
     for item in coverage:
-        (
-            new_lifecycle,
-            _source_type,
-            _block_reason,
-            _disposition,
-            _terminal_time,
-            _retention_deadline,
-            _count,
-            _digest,
-            new_closure,
-            _certified,
-            new_coverage,
-            new_cursor,
-        ) = item.proposed
-        (
-            old_lifecycle,
-            source_type,
-            block_reason,
-            disposition,
-            terminal_time,
-            retention_deadline,
-            count,
-            digest,
-            old_closure,
-            certified,
-            old_coverage,
-            old_cursor,
-        ) = item.old
         changed = connection.execute(
             "UPDATE capture_source SET lifecycle=?,closure_frontier=?,coverage_digest=?,retirement_cursor=? "
             "WHERE source_id=? AND lifecycle=? AND source_type=? AND block_reason IS ? "
@@ -3530,23 +3502,12 @@ def _apply_typed_coverage(connection: sqlite3.Connection, coverage: tuple[_Sourc
             "AND closure_frontier IS ? AND certified_prefix_count IS ? AND coverage_digest IS ? "
             "AND retirement_cursor IS ?",
             (
-                new_lifecycle,
-                new_closure,
-                new_coverage,
-                new_cursor,
+                item.proposed[0],
+                item.proposed[8],
+                item.proposed[10],
+                item.proposed[11],
                 item.source_id,
-                old_lifecycle,
-                source_type,
-                block_reason,
-                disposition,
-                terminal_time,
-                retention_deadline,
-                count,
-                digest,
-                old_closure,
-                certified,
-                old_coverage,
-                old_cursor,
+                *item.old,
             ),
         )
         if changed.rowcount != 1:

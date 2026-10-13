@@ -14,7 +14,7 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
-from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError
+from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.application.ports import StagingPort
 from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
@@ -337,6 +337,39 @@ def test_writer_lock_defers_terminal_sweeps_without_reporting_failures(
         _run(maintenance.run_once(lambda: False))
 
     assert failures == []
+
+
+def test_terminal_sweep_repeats_only_while_progressing_and_stops_for_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        calls = 0
+
+        def sweep(*, should_defer: Callable[[], bool]) -> SweepResult:
+            nonlocal calls
+            assert not should_defer()
+            calls += 1
+            return SweepResult((), calls < 3)
+
+        monkeypatch.setattr(store, "sweep_terminal_quarantine", sweep)
+        await maintenance._sweep_terminal_quarantine(lambda: False)
+        assert calls == 3
+
+        calls = 0
+
+        def one_chunk(*, should_defer: Callable[[], bool]) -> SweepResult:
+            nonlocal calls
+            assert not should_defer()
+            calls += 1
+            return SweepResult((), True)
+
+        monkeypatch.setattr(store, "sweep_terminal_quarantine", one_chunk)
+        await maintenance._sweep_terminal_quarantine(lambda: calls > 0)
+        assert calls == 1
+
+    _run(scenario())
 
 
 def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) -> None:
@@ -790,12 +823,12 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
 
         store = _store(tmp_path)
 
-        def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+        def sweep(*, should_defer: Callable[[], bool]) -> SweepResult:
             worker_started.set()
             while not release_sweep.is_set() and not should_defer():
                 time.sleep(0.001)
             worker_stopped.set()
-            return ()
+            return SweepResult((), False)
 
         store.sweep_terminal_quarantine = sweep  # type: ignore[method-assign]
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
@@ -1130,13 +1163,13 @@ def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
             async def close(self) -> None:
                 return None
 
-        def sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+        def sweep(*, should_defer: Callable[[], bool]) -> SweepResult:
             del should_defer
             started.set()
             if not release.wait(2):
                 raise TimeoutError("maintenance mutation was not released")
             finished.set()
-            return ()
+            return SweepResult((), False)
 
         store = _store(tmp_path)
         monkeypatch.setattr(store, "sweep_terminal_quarantine", sweep)

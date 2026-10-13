@@ -14,7 +14,8 @@ from omi_collector.capture.adapters.attempts import RecordAcceptanceError
 from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
-from omi_collector.capture.adapters.quarantine import QuarantinePublishError
+from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.quarantine import QuarantineCustodyHoldError, QuarantinePublishError
 from omi_collector.capture.adapters.ready_bundles import (
     ReadyOutcomeState,
     SqlitePublicationSource,
@@ -170,6 +171,53 @@ def test_terminal_reason_is_distinct_from_original_quarantine_reason(tmp_path: P
     attempt.close()
 
 
+def test_ready_custody_conflict_cannot_be_salvaged_or_terminally_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    attempt = _attempt(store, count=1)
+    try:
+        raw = _record(1)
+        attempt.accept_chunk(100, raw)
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET block_reason='ready_overlap_conflict', "
+                "terminal_time=NULL, retention_deadline=NULL, "
+                "certified_prefix_count=NULL, coverage_digest=NULL WHERE source_id=?",
+                (source_id,),
+            )
+            connection.commit()
+        before = _source_row(store, source_id)
+        generation = store.state_db.get_generation()
+
+        assert source_id not in store.quarantined_attempts()
+        with pytest.raises(QuarantineCustodyHoldError, match="READY custody conflict") as admission_error:
+            store.admit_quarantined_prefix(source_id)
+        assert OpportunisticRuntime().classify_quarantine_error(admission_error.value) == "deferred"
+        with pytest.raises(QuarantineCustodyHoldError, match="READY custody conflict"):
+            store.mark_quarantine_unprocessable(source_id, "could not authenticate")
+        now += 2_000_000_000
+        assert store.sweep_terminal_quarantine().progressed is False
+        assert _source_row(store, source_id) == before
+        assert store.state_db.get_generation() == generation
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            kept = cast(
+                tuple[object, object] | None,
+                connection.execute(
+                    "SELECT device_timestamp, payload FROM capture_record WHERE source_id=? AND ordinal=0", (source_id,)
+                ).fetchone(),
+            )
+        assert kept is not None and tuple(kept) == (1, raw[4:])
+    finally:
+        attempt.close()
+
+
 def test_opaque_quarantine_sources_are_not_salvaged_and_expire_after_terminal_retention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -191,9 +239,9 @@ def test_opaque_quarantine_sources_are_not_salvaged_and_expire_after_terminal_re
             store.admit_quarantined_prefix(source_id)
         store.mark_quarantine_unprocessable(source_id, "opaque evidence cannot be authenticated")
         now += 999_999_999
-        assert store.sweep_terminal_quarantine() == ()
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
         now += 1
-        assert store.sweep_terminal_quarantine() == (source_id,)
+        assert store.sweep_terminal_quarantine().removed_source_ids == (source_id,)
         assert attempt_source(store, source_id) is None
     finally:
         attempt.close()
@@ -279,7 +327,7 @@ def test_salvaged_prefix_remains_in_sql_until_below_threshold_packaging(
         assert publication_rows == ()
 
         now += 1_000_000_000
-        assert store.sweep_terminal_quarantine() == ()
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
         assert attempt_source(store, source_id) is not None
         with closing(store.state_db.open_connection(read_only=True)) as connection:
             tail = cast(
@@ -293,7 +341,7 @@ def test_salvaged_prefix_remains_in_sql_until_below_threshold_packaging(
         assert tail is None
         assert evidence is None
         for _ in range(3):
-            assert store.sweep_terminal_quarantine() == ()
+            assert store.sweep_terminal_quarantine().removed_source_ids == ()
         assert attempt_source(store, source_id) is not None
         with closing(store.state_db.open_connection(read_only=True)) as connection:
             assert (
@@ -343,7 +391,7 @@ def test_replay_conflict_requires_quarantine_admission_before_publication(
     assert before is not None and before[3] == "unclassified"
     assert isinstance(before[6], str)
     now = int(before[6])
-    assert store.sweep_terminal_quarantine() == ()
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
     retained = _source_row(store, source_id)
     assert retained is not None and retained[3] == "unclassified"
     with closing(store.state_db.open_connection(read_only=True)) as connection:
@@ -386,7 +434,7 @@ def test_standalone_evidence_owns_its_terminal_retention(tmp_path: Path, monkeyp
         )
         connection.commit()
 
-    assert store.sweep_terminal_quarantine() == ()
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
     with closing(store.state_db.open_connection(read_only=True)) as connection:
         evidence = cast(
             tuple[object, object, object, object] | None,
@@ -404,7 +452,7 @@ def test_standalone_evidence_owns_its_terminal_retention(tmp_path: Path, monkeyp
     )
 
     now += 1_000_000_000
-    assert store.sweep_terminal_quarantine() == ()
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
     with closing(store.state_db.open_connection(read_only=True)) as connection:
         assert (
             connection.execute("SELECT 1 FROM capture_evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
@@ -471,7 +519,7 @@ def test_terminal_quarantine_obeys_retention_deadline_and_keeps_unterminalized_s
         live_id = store.quarantine_attempt_source(live.attempt_id)
         now += 72_000_000_000 - 1
 
-        assert store.sweep_terminal_quarantine() == ()
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
         assert attempt_source(store, aged_id) is not None
         with closing(store.state_db.open_connection(read_only=True)) as connection:
             row = cast(
@@ -483,7 +531,7 @@ def test_terminal_quarantine_obeys_retention_deadline_and_keeps_unterminalized_s
         assert row is not None and row[0] == residual[4:]
         now += 1
 
-        assert store.sweep_terminal_quarantine() == (aged_id,)
+        assert store.sweep_terminal_quarantine().removed_source_ids == (aged_id,)
         assert attempt_source(store, aged_id) is None
         assert attempt_source(store, live_id) is not None
     finally:
@@ -548,13 +596,16 @@ def test_terminal_quarantine_sweep_k1_bounds_children_and_converges(
         removed: list[str] = []
         for _ in range(initial):
             before = _quarantine_child_count(store, source_id)
-            removed.extend(store.sweep_terminal_quarantine())
+            result = store.sweep_terminal_quarantine()
+            assert result.progressed
+            removed.extend(result.removed_source_ids)
             after = _quarantine_child_count(store, source_id)
             assert before - after == 1
             if after:
                 assert store.quarantine_state(source_id) is QuarantineState.UNPROCESSABLE
         assert removed == [source_id]
         assert attempt_source(store, source_id) is None
+        assert store.sweep_terminal_quarantine().progressed is False
     finally:
         attempt.close()
 
@@ -588,14 +639,14 @@ def test_terminal_quarantine_sweep_preserves_referenced_canonical_record(
             )
             connection.commit()
         now += 1_000_000_000
-        assert store.sweep_terminal_quarantine() == ()
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
         assert _quarantine_child_count(store, source_id) == 1
         assert attempt_source(store, source_id) is not None
         with closing(store.state_db.open_connection()) as connection:
             connection.execute("DELETE FROM publication_cohort_member WHERE cohort_id = ?", (cohort_id,))
             connection.execute("DELETE FROM publication_cohort WHERE cohort_id = ?", (cohort_id,))
             connection.commit()
-        assert store.sweep_terminal_quarantine() == (source_id,)
+        assert store.sweep_terminal_quarantine().removed_source_ids == (source_id,)
         assert attempt_source(store, source_id) is None
     finally:
         attempt.close()
@@ -613,6 +664,6 @@ def test_corrupt_quarantine_state_is_retained_without_mutation(tmp_path: Path) -
         connection.commit()
     before = _source_row(store, source_id)
 
-    assert store.sweep_terminal_quarantine() == ()
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
     assert _source_row(store, source_id) == before
     attempt.close()

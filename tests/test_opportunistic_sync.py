@@ -34,7 +34,7 @@ from omi_collector.capture.adapters.internal_audio_store import (
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics, read_quality_events
-from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError
+from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import (
     AttemptDescriptor,
@@ -1578,7 +1578,7 @@ async def test_terminal_retired_sweep_failure_is_structured_and_does_not_stop_co
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     events: list[tuple[str, BaseException, dict[str, object]]] = []
 
-    def fail_sweep(*, should_defer: Callable[[], bool]) -> tuple[str, ...]:
+    def fail_sweep(*, should_defer: Callable[[], bool]) -> SweepResult:
         del should_defer
         raise OSError("simulated sweep failure")
 
@@ -2114,7 +2114,7 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     }
     deadline = int(cast(str, terminal[1]))
     monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: deadline)
-    assert store.sweep_terminal_quarantine() == (empty_source_id,)
+    assert store.sweep_terminal_quarantine().removed_source_ids == (empty_source_id,)
     assert _attempt_source(store, empty_source_id) is None
 
 

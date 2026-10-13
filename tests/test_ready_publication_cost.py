@@ -217,7 +217,7 @@ def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
         assert retirement_cursor is not None and retirement_cursor[0] == 1
 
         now += 1_000_000_000
-        assert store.sweep_terminal_quarantine() == ()
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
         assert store.state_db.get_generation() > generation
         assert store.publication_followup_due()
 

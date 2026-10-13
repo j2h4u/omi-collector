@@ -24,7 +24,11 @@ from ..domain.internal_audio_machine import (
     Done,
     Interruption,
     PrepareLeg,
+    QuarantineAction,
+    QuarantineDisposition,
+    QuarantineOpened,
     ReadBegin,
+    quarantine_transition,
     transition,
 )
 from .clock_segments import ClockSegmentMap
@@ -1039,6 +1043,12 @@ class InternalAudioStore:
             if ordinal > MAX_PROTOCOL_UINT32:
                 raise InternalAudioStoreError("conflict evidence ordinal is exhausted")
             now = time.time_ns()
+            classification = quarantine_transition(
+                QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(source.committed_count)
+            )
+            if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
+                raise InternalAudioStoreError(classification.reason)
+            assert classification.next_disposition is not None
             connection.execute(
                 "INSERT INTO capture_conflict(source_id, chunk_ordinal, leg_generation, "
                 "absolute_byte_offset, reason, bytes) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1053,8 +1063,7 @@ class InternalAudioStore:
             )
             connection.execute(
                 "UPDATE capture_source SET source_type = 'quarantine', lifecycle = 'blocked', block_reason = ?, "
-                "quarantine_disposition = CASE WHEN committed_count = 0 THEN 'unprocessable' "
-                "ELSE 'unclassified' END, quarantine_opaque = 0, "
+                "quarantine_disposition = ?, quarantine_opaque = 0, "
                 "terminal_reason = CASE WHEN committed_count = 0 "
                 "THEN 'quarantine contains no committed records' ELSE NULL END, "
                 "terminal_time = ?, retention_deadline = ?, "
@@ -1063,6 +1072,7 @@ class InternalAudioStore:
                 "WHERE source_id = ?",
                 (
                     reason,
+                    classification.next_disposition.value,
                     str(now),
                     str(now + self._terminal_retention_ns),
                     source.source_id,

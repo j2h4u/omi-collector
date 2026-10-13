@@ -76,6 +76,13 @@ class Done:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalPrefix:
+    """Seal an authenticated durable prefix during recovery or drain."""
+
+    authenticated: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class Interruption:
     """Record a recoverable transport interruption."""
 
@@ -92,6 +99,7 @@ class ReadyCustody:
     """Prove complete durable ready custody and source lineage."""
 
     proved: bool = True
+    certified_quarantine_prefix: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +127,7 @@ AudioEvent = (
     | Data
     | Barrier
     | Done
+    | TerminalPrefix
     | Interruption
     | AuthenticatedConflict
     | ReadyCustody
@@ -186,6 +195,20 @@ def _done(phase: AudioPhase | None, event: object) -> AudioDecision:
     return _refuse(phase, "DONE lacks a validated authenticated prefix")
 
 
+def _terminal_prefix(phase: AudioPhase | None, event: object) -> AudioDecision:
+    assert isinstance(event, TerminalPrefix)
+    if event.authenticated and phase in {
+        AudioPhase.PREPARED,
+        AudioPhase.LEG_PREPARED,
+        AudioPhase.RECEIVING,
+        AudioPhase.INTERRUPTED,
+    }:
+        return AudioDecision(AudioPhase.SEALED_WAITING, AudioAction.PERSIST, "authenticated terminal prefix sealed")
+    if event.authenticated and phase is AudioPhase.SEALED_WAITING:
+        return AudioDecision(AudioPhase.SEALED_WAITING, AudioAction.IDEMPOTENT, "terminal prefix already sealed")
+    return _refuse(phase, "terminal prefix is unauthenticated or source phase is invalid")
+
+
 def _create(phase: AudioPhase | None, event: object) -> AudioDecision:
     assert isinstance(event, Create)
     return (
@@ -250,7 +273,9 @@ def _conflict(phase: AudioPhase | None, event: object) -> AudioDecision:
 
 def _ready_custody(phase: AudioPhase | None, event: object) -> AudioDecision:
     assert isinstance(event, ReadyCustody)
-    if phase is AudioPhase.SEALED_WAITING and event.proved:
+    if event.proved and (
+        phase is AudioPhase.SEALED_WAITING or (phase is AudioPhase.BLOCKED and event.certified_quarantine_prefix)
+    ):
         return AudioDecision(AudioPhase.COVERED, AudioAction.RETIRE, "ready custody covers source")
     if phase is AudioPhase.COVERED and event.proved:
         return AudioDecision(AudioPhase.COVERED, AudioAction.IDEMPOTENT, "ready custody already recorded")
@@ -284,6 +309,7 @@ _AUDIO_HANDLERS: dict[type[object], Callable[[AudioPhase | None, object], AudioD
     Data: _data,
     Barrier: lambda phase, _event: _barrier(phase),
     Done: _done,
+    TerminalPrefix: _terminal_prefix,
     Interruption: _interruption,
     AuthenticatedConflict: _conflict,
     ReadyCustody: _ready_custody,
@@ -309,6 +335,7 @@ class CohortAction(StrEnum):
     RECONCILE = "reconcile"
     COMMIT = "commit"
     RETIRE = "retire"
+    BLOCK = "block"
     REFUSE = "refuse"
 
 
@@ -338,7 +365,30 @@ class CompleteRetire:
     all_coverage_proved: bool = True
 
 
-CohortEvent = QualifiedDrained | Stage | OwnedIncompleteRetry | DurableDestination | CompleteRetire
+@dataclass(frozen=True, slots=True)
+class ExistingReadyCustody:
+    """Proven existing ready output advances an accepted cohort without staging."""
+
+    proved_progress: bool = True
+    cohort_complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CohortConflict:
+    """Exclude a conflicting member while preserving any accepted remainder."""
+
+    accepted_remainder: bool = False
+
+
+CohortEvent = (
+    QualifiedDrained
+    | Stage
+    | OwnedIncompleteRetry
+    | DurableDestination
+    | CompleteRetire
+    | ExistingReadyCustody
+    | CohortConflict
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,6 +416,12 @@ def cohort_transition(phase: CohortPhase, event: CohortEvent) -> CohortDecision:
     elif isinstance(event, DurableDestination) and phase is CohortPhase.STAGING and event.durable:
         next_phase = CohortPhase.COMPLETE if event.cohort_complete else CohortPhase.ACCEPTED
         decision = CohortDecision(next_phase, CohortAction.COMMIT, "durable destination committed")
+    elif isinstance(event, ExistingReadyCustody) and phase is CohortPhase.ACCEPTED and event.proved_progress:
+        next_phase = CohortPhase.COMPLETE if event.cohort_complete else CohortPhase.ACCEPTED
+        decision = CohortDecision(next_phase, CohortAction.COMMIT, "existing ready custody advanced cohort")
+    elif isinstance(event, CohortConflict) and phase is CohortPhase.ACCEPTED:
+        next_phase = CohortPhase.ACCEPTED if event.accepted_remainder else None
+        decision = CohortDecision(next_phase, CohortAction.BLOCK, "custody conflict excluded from accepted cohort")
     elif isinstance(event, CompleteRetire) and phase is CohortPhase.COMPLETE and event.all_coverage_proved:
         decision = CohortDecision(None, CohortAction.RETIRE, "cohort coverage retired")
     return decision
@@ -396,18 +452,33 @@ class CertifiedPrefix:
 @dataclass(frozen=True, slots=True)
 class MarkUnprocessable:
     reason: str
+    custody_conflict: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineOpened:
+    """Classify an authenticated capture conflict at the original SQL barrier."""
+
+    committed_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class ResidualExpiry:
     terminal: bool = True
     age_expired: bool = True
-    pending_references: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalExpiry:
+    """Delete canonical bytes only after terminal expiry without publication refs."""
+
+    source_phase: AudioPhase
+    age_expired: bool = True
     cohort_references: bool = False
-    ready_references: bool = False
+    stage_references: bool = False
 
 
-QuarantineEvent = CertifiedPrefix | MarkUnprocessable | ResidualExpiry
+QuarantineEvent = CertifiedPrefix | MarkUnprocessable | QuarantineOpened | ResidualExpiry | CanonicalExpiry
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,35 +493,73 @@ def quarantine_transition(disposition: QuarantineDisposition, event: QuarantineE
 
     if not isinstance(disposition, QuarantineDisposition):
         return QuarantineDecision(None, QuarantineAction.REFUSE, "unsupported quarantine disposition")
-    decision = QuarantineDecision(
-        disposition, QuarantineAction.REFUSE, "quarantine event is invalid for this disposition"
+    handler = _QUARANTINE_HANDLERS.get(type(event))
+    return (
+        QuarantineDecision(disposition, QuarantineAction.REFUSE, "unsupported quarantine event")
+        if handler is None
+        else handler(disposition, event)
     )
-    if isinstance(event, CertifiedPrefix) and disposition is QuarantineDisposition.UNCLASSIFIED:
-        if event.checkpoint_certified and event.salvage_eligible:
-            decision = QuarantineDecision(
-                QuarantineDisposition.PUBLISHED_PREFIX, QuarantineAction.PUBLISH_PREFIX, "certified salvage prefix"
-            )
-        else:
-            decision = QuarantineDecision(
-                disposition, QuarantineAction.REFUSE, "prefix checkpoint or salvage is untrusted"
-            )
-    elif isinstance(event, MarkUnprocessable) and disposition is QuarantineDisposition.UNCLASSIFIED:
-        if event.reason:
-            decision = QuarantineDecision(
-                QuarantineDisposition.UNPROCESSABLE, QuarantineAction.MARK_UNPROCESSABLE, "terminal reason recorded"
-            )
-        else:
-            decision = QuarantineDecision(disposition, QuarantineAction.REFUSE, "unprocessable reason is required")
-    elif isinstance(event, ResidualExpiry) and disposition in {
-        QuarantineDisposition.PUBLISHED_PREFIX,
-        QuarantineDisposition.UNPROCESSABLE,
-    }:
-        if not event.terminal:
-            decision = QuarantineDecision(
-                disposition, QuarantineAction.REFUSE, "nonterminal evidence cannot be retired"
-            )
-        elif not event.age_expired or any((event.pending_references, event.cohort_references, event.ready_references)):
-            decision = QuarantineDecision(disposition, QuarantineAction.KEEP, "residual evidence remains referenced")
-        else:
-            decision = QuarantineDecision(disposition, QuarantineAction.RETIRE, "expired unreferenced residual retired")
-    return decision
+
+
+def _quarantine_refuse(disposition: QuarantineDisposition) -> QuarantineDecision:
+    return QuarantineDecision(disposition, QuarantineAction.REFUSE, "quarantine event is invalid for this disposition")
+
+
+def _quarantine_opened(disposition: QuarantineDisposition, event: object) -> QuarantineDecision:
+    assert isinstance(event, QuarantineOpened)
+    if disposition is not QuarantineDisposition.UNCLASSIFIED or type(event.committed_count) is not int:
+        return _quarantine_refuse(disposition)
+    if event.committed_count < 0:
+        return _quarantine_refuse(disposition)
+    next_disposition = (
+        QuarantineDisposition.UNCLASSIFIED if event.committed_count else QuarantineDisposition.UNPROCESSABLE
+    )
+    action = QuarantineAction.KEEP if event.committed_count else QuarantineAction.MARK_UNPROCESSABLE
+    return QuarantineDecision(next_disposition, action, "authenticated conflict retained")
+
+
+def _certified_prefix(disposition: QuarantineDisposition, event: object) -> QuarantineDecision:
+    assert isinstance(event, CertifiedPrefix)
+    if disposition is not QuarantineDisposition.UNCLASSIFIED or not (
+        event.checkpoint_certified and event.salvage_eligible
+    ):
+        return _quarantine_refuse(disposition)
+    return QuarantineDecision(
+        QuarantineDisposition.PUBLISHED_PREFIX, QuarantineAction.PUBLISH_PREFIX, "certified salvage prefix"
+    )
+
+
+def _mark_unprocessable(disposition: QuarantineDisposition, event: object) -> QuarantineDecision:
+    assert isinstance(event, MarkUnprocessable)
+    if disposition is not QuarantineDisposition.UNCLASSIFIED or not event.reason or event.custody_conflict:
+        return _quarantine_refuse(disposition)
+    return QuarantineDecision(
+        QuarantineDisposition.UNPROCESSABLE, QuarantineAction.MARK_UNPROCESSABLE, "terminal reason recorded"
+    )
+
+
+def _residual_expiry(disposition: QuarantineDisposition, event: object) -> QuarantineDecision:
+    assert isinstance(event, ResidualExpiry)
+    if not event.terminal:
+        return _quarantine_refuse(disposition)
+    if not event.age_expired:
+        return QuarantineDecision(disposition, QuarantineAction.KEEP, "residual evidence has not expired")
+    return QuarantineDecision(disposition, QuarantineAction.RETIRE, "expired residual evidence retired")
+
+
+def _canonical_expiry(disposition: QuarantineDisposition, event: object) -> QuarantineDecision:
+    assert isinstance(event, CanonicalExpiry)
+    if disposition is not QuarantineDisposition.UNPROCESSABLE or event.source_phase is not AudioPhase.BLOCKED:
+        return _quarantine_refuse(disposition)
+    if not event.age_expired or event.cohort_references or event.stage_references:
+        return QuarantineDecision(disposition, QuarantineAction.KEEP, "canonical source remains pinned")
+    return QuarantineDecision(disposition, QuarantineAction.RETIRE, "expired unreferenced canonical source retired")
+
+
+_QUARANTINE_HANDLERS: dict[type[object], Callable[[QuarantineDisposition, object], QuarantineDecision]] = {
+    QuarantineOpened: _quarantine_opened,
+    CertifiedPrefix: _certified_prefix,
+    MarkUnprocessable: _mark_unprocessable,
+    ResidualExpiry: _residual_expiry,
+    CanonicalExpiry: _canonical_expiry,
+}

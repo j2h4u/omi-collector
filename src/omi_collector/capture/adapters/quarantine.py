@@ -13,6 +13,15 @@ from ..domain.internal_audio_machine import (
     AudioAction,
     AudioPhase,
     AuthenticatedConflict,
+    CanonicalExpiry,
+    CertifiedPrefix,
+    MarkUnprocessable,
+    QuarantineAction,
+    QuarantineDisposition,
+    QuarantineOpened,
+    ResidualExpiry,
+    TerminalPrefix,
+    quarantine_transition,
 )
 from ..domain.internal_audio_machine import (
     transition as audio_transition,
@@ -45,6 +54,18 @@ class QuarantinePublishError(ValueError):
     """Typed quarantine evidence cannot authenticate a scheduler prefix."""
 
 
+class QuarantineCustodyHoldError(QuarantinePublishError):
+    """READY byte conflict keeps its canonical SQL audio pending custody review."""
+
+
+@dataclass(frozen=True, slots=True)
+class SweepResult:
+    """Rows removed and whether a bounded sweep made durable progress."""
+
+    removed_source_ids: tuple[str, ...]
+    progressed: bool
+
+
 class QuarantineSalvageDeferredError(Exception):
     """Cooperative maintenance deferred before SQL admission committed."""
 
@@ -64,6 +85,7 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
             rows = connection.execute(
                 "SELECT source_id FROM capture_source "
                 "WHERE source_type = 'quarantine' AND COALESCE(quarantine_opaque, 0) = 0 "
+                "AND block_reason IS NOT 'ready_overlap_conflict' "
                 "ORDER BY source_id"
             ).fetchall()
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
@@ -125,19 +147,42 @@ def _typed_quarantine_row(
     decision = audio_transition(phase, AuthenticatedConflict())
     if decision.action is not AudioAction.BLOCK or decision.next_phase is not AudioPhase.BLOCKED:
         raise AttemptStateError(decision.reason)
+    row = cast(
+        tuple[object] | None,
+        connection.execute(
+            "SELECT committed_count FROM capture_source "
+            "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
+            (source_id, lifecycle),
+        ).fetchone(),
+    )
+    if row is None:
+        raise AttemptStateError("typed attempt changed before quarantine classification")
+    if type(row[0]) is not int:
+        raise AttemptStateError("typed attempt committed count is invalid")
+    classification = quarantine_transition(QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(cast(int, row[0])))
+    if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
+        raise AttemptStateError(classification.reason)
+    assert classification.next_disposition is not None
     now = _wall_clock_ns()
     deadline = now + _seconds_to_nanoseconds(retention_seconds)
     cursor = connection.execute(
         "UPDATE capture_source SET source_type = 'quarantine', lifecycle = ?, "
-        "block_reason = ?, quarantine_disposition = CASE WHEN committed_count = 0 "
-        "THEN 'unprocessable' ELSE 'unclassified' END, quarantine_opaque = 0, "
+        "block_reason = ?, quarantine_disposition = ?, quarantine_opaque = 0, "
         "terminal_reason = CASE WHEN committed_count = 0 "
         "THEN 'quarantine contains no committed records' ELSE NULL END, "
         "terminal_time = ?, retention_deadline = ?, "
         "certified_prefix_count = CASE WHEN committed_count = 0 THEN NULL ELSE committed_count END, "
         "coverage_digest = CASE WHEN committed_count = 0 THEN NULL ELSE committed_sha256 END "
         "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
-        (decision.next_phase.value, reason, str(now), str(deadline), source_id, lifecycle),
+        (
+            decision.next_phase.value,
+            reason,
+            classification.next_disposition.value,
+            str(now),
+            str(deadline),
+            source_id,
+            lifecycle,
+        ),
     )
     if cursor.rowcount != 1:
         raise AttemptStateError("typed attempt changed during quarantine admission")
@@ -167,6 +212,8 @@ class _TypedAdmissionSnapshot:
 
 
 def _typed_admission_snapshot(row: tuple[object, ...]) -> _TypedAdmissionSnapshot:
+    if row[10] == "ready_overlap_conflict":
+        raise QuarantineCustodyHoldError("READY custody conflict cannot be admitted as a quarantine prefix")
     lifecycle = str(row[0])
     count, digest = row[2], row[3]
     if row[6] == 1:
@@ -207,12 +254,19 @@ def _persist_typed_admission(
         terminal_time,
         deadline,
     )
+    decision = quarantine_transition(
+        QuarantineDisposition.UNCLASSIFIED,
+        CertifiedPrefix(checkpoint_certified=True, salvage_eligible=True),
+    )
+    if decision.action is not QuarantineAction.PUBLISH_PREFIX:
+        raise QuarantinePublishError(decision.reason)
     changed = connection.execute(
         "UPDATE capture_source SET certified_prefix_count = ?, coverage_digest = ?, "
         "quarantine_disposition = 'published_prefix', terminal_reason = NULL, "
         "terminal_time = ?, retention_deadline = ? "
         "WHERE source_id = ? AND source_type = 'quarantine' AND lifecycle = ? "
-        "AND quarantine_disposition IN ('unclassified')",
+        "AND quarantine_disposition IN ('unclassified') "
+        "AND block_reason IS NOT 'ready_overlap_conflict'",
         (
             snapshot.record_count,
             snapshot.raw_sha256,
@@ -247,7 +301,7 @@ def _read_typed_admission_snapshot(connection: sqlite3.Connection, source_id: st
         connection.execute(
             "SELECT lifecycle, sequence_start, committed_count, committed_sha256, "
             "certified_prefix_count, coverage_digest, quarantine_opaque, quarantine_disposition, "
-            "terminal_time, retention_deadline FROM capture_source "
+            "terminal_time, retention_deadline, block_reason FROM capture_source "
             "WHERE source_id = ? AND source_type = 'quarantine'",
             (source_id,),
         ).fetchone(),
@@ -398,10 +452,14 @@ def _typed_terminalize_prefix(filesystem: StagingFilesystem, attempt_id: str) ->
             if row is None:
                 raise AttemptStateError("typed prefix source does not exist")
             lifecycle = str(row[0])
-            if lifecycle == "sealed_waiting":
+            try:
+                decision = audio_transition(AudioPhase(lifecycle), TerminalPrefix())
+            except ValueError as error:
+                raise AttemptStateError("attempt source phase is invalid") from error
+            if decision.action is AudioAction.IDEMPOTENT:
                 return
-            if lifecycle not in {"prepared", "leg_prepared", "receiving", "interrupted"}:
-                raise AttemptStateError("attempt source is not an active partial")
+            if decision.action is not AudioAction.PERSIST or decision.next_phase is not AudioPhase.SEALED_WAITING:
+                raise AttemptStateError(decision.reason)
             cursor = connection.execute(
                 "UPDATE capture_source SET lifecycle = 'sealed_waiting', terminal_time = ? "
                 "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
@@ -438,25 +496,34 @@ def _typed_mark_unprocessable(filesystem: StagingFilesystem, source_id: str, rea
     try:
         with _typed_transaction(filesystem) as connection:
             current = cast(
-                tuple[object, object, object, object] | None,
+                tuple[object, object, object, object, object] | None,
                 connection.execute(
-                    "SELECT lifecycle, quarantine_disposition, terminal_reason, retention_deadline "
+                    "SELECT lifecycle, quarantine_disposition, terminal_reason, retention_deadline, block_reason "
                     "FROM capture_source WHERE source_id = ? AND source_type = 'quarantine'",
                     (source_id,),
                 ).fetchone(),
             )
             if current is None:
                 raise AttemptStateError("typed quarantine source does not exist")
+            if current[4] == "ready_overlap_conflict":
+                raise QuarantineCustodyHoldError("READY custody conflict cannot be terminally classified")
             if current[1] == "unprocessable":
                 return
             if current[1] not in {None, "unclassified"} or current[0] not in {"blocked", "covered", "retiring"}:
                 raise AttemptStateError("typed quarantine source is not ready for terminal classification")
+            decision = quarantine_transition(
+                QuarantineDisposition.UNCLASSIFIED,
+                MarkUnprocessable(reason, custody_conflict=False),
+            )
+            if decision.action is not QuarantineAction.MARK_UNPROCESSABLE:
+                raise AttemptStateError(decision.reason)
             changed = connection.execute(
                 "UPDATE capture_source SET quarantine_disposition = ?, "
                 "terminal_reason = ?, terminal_time = ?, retention_deadline = ?, "
                 "certified_prefix_count = NULL, coverage_digest = NULL "
                 "WHERE source_id = ? AND source_type = 'quarantine' AND lifecycle = ? "
-                "AND quarantine_disposition IN ('unclassified')",
+                "AND quarantine_disposition IN ('unclassified') "
+                "AND block_reason IS NOT 'ready_overlap_conflict'",
                 ("unprocessable", reason, now, deadline, source_id, current[0]),
             )
             if changed.rowcount != 1:
@@ -472,20 +539,21 @@ def sweep_terminal_quarantine(
     *,
     should_defer: Callable[[], bool] = _never_defer,
     chunk_limit: int = DEFAULT_CHUNK_LIMIT,
-) -> tuple[str, ...]:
+) -> SweepResult:
     """Classify and expire terminal typed quarantine evidence."""
     if type(chunk_limit) is not int or not 0 < chunk_limit <= MAX_CHUNK_LIMIT:
         raise ValueError("chunk_limit must be between 1 and MAX_CHUNK_LIMIT")
     if should_defer():
-        return ()
+        return SweepResult((), False)
     return _typed_sweep_terminal_quarantine(filesystem, should_defer, chunk_limit)
 
 
 def _typed_sweep_terminal_quarantine(
     filesystem: StagingFilesystem, should_defer: Callable[[], bool], chunk_limit: int
-) -> tuple[str, ...]:
+) -> SweepResult:
     now = _wall_clock_ns()
     removed: list[str] = []
+    progressed = False
     try:
         with _typed_transaction(filesystem) as connection:
             changes_before = connection.total_changes
@@ -501,13 +569,14 @@ def _typed_sweep_terminal_quarantine(
                         removed.append(source)
             if remaining and not should_defer():
                 _sweep_one_expired_standalone(connection, now, remaining)
-            if connection.total_changes != changes_before:
+            progressed = connection.total_changes != changes_before
+            if progressed:
                 state = StateTransaction(connection)
                 state.mark_publication_changed()
                 state.finish()
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise StagingError("typed quarantine retention sweep failed") from error
-    return tuple(removed)
+    return SweepResult(tuple(removed), progressed)
 
 
 def _classify_one_typed_opaque(filesystem: StagingFilesystem, connection: sqlite3.Connection, now: int) -> None:
@@ -526,6 +595,7 @@ def _expired_typed_source_sql() -> str:
     return (
         "source_type = 'quarantine' AND lifecycle IN ('blocked','covered','retiring') "
         "AND quarantine_disposition IN ('unclassified','unprocessable','published_prefix') "
+        "AND block_reason IS NOT 'ready_overlap_conflict' "
         "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
         "AND CAST(retention_deadline AS INTEGER) <= ?"
     )
@@ -567,8 +637,21 @@ def _sweep_one_typed_source(
     )
     if row is None or not _typed_retention_expired(row, now):
         return False, 0
+    try:
+        disposition = QuarantineDisposition(str(row[2]))
+        phase = AudioPhase(str(row[1]))
+    except ValueError:
+        return False, 0
+    residual = quarantine_transition(disposition, ResidualExpiry())
+    if residual.action is not QuarantineAction.RETIRE:
+        return False, 0
+    cohort_ref, stage_ref = _canonical_references(connection, source_id)
+    canonical = quarantine_transition(
+        disposition,
+        CanonicalExpiry(phase, cohort_references=cohort_ref, stage_references=stage_ref),
+    )
     remaining = chunk_limit
-    if row[1] == "blocked" and row[2] == "unprocessable" and _canonical_unreferenced(connection, source_id):
+    if canonical.action is QuarantineAction.RETIRE:
         remaining -= _delete_typed_children(connection, "capture_record", source_id, now, remaining)
     if remaining:
         remaining -= _delete_typed_evidence_chunks(connection, source_id, now, remaining)
@@ -578,19 +661,24 @@ def _sweep_one_typed_source(
         remaining -= _delete_typed_children(connection, "capture_conflict", source_id, now, remaining)
     if remaining:
         remaining -= _delete_typed_evidence_parent(connection, source_id, now, remaining)
-    removed = _delete_expired_typed_source(connection, source_id, now) if row[2] == "unprocessable" else False
+    removed = (
+        _delete_expired_typed_source(connection, source_id, now)
+        if canonical.action is QuarantineAction.RETIRE
+        else False
+    )
     return removed, chunk_limit - remaining
 
 
-def _canonical_unreferenced(connection: sqlite3.Connection, source_id: str) -> bool:
-    return (
+def _canonical_references(connection: sqlite3.Connection, source_id: str) -> tuple[bool, bool]:
+    row = cast(
+        tuple[object, object],
         connection.execute(
-            "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM publication_cohort_member WHERE source_id = ?) "
-            "AND NOT EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?)",
+            "SELECT EXISTS (SELECT 1 FROM publication_cohort_member WHERE source_id = ?), "
+            "EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?)",
             (source_id, source_id),
-        ).fetchone()
-        is not None
+        ).fetchone(),
     )
+    return bool(row[0]), bool(row[1])
 
 
 def _delete_typed_children(connection: sqlite3.Connection, table: str, source_id: str, now: int, limit: int) -> int:
@@ -642,6 +730,12 @@ def _classify_typed_opaque(
 ) -> bool:
     if row is None or row[3] != 1 or row[2] not in {None, "unclassified"}:
         return False
+    decision = quarantine_transition(
+        QuarantineDisposition.UNCLASSIFIED,
+        MarkUnprocessable("opaque typed quarantine evidence"),
+    )
+    if decision.action is not QuarantineAction.MARK_UNPROCESSABLE:
+        return False
     terminal_time = str(now)
     deadline = str(now + _seconds_to_nanoseconds(filesystem._terminal_retention_seconds))
     connection.execute(
@@ -674,6 +768,12 @@ def _classify_standalone_typed_evidence(
     now: int,
 ) -> None:
     """Give unlinked evidence its own terminal lifecycle and retention clock."""
+    decision = quarantine_transition(
+        QuarantineDisposition.UNCLASSIFIED,
+        MarkUnprocessable("standalone typed quarantine evidence"),
+    )
+    if decision.action is not QuarantineAction.MARK_UNPROCESSABLE:
+        return
     terminal_time = str(now)
     deadline = str(now + _seconds_to_nanoseconds(filesystem._terminal_retention_seconds))
     connection.execute(
@@ -687,9 +787,9 @@ def _classify_standalone_typed_evidence(
 
 def _sweep_one_expired_standalone(connection: sqlite3.Connection, now: int, limit: int) -> int:
     row = cast(
-        tuple[object] | None,
+        tuple[object, object] | None,
         connection.execute(
-            "SELECT evidence_id FROM capture_evidence WHERE source_id IS NULL "
+            "SELECT evidence_id, disposition FROM capture_evidence WHERE source_id IS NULL "
             "AND disposition IN ('published_prefix','unprocessable') "
             "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
             "AND CAST(retention_deadline AS INTEGER) <= ? ORDER BY evidence_id LIMIT 1",
@@ -697,6 +797,9 @@ def _sweep_one_expired_standalone(connection: sqlite3.Connection, now: int, limi
         ).fetchone(),
     )
     if row is None:
+        return 0
+    decision = quarantine_transition(QuarantineDisposition(str(row[1])), ResidualExpiry())
+    if decision.action is not QuarantineAction.RETIRE:
         return 0
     evidence_id = str(row[0])
     spent = connection.execute(

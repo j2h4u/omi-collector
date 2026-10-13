@@ -664,16 +664,16 @@ class StagingStore:
         self.publication_input_changed()
         return admitted
 
-    def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[str, ...]:
+    def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool] | None = None) -> quarantine.SweepResult:
         generation = self._state_db.get_generation()
-        removed = quarantine.sweep_terminal_quarantine(
+        result = quarantine.sweep_terminal_quarantine(
             self._filesystem,
             should_defer=should_defer or _never_defer,
             chunk_limit=self._config.writer.chunk_records,
         )
         if self._state_db.get_generation() != generation:
             self.publication_input_changed()
-        return removed
+        return result
 
     def refresh_utc_projection(self) -> int:
         """Refresh one bounded chunk of queryable UTC metadata during idle maintenance."""

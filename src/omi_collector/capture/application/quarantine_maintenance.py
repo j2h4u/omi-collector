@@ -271,18 +271,21 @@ class QuarantineMaintenance:
             self._runtime.debug_exception("utc_projection_refresh_failed", error)
 
     async def _sweep_terminal_quarantine(self, should_defer: Callable[[], bool]) -> None:
-        try:
-            removed = await joined_to_thread(
-                self._staging.sweep_terminal_quarantine,
-                should_defer=should_defer,
-            )
-        except Exception as error:  # noqa: BLE001 - expiry failures preserve evidence
-            if self._runtime.is_device_busy_error(error):
+        while not should_defer():
+            try:
+                result = await joined_to_thread(
+                    self._staging.sweep_terminal_quarantine,
+                    should_defer=should_defer,
+                )
+            except Exception as error:  # noqa: BLE001 - expiry failures preserve evidence
+                if not self._runtime.is_device_busy_error(error):
+                    self._runtime.debug_exception("terminal_quarantine_sweep_failed", error)
                 return
-            self._runtime.debug_exception("terminal_quarantine_sweep_failed", error)
-        else:
-            for source_id in removed:
+            for source_id in result.removed_source_ids:
                 self._runtime.debug_event("terminal_quarantine_deleted", source=source_id)
+            if not result.progressed:
+                return
+            await asyncio.sleep(0)
 
     async def _salvage_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:

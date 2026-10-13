@@ -25,7 +25,7 @@ from .attempt_writer import AttemptWriter, WriterError, WriterFailedError, Write
 from .clock_state_store import ClockStateStore
 from .debug_logging import debug_event, debug_exception
 from .firmware_observations import FirmwareObservationStore, FirmwareObservationWriter
-from .quarantine import QuarantinePublishError, QuarantineSalvageDeferredError
+from .quarantine import QuarantineCustodyHoldError, QuarantinePublishError, QuarantineSalvageDeferredError
 from .staging_contract import DeviceAlreadyRunningError, StagingError
 from .staging_store import StagingStore
 
@@ -237,6 +237,8 @@ class OpportunisticRuntime(CaptureRuntimePort):
         return staging.admit_quarantined_prefix(source, should_defer=should_defer)
 
     def classify_quarantine_error(self, error: BaseException) -> QuarantineErrorKind | None:
+        if isinstance(error, QuarantineCustodyHoldError):
+            return "deferred"
         if isinstance(error, QuarantinePublishError):
             return "unprocessable"
         if isinstance(error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError)):

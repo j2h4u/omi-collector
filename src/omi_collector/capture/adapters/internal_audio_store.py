@@ -13,6 +13,7 @@ from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, replace
 from typing import Final, NoReturn, Protocol, cast
 
+from ...config import MAX_WRITER_CHUNK_RECORDS
 from ..domain.clock_state import ClockState
 from ..domain.internal_audio_machine import (
     AudioAction,
@@ -54,8 +55,8 @@ __all__ = [
 
 AUDIO_RECORD_SIZE: Final = 444
 AUDIO_PAYLOAD_SIZE: Final = 440
-DEFAULT_CHUNK_LIMIT: Final = 128
-MAX_CHUNK_LIMIT: Final = DEFAULT_CHUNK_LIMIT
+DEFAULT_CHUNK_LIMIT: Final = MAX_WRITER_CHUNK_RECORDS
+MAX_CHUNK_LIMIT: Final = MAX_WRITER_CHUNK_RECORDS
 MAX_PROTOCOL_UINT32: Final = 2**32 - 1
 UINT64_BYTES: Final = 8
 TAIL_MAX_BYTES: Final = 443
@@ -365,15 +366,15 @@ def authenticate_capture_source(
 
     source_id = _source_id(source_id)
     limit = _chunk_limit(page_limit)
-    source = read_capture_source(state_db, source_id)
-    if source is None:
-        raise InternalAudioStoreError("source does not exist")
     count = 0
     digest = hashlib.sha256()
     after_ordinal = -1
-    while True:
-        try:
-            with closing(state_db.open_connection(read_only=True)) as connection:
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection:
+            source = _read_capture_source(connection, source_id)
+            if source is None:
+                raise InternalAudioStoreError("source does not exist")
+            while True:
                 rows = cast(
                     list[tuple[object, object, object]],
                     connection.execute(
@@ -382,20 +383,20 @@ def authenticate_capture_source(
                         (source_id, after_ordinal, limit),
                     ).fetchall(),
                 )
-        except (OSError, sqlite3.DatabaseError, StateDBError) as error:
-            raise InternalAudioStoreError("source record authentication failed") from error
-        if not rows:
-            break
-        for ordinal_value, timestamp_value, payload_value in rows:
-            ordinal = _uint32(cast(int, ordinal_value), "source record ordinal")
-            if ordinal != count:
-                raise InternalAudioStoreError("source record ordinals are not contiguous")
-            timestamp = _uint32(cast(int, timestamp_value), "device timestamp")
-            payload = _bytes(payload_value)
-            digest.update(_record_bytes(timestamp.to_bytes(4, "big") + payload))
-            count += 1
-        after_ordinal = count - 1
-    current = read_capture_source(state_db, source_id)
+                if not rows:
+                    break
+                for ordinal_value, timestamp_value, payload_value in rows:
+                    ordinal = _uint32(cast(int, ordinal_value), "source record ordinal")
+                    if ordinal != count:
+                        raise InternalAudioStoreError("source record ordinals are not contiguous")
+                    timestamp = _uint32(cast(int, timestamp_value), "device timestamp")
+                    payload = _bytes(payload_value)
+                    digest.update(_record_bytes(timestamp.to_bytes(4, "big") + payload))
+                    count += 1
+                after_ordinal = count - 1
+            current = _read_capture_source(connection, source_id)
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise InternalAudioStoreError("source record authentication failed") from error
     if current != source:
         raise InternalAudioStoreError("source changed during record authentication")
     if count != source.committed_count:
@@ -864,15 +865,12 @@ class InternalAudioStore:
         return self._append_replay(source, suffix, expected_sha256, tail)
 
     def _prefix_digest(self, source_id: str, count: int) -> str:
+        page = self.read_record_page(source_id, -1, count)
+        if len(page) != count or tuple(row.ordinal for row in page) != tuple(range(count)):
+            raise InternalAudioStoreError("replay prefix is not contiguous")
         digest = hashlib.sha256()
-        ordinal = 0
-        while ordinal < count:
-            page = self.read_record_page(source_id, ordinal - 1, min(self.chunk_limit, count - ordinal))
-            if not page or any(row.ordinal != ordinal + index for index, row in enumerate(page)):
-                raise InternalAudioStoreError("replay prefix is not contiguous")
-            for record in page:
-                digest.update(record.raw_bytes)
-            ordinal += len(page)
+        for record in page:
+            digest.update(record.raw_bytes)
         return digest.hexdigest()
 
     def _commit_replay_tail(
@@ -1335,12 +1333,12 @@ def _validate_receiving_checkpoint(source: CaptureSource, expected: int, leg_gen
     if decision.action is not AudioAction.PERSIST:
         raise InternalAudioStoreError("tail requires a receiving source")
     active_leg = (source.current_leg_start, source.current_leg_count)
-    if (
-        (source.prepared_start, source.prepared_count) != active_leg
-        or (source.read_begin_start, source.read_begin_count) != active_leg
-        or not source.current_leg_start - source.sequence_start <= expected < source.committed_count + 1
-        or source.sequence_start + expected >= source.current_leg_start + source.current_leg_count
-    ):
+    durable_leg = (source.prepared_start, source.prepared_count), (source.read_begin_start, source.read_begin_count)
+    if durable_leg != (active_leg, active_leg):
+        raise InternalAudioStoreError("tail is outside the bound READ leg")
+    leg_floor = source.current_leg_start - source.sequence_start
+    leg_ceiling = min(source.committed_count, leg_floor + source.current_leg_count - 1)
+    if not leg_floor <= expected <= leg_ceiling:
         raise InternalAudioStoreError("tail is outside the bound READ leg")
 
 

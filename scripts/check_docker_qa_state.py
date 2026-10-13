@@ -12,12 +12,14 @@ from typing import cast
 
 _DATABASE = Path("/data/omi/collector/collector-state.sqlite3")
 _COLLECTOR_LOCK = Path("/data/omi/collector/collector.lock")
+_READY = Path("/data/omi/ready")
 _RELEASE_METADATA = Path("/opt/venv/share/omi-collector/release.json")
 _REVISION = re.compile(r"[0-9a-f]{40,64}\Z")
 _APP_UID = 1000
 _OPERATOR_GID = 1001
 _DATABASE_MODE = 0o640
 _LOCK_MODE = 0o600
+_READY_MODE = 0o2750
 
 
 def _require(condition: bool, message: str) -> None:
@@ -43,6 +45,11 @@ def _check_release_metadata() -> None:
 
 
 def _check_database() -> None:
+    ready_stat = _READY.stat()
+    _require(ready_stat.st_uid == _APP_UID, f"ready uid is {ready_stat.st_uid}, expected {_APP_UID}")
+    _require(ready_stat.st_gid == _OPERATOR_GID, f"ready gid is {ready_stat.st_gid}, expected {_OPERATOR_GID}")
+    _require(stat.S_IMODE(ready_stat.st_mode) == _READY_MODE, "ready mode is not 2750")
+    _require(os.access(_READY, os.R_OK | os.X_OK), "ready directory is not readable/traversable by app")
     lock_stat = _COLLECTOR_LOCK.stat()
     _require(lock_stat.st_uid == _APP_UID, f"collector lock uid is {lock_stat.st_uid}, expected {_APP_UID}")
     _require(lock_stat.st_gid == _APP_UID, f"collector lock gid is {lock_stat.st_gid}, expected {_APP_UID}")

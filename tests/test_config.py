@@ -120,6 +120,8 @@ def test_runtime_ranges_are_coherent() -> None:
         ServiceConfig(max_records=1, default_collect_records=2)
     with pytest.raises(ValueError, match="scan cancellation"):
         PresenceConfig(scan_cancel_grace_min_seconds=0.2, scan_cancel_grace_max_seconds=0.1)
+    with pytest.raises(ValueError, match="must not exceed 128"):
+        WriterConfig(chunk_records=129)
 
 
 def test_runtime_ranges_allow_equal_limits() -> None:

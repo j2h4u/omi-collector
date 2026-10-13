@@ -18,6 +18,7 @@ from omi_collector.capture.adapters.internal_audio_store import (
     DrainCheckpoint,
     InternalAudioStore,
     InternalAudioStoreError,
+    authenticate_capture_source,
     capture_space_requirement,
     decode_uint64,
     encode_uint64,
@@ -325,6 +326,81 @@ def test_large_digest_hydration_uses_one_read_connection(tmp_path: Path, monkeyp
         assert calls == [True]
 
 
+def test_multi_page_authentication_reuses_one_read_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    records = [_record(index, index % 251) for index in range(300)]
+    with InternalAudioStore(db, chunk_limit=128) as store:
+        source_id = _source(store, limit=len(records))
+        for start in range(0, len(records), 128):
+            store.commit_drain(source_id, start, records[start : start + 128], DrainCheckpoint(1))
+
+    calls: list[bool] = []
+    original_open = db.open_connection
+
+    def tracked_open(*, read_only: bool = False) -> sqlite3.Connection:
+        calls.append(read_only)
+        return original_open(read_only=read_only)
+
+    monkeypatch.setattr(db, "open_connection", tracked_open)
+
+    authenticated = authenticate_capture_source(db, source_id, page_limit=128)
+
+    assert authenticated.committed_count == len(records)
+    assert authenticated.committed_sha256 == hashlib.sha256(b"".join(records)).hexdigest()
+    assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("DELETE FROM capture_record WHERE ordinal = 299", "count"),
+        ("UPDATE capture_record SET payload = zeroblob(440) WHERE ordinal = 299", "digest"),
+    ],
+)
+def test_authentication_rejects_canonical_row_tampering(tmp_path: Path, mutation: str, message: str) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    records = [_record(index, index % 251) for index in range(300)]
+    with InternalAudioStore(db, chunk_limit=128) as store:
+        source_id = _source(store, limit=len(records))
+        for start in range(0, len(records), 128):
+            store.commit_drain(source_id, start, records[start : start + 128], DrainCheckpoint(1))
+    with closing(db.open_connection()) as connection:
+        connection.execute(mutation)
+        connection.commit()
+
+    with pytest.raises(InternalAudioStoreError, match=message):
+        authenticate_capture_source(db, source_id, page_limit=128)
+
+
+def test_authentication_rejects_source_change_after_record_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    raw = _record(64, 64)
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1))
+    read_source = internal_audio_store._read_capture_source
+    source_reads = 0
+
+    def change_before_final_check(connection: sqlite3.Connection, requested_id: str):
+        nonlocal source_reads
+        source_reads += 1
+        if source_reads == 2:
+            with closing(sqlite3.connect(db.path)) as writer:
+                writer.execute(
+                    "UPDATE capture_source SET lifecycle = 'interrupted' WHERE source_id = ?",
+                    (source_id,),
+                )
+                writer.commit()
+        return read_source(connection, requested_id)
+
+    monkeypatch.setattr(internal_audio_store, "_read_capture_source", change_before_final_check)
+
+    with pytest.raises(InternalAudioStoreError, match="source changed"):
+        authenticate_capture_source(db, source_id)
+
+
 def test_ambiguous_reopen_failure_fail_stops_all_mutators(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     raw = _record(56, 56)
@@ -484,6 +560,76 @@ def test_mixed_replay_mismatch_retains_exact_rejected_chunk(tmp_path: Path) -> N
     assert connection.execute("SELECT bytes FROM capture_conflict").fetchone()[0] == rejected
     assert connection.execute("SELECT COUNT(*) FROM capture_record").fetchone() == (2,)
     connection.close()
+
+
+def test_short_exact_replay_authenticates_its_durable_prefix(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    first, second, third = _record(60, 60), _record(61, 61), _record(62, 62)
+    with InternalAudioStore(db, chunk_limit=3) as store:
+        source_id = _source(store)
+        full_digest = hashlib.sha256(first + second + third).hexdigest()
+        assert (
+            store.commit_drain(source_id, 0, [first, second, third], DrainCheckpoint(1, expected_sha256=full_digest))
+            == 3
+        )
+
+        prefix_digest = hashlib.sha256(first + second).hexdigest()
+        assert (
+            store.commit_drain(
+                source_id,
+                0,
+                [first, second],
+                DrainCheckpoint(1, expected_sha256=prefix_digest),
+            )
+            == 3
+        )
+        with pytest.raises(InternalAudioStoreError, match="checkpoint conflicts"):
+            store.commit_drain(
+                source_id,
+                0,
+                [first, second],
+                DrainCheckpoint(1, expected_sha256=full_digest),
+            )
+
+
+def test_tail_checkpoint_requires_the_current_durable_read_leg(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        tail = CaptureTail(1, 0, 1, 0, b"x")
+        assert store.commit_tail(source_id, 0, DrainCheckpoint(1, tail)) == 0
+
+        with pytest.raises(InternalAudioStoreError, match="generation"):
+            store.commit_tail(source_id, 0, DrainCheckpoint(0, tail))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        ("lifecycle = ?", ("interrupted",)),
+        ("prepared_count = ?", (99,)),
+        (
+            (
+                "prepared_start = ?, prepared_count = ?, read_begin_start = ?, read_begin_count = ?, "
+                "current_leg_start = ?, current_leg_count = ?"
+            ),
+            (encode_uint64(1), 99, encode_uint64(1), 99, encode_uint64(1), 99),
+        ),
+    ],
+)
+def test_tail_checkpoint_rejects_corrupt_durable_read_state(
+    tmp_path: Path,
+    mutation: tuple[str, tuple[object, ...]],
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        clause, values = mutation
+        with closing(db.open_connection()) as connection:
+            connection.execute(f"UPDATE capture_source SET {clause} WHERE source_id = ?", (*values, source_id))
+            connection.commit()
+        with pytest.raises(InternalAudioStoreError, match=r"receiving|bound READ leg"):
+            store.commit_tail(source_id, 0, DrainCheckpoint(1, CaptureTail(1, 0, 1, 0, b"x")))
 
 
 def test_direct_source_delete_is_blocked_by_residual_custody(tmp_path: Path) -> None:
@@ -657,6 +803,61 @@ def test_commit_ambiguity_reopens_and_accepts_exact_durable_result(
         monkeypatch.setattr(store, "_commit", ambiguous_commit)
         assert store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1, expected_sha256=digest)) == 1
         assert store.get_source(source_id).committed_count == 1  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("durable_state", ["proposed", "old", "third"])
+def test_seal_ambiguity_reconciles_only_exact_old_or_proposed_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_state: str,
+) -> None:
+    db = StateDB(tmp_path / f"{durable_state}.sqlite3")
+    raw = _record(63, 63)
+    digest = hashlib.sha256(raw).hexdigest()
+    with InternalAudioStore(db) as store:
+        source_id = _source(store, limit=1)
+        store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1, expected_sha256=digest))
+        commit = store._commit
+
+        def ambiguous_commit() -> None:
+            if durable_state != "old":
+                commit()
+            if durable_state == "third":
+                connection = store._require_connection()
+                connection.execute(
+                    "UPDATE capture_source SET lifecycle = 'blocked' WHERE source_id = ?",
+                    (source_id,),
+                )
+                connection.commit()
+            raise sqlite3.OperationalError("commit result is ambiguous")
+
+        monkeypatch.setattr(store, "_commit", ambiguous_commit)
+        if durable_state == "proposed":
+            sealed = store.seal_source(
+                source_id,
+                leg_generation=1,
+                expected_count=1,
+                expected_sha256=digest,
+            )
+            assert sealed.lifecycle == "sealed_waiting"
+        elif durable_state == "old":
+            with pytest.raises(InternalAudioStoreError, match="rolled back"):
+                store.seal_source(
+                    source_id,
+                    leg_generation=1,
+                    expected_count=1,
+                    expected_sha256=digest,
+                )
+        else:
+            with pytest.raises(InternalAudioStoreError, match="could not be reconciled"):
+                store.seal_source(
+                    source_id,
+                    leg_generation=1,
+                    expected_count=1,
+                    expected_sha256=digest,
+                )
+            with pytest.raises(InternalAudioStoreError, match="fail-stopped"):
+                store.interrupt(source_id)
 
 
 def test_stream_validation_is_bounded_to_count_and_digest() -> None:

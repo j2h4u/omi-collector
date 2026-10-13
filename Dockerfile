@@ -47,8 +47,10 @@ RUN test -n "$SOURCE_REVISION" \
     && chown app:qa-operator /data/omi/collector \
     && chmod 2750 /data/omi/collector \
     && install -o app -g app -m 0600 /dev/null /data/omi/collector/collector.lock \
-    && chown -R app:app /data/omi/draft /data/omi/ready \
-    && chmod 0750 /data/omi/draft /data/omi/ready
+    && chown app:app /data/omi/draft \
+    && chmod 0750 /data/omi/draft \
+    && chown app:qa-operator /data/omi/ready \
+    && chmod 2750 /data/omi/ready
 
 USER 1000:1000
 

@@ -21,7 +21,12 @@ from ..domain.quarantine_machine import (
     QuarantineState,
 )
 from .collector_state_db import StateDBError, StateTransaction
-from .internal_audio_store import InternalAudioStoreError, authenticate_capture_source
+from .internal_audio_store import (
+    DEFAULT_CHUNK_LIMIT,
+    MAX_CHUNK_LIMIT,
+    InternalAudioStoreError,
+    authenticate_capture_source,
+)
 from .staging_contract import (
     AttemptDescriptor,
     AttemptStateError,
@@ -50,19 +55,6 @@ def _wall_clock_ns() -> int:
 
 def _seconds_to_nanoseconds(seconds: float) -> int:
     return int(seconds * 1_000_000_000)
-
-
-def _typed_source_ids(filesystem: StagingFilesystem, *, source_type: str) -> tuple[str, ...]:
-    """Return typed source identities without consulting private directories."""
-    try:
-        with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
-            rows = connection.execute(
-                "SELECT source_id FROM capture_source WHERE source_type = ? ORDER BY source_id", (source_type,)
-            ).fetchall()
-    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
-        raise StagingError("typed audio source inventory is unreadable") from error
-    typed_rows = cast(list[tuple[object]], rows)
-    return tuple(str(row[0]) for row in typed_rows)
 
 
 def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
@@ -277,10 +269,10 @@ def _quarantine_admission(source_id: str, snapshot: _TypedAdmissionSnapshot) -> 
 
 
 def _require_authenticated_admission(
-    source_id: str, snapshot: _TypedAdmissionSnapshot, filesystem: StagingFilesystem
+    source_id: str, snapshot: _TypedAdmissionSnapshot, filesystem: StagingFilesystem, page_limit: int
 ) -> None:
     try:
-        source = authenticate_capture_source(filesystem.state_db, source_id)
+        source = authenticate_capture_source(filesystem.state_db, source_id, page_limit=page_limit)
     except InternalAudioStoreError as error:
         raise QuarantinePublishError("typed quarantine prefix authentication failed") from error
     if (
@@ -297,6 +289,7 @@ def admit_quarantined_prefix(
     filesystem: StagingFilesystem,
     source_id: str,
     *,
+    page_limit: int = DEFAULT_CHUNK_LIMIT,
     should_defer: Callable[[], bool] = _never_defer,
 ) -> QuarantinePrefixAdmission:
     """Certify one parseable prefix and start retention for its residual evidence."""
@@ -310,7 +303,7 @@ def admit_quarantined_prefix(
             if inspected.terminal_time is None or inspected.retention_deadline is None:
                 raise QuarantinePublishError("typed quarantine retention evidence is incomplete")
             return _quarantine_admission(source_id, inspected)
-        _require_authenticated_admission(source_id, inspected, filesystem)
+        _require_authenticated_admission(source_id, inspected, filesystem, page_limit)
         if should_defer():
             raise QuarantineSalvageDeferredError("quarantine admission deferred")
         now_ns = _wall_clock_ns()
@@ -478,16 +471,18 @@ def sweep_terminal_quarantine(
     filesystem: StagingFilesystem,
     *,
     should_defer: Callable[[], bool] = _never_defer,
+    chunk_limit: int = DEFAULT_CHUNK_LIMIT,
 ) -> tuple[str, ...]:
     """Classify and expire terminal typed quarantine evidence."""
+    if type(chunk_limit) is not int or not 0 < chunk_limit <= MAX_CHUNK_LIMIT:
+        raise ValueError("chunk_limit must be between 1 and MAX_CHUNK_LIMIT")
     if should_defer():
         return ()
-    typed = _typed_source_ids(filesystem, source_type="quarantine")
-    return _typed_sweep_terminal_quarantine(filesystem, typed, should_defer)
+    return _typed_sweep_terminal_quarantine(filesystem, should_defer, chunk_limit)
 
 
 def _typed_sweep_terminal_quarantine(
-    filesystem: StagingFilesystem, source_ids: tuple[str, ...], should_defer: Callable[[], bool]
+    filesystem: StagingFilesystem, should_defer: Callable[[], bool], chunk_limit: int
 ) -> tuple[str, ...]:
     now = _wall_clock_ns()
     removed: list[str] = []
@@ -495,28 +490,17 @@ def _typed_sweep_terminal_quarantine(
         with _typed_transaction(filesystem) as connection:
             changes_before = connection.total_changes
             _classify_standalone_typed_evidence(filesystem, connection, now)
-            _delete_expired_unlinked_typed_evidence(connection, now)
-            for source_id in source_ids:
-                if should_defer():
-                    break
-                row = cast(
-                    tuple[object, object, object, object] | None,
-                    connection.execute(
-                        "SELECT retention_deadline, lifecycle, quarantine_disposition, quarantine_opaque "
-                        "FROM capture_source "
-                        "WHERE source_id = ? AND source_type = 'quarantine'",
-                        (source_id,),
-                    ).fetchone(),
-                )
-                if _classify_typed_opaque(filesystem, connection, source_id, row, now):
-                    continue
-                if row is None or not _typed_retention_expired(row, now):
-                    continue
-                _delete_expired_typed_evidence(connection, source_id)
-                connection.execute("DELETE FROM capture_tail WHERE source_id = ?", (source_id,))
-                connection.execute("DELETE FROM capture_conflict WHERE source_id = ?", (source_id,))
-                if _delete_expired_typed_source(connection, source_id, row):
-                    removed.append(source_id)
+            _classify_one_typed_opaque(filesystem, connection, now)
+            remaining = chunk_limit
+            if not should_defer():
+                source = _next_expired_typed_source(connection, now)
+                if source is not None:
+                    source_removed, spent = _sweep_one_typed_source(connection, source, now, remaining)
+                    remaining -= spent
+                    if source_removed:
+                        removed.append(source)
+            if remaining and not should_defer():
+                _sweep_one_expired_standalone(connection, now, remaining)
             if connection.total_changes != changes_before:
                 state = StateTransaction(connection)
                 state.mark_publication_changed()
@@ -524,6 +508,129 @@ def _typed_sweep_terminal_quarantine(
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise StagingError("typed quarantine retention sweep failed") from error
     return tuple(removed)
+
+
+def _classify_one_typed_opaque(filesystem: StagingFilesystem, connection: sqlite3.Connection, now: int) -> None:
+    row = cast(
+        tuple[object] | None,
+        connection.execute(
+            "SELECT source_id FROM capture_source WHERE source_type = 'quarantine' "
+            "AND quarantine_opaque = 1 AND quarantine_disposition = 'unclassified' ORDER BY source_id LIMIT 1"
+        ).fetchone(),
+    )
+    if row is not None:
+        _classify_typed_opaque(filesystem, connection, str(row[0]), (None, "blocked", "unclassified", 1), now)
+
+
+def _expired_typed_source_sql() -> str:
+    return (
+        "source_type = 'quarantine' AND lifecycle IN ('blocked','covered','retiring') "
+        "AND quarantine_disposition IN ('unclassified','unprocessable','published_prefix') "
+        "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
+        "AND CAST(retention_deadline AS INTEGER) <= ?"
+    )
+
+
+def _canonical_delete_eligible_sql() -> str:
+    return (
+        _expired_typed_source_sql() + " AND lifecycle = 'blocked' AND quarantine_disposition = 'unprocessable' "
+        "AND NOT EXISTS (SELECT 1 FROM publication_cohort_member m WHERE m.source_id = capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM ready_stage_range r WHERE r.source_id = capture_source.source_id)"
+    )
+
+
+def _next_expired_typed_source(connection: sqlite3.Connection, now: int) -> str | None:
+    row = cast(
+        tuple[object] | None,
+        connection.execute(
+            "SELECT source_id FROM capture_source WHERE " + _expired_typed_source_sql() + " AND ("
+            "EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) OR "
+            "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) OR "
+            "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id) OR "
+            "(" + _canonical_delete_eligible_sql() + ")) ORDER BY source_id LIMIT 1",
+            (now, now),
+        ).fetchone(),
+    )
+    return None if row is None else str(row[0])
+
+
+def _sweep_one_typed_source(
+    connection: sqlite3.Connection, source_id: str, now: int, chunk_limit: int
+) -> tuple[bool, int]:
+    row = cast(
+        tuple[object, object, object, object] | None,
+        connection.execute(
+            "SELECT retention_deadline, lifecycle, quarantine_disposition, quarantine_opaque "
+            "FROM capture_source WHERE source_id = ?",
+            (source_id,),
+        ).fetchone(),
+    )
+    if row is None or not _typed_retention_expired(row, now):
+        return False, 0
+    remaining = chunk_limit
+    if row[1] == "blocked" and row[2] == "unprocessable" and _canonical_unreferenced(connection, source_id):
+        remaining -= _delete_typed_children(connection, "capture_record", source_id, now, remaining)
+    if remaining:
+        remaining -= _delete_typed_evidence_chunks(connection, source_id, now, remaining)
+    if remaining:
+        remaining -= _delete_typed_children(connection, "capture_tail", source_id, now, remaining)
+    if remaining:
+        remaining -= _delete_typed_children(connection, "capture_conflict", source_id, now, remaining)
+    if remaining:
+        remaining -= _delete_typed_evidence_parent(connection, source_id, now, remaining)
+    removed = _delete_expired_typed_source(connection, source_id, now) if row[2] == "unprocessable" else False
+    return removed, chunk_limit - remaining
+
+
+def _canonical_unreferenced(connection: sqlite3.Connection, source_id: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM publication_cohort_member WHERE source_id = ?) "
+            "AND NOT EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?)",
+            (source_id, source_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _delete_typed_children(connection: sqlite3.Connection, table: str, source_id: str, now: int, limit: int) -> int:
+    if limit <= 0:
+        return 0
+    key = "ordinal" if table == "capture_record" else "chunk_ordinal" if table == "capture_conflict" else "source_id"
+    eligibility = _canonical_delete_eligible_sql() if table == "capture_record" else _expired_typed_source_sql()
+    deleted = connection.execute(
+        f"DELETE FROM {table} WHERE source_id = ? AND {key} IN ("
+        f"SELECT {key} FROM {table} WHERE source_id = ? ORDER BY {key} LIMIT ?) "
+        "AND EXISTS (SELECT 1 FROM capture_source WHERE source_id = ? AND " + eligibility + ")",
+        (source_id, source_id, limit, source_id, now),
+    )
+    return deleted.rowcount
+
+
+def _delete_typed_evidence_chunks(connection: sqlite3.Connection, source_id: str, now: int, limit: int) -> int:
+    if limit <= 0:
+        return 0
+    deleted = connection.execute(
+        "DELETE FROM capture_evidence_chunk WHERE (evidence_id, chunk_ordinal) IN ("
+        "SELECT c.evidence_id, c.chunk_ordinal FROM capture_evidence_chunk c "
+        "JOIN capture_evidence e ON e.evidence_id = c.evidence_id "
+        "WHERE e.source_id = ? ORDER BY c.evidence_id, c.chunk_ordinal LIMIT ?) "
+        "AND EXISTS (SELECT 1 FROM capture_source WHERE source_id = ? AND " + _expired_typed_source_sql() + ")",
+        (source_id, limit, source_id, now),
+    )
+    return deleted.rowcount
+
+
+def _delete_typed_evidence_parent(connection: sqlite3.Connection, source_id: str, now: int, limit: int) -> int:
+    deleted = connection.execute(
+        "DELETE FROM capture_evidence WHERE evidence_id IN ("
+        "SELECT evidence_id FROM capture_evidence WHERE source_id = ? "
+        "AND NOT EXISTS (SELECT 1 FROM capture_evidence_chunk c WHERE c.evidence_id = capture_evidence.evidence_id) "
+        "ORDER BY evidence_id LIMIT ?) "
+        "AND EXISTS (SELECT 1 FROM capture_source WHERE source_id = ? AND " + _expired_typed_source_sql() + ")",
+        (source_id, limit, source_id, now),
+    )
+    return deleted.rowcount
 
 
 def _classify_typed_opaque(
@@ -561,11 +668,6 @@ def _typed_retention_expired(row: tuple[object, object, object, object], now: in
         return False
 
 
-def _delete_expired_typed_evidence(connection: sqlite3.Connection, source_id: str) -> None:
-    """Delete linked residual evidence after its source authority expires."""
-    connection.execute("DELETE FROM capture_evidence WHERE source_id = ?", (source_id,))
-
-
 def _classify_standalone_typed_evidence(
     filesystem: StagingFilesystem,
     connection: sqlite3.Connection,
@@ -577,44 +679,59 @@ def _classify_standalone_typed_evidence(
     connection.execute(
         "UPDATE capture_evidence SET disposition = 'unprocessable', "
         "terminal_reason = 'standalone typed quarantine evidence', terminal_time = ?, retention_deadline = ? "
-        "WHERE source_id IS NULL AND disposition = 'unclassified'",
+        "WHERE evidence_id = (SELECT evidence_id FROM capture_evidence "
+        "WHERE source_id IS NULL AND disposition = 'unclassified' ORDER BY evidence_id LIMIT 1)",
         (terminal_time, deadline),
     )
 
 
-def _delete_expired_unlinked_typed_evidence(connection: sqlite3.Connection, now: int) -> None:
-    evidence = cast(
-        list[tuple[object, object, object]],
+def _sweep_one_expired_standalone(connection: sqlite3.Connection, now: int, limit: int) -> int:
+    row = cast(
+        tuple[object] | None,
         connection.execute(
-            "SELECT evidence_id, disposition, retention_deadline FROM capture_evidence WHERE source_id IS NULL"
-        ).fetchall(),
+            "SELECT evidence_id FROM capture_evidence WHERE source_id IS NULL "
+            "AND disposition IN ('published_prefix','unprocessable') "
+            "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
+            "AND CAST(retention_deadline AS INTEGER) <= ? ORDER BY evidence_id LIMIT 1",
+            (now,),
+        ).fetchone(),
     )
-    for evidence_id, disposition, deadline in evidence:
-        if disposition not in {"published_prefix", "unprocessable"} or deadline is None:
-            continue
-        try:
-            expired = now >= int(cast(str, deadline))
-        except TypeError, ValueError:
-            expired = False
-        if expired:
-            connection.execute("DELETE FROM capture_evidence WHERE evidence_id = ?", (evidence_id,))
+    if row is None:
+        return 0
+    evidence_id = str(row[0])
+    spent = connection.execute(
+        "DELETE FROM capture_evidence_chunk WHERE evidence_id = ? AND chunk_ordinal IN ("
+        "SELECT chunk_ordinal FROM capture_evidence_chunk WHERE evidence_id = ? ORDER BY chunk_ordinal LIMIT ?) "
+        "AND EXISTS (SELECT 1 FROM capture_evidence WHERE evidence_id = ? AND source_id IS NULL "
+        "AND disposition IN ('published_prefix','unprocessable') AND retention_deadline != '' "
+        "AND retention_deadline NOT GLOB '*[^0-9]*' AND CAST(retention_deadline AS INTEGER) <= ?)",
+        (evidence_id, evidence_id, limit, evidence_id, now),
+    ).rowcount
+    if spent < limit:
+        spent += connection.execute(
+            "DELETE FROM capture_evidence WHERE evidence_id = ? "
+            "AND source_id IS NULL AND disposition IN ('published_prefix','unprocessable') "
+            "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
+            "AND CAST(retention_deadline AS INTEGER) <= ? "
+            "AND NOT EXISTS (SELECT 1 FROM capture_evidence_chunk WHERE evidence_id = ?)",
+            (evidence_id, now, evidence_id),
+        ).rowcount
+    return spent
 
 
 def _delete_expired_typed_source(
     connection: sqlite3.Connection,
     source_id: str,
-    row: tuple[object, object, object, object],
+    now: int,
 ) -> bool:
-    if row[1] == "retiring":
-        return False
-    if row[2] != "unprocessable" and row[1] != "covered":
-        return False
     deleted = connection.execute(
-        "DELETE FROM capture_source WHERE source_id = ? AND source_type = 'quarantine' "
-        "AND NOT EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = ?) "
-        "AND NOT EXISTS (SELECT 1 FROM publication_cohort_member WHERE source_id = ?) "
-        "AND NOT EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?)",
-        (source_id, source_id, source_id, source_id),
+        "DELETE FROM capture_source WHERE source_id = ? AND "
+        + _canonical_delete_eligible_sql()
+        + " AND NOT EXISTS (SELECT 1 FROM capture_record WHERE source_id = capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = ?)",
+        (source_id, now, source_id),
     )
     return deleted.rowcount == 1
 
@@ -650,7 +767,11 @@ def _validate_quarantine_payload(entry_name: str, row: dict[str, object]) -> dic
 
 
 def _validate_quarantine_terminal(row: dict[str, object]) -> None:
-    attempt_id = row["attempt_id"]
+    _validate_quarantine_attempt(row["attempt_id"])
+    _validate_terminal_evidence(row["terminal_state"], row["terminal_at_unix_ns"], row["terminal_reason"])
+
+
+def _validate_quarantine_attempt(attempt_id: object) -> None:
     if attempt_id is not None:
         if not isinstance(attempt_id, str):
             raise AttemptStateError("quarantine attempt identity is malformed")
@@ -658,31 +779,26 @@ def _validate_quarantine_terminal(row: dict[str, object]) -> None:
             _validate_attempt_id(attempt_id)
         except (TypeError, ValueError) as error:
             raise AttemptStateError("quarantine attempt identity is malformed") from error
-    terminal_state = row["terminal_state"]
-    terminal_at = row["terminal_at_unix_ns"]
-    terminal_reason = row["terminal_reason"]
+
+
+def _valid_terminal_timestamp(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validate_terminal_evidence(terminal_state: object, terminal_at: object, terminal_reason: object) -> None:
     if terminal_state is None:
         if terminal_at is not None or terminal_reason is not None:
             raise AttemptStateError("quarantine terminal evidence is contradictory")
-    elif terminal_state == "published":
-        if (
-            isinstance(terminal_at, bool)
-            or not isinstance(terminal_at, int)
-            or terminal_at < 0
-            or terminal_reason is not None
-        ):
+        return
+    if terminal_state == "published":
+        if not _valid_terminal_timestamp(terminal_at) or terminal_reason is not None:
             raise AttemptStateError("quarantine terminal evidence is malformed")
-    elif terminal_state == "unprocessable":
-        if (
-            isinstance(terminal_at, bool)
-            or not isinstance(terminal_at, int)
-            or terminal_at < 0
-            or not isinstance(terminal_reason, str)
-            or not terminal_reason
-        ):
+        return
+    if terminal_state == "unprocessable":
+        if not _valid_terminal_timestamp(terminal_at) or not isinstance(terminal_reason, str) or not terminal_reason:
             raise AttemptStateError("quarantine terminal evidence is malformed")
-    else:
-        raise AttemptStateError("quarantine terminal evidence is invalid")
+        return
+    raise AttemptStateError("quarantine terminal evidence is invalid")
 
 
 def _valid_quarantine_identity(entry_name: str, row: dict[str, object]) -> bool:

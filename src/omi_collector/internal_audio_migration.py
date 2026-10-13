@@ -691,6 +691,17 @@ def _verify_evidence_entry(
     fields: _QuarantineFields,
 ) -> None:
     evidence_id = _evidence_id(entry.path)
+    _verify_evidence_metadata(connection, evidence_id, entry, item, fields)
+    _verify_evidence_chunks(connection, evidence_id, entry)
+
+
+def _verify_evidence_metadata(
+    connection: sqlite3.Connection,
+    evidence_id: str,
+    entry: _FileIdentity,
+    item: _Quarantine,
+    fields: _QuarantineFields,
+) -> None:
     root_entry = item.path is not None and entry.path == item.path.relative_to(item.root).as_posix()
     row = cast(
         tuple[object, ...] | None,
@@ -717,6 +728,9 @@ def _verify_evidence_entry(
     )
     if row is None or tuple(row) != expected:
         raise InternalAudioMigrationError(f"typed quarantine evidence metadata differs: {entry.path}")
+
+
+def _verify_evidence_chunks(connection: sqlite3.Connection, evidence_id: str, entry: _FileIdentity) -> None:
     digest = hashlib.sha256()
     byte_count = 0
     for ordinal, block in cast(
@@ -1056,26 +1070,55 @@ def _receipt_quarantines(receipt: dict[str, object]) -> tuple[tuple[str, dict[st
 def _parse_file_identity(value: object) -> _FileIdentity:
     if not isinstance(value, dict) or set(value) != set(_FileIdentity.__dataclass_fields__):
         raise InternalAudioMigrationError("cutover file identity is malformed")
-    path = value["path"]
-    kind = value["kind"]
+    data = cast(dict[str, object], value)
+    path = _parse_file_path(data["path"])
+    kind = _parse_file_kind(data["kind"])
+    _validate_file_stat(data)
+    sha, link = _parse_file_content(kind, data["sha256"], data["symlink_hex"])
+    return _FileIdentity(
+        path,
+        kind,
+        cast(int, data["device"]),
+        cast(int, data["inode"]),
+        cast(int, data["mode"]),
+        cast(int, data["size"]),
+        sha,
+        link,
+    )
+
+
+def _parse_file_path(value: object) -> str:
     prefixes = ("draft/", "collector/attempts/", "collector/quarantine/")
-    if not isinstance(path, str) or not path.startswith(prefixes):
+    if not isinstance(value, str) or not value.startswith(prefixes):
         raise InternalAudioMigrationError("cutover file path is unsupported")
-    if any(part in {"", ".", ".."} for part in path.split("/")):
+    if any(part in {"", ".", ".."} for part in value.split("/")):
         raise InternalAudioMigrationError("cutover file path escapes storage root")
-    if kind not in {"regular", "directory", "symlink"}:
+    return value
+
+
+def _parse_file_kind(value: object) -> str:
+    if not isinstance(value, str) or value not in {"regular", "directory", "symlink"}:
         raise InternalAudioMigrationError("cutover file type is unsupported")
-    if any(type(value[name]) is not int or value[name] < 0 for name in ("device", "inode", "mode", "size")):
+    return value
+
+
+def _validate_file_stat(value: dict[str, object]) -> None:
+    if any(type(value[name]) is not int or cast(int, value[name]) < 0 for name in ("device", "inode", "mode", "size")):
         raise InternalAudioMigrationError("cutover file stat is malformed")
-    sha = value["sha256"]
-    link = value["symlink_hex"]
-    if kind == "regular" and (not isinstance(sha, str) or not _is_sha256(sha) or link is not None):
-        raise InternalAudioMigrationError("cutover file digest is malformed")
-    if kind == "directory" and (sha is not None or link is not None):
-        raise InternalAudioMigrationError("cutover directory identity is malformed")
-    if kind == "symlink" and (sha is not None or not isinstance(link, str) or len(link) % 2):
+
+
+def _parse_file_content(kind: str, sha: object, link: object) -> tuple[str | None, str | None]:
+    if kind == "regular":
+        if not isinstance(sha, str) or not _is_sha256(sha) or link is not None:
+            raise InternalAudioMigrationError("cutover file digest is malformed")
+        return sha, None
+    if kind == "directory":
+        if sha is not None or link is not None:
+            raise InternalAudioMigrationError("cutover directory identity is malformed")
+        return None, None
+    if sha is not None or not isinstance(link, str) or len(link) % 2:
         raise InternalAudioMigrationError("cutover symlink identity is malformed")
-    return _FileIdentity(path, kind, value["device"], value["inode"], value["mode"], value["size"], sha, link)
+    return None, link
 
 
 def _assert_inventory_exact(expected: _Inventory, current: _Inventory) -> None:
@@ -1287,40 +1330,50 @@ def _probe_effective_access(path: Path, user: pwd.struct_passwd, gid: int, *, wr
     read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os.close(read_fd)
-        try:
-            _probe_as_user(path, probe, user, gid, writable=writable)
-            os.write(write_fd, b"ok")
-        except OSError, InternalAudioMigrationError:
-            os.write(write_fd, b"denied")
-        finally:
-            os.close(write_fd)
-            os._exit(0)
+        _run_access_probe_child((path, probe), user, gid, (read_fd, write_fd), writable=writable)
     os.close(write_fd)
     try:
         result = os.read(read_fd, 16)
     finally:
         os.close(read_fd)
         _, status = os.waitpid(pid, 0)
-        if probe.exists() or probe.is_symlink():
-            info = probe.lstat()
-            if stat.S_ISREG(info.st_mode) and info.st_uid == user.pw_uid:
-                probe.unlink()
-                _fsync_directory(path.parent)
-            else:
-                raise InternalAudioMigrationError("access probe was replaced before cleanup")
+        _remove_access_probe(probe, user.pw_uid)
     if result != b"ok" or status != 0:
         role = "service" if writable else "operator"
         raise InternalAudioMigrationError(f"{role} account cannot use Collector state with required access")
 
 
+def _run_access_probe_child(
+    paths: tuple[Path, Path],
+    user: pwd.struct_passwd,
+    gid: int,
+    pipe: tuple[int, int],
+    *,
+    writable: bool,
+) -> None:
+    os.close(pipe[0])
+    try:
+        _probe_as_user(paths[0], paths[1], user, gid, writable=writable)
+        os.write(pipe[1], b"ok")
+    except OSError, InternalAudioMigrationError:
+        os.write(pipe[1], b"denied")
+    finally:
+        os.close(pipe[1])
+        os._exit(0)
+
+
+def _remove_access_probe(probe: Path, expected_uid: int) -> None:
+    if not probe.exists() and not probe.is_symlink():
+        return
+    info = probe.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid:
+        raise InternalAudioMigrationError("access probe was replaced before cleanup")
+    probe.unlink()
+    _fsync_directory(probe.parent)
+
+
 def _probe_as_user(path: Path, probe: Path, user: pwd.struct_passwd, gid: int, *, writable: bool) -> None:
-    if os.geteuid() == 0:
-        os.initgroups(user.pw_name, gid)
-        os.setgid(gid)
-        os.setuid(user.pw_uid)
-    elif (os.geteuid(), os.getegid()) != (user.pw_uid, gid):
-        raise InternalAudioMigrationError("access probe cannot assume account credentials")
+    _assume_probe_credentials(user, gid)
     access_flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_NOFOLLOW
     with closing(os.fdopen(os.open(path, access_flags), "rb")):
         pass
@@ -1329,6 +1382,19 @@ def _probe_as_user(path: Path, probe: Path, user: pwd.struct_passwd, gid: int, *
             pass
         probe.unlink()
         return
+    _probe_operator_readonly(path, probe)
+
+
+def _assume_probe_credentials(user: pwd.struct_passwd, gid: int) -> None:
+    if os.geteuid() == 0:
+        os.initgroups(user.pw_name, gid)
+        os.setgid(gid)
+        os.setuid(user.pw_uid)
+    elif (os.geteuid(), os.getegid()) != (user.pw_uid, gid):
+        raise InternalAudioMigrationError("access probe cannot assume account credentials")
+
+
+def _probe_operator_readonly(path: Path, probe: Path) -> None:
     for target, flags in (
         (path, os.O_WRONLY | os.O_NOFOLLOW),
         (probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW),

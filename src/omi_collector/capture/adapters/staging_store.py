@@ -45,7 +45,6 @@ from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
 from .debug_logging import debug_event
 from .internal_audio_store import (
     AUDIO_RECORD_SIZE,
-    MAX_CHUNK_LIMIT,
     CaptureSource,
     InternalAudioStore,
     InternalAudioStoreError,
@@ -512,7 +511,10 @@ class StagingStore:
         frontier = None if closure is None else closure.next_sequence
         drained = closure is not None and closure.reason == "drained"
         try:
-            with InternalAudioStore(self._state_db) as audio_store:
+            with InternalAudioStore(
+                self._state_db,
+                chunk_limit=self._config.writer.chunk_records,
+            ) as audio_store:
                 sources = tuple(
                     SqlitePublicationSource(audio_store, source_id)
                     for source_id in self._typed_publication_source_ids()
@@ -525,6 +527,7 @@ class StagingStore:
                     clock_segments=segments,
                     frontier=frontier,
                     drained=drained,
+                    page_limit=self._config.writer.chunk_records,
                     custody_cache=self._ready_custody_cache,
                 )
                 if outcome.custody_cache is not None:
@@ -568,7 +571,7 @@ class StagingStore:
         required, available = capture_space_requirement(
             self._state_db,
             record_count,
-            min(self._config.writer.chunk_records, MAX_CHUNK_LIMIT),
+            self._config.writer.chunk_records,
         )
         raw_bytes = record_count * AUDIO_RECORD_SIZE
         safety = max(
@@ -644,10 +647,20 @@ class StagingStore:
         active_lease = self._filesystem._active_lease
         if active_lease is None:
             with self.device_lock(operation="admit_quarantined_prefix"):
-                admitted = quarantine.admit_quarantined_prefix(self._filesystem, source, should_defer=should_defer)
+                admitted = quarantine.admit_quarantined_prefix(
+                    self._filesystem,
+                    source,
+                    should_defer=should_defer,
+                    page_limit=self._config.writer.chunk_records,
+                )
         else:
             self._filesystem.require_device_lock(active_lease)
-            admitted = quarantine.admit_quarantined_prefix(self._filesystem, source, should_defer=should_defer)
+            admitted = quarantine.admit_quarantined_prefix(
+                self._filesystem,
+                source,
+                should_defer=should_defer,
+                page_limit=self._config.writer.chunk_records,
+            )
         self.publication_input_changed()
         return admitted
 
@@ -656,6 +669,7 @@ class StagingStore:
         removed = quarantine.sweep_terminal_quarantine(
             self._filesystem,
             should_defer=should_defer or _never_defer,
+            chunk_limit=self._config.writer.chunk_records,
         )
         if self._state_db.get_generation() != generation:
             self.publication_input_changed()
@@ -664,7 +678,7 @@ class StagingStore:
     def refresh_utc_projection(self) -> int:
         """Refresh one bounded chunk of queryable UTC metadata during idle maintenance."""
 
-        return refresh_utc_projection(self._state_db)
+        return refresh_utc_projection(self._state_db, chunk_limit=self._config.writer.chunk_records)
 
     def assert_no_pending(self) -> None:
         quarantine.assert_no_pending(self._filesystem)
@@ -717,6 +731,7 @@ class StagingStore:
         try:
             audio_store = InternalAudioStore(
                 self._state_db,
+                chunk_limit=self._config.writer.chunk_records,
                 terminal_retention_seconds=self._config.staging_retention.terminal_retention_seconds,
             )
         except InternalAudioStoreError as error:
@@ -738,7 +753,11 @@ class StagingStore:
         """Open one immutable SQL snapshot without creating a persistent writer."""
         _validate_attempt_id(attempt_id)
         try:
-            typed = authenticate_capture_source(self._state_db, attempt_id)
+            typed = authenticate_capture_source(
+                self._state_db,
+                attempt_id,
+                page_limit=self._config.writer.chunk_records,
+            )
         except InternalAudioStoreError as error:
             raise AttemptStateError(str(error)) from error
         if typed is not None and typed.source_type == "attempt":
@@ -765,6 +784,7 @@ class StagingStore:
             try:
                 audio_store = InternalAudioStore(
                     self._state_db,
+                    chunk_limit=self._config.writer.chunk_records,
                     terminal_retention_seconds=self._config.staging_retention.terminal_retention_seconds,
                 )
             except InternalAudioStoreError as error:

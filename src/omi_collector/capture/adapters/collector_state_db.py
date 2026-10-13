@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import quote
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_LEGACY_SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5_000
 _STATE_DB_MODE = 0o640
 
@@ -147,6 +148,12 @@ class StateTransaction(_Operations):
             raise StateDBError("publication generation is exhausted")
         _Operations.put(self, StateKind.PUBLICATION_GENERATION, "current", {"value": generation + 1})
 
+    def finish(self) -> None:
+        """Apply the publication-generation change on this same open transaction."""
+
+        if self._publication_changed:
+            self._bump_generation()
+
 
 class StateDB(_Operations):
     """Thread-safe facade; each call owns and closes its SQLite connection."""
@@ -155,6 +162,7 @@ class StateDB(_Operations):
         self.path = Path(path).absolute()
         self.read_only = read_only
         self._active = threading.local()
+        self._allow_create = not read_only and not self.path.exists()
         if read_only:
             _require_directory(self.path.parent)
             self._validate_existing()
@@ -163,17 +171,19 @@ class StateDB(_Operations):
             self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
+        connection: sqlite3.Connection | None = None
         try:
             if self.path.is_symlink():
                 raise StateDBError("state database must not be a symlink")
             if self.read_only and not self.path.is_file():
                 raise StateDBError("state database does not exist")
-            mode = "ro" if self.read_only else "rw" if self.path.exists() else "rwc"
+            mode = "ro" if self.read_only else "rwc" if self._allow_create and not self.path.exists() else "rw"
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
             connection = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             connection.execute("PRAGMA synchronous = EXTRA")
+            connection.execute("PRAGMA foreign_keys = ON")
             journal_row = _fetchone(connection.execute("PRAGMA journal_mode"))
             if journal_row is None:
                 raise StateDBError("state database journal mode is unavailable")
@@ -184,7 +194,13 @@ class StateDB(_Operations):
                 raise StateDBError("state database journal mode is unsupported")
             return connection
         except (OSError, sqlite3.DatabaseError) as error:
+            if connection is not None:
+                connection.close()
             raise StateDBError("state database is unavailable") from error
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
 
     def _initialize(self) -> None:
         connection = self._connect()
@@ -205,11 +221,14 @@ class StateDB(_Operations):
                     "kind TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, "
                     "PRIMARY KEY(kind, id)) WITHOUT ROWID"
                 )
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            elif version != _SCHEMA_VERSION or tables != {"state"}:
+                connection.execute(f"PRAGMA user_version = {_LEGACY_SCHEMA_VERSION}")
+                install_audio_schema(connection)
+            elif version != _SCHEMA_VERSION or "state" not in tables:
                 raise StateDBError("state database schema is unsupported")
             _validate_schema(connection)
+            _validate_audio_schema(connection)
             connection.commit()
+            self._allow_create = False
             mode = stat.S_IMODE(self.path.stat().st_mode)
             if mode != _STATE_DB_MODE:
                 self.path.chmod(_STATE_DB_MODE)
@@ -231,9 +250,10 @@ class StateDB(_Operations):
                 for row in _fetchall(connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'"))
                 if not (name := _row_text(row, 0)).startswith("sqlite_")
             }
-            if version != _SCHEMA_VERSION or tables != {"state"}:
+            if version != _SCHEMA_VERSION or "state" not in tables:
                 raise StateDBError("state database schema is unsupported")
             _validate_schema(connection)
+            _validate_audio_schema(connection)
         except sqlite3.DatabaseError as error:
             raise StateDBError("state database validation failed") from error
         finally:
@@ -297,8 +317,7 @@ class StateDB(_Operations):
             self._active.in_transaction = True
             transaction = StateTransaction(connection)
             yield transaction
-            if transaction._publication_changed:
-                transaction._bump_generation()
+            transaction.finish()
             connection.commit()
         except sqlite3.DatabaseError as error:
             _rollback(connection)
@@ -318,6 +337,40 @@ class StateDB(_Operations):
                 raise StateDBError("state database integrity check failed") from error
         if result is None or _row_text(result, 0) != "ok":
             raise StateDBError("state database integrity check failed")
+
+    def open_connection(self, *, read_only: bool = False) -> sqlite3.Connection:
+        """Open a configured connection for a persistent typed-store caller."""
+
+        if self.path.is_symlink():
+            raise StateDBError("state database must not be a symlink")
+        if read_only:
+            if not self.path.is_file():
+                raise StateDBError("state database does not exist")
+            mode = "ro"
+        else:
+            if self.read_only:
+                raise StateDBError("state database is read-only")
+            mode = "rw"
+        connection: sqlite3.Connection | None = None
+        try:
+            uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
+            connection = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+            connection.row_factory = sqlite3.Row
+            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA synchronous = EXTRA")
+            connection.execute("PRAGMA foreign_keys = ON")
+            journal_row = _fetchone(connection.execute("PRAGMA journal_mode"))
+            if journal_row is None or _row_text(journal_row, 0).lower() != "delete":
+                raise StateDBError("state database journal mode is unsupported")
+            return connection
+        except (OSError, sqlite3.DatabaseError) as error:
+            if connection is not None:
+                connection.close()
+            raise StateDBError("state database is unavailable") from error
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
 
 
 def _validate_kind(kind: StateKind) -> None:
@@ -429,6 +482,175 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     expected = (("kind", "TEXT", 1, 1), ("id", "TEXT", 1, 2), ("payload", "TEXT", 1, 0))
     if columns != expected:
         raise StateDBError("state database table is unsupported")
+
+
+_AUDIO_TABLES = (
+    "capture_source",
+    "capture_record",
+    "capture_tail",
+    "capture_conflict",
+    "capture_evidence",
+    "capture_evidence_chunk",
+    "publication_cohort",
+    "publication_cohort_member",
+    "ready_output_stage",
+    "ready_stage_range",
+)
+
+
+def _ddl(*parts: str) -> str:
+    return "".join(parts)
+
+
+_AUDIO_DDL = (
+    _ddl(
+        "CREATE TABLE capture_source ("
+        "source_id TEXT PRIMARY KEY NOT NULL CHECK (length(source_id) = 32 AND lower(source_id) = source_id AND source_id NOT GLOB '*[^0-9a-f]*'),"
+        "source_type TEXT NOT NULL CHECK (source_type IN ('attempt','draft','quarantine')),"
+        "lifecycle TEXT NOT NULL CHECK (lifecycle IN ('prepared','leg_prepared','receiving','interrupted','sealed_waiting','blocked','covered','retiring')),"
+        "sequence_start BLOB NOT NULL CHECK (typeof(sequence_start) = 'blob' AND length(sequence_start) = 8),"
+        "sequence_limit BLOB NOT NULL CHECK (typeof(sequence_limit) = 'blob' AND length(sequence_limit) = 8),"
+        "prepared_start BLOB CHECK (prepared_start IS NULL OR (typeof(prepared_start) = 'blob' AND length(prepared_start) = 8)),"
+        "prepared_count INTEGER CHECK (prepared_count IS NULL OR prepared_count BETWEEN 0 AND 4294967295),"
+        "read_begin_start BLOB CHECK (read_begin_start IS NULL OR (typeof(read_begin_start) = 'blob' AND length(read_begin_start) = 8)),"
+        "read_begin_count INTEGER CHECK (read_begin_count IS NULL OR read_begin_count BETWEEN 0 AND 4294967295),"
+        "current_leg_generation INTEGER NOT NULL CHECK (current_leg_generation BETWEEN 0 AND 4294967295),"
+        "current_leg_start BLOB NOT NULL CHECK (typeof(current_leg_start) = 'blob' AND length(current_leg_start) = 8),"
+        "current_leg_count INTEGER NOT NULL CHECK (current_leg_count BETWEEN 0 AND 4294967295),"
+        "committed_count INTEGER NOT NULL DEFAULT 0 CHECK (committed_count BETWEEN 0 AND 4294967295),"
+        "committed_sha256 TEXT NOT NULL CHECK (length(committed_sha256) = 64 AND lower(committed_sha256) = committed_sha256 AND committed_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "closure_frontier BLOB CHECK (closure_frontier IS NULL OR (typeof(closure_frontier) = 'blob' AND length(closure_frontier) = 8)),"
+        "block_reason TEXT, terminal_reason TEXT, terminal_time TEXT, retention_deadline TEXT,"
+        "certified_prefix_count INTEGER CHECK (certified_prefix_count IS NULL OR certified_prefix_count BETWEEN 0 AND 4294967295),"
+        "coverage_digest TEXT CHECK (coverage_digest IS NULL OR (length(coverage_digest) = 64 AND lower(coverage_digest) = coverage_digest AND coverage_digest NOT GLOB '*[^0-9a-f]*')),"
+        "retirement_cursor INTEGER CHECK (retirement_cursor IS NULL OR retirement_cursor BETWEEN 0 AND 4294967295),"
+        "CHECK (CAST(sequence_start AS BLOB) <= CAST(sequence_limit AS BLOB))"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_record ("
+        "source_id TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 4294967295),"
+        "device_timestamp INTEGER NOT NULL CHECK (device_timestamp BETWEEN 0 AND 4294967295),"
+        "payload BLOB NOT NULL CHECK (typeof(payload) = 'blob' AND length(payload) = 440),"
+        "utc_timestamp INTEGER CHECK (utc_timestamp IS NULL OR utc_timestamp BETWEEN 0 AND 4294967295),"
+        "mapping_revision TEXT CHECK (mapping_revision IS NULL OR (length(mapping_revision) = 64 AND lower(mapping_revision) = mapping_revision AND mapping_revision NOT GLOB '*[^0-9a-f]*')),"
+        "PRIMARY KEY (source_id, ordinal), FOREIGN KEY (source_id) REFERENCES capture_source(source_id) ON DELETE CASCADE"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_tail ("
+        "source_id TEXT PRIMARY KEY NOT NULL, leg_generation INTEGER NOT NULL CHECK (leg_generation BETWEEN 0 AND 4294967295),"
+        "complete_high_water INTEGER NOT NULL CHECK (complete_high_water BETWEEN 0 AND 4294967295),"
+        "received_high_water INTEGER NOT NULL CHECK (received_high_water >= 0),"
+        "byte_offset INTEGER NOT NULL CHECK (byte_offset >= 0), bytes BLOB NOT NULL CHECK (typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 443),"
+        "CHECK (received_high_water = byte_offset + length(bytes) AND byte_offset = complete_high_water * 444),"
+        "FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_conflict ("
+        "source_id TEXT NOT NULL, chunk_ordinal INTEGER NOT NULL CHECK (chunk_ordinal BETWEEN 0 AND 4294967295),"
+        "leg_generation INTEGER NOT NULL CHECK (leg_generation BETWEEN 0 AND 4294967295), absolute_byte_offset INTEGER NOT NULL CHECK (absolute_byte_offset >= 0),"
+        "reason TEXT NOT NULL, bytes BLOB NOT NULL CHECK (typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 56832),"
+        "PRIMARY KEY (source_id, chunk_ordinal), FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_evidence ("
+        "evidence_id TEXT PRIMARY KEY NOT NULL, source_id TEXT, entry_kind TEXT NOT NULL CHECK (entry_kind IN ('regular','symlink')),"
+        "original_relative_path TEXT NOT NULL, device INTEGER NOT NULL CHECK (device >= 0), inode INTEGER NOT NULL CHECK (inode >= 0),"
+        "mode INTEGER NOT NULL CHECK (mode >= 0), size INTEGER NOT NULL CHECK (size >= 0), sha256 TEXT, symlink_text BLOB,"
+        "disposition TEXT CHECK (disposition IS NULL OR disposition IN ('unclassified','published_prefix','unprocessable')), terminal_time TEXT, retention_deadline TEXT, reason TEXT,"
+        "CHECK ((entry_kind = 'regular' AND sha256 IS NOT NULL AND length(sha256) = 64 AND lower(sha256) = sha256 AND sha256 NOT GLOB '*[^0-9a-f]*' AND symlink_text IS NULL) OR"
+        " (entry_kind = 'symlink' AND symlink_text IS NOT NULL AND typeof(symlink_text) = 'blob' AND sha256 IS NULL)),"
+        "FOREIGN KEY (source_id) REFERENCES capture_source(source_id) ON DELETE SET NULL"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_evidence_chunk ("
+        "evidence_id TEXT NOT NULL, chunk_ordinal INTEGER NOT NULL CHECK (chunk_ordinal BETWEEN 0 AND 4294967295),"
+        "bytes BLOB NOT NULL CHECK (typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 56832), PRIMARY KEY (evidence_id, chunk_ordinal),"
+        "FOREIGN KEY (evidence_id) REFERENCES capture_evidence(evidence_id) ON DELETE CASCADE"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE publication_cohort ("
+        "cohort_id TEXT PRIMARY KEY NOT NULL, lifecycle TEXT NOT NULL CHECK (lifecycle IN ('unqualified','accepted','staging','complete')),"
+        "accepted_permit TEXT, drained_threshold INTEGER CHECK (drained_threshold IS NULL OR drained_threshold >= 0), config_digest TEXT CHECK (config_digest IS NULL OR (length(config_digest) = 64 AND lower(config_digest) = config_digest AND config_digest NOT GLOB '*[^0-9a-f]*')),"
+        "closure_frontier BLOB CHECK (closure_frontier IS NULL OR (typeof(closure_frontier) = 'blob' AND length(closure_frontier) = 8)), cursor INTEGER NOT NULL DEFAULT 0 CHECK (cursor >= 0),"
+        "accepted_time TEXT"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE publication_cohort_member ("
+        "cohort_id TEXT NOT NULL, member_ordinal INTEGER NOT NULL CHECK (member_ordinal BETWEEN 0 AND 4294967295), source_id TEXT NOT NULL,"
+        "slice_start INTEGER NOT NULL CHECK (slice_start BETWEEN 0 AND 4294967295), slice_count INTEGER NOT NULL CHECK (slice_count BETWEEN 0 AND 4294967295),"
+        "cursor INTEGER NOT NULL DEFAULT 0 CHECK (cursor BETWEEN 0 AND 4294967295), PRIMARY KEY (cohort_id, member_ordinal),"
+        "FOREIGN KEY (cohort_id) REFERENCES publication_cohort(cohort_id) ON DELETE CASCADE, FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE ready_output_stage ("
+        "stage_id TEXT PRIMARY KEY NOT NULL, group_identity TEXT NOT NULL UNIQUE, owned_path TEXT NOT NULL, expected_bundle_digest TEXT NOT NULL CHECK (length(expected_bundle_digest) = 64 AND lower(expected_bundle_digest) = expected_bundle_digest AND expected_bundle_digest NOT GLOB '*[^0-9a-f]*'),"
+        "expected_record_count INTEGER NOT NULL CHECK (expected_record_count BETWEEN 0 AND 4294967295), expected_slice_count INTEGER NOT NULL CHECK (expected_slice_count >= 0),"
+        "progress_records INTEGER NOT NULL DEFAULT 0 CHECK (progress_records BETWEEN 0 AND 4294967295), progress_slice INTEGER NOT NULL DEFAULT 0 CHECK (progress_slice >= 0),"
+        "frozen_device_start INTEGER CHECK (frozen_device_start IS NULL OR frozen_device_start BETWEEN 0 AND 4294967295), frozen_device_end INTEGER CHECK (frozen_device_end IS NULL OR frozen_device_end BETWEEN 0 AND 4294967295),"
+        "frozen_utc_start INTEGER CHECK (frozen_utc_start IS NULL OR frozen_utc_start BETWEEN 0 AND 4294967295), frozen_utc_end INTEGER CHECK (frozen_utc_end IS NULL OR frozen_utc_end BETWEEN 0 AND 4294967295),"
+        "frozen_mapping_revision TEXT CHECK (frozen_mapping_revision IS NULL OR (length(frozen_mapping_revision) = 64 AND lower(frozen_mapping_revision) = frozen_mapping_revision AND frozen_mapping_revision NOT GLOB '*[^0-9a-f]*')), owner_token TEXT NOT NULL"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE ready_stage_range ("
+        "stage_id TEXT NOT NULL, range_ordinal INTEGER NOT NULL CHECK (range_ordinal BETWEEN 0 AND 4294967295), source_id TEXT NOT NULL,"
+        "start_ordinal INTEGER NOT NULL CHECK (start_ordinal BETWEEN 0 AND 4294967295), record_count INTEGER NOT NULL CHECK (record_count BETWEEN 0 AND 4294967295),"
+        "device_start INTEGER NOT NULL CHECK (device_start BETWEEN 0 AND 4294967295), device_end INTEGER NOT NULL CHECK (device_end BETWEEN 0 AND 4294967295),"
+        "utc_start INTEGER CHECK (utc_start IS NULL OR utc_start BETWEEN 0 AND 4294967295), utc_end INTEGER CHECK (utc_end IS NULL OR utc_end BETWEEN 0 AND 4294967295),"
+        "PRIMARY KEY (stage_id, range_ordinal), FOREIGN KEY (stage_id) REFERENCES ready_output_stage(stage_id) ON DELETE CASCADE, FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
+        ") WITHOUT ROWID"
+    ),
+)
+
+
+def install_audio_schema(connection: sqlite3.Connection) -> None:
+    """Install typed audio tables on an offline v1 backup, or validate v2."""
+
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    version = _user_version(connection)
+    if version not in {_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION}:
+        raise StateDBError("state database schema is unsupported")
+    tables = {
+        _row_text(row, 0)
+        for row in _fetchall(connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'"))
+        if not _row_text(row, 0).startswith("sqlite_")
+    }
+    if "state" not in tables:
+        raise StateDBError("state database table is unsupported")
+    for table, ddl in zip(_AUDIO_TABLES, _AUDIO_DDL, strict=True):
+        if table not in tables:
+            connection.execute(ddl)
+    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    _validate_audio_schema(connection)
+
+
+def _validate_audio_schema(connection: sqlite3.Connection) -> None:
+    rows = _fetchall(connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'"))
+    user_tables = {_row_text(row, "name") for row in rows if not _row_text(row, "name").startswith("sqlite_")}
+    expected_tables = {"state", *_AUDIO_TABLES}
+    if user_tables != expected_tables:
+        raise StateDBError("state database typed schema has unexpected tables")
+    statements = {
+        _row_text(row, "name"): _row_text(row, "sql") for row in rows if _row_text(row, "name") in _AUDIO_TABLES
+    }
+    if set(statements) != set(_AUDIO_TABLES):
+        raise StateDBError("state database typed schema is incomplete")
+    for table, ddl in zip(_AUDIO_TABLES, _AUDIO_DDL, strict=True):
+        if _normalize_sql(statements[table]) != _normalize_sql(ddl):
+            raise StateDBError("state database typed table is unsupported")
+
+
+def _normalize_sql(statement: str) -> str:
+    return " ".join(statement.split()).lower()
 
 
 def _ensure_directory(path: Path) -> None:

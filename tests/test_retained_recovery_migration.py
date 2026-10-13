@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -267,6 +267,30 @@ def test_recovery_without_legacy_collector_state_refuses_runtime_and_migration(t
 
     assert (manifest.read_bytes(), records.read_bytes()) == retained_before
     assert not layout.collector.state_db.exists()
+
+
+def test_absent_rescue_is_optional_for_installed_migration_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = replace(_layout(tmp_path), root=Path("/srv/pipelines/omi"))
+    manifest = tmp_path / "absent-rescue" / "rescue-manifest.json"
+    monkeypatch.setattr(migration, "_recovery_manifest_path", lambda _layout: manifest)
+
+    assert migration._load_retained_recovery(layout) is None
+
+    manifest.parent.mkdir()
+    with pytest.raises(StateMigrationError, match="retained recovery passport is missing"):
+        migration._load_retained_recovery(layout)
+
+
+def test_completed_migration_allows_retired_rescue_pair(recovery_case: _RecoveryCase) -> None:
+    migrate_state(recovery_case.layout, legacy_phy_state_homes=())
+    recovery_case.records.unlink()
+    recovery_case.manifest.unlink()
+    recovery_case.manifest.parent.rmdir()
+
+    assert migrate_state(recovery_case.layout, legacy_phy_state_homes=()) == {"removed_files": 0}
+    assert open_runtime_state(recovery_case.layout, read_only=True).get(StateKind.CLOCK, "current") is not None
 
 
 def _interrupt_after_clock_observation_removal(case: _RecoveryCase, monkeypatch: pytest.MonkeyPatch) -> None:

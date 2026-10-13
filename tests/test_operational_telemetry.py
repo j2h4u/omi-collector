@@ -1113,12 +1113,13 @@ def test_hanging_optional_reads_are_short_bounded_and_observation_still_emits() 
 def test_hanging_host_clock_probe_uses_configured_host_timeout() -> None:
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
     events: list[dict[str, object]] = []
+    observed_timeouts: list[float] = []
 
     def timeout_aware_probe(timeout: float) -> bool:
+        observed_timeouts.append(timeout)
         time.sleep(timeout)
         raise TimeoutError
 
-    started = time.monotonic()
     asyncio.run(
         collect_operational_telemetry(
             session,
@@ -1133,7 +1134,7 @@ def test_hanging_host_clock_probe_uses_configured_host_timeout() -> None:
         )
     )
 
-    assert time.monotonic() - started < 0.1
+    assert observed_timeouts == [0.02]
     assert _clock_event(events)["outcome"] == "host_probe_timeout"
 
 

@@ -72,6 +72,7 @@ def inspect_legacy_attempt(
     if not entries <= allowed:
         raise LegacyAudioImportError(f"attempt has unsupported entries: {path}")
     row, descriptor, checkpoint, raw_size = _attempt_metadata(path, attempt_id, authoritative_row)
+    _require_read_begin_for_private_bytes(descriptor, raw_size)
     return LegacyAttempt(
         path,
         attempt_id,
@@ -116,6 +117,13 @@ def _check_authoritative_row(row: dict[str, object], authoritative_row: Mapping[
         raise LegacyAudioImportError("attempt metadata differs from authoritative state row")
 
 
+def _require_read_begin_for_private_bytes(descriptor: AttemptDescriptor, raw_size: int) -> None:
+    if raw_size and descriptor.read_begin_start is None:
+        raise LegacyAudioImportError(
+            "v1 attempt has private bytes without READ_BEGIN; manual custody resolution required"
+        )
+
+
 def import_legacy_attempt(
     connection: sqlite3.Connection,
     attempt: LegacyAttempt,
@@ -127,13 +135,14 @@ def import_legacy_attempt(
 
     if type(chunk_limit) is not int or not 1 <= chunk_limit <= DEFAULT_CHUNK_LIMIT:
         raise LegacyAudioImportError("migration chunk size is invalid")
+    _require_read_begin_for_private_bytes(attempt.descriptor, attempt.raw_size)
     expected = inspect_legacy_attempt(attempt.path, attempt.attempt_id, authoritative_row)
     if expected != attempt:
         raise LegacyAudioImportError(f"attempt changed before import: {attempt.path}")
     complete_count, residual = divmod(attempt.raw_size, AUDIO_RECORD_SIZE)
     read_begin_start = attempt.descriptor.read_begin_start
     has_read_begin = read_begin_start is not None
-    lifecycle = "interrupted" if has_read_begin else "blocked" if complete_count or residual else "prepared"
+    lifecycle = "interrupted" if has_read_begin else "prepared"
     generation = 0
     try:
         connection.execute("BEGIN IMMEDIATE")

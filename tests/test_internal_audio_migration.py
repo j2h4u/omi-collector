@@ -18,6 +18,7 @@ import pytest
 
 import omi_collector.internal_audio_migration as migration
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.legacy_audio_import import LegacyAudioImportError
 from omi_collector.internal_audio_migration import InternalAudioMigrationError, migrate_internal_audio
 from omi_collector.storage_layout import StorageLayout, load_operator_config
 
@@ -686,6 +687,61 @@ def test_cutover_imports_v1_attempt_rows_and_complete_raw_tail(tmp_path: Path) -
         assert source == ("attempt", "interrupted", 3, 2)
         tail = cast(tuple[bytes] | None, connection.execute("SELECT bytes FROM capture_tail").fetchone())
         assert tail == (b"partial",)
+
+
+@pytest.mark.parametrize("raw", (b"\x00\x00\x00\x01" + b"x" * 440, b"partial"))
+def test_cutover_refuses_v1_private_bytes_without_read_begin_before_receipt(tmp_path: Path, raw: bytes) -> None:
+    layout = _layout(tmp_path)
+    release = _release(tmp_path)
+    _v1(layout)
+    attempt_id = "b" * 32
+    attempt_path = layout.collector.attempts / attempt_id
+    attempt_path.mkdir(parents=True)
+    descriptor = {
+        "attempt_id": attempt_id,
+        "schema_version": 2,
+        "start_sequence": 100,
+        "packet_count": 1,
+        "record_size": 444,
+        "read_begin_start": None,
+        "read_begin_count": None,
+    }
+    checkpoint = {
+        "version": 1,
+        "attempt_id": attempt_id,
+        "record_count": 0,
+        "raw_sha256": hashlib.sha256(b"").hexdigest(),
+    }
+    (attempt_path / "attempt.json").write_text(json.dumps(descriptor), encoding="utf-8")
+    (attempt_path / "checkpoint.json").write_text(json.dumps(checkpoint), encoding="utf-8")
+    (attempt_path / "records.bin").write_bytes(raw)
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        connection.execute(
+            "INSERT INTO state VALUES ('attempt',?,?)",
+            (
+                attempt_id,
+                json.dumps(
+                    {
+                        "descriptor": descriptor,
+                        "checkpoint": checkpoint,
+                        "prefix_publication": None,
+                        "terminal_retirement": None,
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+    source_bytes = layout.collector.state_db.read_bytes()
+    private_bytes = {path.name: path.read_bytes() for path in attempt_path.iterdir()}
+
+    with pytest.raises(LegacyAudioImportError, match="without READ_BEGIN"):
+        migrate_internal_audio(layout, release_metadata=release)
+
+    assert layout.collector.state_db.read_bytes() == source_bytes
+    assert {path.name: path.read_bytes() for path in attempt_path.iterdir()} == private_bytes
+    assert not tuple(layout.collector.root.glob(".collector-state.sqlite3.migrating.*"))
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("SELECT 1 FROM state WHERE id='internal_audio_cutover'").fetchone() is None
 
 
 @pytest.mark.parametrize("missing_directory", [False, True])

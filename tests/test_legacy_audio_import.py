@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections.abc import Iterable
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -161,32 +161,24 @@ def test_attempt_import_accepts_checkpoint_behind_aligned_raw(tmp_path: Path) ->
     assert tuple(source) == (8, 5)
 
 
-def test_attempt_import_retains_partial_tail_and_blocks_without_read_begin(tmp_path: Path) -> None:
-    attempt_path, _, row = _attempt(
-        tmp_path, _AttemptSpec(count=3, packet_count=5, read_begin=False, tail=b"tail" * 20)
-    )
+@pytest.mark.parametrize(("count", "tail"), ((3, b"tail" * 20), (0, b"tail")))
+def test_attempt_inspection_refuses_private_bytes_without_read_begin(tmp_path: Path, count: int, tail: bytes) -> None:
+    attempt_path, raw, row = _attempt(tmp_path, _AttemptSpec(count=count, packet_count=5, read_begin=False, tail=tail))
+    with pytest.raises(LegacyAudioImportError, match="without READ_BEGIN"):
+        inspect_legacy_attempt(attempt_path, "a" * 32, row)
+    assert (attempt_path / "records.bin").read_bytes() == raw
+
+
+def test_attempt_import_defensively_refuses_private_bytes_without_read_begin(tmp_path: Path) -> None:
+    attempt_path, raw, row = _attempt(tmp_path, _AttemptSpec(count=1, packet_count=2))
     state_db = StateDB(tmp_path / "candidate.sqlite3")
     attempt = inspect_legacy_attempt(attempt_path, "a" * 32, row)
+    unsupported = replace(attempt, descriptor=replace(attempt.descriptor, read_begin_start=None, read_begin_count=None))
     with closing(state_db.open_connection()) as connection:
-        import_legacy_attempt(connection, attempt)
-        verify_imported_attempt(connection, attempt)
-        source = cast(
-            tuple[object, ...] | None,
-            connection.execute(
-                "SELECT lifecycle, committed_count FROM capture_source WHERE source_id = ?",
-                (attempt.attempt_id,),
-            ).fetchone(),
-        )
-        tail = cast(
-            tuple[object, ...] | None,
-            connection.execute(
-                "SELECT complete_high_water, received_high_water, length(bytes) FROM capture_tail WHERE source_id = ?",
-                (attempt.attempt_id,),
-            ).fetchone(),
-        )
-    assert source is not None and tail is not None
-    assert tuple(source) == ("blocked", 3)
-    assert tuple(tail) == (3, 1412, 80)
+        with pytest.raises(LegacyAudioImportError, match="without READ_BEGIN"):
+            import_legacy_attempt(connection, unsupported)
+        assert connection.execute("SELECT 1 FROM capture_source").fetchone() is None
+    assert (attempt_path / "records.bin").read_bytes() == raw
 
 
 def test_renamed_attempt_inspector_uses_explicit_identity(tmp_path: Path) -> None:

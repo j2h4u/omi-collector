@@ -787,18 +787,30 @@ def _valid_terminal_timestamp(value: object) -> bool:
 
 def _validate_terminal_evidence(terminal_state: object, terminal_at: object, terminal_reason: object) -> None:
     if terminal_state is None:
-        if terminal_at is not None or terminal_reason is not None:
-            raise AttemptStateError("quarantine terminal evidence is contradictory")
+        _validate_unset_terminal(terminal_at, terminal_reason)
         return
     if terminal_state == "published":
-        if not _valid_terminal_timestamp(terminal_at) or terminal_reason is not None:
-            raise AttemptStateError("quarantine terminal evidence is malformed")
+        _validate_published_terminal(terminal_at, terminal_reason)
         return
     if terminal_state == "unprocessable":
-        if not _valid_terminal_timestamp(terminal_at) or not isinstance(terminal_reason, str) or not terminal_reason:
-            raise AttemptStateError("quarantine terminal evidence is malformed")
+        _validate_unprocessable_terminal(terminal_at, terminal_reason)
         return
     raise AttemptStateError("quarantine terminal evidence is invalid")
+
+
+def _validate_unset_terminal(terminal_at: object, terminal_reason: object) -> None:
+    if terminal_at is not None or terminal_reason is not None:
+        raise AttemptStateError("quarantine terminal evidence is contradictory")
+
+
+def _validate_published_terminal(terminal_at: object, terminal_reason: object) -> None:
+    if not _valid_terminal_timestamp(terminal_at) or terminal_reason is not None:
+        raise AttemptStateError("quarantine terminal evidence is malformed")
+
+
+def _validate_unprocessable_terminal(terminal_at: object, terminal_reason: object) -> None:
+    if not _valid_terminal_timestamp(terminal_at) or not isinstance(terminal_reason, str) or not terminal_reason:
+        raise AttemptStateError("quarantine terminal evidence is malformed")
 
 
 def _valid_quarantine_identity(entry_name: str, row: dict[str, object]) -> bool:

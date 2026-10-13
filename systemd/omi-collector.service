@@ -12,6 +12,7 @@ Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 XDG_STATE_HOME=/var/lib
 ExecStartPre=+/usr/local/sbin/omi-collector-bluetooth-ready
 ExecStart=/var/lib/omi-collector-deployments/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml
 Restart=always
+RestartPreventExitStatus=78
 RestartSec=5s
 RestartSteps=5
 RestartMaxDelaySec=5min

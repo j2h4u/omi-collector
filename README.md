@@ -237,12 +237,13 @@ sudo scripts/dev-deploy-release.sh v0.3.0
 
 `/srv/pipelines/omi/config.toml` is the single operator-facing configuration.
 Its parent is the storage root. The collector uses `collector` for private
-state, `draft` for unfinished raw audio, and `ready` for immutable published
-bundles. The checked-in systemd unit grants write access to this one fixed root.
+state and `ready` for immutable published bundles. The checked-in systemd
+unit grants write access to this one fixed root.
 
 All mutable structured Collector state lives in
-`collector/collector-state.sqlite3`; `draft` and `ready` retain authenticated
-audio files and immutable manifests. One stable `collector/collector.lock`
+`collector/collector-state.sqlite3`, including private capture audio and its
+recovery evidence. Public `ready` bundles retain authenticated audio files
+and immutable manifests. One stable `collector/collector.lock`
 guards the complete service invocation and each command that can mutate
 Collector state. Read-only `device status` and `device metrics` use read-only
 database access and can run while the service is active. Keep the guard file in
@@ -256,17 +257,19 @@ This gives the local operator password-free read and inventory access without
 allowing edits to Collector state. Existing nested files from older releases
 need a one-time ownership/mode repair before the operator can read them.
 
-The canonical systemd deployment performs the offline cutover in the same
-transaction: it stops the service, runs the staged `migrate-state` command,
-assigns the database and stable lock to the service account, then starts the
-new release. Migration verifies imported state and clock-normalized raw records
-before activating the database and directly removes legacy mutable files. If
-cleanup is interrupted, keep the service stopped and rerun `migrate-state`
-with `--legacy-phy-state-home PATH` when the prior PHY marker lived under a
-user-owned state home. Once the database exists, the deployer keeps the new
-release selected rather than restarting a pre-migration binary. See
+The canonical systemd deployment persists the sealed release and checks backup
+space before stopping the service. It then selects the new release, runs that
+release's `migrate-state` command, and starts the service. The
+command converts supported v1 SQLite state and private capture files into
+typed records, verifies parity, and removes only inventoried old private
+copies. An attributable v1 quarantine or terminal-retired attempt needs manual
+custody resolution before a cutover receipt is written. If conversion or
+cleanup is interrupted, keep the service stopped and rerun the selected new
+release's migrator; runtime refuses an incomplete cutover. The deployer keeps
+the new release selected after the cutover boundary. See
 [Best practices](docs/BEST_PRACTICES.md#state-ownership-and-offline-migration)
-for recovery details.
+for recovery details and the [implementation receipt](docs/qa/2026-10-13-omic-16-implementation.md)
+for the current release status.
 
 Published bundles are a shared boundary. If another local account consumes
 them, configure either a shared Unix group or a default ACL on the ready root.

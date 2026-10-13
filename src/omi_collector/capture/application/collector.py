@@ -41,7 +41,7 @@ from ..domain.ring_protocol import (
     parse_read_begin_notification,
 )
 from ..domain.transfer_arena import TransferArena
-from .ring_transport import RingSession, RingTransportDisconnectedError
+from .ring_transport import RingSession, RingTransportDisconnectedError, RingTransportError
 
 _OPTIONAL_OPTIONS_ARG_COUNT = 3
 
@@ -230,15 +230,17 @@ class IngestWriter(Protocol):
     @property
     def written_high_water(self) -> int: ...
 
-    async def start(self) -> None: ...
+    async def start(self) -> object: ...
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> object: ...
 
     def submit_read_begin(self, notice: ReadBeginNotification) -> Awaitable[object] | object: ...
 
-    def publish(self, high_water: int) -> object: ...
+    def publish(self, high_water: int, tail: bytes = b"") -> object: ...
 
     async def barrier(self) -> object: ...
+
+    async def interrupt(self) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,8 +338,10 @@ async def read_leg(
     except asyncio.CancelledError:
         state.progress_mailbox.finish()
         await _stop_best_effort(session, options.cleanup_timeout)
+        wait_timeout = options.cleanup_timeout if options.cleanup_timeout is not None else options.timeout
+        await _persist_interrupted_writer(state, writer, wait_timeout)
         raise
-    except (RingProtocolError, RingTransferError, MemoryError, ValueError, OSError) as error:
+    except (RingProtocolError, RingTransferError, RingTransportError, MemoryError, ValueError, OSError) as error:
         state.failure_message = str(error)
         state.failure_cause = error
         state.progress_mailbox.finish()
@@ -465,9 +469,10 @@ def _consume_data(payload: bytes, state: _IngestState, arena: TransferArena, wri
         raise RingTransferError("received DATA before READ_BEGIN")
     arena.append(parse_data_notification(payload))
     complete_bytes = arena.complete_records * RECORD_SIZE
-    if complete_bytes > writer_high_water(writer):
+    tail = arena.partial_tail()
+    if complete_bytes > writer_high_water(writer) or tail:
         arena.submit_prefix()
-        writer.publish(complete_bytes)
+        writer.publish(complete_bytes, tail)
     # The terminal 100% snapshot is published only after DONE validates the
     # complete transfer.  An in-flight DATA notification must not look like a
     # completed read to progress consumers.
@@ -484,13 +489,22 @@ async def _interrupt(
 ) -> TransferInterruptedError:
     await _stop_best_effort(session, options.cleanup_timeout)
     wait_timeout = options.cleanup_timeout if options.cleanup_timeout is not None else options.timeout
-    with suppress(BaseException):
-        await _await_with_timeout(_await_read_begin(state.read_begin_future), wait_timeout)
-    with suppress(BaseException):
-        await _await_with_timeout(_await_writer_barrier(writer), wait_timeout)
+    await _persist_interrupted_writer(state, writer, wait_timeout)
     return TransferInterruptedError(
         state.failure_message, _leg_counters(arena, writer, state.baselines), cause=state.failure_cause
     )
+
+
+async def _persist_interrupted_writer(
+    state: _IngestState,
+    writer: IngestWriter,
+    wait_timeout: float,
+) -> None:
+    """Best-effort the queued READ_BEGIN, exact frontier, and interruption in order."""
+    with suppress(BaseException):
+        await _await_with_timeout(_await_read_begin(state.read_begin_future), wait_timeout)
+    with suppress(BaseException):
+        await _await_with_timeout(_await_writer_interrupt(writer), wait_timeout)
 
 
 def _capture_leg_baselines(arena: TransferArena, writer: IngestWriter) -> _LegBaselines:
@@ -550,6 +564,10 @@ async def _finish_read(
 
 async def _await_writer_barrier(writer: IngestWriter) -> object:
     return await writer.barrier()
+
+
+async def _await_writer_interrupt(writer: IngestWriter) -> object:
+    return await writer.interrupt()
 
 
 async def _stop_best_effort(session: RingSession, timeout: float | None) -> None:

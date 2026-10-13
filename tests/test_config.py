@@ -38,7 +38,6 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.retry.presence_preflight_budget_seconds == 10.0
     assert DEFAULT_CONFIG.transfer.collect_timeout_seconds == 600.0
     assert DEFAULT_CONFIG.memory.arena_max_bytes == 512 * 1024 * 1024
-    assert DEFAULT_CONFIG.durability.checkpoint_records == 1024
     assert DEFAULT_CONFIG.ble.preflight_settle_seconds == 0.5
     assert DEFAULT_CONFIG.ble.observer_max_connection_parameter_requests == 8
     assert DEFAULT_CONFIG.ble.observer_max_connection_parameter_updates == 8
@@ -89,7 +88,6 @@ def test_staging_retention_default_is_terminal_lifecycle_window() -> None:
         (RetryConfig, "max_storage_not_ready_responses", 0),
         (TransferConfig, "info_timeout_seconds", 0.0),
         (MemoryConfig, "arena_max_bytes", 0),
-        (DurabilityConfig, "checkpoint_records", 0),
         (StagingRetentionConfig, "terminal_retention_seconds", 0.0),
         (BleConfig, "preflight_settle_seconds", 0.0),
         (BleConfig, "att_mtu_query_timeout_seconds", 0.0),

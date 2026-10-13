@@ -6,5 +6,7 @@
 !pyproject.toml
 !uv.lock
 !config/config.toml.example
+!scripts/
+!scripts/docker_qa_entrypoint.py
 !src/
 !src/**

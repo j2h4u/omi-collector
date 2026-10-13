@@ -5,10 +5,12 @@ import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters import internal_audio_store
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind, install_audio_schema
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
@@ -16,10 +18,30 @@ from omi_collector.capture.adapters.internal_audio_store import (
     DrainCheckpoint,
     InternalAudioStore,
     InternalAudioStoreError,
+    capture_space_requirement,
     decode_uint64,
     encode_uint64,
     validate_source_stream,
 )
+
+
+def test_capture_space_reserve_uses_total_growth_and_one_bounded_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    monkeypatch.setattr(
+        internal_audio_store.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(f_bavail=321, f_frsize=4096),
+    )
+    with closing(db.open_connection(read_only=True)) as connection:
+        page_size = cast(int, connection.execute("PRAGMA page_size").fetchone()[0])
+        freelist = cast(int, connection.execute("PRAGMA freelist_count").fetchone()[0])
+
+    required, available = capture_space_requirement(db, 256, 128)
+
+    assert required == max(0, 256 * 640 - freelist * page_size) + 128 * 1024 + 16 * page_size
+    assert available == 321 * 4096
 
 
 def _record(timestamp: int, fill: int) -> bytes:
@@ -565,6 +587,12 @@ def test_typed_sql_checks_reject_malformed_canonical_values(tmp_path: Path) -> N
             )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
+                "UPDATE capture_source SET quarantine_disposition = 'unknown' WHERE source_id = ?", (source_id,)
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE capture_source SET quarantine_opaque = 2 WHERE source_id = ?", (source_id,))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
                 "INSERT INTO capture_record(source_id, ordinal, device_timestamp, payload, mapping_revision) VALUES (?, 0, 0, ?, ?)",
                 (source_id, bytes(440), "A" * 64),
             )
@@ -579,6 +607,36 @@ def test_typed_sql_checks_reject_malformed_canonical_values(tmp_path: Path) -> N
                 "INSERT INTO capture_evidence(evidence_id, source_id, entry_kind, original_relative_path, device, inode, mode, size, sha256, disposition) "
                 "VALUES ('e2', ?, 'regular', 'x', 1, 1, 0, 1, ?, 'other')",
                 (source_id, hashlib.sha256(b"x").hexdigest()),
+            )
+        connection.execute(
+            "INSERT INTO capture_evidence(evidence_id, source_id, entry_kind, original_relative_path, device, inode, mode, size, reason, terminal_reason) "
+            "VALUES ('empty-dir', ?, 'directory', 'quarantine/empty', 1, 2, 493, 0, 'original', 'classified')",
+            (source_id,),
+        )
+        evidence = cast(
+            sqlite3.Row | None,
+            connection.execute(
+                "SELECT reason,terminal_reason FROM capture_evidence WHERE evidence_id='empty-dir'"
+            ).fetchone(),
+        )
+        assert evidence is not None and tuple(evidence) == ("original", "classified")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO capture_evidence(evidence_id, source_id, entry_kind, original_relative_path, device, inode, mode, size, sha256) "
+                "VALUES ('bad-dir', ?, 'directory', 'quarantine/bad', 1, 3, 493, 0, ?)",
+                (source_id, hashlib.sha256(b"").hexdigest()),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO capture_evidence(evidence_id, source_id, entry_kind, original_relative_path, device, inode, mode, size) "
+                "VALUES ('large-dir', ?, 'directory', 'quarantine/large', 1, 4, 493, 1)",
+                (source_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO capture_evidence(evidence_id, source_id, entry_kind, original_relative_path, device, inode, mode, size, symlink_text) "
+                "VALUES ('linked-dir', ?, 'directory', 'quarantine/link', 1, 5, 493, 0, ?)",
+                (source_id, b"target"),
             )
 
 

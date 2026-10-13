@@ -3,25 +3,31 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import os
 import sqlite3
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, replace
 from typing import Final, NoReturn, Protocol, cast
 
+from ..domain.clock_state import ClockState
 from ..domain.internal_audio_machine import (
     AudioAction,
     AudioEvent,
     AudioPhase,
     Create,
     Data,
+    Done,
     Interruption,
     PrepareLeg,
     ReadBegin,
     transition,
 )
-from .collector_state_db import StateDB, StateDBError, StateTransaction, install_audio_schema
+from .clock_segments import ClockSegmentMap
+from .collector_state_db import StateDB, StateDBError, StateTransaction, _decode, _encode, install_audio_schema
 
 __all__ = [
     "AUDIO_PAYLOAD_SIZE",
@@ -34,11 +40,15 @@ __all__ = [
     "DrainCheckpoint",
     "InternalAudioStore",
     "InternalAudioStoreError",
+    "authenticate_capture_source",
+    "capture_space_requirement",
+    "clock_mapping_revision",
     "decode_sequence",
     "decode_uint64",
     "encode_sequence",
     "encode_uint64",
     "install_audio_schema",
+    "refresh_utc_projection",
     "validate_source_stream",
 ]
 
@@ -51,13 +61,58 @@ UINT64_BYTES: Final = 8
 TAIL_MAX_BYTES: Final = 443
 SOURCE_ID_LENGTH: Final = 32
 SHA256_HEX_LENGTH: Final = 64
+# The retained 684,816-record replay measured 636.6 database bytes per
+# 444-byte record and a 127,736-byte journal high-water for K=128. Round both
+# upward; the configured safety headroom is added by the staging facade.
+_CAPTURE_DB_BYTES_PER_RECORD: Final = 640
+_CAPTURE_JOURNAL_BYTES_PER_RECORD: Final = 1024
+_CAPTURE_JOURNAL_MARGIN_PAGES: Final = 16
+_DEFAULT_TERMINAL_RETENTION_SECONDS: Final = 72.0 * 60.0 * 60.0
 
 _SOURCE_TYPES = frozenset({"attempt", "draft", "quarantine"})
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+_DEFAULT_CLOCK_PAYLOAD = _encode(ClockState().to_payload())
 
 
 class InternalAudioStoreError(StateDBError):
     """A typed audio operation was refused or could not be made durable."""
+
+
+def capture_space_requirement(state_db: StateDB, record_count: int, chunk_records: int) -> tuple[int, int]:
+    """Return bounded capture demand and currently available database-filesystem bytes."""
+    if type(record_count) is not int or record_count <= 0:
+        raise ValueError("record count must be a positive integer")
+    if type(chunk_records) is not int or chunk_records <= 0 or chunk_records > MAX_CHUNK_LIMIT:
+        raise ValueError("chunk records must be within the typed writer bound")
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection:
+            page_size = _pragma_positive_int(connection, "page_size")
+            freelist_count = _pragma_nonnegative_int(connection, "freelist_count")
+        reusable_bytes = freelist_count * page_size
+        database_growth = max(0, record_count * _CAPTURE_DB_BYTES_PER_RECORD - reusable_bytes)
+        transaction_records = min(record_count, chunk_records)
+        journal_bytes = (
+            transaction_records * _CAPTURE_JOURNAL_BYTES_PER_RECORD + _CAPTURE_JOURNAL_MARGIN_PAGES * page_size
+        )
+        filesystem = os.statvfs(state_db.path.parent)
+        available = filesystem.f_bavail * filesystem.f_frsize
+    except (OSError, sqlite3.DatabaseError, StateDBError, TypeError, AttributeError) as error:
+        raise InternalAudioStoreError("capture space reserve could not be inspected") from error
+    return database_growth + journal_bytes, available
+
+
+def _pragma_positive_int(connection: sqlite3.Connection, name: str) -> int:
+    row = cast(tuple[object] | None, connection.execute(f"PRAGMA {name}").fetchone())
+    if row is None or type(row[0]) is not int or row[0] <= 0:
+        raise InternalAudioStoreError(f"SQLite {name} is invalid")
+    return cast(int, row[0])
+
+
+def _pragma_nonnegative_int(connection: sqlite3.Connection, name: str) -> int:
+    row = cast(tuple[object] | None, connection.execute(f"PRAGMA {name}").fetchone())
+    if row is None or type(row[0]) is not int or row[0] < 0:
+        raise InternalAudioStoreError(f"SQLite {name} is invalid")
+    return cast(int, row[0])
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,22 +232,208 @@ def validate_source_stream(
     return result
 
 
+def clock_mapping_revision(state_db: StateDB) -> str:
+    """Hash the exact authoritative clock payload bytes used by SQL clients."""
+
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection:
+            payload = _clock_payload_text(connection)
+        return hashlib.sha256((payload if payload is not None else _DEFAULT_CLOCK_PAYLOAD).encode("utf-8")).hexdigest()
+    except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError) as error:
+        raise InternalAudioStoreError("clock mapping revision could not be read") from error
+
+
+def refresh_utc_projection(state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUNK_LIMIT) -> int:
+    """Refresh at most one indexed chunk of stale unpublished UTC projections."""
+
+    limit = _chunk_limit(chunk_limit)
+    payload, revision, segments = _clock_projection_snapshot(state_db)
+    try:
+        with closing(state_db.open_connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if _clock_payload_text(connection) != payload:
+                connection.rollback()
+                return 0
+            rows = _stale_projection_rows(connection, revision, limit)
+            for source_id, ordinal, sequence_start, device_timestamp, old_revision in rows:
+                utc_timestamp = _project_utc_timestamp(
+                    segments,
+                    decode_sequence(sequence_start) + ordinal,
+                    device_timestamp,
+                )
+                changed = connection.execute(
+                    "UPDATE capture_record SET utc_timestamp = ?, mapping_revision = ? "
+                    "WHERE source_id = ? AND ordinal = ? AND mapping_revision IS ? "
+                    "AND EXISTS (SELECT 1 FROM capture_source "
+                    "WHERE capture_source.source_id = capture_record.source_id "
+                    "AND capture_source.lifecycle NOT IN ('covered','retiring'))",
+                    (utc_timestamp, revision, source_id, ordinal, old_revision),
+                )
+                if changed.rowcount != 1:
+                    raise InternalAudioStoreError("UTC projection row changed during refresh")
+            connection.commit()
+            return len(rows)
+    except InternalAudioStoreError:
+        raise
+    except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError, TypeError, ValueError) as error:
+        raise InternalAudioStoreError("UTC projection refresh failed") from error
+
+
+def _clock_projection_snapshot(state_db: StateDB) -> tuple[str | None, str, ClockSegmentMap]:
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection:
+            payload = _clock_payload_text(connection)
+        authoritative = payload if payload is not None else _DEFAULT_CLOCK_PAYLOAD
+        state = ClockState.from_payload(_decode(authoritative))
+        return payload, hashlib.sha256(authoritative.encode("utf-8")).hexdigest(), ClockSegmentMap.from_state(state)
+    except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError, TypeError, ValueError) as error:
+        raise InternalAudioStoreError("clock mapping snapshot is invalid") from error
+
+
+def _clock_payload_text(connection: sqlite3.Connection) -> str | None:
+    row = _fetchone(connection.execute("SELECT payload FROM state WHERE kind = 'clock' AND id = 'current'"))
+    if row is None:
+        return None
+    payload = cast(object, row[0])
+    if not isinstance(payload, str):
+        raise InternalAudioStoreError("clock mapping payload is invalid")
+    return payload
+
+
+def _stale_projection_rows(
+    connection: sqlite3.Connection, revision: str, limit: int
+) -> tuple[tuple[str, int, bytes, int, str | None], ...]:
+    rows: list[tuple[str, int, bytes, int, str | None]] = []
+    predicates: tuple[tuple[str, tuple[object, ...]], ...] = (
+        ("record.mapping_revision IS NULL", ()),
+        ("record.mapping_revision < ?", (revision,)),
+        ("record.mapping_revision > ?", (revision,)),
+    )
+    for predicate, parameters in predicates:
+        remaining = limit - len(rows)
+        if remaining == 0:
+            break
+        selected = _fetchall(
+            connection.execute(
+                "SELECT record.source_id, record.ordinal, source.sequence_start, "
+                "record.device_timestamp, record.mapping_revision "
+                "FROM capture_record AS record JOIN capture_source AS source USING (source_id) "
+                f"WHERE {predicate} AND source.lifecycle NOT IN ('covered','retiring') "
+                "ORDER BY record.mapping_revision, record.source_id, record.ordinal LIMIT ?",
+                (*parameters, remaining),
+            )
+        )
+        rows.extend(
+            (
+                cast(str, row[0]),
+                cast(int, row[1]),
+                cast(bytes, row[2]),
+                cast(int, row[3]),
+                cast(str | None, row[4]),
+            )
+            for row in selected
+        )
+    return tuple(rows)
+
+
+def _project_utc_timestamp(segments: ClockSegmentMap, sequence: int, device_timestamp: int) -> int | None:
+    projected = segments.utc_for(sequence, device_timestamp)
+    if projected is None:
+        return None
+    normalized = math.floor(projected + 0.5)
+    return normalized if 0 <= normalized <= MAX_PROTOCOL_UINT32 else None
+
+
+def read_capture_source(state_db: StateDB, source_id: str) -> CaptureSource | None:
+    """Read one immutable source snapshot without creating a persistent writer."""
+
+    source_id = _source_id(source_id)
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection:
+            return _read_capture_source(connection, source_id)
+    except (sqlite3.DatabaseError, StateDBError) as error:
+        raise InternalAudioStoreError("source read failed") from error
+
+
+def authenticate_capture_source(
+    state_db: StateDB,
+    source_id: str,
+    *,
+    page_limit: int = DEFAULT_CHUNK_LIMIT,
+) -> CaptureSource:
+    """Authenticate canonical records against one stable source checkpoint."""
+
+    source_id = _source_id(source_id)
+    limit = _chunk_limit(page_limit)
+    source = read_capture_source(state_db, source_id)
+    if source is None:
+        raise InternalAudioStoreError("source does not exist")
+    count = 0
+    digest = hashlib.sha256()
+    after_ordinal = -1
+    while True:
+        try:
+            with closing(state_db.open_connection(read_only=True)) as connection:
+                rows = cast(
+                    list[tuple[object, object, object]],
+                    connection.execute(
+                        "SELECT ordinal, device_timestamp, payload FROM capture_record "
+                        "WHERE source_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?",
+                        (source_id, after_ordinal, limit),
+                    ).fetchall(),
+                )
+        except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise InternalAudioStoreError("source record authentication failed") from error
+        if not rows:
+            break
+        for ordinal_value, timestamp_value, payload_value in rows:
+            ordinal = _uint32(cast(int, ordinal_value), "source record ordinal")
+            if ordinal != count:
+                raise InternalAudioStoreError("source record ordinals are not contiguous")
+            timestamp = _uint32(cast(int, timestamp_value), "device timestamp")
+            payload = _bytes(payload_value)
+            digest.update(_record_bytes(timestamp.to_bytes(4, "big") + payload))
+            count += 1
+        after_ordinal = count - 1
+    current = read_capture_source(state_db, source_id)
+    if current != source:
+        raise InternalAudioStoreError("source changed during record authentication")
+    if count != source.committed_count:
+        raise InternalAudioStoreError("source record count does not match checkpoint")
+    if digest.hexdigest() != source.committed_sha256:
+        raise InternalAudioStoreError("source record digest does not match checkpoint")
+    return source
+
+
 class InternalAudioStore:
     """A thread-owned persistent writer plus short-lived read connections."""
 
     def __init__(
-        self, state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUNK_LIMIT, busy_deadline: float = 5.0
+        self,
+        state_db: StateDB,
+        *,
+        chunk_limit: int = DEFAULT_CHUNK_LIMIT,
+        busy_deadline: float = 5.0,
+        terminal_retention_seconds: float = _DEFAULT_TERMINAL_RETENTION_SECONDS,
     ) -> None:
         self.state_db = state_db
         self.chunk_limit = _chunk_limit(chunk_limit)
         if isinstance(busy_deadline, bool) or not isinstance(busy_deadline, (int, float)) or busy_deadline <= 0:
             raise InternalAudioStoreError("busy deadline is invalid")
         self.busy_deadline = float(busy_deadline)
+        if (
+            isinstance(terminal_retention_seconds, bool)
+            or not isinstance(terminal_retention_seconds, (int, float))
+            or terminal_retention_seconds <= 0
+        ):
+            raise InternalAudioStoreError("terminal retention is invalid")
+        self._terminal_retention_ns = int(float(terminal_retention_seconds) * 1_000_000_000)
         self._owner_thread = threading.get_ident()
         self._failed = False
         self._busy_timeout_ms = max(1, min(5_000, int(self.busy_deadline * 1_000)))
         self._digest_cache: dict[str, tuple[int, str, _HashState]] = {}
         self._connection: sqlite3.Connection | None = None
+        self._publication_reader: sqlite3.Connection | None = None
         try:
             self._connection = state_db.open_connection()
             self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
@@ -203,9 +444,31 @@ class InternalAudioStore:
 
     def close(self) -> None:
         self._check_thread()
+        if self._publication_reader is not None:
+            self._publication_reader.close()
+            self._publication_reader = None
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+
+    @contextmanager
+    def publication_reader(self) -> Iterator[None]:
+        """Reuse one autocommit reader across a bounded publication call."""
+
+        self._check_writer()
+        if self._publication_reader is not None:
+            raise InternalAudioStoreError("publication reader is already active")
+        try:
+            self._publication_reader = self.state_db.open_connection(read_only=True)
+            yield
+        except InternalAudioStoreError:
+            raise
+        except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise InternalAudioStoreError("publication reader failed") from error
+        finally:
+            if self._publication_reader is not None:
+                self._publication_reader.close()
+                self._publication_reader = None
 
     @contextmanager
     def publication_transaction(self) -> Iterator[tuple[StateTransaction, sqlite3.Connection]]:
@@ -235,7 +498,7 @@ class InternalAudioStore:
     def __enter__(self) -> InternalAudioStore:
         return self
 
-    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+    def __exit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> None:
         self.close()
 
     def create_source(
@@ -394,6 +657,52 @@ class InternalAudioStore:
             raise InternalAudioStoreError("interruption was not confirmed durable") from error
         return self._require_source(source.source_id)
 
+    def seal_source(
+        self,
+        source_id: str,
+        *,
+        leg_generation: int,
+        expected_count: int,
+        expected_sha256: str,
+    ) -> CaptureSource:
+        """Durably seal one exact complete source before device advancement."""
+
+        self._check_writer()
+        source = self._require_source(source_id)
+        count = _uint32(expected_count, "seal count")
+        digest = _sha256(expected_sha256)
+        if type(leg_generation) is not int or leg_generation != source.current_leg_generation:
+            raise InternalAudioStoreError("seal leg generation is stale")
+        if (
+            count != source.committed_count
+            or digest != source.committed_sha256
+            or source.sequence_start + count != source.sequence_limit
+        ):
+            raise InternalAudioStoreError("seal does not match the complete durable source")
+        next_phase = _phase_after(_phase(source), Done(), AudioAction.PERSIST)
+        if self._read_tail(source.source_id) is not None:
+            raise InternalAudioStoreError("complete source still has a partial tail")
+        authenticate_capture_source(self.state_db, source.source_id, page_limit=self.chunk_limit)
+        proposed = replace(source, lifecycle=next_phase.value)
+        connection = self._require_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_source_snapshot(connection, source)
+            if self._tail_from_connection(connection, source.source_id) is not None:
+                raise InternalAudioStoreError("complete source still has a partial tail")
+            connection.execute(
+                "UPDATE capture_source SET lifecycle = ? WHERE source_id = ?",
+                (next_phase.value, source.source_id),
+            )
+            self._commit()
+        except InternalAudioStoreError:
+            self._rollback()
+            raise
+        except sqlite3.DatabaseError as error:
+            self._rollback()
+            return self._recover_seal(source, proposed, error)
+        return proposed
+
     def _require_source(self, source_id: str) -> CaptureSource:
         source = self.get_source(source_id)
         if source is None:
@@ -402,12 +711,12 @@ class InternalAudioStore:
 
     def get_source(self, source_id: str) -> CaptureSource | None:
         source_id = _source_id(source_id)
-        try:
-            with closing(self.state_db.open_connection(read_only=True)) as connection:
-                row = _fetchone(connection.execute("SELECT * FROM capture_source WHERE source_id = ?", (source_id,)))
-        except sqlite3.DatabaseError as error:
-            raise InternalAudioStoreError("source read failed") from error
-        return _source_from_row(row) if row is not None else None
+        if self._publication_reader is not None:
+            try:
+                return _read_capture_source(self._publication_reader, source_id)
+            except sqlite3.DatabaseError as error:
+                raise InternalAudioStoreError("source read failed") from error
+        return read_capture_source(self.state_db, source_id)
 
     def read_record_page(
         self, source_id: str, after_ordinal: int = -1, limit: int = DEFAULT_CHUNK_LIMIT
@@ -417,17 +726,12 @@ class InternalAudioStore:
             raise InternalAudioStoreError("record page cursor is invalid")
         limit = _page_limit(limit, self.chunk_limit)
         try:
+            if self._publication_reader is not None:
+                return _read_record_page(self._publication_reader, source_id, after_ordinal, limit)
             with closing(self.state_db.open_connection(read_only=True)) as connection:
-                rows = _fetchall(
-                    connection.execute(
-                        "SELECT source_id, ordinal, device_timestamp, payload, utc_timestamp, mapping_revision "
-                        "FROM capture_record WHERE source_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?",
-                        (source_id, after_ordinal, limit),
-                    )
-                )
-        except sqlite3.DatabaseError as error:
+                return _read_record_page(connection, source_id, after_ordinal, limit)
+        except (sqlite3.DatabaseError, StateDBError) as error:
             raise InternalAudioStoreError("record page read failed") from error
-        return tuple(_record_from_row(row) for row in rows)
 
     def commit_drain(
         self,
@@ -453,6 +757,24 @@ class InternalAudioStore:
         if expected != source.committed_count:
             raise InternalAudioStoreError("drain ordinal is not the committed frontier")
         return self._append_drain(source, expected, raw_records, expected_sha256, checkpoint.tail)
+
+    def commit_tail(self, source_id: str, expected_ordinal: int, checkpoint: DrainCheckpoint) -> int:
+        """Commit a bounded partial tail at the exact durable record frontier."""
+
+        self._check_writer()
+        source = self._require_source(_source_id(source_id))
+        expected = _uint32(expected_ordinal, "expected ordinal")
+        if expected != source.committed_count:
+            raise InternalAudioStoreError("tail ordinal is not the committed frontier")
+        _validate_receiving_checkpoint(source, expected, checkpoint.leg_generation)
+        if checkpoint.tail is None:
+            raise InternalAudioStoreError("tail checkpoint is missing")
+        previous = self._read_tail(source.source_id)
+        desired = self._resolve_tail(source, previous, checkpoint.tail, source.committed_count, ())
+        if desired == previous:
+            return source.committed_count
+        self._commit_replay_tail(source, previous, desired)
+        return source.committed_count
 
     def _append_drain(
         self,
@@ -706,6 +1028,7 @@ class InternalAudioStore:
             ordinal = _int_value(_value(row, 0)) + 1
             if ordinal > MAX_PROTOCOL_UINT32:
                 raise InternalAudioStoreError("conflict evidence ordinal is exhausted")
+            now = time.time_ns()
             connection.execute(
                 "INSERT INTO capture_conflict(source_id, chunk_ordinal, leg_generation, "
                 "absolute_byte_offset, reason, bytes) VALUES (?, ?, ?, ?, ?, ?)",
@@ -719,8 +1042,21 @@ class InternalAudioStore:
                 ),
             )
             connection.execute(
-                "UPDATE capture_source SET lifecycle = 'blocked', block_reason = ? WHERE source_id = ?",
-                (reason, source.source_id),
+                "UPDATE capture_source SET source_type = 'quarantine', lifecycle = 'blocked', block_reason = ?, "
+                "quarantine_disposition = CASE WHEN committed_count = 0 THEN 'unprocessable' "
+                "ELSE 'unclassified' END, quarantine_opaque = 0, "
+                "terminal_reason = CASE WHEN committed_count = 0 "
+                "THEN 'quarantine contains no committed records' ELSE NULL END, "
+                "terminal_time = ?, retention_deadline = ?, "
+                "certified_prefix_count = CASE WHEN committed_count = 0 THEN NULL ELSE committed_count END, "
+                "coverage_digest = CASE WHEN committed_count = 0 THEN NULL ELSE committed_sha256 END "
+                "WHERE source_id = ?",
+                (
+                    reason,
+                    str(now),
+                    str(now + self._terminal_retention_ns),
+                    source.source_id,
+                ),
             )
             self._commit()
         except InternalAudioStoreError:
@@ -878,6 +1214,22 @@ class InternalAudioStore:
         self._fail_stop("ambiguous source creation could not be reconciled")
         raise AssertionError("fail-stop must raise")
 
+    def _recover_seal(
+        self, source: CaptureSource, proposed: CaptureSource, error: sqlite3.DatabaseError
+    ) -> CaptureSource:
+        try:
+            self._reopen()
+            current = self.get_source(source.source_id)
+            tail = self._read_tail(source.source_id)
+        except (sqlite3.DatabaseError, StateDBError) as inspection_error:
+            self._fail_stop(f"ambiguous seal could not be inspected: {inspection_error}")
+        if current == proposed and tail is None:
+            return proposed
+        if current == source and tail is None:
+            raise InternalAudioStoreError("ambiguous seal was rolled back") from error
+        self._fail_stop("ambiguous seal commit could not be reconciled")
+        raise AssertionError("fail-stop must raise")
+
     def _read_tail(self, source_id: str) -> CaptureTail | None:
         try:
             with closing(self.state_db.open_connection(read_only=True)) as connection:
@@ -976,6 +1328,22 @@ def _validate_receiving_leg(source: CaptureSource, expected: int, count: int, le
         raise InternalAudioStoreError("drain is outside the bound READ leg")
 
 
+def _validate_receiving_checkpoint(source: CaptureSource, expected: int, leg_generation: int) -> None:
+    if type(leg_generation) is not int or leg_generation != source.current_leg_generation:
+        raise InternalAudioStoreError("drain leg generation is stale")
+    decision = transition(_phase(source), Data())
+    if decision.action is not AudioAction.PERSIST:
+        raise InternalAudioStoreError("tail requires a receiving source")
+    active_leg = (source.current_leg_start, source.current_leg_count)
+    if (
+        (source.prepared_start, source.prepared_count) != active_leg
+        or (source.read_begin_start, source.read_begin_count) != active_leg
+        or not source.current_leg_start - source.sequence_start <= expected < source.committed_count + 1
+        or source.sequence_start + expected >= source.current_leg_start + source.current_leg_count
+    ):
+        raise InternalAudioStoreError("tail is outside the bound READ leg")
+
+
 def _source_from_row(row: sqlite3.Row) -> CaptureSource:
     return CaptureSource(
         source_id=str(_value(row, "source_id")),
@@ -994,6 +1362,27 @@ def _source_from_row(row: sqlite3.Row) -> CaptureSource:
         committed_sha256=str(_value(row, "committed_sha256")),
         closure_frontier=_optional_uint64(_value(row, "closure_frontier")),
     )
+
+
+def _read_capture_source(connection: sqlite3.Connection, source_id: str) -> CaptureSource | None:
+    row = _fetchone(connection.execute("SELECT * FROM capture_source WHERE source_id = ?", (source_id,)))
+    return _source_from_row(row) if row is not None else None
+
+
+def _read_record_page(
+    connection: sqlite3.Connection,
+    source_id: str,
+    after_ordinal: int,
+    limit: int,
+) -> tuple[CaptureRecord, ...]:
+    rows = _fetchall(
+        connection.execute(
+            "SELECT source_id, ordinal, device_timestamp, payload, utc_timestamp, mapping_revision "
+            "FROM capture_record WHERE source_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?",
+            (source_id, after_ordinal, limit),
+        )
+    )
+    return tuple(_record_from_row(row) for row in rows)
 
 
 def _record_from_row(row: sqlite3.Row) -> CaptureRecord:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 from shutil import rmtree
@@ -8,10 +7,10 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
+from omi_collector.capture.adapters.internal_audio_store import CaptureSource
 from omi_collector.capture.adapters.staging_writer import StagingWriter, StagingWriterStateError, ThreadAffinityError
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from staging_test_factory import StagingStore, attempt_payload
+from staging_test_factory import StagingStore, attempt_records, attempt_source
 
 _CAPTURE_ROOTS: set[Path] = set()
 
@@ -28,12 +27,19 @@ def _store(tmp_path: Path) -> StagingStore:
     return StagingStore(tmp_path, _capture_root(tmp_path))
 
 
+def _typed_state(store: StagingStore, attempt_id: str) -> tuple[CaptureSource, tuple[bytes, ...]]:
+    source = attempt_source(store, attempt_id)
+    assert source is not None
+    return source, attempt_records(store, attempt_id)
+
+
 def _record(value: int) -> bytes:
     return value.to_bytes(4, "big") + bytes(RECORD_SIZE - 4)
 
 
 def _begin(writer: StagingWriter, start: int = 100, count: int = 2) -> None:
     writer.prepare()
+    writer.prepare_leg(start, count)
     writer.read_begin(ReadBeginNotification(start, count))
 
 
@@ -50,7 +56,8 @@ def test_construction_does_not_touch_disk(tmp_path: Path) -> None:
 
 
 def test_writer_maps_arena_offsets_and_owns_streaming_mutations(tmp_path: Path) -> None:
-    writer = StagingWriter(_store(tmp_path), 100, 2)
+    store = _store(tmp_path)
+    writer = StagingWriter(store, 100, 2)
     first = _record(1)
     second = _record(2)
 
@@ -61,10 +68,12 @@ def test_writer_maps_arena_offsets_and_owns_streaming_mutations(tmp_path: Path) 
     assert prefix.start_sequence == 100
     assert prefix.next_sequence == 102
     result = writer.seal(DoneNotification(0, 102))
+    source = attempt_source(store, result.source_id)
     writer.close()
 
-    assert result.bundle_path.joinpath("records.bin").read_bytes() == first + second
-    assert result.deduplicated is False
+    assert source is not None
+    assert result.record_count == source.committed_count == 2
+    assert result.raw_sha256 == source.committed_sha256
 
 
 def test_append_chunk_rejects_unaligned_or_out_of_range_data(tmp_path: Path) -> None:
@@ -73,7 +82,7 @@ def test_append_chunk_rejects_unaligned_or_out_of_range_data(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="offset"):
         writer.append_chunk(1, memoryview(_record(1)))
-    with pytest.raises(ValueError, match="positive multiple"):
+    with pytest.raises(ValueError, match="multiple of 444 bytes"):
         writer.append_chunk(0, memoryview(b"short"))
     with pytest.raises(ValueError, match="exceeds"):
         writer.append_chunk(0, memoryview(_record(1) * 3))
@@ -89,16 +98,20 @@ def test_prepare_resumes_partial_and_replays_from_checkpoint(tmp_path: Path) -> 
     initial.checkpoint()
     initial.close()
 
-    resumed = StagingWriter(_store(tmp_path), 100, 2)
-    prefix = resumed.prepare_leg(100, 2)
+    store = _store(tmp_path)
+    resumed = StagingWriter(store, 100, 2)
+    prefix = resumed.prepare_leg(101, 1)
     assert prefix.next_sequence == 101
-    resumed.read_begin(ReadBeginNotification(100, 2))
-    resumed.append_chunk(0, memoryview(first + second))
+    resumed.read_begin(ReadBeginNotification(101, 1))
+    resumed.append_chunk(0, memoryview(second))
     resumed.checkpoint()
     result = resumed.seal(DoneNotification(0, 102))
+    source = attempt_source(store, result.source_id)
     resumed.close()
 
-    assert result.bundle_path.joinpath("records.bin").read_bytes() == first + second
+    assert source is not None
+    assert result.record_count == source.committed_count == 2
+    assert result.raw_sha256 == source.committed_sha256
 
 
 def test_read_begin_rebinds_original_range_after_recovery_read_started(tmp_path: Path) -> None:
@@ -107,27 +120,32 @@ def test_read_begin_rebinds_original_range_after_recovery_read_started(tmp_path:
     writer.append_chunk(0, memoryview(_record(1) * 2))
     writer.checkpoint()
 
-    writer.begin_recovery(102, 1)
+    writer.interrupt()
+    writer.prepare_leg(102, 1)
     writer.read_begin(ReadBeginNotification(102, 1))
-    writer.read_begin(ReadBeginNotification(100, 3))
 
     with pytest.raises(StagingWriterStateError, match="does not match the prepared leg"):
-        writer.read_begin(ReadBeginNotification(100, 2))
+        writer.read_begin(ReadBeginNotification(100, 3))
     writer.close()
 
 
-def test_prefix_is_published_by_the_same_target(tmp_path: Path) -> None:
-    writer = StagingWriter(_store(tmp_path), 100, 2)
+def test_prefix_is_certified_by_the_same_target(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    writer = StagingWriter(store, 100, 2)
     _begin(writer)
     writer.append_chunk(0, memoryview(_record(1)))
     writer.checkpoint()
 
     result = writer.publish_prefix()
+    source_id = writer.attempt_id
     writer.close()
 
     assert result is not None
-    assert result.bundle_path.joinpath("manifest.json").is_file()
-    assert not result.bundle_path.joinpath("gap.json").exists()
+    assert result.source_id == source_id
+    assert result.record_count == 1
+    source = attempt_source(store, source_id)
+    assert source is not None
+    assert source.lifecycle == "sealed_waiting"
 
 
 def test_target_rejects_direct_cross_thread_calls_after_first_call(tmp_path: Path) -> None:
@@ -156,14 +174,13 @@ def test_prepare_is_idempotent_and_data_waits_for_each_read_begin(tmp_path: Path
     try:
         descriptor = writer.prepare()
         assert writer.prepare() == descriptor
-        raw = tmp_path / "attempts" / descriptor.attempt_id / "records.bin"
-        before = (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id))
+        before = _typed_state(store, descriptor.attempt_id)
 
         with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
             writer.append_chunk(0, memoryview(_record(1)))
         with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
             writer.checkpoint()
-        assert (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id)) == before
+        assert _typed_state(store, descriptor.attempt_id) == before
 
         prefix = writer.prepare_leg(100, 3)
         assert prefix.record_count == 0
@@ -175,6 +192,7 @@ def test_prepare_is_idempotent_and_data_waits_for_each_read_begin(tmp_path: Path
         writer.read_begin(ReadBeginNotification(100, 3))
         writer.append_chunk(0, memoryview(_record(1) * 2))
         durable = writer.checkpoint()
+        writer.interrupt()
         recovery = writer.begin_recovery(102, 1)
         assert recovery == durable
         with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
@@ -193,16 +211,16 @@ def test_invalid_append_scalars_and_empty_data_leave_persisted_bytes_unchanged(t
     writer = StagingWriter(store, 100, 2)
     try:
         descriptor = writer.prepare()
+        writer.prepare_leg(100, 2)
         writer.read_begin(ReadBeginNotification(100, 2))
-        raw = tmp_path / "attempts" / descriptor.attempt_id / "records.bin"
-        before = (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id))
+        before = _typed_state(store, descriptor.attempt_id)
 
         for offset, error in ((True, TypeError), ("0", TypeError), (-1, ValueError)):
             with pytest.raises(error):
                 writer.append_chunk(cast(int, offset), memoryview(_record(1)))
-        with pytest.raises(ValueError, match="positive multiple"):
+        with pytest.raises(ValueError, match="drain must contain records or a partial tail"):
             writer.append_chunk(0, memoryview(b""))
-        assert (raw.read_bytes(), attempt_payload(store, descriptor.attempt_id)) == before
+        assert _typed_state(store, descriptor.attempt_id) == before
     finally:
         writer.close()
 
@@ -238,39 +256,31 @@ def test_terminal_publication_blocks_later_appends(tmp_path: Path, terminal: str
         writer.close()
 
 
-def test_close_flushes_raw_before_releasing_lease_and_resume_adopts_raw_tail(tmp_path: Path) -> None:
-    lock_checks: list[bool] = []
-    store: StagingStore
-
-    def fsync_and_check_lock(fd: int) -> None:
-        os.fsync(fd)
-        if Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin" and os.fstat(fd).st_size:
-            try:
-                with store.device_lock(operation="close_order_probe"):
-                    lock_checks.append(False)
-            except DeviceAlreadyRunningError:
-                lock_checks.append(True)
-
-    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_and_check_lock)
-    writer = StagingWriter(store, 100, 1)
+def test_close_releases_lease_after_preserving_typed_records_and_resume(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    writer = StagingWriter(store, 100, 2)
     try:
         descriptor = writer.prepare()
-        writer.read_begin(ReadBeginNotification(100, 1))
+        writer.prepare_leg(100, 2)
+        writer.read_begin(ReadBeginNotification(100, 2))
         writer.append_chunk(0, memoryview(_record(1)))
-        state_before_close = attempt_payload(store, descriptor.attempt_id)
+        state_before_close = _typed_state(store, descriptor.attempt_id)
         writer.close()
     finally:
         writer.close()
 
-    assert lock_checks == [True]
-    assert attempt_payload(store, descriptor.attempt_id) == state_before_close
+    assert _typed_state(store, descriptor.attempt_id) == state_before_close
     with store.device_lock(operation="post_close_probe"):
         pass
 
-    resumed = StagingWriter(store, 100, 1)
+    resumed = StagingWriter(store, 100, 2)
     try:
         resumed.prepare()
-        prefix = resumed.prepare_leg(100, 1)
+        prefix = resumed.prepare_leg(101, 1)
         assert (prefix.next_sequence, prefix.record_count) == (101, 1)
+        resumed.read_begin(ReadBeginNotification(101, 1))
+        resumed.append_chunk(0, memoryview(_record(2)))
+        resumed.checkpoint()
+        assert attempt_records(store, descriptor.attempt_id) == (_record(1), _record(2))
     finally:
         resumed.close()

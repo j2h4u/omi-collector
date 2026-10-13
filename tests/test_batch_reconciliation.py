@@ -7,7 +7,6 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import wraps
-from json import dumps
 from pathlib import Path
 from struct import pack
 from threading import Thread
@@ -17,7 +16,9 @@ import pytest
 
 from fakes import DelayedNotification, ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.attempt_writer import WriterError, WriterFailedError
+from omi_collector.capture.adapters.attempts import DurableSqliteSeal
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, read_confirmed_losses
+from omi_collector.capture.adapters.internal_audio_store import CaptureSource
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.staging_contract import AttemptDescriptor, StagingError
 from omi_collector.capture.adapters.staging_writer import StagingWriter
@@ -33,6 +34,7 @@ from omi_collector.capture.application.collector import (
 from omi_collector.capture.application.ports import (
     BatchWriterPort,
     DurablePrefixShape,
+    DurableSealShape,
     SealResultShape,
     StagingPort,
     WriterProgressShape,
@@ -52,7 +54,7 @@ from omi_collector.capture.domain.ring_protocol import (
     RingStatus,
 )
 from omi_collector.config import DEFAULT_CONFIG, WriterConfig
-from staging_test_factory import StagingStore, attempt_payload, closure_payload, closure_rows
+from staging_test_factory import StagingStore, attempt_records, attempt_source, closure_payload, closure_rows
 
 
 def _record(value: int) -> bytes:
@@ -67,36 +69,27 @@ def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
     return run
 
 
-def _seed_partial(spool: Path, capture_root: Path) -> tuple[StagingStore, Path, bytes, bytes]:
+def _seed_partial(spool: Path, capture_root: Path) -> tuple[StagingStore, CaptureSource, tuple[bytes, ...]]:
     store = StagingStore(spool, capture_root)
     attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.accept_chunk(100, _record(100))
-    prefix = attempt.checkpoint()
-    attempt.close(durable=True)
+    try:
+        attempt.prepare_leg(100, 2)
+        attempt.record_read_begin(ReadBeginNotification(100, 2))
+        attempt.accept_chunk(100, _record(100))
+        prefix = attempt.checkpoint()
+    finally:
+        attempt.close(durable=True)
 
     assert prefix.next_sequence == 101
     descriptor = store.pending_attempts()[0]
-    attempt_path = store.attempts_root / descriptor.attempt_id
-    persisted = attempt_payload(store, descriptor.attempt_id)
-    assert persisted is not None
-    return (
-        store,
-        attempt_path,
-        (attempt_path / "records.bin").read_bytes(),
-        dumps(persisted, sort_keys=True).encode(),
-    )
-
-
-def _attempt_state_bytes(store: StagingStore, attempt_id: str) -> bytes:
-    persisted = attempt_payload(store, attempt_id)
-    assert persisted is not None
-    return dumps(persisted, sort_keys=True).encode()
+    source = attempt_source(store, descriptor.attempt_id)
+    assert source is not None
+    return store, source, attempt_records(store, descriptor.attempt_id)
 
 
 @_async_test
 async def test_regressed_pending_prefix_keeps_authenticated_visit_frontier(tmp_path: Path) -> None:
-    store, _attempt_path, _raw, _checkpoint = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store, _source, _records = _seed_partial(tmp_path / "spool", tmp_path / "captures")
     descriptor = store.pending_attempts()[0]
     durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
     assert durable_next == 101
@@ -142,7 +135,7 @@ async def test_regressed_pending_prefix_keeps_authenticated_visit_frontier(tmp_p
 
 @_async_test
 async def test_cursor_ahead_with_metrics_disabled_has_no_metrics_error_event(tmp_path: Path) -> None:
-    store, _path, _raw, _checkpoint = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store, _source, _records = _seed_partial(tmp_path / "spool", tmp_path / "captures")
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     descriptor = store.pending_attempts()[0]
@@ -176,7 +169,12 @@ async def test_cursor_ahead_with_metrics_disabled_has_no_metrics_error_event(tmp
         assert result.packet_count == 1
         assert [event.get("event") for event in operational_events] == ["loss_detected"]
         assert all(event != "quality_metrics_write_error" for event, _error, _fields in runtime.debug_errors)
-        assert len(tuple(store.capture_root.glob("100-101-*"))) == 1
+        terminal_source = attempt_source(store, descriptor.attempt_id)
+        assert terminal_source is not None
+        assert terminal_source.lifecycle == "sealed_waiting"
+        assert terminal_source.committed_count == 1
+        assert attempt_records(store, descriptor.attempt_id) == (_record(100),)
+        assert not tuple(store.capture_root.iterdir())
     finally:
         await _close_real_writers(runtime)
         await session.close()
@@ -200,7 +198,7 @@ def _reconciler(store: StagingStore, descriptor: AttemptDescriptor, durable_next
 
 
 def test_restart_interrupted_preserves_unpublished_partial_and_clears_visit(tmp_path: Path) -> None:
-    store, attempt_path, raw_before, checkpoint_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store, source_before, records_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
     descriptor = store.pending_attempts()[0]
     durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
     reconciler = _reconciler(store, descriptor, durable_next)
@@ -211,12 +209,8 @@ def test_restart_interrupted_preserves_unpublished_partial_and_clears_visit(tmp_
 
     asyncio.run(reconciler.close_visit("restart_interrupted"))
 
-    assert (attempt_path / "records.bin").read_bytes() == raw_before
-    assert _attempt_state_bytes(store, descriptor.attempt_id) == checkpoint_before
-    attempt_state = attempt_payload(store, descriptor.attempt_id)
-    assert attempt_state is not None
-    assert attempt_state["prefix_publication"] is None
-    assert attempt_state["terminal_retirement"] is None
+    assert attempt_source(store, descriptor.attempt_id) == source_before
+    assert attempt_records(store, descriptor.attempt_id) == records_before
     assert store.pending_attempts() == (descriptor,)
     assert closure_payload(store) is None
     assert reconciler.pending_descriptor is None
@@ -225,23 +219,24 @@ def test_restart_interrupted_preserves_unpublished_partial_and_clears_visit(tmp_
 
 
 def test_absence_publishes_authenticated_partial_and_closes_visit(tmp_path: Path) -> None:
-    store, _attempt_path, _raw_before, _checkpoint_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store, source_before, records_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
     descriptor = store.pending_attempts()[0]
     durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
     reconciler = _reconciler(store, descriptor, durable_next)
 
     asyncio.run(reconciler.close_visit("absence"))
 
-    attempt_state = attempt_payload(store, descriptor.attempt_id)
-    assert attempt_state is not None
-    assert attempt_state["prefix_publication"] is not None
-    assert attempt_state["terminal_retirement"] is not None
+    terminal_source = attempt_source(store, descriptor.attempt_id)
+    assert terminal_source is not None
+    assert terminal_source.lifecycle == "sealed_waiting"
+    assert terminal_source.committed_count == source_before.committed_count == len(records_before)
+    assert terminal_source.committed_sha256 == source_before.committed_sha256
     assert store.pending_attempts() == ()
     assert closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
     assert reconciler.pending_descriptor is None
     assert reconciler.pending_durable_next is None
     assert reconciler.durable_progress() == 0
-    assert tuple((tmp_path / "captures").glob("100-101-*"))
+    assert not tuple(store.capture_root.iterdir())
 
 
 @_async_test
@@ -292,11 +287,15 @@ class _WriterProxy:
         self.writer = writer
         self.seal_fault: BaseException | None = None
         self.prepare_fault: BaseException | None = None
+        self.start_fault: BaseException | None = None
         self.close_fault: BaseException | None = None
         self.failure_fault: BaseException | None = None
         self.checkpoint_fault: BaseException | None = None
+        self.interrupt_fault: BaseException | None = None
         self.late_seal_fault: BaseException | None = None
         self.seal_result_calls = 0
+        self._initial_prefix: DurablePrefixShape | None = None
+        self._attempt_id: str | None = None
         self.checkpoint_calls = 0
         self.checkpoint_hook: Callable[[], None] | None = None
         self.restore_clock: Callable[[], None] | None = None
@@ -304,7 +303,8 @@ class _WriterProxy:
 
     @property
     def attempt_id(self) -> str:
-        return self.writer.attempt_id
+        assert self._attempt_id is not None
+        return self._attempt_id
 
     @property
     def thread(self) -> Thread:
@@ -328,6 +328,19 @@ class _WriterProxy:
 
     async def start(self) -> None:
         await self.writer.start()
+        self._attempt_id = self.writer.attempt_id
+        self._initial_prefix = self.writer.initial_prefix
+        if self.start_fault is not None:
+            raise self.start_fault
+
+    @property
+    def initial_prefix(self) -> DurablePrefixShape:
+        assert self._initial_prefix is not None
+        return self._initial_prefix
+
+    @property
+    def interrupted_prefix(self) -> DurablePrefixShape | None:
+        return self.writer.interrupted_prefix
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefixShape:
         if self.prepare_fault is not None:
@@ -352,20 +365,26 @@ class _WriterProxy:
     async def barrier(self) -> DurablePrefixShape:
         return await self.writer.barrier()
 
-    async def seal(self, done_notice: DoneNotification) -> SealResultShape:
+    async def interrupt(self) -> DurablePrefixShape:
+        if self.interrupt_fault is not None:
+            error, self.interrupt_fault = self.interrupt_fault, None
+            raise error
+        return await self.writer.interrupt()
+
+    async def seal(self, done_notice: DoneNotification) -> SealResultShape | DurableSealShape:
         result = await self.writer.seal(done_notice)
         if self.seal_fault is not None:
             error, self.seal_fault = self.seal_fault, None
             raise error
         return result
 
-    async def await_seal_result(self) -> SealResultShape | None:
+    async def await_seal_result(self) -> SealResultShape | DurableSealShape | None:
         self.seal_result_calls += 1
         if self.seal_result_calls > 1 and self.late_seal_fault is not None:
             raise self.late_seal_fault
         return await self.writer.await_seal_result()
 
-    async def publish_prefix(self) -> SealResultShape | None:
+    async def publish_prefix(self) -> SealResultShape | DurableSealShape | None:
         return await self.writer.publish_prefix()
 
     async def close(self, *, timeout: float) -> None:
@@ -376,8 +395,8 @@ class _WriterProxy:
         if self.close_fault is not None:
             raise self.close_fault
 
-    def publish(self, high_water: int) -> bool:
-        return self.writer.publish(high_water)
+    def publish(self, high_water: int, tail: bytes = b"") -> bool:
+        return self.writer.publish(high_water, tail)
 
     def submit_read_begin(self, notice: ReadBeginNotification) -> object:
         future = cast(asyncio.Future[object], self.writer.submit_read_begin(notice))
@@ -391,9 +410,11 @@ class _Runtime(OpportunisticRuntime):
         self.debug_errors: list[tuple[str, BaseException, dict[str, object]]] = []
         self.seal_fault: BaseException | None = None
         self.prepare_fault: BaseException | None = None
+        self.start_fault: BaseException | None = None
         self.close_fault: BaseException | None = None
         self.failure_fault: BaseException | None = None
         self.checkpoint_fault: BaseException | None = None
+        self.interrupt_fault: BaseException | None = None
         self.late_seal_fault: BaseException | None = None
         self.checkpoint_hook: Callable[[], None] | None = None
         self.restore_clock: Callable[[], None] | None = None
@@ -415,9 +436,13 @@ class _Runtime(OpportunisticRuntime):
         proxy.seal_fault = self.seal_fault
         self.seal_fault = None
         proxy.prepare_fault = self.prepare_fault
+        proxy.start_fault = self.start_fault
+        self.start_fault = None
         proxy.close_fault = self.close_fault
         proxy.failure_fault = self.failure_fault
         proxy.checkpoint_fault = self.checkpoint_fault
+        proxy.interrupt_fault = self.interrupt_fault
+        self.interrupt_fault = None
         proxy.late_seal_fault = self.late_seal_fault
         proxy.checkpoint_hook = self.checkpoint_hook
         proxy.restore_clock = self.restore_clock
@@ -513,7 +538,7 @@ def _install_confirmed_loss_retry_observers(
         events.append("rebind")
         original_read_begin(writer, notice)
 
-    def publish_prefix(writer: StagingWriter) -> SealResultShape | None:
+    def publish_prefix(writer: StagingWriter) -> SealResultShape | DurableSealShape | None:
         events.append("publish")
         return original_publish_prefix(writer)
 
@@ -531,7 +556,7 @@ def _assert_confirmed_loss(store: StagingStore, loss_id: str) -> None:
 
 
 def _make_cursor_ahead_loss_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _CursorAheadLossRetry:
-    store, _attempt_path, _raw, _checkpoint = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store, _source, _records = _seed_partial(tmp_path / "spool", tmp_path / "captures")
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     descriptor = store.pending_attempts()[0]
@@ -561,7 +586,7 @@ async def _assert_confirmed_loss_retry_completion(
     seen: RingInfo | None,
 ) -> None:
     assert seen is scenario.current
-    assert scenario.events == ["loss", "rebind", "publish"]
+    assert scenario.events == ["loss", "publish"]
     assert len(scenario.loss_ids) == 2 and scenario.loss_ids[0] == scenario.loss_ids[1]
     _assert_confirmed_loss(scenario.store, scenario.loss_ids[0])
     [metric] = scenario.metrics.losses
@@ -611,7 +636,7 @@ async def test_cursor_ahead_loss_is_durable_before_prefix_publish_and_idempotent
 async def test_confirmed_loss_write_failure_preserves_unpublished_audio(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store, attempt_path, raw_before, checkpoint_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    store, source_before, records_before = _seed_partial(tmp_path / "spool", tmp_path / "captures")
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     descriptor = store.pending_attempts()[0]
@@ -633,7 +658,7 @@ async def test_confirmed_loss_write_failure_preserves_unpublished_audio(
         events.append("rebind")
         original_read_begin(writer, notice)
 
-    def publish_prefix(writer: StagingWriter) -> SealResultShape | None:
+    def publish_prefix(writer: StagingWriter) -> SealResultShape | DurableSealShape | None:
         events.append("publish")
         return original_publish_prefix(writer)
 
@@ -655,11 +680,8 @@ async def test_confirmed_loss_write_failure_preserves_unpublished_audio(
         await session.close()
 
     assert store.pending_attempts() == (descriptor,)
-    assert (attempt_path / "records.bin").read_bytes() == raw_before
-    assert _attempt_state_bytes(store, descriptor.attempt_id) == checkpoint_before
-    attempt_state = attempt_payload(store, descriptor.attempt_id)
-    assert attempt_state is not None
-    assert attempt_state["prefix_publication"] is None
+    assert attempt_source(store, descriptor.attempt_id) == replace(source_before, lifecycle="interrupted")
+    assert attempt_records(store, descriptor.attempt_id) == records_before
     assert not tuple(store.capture_root.iterdir())
 
 
@@ -707,7 +729,7 @@ def _make_reconciler(
 @_async_test
 async def test_collect_only_adopts_seal_completed_before_ack_timeout(tmp_path: Path) -> None:
     runtime = _Runtime()
-    _store, reconciler = _make_reconciler(tmp_path, runtime, _options(advance=False))
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options(advance=False))
     session = ScriptedRingSession(RingStatus(0, 0, 0, 1), _real_batch_steps())
     current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
 
@@ -715,7 +737,7 @@ async def test_collect_only_adopts_seal_completed_before_ack_timeout(tmp_path: P
         return current
 
     try:
-        # Let seal publish the real bundle, then model a lost bounded ACK.
+        # Let seal persist typed SQL custody, then model a lost bounded ACK.
         runtime.seal_fault = CollectorTimeoutError("simulated lost seal acknowledgement")
         try:
             await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
@@ -726,15 +748,21 @@ async def test_collect_only_adopts_seal_completed_before_ack_timeout(tmp_path: P
         runtime_writer = runtime.proxies[0]
         await reconciler.checkpoint_after_session()
         adopted = await runtime_writer.await_seal_result()
-        assert adopted is not None
+        assert isinstance(adopted, DurableSqliteSeal)
         result, seen = await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
         assert (result, seen) == ("collected", current)
         collected = reconciler.drained_result()
         assert isinstance(collected, CollectionResult)
         assert collected.advance_confirmed is False
         assert all(command[0] != 0x12 for command in session.writes)
-        assert adopted.bundle_path.is_dir()
-        assert (adopted.bundle_path / "records.bin").read_bytes() == _record(100) + _record(101)
+        assert adopted.source_id == runtime_writer.attempt_id
+        source = attempt_source(store, adopted.source_id)
+        assert source is not None
+        assert source.lifecycle == "sealed_waiting"
+        assert source.committed_count == adopted.record_count == 2
+        assert source.committed_sha256 == adopted.raw_sha256
+        assert attempt_records(store, adopted.source_id) == (_record(100), _record(101))
+        assert not tuple(store.capture_root.iterdir())
         assert not runtime_writer.thread.is_alive()
     finally:
         await _close_real_writers(runtime)
@@ -761,8 +789,13 @@ async def test_fresh_info_regression_keeps_sealed_batch_without_advance(tmp_path
         assert all(command[0] != 0x12 for command in session.writes)
         assert calls == 1
         assert len(runtime.proxies) == 1
-        [bundle] = store.capture_root.glob("100-102-*")
-        assert (bundle / "records.bin").read_bytes() == _record(100) + _record(101)
+        source_id = runtime.proxies[0].attempt_id
+        source = attempt_source(store, source_id)
+        assert source is not None
+        assert source.lifecycle == "sealed_waiting"
+        assert source.committed_count == 2
+        assert attempt_records(store, source_id) == (_record(100), _record(101))
+        assert not tuple(store.capture_root.iterdir())
     finally:
         await _close_real_writers(runtime)
         await session.close()
@@ -1014,7 +1047,7 @@ async def test_admission_error_precedence_closes_real_writer(
     runtime = _Runtime()
     cause = StagingError("writer target failed")
     ordinary_primary = CursorConsistencyError("prepare rejected by test boundary")
-    runtime.prepare_fault = WriterFailedError("writer target failed") if primary_kind == "writer" else ordinary_primary
+    runtime.start_fault = WriterFailedError("writer target failed") if primary_kind == "writer" else ordinary_primary
     runtime.failure_fault = cause if primary_kind == "writer" else None
     runtime.close_fault = close_error
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
@@ -1077,6 +1110,28 @@ async def _admit_partial_and_cancel(reconciler: BatchReconciler, runtime: _Runti
         raise
 
 
+@_async_test
+async def test_checkpoint_after_interrupted_leg_adopts_ack_without_second_checkpoint(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    try:
+        interrupted = proxy.interrupted_prefix
+        assert interrupted is not None
+        assert interrupted.record_count == 1
+        assert proxy.checkpoint_calls == 0
+
+        await reconciler.checkpoint_after_session()
+
+        assert proxy.checkpoint_calls == 0
+        assert reconciler.pending_durable_next == interrupted.next_sequence
+        assert reconciler.durable_progress() == interrupted.next_sequence
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
 @pytest.mark.parametrize("late_fault", [None, OSError("late seal lookup failed")], ids=["no-seal", "late-error"])
 @_async_test
 async def test_finalize_retains_first_checkpoint_error_when_late_seal_is_absent(
@@ -1085,14 +1140,17 @@ async def test_finalize_retains_first_checkpoint_error_when_late_seal_is_absent(
     runtime = _Runtime()
     first = OSError("checkpoint failed")
     runtime.checkpoint_fault = first
+    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
     runtime.late_seal_fault = late_fault
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
     session = await _admit_partial_and_cancel(reconciler, runtime)
+    source_id = runtime.proxies[0].attempt_id
     try:
         result = await reconciler.finalize_active()
         assert result.checkpoint_error is first
         assert result.close_error is None
-        assert result.preserved_kind == "partial collection"
+        assert result.preserved_kind == "internal audio source"
+        assert result.preserved_source_id == source_id
         assert not runtime.proxies[0].thread.is_alive()
     finally:
         await _close_real_writers(runtime)
@@ -1113,11 +1171,13 @@ async def test_finalize_adopts_recognized_late_error_after_close(tmp_path: Path,
     runtime.late_seal_fault = late_error
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
     session = await _admit_partial_and_cancel(reconciler, runtime)
+    source_id = runtime.proxies[0].attempt_id
     try:
         result = await reconciler.finalize_active()
         assert result.checkpoint_error is late_error
         assert result.close_error is None
-        assert result.preserved_kind == "partial collection"
+        assert result.preserved_kind == "internal audio source"
+        assert result.preserved_source_id == source_id
         assert not runtime.proxies[0].thread.is_alive()
     finally:
         await _close_real_writers(runtime)
@@ -1131,10 +1191,13 @@ async def test_finalize_adopts_late_collector_timeout_after_close(tmp_path: Path
     runtime.late_seal_fault = late
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
     session = await _admit_partial_and_cancel(reconciler, runtime)
+    source_id = runtime.proxies[0].attempt_id
     try:
         result = await reconciler.finalize_active()
         assert result.checkpoint_error is late
         assert result.close_error is None
+        assert result.preserved_kind == "internal audio source"
+        assert result.preserved_source_id == source_id
         assert not runtime.proxies[0].thread.is_alive()
     finally:
         await _close_real_writers(runtime)
@@ -1242,11 +1305,13 @@ async def test_finalize_sealed_batch_skips_checkpoint_and_second_seal_adoption(t
             await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
         await reconciler.checkpoint_after_session()
         proxy = runtime.proxies[0]
+        source_id = proxy.attempt_id
         checkpoint_calls = proxy.checkpoint_calls
         result = await reconciler.finalize_active()
         assert result.checkpoint_error is None
         assert result.close_error is close_error
-        assert result.preserved_kind == "sealed bundle"
+        assert result.preserved_kind == "internal audio source"
+        assert result.preserved_source_id == source_id
         assert proxy.checkpoint_calls == checkpoint_calls
         assert proxy.seal_result_calls == 1
         assert not proxy.thread.is_alive()
@@ -1265,15 +1330,19 @@ async def test_failed_close_does_not_adopt_seal_again(tmp_path: Path, close_erro
     runtime = _Runtime()
     checkpoint_error = OSError("checkpoint failed")
     runtime.checkpoint_fault = checkpoint_error
+    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
     runtime.close_fault = close_error
     runtime.late_seal_fault = RuntimeError("late adoption is forbidden after failed close")
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
     session = await _admit_partial_and_cancel(reconciler, runtime)
+    source_id = runtime.proxies[0].attempt_id
     try:
         result = await reconciler.finalize_active()
         proxy = runtime.proxies[0]
         assert result.checkpoint_error is checkpoint_error
         assert result.close_error is close_error
+        assert result.preserved_kind == "internal audio source"
+        assert result.preserved_source_id == source_id
         assert proxy.seal_result_calls == 1
         assert not proxy.thread.is_alive()
     finally:
@@ -1286,6 +1355,7 @@ async def test_checkpoint_after_session_times_out_at_exact_writer_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = _Runtime()
+    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
     timeout = 1.0
     sleep_calls: list[float] = []
 
@@ -1322,6 +1392,7 @@ async def test_finalize_times_out_at_exact_writer_deadline_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = _Runtime()
+    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
     timeout = 1.0
     sleep_calls: list[float] = []
 

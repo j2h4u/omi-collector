@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Never
 
-from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification, RingInfo
+from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, RingInfo
 from ..domain.transfer_arena import TransferArena
 from . import batch_machine, collector
 from .operational_telemetry import OperationalEmitter
@@ -24,6 +24,7 @@ from .ports import (
     BatchWriterPort,
     CaptureRuntimePort,
     DurablePrefixShape,
+    DurableSealShape,
     SealResultShape,
     StagingPort,
 )
@@ -67,7 +68,7 @@ class _Batch:
     arena: TransferArena
     writer: BatchWriterPort
     durable: DurablePrefixShape | None = None
-    seal: SealResultShape | None = None
+    seal: SealResultShape | DurableSealShape | None = None
 
     @property
     def count(self) -> int:
@@ -82,7 +83,7 @@ class _ReconcileRestart:
 class _PrefixPublished:
     """A durable prefix was published before collection continues at the cursor."""
 
-    seal: SealResultShape | None
+    seal: SealResultShape | DurableSealShape | None
 
 
 @dataclass(slots=True)
@@ -109,7 +110,10 @@ class FinalizationResult:
 
     checkpoint_error: BaseException | None
     close_error: BaseException | None
+    # A path is meaningful only for an immutable public ready bundle.  An
+    # interrupted SQL-backed source is identified by its durable source ID.
     preserved_path: Path | None = None
+    preserved_source_id: str | None = None
     preserved_kind: str | None = None
 
 
@@ -225,10 +229,14 @@ class BatchReconciler:
         batch = self._state.batch
         if batch is None:
             return FinalizationResult(None, None)
+        # Closing the writer deliberately makes its target identity
+        # inaccessible. Retain it first so teardown cannot mask the cause.
+        attempt_id = batch.writer.attempt_id
         checkpoint_error, close_error = await _finalize_batch(batch, self._run.options, self._run.runtime)
-        preserved_path = batch.seal.bundle_path if batch.seal is not None else self._run.staging.attempts_root
-        preserved_kind = "sealed bundle" if batch.seal is not None else "partial collection"
-        return FinalizationResult(checkpoint_error, close_error, preserved_path, preserved_kind)
+        preserved_path = batch.seal.bundle_path if isinstance(batch.seal, SealResultShape) else None
+        preserved_source_id = None if preserved_path is not None else attempt_id
+        preserved_kind = "sealed bundle" if preserved_path is not None else "internal audio source"
+        return FinalizationResult(checkpoint_error, close_error, preserved_path, preserved_source_id, preserved_kind)
 
     def drained_result(self) -> collector.CollectResult:
         return _drained_result(self._state)
@@ -250,7 +258,7 @@ async def _checkpoint_after_session(state: _State, run: _Run) -> None:
     batch = state.batch
     if batch is None or batch.seal is not None:
         return
-    if await _adopt_seal_result(batch, run.options):
+    if await _adopt_completed_session_result(state, batch, run.options):
         return
     if not batch.writer.progress.submitted:
         return
@@ -417,7 +425,7 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
     )
     try:
         await writer.start()
-        prepared_prefix = await writer.prepare_leg(start, end - start)
+        prepared_prefix = writer.initial_prefix
         if durable_next is not None and prepared_prefix.next_sequence != durable_next:
             raise CursorConsistencyError("prepared durable prefix changed before recovery")
     except BaseException as error:
@@ -552,23 +560,15 @@ async def _read_or_reconcile(
     if cursor > prefix.next_sequence:
         return await _publish_cursor_ahead(current, batch, run, prefix.next_sequence, phase.quality)
     if cursor == batch.end:
-        # A restarted, fully checkpointed attempt has a persisted original
-        # READ_BEGIN but no live writer command yet.  Rebind it through the
-        # adapter so seal remains a writer-thread-only staging operation.
-        await _rebind_durable_batch(batch, options)
         return None
     if prefix.next_sequence == batch.end:
-        await _rebind_durable_batch(batch, options)
         return None
     # A prior process may have sealed/persisted all bytes before ADVANCE was
     # observed. Fresh INFO still governs; replaying the exact range is
     # duplicate-safe and prevents a blind disk-journal ADVANCE.
     await _report_activity(options.activity, "reading")
     read_start = max(cursor, prefix.next_sequence)
-    await _bounded(
-        batch.writer.prepare_leg(read_start, batch.end - read_start),
-        options.timeouts.transfer,
-    )
+    await joined_to_thread(run.staging.require_capture_space, batch.end - read_start)
     await _read_leg_with_progress(session, batch, read_start, options, phase.quality)
     prefix = await _checkpoint_batch(batch, options)
     if current.read_sequence > prefix.next_sequence:
@@ -669,11 +669,6 @@ async def _report_progress_safely(callback: collector.ProgressCallback, event: c
         return
 
 
-async def _rebind_durable_batch(batch: _Batch, options: OpportunisticOptions) -> None:
-    """Rebind a fully durable attempt before sealing it in this process."""
-    await _bounded(batch.writer.read_begin(ReadBeginNotification(batch.start, batch.count)), options.timeouts.transfer)
-
-
 async def _publish_cursor_ahead(
     current: RingInfo,
     batch: _Batch,
@@ -686,8 +681,7 @@ async def _publish_cursor_ahead(
     if not durable_next < cursor <= current.write_sequence or batch.end > current.write_sequence:
         raise CursorConsistencyError(f"device cursor {cursor} passed durable prefix {durable_next}")
     # No READ is legal after the device cursor passed the durable prefix.
-    # Activate the persisted original READ_BEGIN only so the writer can
-    # durably publish its checkpoint-authenticated prefix on its own thread.
+    # Publish the authenticated prefix directly from the prepared writer.
     occurred_at = utc_timestamp(options.host_time())
     loss_id = await joined_to_thread(
         run.staging.record_confirmed_loss,
@@ -696,7 +690,6 @@ async def _publish_cursor_ahead(
         cursor,
         occurred_at,
     )
-    await _rebind_durable_batch(batch, options)
     published = await _bounded(batch.writer.publish_prefix(), options.timeouts.transfer)
     await _report_loss_detected(
         options,
@@ -759,12 +752,33 @@ async def _checkpoint_batch(batch: _Batch, options: OpportunisticOptions) -> Dur
     return durable
 
 
+def _adopt_interrupted_prefix(batch: _Batch) -> DurablePrefixShape | None:
+    """Adopt the durable result already committed while ending the current leg."""
+    durable = batch.writer.interrupted_prefix
+    if durable is None:
+        return None
+    batch.durable = durable
+    return durable
+
+
 async def _adopt_seal_result(batch: _Batch, options: OpportunisticOptions) -> bool:
     """Record a seal command that outlived its original bounded await."""
     sealed = await _bounded(batch.writer.await_seal_result(), options.timeouts.transfer)
     if sealed is None:
         return False
     batch.seal = sealed
+    return True
+
+
+async def _adopt_completed_session_result(state: _State, batch: _Batch, options: OpportunisticOptions) -> bool:
+    """Adopt a terminal writer acknowledgment before issuing another checkpoint."""
+    if await _adopt_seal_result(batch, options):
+        return True
+    interrupted = _adopt_interrupted_prefix(batch)
+    if interrupted is None:
+        return False
+    state.pending_durable_next = interrupted.next_sequence
+    _retain_durable_frontier(state, interrupted)
     return True
 
 
@@ -782,7 +796,8 @@ async def _finalize_batch(
         if batch.seal is None:
             try:
                 sealed = await _adopt_seal_result(batch, options)
-                if not sealed and batch.writer.progress.submitted:
+                interrupted = _adopt_interrupted_prefix(batch) is not None
+                if not sealed and not interrupted and batch.writer.progress.submitted:
                     await _checkpoint_for_finalization(batch, options, runtime)
             except (OSError, collector.CollectorTimeoutError) as error:
                 checkpoint_error = error

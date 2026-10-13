@@ -219,8 +219,8 @@ system account and state ownership, protects the configuration, validates the
 staged unit, and restores the prior unit if installation cannot be reloaded or
 enabled. It never starts the service without `--restart`.
 It also provisions the fixed Collector data roots as
-`omi-collector:j2h4u` mode `2750`. The setgid bit keeps newly created attempts,
-quarantine entries, drafts, and ready bundles in the operator's read group.
+`omi-collector:j2h4u` mode `2750`. The setgid bit keeps new ready bundles and
+service-created files in the operator's read group.
 Each deployment reapplies these root modes and sets the SQLite state database
 to `omi-collector:j2h4u` mode `0640`; the singleton lock remains private
 `omi-collector:omi-collector` mode `0600`. This operator access is read-only:
@@ -263,38 +263,37 @@ derived directories when a downstream account also needs access.
 
 All mutable structured Collector state lives in
 `collector/collector-state.sqlite3`, using SQLite's DELETE rollback journal,
-`synchronous=EXTRA`, and a bounded busy timeout. Raw audio and authenticated
-draft/ready manifests remain filesystem artifacts; ready bundles contain only
-`records.bin` and `manifest.json`. Keep the separate, zero-content
+`synchronous=EXTRA`, and a bounded busy timeout. Private attempt, draft, and
+quarantine audio and its recovery evidence live in typed tables in that same
+database. Public ready bundles remain immutable filesystem artifacts containing
+only `records.bin` and `manifest.json`. Keep the separate, zero-content
 `collector/collector.lock` stable: the service holds its flock for the full
 invocation, and every state-mutating manual command and migration takes that
 same guard before opening writable state or performing BLE work. Read-only
 `device status` and `device metrics` may read the database while the service
 is active.
 
-The canonical systemd deployer stops the service and runs the staged
-`omi-collector migrate-state --config PATH --legacy-phy-state-home PATH`
-before restart, then assigns the database and stable lock to the unprivileged
-service account. For recovery after an interrupted cutover, keep the service
-stopped and rerun that command from the staged release while systemd reports
-inactive or failed. Migration acquires the canonical guard, restores
-any recognized legacy PHY marker, imports and validates the old state,
-checks raw and clock-normalization parity, activates the database, then
-deletes verified legacy mutable files directly. It does not create an archive
-or change ready audio/manifests. A validation or parity failure prevents
-activation. If cleanup is interrupted after activation, leave the service
-stopped and rerun `migrate-state`; the incomplete marker blocks runtime and
-mutating commands until cleanup and the final complete marker are verified.
-Changed or unclassified legacy files fail closed and require inspection.
-Never remove or replace `collector.lock` during migration.
-The known October 7 sparse recovery package is separately retained under the
-storage root. Migration authenticates its passport and raw SHA, preserves its
-physical sequence order and explicit unknown gaps, and imports the clock
-mapping needed by its retained records even when the current firmware frontier
-has moved past them. Runtime clock updates preserve existing ranges; there is
-no clock-range pruning path. The package is never part of legacy-file deletion.
-After database activation, do not restart an old release that reads the JSON
-control files; the deployer keeps the staged release selected on failure.
+The canonical systemd deployer fsyncs the sealed release and managed Python
+tree, screens backup space, and only then stops the service and durably selects
+the new release. It invokes that release's `omi-collector migrate-state
+--config PATH` before restart. Migration takes the stable guard,
+inventories the deployed v1 SQLite database and private files, reserves space
+for a full candidate backup, typed growth, rollback journal, and filesystem
+headroom, then records a source receipt. It builds and verifies a v2 candidate
+on the same filesystem, activates it, deletes only inventoried old private
+files, verifies service and operator access, and marks the receipt complete
+last. The command does not archive old raw audio or alter public ready bundles.
+An attributable or spool-rooted v1 quarantine, terminal-retired attempt, or unknown private
+artifact fails before the receipt; resolve custody manually instead of
+discarding it. Any later source change fails before activation. A validation
+or parity failure leaves the service
+stopped. To recover an interrupted cutover, keep the service stopped and rerun
+the selected new release's command; v1 resumes candidate preparation and v2
+resumes forward cleanup only. Runtime refuses known v1 state and incomplete v2
+receipts before BLE, with exit status 78 preventing a restart loop. Missing or
+unknown database state fails separately; runtime never creates a replacement.
+Never remove or replace `collector.lock` during migration, and never restart
+the old release after the new selector is durable.
 
 The retained ready-bundle ACK checkpoint under `work` is a real publication
 dependency. The producer must grant the trusted collector UID a numeric read
@@ -312,8 +311,9 @@ processing disabled until those checks pass; checkpoint readability alone
 does not show that an existing publication backlog was processed.
 
 After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
-builds the environment as the dedicated build account, copies dependencies into it,
-then seals the selected release as root-owned under
+checks the installed unit and fixed operator configuration, records the full
+source revision, builds the environment as the dedicated build account, and
+copies dependencies into it. It then seals the selected release as root-owned under
 `/var/lib/omi-collector-deployments`. The first successful deployment creates
 the `current` selector used by the fixed unit command.
 
@@ -325,13 +325,6 @@ through a dedicated `visudo -f /etc/sudoers.d/omi-collector-bluetoothctl` file.
 The base allowlist is the no-argument query plus `LE1MTX LE1MRX` and
 `LE1MTX LE1MRX LE2MTX LE2MRX`; add a different sequence only after observing it.
 Do not grant general `bluetoothctl`, shell, or unrestricted sudo access.
-
-Run `sudo scripts/deploy-systemd-service.sh` from the reviewed production
-checkout. It checks the installed unit against the checked-in unit, validates
-the fixed operator configuration with the staged application, records the full
-source revision inside the sealed environment, then atomically selects the
-release. Readiness or stability failure restores the previous verified
-environment.
 
 Docker is for packaging and runtime QA only; it is not a production Bluetooth
 supervisor. Keep production state and publication roots configured explicitly,

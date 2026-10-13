@@ -72,11 +72,14 @@ class WriterTarget(Protocol):
     def read_begin(self, notice: object) -> object:
         """Persist the beginning of the read represented by ``notice``."""
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
         """Append one contiguous slice beginning at ``offset``."""
 
     def checkpoint(self) -> object:
         """Durably checkpoint all bytes written so far."""
+
+    def interrupt(self) -> object:
+        """Persist an interrupted source after its exact frontier."""
 
     def seal(self, done_notice: object) -> object:
         """Seal and publish the target for a completed device read."""
@@ -169,6 +172,15 @@ class CheckpointCommand:
     """Flush bytes through this high-water mark, then checkpoint."""
 
     high_water: int
+    tail: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptCommand:
+    """Flush the exact receive frontier, then persist interruption."""
+
+    high_water: int
+    tail: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +189,7 @@ class SealCommand:
 
     high_water: int
     done_notice: object
+    tail: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +197,7 @@ class PublishPrefixCommand:
     """Flush published bytes, then publish the durable prefix."""
 
     high_water: int
+    tail: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +205,7 @@ class CloseCommand:
     """Flush bytes through this high-water mark, then close."""
 
     high_water: int
+    tail: bytes = b""
 
 
 type WriterCommand = (
@@ -198,6 +213,7 @@ type WriterCommand = (
     | PrepareLegCommand
     | ReadBeginCommand
     | CheckpointCommand
+    | InterruptCommand
     | SealCommand
     | PublishPrefixCommand
     | CloseCommand
@@ -239,7 +255,9 @@ class AttemptWriter:
         self._lock = Lock()
         self._wake = Event()
         self._published = 0
+        self._published_tail = b""
         self._written = 0
+        self._written_tail = b""
         self._durable_next_sequence: int | None = None
         self._durable_record_count: int | None = None
         self._state: AttemptWriterMachineState = Constructed()
@@ -311,7 +329,7 @@ class AttemptWriter:
         with self._lock:
             return failure_of(self._state)
 
-    def publish(self, high_water: int) -> bool:
+    def publish(self, high_water: int, tail: bytes = b"") -> bool:
         """Publish a monotonic source byte offset without waiting for disk I/O.
 
         The return value is ``True`` only when the offset advances the current
@@ -321,26 +339,39 @@ class AttemptWriter:
             raise ValueError(f"high_water must be between 0 and {len(self._arena)}")
         if high_water % RECORD_SIZE:
             raise ValueError(f"high_water must be record-aligned ({RECORD_SIZE} bytes)")
+        if not isinstance(tail, bytes) or len(tail) >= RECORD_SIZE:
+            raise ValueError(f"tail must be bytes shorter than {RECORD_SIZE} bytes")
+        if high_water + len(tail) > len(self._arena):
+            raise ValueError("tail exceeds the source arena")
+        if self._arena[high_water : high_water + len(tail)].tobytes() != tail:
+            raise ValueError("tail does not match the source arena")
         with self._lock:
             result = transition(self._state, PublishRequested())
             self._raise_rejection_locked(result.directive, publish=True)
-            if high_water <= self._published:
+            if high_water < self._published:
                 return False
+            if high_water == self._published:
+                if self._published_tail[: len(tail)] != tail[: len(self._published_tail)]:
+                    raise ValueError("tail conflicts with the published frontier")
+                if len(tail) <= len(self._published_tail):
+                    return False
             self._published = high_water
+            self._published_tail = tail
             self._wake.set()
             return True
 
-    async def start(self) -> None:
+    async def start(self) -> object:
         """Prepare the target attempt on the dedicated thread."""
-        future = self._admit(StartRequested(), lambda _high_water: PrepareCommand())
+        future = self._admit(StartRequested(), lambda _high_water, _tail: PrepareCommand())
         if future is not None:
-            await future
+            return await future
+        return None
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> object:
         """Prepare one target leg on the dedicated thread."""
         if start_sequence < 0 or record_count < 0:
             raise ValueError("leg sequence and record count must be non-negative")
-        future = self._admit(LegRequested(), lambda _high_water: PrepareLegCommand(start_sequence, record_count))
+        future = self._admit(LegRequested(), lambda _high_water, _tail: PrepareLegCommand(start_sequence, record_count))
         if future is None:
             return None
         return await future
@@ -352,7 +383,7 @@ class AttemptWriter:
     def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
         """Queue READ_BEGIN without waiting for target or disk progress."""
         try:
-            future = self._admit(ReadBeginRequested(), lambda _high_water: ReadBeginCommand(notice))
+            future = self._admit(ReadBeginRequested(), lambda _high_water, _tail: ReadBeginCommand(notice))
         except WriterFailedError as error:
             with self._lock:
                 future = self._new_future_locked()
@@ -375,11 +406,18 @@ class AttemptWriter:
         """Alias for :meth:`checkpoint`, emphasizing ordering semantics."""
         return await self.checkpoint()
 
+    async def interrupt(self) -> object:
+        """Flush the exact receive frontier, then persist interruption in order."""
+        future = self._admit(CheckpointRequested(), InterruptCommand)
+        if future is None:
+            return None
+        return await future
+
     async def seal(self, done_notice: object = None) -> object:
         """Flush published bytes and seal, unless the target has failed."""
         future = self._admit(
             FinalizeRequested(),
-            lambda high_water: SealCommand(high_water, done_notice),
+            lambda high_water, tail: SealCommand(high_water, done_notice, tail),
             finalization_message="writer seal is already pending",
         )
         if future is None:
@@ -474,7 +512,7 @@ class AttemptWriter:
     def _admit(
         self,
         event: AttemptWriterMachineEvent,
-        command_factory: Callable[[int], WriterCommand],
+        command_factory: Callable[[int, bytes], WriterCommand],
         *,
         finalization_message: str | None = None,
     ) -> asyncio.Future[object] | None:
@@ -490,7 +528,7 @@ class AttemptWriter:
             assert isinstance(result.directive, Admit)
             if not isinstance(event, CloseRequested) and len(self._commands) >= self._config.max_control_commands:
                 raise WriterQueueFullError("writer control queue is full")
-            command = command_factory(self._published)
+            command = command_factory(self._published, self._published_tail)
             future = self._new_future_locked()
             self._commands.append(_Pending(command, future))
             self._state = result.state
@@ -597,7 +635,7 @@ class AttemptWriter:
                 self._seal_result = result
                 self._seal_completed = True
             failure = failure_of(self._state)
-        if failure is None and isinstance(command, CheckpointCommand):
+        if failure is None and isinstance(command, CheckpointCommand | InterruptCommand):
             self._remember_durable_result(result)
         if failure is not None:
             self._complete(pending.future, None, WriterFailedError("writer target failed", failure))
@@ -632,38 +670,54 @@ class AttemptWriter:
         elif isinstance(command, ReadBeginCommand):
             result = self._target.read_begin(command.notice)
         elif isinstance(command, CheckpointCommand):
-            self._drain_data(command.high_water, exact=True)
+            self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.checkpoint()
+        elif isinstance(command, InterruptCommand):
+            self._drain_data(command.high_water, command.tail, exact=True)
+            result = self._target.interrupt()
         elif isinstance(command, SealCommand):
-            self._drain_data(command.high_water, exact=True)
+            self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.seal(command.done_notice)
         elif isinstance(command, PublishPrefixCommand):
-            self._drain_data(command.high_water, exact=True)
+            self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.publish_prefix()
         else:
             with self._lock:
                 state = self._state
             if isinstance(state, Closing) and state.failure is None and state.drain:
-                self._drain_data(command.high_water, exact=True)
+                self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.close()
         return result
 
-    def _drain_data(self, limit: int | None, *, exact: bool = False) -> bool:
+    def _drain_data(self, limit: int | None, tail: bytes | None = None, *, exact: bool = False) -> bool:
         with self._lock:
             target = self._published if limit is None else min(limit, self._published)
+            frontier_tail = self._published_tail if tail is None else tail
             start = self._written
+            written_tail = self._written_tail
         wrote = False
         while start < target:
             end = target
             end = min(end, start + self._config.chunk_records * RECORD_SIZE)
             chunk = self._arena[start:end].toreadonly()
-            self._target.append_chunk(start, chunk)
+            following = frontier_tail if end == target else b""
+            if following:
+                self._target.append_chunk(start, chunk, following)
+            else:
+                self._target.append_chunk(start, chunk)
             with self._lock:
                 self._written = end
+                self._written_tail = following
             wrote = True
             start = end
+            written_tail = following
             if not exact:
                 break
+        if start == target and frontier_tail != written_tail:
+            self._target.append_chunk(start, self._arena[start:start].toreadonly(), frontier_tail)
+            with self._lock:
+                self._written_tail = frontier_tail
+            wrote = True
         return wrote
 
     def _success_event(self, command: WriterCommand) -> AttemptWriterMachineEvent:
@@ -673,7 +727,7 @@ class AttemptWriter:
             return LegSucceeded()
         if isinstance(command, ReadBeginCommand):
             return ReadBeginSucceeded()
-        if isinstance(command, CheckpointCommand):
+        if isinstance(command, CheckpointCommand | InterruptCommand):
             return CheckpointSucceeded()
         if isinstance(command, SealCommand | PublishPrefixCommand):
             return FinalizeSucceeded()

@@ -306,6 +306,108 @@ function seal_managed_python {
         || die "managed Python installation must be root:root 0755: ${python_install_dir}"
 }
 
+function persist_sealed_tree {
+    # args
+    local -r tree_root="$1" parent_dir="$2" trusted_python="$3"
+
+    # code
+    # assert: only a sealed, real tree under its expected parent may be persisted
+    [[ "$tree_root" == "${parent_dir}"/* && -d "$tree_root" && ! -L "$tree_root" ]] \
+        || die "sealed deployment tree is missing or unsafe: ${tree_root}"
+    "$trusted_python" -I -B -S - "$tree_root" "$parent_dir" <<'PY' \
+        || die "could not durably persist sealed deployment tree: ${tree_root}"
+import os
+import stat
+import sys
+
+root, parent = sys.argv[1:]
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+for directory, _children, files, directory_fd in os.fwalk(root, topdown=False, follow_symlinks=False):
+    for name in files:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(entry.st_mode):
+            continue
+        if not stat.S_ISREG(entry.st_mode):
+            raise OSError(f"unsupported sealed tree entry: {directory}/{name}")
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    os.fsync(directory_fd)
+parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
+function screen_cutover_backup_space {
+    # args
+    local -r state_file="$1" trusted_python="$2"
+
+    # code
+    # assert: a live v1 snapshot has room for its copy, typed private audio, journal, and reserve before service stop
+    "$trusted_python" -I -B -S - "$state_file" <<'PY' \
+        || die 'Collector SQLite backup space screening failed before service stop'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    metadata = path.lstat()
+except FileNotFoundError:
+    raise SystemExit(0)
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("Collector state database is not a regular file")
+if metadata.st_size == 0:
+    raise SystemExit(0)
+with path.open("rb") as source:
+    header = source.read(100)
+if len(header) != 100 or not header.startswith(b"SQLite format 3\0"):
+    raise SystemExit("Collector state database has an invalid SQLite header")
+if int.from_bytes(header[60:64], "big") == 1:
+    page_size = int.from_bytes(header[16:18], "big")
+    page_size = 65536 if page_size == 1 else page_size
+    page_count = int.from_bytes(header[28:32], "big")
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        raise SystemExit("v1 SQLite page size is invalid")
+    candidate_base = max(metadata.st_size, page_count * page_size)
+    private_bytes = 0
+    private_entries = 0
+    for root in (path.parent / "attempts", path.parent / "quarantine", path.parent.parent / "draft"):
+        if root.is_symlink():
+            raise SystemExit(f"private Collector root is a symlink: {root}")
+        if not root.exists():
+            continue
+        for directory, children, files in os.walk(root, followlinks=False):
+            private_entries += len(children) + len(files)
+            children[:] = [name for name in children if not (Path(directory) / name).is_symlink()]
+            for name in files:
+                item = (Path(directory) / name).lstat()
+                if stat.S_ISREG(item.st_mode):
+                    private_bytes += item.st_size
+    # Every private byte is conservatively treated as candidate record data; metadata is counted again.
+    record_pages = 2 * ((private_bytes + 443) // 444)
+    typed_growth = (64 + record_pages + 4 * private_entries) * page_size
+    journal_bound = max(candidate_base + 16 * page_size, (2 * 128 + 64) * page_size)
+    headroom = 64 * 1024 * 1024
+    required = candidate_base + typed_growth + journal_bound + headroom
+    filesystem = os.statvfs(path.parent)
+    available = filesystem.f_bavail * filesystem.f_frsize
+    if available < required:
+        raise SystemExit(
+            f"v1 cutover space is insufficient: page_count={page_count} "
+            f"candidate_base={candidate_base} typed_growth={typed_growth} "
+            f"journal_bound={journal_bound} headroom={headroom} "
+            f"required={required} available={available}"
+        )
+PY
+}
+
 function verify_installed_package {
     # args
     local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" environment="$5" source_package="$6"
@@ -366,28 +468,25 @@ function validate_candidate_config {
 
 function migrate_stopped_collector_state {
     # args
-    local -r environment="$1" config_file="$2" state_file="$3" legacy_phy_home="$4"
-    local -r runuser_bin="$5" account_user="$6" account_group="$7" operator_group="$8"
+    local -r environment="$1" config_file="$2" state_file="$3"
+    local -r runuser_bin="$4" account_user="$5" account_group="$6" operator_group="$7"
     local -r lock_file="${state_file%/*}/collector.lock"
 
     # code
     [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
     "$environment/bin/omi-collector" migrate-state --config "$config_file" \
-        --legacy-phy-state-home "$legacy_phy_home" \
         || die 'offline Collector state migration failed; service remains stopped'
     [[ ! -e "$lock_file" && ! -L "$lock_file" ]] \
         || [[ -f "$lock_file" && ! -L "$lock_file" ]] \
         || die "Collector singleton lock is not a regular file: ${lock_file}"
-    if [[ ! -e "$state_file" ]]; then
-        return
-    fi
     [[ -f "$state_file" && ! -L "$state_file" ]] \
-        || die "Collector state database is not a regular file: ${state_file}"
+        || die "offline migration did not install a regular Collector state database: ${state_file}"
     [[ -f "$lock_file" && ! -L "$lock_file" ]] \
         || die "Collector singleton lock is not a regular file: ${lock_file}"
-    chown "$account_user:$operator_group" -- "$state_file" \
-        || die 'could not assign Collector state database to the service account'
-    chmod 0640 -- "$state_file" || die 'could not set Collector state database mode'
+    # The migrator verifies this handoff before its COMPLETE receipt.  The
+    # wrapper checks it again but must not perform the handoff afterward.
+    [[ $(stat -c '%U:%G:%a' -- "$state_file") == "${account_user}:${operator_group}:640" ]] \
+        || die 'Collector state database ownership or mode is unexpected after migration'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -r "$state_file" \
         || die 'service account cannot read Collector state database'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "$state_file" \
@@ -465,6 +564,38 @@ function read_current_target {
     printf -v "$output_name" '%s' "$target"
 }
 
+function canonical_is_previous_runtime_state {
+    # Restart the previous release only while its v1 state is still intact.
+    "$sealer_python" - "$state_file" <<'PY'
+import json
+import sqlite3
+import stat
+import sys
+from contextlib import closing
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError("unsafe canonical inode")
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()
+        row = connection.execute(
+            "SELECT payload FROM state WHERE kind='migration' AND id='current'"
+        ).fetchone()
+        cutover = connection.execute(
+            "SELECT 1 FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
+        ).fetchone()
+        receipt = json.loads(row[0]) if row is not None else None
+    if version != (1,) or cutover is not None:
+        raise ValueError("canonical state is not accepted v1")
+    if receipt != {"version": 1, "phase": "complete"}:
+        raise ValueError("canonical v1 receipt is incomplete")
+except (OSError, sqlite3.Error, ValueError, TypeError):
+    raise SystemExit(1)
+PY
+}
+
 function publish_current_target {
     # args
     local -r current_link="$1" target="$2" temporary_link="$3"
@@ -475,29 +606,16 @@ function publish_current_target {
         || die "temporary deployment selector already exists: ${temporary_link}"
     ln --symbolic -- "$target" "$temporary_link" || die 'could not stage current deployment selector'
     mv -T -- "$temporary_link" "$current_link" || die 'could not publish current deployment selector'
-}
+    "$sealer_python" - "${current_link%/*}" <<'PY' || die 'could not durably publish current deployment selector'
+import os
+import sys
 
-function rollback_deployment {
-    # args
-    local -r service_name="$1" current_link="$2" previous_target="$3" temporary_link="$4"
-    local -r failed_release="$5" deployments_dir="$6"
-
-    # code
-    systemctl stop "$service_name" || return 1
-    if [[ -n "$previous_target" ]]; then
-        publish_current_target "$current_link" "$previous_target" "$temporary_link" || return 1
-        systemctl restart "$service_name" || return 1
-        read_service_snapshot "$service_name" &> /dev/null || return 1
-    else
-        rm -f -- "$current_link" || return 1
-    fi
-    service_quiesced=0
-    selection_published=0
-    if [[ "$failed_release" == "${deployments_dir}"/release-* && -d "$failed_release" && ! -L "$failed_release" ]]; then
-        rm -rf -- "$failed_release" || return 1
-        release_created=0
-    fi
-    printf 'Restored the prior deployment state.\n' >&2
+directory = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
 }
 
 function prune_obsolete_deployments {
@@ -538,7 +656,7 @@ declare script_dir repo_root source_package source_unit installed_unit config_fi
 declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user account_group operator_group build_user build_group
 declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
-declare state_file candidate_state_file legacy_phy_state_home
+declare state_file
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
 declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0
@@ -572,8 +690,6 @@ python_install_dir='/var/lib/omi-collector-deployments/python'
 deployment_lock_file='/var/lib/omi-collector-deployments/.deployment.lock'
 current_link='/var/lib/omi-collector-deployments/current'
 state_file='/srv/pipelines/omi/collector/collector-state.sqlite3'
-candidate_state_file='/srv/pipelines/omi/collector/.collector-state.sqlite3.migrating'
-legacy_phy_state_home='/home/j2h4u/.local/state'
 temporary_link="${deployment_root}/.current.${BASHPID}.${RANDOM}"
 release_path=''
 staged_environment=''
@@ -596,43 +712,58 @@ function cleanup {
 
 function finalize {
     # vars
-    local -i final_status=$? rollback_failed=0 forward_only=0
+    local -i final_status=$? recovery_failed=0
+    local selected_target=''
+    local -i selector_readable=0
 
     # code
     trap '' INT TERM HUP QUIT USR1 USR2
-    if (( service_quiesced || selection_published )) && [[ -e "$state_file" || -L "$state_file" ]]; then
-        forward_only=1
+    if [[ -L "$current_link" ]]; then
+        if selected_target=$(readlink -- "$current_link"); then
+            selector_readable=1
+        fi
+    elif [[ ! -e "$current_link" ]]; then
+        selector_readable=1
     fi
     if (( deployment_committed )); then
         selection_published=0
-    elif (( forward_only )); then
+    elif (( ! service_quiesced && ! selection_published )); then
+        : # The deployer has not stopped the service or attempted selector publication.
+    elif (( selector_readable )) && [[ "$selected_target" == "releases/${release_name}" ]]; then
+        selection_published=1
         if ! systemctl stop "$service_name"; then
-            rollback_failed=1
+            recovery_failed=1
         fi
-        if (( ! selection_published )); then
-            if publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"; then
-                selection_published=1
-            else
-                rollback_failed=1
+        printf 'ERROR: selected new release requires forward Collector recovery; service is stopped and recovery state retained\n' >&2
+        recovery_failed=1
+    elif (( selector_readable )) && [[ "$selected_target" == "$previous_target" ]]; then
+        if canonical_is_previous_runtime_state; then
+            selection_published=0
+            if (( service_quiesced )) && [[ -n "$previous_target" ]]; then
+                if systemctl start "$service_name"; then
+                    service_quiesced=0
+                else
+                    recovery_failed=1
+                    printf 'ERROR: could not restart the previous deployment; recovery artifacts were retained\n' >&2
+                fi
             fi
-        fi
-        printf 'ERROR: Collector state cutover requires the new release; service is stopped and recovery state retained\n' >&2
-        rollback_failed=1
-    elif (( selection_published )); then
-        if ! rollback_deployment "$service_name" "$current_link" "$previous_target" "$temporary_link" \
-            "$staged_environment" "$deployments_dir"; then
-            rollback_failed=1
-            printf 'ERROR: could not restore the previous deployment; recovery artifacts were retained\n' >&2
-        fi
-    elif (( service_quiesced )) && [[ -n "$previous_target" ]]; then
-        if systemctl start "$service_name"; then
-            service_quiesced=0
         else
-            rollback_failed=1
-            printf 'ERROR: could not restart the previous deployment; recovery artifacts were retained\n' >&2
+            selection_published=1
+            if ! systemctl stop "$service_name"; then
+                recovery_failed=1
+            fi
+            printf 'ERROR: canonical state is not accepted v1; previous runtime remains stopped for forward recovery\n' >&2
+            recovery_failed=1
         fi
+    else
+        selection_published=1
+        if ! systemctl stop "$service_name"; then
+            recovery_failed=1
+        fi
+        printf 'ERROR: deployment selector is ambiguous; service is stopped and recovery state retained\n' >&2
+        recovery_failed=1
     fi
-    cleanup "$rollback_failed"
+    cleanup "$recovery_failed"
     trap - EXIT
     exit "$final_status"
 }
@@ -702,20 +833,20 @@ seal_managed_python "$python_install_dir" "$deployment_root" "$sealer_python" "$
 seal_deployment_environment "$staged_environment" "$deployments_dir" "$sealer_python" "$sealer_script" "$sealer_owner" \
     "$python_install_dir"
 write_release_metadata "$staged_environment" "$deployments_dir" "$source_revision"
+persist_sealed_tree "$python_install_dir" "$deployment_root" "$sealer_python"
+persist_sealed_tree "$staged_environment" "$deployments_dir" "$sealer_python"
+screen_cutover_backup_space "$state_file" "$sealer_python"
 validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
 provision_operator_data_access "${state_file%/collector/collector-state.sqlite3}" "$account_user" "$operator_group"
-[[ ! -e "$candidate_state_file" && ! -L "$candidate_state_file" ]] \
-    || die "unfinished Collector state migration candidate needs inspection: ${candidate_state_file}"
-
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"
 [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
 prepare_service_singleton_lock "${state_file%/*}/collector.lock" "$runuser_bin" "$account_user" "$account_group" \
     || die 'could not prepare the stable Collector singleton lock for migration'
-migrate_stopped_collector_state "$staged_environment" "$config_file" "$state_file" "$legacy_phy_state_home" \
-    "$runuser_bin" "$account_user" "$account_group" "$operator_group"
 selection_published=1
 publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"
+migrate_stopped_collector_state "$current_link" "$config_file" "$state_file" \
+    "$runuser_bin" "$account_user" "$account_group" "$operator_group"
 systemctl restart "$service_name" || die "could not restart ${service_name}"
 initial_snapshot=$(read_service_snapshot "$service_name") \
     || die "${service_name} did not provide a valid active-process snapshot after deployment"

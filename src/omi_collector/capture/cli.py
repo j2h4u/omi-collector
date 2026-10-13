@@ -35,6 +35,7 @@ from .application.opportunistic_sync import (
     CollectionPreservedCancelledError,
     run_opportunistic_collector,
 )
+from .application.ports import DurableSealShape
 from .application.presence import PresencePolicy, PresenceScheduler
 from .application.ring_transport import CandidateUnavailableError, RingSession
 from .application.session_lifecycle import ActivityEvent, OpportunisticOptions, RetryPolicy
@@ -567,7 +568,7 @@ def render_info(info_result: RingInfo) -> str:
 
 
 def render_collect(result: collector.CollectResult, metrics: DownloadMetrics | None = None) -> str:
-    """Render sealed-bundle metadata, never ring-record or audio bytes."""
+    """Render durable custody metadata, never ring-record or audio bytes."""
     if isinstance(result, collector.NoDataResult):
         payload: dict[str, object] = {
             "read_sequence": result.info.read_sequence,
@@ -578,17 +579,13 @@ def render_collect(result: collector.CollectResult, metrics: DownloadMetrics | N
         if metrics is not None:
             payload.update(metrics.as_dict())
         return _json(payload)
-    seal = _require_seal(result)
-    manifest = _bundle_manifest(seal.bundle_path)
     payload = {
-        "bundle_path": str(seal.bundle_path),
-        "deduplicated": seal.deduplicated,
         "next_sequence": result.info.read_sequence + result.packet_count,
-        "raw_sha256": manifest.get("raw_sha256"),
         "record_count": result.packet_count,
         "start_sequence": result.info.read_sequence,
         "status": "sealed",
     }
+    payload.update(_custody_fields(result))
     if metrics is not None:
         payload.update(metrics.as_dict())
     return _json(payload)
@@ -604,18 +601,14 @@ def render_sync(result: collector.CollectResult, metrics: DownloadMetrics) -> st
             "write_sequence": result.info.write_sequence,
         }
     else:
-        seal = _require_seal(result)
-        manifest = _bundle_manifest(seal.bundle_path)
         payload = {
             "advance_confirmed": result.advance_confirmed,
-            "bundle_path": str(seal.bundle_path),
-            "deduplicated": seal.deduplicated,
             "next_sequence": result.next_sequence,
-            "raw_sha256": manifest.get("raw_sha256"),
             "record_count": result.packet_count,
             "start_sequence": result.info.read_sequence,
             "status": "synced",
         }
+        payload.update(_custody_fields(result))
     payload.update(metrics.as_dict())
     return _json(payload)
 
@@ -630,6 +623,25 @@ def _require_seal(result: collector.CollectionResult) -> SealResult:
     if not isinstance(seal, SealResult):
         raise RuntimeError("sealed bundle metadata is unavailable")
     return seal
+
+
+def _custody_fields(result: collector.CollectionResult) -> dict[str, object]:
+    seal = result.seal
+    if isinstance(seal, DurableSealShape):
+        if (
+            seal.start_sequence != result.info.read_sequence
+            or seal.record_count != result.packet_count
+            or seal.next_sequence != seal.start_sequence + seal.record_count
+        ):
+            raise RuntimeError("durable source receipt does not match collection")
+        return {"source_id": seal.source_id, "raw_sha256": seal.raw_sha256}
+    public = _require_seal(result)
+    manifest = _bundle_manifest(public.bundle_path)
+    return {
+        "bundle_path": str(public.bundle_path),
+        "deduplicated": public.deduplicated,
+        "raw_sha256": manifest.get("raw_sha256"),
+    }
 
 
 def _require_supported_adapter(adapter: str) -> None:

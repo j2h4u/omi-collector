@@ -8,8 +8,12 @@ from os import fsync, statvfs
 from pathlib import Path
 from typing import cast
 
-from omi_collector.capture.adapters.attempts import StagedAttempt
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.internal_audio_store import (
+    CaptureSource,
+    InternalAudioStore,
+    read_capture_source,
+)
 from omi_collector.capture.adapters.staging_filesystem import DEFAULT_STAGING_IO, StagingIO, StagingPaths
 from omi_collector.capture.adapters.staging_store import StagingStore as _StagingStore
 from omi_collector.config import CollectorConfig
@@ -76,14 +80,15 @@ def closure_rows(store: StagingStore) -> list[dict[str, object]]:
     return cast(list[dict[str, object]], closures) if isinstance(closures, list) else []
 
 
-def attempt_payload(store: StagingStore, attempt_id: str) -> dict[str, object] | None:
-    """Read one authoritative attempt row for direct state assertions."""
-    return store.state_db.get(StateKind.ATTEMPT, attempt_id)
+def attempt_source(store: StagingStore, attempt_id: str) -> CaptureSource | None:
+    """Read the typed SQL source snapshot used by an attempt."""
+    return read_capture_source(store.state_db, attempt_id)
 
 
-def staged_attempt_payload(attempt: StagedAttempt) -> dict[str, object] | None:
-    """Read the authoritative row through an attempt used directly by tests."""
-    return attempt._filesystem.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
+def attempt_records(store: StagingStore, attempt_id: str) -> tuple[bytes, ...]:
+    """Read committed attempt records through the typed SQL store."""
+    with InternalAudioStore(store.state_db) as audio_store:
+        return tuple(record.raw_bytes for record in audio_store.read_record_page(attempt_id, limit=128))
 
 
 def quarantine_payload(store: StagingStore, item_id: str) -> dict[str, object]:

@@ -122,6 +122,11 @@ class StateTransaction(_Operations):
         row = super().get(StateKind.PUBLICATION_GENERATION, "current")
         return _generation_value(row)
 
+    def mark_publication_changed(self) -> None:
+        """Wake publication for a typed audio mutation in this transaction."""
+
+        self._publication_changed = True
+
     def payload_bytes(self, kind: StateKind, *, row_overhead: int = 0) -> int:
         _validate_kind(kind)
         if type(row_overhead) is not int or row_overhead < 0:
@@ -520,7 +525,9 @@ _AUDIO_DDL = (
         "committed_count INTEGER NOT NULL DEFAULT 0 CHECK (committed_count BETWEEN 0 AND 4294967295),"
         "committed_sha256 TEXT NOT NULL CHECK (length(committed_sha256) = 64 AND lower(committed_sha256) = committed_sha256 AND committed_sha256 NOT GLOB '*[^0-9a-f]*'),"
         "closure_frontier BLOB CHECK (closure_frontier IS NULL OR (typeof(closure_frontier) = 'blob' AND length(closure_frontier) = 8)),"
-        "block_reason TEXT, terminal_reason TEXT, terminal_time TEXT, retention_deadline TEXT,"
+        "block_reason TEXT, quarantine_disposition TEXT CHECK (quarantine_disposition IS NULL OR quarantine_disposition IN ('unclassified','published_prefix','unprocessable')) ,"
+        "quarantine_opaque INTEGER CHECK (quarantine_opaque IS NULL OR quarantine_opaque IN (0,1)),"
+        "terminal_reason TEXT, terminal_time TEXT, retention_deadline TEXT,"
         "certified_prefix_count INTEGER CHECK (certified_prefix_count IS NULL OR certified_prefix_count BETWEEN 0 AND 4294967295),"
         "coverage_digest TEXT CHECK (coverage_digest IS NULL OR (length(coverage_digest) = 64 AND lower(coverage_digest) = coverage_digest AND coverage_digest NOT GLOB '*[^0-9a-f]*')),"
         "retirement_cursor INTEGER CHECK (retirement_cursor IS NULL OR retirement_cursor BETWEEN 0 AND 4294967295),"
@@ -557,12 +564,13 @@ _AUDIO_DDL = (
     ),
     _ddl(
         "CREATE TABLE capture_evidence ("
-        "evidence_id TEXT PRIMARY KEY NOT NULL, source_id TEXT, entry_kind TEXT NOT NULL CHECK (entry_kind IN ('regular','symlink')),"
+        "evidence_id TEXT PRIMARY KEY NOT NULL, source_id TEXT, entry_kind TEXT NOT NULL CHECK (entry_kind IN ('regular','symlink','directory')) ,"
         "original_relative_path TEXT NOT NULL, device INTEGER NOT NULL CHECK (device >= 0), inode INTEGER NOT NULL CHECK (inode >= 0),"
         "mode INTEGER NOT NULL CHECK (mode >= 0), size INTEGER NOT NULL CHECK (size >= 0), sha256 TEXT, symlink_text BLOB,"
-        "disposition TEXT CHECK (disposition IS NULL OR disposition IN ('unclassified','published_prefix','unprocessable')), terminal_time TEXT, retention_deadline TEXT, reason TEXT,"
+        "disposition TEXT CHECK (disposition IS NULL OR disposition IN ('unclassified','published_prefix','unprocessable')), terminal_time TEXT, retention_deadline TEXT, reason TEXT, terminal_reason TEXT,"
         "CHECK ((entry_kind = 'regular' AND sha256 IS NOT NULL AND length(sha256) = 64 AND lower(sha256) = sha256 AND sha256 NOT GLOB '*[^0-9a-f]*' AND symlink_text IS NULL) OR"
-        " (entry_kind = 'symlink' AND symlink_text IS NOT NULL AND typeof(symlink_text) = 'blob' AND sha256 IS NULL)),"
+        " (entry_kind = 'symlink' AND symlink_text IS NOT NULL AND typeof(symlink_text) = 'blob' AND sha256 IS NULL) OR"
+        " (entry_kind = 'directory' AND size = 0 AND sha256 IS NULL AND symlink_text IS NULL)),"
         "FOREIGN KEY (source_id) REFERENCES capture_source(source_id) ON DELETE SET NULL"
         ") WITHOUT ROWID"
     ),
@@ -585,6 +593,9 @@ _AUDIO_DDL = (
         "CREATE TABLE publication_cohort_member ("
         "cohort_id TEXT NOT NULL, member_ordinal INTEGER NOT NULL CHECK (member_ordinal BETWEEN 0 AND 4294967295), source_id TEXT NOT NULL,"
         "slice_start INTEGER NOT NULL CHECK (slice_start BETWEEN 0 AND 4294967295), slice_count INTEGER NOT NULL CHECK (slice_count BETWEEN 0 AND 4294967295),"
+        "admitted_lifecycle TEXT NOT NULL CHECK (admitted_lifecycle IN ('sealed_waiting','blocked')),"
+        "admitted_count INTEGER NOT NULL CHECK (admitted_count BETWEEN 0 AND 4294967295),"
+        "admitted_sha256 TEXT NOT NULL CHECK (length(admitted_sha256) = 64 AND lower(admitted_sha256) = admitted_sha256 AND admitted_sha256 NOT GLOB '*[^0-9a-f]*'),"
         "cursor INTEGER NOT NULL DEFAULT 0 CHECK (cursor BETWEEN 0 AND 4294967295), PRIMARY KEY (cohort_id, member_ordinal),"
         "FOREIGN KEY (cohort_id) REFERENCES publication_cohort(cohort_id) ON DELETE CASCADE, FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
         ") WITHOUT ROWID"
@@ -603,12 +614,23 @@ _AUDIO_DDL = (
         "CREATE TABLE ready_stage_range ("
         "stage_id TEXT NOT NULL, range_ordinal INTEGER NOT NULL CHECK (range_ordinal BETWEEN 0 AND 4294967295), source_id TEXT NOT NULL,"
         "start_ordinal INTEGER NOT NULL CHECK (start_ordinal BETWEEN 0 AND 4294967295), record_count INTEGER NOT NULL CHECK (record_count BETWEEN 0 AND 4294967295),"
+        "sequence_start BLOB NOT NULL CHECK (length(sequence_start) = 8), next_sequence BLOB NOT NULL CHECK (length(next_sequence) = 8 AND next_sequence > sequence_start),"
         "device_start INTEGER NOT NULL CHECK (device_start BETWEEN 0 AND 4294967295), device_end INTEGER NOT NULL CHECK (device_end BETWEEN 0 AND 4294967295),"
         "utc_start INTEGER CHECK (utc_start IS NULL OR utc_start BETWEEN 0 AND 4294967295), utc_end INTEGER CHECK (utc_end IS NULL OR utc_end BETWEEN 0 AND 4294967295),"
+        "utc_observation_id TEXT, utc_offset_seconds REAL, utc_uncertainty_seconds REAL,"
+        "utc_confidence TEXT CHECK (utc_confidence IN ('confirmed','approximate')) ,"
+        "CHECK ((utc_start IS NULL AND utc_end IS NULL AND utc_observation_id IS NULL AND utc_offset_seconds IS NULL AND utc_uncertainty_seconds IS NULL AND utc_confidence IS NULL) OR "
+        "(utc_start IS NOT NULL AND utc_end IS NOT NULL AND utc_observation_id IS NOT NULL AND utc_offset_seconds IS NOT NULL AND utc_uncertainty_seconds IS NOT NULL AND utc_confidence IS NOT NULL)),"
         "PRIMARY KEY (stage_id, range_ordinal), FOREIGN KEY (stage_id) REFERENCES ready_output_stage(stage_id) ON DELETE CASCADE, FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
         ") WITHOUT ROWID"
     ),
 )
+
+_AUDIO_INDEXES = {
+    "capture_record_mapping_revision_idx": (
+        "CREATE INDEX capture_record_mapping_revision_idx ON capture_record (mapping_revision, source_id, ordinal)"
+    ),
+}
 
 
 def install_audio_schema(connection: sqlite3.Connection) -> None:
@@ -629,6 +651,13 @@ def install_audio_schema(connection: sqlite3.Connection) -> None:
     for table, ddl in zip(_AUDIO_TABLES, _AUDIO_DDL, strict=True):
         if table not in tables:
             connection.execute(ddl)
+    indexes = {
+        _row_text(row, 0)
+        for row in _fetchall(connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'"))
+    }
+    for name, ddl in _AUDIO_INDEXES.items():
+        if name not in indexes:
+            connection.execute(ddl)
     connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     _validate_audio_schema(connection)
 
@@ -647,6 +676,10 @@ def _validate_audio_schema(connection: sqlite3.Connection) -> None:
     for table, ddl in zip(_AUDIO_TABLES, _AUDIO_DDL, strict=True):
         if _normalize_sql(statements[table]) != _normalize_sql(ddl):
             raise StateDBError("state database typed table is unsupported")
+    for name, ddl in _AUDIO_INDEXES.items():
+        row = _fetchone(connection.execute("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)))
+        if row is None or _normalize_sql(_row_text(row, 0)) != _normalize_sql(ddl):
+            raise StateDBError("state database typed projection index is unsupported")
 
 
 def _normalize_sql(statement: str) -> str:

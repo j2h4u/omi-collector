@@ -1,4 +1,4 @@
-"""Adversarial same-path, retry-deadline, and shutdown publication races."""
+"""Adversarial typed-source, retry-deadline, and shutdown publication races."""
 
 from __future__ import annotations
 
@@ -17,67 +17,78 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import staging_store as staging_store_module
-from omi_collector.capture.adapters.bundle_contract import BundleManifest
+from omi_collector.capture.adapters.internal_audio_store import (
+    AUDIO_RECORD_SIZE,
+    CaptureRecord,
+    DrainCheckpoint,
+    InternalAudioStore,
+)
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import (
-    ConflictingOverlapError,
     ReadyBundleError,
     ReadyOutcome,
     ReadyOutcomeState,
+    SqlitePublicationSource,
 )
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
+from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
 from staging_test_factory import StagingStore
-from test_publication_fsm import _count_raw_reads, _draft, _store
+from test_publication_fsm import _store
 
 
-def _conflicting_overlap(store: StagingStore) -> Path:
-    _draft(store, "first", 100, 2)
-    overlap = _draft(store, "overlap", 101)
-    raw = bytearray((overlap / "records.bin").read_bytes())
-    raw[-1] ^= 1
+def _record(sequence: int) -> bytes:
+    return sequence.to_bytes(4, "big") + bytes((2, 8, sequence % 256)) + bytes(AUDIO_RECORD_SIZE - 7)
+
+
+def _add_source(store: StagingStore, start: int, count: int = 1) -> None:
+    attempt = store.prepare_streaming_attempt(start, count)
+    attempt.prepare_leg(start, count)
+    attempt.record_read_begin(ReadBeginNotification(start, count))
+    attempt.accept_chunk(start, b"".join(_record(sequence) for sequence in range(start, start + count)))
+    attempt.seal(DoneNotification(0, start + count))
+    attempt.close()
+
+
+def _insert_source(audio_store: InternalAudioStore, source_id: str, start: int, raw: bytes) -> None:
+    count = len(raw) // AUDIO_RECORD_SIZE
     digest = sha256(raw).hexdigest()
-    (overlap / "records.bin").write_bytes(raw)
-    (overlap / "manifest.json").write_text(
-        dumps(BundleManifest(2, 101, 102, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
+    audio_store.create_source(source_id, "attempt", start, start + count)
+    audio_store.prepare_leg(source_id, start, count)
+    audio_store.record_read_begin(source_id, start, count)
+    audio_store.commit_drain(
+        source_id,
+        0,
+        (raw[offset : offset + AUDIO_RECORD_SIZE] for offset in range(0, len(raw), AUDIO_RECORD_SIZE)),
+        DrainCheckpoint(1, expected_sha256=digest),
     )
-    return overlap
+    audio_store.seal_source(
+        source_id,
+        leg_generation=1,
+        expected_count=count,
+        expected_sha256=digest,
+    )
 
 
-def _replace_draft_files(store: StagingStore, path: Path, start: int, count: int) -> int:
-    replacement = _draft(store, "replacement", start, count)
-    previous_inode = (path / "records.bin").stat().st_ino
-    for name in ("records.bin", "manifest.json"):
-        (replacement / name).replace(path / name)
-    replacement.rmdir()
-    return previous_inode
+def _patch_finalize_to_add_exact_source(monkeypatch: pytest.MonkeyPatch, raw: bytes) -> list[tuple[str, ...]]:
+    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_typed_sources)
+    admitted_sources: list[tuple[str, ...]] = []
 
+    def add_after_first_attempt(*args: object, **kwargs: object) -> ReadyOutcome:
+        sources = cast(tuple[SqlitePublicationSource, ...], args[1])
+        admitted_sources.append(tuple(source.source_id for source in sources))
+        result = original(*args, **kwargs)
+        if len(admitted_sources) == 1:
+            _insert_source(cast(InternalAudioStore, args[0]), "b" * 32, 100, raw)
+        return result
 
-def _patch_finalize_to_resolve_overlap(
-    monkeypatch: pytest.MonkeyPatch, store: StagingStore, overlap: Path
-) -> tuple[list[str], list[int]]:
-    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_drafts)
-    errors: list[str] = []
-    calls = [0]
-
-    def resolve_after_first_attempt(*args: object, **kwargs: object) -> ReadyOutcome:
-        calls[0] += 1
-        try:
-            return original(*args, **kwargs)
-        except ConflictingOverlapError as error:
-            errors.append(str(error))
-            if calls[0] == 1:
-                _replace_draft_files(store, overlap, 102, 1)
-            raise
-
-    monkeypatch.setattr(staging_store_module, "finalize_drafts", resolve_after_first_attempt)
-    return errors, calls
+    monkeypatch.setattr(staging_store_module, "finalize_typed_sources", add_after_first_attempt)
+    return admitted_sources
 
 
 def _patch_finalize_to_pause(monkeypatch: pytest.MonkeyPatch, entered: Event, release: Event) -> list[int]:
-    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_drafts)
+    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_typed_sources)
     calls = [0]
 
     def pause_after_real_finalization(*args: object, **kwargs: object) -> ReadyOutcome:
@@ -88,53 +99,44 @@ def _patch_finalize_to_pause(monkeypatch: pytest.MonkeyPatch, entered: Event, re
             raise AssertionError("test did not release the in-flight publication")
         return outcome
 
-    monkeypatch.setattr(staging_store_module, "finalize_drafts", pause_after_real_finalization)
+    monkeypatch.setattr(staging_store_module, "finalize_typed_sources", pause_after_real_finalization)
     return calls
 
 
-def test_replaced_same_path_draft_invalidates_blocked_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = _store(tmp_path)
-    overlap = _conflicting_overlap(store)
-    store.append_ready_closure(103, "drained")
-    counts = _count_raw_reads(monkeypatch)
+def _count_source_page_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    counts = [0, 0]
+    original = InternalAudioStore.read_record_page
 
-    blocked = store.recover_and_publish()
-    assert blocked.state is ReadyOutcomeState.BLOCKED
-    assert blocked.reason is not None
-    first_counts = tuple(counts)
-    assert first_counts[0] > 0 and first_counts[1] > 0
+    def counted(
+        store: InternalAudioStore, source_id: str, after_ordinal: int = -1, limit: int = 128
+    ) -> tuple[CaptureRecord, ...]:
+        records = original(store, source_id, after_ordinal, limit)
+        counts[0] += 1
+        counts[1] += len(records)
+        return records
 
-    old_inode = _replace_draft_files(store, overlap, 102, 1)
-    assert (overlap / "records.bin").stat().st_ino != old_inode
-    assert overlap == store.capture_root / "overlap"
-
-    published = store.recover_and_publish()
-    assert published.state is ReadyOutcomeState.PUBLISHED
-    assert len(published.published) == 1
-    assert published.published[0].record_count == 3
-    assert published.published[0].next_sequence == 103
-    after_publish = tuple(counts)
-    assert after_publish[1] > first_counts[1]
-
-    assert store.recover_and_publish().state is ReadyOutcomeState.WAITING
-    assert tuple(counts) == after_publish
+    monkeypatch.setattr(InternalAudioStore, "read_record_page", counted)
+    return counts
 
 
 def test_inflight_source_change_cannot_settle_the_old_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
-    overlap = _conflicting_overlap(store)
-    store.append_ready_closure(103, "drained")
-    counts = _count_raw_reads(monkeypatch)
-    errors, calls = _patch_finalize_to_resolve_overlap(monkeypatch, store, overlap)
+    _add_source(store, 100)
+    raw = _record(100)
+    store.append_ready_closure(101, "drained")
+    counts = _count_source_page_reads(monkeypatch)
+    admitted_sources = _patch_finalize_to_add_exact_source(monkeypatch, raw)
 
     outcome = store.recover_and_publish()
+    assert store.publication_followup_due()
+    store.recover_and_publish()
 
-    assert calls == [2]
-    assert errors == ["authenticated draft overlap has conflicting record bytes"]
+    assert admitted_sources and "b" * 32 not in admitted_sources[0]
+    assert any("b" * 32 in sources for sources in admitted_sources[1:])
     assert outcome.state is ReadyOutcomeState.PUBLISHED
     assert len(outcome.published) == 1
-    assert outcome.published[0].record_count == 3
-    assert outcome.published[0].next_sequence == 103
+    assert outcome.published[0].record_count == 1
+    assert outcome.published[0].next_sequence == 101
     assert counts[0] > 0 and counts[1] > 0
     assert len(tuple((tmp_path / "ready").iterdir())) == 1
 
@@ -144,18 +146,18 @@ def test_repeated_retry_wakes_keep_the_absolute_deadline_and_one_effect(
 ) -> None:
     backoff = 30.0
     store = _store(tmp_path, threshold=0.04, backoff=backoff)
-    _draft(store, "only", 100)
+    _add_source(store, 100)
     store.append_ready_closure(101, "drained")
-    counts = _count_raw_reads(monkeypatch)
+    counts = _count_source_page_reads(monkeypatch)
     original_lock = store.device_lock
     attempts = [0]
 
     @contextmanager
-    def busy_once(*, recover_capture_temporaries: bool = True, operation: str = "unknown") -> Iterator[DeviceLock]:
+    def busy_once(*, operation: str = "unknown") -> Iterator[DeviceLock]:
         attempts[0] += 1
         if attempts[0] == 1:
             raise DeviceAlreadyRunningError
-        with original_lock(recover_capture_temporaries=recover_capture_temporaries, operation=operation) as lease:
+        with original_lock(operation=operation) as lease:
             yield lease
 
     monkeypatch.setattr(store, "device_lock", busy_once)
@@ -174,7 +176,7 @@ def test_checkpoint_access_denial_is_diagnostic_and_ack_retry_self_heals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path, backoff=0.02)
-    _draft(store, "only", 100)
+    _add_source(store, 100)
     store.append_ready_closure(101, "drained")
     published = store.recover_and_publish().published[0]
     checkpoint = tmp_path / "work" / "omi-ready-checkpoint.json"
@@ -251,7 +253,7 @@ def test_publication_effect_access_denial_has_typed_retry_diagnostic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    _draft(store, "only", 100)
+    _add_source(store, 100)
     store.append_ready_closure(101, "drained")
     failure_path = tmp_path / "protected" / "checkpoint.json"
 
@@ -383,9 +385,9 @@ def test_shutdown_joins_owned_publication_and_ignores_late_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    _draft(store, "only", 100)
+    _add_source(store, 100)
     store.append_ready_closure(101, "drained")
-    counts = _count_raw_reads(monkeypatch)
+    counts = _count_source_page_reads(monkeypatch)
     entered = Event()
     release = Event()
     calls = _patch_finalize_to_pause(monkeypatch, entered, release)

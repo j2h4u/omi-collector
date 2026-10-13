@@ -5,26 +5,32 @@ from __future__ import annotations
 import json
 import math
 import os
-import shutil
+import sqlite3
 import stat
 from bisect import bisect_right
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from contextlib import closing
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
 from itertools import pairwise
 from math import ceil
 from pathlib import Path
-from typing import cast
-from uuid import uuid4
+from typing import NoReturn, Protocol, cast
 
 from ...config import ReadyConfig
 from ..domain.opus_duration import inspect_20ms_record
-from ..domain.ready_machine import ReadyCommand, decide_ready
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
-from .bundle_contract import BundleManifest
 from .clock_segments import ClockSegmentMap
-from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction
+from .collector_state_db import StateDB, StateDBError, StateKind
+from .internal_audio_store import (
+    CaptureRecord,
+    CaptureSource,
+    InternalAudioStore,
+    InternalAudioStoreError,
+    decode_uint64,
+    encode_uint64,
+)
 
 
 class ReadyBundleError(RuntimeError):
@@ -33,6 +39,16 @@ class ReadyBundleError(RuntimeError):
 
 class ConflictingOverlapError(ReadyBundleError):
     """Two authenticated drafts claim different bytes for one sequence."""
+
+
+class _TypedCustodyConflictError(ReadyBundleError):
+    """Typed source custody conflicts with immutable ready history."""
+
+
+class _TypedAdmissionConflictError(ReadyBundleError):
+    def __init__(self, source_id: str, message: str) -> None:
+        super().__init__(message)
+        self.source_id = source_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,12 +76,29 @@ class ReadyOutcome:
     reason: str | None = None
     remaining_at_frontier: bool = False
     retry_after_seconds: float | None = None
-    inventory: ReadyInventory | None = None
+    stats: ReadyPublicationStats | None = None
+    custody_cache: ReadyCustodyCache | None = None
+    retirement_pending: bool = False
 
 
-def source_revision(*roots: Path, extras: tuple[Path, ...] = ()) -> tuple[tuple[str, int, int, int, int, int], ...]:
+@dataclass(frozen=True, slots=True)
+class ReadyPublicationStats:
+    """Bounded facts collected while selecting a typed publication cohort."""
+
+    source_count: int = 0
+    record_count: int = 0
+    audio_packets: int = 0
+    threshold_packets: int = 0
+    gap_count: int = 0
+    gap_records: int = 0
+
+
+SourceRevision = tuple[tuple[str, int, int, int, int, int, int], ...]
+
+
+def source_revision(*roots: Path, extras: tuple[Path, ...] = ()) -> SourceRevision:
     """Return cheap filesystem identity for publication inputs, without opening payloads."""
-    entries: list[tuple[str, int, int, int, int, int]] = []
+    entries: list[tuple[str, int, int, int, int, int, int]] = []
     for root in (*roots, *extras):
         paths = (root, *root.iterdir()) if root.is_dir() else (root,)
         for path in paths:
@@ -73,7 +106,9 @@ def source_revision(*roots: Path, extras: tuple[Path, ...] = ()) -> tuple[tuple[
                 info = path.lstat()
             except FileNotFoundError:
                 continue
-            entries.append((str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+            entries.append(
+                (str(path), info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            )
             if path.is_dir() and not path.is_symlink():
                 for child in path.iterdir():
                     try:
@@ -85,27 +120,13 @@ def source_revision(*roots: Path, extras: tuple[Path, ...] = ()) -> tuple[tuple[
                             str(child),
                             child_info.st_dev,
                             child_info.st_ino,
+                            child_info.st_mode,
                             child_info.st_size,
                             child_info.st_mtime_ns,
                             child_info.st_ctime_ns,
                         )
                     )
     return tuple(sorted(entries))
-
-
-@dataclass(frozen=True, slots=True)
-class _Draft:
-    """An authenticated raw draft, optionally cropped after a replay prefix."""
-
-    path: Path
-    manifest: BundleManifest
-    byte_offset: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class _DraftGroup:
-    drafts: tuple[_Draft, ...]
-    facts: _BundleFacts
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,41 +142,12 @@ SourceLineage = tuple[int, int, str]
 
 
 @dataclass(frozen=True, slots=True)
-class _DraftAudio:
-    packet_count: int
-    first_size: int
-    final_overflow_size: int | None
-    continuity_breaks: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _ReadySource:
     """A validated ready bundle used only to compare replayed payloads."""
 
     result: ReadyBundleResult
     facts: _BundleFacts
     time_ranges: tuple[Mapping[str, object], ...]
-
-
-@dataclass(slots=True)
-class ReadyInventory:
-    drafts: tuple[_Draft, ...]
-    ready: tuple[_ReadySource, ...]
-    identities: dict[str, tuple[tuple[int, int, int, int, int], ...]]
-    audio_packets: dict[tuple[str, int, int], _DraftAudio]
-    replay_slices: dict[str, tuple[_Draft, ...]] | None = None
-    replay_keys: dict[str, tuple[tuple[str, tuple[tuple[int, int, int, int, int], ...]], ...]] | None = None
-    normalized_slices: tuple[_Draft, ...] | None = None
-    normalization_key: tuple[tuple[str, int, int, tuple[tuple[int, int, int, int, int], ...]], ...] | None = None
-    normalization_error: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _Finalization:
-    ready_root: Path
-    state_db: StateDB
-    ledger: dict[str, object]
-    clock_segments: ClockSegmentMap
 
 
 _MANIFEST_NAME = "manifest.json"
@@ -170,448 +162,16 @@ _LEDGER_ENTRY_FIELDS = frozenset({"records_sha256", "state", "start_sequence", "
 _LEDGER_SOURCE_FIELDS = frozenset({"start_sequence", "next_sequence", "raw_sha256"})
 _WINDMILL_CHECKPOINT_FIELDS = frozenset({"analysis_cursor", "vad_decisions", "open_speech_tail", "acknowledged"})
 _WINDMILL_TAIL_FIELDS = frozenset({"entries", "opened_at", "outputs"})
-
-
-def finalize_drafts(  # noqa: PLR0913 - the four storage paths and explicit publication boundary stay visible
-    draft_root: Path,
-    ready_root: Path,
-    state_db: StateDB,
-    clock_segments: ClockSegmentMap,
-    *,
-    config: ReadyConfig,
-    frontier: int | None = None,
-    drained: bool = False,
-    inventory: ReadyInventory | None = None,
-) -> ReadyOutcome:
-    """Publish every authenticated draft once, then remove its raw source.
-
-    A destination is durable before its ledger entry; on restart an existing
-    validated destination completes the ledger and source cleanup.
-    """
-    if drained and frontier is None:
-        raise ReadyBundleError("a drained publication requires its durable frontier")
-    _prepare_directory(draft_root)
-    _prepare_directory(ready_root)
-    _require_shared_ready_directory(ready_root)
-    ledger = _read_ledger(state_db)
-    results: list[ReadyBundleResult] = []
-    finalization = _Finalization(ready_root, state_db, ledger, clock_segments)
-    inventory = authenticated_inventory(draft_root, ready_root, inventory)
-    _reconcile_ready_ledger(finalization, inventory.ready, inventory.drafts)
-    eligible, replayed_paths = _eligible_drafts(inventory, frontier)
-    eligible = _normalize_drafts(eligible, inventory)
-    if not eligible:
-        for path in replayed_paths:
-            _remove_draft(path)
-        return ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_eligible_drafts", inventory=inventory)
-    packets = sum(_cached_draft_audio(draft, inventory).packet_count for draft in eligible)
-    decision = decide_ready(
-        drained=drained,
-        has_audio=packets > 0,
-        threshold_met=packets >= ceil(config.target_audio_seconds * 50),
-    )
-    if decision.command is ReadyCommand.PUBLISH:
-        source_paths = tuple(
-            draft.path for draft in inventory.drafts if frontier is None or draft.manifest.next_sequence <= frontier
-        )
-        for group in _continuity_groups(eligible, inventory):
-            result = _finalize_group(group, finalization, ())
-            if result is not None:
-                results.append(result)
-        for path in source_paths:
-            _remove_draft(path)
-    else:
-        for path in replayed_paths:
-            _remove_draft(path)
-    return ReadyOutcome(
-        ReadyOutcomeState.PUBLISHED if results else ReadyOutcomeState.WAITING,
-        tuple(results),
-        None if results else decision.state.value,
-        bool(eligible) and not results,
-        inventory=inventory,
-    )
-
-
-def _eligible_drafts(inventory: ReadyInventory, frontier: int | None) -> tuple[tuple[_Draft, ...], tuple[Path, ...]]:
-    eligible: list[_Draft] = []
-    replayed_paths: list[Path] = []
-    for draft in inventory.drafts:
-        if frontier is not None and draft.manifest.next_sequence > frontier:
-            continue
-        key = str(draft.path)
-        slices = inventory.replay_slices
-        if slices is not None and key in slices:
-            source = slices[key]
-        else:
-            source = _unique_slices(draft, inventory.ready)
-            if slices is not None:
-                slices[key] = source
-        if not source:
-            replayed_paths.append(draft.path)
-        else:
-            eligible.extend(source)
-    return tuple(eligible), tuple(replayed_paths)
-
-
-def authenticated_inventory(draft_root: Path, ready_root: Path, previous: ReadyInventory | None) -> ReadyInventory:
-    previous = previous or ReadyInventory((), (), {}, {})
-    prior_drafts = {str(draft.path): draft for draft in previous.drafts}
-    prior_ready = {str(source.result.path): source for source in previous.ready}
-    identities: dict[str, tuple[tuple[int, int, int, int, int], ...]] = {}
-    drafts: list[_Draft] = []
-    ready: list[_ReadySource] = []
-    audio_packets = dict(previous.audio_packets)
-    for path in draft_root.iterdir():
-        if path.name.startswith("."):
-            continue
-        identity = _source_identity(path)
-        identities[str(path)] = identity
-        draft = prior_drafts.get(str(path))
-        if draft is None or previous.identities.get(str(path)) != identity:
-            draft = _read_draft(path)
-            audio_packets = {key: value for key, value in audio_packets.items() if key[0] != str(path)}
-        drafts.append(draft)
-    for path in _visible_children(ready_root):
-        identity = _source_identity(path)
-        identities[str(path)] = identity
-        source = prior_ready.get(str(path))
-        if source is None or previous.identities.get(str(path)) != identity:
-            source = _read_ready_source(path)
-        ready.append(source)
-    drafts.sort(key=lambda item: item.manifest.start_sequence)
-    ready.sort(key=_ready_start)
-    if any(left.result.next_sequence > _ready_start(right) for left, right in pairwise(ready)):
-        raise ReadyBundleError("ready bundle sequence ranges overlap")
-    draft_paths = {str(draft.path) for draft in drafts}
-    audio_packets = {key: value for key, value in audio_packets.items() if key[0] in draft_paths}
-    replay_keys = {
-        str(draft.path): tuple(
-            (str(source.result.path), identities[str(source.result.path)])
-            for source in ready
-            if _overlaps(draft.manifest, source)
-        )
-        for draft in drafts
-    }
-    replay_slices = {
-        key: value
-        for key, value in (previous.replay_slices or {}).items()
-        if key in draft_paths
-        and previous.identities.get(key) == identities.get(key)
-        and (previous.replay_keys or {}).get(key) == replay_keys[key]
-    }
-    if previous.identities == identities and previous.drafts == tuple(drafts) and previous.ready == tuple(ready):
-        return previous
-    return ReadyInventory(
-        tuple(drafts),
-        tuple(ready),
-        identities,
-        audio_packets,
-        replay_slices,
-        replay_keys,
-        previous.normalized_slices,
-        previous.normalization_key,
-        previous.normalization_error,
-    )
-
-
-def _source_identity(path: Path) -> tuple[tuple[int, int, int, int, int], ...]:
-    if path.is_symlink():
-        raise ReadyBundleError("publication source contains an unsafe entry")
-    paths = [path]
-    if path.is_dir():
-        paths.extend(path.iterdir())
-    result = []
-    for item in paths:
-        info = item.lstat()
-        result.append((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
-    return tuple(result)
-
-
-def _read_draft(path: Path) -> _Draft:
-    if path.is_symlink() or not path.is_dir():
-        raise ReadyBundleError("draft root contains an unsafe entry")
-    try:
-        manifest = BundleManifest.from_json(_read_json(path / _MANIFEST_NAME))
-    except (OSError, ValueError, StateDBError) as error:
-        raise ReadyBundleError("draft bundle manifest is invalid") from error
-    raw = path / _RAW_NAME
-    if raw.is_symlink() or not raw.is_file() or raw.stat().st_size != manifest.record_count * RECORD_SIZE:
-        raise ReadyBundleError("draft bundle records are invalid")
-    if _digest(raw) != manifest.raw_sha256:
-        raise ReadyBundleError("draft bundle records do not match its manifest")
-    return _Draft(path, manifest)
-
-
-def _cached_draft_audio(draft: _Draft, inventory: ReadyInventory) -> _DraftAudio:
-    key = (str(draft.path), draft.byte_offset, draft.manifest.record_count)
-    if key not in inventory.audio_packets:
-        inventory.audio_packets[key] = _draft_audio(draft)
-    return inventory.audio_packets[key]
-
-
-def has_drafts_at_or_below(draft_root: Path, frontier: int) -> bool:
-    """Return whether a closed frontier still owns an authenticated draft."""
-    if not draft_root.exists():
-        return False
-    return any(draft.manifest.next_sequence <= frontier for draft in _drafts(draft_root))
-
-
-def draft_frontier(draft_root: Path) -> int | None:
-    """Return the highest authenticated draft boundary, if any."""
-    if not draft_root.exists():
-        return None
-    drafts = _drafts(draft_root)
-    return max((draft.manifest.next_sequence for draft in drafts), default=None)
-
-
-def _make_group(drafts: tuple[_Draft, ...]) -> _DraftGroup:
-    if not drafts:
-        raise ReadyBundleError("cannot publish an empty draft group")
-    digest = sha256()
-    count = 0
-    for draft in drafts:
-        with (draft.path / _RAW_NAME).open("rb") as stream:
-            stream.seek(draft.byte_offset)
-            remaining = draft.manifest.record_count * RECORD_SIZE
-            while remaining:
-                block = stream.read(min(remaining, 1024 * 1024))
-                if not block:
-                    raise ReadyBundleError("draft records ended unexpectedly")
-                digest.update(block)
-                remaining -= len(block)
-        count += draft.manifest.record_count
-    first, last = drafts[0].manifest, drafts[-1].manifest
-    gaps = tuple(
-        (left.manifest.next_sequence, right.manifest.start_sequence)
-        for left, right in pairwise(drafts)
-        if left.manifest.next_sequence < right.manifest.start_sequence
-    )
-    return _DraftGroup(drafts, _BundleFacts(first.start_sequence, last.next_sequence, count, digest.hexdigest(), gaps))
-
-
-def _draft_audio(draft: _Draft) -> _DraftAudio:
-    total = 0
-    first_size = 0
-    previous_overflow: int | None = None
-    continuity_breaks: list[int] = []
-    with (draft.path / _RAW_NAME).open("rb") as stream:
-        stream.seek(draft.byte_offset)
-        for index in range(draft.manifest.record_count):
-            record = stream.read(RECORD_SIZE)
-            if len(record) != RECORD_SIZE:
-                raise ReadyBundleError("draft records ended unexpectedly")
-            try:
-                layout = inspect_20ms_record(record)
-            except ValueError as error:
-                raise ReadyBundleError("draft contains an invalid 20 ms Opus packet") from error
-            if index == 0:
-                first_size = layout.first_size
-            elif previous_overflow is not None and layout.first_size != previous_overflow:
-                continuity_breaks.append(draft.manifest.start_sequence + index)
-            total += layout.packet_count
-            previous_overflow = layout.overflow_size
-    return _DraftAudio(total, first_size, previous_overflow, tuple(continuity_breaks))
-
-
-def _continuity_groups(drafts: tuple[_Draft, ...], inventory: ReadyInventory) -> tuple[_DraftGroup, ...]:
-    """Split physical output where firmware packet continuation is unavailable."""
-    groups: list[_DraftGroup] = []
-    current: list[_Draft] = []
-    previous: _Draft | None = None
-    previous_audio: _DraftAudio | None = None
-    for draft in drafts:
-        audio = _cached_draft_audio(draft, inventory)
-        if (
-            previous is not None
-            and previous_audio is not None
-            and previous.manifest.next_sequence == draft.manifest.start_sequence
-            and previous_audio.final_overflow_size is not None
-            and audio.first_size != previous_audio.final_overflow_size
-        ):
-            groups.append(_make_group(tuple(current)))
-            current.clear()
-        cursor = draft.manifest.start_sequence
-        for boundary in (*audio.continuity_breaks, draft.manifest.next_sequence):
-            current.append(_crop_draft(draft, cursor, boundary))
-            if boundary != draft.manifest.next_sequence:
-                groups.append(_make_group(tuple(current)))
-                current.clear()
-            cursor = boundary
-        previous, previous_audio = draft, audio
-    if current:
-        groups.append(_make_group(tuple(current)))
-    return tuple(groups)
-
-
-def _finalize_group(
-    group: _DraftGroup, finalization: _Finalization, source_paths: tuple[Path, ...]
-) -> ReadyBundleResult | None:
-    facts = group.facts
-    bundle_id = _bundle_id(facts)
-    retired = _retired_entry(finalization.ledger, bundle_id)
-    if retired is not None:
-        _validate_retired_duplicate(retired, facts, group.drafts)
-        for path in source_paths:
-            _remove_draft(path)
-        return None
-    _reject_retired_overlap(finalization.ledger, facts)
-    _reject_out_of_order(finalization.ledger, facts, bundle_id)
-    destination = finalization.ready_root / bundle_id
-    if destination.exists():
-        ready = _read_ready_source(destination)
-        if ready.facts != facts:
-            raise ReadyBundleError("ready destination conflicts with its draft group")
-        result = ready.result
-        _record_ready(finalization.state_db, finalization.ledger, result, facts, _draft_lineage(group.drafts))
-        for path in source_paths:
-            _remove_draft(path)
-        return result
-    ranges = _time_ranges(facts, finalization.clock_segments)
-    ranges = _clear_unrepresentable_ranges(group, ranges)
-    result = _write_ready_group(group, destination, ranges)
-    _record_ready(finalization.state_db, finalization.ledger, result, facts, _draft_lineage(group.drafts))
-    for path in source_paths:
-        _remove_draft(path)
-    return result
-
-
-def _drafts(root: Path) -> tuple[_Draft, ...]:
-    drafts: list[_Draft] = []
-    for path in root.iterdir():
-        if path.name.startswith("."):
-            continue
-        if path.is_symlink() or not path.is_dir():
-            raise ReadyBundleError("draft root contains an unsafe entry")
-        try:
-            manifest = BundleManifest.from_json(_read_json(path / _MANIFEST_NAME))
-        except (OSError, ValueError, StateDBError) as error:
-            raise ReadyBundleError("draft bundle manifest is invalid") from error
-        raw = path / _RAW_NAME
-        if raw.is_symlink() or not raw.is_file() or raw.stat().st_size != manifest.record_count * RECORD_SIZE:
-            raise ReadyBundleError("draft bundle records are invalid")
-        if _digest(raw) != manifest.raw_sha256:
-            raise ReadyBundleError("draft bundle records do not match its manifest")
-        drafts.append(_Draft(path, manifest))
-    drafts.sort(key=lambda item: item.manifest.start_sequence)
-    return tuple(drafts)
-
-
-def _unique_slices(draft: _Draft, ready: tuple[_ReadySource, ...]) -> tuple[_Draft, ...]:
-    """Remove only authenticated physical ready records from a draft."""
-    start, end = draft.manifest.start_sequence, draft.manifest.next_sequence
-    cursor = start
-    slices: list[_Draft] = []
-    for source in ready:
-        ready_offset = 0
-        for run_start, run_end in _physical_runs(source.facts):
-            if run_end <= cursor:
-                ready_offset += run_end - run_start
-                continue
-            if run_start >= end:
-                break
-            if cursor < run_start:
-                slices.append(_crop_draft(draft, cursor, min(run_start, end)))
-                cursor = min(run_start, end)
-            overlap_end = min(run_end, end)
-            if cursor < overlap_end:
-                _validate_replayed_payload(draft, source, (cursor, overlap_end), ready_offset + cursor - run_start)
-                cursor = overlap_end
-            ready_offset += run_end - run_start
-            if cursor == end:
-                return tuple(slices)
-    if cursor < end:
-        slices.append(_crop_draft(draft, cursor, end))
-    return tuple(slices)
-
-
-def _normalize_drafts(drafts: tuple[_Draft, ...], inventory: ReadyInventory) -> tuple[_Draft, ...]:
-    key = tuple(
-        (str(draft.path), draft.byte_offset, draft.manifest.record_count, inventory.identities[str(draft.path)])
-        for draft in sorted(drafts, key=lambda item: (item.manifest.start_sequence, str(item.path)))
-    )
-    if inventory.normalization_key == key and inventory.normalized_slices is not None:
-        return inventory.normalized_slices
-    if inventory.normalization_key == key and inventory.normalization_error is not None:
-        raise ConflictingOverlapError(inventory.normalization_error)
-    normalized: list[_Draft] = []
-    ends: list[int] = []
-    try:
-        for draft in sorted(drafts, key=lambda item: (item.manifest.start_sequence, str(item.path))):
-            for unique in _unique_against_drafts(draft, normalized, bisect_right(ends, draft.manifest.start_sequence)):
-                position = bisect_right(ends, unique.manifest.start_sequence)
-                normalized.insert(position, unique)
-                ends.insert(position, unique.manifest.next_sequence)
-    except ConflictingOverlapError as error:
-        inventory.normalization_key = key
-        inventory.normalized_slices = None
-        inventory.normalization_error = str(error)
-        raise
-    result = tuple(normalized)
-    inventory.normalization_key = key
-    inventory.normalized_slices = result
-    inventory.normalization_error = None
-    return result
-
-
-def _unique_against_drafts(draft: _Draft, normalized: list[_Draft], index: int) -> tuple[_Draft, ...]:
-    end = draft.manifest.next_sequence
-    cursor = draft.manifest.start_sequence
-    unique: list[_Draft] = []
-    while index < len(normalized):
-        retained = normalized[index]
-        left, right = retained.manifest.start_sequence, retained.manifest.next_sequence
-        if left >= end:
-            break
-        if cursor < left:
-            unique.append(_crop_draft(draft, cursor, min(left, end)))
-            cursor = min(left, end)
-        overlap_end = min(right, end)
-        if cursor < overlap_end:
-            _compare_draft_overlap(draft, retained, cursor, overlap_end)
-            cursor = overlap_end
-        if cursor == end:
-            break
-        index += 1
-    if cursor < end:
-        unique.append(_crop_draft(draft, cursor, end))
-    return tuple(unique)
-
-
-def _compare_draft_overlap(left: _Draft, right: _Draft, start: int, end: int) -> None:
-    left_offset = left.byte_offset + (start - left.manifest.start_sequence) * RECORD_SIZE
-    right_offset = right.byte_offset + (start - right.manifest.start_sequence) * RECORD_SIZE
-    remaining = (end - start) * RECORD_SIZE
-    with (left.path / _RAW_NAME).open("rb") as left_stream, (right.path / _RAW_NAME).open("rb") as right_stream:
-        left_stream.seek(left_offset)
-        right_stream.seek(right_offset)
-        while remaining:
-            size = min(remaining, RECORD_SIZE * 2048)
-            left_bytes, right_bytes = left_stream.read(size), right_stream.read(size)
-            if len(left_bytes) != size or left_bytes != right_bytes:
-                raise ConflictingOverlapError("authenticated draft overlap has conflicting record bytes")
-            remaining -= size
-
-
-def _reconcile_ready_ledger(
-    finalization: _Finalization, ready: tuple[_ReadySource, ...], drafts: tuple[_Draft, ...]
-) -> None:
-    for source in ready:
-        _reconcile_ready_source(finalization, source, drafts)
-
-
-def _reconcile_ready_source(finalization: _Finalization, source: _ReadySource, drafts: tuple[_Draft, ...]) -> None:
-    bundles = finalization.ledger["bundles"]
-    assert isinstance(bundles, dict)
-    entry = bundles.get(source.result.bundle_id)
-    lineage = _matching_draft_lineage(source, drafts)
-    if entry is None:
-        _record_ready(finalization.state_db, finalization.ledger, source.result, source.facts, lineage)
-        return
-    if not isinstance(entry, dict) or entry.get("state") != "ready":
-        raise ReadyBundleError("ready bundle is not active in the publication ledger")
-    _validate_ready_ledger_entry(entry, source)
-    if lineage is not None:
-        _record_ready(finalization.state_db, finalization.ledger, source.result, source.facts, lineage)
+_TYPED_PAGE_MAX = 128
+_TYPED_SPACE_HEADROOM = 64 * 1024 * 1024
+_TYPED_JOURNAL_MARGIN_PAGES = 16
+_TYPED_BTREE_PAGES_PER_LEVEL = 3
+# A 15-column range row needs at most 31 record-header bytes, nine-byte
+# integer serializations, two eight-byte sequence blobs and short scalar text;
+# identifiers and clock text are counted separately below. Round that <160-byte
+# fixed part up to one explicit 256-byte per-row bound.
+_TYPED_METADATA_ROW_BYTES = 256
+_TYPED_STAGE_RANGE_COLUMNS = 14
 
 
 def _visible_children(root: Path) -> tuple[Path, ...]:
@@ -734,6 +294,10 @@ def _nonnegative_int(value: object) -> int:
     return value
 
 
+def _is_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
 def _sha256(value: object) -> str:
     if (
         not isinstance(value, str)
@@ -742,137 +306,6 @@ def _sha256(value: object) -> str:
     ):
         raise ReadyBundleError("ready metadata digest is invalid")
     return value
-
-
-def _overlaps(source: BundleManifest, ready: _ReadySource) -> bool:
-    return source.start_sequence < ready.facts.next_sequence and ready.facts.start_sequence < source.next_sequence
-
-
-def _validate_replayed_payload(
-    draft: _Draft,
-    ready: _ReadySource,
-    sequence_range: tuple[int, int],
-    ready_record_offset: int,
-    *,
-    exact_time: bool = False,
-) -> None:
-    start, next_sequence = sequence_range
-    draft_offset = draft.byte_offset + (start - draft.manifest.start_sequence) * RECORD_SIZE
-    with (draft.path / _RAW_NAME).open("rb") as raw, (ready.result.path / _RAW_NAME).open("rb") as published:
-        raw.seek(draft_offset)
-        published.seek(ready_record_offset * RECORD_SIZE)
-        range_index = 0
-        for sequence in range(start, next_sequence):
-            original, converted = raw.read(RECORD_SIZE), published.read(RECORD_SIZE)
-            if exact_time:
-                while range_index < len(ready.time_ranges) and sequence >= cast(
-                    int, ready.time_ranges[range_index]["next_sequence"]
-                ):
-                    range_index += 1
-                if range_index == len(ready.time_ranges) or sequence < cast(
-                    int, ready.time_ranges[range_index]["start_sequence"]
-                ):
-                    raise ReadyBundleError("ready overlap has no UTC mapping")
-            if (
-                len(original) != RECORD_SIZE
-                or len(converted) != RECORD_SIZE
-                or (
-                    _convert_record(original, ready.time_ranges[range_index]) != converted
-                    if exact_time
-                    else original[TIMESTAMP_SIZE:] != converted[TIMESTAMP_SIZE:]
-                )
-            ):
-                raise ReadyBundleError("ready overlap conflicts with original payload")
-
-
-def _crop_draft(draft: _Draft, start_sequence: int, next_sequence: int) -> _Draft:
-    source = draft.manifest
-    if start_sequence == source.start_sequence and next_sequence == source.next_sequence:
-        return draft
-    count = next_sequence - start_sequence
-    offset = draft.byte_offset + (start_sequence - source.start_sequence) * RECORD_SIZE
-    raw_sha256 = _digest_slice(draft.path / _RAW_NAME, offset, count * RECORD_SIZE)
-    manifest = BundleManifest(2, start_sequence, next_sequence, count, RECORD_SIZE, raw_sha256)
-    return _Draft(draft.path, manifest, offset)
-
-
-def _write_ready_group(
-    group: _DraftGroup,
-    destination: Path,
-    ranges: tuple[dict[str, object], ...],
-) -> ReadyBundleResult:
-    temporary = destination.parent / f".{destination.name}.{uuid4().hex}.tmp"
-    temporary.mkdir(mode=_READY_DIRECTORY_MODE)
-    try:
-        _require_shared_ready_directory(temporary)
-        digest = sha256()
-        range_index = 0
-        with (temporary / _RAW_NAME).open("xb") as output:
-            for draft in group.drafts:
-                with (draft.path / _RAW_NAME).open("rb") as source:
-                    source.seek(draft.byte_offset)
-                    for index in range(draft.manifest.record_count):
-                        record = source.read(RECORD_SIZE)
-                        if len(record) != RECORD_SIZE:
-                            raise ReadyBundleError("draft records ended unexpectedly")
-                        sequence = draft.manifest.start_sequence + index
-                        next_sequence = ranges[range_index]["next_sequence"]
-                        assert isinstance(next_sequence, int)
-                        while sequence >= next_sequence:
-                            range_index += 1
-                            next_sequence = ranges[range_index]["next_sequence"]
-                            assert isinstance(next_sequence, int)
-                        converted = _convert_record(record, ranges[range_index])
-                        if converted[TIMESTAMP_SIZE:] != record[TIMESTAMP_SIZE:]:
-                            raise ReadyBundleError("ready conversion changed an Opus payload")
-                        output.write(converted)
-                        digest.update(converted)
-            output.flush()
-            os.fsync(output.fileno())
-        (temporary / _RAW_NAME).chmod(_READY_FILE_MODE)
-        _write_file(temporary / _MANIFEST_NAME, _canonical(_ready_manifest(group.facts, digest.hexdigest(), ranges)))
-        _sync_directory(temporary)
-        temporary.rename(destination)
-        _sync_directory(destination.parent)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
-    return ReadyBundleResult(
-        destination.name, destination, group.facts.next_sequence, group.facts.record_count, digest.hexdigest()
-    )
-
-
-def _clear_unrepresentable_ranges(
-    group: _DraftGroup, ranges: tuple[dict[str, object], ...]
-) -> tuple[dict[str, object], ...]:
-    """Keep every record intact when UTC normalization would exceed its uint32 header."""
-    invalid: set[int] = set()
-    range_index = 0
-    next_sequence = ranges[0]["next_sequence"]
-    assert isinstance(next_sequence, int)
-    for draft in group.drafts:
-        with (draft.path / _RAW_NAME).open("rb") as source:
-            source.seek(draft.byte_offset)
-            for index in range(draft.manifest.record_count):
-                record = source.read(RECORD_SIZE)
-                if len(record) != RECORD_SIZE:
-                    raise ReadyBundleError("draft records ended unexpectedly")
-                sequence = draft.manifest.start_sequence + index
-                while sequence >= next_sequence:
-                    range_index += 1
-                    next_sequence = ranges[range_index]["next_sequence"]
-                    assert isinstance(next_sequence, int)
-                utc = ranges[range_index]["utc"]
-                if utc is None:
-                    continue
-                assert isinstance(utc, Mapping)
-                timestamp = int.from_bytes(record[:TIMESTAMP_SIZE], "big")
-                offset = utc["offset_seconds"]
-                assert isinstance(offset, float)
-                normalized = math.floor(timestamp + offset + 0.5)
-                if not 0 <= normalized <= _UINT32_MAX:
-                    invalid.add(range_index)
-    return tuple({**item, "utc": None} if index in invalid else item for index, item in enumerate(ranges))
 
 
 def _convert_record(record: bytes, time_range: Mapping[str, object]) -> bytes:
@@ -939,58 +372,6 @@ def _ready_manifest(
     }
 
 
-def _record_ready(
-    state_db: StateDB,
-    ledger: dict[str, object],
-    result: ReadyBundleResult,
-    source: _BundleFacts,
-    lineage: tuple[SourceLineage, ...] | None = None,
-) -> None:
-    bundles = ledger["bundles"]
-    assert isinstance(bundles, dict)
-    entry = _ledger_entry(result.records_sha256, "ready", source, lineage)
-    target = _ready_entry_target(bundles.get(result.bundle_id), entry, lineage)
-    if target is None:
-        return
-    frontier = ledger["frontier"]
-    assert isinstance(frontier, int)
-    updated_frontier = max(frontier, result.next_sequence)
-    try:
-        with state_db.transaction() as transaction:
-            target = _transaction_ready_target(transaction, result.bundle_id, target, lineage)
-            if target is None:
-                return
-            transaction.put(StateKind.READY_PUBLICATION, result.bundle_id, target)
-            transaction.put(StateKind.READY_PUBLICATION, "frontier", {"value": updated_frontier})
-    except (OSError, ValueError, StateDBError) as error:
-        raise ReadyBundleError("ready publication ledger could not be written") from error
-    bundles[result.bundle_id] = target
-    ledger["frontier"] = updated_frontier
-
-
-def _ready_entry_target(
-    existing: object, entry: dict[str, object], lineage: tuple[SourceLineage, ...] | None
-) -> dict[str, object] | None:
-    if existing is None:
-        return entry
-    if not isinstance(existing, dict) or not _same_ledger_identity(existing, entry):
-        raise ReadyBundleError("ready publication ledger conflicts with bundle")
-    existing_lineage = source_lineage(existing) if "sources" in existing else None
-    if existing_lineage is not None and lineage is not None and existing_lineage != lineage:
-        raise ReadyBundleError("ready publication ledger source lineage conflicts with bundle")
-    return None if existing_lineage is not None or lineage is None else entry
-
-
-def _transaction_ready_target(
-    transaction: StateTransaction,
-    bundle_id: str,
-    entry: dict[str, object],
-    lineage: tuple[SourceLineage, ...] | None,
-) -> dict[str, object] | None:
-    current = transaction.get(StateKind.READY_PUBLICATION, bundle_id)
-    return _ready_entry_target(current, entry, lineage) if current is not None else entry
-
-
 def _ledger_entry(
     records_sha256: str,
     state: str,
@@ -1021,110 +402,6 @@ def _same_ledger_identity(left: Mapping[str, object], right: Mapping[str, object
     return all(left.get(field) == right.get(field) for field in _LEDGER_ENTRY_FIELDS | {"gaps"})
 
 
-def _draft_lineage(drafts: tuple[_Draft, ...]) -> tuple[SourceLineage, ...]:
-    return tuple(
-        (draft.manifest.start_sequence, draft.manifest.next_sequence, draft.manifest.raw_sha256) for draft in drafts
-    )
-
-
-def _matching_draft_lineage(source: _ReadySource, drafts: tuple[_Draft, ...]) -> tuple[SourceLineage, ...] | None:
-    candidates = tuple(
-        sorted(
-            (draft for draft in drafts if _overlaps(draft.manifest, source)),
-            key=lambda item: (item.manifest.start_sequence, str(item.path)),
-        )
-    )
-    if not candidates:
-        return None
-    return _lineage_for_runs(source, _normalize_matching_drafts(candidates))
-
-
-def _normalize_matching_drafts(candidates: tuple[_Draft, ...]) -> tuple[_Draft, ...]:
-    normalized: list[_Draft] = []
-    ends: list[int] = []
-    for draft in candidates:
-        for unique in _unique_against_drafts(draft, normalized, bisect_right(ends, draft.manifest.start_sequence)):
-            position = bisect_right(ends, unique.manifest.start_sequence)
-            normalized.insert(position, unique)
-            ends.insert(position, unique.manifest.next_sequence)
-    return tuple(normalized)
-
-
-def _lineage_for_runs(source: _ReadySource, normalized: tuple[_Draft, ...]) -> tuple[SourceLineage, ...] | None:
-    selected: list[_Draft] = []
-    ready_offset = 0
-    for run_start, run_end in _physical_runs(source.facts):
-        cursor = run_start
-        for draft in normalized:
-            draft_start, draft_end = draft.manifest.start_sequence, draft.manifest.next_sequence
-            if draft_end <= cursor:
-                continue
-            if draft_start >= run_end:
-                break
-            if draft_start > cursor:
-                return None
-            overlap_end = min(draft_end, run_end)
-            if cursor < overlap_end:
-                slice_ = _crop_draft(draft, cursor, overlap_end)
-                _validate_replayed_payload(
-                    draft, source, (cursor, overlap_end), ready_offset + cursor - run_start, exact_time=True
-                )
-                selected.append(slice_)
-                cursor = overlap_end
-        if cursor != run_end:
-            return None
-        ready_offset += run_end - run_start
-    return _draft_lineage(tuple(selected))
-
-
-def _retired_entry(ledger: Mapping[str, object], bundle_id: str) -> dict[str, object] | None:
-    bundles = ledger["bundles"]
-    assert isinstance(bundles, dict)
-    entry = bundles.get(bundle_id)
-    if isinstance(entry, dict) and entry.get("state") == "retired":
-        return entry
-    return None
-
-
-def _validate_retired_duplicate(
-    entry: Mapping[str, object], source: _BundleFacts, drafts: tuple[_Draft, ...] | None = None
-) -> None:
-    if (
-        entry.get("start_sequence") != source.start_sequence
-        or entry.get("next_sequence") != source.next_sequence
-        or entry.get("draft_raw_sha256") != source.raw_sha256
-        or _entry_gaps(entry) != source.gaps
-    ):
-        raise ReadyBundleError("retired ledger entry conflicts with draft")
-    if "sources" in entry and drafts is not None and source_lineage(entry) != _draft_lineage(drafts):
-        raise ReadyBundleError("retired ledger source lineage conflicts with draft")
-
-
-def _reject_retired_overlap(ledger: Mapping[str, object], source: _BundleFacts) -> None:
-    bundles = ledger["bundles"]
-    assert isinstance(bundles, dict)
-    for entry in bundles.values():
-        if not isinstance(entry, dict) or entry.get("state") != "retired":
-            continue
-        if any(
-            source_start < retired_end and retired_start < source_end
-            for source_start, source_end in _physical_runs(source)
-            for retired_start, retired_end in _physical_runs(_entry_facts(entry))
-        ):
-            raise ReadyBundleError("draft overlaps a retired range without original payload evidence")
-
-
-def _reject_out_of_order(ledger: Mapping[str, object], source: _BundleFacts, bundle_id: str) -> None:
-    bundles = ledger["bundles"]
-    assert isinstance(bundles, dict)
-    if any(
-        source.start_sequence < entry["next_sequence"]
-        for key, entry in bundles.items()
-        if key != bundle_id and isinstance(entry, dict)
-    ):
-        raise ReadyBundleError("draft ordering is blocked by an already published bundle")
-
-
 def resume_retired(ready_root: Path, state_db: StateDB) -> None:
     """Finish already committed retirements before reconciling new publication."""
     _prepare_directory(ready_root)
@@ -1138,28 +415,6 @@ def resume_retired(ready_root: Path, state_db: StateDB) -> None:
             retired.append(destination)
     for destination in retired:
         _remove_retired_ready(destination)
-
-
-def legacy_ready_retirement_ranges(
-    ready_root: Path, state_db: StateDB, acknowledged: tuple[tuple[str, str], ...]
-) -> tuple[tuple[int, int], ...]:
-    """Return legacy ready spans whose physical proof is about to disappear."""
-    bundles = _read_ledger(state_db)["bundles"]
-    assert isinstance(bundles, dict)
-    endangered: set[tuple[int, int]] = set()
-    for bundle_id, _ in acknowledged:
-        entry = bundles.get(bundle_id)
-        if isinstance(entry, dict) and entry.get("state") == "ready" and "sources" not in entry:
-            endangered.add((cast(int, entry["start_sequence"]), cast(int, entry["next_sequence"])))
-    for bundle_id, entry in bundles.items():
-        if (
-            isinstance(entry, dict)
-            and entry.get("state") == "retired"
-            and "sources" not in entry
-            and os.path.lexists(ready_root / bundle_id)
-        ):
-            endangered.add((cast(int, entry["start_sequence"]), cast(int, entry["next_sequence"])))
-    return tuple(sorted(endangered))
 
 
 def acknowledged_ready(checkpoint_path: Path) -> tuple[tuple[str, str], ...]:
@@ -1376,46 +631,6 @@ def _read_ledger(state_db: StateDB) -> dict[str, object]:
     return {"bundles": bundles, "frontier": frontier}
 
 
-def legacy_ready_publications(path: Path) -> dict[str, dict[str, object]]:
-    """Read and strictly validate the former JSON ledger as typed DB rows."""
-    if not os.path.lexists(path):
-        return {"frontier": {"value": 0}}
-    value = _read_json(path)
-    if not isinstance(value, dict):
-        raise ReadyBundleError("ready publication ledger is invalid")
-    bundles, frontier = _legacy_ledger_parts(value)
-    rows: dict[str, dict[str, object]] = {"frontier": {"value": frontier}}
-    rows.update(_legacy_bundle_rows(bundles))
-    return rows
-
-
-def _legacy_ledger_parts(value: dict[str, object]) -> tuple[dict[str, object], int]:
-    _validate_ledger_header(value)
-    raw_bundles = value["bundles"]
-    assert isinstance(raw_bundles, dict)
-    if any(not isinstance(bundle_id, str) for bundle_id in raw_bundles):
-        raise ReadyBundleError("ready publication ledger is invalid")
-    bundles = cast(dict[str, object], raw_bundles)
-    _validate_ledger_entries(bundles)
-    frontier = value["frontier"]
-    assert isinstance(frontier, int)
-    return bundles, frontier
-
-
-def _legacy_bundle_rows(bundles: Mapping[str, object]) -> dict[str, dict[str, object]]:
-    rows: dict[str, dict[str, object]] = {}
-    for bundle_id, entry in bundles.items():
-        assert isinstance(bundle_id, str) and isinstance(entry, dict)
-        rows[bundle_id] = entry
-    return rows
-
-
-def _validate_ledger_header(value: dict[str, object]) -> None:
-    if set(value) != _LEDGER_FIELDS:
-        raise ReadyBundleError("ready publication ledger is invalid")
-    _validate_ledger_values(value["bundles"], value["frontier"])
-
-
 def _validate_ledger_values(bundles: object, frontier: object) -> None:
     if not isinstance(bundles, dict):
         raise ReadyBundleError("ready publication ledger is invalid")
@@ -1586,11 +801,6 @@ def _bundle_id(facts: _BundleFacts) -> str:
     return sha256(identity).hexdigest()
 
 
-def _remove_draft(path: Path) -> None:
-    shutil.rmtree(path)
-    _sync_directory(path.parent)
-
-
 def _prepare_directory(path: Path) -> None:
     path.mkdir(mode=_READY_DIRECTORY_MODE, parents=True, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
@@ -1610,17 +820,6 @@ def _write_file(path: Path, payload: bytes) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     path.chmod(_READY_FILE_MODE)
-
-
-def _write_file_atomic(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(mode=_READY_DIRECTORY_MODE, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        _write_file(temporary, payload)
-        temporary.replace(path)
-        _sync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> object:
@@ -1646,25 +845,2550 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _digest_slice(path: Path, offset: int, length: int) -> str:
-    if path.is_symlink() or not path.is_file():
-        raise ReadyBundleError("ready records are not a regular file")
-    digest = sha256()
-    remaining = length
-    with path.open("rb") as stream:
-        stream.seek(offset)
-        while remaining:
-            chunk = stream.read(min(1024 * 1024, remaining))
-            if not chunk:
-                raise ReadyBundleError("draft records ended unexpectedly")
-            digest.update(chunk)
-            remaining -= len(chunk)
-    return digest.hexdigest()
-
-
 def _sync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+# The SQL projector shares the public ready contract with the legacy projector,
+# but all private source custody and crash recovery live in typed SQLite rows.
+class TypedPublicationSource(Protocol):
+    @property
+    def source(self) -> CaptureSource: ...
+
+    def source_page(self, after_ordinal: int = -1, limit: int = 128) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedPage:
+    source: CaptureSource
+    after_ordinal: int
+    records: tuple[CaptureRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SqlitePublicationSource:
+    store: InternalAudioStore
+    source_id: str
+
+    @property
+    def source(self) -> CaptureSource:
+        source = self.store.get_source(self.source_id)
+        if source is None:
+            raise ReadyBundleError("typed publication source disappeared")
+        return source
+
+    def source_page(self, after_ordinal: int = -1, limit: int = 128) -> _TypedPage:
+        source = self.source
+        records = self.store.read_record_page(self.source_id, after_ordinal, limit)
+        if self.source != source:
+            raise ReadyBundleError("typed publication source changed during page read")
+        return _TypedPage(source, after_ordinal, records)
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedAdmission:
+    reader: TypedPublicationSource
+    snapshot: CaptureSource
+    admitted_lifecycle: str
+    admitted_count: int
+    admitted_sha256: str
+    cursor: int = 0
+    member_ordinal: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedSlice:
+    admission: _TypedAdmission
+    start_ordinal: int
+    record_count: int
+    start_sequence: int
+    next_sequence: int
+    raw_sha256: str
+    first_size: int
+    final_overflow_size: int | None
+    audio_packets: int
+    continuity_breaks: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedGroup:
+    slices: tuple[_TypedSlice, ...]
+    facts: _BundleFacts
+    ranges: tuple[dict[str, object], ...]
+    output_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedReadyCustody:
+    active: tuple[_ReadySource, ...]
+    entries: dict[str, dict[str, object]]
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyCustodyCache:
+    """Authenticated ready custody reusable while its complete identity is unchanged."""
+
+    revision: SourceRevision
+    custody: _TypedReadyCustody
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedCohort:
+    cohort_id: str
+    lifecycle: str
+    threshold: int
+    frontier: int | None
+    cursor: int
+    config_digest: str
+    admissions: tuple[_TypedAdmission, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _StageRange:
+    slice: _TypedSlice
+    time_range: dict[str, object]
+    device_start: int
+    device_end: int
+    utc_start: int | None
+    utc_end: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _StageRangeRow:
+    ordinal: int
+    source_id: str
+    start: int
+    count: int
+    sequence_start: bytes
+    next_sequence: bytes
+    device_start: object
+    device_end: object
+    utc_start: object
+    utc_end: object
+    observation: object
+    offset: object
+    uncertainty: object
+    confidence: object
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedStage:
+    stage_id: str
+    group_identity: str
+    path: Path
+    group: _TypedGroup
+    rows: tuple[_StageRange, ...]
+    owner_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MemberProgress:
+    member_ordinal: int
+    old_cursor: int
+    new_cursor: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCoverage:
+    source_id: str
+    old: tuple[object, ...]
+    proposed: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _StageKey:
+    stage_id: str
+    group_identity: str
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalCommit:
+    cohort: _TypedCohort
+    stage: _TypedStage
+    result: ReadyBundleResult
+    entry: dict[str, object]
+    progress: tuple[_MemberProgress, ...]
+    coverage: tuple[_SourceCoverage, ...]
+    all_complete: bool
+    ledger: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _CustodyCommit:
+    cohort: _TypedCohort
+    proposed: _TypedCohort
+    progress: tuple[_MemberProgress, ...]
+    coverage: tuple[_SourceCoverage, ...]
+    proofs: dict[str, dict[str, object]]
+    all_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RetirementStep:
+    source_id: str
+    committed_count: int
+    coverage_digest: str
+    old_cursor: int
+    page_limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RetirementResult:
+    cursor: int | None
+    progressed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _StageHeader:
+    expected_digest: str
+    expected_count: int
+    frozen_device_start: int
+    frozen_device_end: int
+    frozen_utc_start: int | None
+    frozen_utc_end: int | None
+    mapping_revision: str
+    owner_token: str
+
+
+def _sql_one(cursor: sqlite3.Cursor) -> tuple[object, ...] | None:
+    return cast(tuple[object, ...] | None, cursor.fetchone())
+
+
+def _sql_all(cursor: sqlite3.Cursor) -> tuple[tuple[object, ...], ...]:
+    return tuple(cast(list[tuple[object, ...]], cursor.fetchall()))
+
+
+def finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps storage and policy inputs explicit
+    audio_store: InternalAudioStore,
+    sources: tuple[TypedPublicationSource, ...] | list[TypedPublicationSource],
+    ready_root: Path,
+    *,
+    config: ReadyConfig,
+    clock_segments: ClockSegmentMap,
+    frontier: int | None = None,
+    drained: bool = False,
+    page_limit: int = 128,
+    custody_cache: ReadyCustodyCache | None = None,
+) -> ReadyOutcome:
+    """Publish or resume exactly one durable SQL cohort."""
+    with audio_store.publication_reader():
+        return _finalize_typed_sources(
+            audio_store,
+            sources,
+            ready_root,
+            config=config,
+            clock_segments=clock_segments,
+            frontier=frontier,
+            drained=drained,
+            page_limit=page_limit,
+            custody_cache=custody_cache,
+        )
+
+
+def _finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps storage and policy inputs explicit
+    audio_store: InternalAudioStore,
+    sources: tuple[TypedPublicationSource, ...] | list[TypedPublicationSource],
+    ready_root: Path,
+    *,
+    config: ReadyConfig,
+    clock_segments: ClockSegmentMap,
+    frontier: int | None,
+    drained: bool,
+    page_limit: int,
+    custody_cache: ReadyCustodyCache | None,
+) -> ReadyOutcome:
+    _validate_typed_request(frontier, drained, page_limit)
+    _prepare_directory(ready_root)
+    _require_shared_ready_directory(ready_root)
+    threshold = ceil(config.target_audio_seconds * 50)
+    config_digest = sha256(f"target_audio_seconds={config.target_audio_seconds.hex()}".encode()).hexdigest()
+    cohort = _load_active_typed_cohort(audio_store)
+    stats: ReadyPublicationStats | None = None
+    prepared_slices: tuple[_TypedSlice, ...] | None = None
+    if cohort is None:
+        custody_cache = _typed_ready_custody(ready_root, audio_store.state_db, custody_cache)
+        custody = custody_cache.custody
+        admissions = _typed_source_admissions(audio_store, sources, frontier)
+        if drained:
+            admissions = _cover_typed_full_replays(audio_store, admissions, custody, page_limit)
+        try:
+            slices = _normalize_typed_admissions(admissions, page_limit, custody)
+        except _TypedAdmissionConflictError as error:
+            admission = next(item for item in admissions if item.snapshot.source_id == error.source_id)
+            _block_typed_custody_conflict(audio_store, admission)
+            raise
+        _require_typed_admissions_current(audio_store, admissions)
+        stats = _typed_stats(admissions, slices, threshold)
+        if not drained:
+            retirement_pending = _retire_one_typed_source(audio_store, page_limit)
+            return ReadyOutcome(
+                ReadyOutcomeState.WAITING,
+                reason="waiting_for_drain",
+                remaining_at_frontier=bool(admissions),
+                stats=stats,
+                custody_cache=custody_cache,
+                retirement_pending=retirement_pending,
+            )
+        if not slices or stats.audio_packets < threshold:
+            retirement_pending = _retire_one_typed_source(audio_store, page_limit)
+            return ReadyOutcome(
+                ReadyOutcomeState.WAITING,
+                reason="waiting_for_threshold",
+                remaining_at_frontier=bool(admissions),
+                stats=stats,
+                custody_cache=custody_cache,
+                retirement_pending=retirement_pending,
+            )
+        cohort = _create_typed_cohort(audio_store, admissions, threshold, frontier, config_digest)
+        prepared_slices = _rebind_typed_slices(slices, cohort.admissions)
+    published, custody_cache = _resume_typed_cohort(
+        audio_store,
+        ready_root,
+        cohort,
+        clock_segments,
+        page_limit,
+        custody_cache=custody_cache,
+        prepared_slices=prepared_slices,
+    )
+    retirement_pending = _retire_one_typed_source(audio_store, page_limit)
+    return ReadyOutcome(
+        ReadyOutcomeState.PUBLISHED if published else ReadyOutcomeState.WAITING,
+        tuple(published),
+        None if published else "already_published",
+        bool(cohort.admissions) and not published,
+        stats=stats,
+        custody_cache=custody_cache,
+        retirement_pending=retirement_pending,
+    )
+
+
+publish_typed_sources = finalize_typed_sources
+finalize_sql_sources = finalize_typed_sources
+
+
+def _validate_typed_request(frontier: int | None, drained: bool, page_limit: int) -> None:
+    if type(page_limit) is not int or not 0 < page_limit <= _TYPED_PAGE_MAX:
+        raise ReadyBundleError("typed publication page limit is invalid")
+    if frontier is not None and (type(frontier) is not int or not 0 <= frontier < 2**64):
+        raise ReadyBundleError("typed publication frontier is invalid")
+    if drained and frontier is None:
+        raise ReadyBundleError("a drained typed publication requires its durable frontier")
+
+
+def _typed_source_admissions(
+    audio_store: InternalAudioStore,
+    sources: tuple[TypedPublicationSource, ...] | list[TypedPublicationSource],
+    frontier: int | None,
+) -> tuple[_TypedAdmission, ...]:
+    supplied: dict[str, tuple[TypedPublicationSource, CaptureSource]] = {}
+    for reader in sources:
+        snapshot = reader.source
+        if snapshot.source_id in supplied:
+            raise ReadyBundleError("typed publication source is duplicated")
+        supplied[snapshot.source_id] = (reader, snapshot)
+    admissions: list[_TypedAdmission] = []
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            for source_id, (reader, supplied_snapshot) in supplied.items():
+                current = audio_store.get_source(source_id)
+                if current is None or current != supplied_snapshot:
+                    raise ReadyBundleError("typed publication source snapshot changed")
+                row = cast(
+                    tuple[object, ...] | None,
+                    connection.execute(
+                        "SELECT certified_prefix_count, coverage_digest, block_reason, "
+                        "quarantine_disposition, terminal_time, retention_deadline "
+                        "FROM capture_source WHERE source_id=?",
+                        (source_id,),
+                    ).fetchone(),
+                )
+                if row is None:
+                    raise ReadyBundleError("typed publication source disappeared")
+                admitted = _typed_admission(reader, current, row)
+                if admitted is None:
+                    continue
+                if frontier is not None and current.sequence_start + admitted.admitted_count > frontier:
+                    continue
+                admissions.append(admitted)
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed publication source state is unreadable") from error
+    return tuple(sorted(admissions, key=lambda item: (item.snapshot.sequence_start, item.snapshot.source_id)))
+
+
+def _typed_admission(
+    reader: TypedPublicationSource, snapshot: CaptureSource, certification: tuple[object, ...]
+) -> _TypedAdmission | None:
+    if snapshot.source_type not in {"attempt", "draft", "quarantine"}:
+        raise ReadyBundleError("typed publication source type is invalid")
+    if snapshot.lifecycle == "sealed_waiting":
+        count, digest = snapshot.committed_count, snapshot.committed_sha256
+    elif snapshot.lifecycle == "blocked":
+        certified = _blocked_typed_certification(snapshot, certification)
+        if certified is None:
+            return None
+        count, digest = certified
+    else:
+        return None
+    if count <= 0 or snapshot.sequence_start + count > snapshot.sequence_limit:
+        raise ReadyBundleError("typed publication source checkpoint is invalid")
+    return _TypedAdmission(reader, snapshot, snapshot.lifecycle, count, digest)
+
+
+def _blocked_typed_certification(snapshot: CaptureSource, certification: tuple[object, ...]) -> tuple[int, str] | None:
+    count, digest, block_reason, disposition, terminal_time, retention_deadline = certification
+    if block_reason == "ready_overlap_conflict":
+        return None
+    if snapshot.source_type != "quarantine":
+        raise ReadyBundleError("blocked typed publication source lacks quarantine custody")
+    if disposition in {None, "unclassified", "unprocessable"}:
+        return None
+    if disposition != "published_prefix":
+        raise ReadyBundleError("blocked typed publication source disposition is invalid")
+    if not _valid_quarantine_retention(terminal_time, retention_deadline):
+        raise ReadyBundleError("blocked typed publication source retention evidence is incomplete")
+    if type(count) is not int or count <= 0 or not _is_sha256(digest):
+        return None
+    assert isinstance(count, int) and isinstance(digest, str)
+    if count > snapshot.committed_count:
+        raise ReadyBundleError("typed certified prefix exceeds its source")
+    return count, digest
+
+
+def _valid_quarantine_retention(terminal_time: object, retention_deadline: object) -> bool:
+    if not isinstance(terminal_time, str) or not isinstance(retention_deadline, str):
+        return False
+    try:
+        terminal = int(terminal_time)
+        deadline = int(retention_deadline)
+    except ValueError:
+        return False
+    return 0 <= terminal <= deadline
+
+
+def _typed_records(
+    admission: _TypedAdmission, start_ordinal: int, count: int, page_limit: int
+) -> Iterator[CaptureRecord]:
+    if start_ordinal < 0 or count < 0 or start_ordinal + count > admission.admitted_count:
+        raise ReadyBundleError("typed source slice is outside its admitted prefix")
+    cursor = start_ordinal - 1
+    end = start_ordinal + count
+    while cursor < end - 1:
+        requested = min(page_limit, end - cursor - 1)
+        page = admission.reader.source_page(cursor, requested)
+        page_source = getattr(page, "source", None)
+        page_after = getattr(page, "after_ordinal", None)
+        records = getattr(page, "records", None)
+        if not isinstance(page_source, CaptureSource) or page_after != cursor or not isinstance(records, tuple):
+            raise ReadyBundleError("typed source page is invalid")
+        _require_typed_snapshot(page_source, admission)
+        if not records or len(records) > requested:
+            raise ReadyBundleError("typed source page ended before its frozen slice")
+        for record in records:
+            if not isinstance(record, CaptureRecord) or record.source_id != admission.snapshot.source_id:
+                raise ReadyBundleError("typed source record is invalid")
+            if record.ordinal != cursor + 1 or record.ordinal >= end:
+                raise ReadyBundleError("typed source page range is invalid")
+            yield record
+            cursor = record.ordinal
+
+
+def _typed_ready_custody(
+    ready_root: Path,
+    state_db: StateDB,
+    previous: ReadyCustodyCache | None = None,
+) -> ReadyCustodyCache:
+    ledger = _read_ledger(state_db)
+    bundles = cast(dict[str, object], ledger["bundles"])
+    entries = {bundle_id: cast(dict[str, object], entry) for bundle_id, entry in bundles.items()}
+    revision = source_revision(ready_root)
+    if previous is not None and previous.revision == revision and previous.custody.entries == entries:
+        return previous
+    active_ids = {bundle_id for bundle_id, entry in entries.items() if entry["state"] == "ready"}
+    paths = tuple(sorted(_visible_children(ready_root), key=lambda path: path.name))
+    if {path.name for path in paths} != active_ids:
+        raise ReadyBundleError("typed ready files do not match the active publication ledger")
+    active = tuple(sorted((_read_ready_source(path) for path in paths), key=_ready_start))
+    for source in active:
+        _validate_ready_ledger_entry(entries[source.result.bundle_id], source)
+    if revision != source_revision(ready_root) or entries != cast(dict[str, object], _read_ledger(state_db)["bundles"]):
+        raise ReadyBundleError("typed ready custody changed during authentication")
+    return ReadyCustodyCache(revision, _TypedReadyCustody(active, entries))
+
+
+def _typed_ready_overlap(
+    admission: _TypedAdmission,
+    source: _ReadySource,
+    sequence_range: tuple[int, int],
+    ready_offset: int,
+    page_limit: int,
+) -> None:
+    start, end = sequence_range
+    ordinal = start - admission.snapshot.sequence_start
+    range_index = 0
+    with (source.result.path / _RAW_NAME).open("rb") as published:
+        published.seek(ready_offset * RECORD_SIZE)
+        for record in _typed_records(admission, ordinal, end - start, page_limit):
+            sequence = admission.snapshot.sequence_start + record.ordinal
+            while range_index < len(source.time_ranges) and sequence >= cast(
+                int, source.time_ranges[range_index]["next_sequence"]
+            ):
+                range_index += 1
+            if range_index == len(source.time_ranges) or sequence < cast(
+                int, source.time_ranges[range_index]["start_sequence"]
+            ):
+                raise ReadyBundleError("typed ready overlap has no timestamp mapping")
+            expected = _convert_record(record.raw_bytes, source.time_ranges[range_index])
+            if published.read(RECORD_SIZE) != expected:
+                raise ConflictingOverlapError("typed ready overlap conflicts with its source record")
+
+
+def _typed_active_segments(source: _ReadySource) -> Iterator[tuple[int, int, int]]:
+    offset = 0
+    for start, end in _physical_runs(source.facts):
+        yield start, end, offset
+        offset += end - start
+
+
+def _typed_retired_full_proof(
+    admission: _TypedAdmission, custody: _TypedReadyCustody
+) -> tuple[str, dict[str, object]] | None:
+    start = admission.snapshot.sequence_start
+    end = start + admission.admitted_count
+    for bundle_id, entry in custody.entries.items():
+        if entry["state"] != "retired":
+            continue
+        lineage = source_lineage(entry)
+        if (start, end, admission.admitted_sha256) in lineage:
+            return bundle_id, entry
+    return None
+
+
+def _typed_reject_partial_retired_overlap(admission: _TypedAdmission, custody: _TypedReadyCustody) -> None:
+    start = admission.snapshot.sequence_start + admission.cursor
+    end = admission.snapshot.sequence_start + admission.admitted_count
+    if _typed_retired_full_proof(admission, custody) is not None:
+        return
+    for entry in custody.entries.values():
+        if entry["state"] != "retired":
+            continue
+        if any(start < run_end and run_start < end for run_start, run_end in _physical_runs(_entry_facts(entry))):
+            raise _TypedCustodyConflictError("typed source overlaps retired custody without exact full-source lineage")
+
+
+def _typed_full_ready_proofs(
+    admission: _TypedAdmission, custody: _TypedReadyCustody, page_limit: int
+) -> tuple[tuple[str, dict[str, object]], ...] | None:
+    retired = _typed_retired_full_proof(admission, custody)
+    if retired is not None:
+        return (retired,)
+    _typed_reject_partial_retired_overlap(admission, custody)
+    cursor = admission.snapshot.sequence_start
+    end = cursor + admission.admitted_count
+    proofs: list[tuple[str, dict[str, object]]] = []
+    for source in custody.active:
+        for run_start, run_end, ready_offset in _typed_active_segments(source):
+            if run_end <= cursor:
+                continue
+            if run_start > cursor:
+                return None
+            overlap_end = min(run_end, end)
+            _typed_ready_overlap(
+                admission, source, (cursor, overlap_end), ready_offset + cursor - run_start, page_limit
+            )
+            proof = (source.result.bundle_id, custody.entries[source.result.bundle_id])
+            if not proofs or proofs[-1][0] != proof[0]:
+                proofs.append(proof)
+            cursor = overlap_end
+            if cursor == end:
+                return tuple(proofs)
+    return None
+
+
+def _typed_ready_prefix(
+    admission: _TypedAdmission, custody: _TypedReadyCustody, page_limit: int
+) -> tuple[int, tuple[tuple[str, dict[str, object]], ...]]:
+    if admission.cursor == admission.admitted_count:
+        return admission.cursor, ()
+    retired = _typed_retired_full_proof(admission, custody)
+    if retired is not None:
+        return admission.admitted_count, (retired,)
+    _typed_reject_partial_retired_overlap(admission, custody)
+    cursor = admission.snapshot.sequence_start + admission.cursor
+    end = admission.snapshot.sequence_start + admission.admitted_count
+    proofs: list[tuple[str, dict[str, object]]] = []
+    for source in custody.active:
+        for run_start, run_end, ready_offset in _typed_active_segments(source):
+            if run_end <= cursor:
+                continue
+            if run_start > cursor:
+                return cursor - admission.snapshot.sequence_start, tuple(proofs)
+            overlap_end = min(run_end, end)
+            _typed_ready_overlap(
+                admission, source, (cursor, overlap_end), ready_offset + cursor - run_start, page_limit
+            )
+            proof = (source.result.bundle_id, custody.entries[source.result.bundle_id])
+            if not proofs or proofs[-1][0] != proof[0]:
+                proofs.append(proof)
+            cursor = overlap_end
+            if cursor == end:
+                break
+        if cursor == end:
+            break
+    return cursor - admission.snapshot.sequence_start, tuple(proofs)
+
+
+def _require_typed_snapshot(current: CaptureSource, admission: _TypedAdmission) -> None:
+    frozen = admission.snapshot
+    current_identity = (
+        current.source_id,
+        current.source_type,
+        current.sequence_start,
+        current.sequence_limit,
+        current.committed_count,
+        current.committed_sha256,
+    )
+    frozen_identity = (
+        frozen.source_id,
+        frozen.source_type,
+        frozen.sequence_start,
+        frozen.sequence_limit,
+        frozen.committed_count,
+        frozen.committed_sha256,
+    )
+    if current_identity != frozen_identity or current.lifecycle not in {
+        admission.admitted_lifecycle,
+        "covered",
+        "retiring",
+    }:
+        raise ReadyBundleError("typed publication source identity changed")
+
+
+def _require_typed_admissions_current(
+    audio_store: InternalAudioStore,
+    admissions: tuple[_TypedAdmission, ...],
+) -> None:
+    for admission in admissions:
+        current = audio_store.get_source(admission.snapshot.source_id)
+        if current is None:
+            raise ReadyBundleError("typed publication source disappeared")
+        _require_typed_snapshot(current, admission)
+
+
+def _rebind_typed_slices(
+    slices: tuple[_TypedSlice, ...], admissions: tuple[_TypedAdmission, ...]
+) -> tuple[_TypedSlice, ...]:
+    by_source = {item.snapshot.source_id: item for item in admissions}
+    if len(by_source) != len(admissions):
+        raise ReadyBundleError("typed publication source is duplicated")
+    try:
+        return tuple(replace(item, admission=by_source[item.admission.snapshot.source_id]) for item in slices)
+    except KeyError as error:
+        raise ReadyBundleError("typed publication slice lost its cohort member") from error
+
+
+def _typed_slice(admission: _TypedAdmission, start_ordinal: int, count: int, page_limit: int) -> _TypedSlice:
+    digest = sha256()
+    audio_packets = 0
+    first_size = 0
+    previous_overflow: int | None = None
+    breaks: list[int] = []
+    seen = 0
+    for record in _typed_records(admission, start_ordinal, count, page_limit):
+        raw = record.raw_bytes
+        digest.update(raw)
+        try:
+            layout = inspect_20ms_record(raw)
+        except ValueError as error:
+            raise ReadyBundleError("typed source contains an invalid 20 ms Opus packet") from error
+        if seen == 0:
+            first_size = layout.first_size
+        elif previous_overflow is not None and layout.first_size != previous_overflow:
+            breaks.append(admission.snapshot.sequence_start + record.ordinal)
+        seen += 1
+        audio_packets += layout.packet_count
+        previous_overflow = layout.overflow_size
+    if seen != count:
+        raise ReadyBundleError("typed source slice ended before its frozen count")
+    return _TypedSlice(
+        admission,
+        start_ordinal,
+        count,
+        admission.snapshot.sequence_start + start_ordinal,
+        admission.snapshot.sequence_start + start_ordinal + count,
+        digest.hexdigest(),
+        first_size,
+        previous_overflow,
+        audio_packets,
+        tuple(breaks),
+    )
+
+
+def _normalize_typed_admissions(
+    admissions: tuple[_TypedAdmission, ...], page_limit: int, custody: _TypedReadyCustody | None = None
+) -> tuple[_TypedSlice, ...]:
+    normalized: list[_TypedSlice] = []
+    ends: list[int] = []
+    for admission in admissions:
+        remaining = admission.admitted_count - admission.cursor
+        if remaining <= 0:
+            continue
+        candidate = _typed_slice(admission, admission.cursor, remaining, page_limit)
+        if admission.cursor == 0 and candidate.raw_sha256 != admission.admitted_sha256:
+            raise ReadyBundleError("typed source rows do not match its admitted checkpoint")
+        try:
+            ready_unique = (
+                (candidate,) if custody is None else _unique_against_typed_ready(candidate, custody, page_limit)
+            )
+        except (ConflictingOverlapError, _TypedCustodyConflictError) as error:
+            raise _TypedAdmissionConflictError(admission.snapshot.source_id, str(error)) from error
+        for ready_slice in ready_unique:
+            index = bisect_right(ends, ready_slice.start_sequence)
+            for unique in _unique_against_typed(ready_slice, normalized, index, page_limit):
+                position = bisect_right(ends, unique.start_sequence)
+                normalized.insert(position, unique)
+                ends.insert(position, unique.next_sequence)
+    return tuple(normalized)
+
+
+def _unique_against_typed_ready(
+    candidate: _TypedSlice, custody: _TypedReadyCustody, page_limit: int
+) -> tuple[_TypedSlice, ...]:
+    _typed_reject_partial_retired_overlap(candidate.admission, custody)
+    end = candidate.next_sequence
+    cursor = candidate.start_sequence
+    unique: list[_TypedSlice] = []
+    for source in custody.active:
+        for run_start, run_end, ready_offset in _typed_active_segments(source):
+            if run_end <= cursor:
+                continue
+            if run_start >= end:
+                break
+            if cursor < run_start:
+                unique.append(_crop_typed_slice(candidate, cursor, min(run_start, end), page_limit))
+                cursor = min(run_start, end)
+            overlap_end = min(run_end, end)
+            if cursor < overlap_end:
+                _typed_ready_overlap(
+                    candidate.admission,
+                    source,
+                    (cursor, overlap_end),
+                    ready_offset + cursor - run_start,
+                    page_limit,
+                )
+                cursor = overlap_end
+            if cursor == end:
+                return tuple(unique)
+        if cursor == end:
+            break
+    if cursor < end:
+        unique.append(_crop_typed_slice(candidate, cursor, end, page_limit))
+    return tuple(unique)
+
+
+def _unique_against_typed(
+    candidate: _TypedSlice, normalized: list[_TypedSlice], index: int, page_limit: int
+) -> tuple[_TypedSlice, ...]:
+    end = candidate.next_sequence
+    cursor = candidate.start_sequence
+    unique: list[_TypedSlice] = []
+    while index < len(normalized):
+        retained = normalized[index]
+        if retained.start_sequence >= end:
+            break
+        if cursor < retained.start_sequence:
+            unique.append(_crop_typed_slice(candidate, cursor, min(retained.start_sequence, end), page_limit))
+            cursor = min(retained.start_sequence, end)
+        overlap_end = min(retained.next_sequence, end)
+        if cursor < overlap_end:
+            _compare_typed_overlap(candidate, retained, cursor, overlap_end, page_limit)
+            cursor = overlap_end
+        if cursor == end:
+            break
+        index += 1
+    if cursor < end:
+        unique.append(_crop_typed_slice(candidate, cursor, end, page_limit))
+    return tuple(unique)
+
+
+def _compare_typed_overlap(left: _TypedSlice, right: _TypedSlice, start: int, end: int, page_limit: int) -> None:
+    left_start = left.start_ordinal + start - left.start_sequence
+    right_start = right.start_ordinal + start - right.start_sequence
+    left_rows = _typed_records(left.admission, left_start, end - start, page_limit)
+    right_rows = _typed_records(right.admission, right_start, end - start, page_limit)
+    for left_record, right_record in zip(left_rows, right_rows, strict=True):
+        if left_record.raw_bytes != right_record.raw_bytes:
+            raise ConflictingOverlapError("authenticated typed source overlap has conflicting record bytes")
+
+
+def _crop_typed_slice(source: _TypedSlice, start: int, end: int, page_limit: int) -> _TypedSlice:
+    if not source.start_sequence <= start < end <= source.next_sequence:
+        raise ReadyBundleError("typed source crop is invalid")
+    if (start, end) == (source.start_sequence, source.next_sequence):
+        return source
+    ordinal = source.start_ordinal + start - source.start_sequence
+    return _typed_slice(source.admission, ordinal, end - start, page_limit)
+
+
+def _typed_stats(
+    admissions: tuple[_TypedAdmission, ...], slices: tuple[_TypedSlice, ...], threshold: int
+) -> ReadyPublicationStats:
+    gaps = tuple(
+        (left.next_sequence, right.start_sequence)
+        for left, right in pairwise(slices)
+        if left.next_sequence < right.start_sequence
+    )
+    return ReadyPublicationStats(
+        source_count=len(admissions),
+        record_count=sum(item.record_count for item in slices),
+        audio_packets=sum(item.audio_packets for item in slices),
+        threshold_packets=threshold,
+        gap_count=len(gaps),
+        gap_records=sum(end - start for start, end in gaps),
+    )
+
+
+def _typed_groups(
+    slices: tuple[_TypedSlice, ...], page_limit: int, clock_segments: ClockSegmentMap
+) -> tuple[_TypedGroup, ...]:
+    physical: list[_TypedSlice] = []
+    for item in slices:
+        cursor = item.start_sequence
+        for boundary in (*item.continuity_breaks, item.next_sequence):
+            physical.append(_crop_typed_slice(item, cursor, boundary, page_limit))
+            cursor = boundary
+    groups: list[list[_TypedSlice]] = []
+    previous: _TypedSlice | None = None
+    for item in physical:
+        split = previous is not None and (
+            previous.next_sequence != item.start_sequence
+            or (previous.final_overflow_size is not None and previous.final_overflow_size != item.first_size)
+        )
+        if split or not groups:
+            groups.append([])
+        groups[-1].append(item)
+        previous = item
+    return tuple(_make_typed_group(tuple(group), page_limit, clock_segments) for group in groups)
+
+
+def _make_typed_group(slices: tuple[_TypedSlice, ...], page_limit: int, clock_segments: ClockSegmentMap) -> _TypedGroup:
+    if not slices:
+        raise ReadyBundleError("cannot publish an empty typed group")
+    count = sum(item.record_count for item in slices)
+    raw_sha256 = slices[0].raw_sha256 if len(slices) == 1 else _typed_raw_digest(slices, page_limit)
+    gaps = tuple(
+        (left.next_sequence, right.start_sequence)
+        for left, right in pairwise(slices)
+        if left.next_sequence < right.start_sequence
+    )
+    facts = _BundleFacts(slices[0].start_sequence, slices[-1].next_sequence, count, raw_sha256, gaps)
+    ranges = _typed_clear_unrepresentable_ranges(slices, _time_ranges(facts, clock_segments), page_limit)
+    output_digest = _typed_output_digest(slices, ranges, page_limit)
+    return _TypedGroup(slices, facts, ranges, output_digest)
+
+
+def _typed_clear_unrepresentable_ranges(
+    slices: tuple[_TypedSlice, ...], ranges: tuple[dict[str, object], ...], page_limit: int
+) -> tuple[dict[str, object], ...]:
+    if all(item["utc"] is None for item in ranges):
+        return ranges
+    invalid: set[int] = set()
+    range_index = 0
+    next_sequence = cast(int, ranges[0]["next_sequence"])
+    for item in slices:
+        for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+            sequence = item.admission.snapshot.sequence_start + record.ordinal
+            while sequence >= next_sequence:
+                range_index += 1
+                next_sequence = cast(int, ranges[range_index]["next_sequence"])
+            utc = ranges[range_index]["utc"]
+            if utc is None:
+                continue
+            assert isinstance(utc, Mapping)
+            timestamp = int.from_bytes(record.raw_bytes[:TIMESTAMP_SIZE], "big")
+            normalized = math.floor(timestamp + _finite_number(utc["offset_seconds"]) + 0.5)
+            if not 0 <= normalized <= _UINT32_MAX:
+                invalid.add(range_index)
+    return tuple({**item, "utc": None} if index in invalid else item for index, item in enumerate(ranges))
+
+
+def _typed_raw_digest(slices: tuple[_TypedSlice, ...], page_limit: int) -> str:
+    digest = sha256()
+    for item in slices:
+        for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+            digest.update(record.raw_bytes)
+    return digest.hexdigest()
+
+
+def _typed_output_digest(
+    slices: tuple[_TypedSlice, ...], ranges: tuple[dict[str, object], ...], page_limit: int
+) -> str:
+    digest = sha256()
+    range_index = 0
+    next_sequence = cast(int, ranges[0]["next_sequence"])
+    for item in slices:
+        for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+            sequence = item.admission.snapshot.sequence_start + record.ordinal
+            while sequence >= next_sequence:
+                range_index += 1
+                next_sequence = cast(int, ranges[range_index]["next_sequence"])
+            digest.update(_convert_record(record.raw_bytes, ranges[range_index]))
+    return digest.hexdigest()
+
+
+def _typed_cohort_id(
+    admissions: tuple[_TypedAdmission, ...], threshold: int, frontier: int | None, config_digest: str
+) -> str:
+    identity = ":".join(
+        f"{item.snapshot.source_id}:{item.snapshot.sequence_start}:{item.admitted_lifecycle}:"
+        f"{item.admitted_count}:{item.admitted_sha256}"
+        for item in admissions
+    )
+    return sha256(f"{threshold}:{frontier}:{config_digest}:{identity}".encode()).hexdigest()
+
+
+def _load_active_typed_cohort(audio_store: InternalAudioStore) -> _TypedCohort | None:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            rows = _sql_all(
+                connection.execute(
+                    "SELECT cohort_id,lifecycle,accepted_permit,drained_threshold,closure_frontier,cursor,config_digest "
+                    "FROM publication_cohort WHERE lifecycle IN ('accepted','staging','complete') ORDER BY cohort_id"
+                )
+            )
+            if len(rows) > 1:
+                raise ReadyBundleError("multiple active typed publication cohorts exist")
+            if not rows:
+                return None
+            row = rows[0]
+            cohort_id = cast(str, row[0])
+            lifecycle = cast(str, row[1])
+            permit = row[2]
+            threshold = row[3]
+            frontier_raw = row[4]
+            cursor = row[5]
+            config_digest = row[6]
+            if (
+                permit != cohort_id
+                or not _is_nonnegative_int(threshold)
+                or not _is_nonnegative_int(cursor)
+                or not _is_sha256(config_digest)
+            ):
+                raise ReadyBundleError("typed publication cohort permit is invalid")
+            assert isinstance(threshold, int) and isinstance(cursor, int)
+            frontier = None if frontier_raw is None else decode_uint64(cast(bytes, frontier_raw))
+            member_rows = _sql_all(
+                connection.execute(
+                    "SELECT member_ordinal,source_id,slice_start,slice_count,admitted_lifecycle,"
+                    "admitted_count,admitted_sha256,cursor FROM publication_cohort_member "
+                    "WHERE cohort_id=? ORDER BY member_ordinal",
+                    (cohort_id,),
+                )
+            )
+            certifications = {
+                cast(str, member[1]): _sql_one(
+                    connection.execute(
+                        "SELECT certified_prefix_count,coverage_digest FROM capture_source WHERE source_id=?",
+                        (member[1],),
+                    )
+                )
+                for member in member_rows
+            }
+    except ReadyBundleError:
+        raise
+    except (OSError, StateDBError, sqlite3.DatabaseError, ValueError) as error:
+        raise ReadyBundleError("typed publication cohort is unreadable") from error
+    frozen = tuple(
+        _persisted_admission(audio_store, expected, member, certifications)
+        for expected, member in enumerate(member_rows)
+    )
+    if not frozen or _typed_cohort_id(frozen, threshold, frontier, cast(str, config_digest)) != cohort_id:
+        raise ReadyBundleError("typed publication cohort identity is invalid")
+    return _TypedCohort(
+        cohort_id,
+        lifecycle,
+        threshold,
+        frontier,
+        cursor,
+        cast(str, config_digest),
+        frozen,
+    )
+
+
+def _persisted_admission(
+    audio_store: InternalAudioStore,
+    expected_ordinal: int,
+    member: tuple[object, ...],
+    certifications: dict[str, tuple[object, ...] | None],
+) -> _TypedAdmission:
+    member_ordinal, source_id, slice_start, slice_count, lifecycle, admitted_count, digest, progress = member
+    valid = (
+        member_ordinal == expected_ordinal
+        and slice_start == 0
+        and type(slice_count) is int
+        and type(admitted_count) is int
+        and slice_count == admitted_count
+        and type(progress) is int
+        and 0 <= cast(int, progress) <= cast(int, slice_count)
+        and lifecycle in {"sealed_waiting", "blocked"}
+        and _is_sha256(digest)
+        and isinstance(source_id, str)
+    )
+    if not valid:
+        raise ReadyBundleError("typed publication cohort membership is invalid")
+    assert isinstance(member_ordinal, int)
+    assert isinstance(source_id, str) and isinstance(admitted_count, int)
+    assert isinstance(digest, str) and isinstance(progress, int)
+    snapshot = audio_store.get_source(source_id)
+    certification = certifications[source_id]
+    if snapshot is None or certification is None:
+        raise ReadyBundleError("typed publication cohort source evidence disappeared")
+    admission = _TypedAdmission(
+        SqlitePublicationSource(audio_store, source_id),
+        snapshot,
+        cast(str, lifecycle),
+        admitted_count,
+        digest,
+        progress,
+        member_ordinal,
+    )
+    _require_persisted_admission(admission, certification)
+    return admission
+
+
+def _require_persisted_admission(admission: _TypedAdmission, certification: tuple[object, ...]) -> None:
+    snapshot = admission.snapshot
+    if admission.admitted_lifecycle == "sealed_waiting":
+        valid = (
+            admission.admitted_count == snapshot.committed_count
+            and admission.admitted_sha256 == snapshot.committed_sha256
+        )
+    else:
+        certified_count, certified_digest = certification
+        valid = certified_count == admission.admitted_count and certified_digest == admission.admitted_sha256
+    if not valid or snapshot.lifecycle not in {admission.admitted_lifecycle, "covered", "retiring"}:
+        raise ReadyBundleError("typed publication cohort source identity changed")
+
+
+def _create_typed_cohort(
+    audio_store: InternalAudioStore,
+    admissions: tuple[_TypedAdmission, ...],
+    threshold: int,
+    frontier: int | None,
+    config_digest: str,
+) -> _TypedCohort:
+    cohort_id = _typed_cohort_id(admissions, threshold, frontier, config_digest)
+    proposed = _TypedCohort(
+        cohort_id,
+        "accepted",
+        threshold,
+        frontier,
+        0,
+        config_digest,
+        tuple(replace(item, member_ordinal=index) for index, item in enumerate(admissions)),
+    )
+    for attempt in range(2):
+        try:
+            with audio_store.publication_transaction() as (state, connection):
+                active = _sql_all(
+                    connection.execute(
+                        "SELECT cohort_id FROM publication_cohort WHERE lifecycle IN ('accepted','staging','complete')"
+                    )
+                )
+                if active:
+                    raise ReadyBundleError("another typed publication cohort is active")
+                connection.execute(
+                    "INSERT INTO publication_cohort(cohort_id,lifecycle,accepted_permit,drained_threshold,"
+                    "config_digest,closure_frontier,cursor,accepted_time) "
+                    "VALUES (?, 'accepted', ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    (
+                        cohort_id,
+                        cohort_id,
+                        threshold,
+                        config_digest,
+                        None if frontier is None else encode_uint64(frontier),
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,"
+                    "slice_count,admitted_lifecycle,admitted_count,admitted_sha256,cursor) "
+                    "VALUES (?, ?, ?, 0, ?, ?, ?, ?, 0)",
+                    (
+                        (
+                            cohort_id,
+                            index,
+                            item.snapshot.source_id,
+                            item.admitted_count,
+                            item.admitted_lifecycle,
+                            item.admitted_count,
+                            item.admitted_sha256,
+                        )
+                        for index, item in enumerate(admissions)
+                    ),
+                )
+                state.mark_publication_changed()
+            return proposed
+        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            durable = _load_active_for_reconciliation(audio_store)
+            if durable is not None and _same_typed_cohort(durable, proposed):
+                return durable
+            if durable is None and attempt == 0:
+                continue
+            if durable is None:
+                raise ReadyBundleError("typed cohort acceptance was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous typed cohort acceptance has a third state")
+    raise AssertionError("unreachable")
+
+
+def _load_active_for_reconciliation(audio_store: InternalAudioStore) -> _TypedCohort | None:
+    try:
+        return _load_active_typed_cohort(audio_store)
+    except (ReadyBundleError, InternalAudioStoreError) as error:
+        _typed_fail_stop(audio_store, f"ambiguous typed cohort could not be inspected: {error}")
+
+
+def _same_typed_cohort(left: _TypedCohort, right: _TypedCohort) -> bool:
+    return (
+        left.cohort_id,
+        left.lifecycle,
+        left.threshold,
+        left.frontier,
+        left.cursor,
+        left.config_digest,
+        tuple(
+            (
+                item.snapshot.source_id,
+                item.admitted_lifecycle,
+                item.admitted_count,
+                item.admitted_sha256,
+                item.cursor,
+                item.member_ordinal,
+            )
+            for item in left.admissions
+        ),
+    ) == (
+        right.cohort_id,
+        right.lifecycle,
+        right.threshold,
+        right.frontier,
+        right.cursor,
+        right.config_digest,
+        tuple(
+            (
+                item.snapshot.source_id,
+                item.admitted_lifecycle,
+                item.admitted_count,
+                item.admitted_sha256,
+                item.cursor,
+                item.member_ordinal,
+            )
+            for item in right.admissions
+        ),
+    )
+
+
+def _resume_typed_cohort(  # noqa: PLR0913 - resume keeps the frozen storage and policy inputs explicit
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    clock_segments: ClockSegmentMap,
+    page_limit: int,
+    *,
+    custody_cache: ReadyCustodyCache | None,
+    prepared_slices: tuple[_TypedSlice, ...] | None,
+) -> tuple[list[ReadyBundleResult], ReadyCustodyCache | None]:
+    published: list[ReadyBundleResult] = []
+    current: _TypedCohort | None = cohort
+    while current is not None:
+        if current.lifecycle == "accepted":
+            custody_cache = _typed_ready_custody(ready_root, audio_store.state_db, custody_cache)
+            custody = custody_cache.custody
+            try:
+                current = _advance_typed_ready_custody(audio_store, current, custody, page_limit)
+            except _TypedAdmissionConflictError as error:
+                admission = next(item for item in current.admissions if item.snapshot.source_id == error.source_id)
+                _block_typed_custody_conflict(audio_store, admission, current)
+                raise
+            if current is None:
+                break
+            slices = _accepted_typed_slices(audio_store, current, page_limit, custody, prepared_slices)
+            prepared_slices = None
+        else:
+            slices = _normalize_typed_admissions(current.admissions, page_limit)
+        _require_typed_admissions_current(audio_store, current.admissions)
+        if not slices:
+            _complete_empty_typed_cohort(audio_store, current)
+            break
+        group = _typed_groups(slices, page_limit, clock_segments)[0]
+        try:
+            result = _publish_typed_group(audio_store, ready_root, current, group, page_limit)
+        except InternalAudioStoreError:
+            raise
+        except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+            raise ReadyBundleError("typed ready group could not be published") from error
+        published.append(result)
+        current = _load_active_typed_cohort(audio_store)
+        if current is not None and current.cohort_id != cohort.cohort_id:
+            _typed_fail_stop(audio_store, "typed publication cohort changed during resume")
+    return published, custody_cache
+
+
+def _accepted_typed_slices(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    page_limit: int,
+    custody: _TypedReadyCustody,
+    prepared_slices: tuple[_TypedSlice, ...] | None,
+) -> tuple[_TypedSlice, ...]:
+    if prepared_slices is not None:
+        return prepared_slices
+    try:
+        return _normalize_typed_admissions(cohort.admissions, page_limit, custody)
+    except _TypedAdmissionConflictError as error:
+        admission = next(item for item in cohort.admissions if item.snapshot.source_id == error.source_id)
+        _block_typed_custody_conflict(audio_store, admission, cohort)
+        raise
+
+
+def _advance_typed_ready_custody(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    custody: _TypedReadyCustody,
+    page_limit: int,
+) -> _TypedCohort | None:
+    progress, proofs = _typed_ready_progress(cohort, custody, page_limit)
+    _require_typed_admissions_current(audio_store, cohort.admissions)
+    if all(item.new_cursor == item.old_cursor for item in progress):
+        return cohort
+    proposed = replace(
+        cohort,
+        admissions=tuple(
+            replace(admission, cursor=item.new_cursor)
+            for item, admission in zip(progress, cohort.admissions, strict=True)
+        ),
+    )
+    commit = _CustodyCommit(
+        cohort,
+        proposed,
+        progress,
+        _typed_coverage_proposals(audio_store, cohort, progress),
+        proofs,
+        all(
+            item.new_cursor == admission.admitted_count
+            for item, admission in zip(progress, cohort.admissions, strict=True)
+        ),
+    )
+    return _commit_typed_ready_custody(audio_store, commit)
+
+
+def _typed_ready_progress(
+    cohort: _TypedCohort, custody: _TypedReadyCustody, page_limit: int
+) -> tuple[tuple[_MemberProgress, ...], dict[str, dict[str, object]]]:
+    progress: list[_MemberProgress] = []
+    proofs: dict[str, dict[str, object]] = {}
+    for admission in cohort.admissions:
+        try:
+            new_cursor, admission_proofs = _typed_ready_prefix(admission, custody, page_limit)
+        except (ConflictingOverlapError, _TypedCustodyConflictError) as error:
+            raise _TypedAdmissionConflictError(admission.snapshot.source_id, str(error)) from error
+        assert admission.member_ordinal is not None
+        progress.append(_MemberProgress(admission.member_ordinal, admission.cursor, new_cursor))
+        proofs.update(admission_proofs)
+    return tuple(progress), proofs
+
+
+def _commit_typed_ready_custody(audio_store: InternalAudioStore, commit: _CustodyCommit) -> _TypedCohort | None:
+    for attempt in range(2):
+        try:
+            _commit_typed_ready_custody_once(audio_store, commit)
+            return None if commit.all_complete else commit.proposed
+        except (InternalAudioStoreError, StateDBError, sqlite3.DatabaseError) as error:
+            state = _inspect_typed_ready_custody(audio_store, commit)
+            if state == "proposed":
+                return None if commit.all_complete else commit.proposed
+            if state == "old" and attempt == 0:
+                continue
+            if state == "old":
+                raise ReadyBundleError("typed ready custody commit was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous typed ready custody commit has a third state")
+    raise AssertionError("unreachable")
+
+
+def _commit_typed_ready_custody_once(audio_store: InternalAudioStore, commit: _CustodyCommit) -> None:
+    cohort = commit.cohort
+    with audio_store.publication_transaction() as (state, connection):
+        if any(state.get(StateKind.READY_PUBLICATION, key) != entry for key, entry in commit.proofs.items()):
+            raise ReadyBundleError("typed ready custody changed before cursor commit")
+        row = _sql_one(
+            connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,))
+        )
+        if row is None or tuple(row) != ("accepted", cohort.cursor):
+            raise ReadyBundleError("typed cohort changed before custody commit")
+        for item in commit.progress:
+            if item.new_cursor == item.old_cursor:
+                continue
+            updated = connection.execute(
+                "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
+                (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
+            )
+            if updated.rowcount != 1:
+                raise ReadyBundleError("typed cohort member changed before custody commit")
+        _apply_typed_coverage(connection, commit.coverage)
+        if commit.all_complete:
+            deleted = connection.execute(
+                "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
+                (cohort.cohort_id, cohort.cursor),
+            )
+            if deleted.rowcount != 1:
+                raise ReadyBundleError("typed replay cohort completion changed")
+        state.mark_publication_changed()
+
+
+def _inspect_typed_ready_custody(audio_store: InternalAudioStore, commit: _CustodyCommit) -> str:
+    durable = _load_active_for_reconciliation(audio_store)
+    source_states = tuple(_typed_source_coverage_state(audio_store, item.source_id) for item in commit.coverage)
+    proposed_sources = all(state == item.proposed for state, item in zip(source_states, commit.coverage, strict=True))
+    proposed_cohort = (
+        durable is None if commit.all_complete else durable is not None and _same_typed_cohort(durable, commit.proposed)
+    )
+    if proposed_cohort and proposed_sources:
+        return "proposed"
+    old_sources = all(state == item.old for state, item in zip(source_states, commit.coverage, strict=True))
+    if durable is not None and _same_typed_cohort(durable, commit.cohort) and old_sources:
+        return "old"
+    return "third"
+
+
+def _complete_empty_typed_cohort(audio_store: InternalAudioStore, cohort: _TypedCohort) -> None:
+    if any(item.cursor != item.admitted_count for item in cohort.admissions):
+        raise ReadyBundleError("typed cohort has no output but incomplete members")
+    try:
+        with audio_store.publication_transaction() as (state, connection):
+            cursor = connection.execute(
+                "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle IN ('accepted','complete')",
+                (cohort.cohort_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ReadyBundleError("typed completed cohort changed")
+            state.mark_publication_changed()
+    except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+        durable = _load_active_for_reconciliation(audio_store)
+        if durable is None:
+            return
+        if _same_typed_cohort(durable, cohort):
+            raise ReadyBundleError("typed completed cohort deletion was rolled back") from error
+        _typed_fail_stop(audio_store, "ambiguous typed cohort completion has a third state")
+
+
+def _ensure_typed_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _TypedGroup,
+    page_limit: int,
+) -> _TypedStage:
+    bundle_id = _bundle_id(group.facts)
+    group_identity = f"{cohort.cohort_id}:{cohort.cursor}:{bundle_id}"
+    stage_id = sha256(group_identity.encode()).hexdigest()
+    path = ready_root / f".{bundle_id}.{stage_id[:16]}.stage"
+    key = _StageKey(stage_id, group_identity, path)
+    existing = _load_typed_stage(audio_store, cohort, key, page_limit)
+    if existing is not None:
+        if cohort.lifecycle != "staging":
+            _typed_fail_stop(audio_store, "typed stage exists outside STAGING")
+        _require_typed_stage_space(audio_store, cohort, existing)
+        return existing
+    if cohort.lifecycle != "accepted":
+        raise ReadyBundleError("STAGING cohort lost its typed stage intent")
+    if os.path.lexists(path):
+        raise ReadyBundleError("unowned typed ready stage blocks publication")
+    rows = _stage_ranges(group, page_limit)
+    proposed = _TypedStage(stage_id, group_identity, path, group, rows, stage_id)
+    _require_typed_stage_space(audio_store, cohort, proposed)
+    for attempt in range(2):
+        try:
+            _insert_typed_stage(audio_store, cohort, proposed)
+            return proposed
+        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            durable_cohort = _load_active_for_reconciliation(audio_store)
+            durable = (
+                None if durable_cohort is None else _load_typed_stage(audio_store, durable_cohort, key, page_limit)
+            )
+            if (
+                durable_cohort is not None
+                and _same_typed_cohort(durable_cohort, replace(cohort, lifecycle="staging"))
+                and durable is not None
+                and _same_typed_stage(durable, proposed)
+            ):
+                return durable
+            if (
+                durable_cohort is not None
+                and _same_typed_cohort(durable_cohort, cohort)
+                and durable is None
+                and attempt == 0
+            ):
+                continue
+            if durable_cohort is not None and _same_typed_cohort(durable_cohort, cohort) and durable is None:
+                raise ReadyBundleError("typed stage intent was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous typed stage intent has a third state")
+    raise AssertionError("unreachable")
+
+
+def _insert_typed_stage(audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _TypedStage) -> None:
+    ranges_digest = sha256(_canonical(stage.group.ranges)).hexdigest()
+    first = stage.rows[0]
+    last = stage.rows[-1]
+    with audio_store.publication_transaction() as (state, connection):
+        changed = connection.execute(
+            "UPDATE publication_cohort SET lifecycle='staging' WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
+            (cohort.cohort_id, cohort.cursor),
+        )
+        if changed.rowcount != 1:
+            raise ReadyBundleError("typed cohort changed before stage intent")
+        connection.execute(
+            "INSERT INTO ready_output_stage(stage_id,group_identity,owned_path,expected_bundle_digest,"
+            "expected_record_count,expected_slice_count,progress_records,progress_slice,frozen_device_start,"
+            "frozen_device_end,frozen_utc_start,frozen_utc_end,frozen_mapping_revision,owner_token) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)",
+            (
+                stage.stage_id,
+                stage.group_identity,
+                str(stage.path),
+                stage.group.output_sha256,
+                stage.group.facts.record_count,
+                len(stage.rows),
+                first.device_start,
+                last.device_end,
+                first.utc_start,
+                last.utc_end,
+                ranges_digest,
+                stage.owner_token,
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO ready_stage_range(stage_id,range_ordinal,source_id,start_ordinal,record_count,"
+            "sequence_start,next_sequence,device_start,device_end,utc_start,utc_end,utc_observation_id,"
+            "utc_offset_seconds,utc_uncertainty_seconds,utc_confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_stage_range_values(stage.stage_id, index, item) for index, item in enumerate(stage.rows)),
+        )
+        state.mark_publication_changed()
+
+
+def _stage_range_values(stage_id: str, index: int, item: _StageRange) -> tuple[object, ...]:
+    utc = item.time_range["utc"]
+    if utc is None:
+        mapping: tuple[object, ...] = (None, None, None, None)
+    else:
+        assert isinstance(utc, Mapping)
+        mapping = (
+            utc["observation_id"],
+            utc["offset_seconds"],
+            utc["uncertainty_seconds"],
+            utc.get("confidence", "confirmed"),
+        )
+    return (
+        stage_id,
+        index,
+        item.slice.admission.snapshot.source_id,
+        item.slice.start_ordinal,
+        item.slice.record_count,
+        encode_uint64(item.slice.start_sequence),
+        encode_uint64(item.slice.next_sequence),
+        item.device_start,
+        item.device_end,
+        item.utc_start,
+        item.utc_end,
+        *mapping,
+    )
+
+
+def _stage_ranges(group: _TypedGroup, page_limit: int) -> tuple[_StageRange, ...]:
+    rows: list[_StageRange] = []
+    for item in group.slices:
+        for time_range in group.ranges:
+            start = max(item.start_sequence, cast(int, time_range["start_sequence"]))
+            end = min(item.next_sequence, cast(int, time_range["next_sequence"]))
+            if start >= end:
+                continue
+            slice_ = _crop_typed_slice(item, start, end, page_limit)
+            device_start, device_end = _typed_endpoint_timestamps(slice_, page_limit)
+            utc = time_range["utc"]
+            if utc is None:
+                utc_start = utc_end = None
+            else:
+                assert isinstance(utc, Mapping)
+                offset = _finite_number(utc["offset_seconds"])
+                utc_start = math.floor(device_start + offset + 0.5)
+                utc_end = math.floor(device_end + offset + 0.5)
+                if not 0 <= utc_start <= _UINT32_MAX or not 0 <= utc_end <= _UINT32_MAX:
+                    raise ReadyBundleError("frozen typed UTC endpoint is outside uint32")
+            rows.append(
+                _StageRange(
+                    slice_,
+                    {
+                        "start_sequence": start,
+                        "next_sequence": end,
+                        "utc": utc,
+                    },
+                    device_start,
+                    device_end,
+                    utc_start,
+                    utc_end,
+                )
+            )
+    if not rows or sum(item.slice.record_count for item in rows) != group.facts.record_count:
+        raise ReadyBundleError("typed stage ranges do not cover the group")
+    return tuple(rows)
+
+
+def _typed_endpoint_timestamps(item: _TypedSlice, page_limit: int) -> tuple[int, int]:
+    first = next(_typed_records(item.admission, item.start_ordinal, 1, page_limit))
+    last = next(
+        _typed_records(
+            item.admission,
+            item.start_ordinal + item.record_count - 1,
+            1,
+            page_limit,
+        )
+    )
+    return first.device_timestamp, last.device_timestamp
+
+
+def _load_typed_stage(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    key: _StageKey,
+    page_limit: int,
+) -> _TypedStage | None:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            row = _sql_one(
+                connection.execute(
+                    "SELECT group_identity,owned_path,expected_bundle_digest,expected_record_count,"
+                    "expected_slice_count,frozen_device_start,frozen_device_end,frozen_utc_start,frozen_utc_end,"
+                    "frozen_mapping_revision,owner_token FROM ready_output_stage WHERE stage_id=?",
+                    (key.stage_id,),
+                )
+            )
+            if row is None:
+                return None
+            raw_ranges = _sql_all(
+                connection.execute(
+                    "SELECT range_ordinal,source_id,start_ordinal,record_count,sequence_start,next_sequence,"
+                    "device_start,device_end,utc_start,utc_end,utc_observation_id,utc_offset_seconds,"
+                    "utc_uncertainty_seconds,utc_confidence FROM ready_stage_range "
+                    "WHERE stage_id=? ORDER BY range_ordinal",
+                    (key.stage_id,),
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed stage intent is unreadable") from error
+    header = _parse_stage_header(row, key, len(raw_ranges))
+    by_source = {item.snapshot.source_id: item for item in cohort.admissions}
+    stage_rows = tuple(
+        _stage_range_from_row(by_source, expected, raw, page_limit) for expected, raw in enumerate(raw_ranges)
+    )
+    if not stage_rows:
+        raise ReadyBundleError("typed stage has no frozen ranges")
+    ranges = _merge_frozen_ranges(tuple(item.time_range for item in stage_rows))
+    slices = tuple(item.slice for item in stage_rows)
+    group = _typed_group_from_frozen(slices, ranges, page_limit)
+    actual_identity = (
+        group.output_sha256,
+        group.facts.record_count,
+        sha256(_canonical(ranges)).hexdigest(),
+        stage_rows[0].device_start,
+        stage_rows[-1].device_end,
+        stage_rows[0].utc_start,
+        stage_rows[-1].utc_end,
+    )
+    expected_identity = (
+        header.expected_digest,
+        header.expected_count,
+        header.mapping_revision,
+        header.frozen_device_start,
+        header.frozen_device_end,
+        header.frozen_utc_start,
+        header.frozen_utc_end,
+    )
+    if actual_identity != expected_identity:
+        raise ReadyBundleError("typed stage frozen identity changed")
+    return _TypedStage(
+        key.stage_id,
+        key.group_identity,
+        key.path,
+        group,
+        stage_rows,
+        header.owner_token,
+    )
+
+
+def _parse_stage_header(row: tuple[object, ...], key: _StageKey, range_count: int) -> _StageHeader:
+    identity, path, digest, count, slices, device_start, device_end, utc_start, utc_end, revision, owner = row
+    valid = (
+        identity == key.group_identity
+        and path == str(key.path)
+        and owner == key.stage_id
+        and _is_sha256(digest)
+        and type(count) is int
+        and count > 0
+        and slices == range_count
+        and _is_sha256(revision)
+        and type(device_start) is int
+        and type(device_end) is int
+        and (utc_start is None or type(utc_start) is int)
+        and (utc_end is None or type(utc_end) is int)
+    )
+    if not valid:
+        raise ReadyBundleError("typed stage ownership is invalid")
+    assert isinstance(digest, str) and isinstance(count, int)
+    assert isinstance(device_start, int) and isinstance(device_end, int)
+    assert isinstance(revision, str) and isinstance(owner, str)
+    return _StageHeader(
+        digest, count, device_start, device_end, cast(int | None, utc_start), cast(int | None, utc_end), revision, owner
+    )
+
+
+def _stage_range_from_row(
+    by_source: dict[str, _TypedAdmission],
+    expected_ordinal: int,
+    raw: tuple[object, ...],
+    page_limit: int,
+) -> _StageRange:
+    row = _parse_stage_range_row(raw)
+    if row.ordinal != expected_ordinal or row.source_id not in by_source:
+        raise ReadyBundleError("typed stage ranges are invalid")
+    slice_ = _typed_slice(by_source[row.source_id], row.start, row.count, page_limit)
+    sequence = (decode_uint64(row.sequence_start), decode_uint64(row.next_sequence))
+    endpoints = _typed_endpoint_timestamps(slice_, page_limit)
+    if sequence != (slice_.start_sequence, slice_.next_sequence) or endpoints != (row.device_start, row.device_end):
+        raise ReadyBundleError("typed stage slice identity changed")
+    utc = _frozen_utc_mapping(
+        (row.observation, row.offset, row.uncertainty, row.confidence),
+        (row.utc_start, row.utc_end),
+    )
+    _require_frozen_endpoints(endpoints, row.utc_start, row.utc_end, row.offset, utc)
+    return _StageRange(
+        slice_,
+        {"start_sequence": sequence[0], "next_sequence": sequence[1], "utc": utc},
+        endpoints[0],
+        endpoints[1],
+        cast(int | None, row.utc_start),
+        cast(int | None, row.utc_end),
+    )
+
+
+def _parse_stage_range_row(raw: tuple[object, ...]) -> _StageRangeRow:
+    if len(raw) != _TYPED_STAGE_RANGE_COLUMNS:
+        raise ReadyBundleError("typed stage ranges are invalid")
+    if not isinstance(raw[1], str) or not _is_nonnegative_int(raw[2]):
+        raise ReadyBundleError("typed stage ranges are invalid")
+    if not _is_nonnegative_int(raw[0]) or not _is_nonnegative_int(raw[3]) or raw[3] == 0:
+        raise ReadyBundleError("typed stage ranges are invalid")
+    if not isinstance(raw[4], bytes) or not isinstance(raw[5], bytes):
+        raise ReadyBundleError("typed stage ranges are invalid")
+    return _StageRangeRow(
+        ordinal=cast(int, raw[0]),
+        source_id=raw[1],
+        start=cast(int, raw[2]),
+        count=cast(int, raw[3]),
+        sequence_start=raw[4],
+        next_sequence=raw[5],
+        device_start=raw[6],
+        device_end=raw[7],
+        utc_start=raw[8],
+        utc_end=raw[9],
+        observation=raw[10],
+        offset=raw[11],
+        uncertainty=raw[12],
+        confidence=raw[13],
+    )
+
+
+def _require_frozen_endpoints(
+    device: tuple[int, int], utc_start: object, utc_end: object, offset: object, utc: dict[str, object] | None
+) -> None:
+    if utc is None:
+        return
+    assert isinstance(offset, (int, float)) and not isinstance(offset, bool)
+    calculated = tuple(math.floor(value + offset + 0.5) for value in device)
+    if calculated != (utc_start, utc_end):
+        raise ReadyBundleError("typed stage UTC endpoints are invalid")
+
+
+def _frozen_utc_mapping(
+    mapping: tuple[object, object, object, object],
+    endpoints: tuple[object, object],
+) -> dict[str, object] | None:
+    observation_id, offset, uncertainty, confidence = mapping
+    utc_start, utc_end = endpoints
+    values = (observation_id, offset, uncertainty, confidence, utc_start, utc_end)
+    if all(value is None for value in values):
+        return None
+    try:
+        _validate_observation_id(observation_id)
+        offset_value = _finite_number(offset)
+        uncertainty_value = _finite_number(uncertainty)
+        _validate_nonnegative(uncertainty_value)
+    except ReadyBundleError as error:
+        raise ReadyBundleError("typed stage UTC mapping is invalid") from error
+    if confidence not in {"confirmed", "approximate"} or type(utc_start) is not int or type(utc_end) is not int:
+        raise ReadyBundleError("typed stage UTC mapping is invalid")
+    result: dict[str, object] = {
+        "observation_id": observation_id,
+        "offset_seconds": offset_value,
+        "uncertainty_seconds": uncertainty_value,
+    }
+    if confidence == "approximate":
+        result["confidence"] = confidence
+    return result
+
+
+def _merge_frozen_ranges(rows: tuple[dict[str, object], ...]) -> tuple[dict[str, object], ...]:
+    merged: list[dict[str, object]] = []
+    for item in rows:
+        if merged and merged[-1]["next_sequence"] == item["start_sequence"] and merged[-1]["utc"] == item["utc"]:
+            merged[-1] = {**merged[-1], "next_sequence": item["next_sequence"]}
+        else:
+            merged.append(dict(item))
+    return tuple(merged)
+
+
+def _typed_group_from_frozen(
+    slices: tuple[_TypedSlice, ...], ranges: tuple[dict[str, object], ...], page_limit: int
+) -> _TypedGroup:
+    digest = sha256()
+    count = 0
+    for item in slices:
+        for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+            digest.update(record.raw_bytes)
+        count += item.record_count
+    gaps = tuple(
+        (left.next_sequence, right.start_sequence)
+        for left, right in pairwise(slices)
+        if left.next_sequence < right.start_sequence
+    )
+    facts = _BundleFacts(slices[0].start_sequence, slices[-1].next_sequence, count, digest.hexdigest(), gaps)
+    if ranges[0]["start_sequence"] != facts.start_sequence or ranges[-1]["next_sequence"] != facts.next_sequence:
+        raise ReadyBundleError("typed stage time ranges do not cover the group")
+    return _TypedGroup(slices, facts, ranges, _typed_output_digest(slices, ranges, page_limit))
+
+
+def _same_typed_stage(left: _TypedStage, right: _TypedStage) -> bool:
+    return (
+        left.stage_id,
+        left.group_identity,
+        left.path,
+        left.group.facts,
+        left.group.ranges,
+        left.group.output_sha256,
+        left.owner_token,
+    ) == (
+        right.stage_id,
+        right.group_identity,
+        right.path,
+        right.group.facts,
+        right.group.ranges,
+        right.group.output_sha256,
+        right.owner_token,
+    )
+
+
+def _publish_typed_group(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _TypedGroup,
+    page_limit: int,
+) -> ReadyBundleResult:
+    stage = _ensure_typed_stage(audio_store, ready_root, cohort, group, page_limit)
+    result = _materialize_typed_stage(stage, page_limit)
+    _commit_typed_stage(audio_store, cohort, stage, result)
+    return result
+
+
+def _materialize_typed_stage(stage: _TypedStage, page_limit: int) -> ReadyBundleResult:
+    bundle_id = _bundle_id(stage.group.facts)
+    destination = stage.path.parent / bundle_id
+    if os.path.lexists(destination):
+        _require_typed_destination(destination, stage.group)
+        _discard_owned_typed_stage(stage.path)
+    else:
+        if os.path.lexists(stage.path):
+            if _complete_typed_stage_matches(stage.path, stage.group):
+                stage.path.rename(destination)
+                _sync_directory(destination.parent)
+            else:
+                _discard_owned_typed_stage(stage.path)
+        if not destination.exists():
+            _write_typed_stage(stage, page_limit)
+            try:
+                stage.path.rename(destination)
+            except FileExistsError:
+                _require_typed_destination(destination, stage.group)
+                _discard_owned_typed_stage(stage.path)
+            _sync_directory(destination.parent)
+    _require_typed_destination(destination, stage.group)
+    return ReadyBundleResult(
+        bundle_id,
+        destination,
+        stage.group.facts.next_sequence,
+        stage.group.facts.record_count,
+        stage.group.output_sha256,
+    )
+
+
+def _write_typed_stage(stage: _TypedStage, page_limit: int) -> None:
+    _write_typed_stage_files(stage.path, stage.group, page_limit)
+
+
+def _require_typed_stage_space(audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _TypedStage) -> None:
+    manifest = _canonical(_ready_manifest(stage.group.facts, stage.group.output_sha256, stage.group.ranges))
+    stage_bytes = stage.group.facts.record_count * RECORD_SIZE + len(manifest)
+    database = audio_store.state_db.path
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            page_size = cast(int, connection.execute("PRAGMA page_size").fetchone()[0])
+            page_count = cast(int, connection.execute("PRAGMA page_count").fetchone()[0])
+        if page_size <= 0 or page_count <= 0:
+            raise ReadyBundleError("typed publication SQLite page accounting is invalid")
+        database_bytes = _typed_database_reserve_bytes(page_size, page_count, cohort, stage)
+        ready_stat = stage.path.parent.stat()
+        database_stat = database.stat()
+        if ready_stat.st_dev == database_stat.st_dev:
+            _require_typed_filesystem_space(stage.path.parent, stage_bytes + database_bytes + _TYPED_SPACE_HEADROOM)
+        else:
+            _require_typed_filesystem_space(stage.path.parent, stage_bytes + _TYPED_SPACE_HEADROOM)
+            _require_typed_filesystem_space(database.parent, database_bytes + _TYPED_SPACE_HEADROOM)
+    except ReadyBundleError:
+        raise
+    except (OSError, StateDBError, sqlite3.DatabaseError, TypeError, IndexError) as error:
+        raise ReadyBundleError("typed publication space reserve could not be inspected") from error
+
+
+def _typed_database_reserve_bytes(
+    page_size: int,
+    page_count: int,
+    cohort: _TypedCohort,
+    stage: _TypedStage,
+) -> int:
+    range_rows = len(stage.rows)
+    member_rows = len(cohort.admissions)
+    # The final transaction is the larger case: range deletion, member cursor
+    # update, source coverage update, possible member cascade, three state rows,
+    # the stage table plus its unique index, and the cohort row.
+    btree_mutations = range_rows + 3 * member_rows + 6
+    # A binary tree is the least-fanout SQLite b-tree, so bit_length(page_count)
+    # bounds its depth. At each level a mutation can dirty the path page, one
+    # rebalance sibling and one parent/split page. Each schema index above is
+    # already counted as its own mutation.
+    btree_depth = max(1, page_count.bit_length())
+    btree_pages = _TYPED_BTREE_PAGES_PER_LEVEL * btree_depth * btree_mutations
+    payload_bytes = _typed_stage_metadata_bytes(stage, member_rows)
+    payload_pages = ceil(payload_bytes / page_size)
+    journal_pages = min(page_count, btree_pages) + _TYPED_JOURNAL_MARGIN_PAGES
+    growth_pages = btree_pages
+    return (journal_pages + growth_pages + payload_pages) * page_size
+
+
+def _typed_stage_metadata_bytes(stage: _TypedStage, member_rows: int) -> int:
+    lineage = tuple((item.start_sequence, item.next_sequence, item.raw_sha256) for item in stage.group.slices)
+    entry = _ledger_entry(
+        stage.group.output_sha256,
+        "ready",
+        stage.group.facts,
+        lineage,
+    )
+    text_bytes = sum(
+        len(value.encode())
+        for value in (
+            stage.stage_id,
+            stage.group_identity,
+            str(stage.path),
+            stage.group.output_sha256,
+            stage.owner_token,
+        )
+    )
+    row_text_bytes = sum(
+        len(item.slice.admission.snapshot.source_id.encode())
+        + len(stage.stage_id.encode())
+        + (
+            len(str(cast(Mapping[str, object], item.time_range["utc"])["observation_id"]).encode())
+            if item.time_range["utc"] is not None
+            else 0
+        )
+        for item in stage.rows
+    )
+    row_count = len(stage.rows) + member_rows + 4
+    return (
+        text_bytes
+        + row_text_bytes
+        + len(_canonical(stage.group.ranges))
+        + len(_canonical(entry))
+        + row_count * _TYPED_METADATA_ROW_BYTES
+    )
+
+
+def _require_typed_filesystem_space(path: Path, required: int) -> None:
+    filesystem = os.statvfs(path)
+    available = filesystem.f_bavail * filesystem.f_frsize
+    if available < required:
+        raise ReadyBundleError("insufficient filesystem space for typed ready publication")
+
+
+def _complete_typed_stage_matches(path: Path, group: _TypedGroup) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        raise ReadyBundleError("owned typed ready stage is unsafe")
+    entries = {item.name for item in path.iterdir()}
+    if not entries <= {_RAW_NAME, _MANIFEST_NAME}:
+        raise ReadyBundleError("owned typed ready stage contains an unsafe entry")
+    if entries != {_RAW_NAME, _MANIFEST_NAME}:
+        return False
+    return _typed_files_match(path, group, require_bundle_name=False)
+
+
+def _require_typed_destination(path: Path, group: _TypedGroup) -> None:
+    if not _typed_files_match(path, group, require_bundle_name=True):
+        raise ReadyBundleError("typed ready destination conflicts with its frozen stage")
+
+
+def _typed_files_match(path: Path, group: _TypedGroup, *, require_bundle_name: bool) -> bool:
+    if path.is_symlink() or not path.is_dir() or {item.name for item in path.iterdir()} != {_RAW_NAME, _MANIFEST_NAME}:
+        return False
+    manifest = _read_json(path / _MANIFEST_NAME)
+    expected = _ready_manifest(group.facts, group.output_sha256, group.ranges)
+    if manifest != expected or (require_bundle_name and path.name != _bundle_id(group.facts)):
+        return False
+    raw = path / _RAW_NAME
+    return (
+        not raw.is_symlink()
+        and raw.is_file()
+        and raw.stat().st_size == group.facts.record_count * RECORD_SIZE
+        and _digest(raw) == group.output_sha256
+    )
+
+
+def _discard_owned_typed_stage(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        raise ReadyBundleError("owned typed ready stage is unsafe")
+    entries = tuple(path.iterdir())
+    if any(item.is_symlink() or not item.is_file() or item.name not in {_RAW_NAME, _MANIFEST_NAME} for item in entries):
+        raise ReadyBundleError("owned typed ready stage contains an unsafe entry")
+    for item in entries:
+        item.unlink()
+    path.rmdir()
+    _sync_directory(path.parent)
+
+
+def _write_typed_stage_files(path: Path, group: _TypedGroup, page_limit: int) -> None:
+    if os.path.lexists(path):
+        raise ReadyBundleError("typed ready stage already exists")
+    path.mkdir(mode=_READY_DIRECTORY_MODE)
+    digest = sha256()
+    range_index = 0
+    next_sequence = cast(int, group.ranges[0]["next_sequence"])
+    with (path / _RAW_NAME).open("xb") as output:
+        for item in group.slices:
+            for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+                sequence = item.admission.snapshot.sequence_start + record.ordinal
+                while sequence >= next_sequence:
+                    range_index += 1
+                    next_sequence = cast(int, group.ranges[range_index]["next_sequence"])
+                converted = _convert_record(record.raw_bytes, group.ranges[range_index])
+                output.write(converted)
+                digest.update(converted)
+        output.flush()
+        os.fsync(output.fileno())
+    (path / _RAW_NAME).chmod(_READY_FILE_MODE)
+    if digest.hexdigest() != group.output_sha256:
+        raise ReadyBundleError("typed ready output changed while staging")
+    _write_file(path / _MANIFEST_NAME, _canonical(_ready_manifest(group.facts, group.output_sha256, group.ranges)))
+    _sync_directory(path)
+
+
+def _commit_typed_stage(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _TypedStage,
+    result: ReadyBundleResult,
+) -> None:
+    progress = _typed_member_progress(cohort, stage.group.facts)
+    all_complete = all(
+        item.new_cursor == admission.admitted_count for item, admission in zip(progress, cohort.admissions, strict=True)
+    )
+    entry = _ledger_entry(
+        stage.group.output_sha256,
+        "ready",
+        stage.group.facts,
+        tuple((item.start_sequence, item.next_sequence, item.raw_sha256) for item in stage.group.slices),
+    )
+    ledger = _read_ledger(audio_store.state_db)
+    existing = cast(dict[str, object], ledger["bundles"]).get(result.bundle_id)
+    if existing is not None and (not isinstance(existing, dict) or not _same_ledger_identity(existing, entry)):
+        raise ReadyBundleError("typed ready ledger conflicts with its frozen stage")
+    coverage = _typed_coverage_proposals(audio_store, cohort, progress)
+    proposal = _FinalCommit(cohort, stage, result, entry, progress, coverage, all_complete, ledger)
+    for attempt in range(2):
+        try:
+            _commit_typed_stage_once(audio_store, proposal)
+            return
+        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            final_state = _inspect_typed_final(audio_store, proposal)
+            if final_state == "proposed":
+                return
+            if final_state == "old" and attempt == 0:
+                continue
+            if final_state == "old":
+                raise ReadyBundleError("typed ready final commit was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous typed ready final commit has a third state")
+    raise AssertionError("unreachable")
+
+
+def _typed_member_progress(cohort: _TypedCohort, facts: _BundleFacts) -> tuple[_MemberProgress, ...]:
+    runs = _physical_runs(facts)
+    result: list[_MemberProgress] = []
+    for admission in cohort.admissions:
+        absolute = admission.snapshot.sequence_start + admission.cursor
+        limit = admission.snapshot.sequence_start + admission.admitted_count
+        for start, end in runs:
+            if end <= absolute:
+                continue
+            if start > absolute:
+                break
+            absolute = min(limit, max(absolute, end))
+            if absolute == limit:
+                break
+        assert admission.member_ordinal is not None
+        result.append(
+            _MemberProgress(
+                admission.member_ordinal,
+                admission.cursor,
+                absolute - admission.snapshot.sequence_start,
+            )
+        )
+    return tuple(result)
+
+
+def _typed_coverage_proposals(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    progress: tuple[_MemberProgress, ...],
+) -> tuple[_SourceCoverage, ...]:
+    proposals: list[_SourceCoverage] = []
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            for item, admission in zip(progress, cohort.admissions, strict=True):
+                if item.old_cursor == admission.admitted_count or item.new_cursor != admission.admitted_count:
+                    continue
+                proposals.append(_typed_coverage_proposal(connection, admission))
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed coverage state is unreadable") from error
+    return tuple(proposals)
+
+
+def _typed_coverage_proposal(connection: sqlite3.Connection, admission: _TypedAdmission) -> _SourceCoverage:
+    row = _sql_one(
+        connection.execute(
+            "SELECT lifecycle,committed_count,committed_sha256,closure_frontier,"
+            "certified_prefix_count,coverage_digest,retirement_cursor "
+            "FROM capture_source WHERE source_id=?",
+            (admission.snapshot.source_id,),
+        )
+    )
+    if row is None:
+        raise ReadyBundleError("typed source disappeared before coverage commit")
+    old = tuple(row)
+    _require_typed_coverage_source(old, admission)
+    proposed = list(old)
+    full = admission.admitted_count == admission.snapshot.committed_count
+    if not full and admission.admitted_lifecycle != "blocked":
+        raise ReadyBundleError("only a certified blocked prefix may retain uncovered source rows")
+    proposed[0] = "retiring" if full else "covered"
+    proposed[3] = encode_uint64(admission.snapshot.sequence_start + admission.admitted_count)
+    proposed[5] = admission.admitted_sha256
+    proposed[6] = 0 if full else None
+    return _SourceCoverage(admission.snapshot.source_id, old, tuple(proposed))
+
+
+def _cover_typed_full_replays(
+    audio_store: InternalAudioStore,
+    admissions: tuple[_TypedAdmission, ...],
+    custody: _TypedReadyCustody,
+    page_limit: int,
+) -> tuple[_TypedAdmission, ...]:
+    remaining: list[_TypedAdmission] = []
+    for admission in admissions:
+        try:
+            proofs = _typed_full_ready_proofs(admission, custody, page_limit)
+        except ConflictingOverlapError, _TypedCustodyConflictError:
+            _block_typed_custody_conflict(audio_store, admission)
+            raise
+        if proofs is None:
+            remaining.append(admission)
+            continue
+        _commit_typed_replay_coverage(audio_store, admission, proofs)
+    return tuple(remaining)
+
+
+def _commit_typed_replay_coverage(
+    audio_store: InternalAudioStore,
+    admission: _TypedAdmission,
+    proofs: tuple[tuple[str, dict[str, object]], ...],
+) -> None:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            proposal = _typed_coverage_proposal(connection, admission)
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed replay coverage state is unreadable") from error
+    for attempt in range(2):
+        try:
+            with audio_store.publication_transaction() as (state, connection):
+                if any(state.get(StateKind.READY_PUBLICATION, bundle_id) != entry for bundle_id, entry in proofs):
+                    raise ReadyBundleError("typed replay custody changed before coverage commit")
+                _apply_typed_coverage(connection, (proposal,))
+                state.mark_publication_changed()
+            return
+        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            current = _typed_source_coverage_state(audio_store, proposal.source_id)
+            if current == proposal.proposed:
+                return
+            if current == proposal.old and attempt == 0:
+                continue
+            if current == proposal.old:
+                raise ReadyBundleError("typed replay coverage commit was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous typed replay coverage commit has a third state")
+    raise AssertionError("unreachable")
+
+
+def _typed_source_coverage_state(audio_store: InternalAudioStore, source_id: str) -> tuple[object, ...] | None:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            row = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,committed_count,committed_sha256,closure_frontier,"
+                    "certified_prefix_count,coverage_digest,retirement_cursor FROM capture_source WHERE source_id=?",
+                    (source_id,),
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        _typed_fail_stop(audio_store, f"typed replay coverage could not be inspected: {error}")
+    return None if row is None else tuple(row)
+
+
+def _block_typed_custody_conflict(
+    audio_store: InternalAudioStore, admission: _TypedAdmission, cohort: _TypedCohort | None = None
+) -> None:
+    source = admission.snapshot
+    try:
+        with audio_store.publication_transaction() as (state, connection):
+            changed = connection.execute(
+                "UPDATE capture_source SET lifecycle='blocked',block_reason='ready_overlap_conflict' "
+                "WHERE source_id=? AND lifecycle=? AND committed_count=? AND committed_sha256=? "
+                "AND closure_frontier IS ?",
+                (
+                    source.source_id,
+                    admission.admitted_lifecycle,
+                    source.committed_count,
+                    source.committed_sha256,
+                    None if source.closure_frontier is None else encode_uint64(source.closure_frontier),
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ReadyBundleError("typed conflict source changed before disposition")
+            if cohort is not None:
+                deleted = connection.execute(
+                    "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
+                    (cohort.cohort_id, cohort.cursor),
+                )
+                if deleted.rowcount != 1:
+                    raise ReadyBundleError("typed conflict cohort changed before disposition")
+            state.mark_publication_changed()
+    except InternalAudioStoreError, sqlite3.DatabaseError:
+        try:
+            with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+                row = _sql_one(
+                    connection.execute(
+                        "SELECT lifecycle,block_reason FROM capture_source WHERE source_id=?", (source.source_id,)
+                    )
+                )
+        except (OSError, StateDBError, sqlite3.DatabaseError) as inspect_error:
+            _typed_fail_stop(audio_store, f"typed conflict disposition could not be inspected: {inspect_error}")
+        active = _load_active_for_reconciliation(audio_store) if cohort is not None else None
+        if row is not None and tuple(row) == ("blocked", "ready_overlap_conflict") and active is None:
+            return
+        _typed_fail_stop(audio_store, "ambiguous typed conflict disposition has a third state")
+
+
+def _require_typed_coverage_source(state: tuple[object, ...], admission: _TypedAdmission) -> None:
+    snapshot = admission.snapshot
+    expected_closure = None if snapshot.closure_frontier is None else encode_uint64(snapshot.closure_frontier)
+    valid = (
+        state[0] == admission.admitted_lifecycle
+        and state[1] == snapshot.committed_count
+        and state[2] == snapshot.committed_sha256
+        and state[3] == expected_closure
+        and state[6] is None
+    )
+    if admission.admitted_lifecycle == "blocked":
+        valid = valid and state[4] == admission.admitted_count and state[5] == admission.admitted_sha256
+    if not valid:
+        raise ReadyBundleError("typed source changed before coverage commit")
+
+
+def _commit_typed_stage_once(audio_store: InternalAudioStore, proposal: _FinalCommit) -> None:
+    cohort, stage = proposal.cohort, proposal.stage
+    ledger = _typed_proposed_ledger(proposal)
+    with audio_store.publication_transaction() as (state, connection):
+        row = _sql_one(
+            connection.execute(
+                "SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?",
+                (cohort.cohort_id,),
+            )
+        )
+        if row is None or tuple(row) != ("staging", cohort.cursor):
+            raise ReadyBundleError("typed cohort changed before final commit")
+        stage_row = _sql_one(
+            connection.execute(
+                "SELECT group_identity,owned_path,expected_bundle_digest,expected_record_count,owner_token "
+                "FROM ready_output_stage WHERE stage_id=?",
+                (stage.stage_id,),
+            )
+        )
+        if stage_row is None or tuple(stage_row) != (
+            stage.group_identity,
+            str(stage.path),
+            stage.group.output_sha256,
+            stage.group.facts.record_count,
+            stage.owner_token,
+        ):
+            raise ReadyBundleError("typed stage ownership changed before final commit")
+        state.put(StateKind.READY_PUBLICATION, proposal.result.bundle_id, proposal.entry)
+        state.put(StateKind.READY_PUBLICATION, "frontier", {"value": ledger["frontier"]})
+        for item in proposal.progress:
+            changed = connection.execute(
+                "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
+                (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
+            )
+            if changed.rowcount != 1:
+                raise ReadyBundleError("typed cohort member changed before final commit")
+        _apply_typed_coverage(connection, proposal.coverage)
+        connection.execute("DELETE FROM ready_output_stage WHERE stage_id=?", (stage.stage_id,))
+        if proposal.all_complete:
+            deleted = connection.execute(
+                "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='staging' AND cursor=?",
+                (cohort.cohort_id, cohort.cursor),
+            )
+            if deleted.rowcount != 1:
+                raise ReadyBundleError("typed cohort completion changed before final commit")
+        else:
+            changed = connection.execute(
+                "UPDATE publication_cohort SET lifecycle='accepted',cursor=? "
+                "WHERE cohort_id=? AND lifecycle='staging' AND cursor=?",
+                (cohort.cursor + 1, cohort.cohort_id, cohort.cursor),
+            )
+            if changed.rowcount != 1:
+                raise ReadyBundleError("typed cohort cursor changed before final commit")
+        state.mark_publication_changed()
+
+
+def _typed_proposed_ledger(proposal: _FinalCommit) -> dict[str, object]:
+    bundles = dict(cast(dict[str, object], proposal.ledger["bundles"]))
+    bundles[proposal.result.bundle_id] = proposal.entry
+    return {
+        "bundles": bundles,
+        "frontier": max(cast(int, proposal.ledger["frontier"]), proposal.stage.group.facts.next_sequence),
+    }
+
+
+def _apply_typed_coverage(connection: sqlite3.Connection, coverage: tuple[_SourceCoverage, ...]) -> None:
+    for item in coverage:
+        new_lifecycle, _count, _digest, new_closure, _certified, new_coverage, new_cursor = item.proposed
+        old_lifecycle, count, digest, old_closure, certified, old_coverage, old_cursor = item.old
+        changed = connection.execute(
+            "UPDATE capture_source SET lifecycle=?,closure_frontier=?,coverage_digest=?,retirement_cursor=? "
+            "WHERE source_id=? AND lifecycle=? AND committed_count=? AND committed_sha256=? "
+            "AND closure_frontier IS ? AND certified_prefix_count IS ? AND coverage_digest IS ? "
+            "AND retirement_cursor IS ?",
+            (
+                new_lifecycle,
+                new_closure,
+                new_coverage,
+                new_cursor,
+                item.source_id,
+                old_lifecycle,
+                count,
+                digest,
+                old_closure,
+                certified,
+                old_coverage,
+                old_cursor,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ReadyBundleError("typed source changed before coverage commit")
+
+
+def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit) -> str:
+    cohort, stage = proposal.cohort, proposal.stage
+    try:
+        ledger = _read_ledger(audio_store.state_db)
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            cohort_row = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?",
+                    (cohort.cohort_id,),
+                )
+            )
+            stage_row = _sql_one(
+                connection.execute(
+                    "SELECT group_identity FROM ready_output_stage WHERE stage_id=?",
+                    (stage.stage_id,),
+                )
+            )
+            cursors = tuple(
+                _sql_one(
+                    connection.execute(
+                        "SELECT cursor FROM publication_cohort_member WHERE cohort_id=? AND member_ordinal=?",
+                        (cohort.cohort_id, item.member_ordinal),
+                    )
+                )
+                for item in proposal.progress
+            )
+            sources = tuple(
+                (
+                    item.source_id,
+                    _sql_one(
+                        connection.execute(
+                            "SELECT lifecycle,committed_count,committed_sha256,closure_frontier,"
+                            "certified_prefix_count,coverage_digest,retirement_cursor "
+                            "FROM capture_source WHERE source_id=?",
+                            (item.source_id,),
+                        )
+                    ),
+                )
+                for item in proposal.coverage
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError, ReadyBundleError) as error:
+        _typed_fail_stop(audio_store, f"ambiguous typed final commit could not be inspected: {error}")
+    proposed_sources = all(
+        row is not None and tuple(row) == item.proposed
+        for (_source_id, row), item in zip(sources, proposal.coverage, strict=True)
+    )
+    old_sources = all(
+        row is not None and tuple(row) == item.old
+        for (_source_id, row), item in zip(sources, proposal.coverage, strict=True)
+    )
+    proposed_cohort = (
+        cohort_row is None
+        if proposal.all_complete
+        else cohort_row is not None and tuple(cohort_row) == ("accepted", cohort.cursor + 1)
+    )
+    proposed_cursors = proposal.all_complete or all(
+        row is not None and row[0] == item.new_cursor for row, item in zip(cursors, proposal.progress, strict=True)
+    )
+    if (
+        ledger == _typed_proposed_ledger(proposal)
+        and proposed_cohort
+        and stage_row is None
+        and proposed_cursors
+        and proposed_sources
+    ):
+        return "proposed"
+    old_cursors = all(
+        row is not None and row[0] == item.old_cursor for row, item in zip(cursors, proposal.progress, strict=True)
+    )
+    durable_control_state = (
+        ledger,
+        None if cohort_row is None else tuple(cohort_row),
+        None if stage_row is None else tuple(stage_row),
+    )
+    expected_control_state = (
+        proposal.ledger,
+        ("staging", cohort.cursor),
+        (stage.group_identity,),
+    )
+    if durable_control_state == expected_control_state and old_cursors and old_sources:
+        return "old"
+    return "third"
+
+
+def _retire_one_typed_source(audio_store: InternalAudioStore, page_limit: int) -> bool:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            row = _sql_one(
+                connection.execute(
+                    "SELECT source_id,committed_count,committed_sha256,coverage_digest,retirement_cursor "
+                    "FROM capture_source WHERE lifecycle='retiring' AND NOT EXISTS "
+                    "(SELECT 1 FROM publication_cohort_member WHERE publication_cohort_member.source_id=capture_source.source_id) "
+                    "AND (retirement_cursor<committed_count OR (retirement_cursor=committed_count "
+                    "AND NOT EXISTS (SELECT 1 FROM capture_tail WHERE capture_tail.source_id=capture_source.source_id) "
+                    "AND NOT EXISTS (SELECT 1 FROM capture_conflict WHERE capture_conflict.source_id=capture_source.source_id) "
+                    "AND NOT EXISTS (SELECT 1 FROM capture_evidence WHERE capture_evidence.source_id=capture_source.source_id))) "
+                    "ORDER BY retirement_cursor=committed_count,source_id LIMIT 1"
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed retirement state is unreadable") from error
+    if row is None:
+        return False
+    source_id, committed_count, committed_digest, coverage_digest, old_cursor = row
+    if (
+        not isinstance(source_id, str)
+        or type(committed_count) is not int
+        or coverage_digest != committed_digest
+        or type(old_cursor) is not int
+        or not 0 <= old_cursor <= committed_count
+    ):
+        _typed_fail_stop(audio_store, "typed retirement coverage proof is invalid")
+    step = _RetirementStep(
+        source_id,
+        committed_count,
+        cast(str, committed_digest),
+        old_cursor,
+        page_limit,
+    )
+    return _advance_typed_retirement(audio_store, step)
+
+
+def _advance_typed_retirement(audio_store: InternalAudioStore, step: _RetirementStep) -> bool:
+    old_cursor = step.old_cursor
+    committed_count = step.committed_count
+    for attempt in range(2):
+        proposed = None if old_cursor == committed_count else min(committed_count, old_cursor + step.page_limit)
+        try:
+            result = _retire_typed_source_once(audio_store, step)
+            actual = result.cursor
+            if not result.progressed:
+                if actual != old_cursor:
+                    _typed_fail_stop(audio_store, "typed retirement reported invalid stalled progress")
+                return False
+            if actual == old_cursor == committed_count:
+                return False
+            if actual != proposed:
+                _typed_fail_stop(audio_store, "typed retirement advanced an unexpected cursor")
+            return True
+        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            state = _inspect_typed_retirement(audio_store, step, proposed)
+            if state == "proposed":
+                return True
+            if state == "old" and attempt == 0:
+                continue
+            if state == "old":
+                raise ReadyBundleError("typed retirement step was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous typed retirement has a third state")
+    raise AssertionError("unreachable typed retirement retry state")
+
+
+def _retire_typed_source_once(audio_store: InternalAudioStore, step: _RetirementStep) -> _RetirementResult:
+    proposed: int | None = step.old_cursor
+    with audio_store.publication_transaction() as (state, connection):
+        source = _sql_one(
+            connection.execute(
+                "SELECT lifecycle,committed_count,committed_sha256,coverage_digest,retirement_cursor "
+                "FROM capture_source WHERE source_id=?",
+                (step.source_id,),
+            )
+        )
+        if source is None or tuple(source) != (
+            "retiring",
+            step.committed_count,
+            step.coverage_digest,
+            step.coverage_digest,
+            step.old_cursor,
+        ):
+            raise ReadyBundleError("typed retirement source changed")
+        ordinals = tuple(
+            cast(int, row[0])
+            for row in _sql_all(
+                connection.execute(
+                    "SELECT ordinal FROM capture_record WHERE source_id=? AND ordinal>=? ORDER BY ordinal LIMIT ?",
+                    (step.source_id, step.old_cursor, step.page_limit),
+                )
+            )
+        )
+        retired_residue = _sql_one(
+            connection.execute(
+                "SELECT count(*) FROM capture_record WHERE source_id=? AND ordinal<?",
+                (step.source_id, step.old_cursor),
+            )
+        )
+        if retired_residue is None or retired_residue[0] != 0:
+            raise ReadyBundleError("typed retirement cursor does not match retained rows")
+        if ordinals:
+            if ordinals != tuple(range(step.old_cursor, step.old_cursor + len(ordinals))):
+                raise ReadyBundleError("typed retirement rows are not contiguous")
+            proposed = step.old_cursor + len(ordinals)
+            connection.executemany(
+                "DELETE FROM capture_record WHERE source_id=? AND ordinal=?",
+                ((step.source_id, ordinal) for ordinal in ordinals),
+            )
+            changed = connection.execute(
+                "UPDATE capture_source SET retirement_cursor=? "
+                "WHERE source_id=? AND lifecycle='retiring' AND retirement_cursor=?",
+                (proposed, step.source_id, step.old_cursor),
+            )
+            if changed.rowcount != 1:
+                raise ReadyBundleError("typed retirement cursor changed")
+        else:
+            if step.old_cursor != step.committed_count:
+                raise ReadyBundleError("typed retirement rows ended before coverage")
+            residue = _sql_one(
+                connection.execute(
+                    "SELECT "
+                    "(SELECT count(*) FROM capture_tail WHERE source_id=?),"
+                    "(SELECT count(*) FROM capture_conflict WHERE source_id=?),"
+                    "(SELECT count(*) FROM capture_evidence WHERE source_id=?),"
+                    "(SELECT count(*) FROM publication_cohort_member WHERE source_id=?)",
+                    (step.source_id, step.source_id, step.source_id, step.source_id),
+                )
+            )
+            if residue is None or tuple(residue) != (0, 0, 0, 0):
+                return _RetirementResult(step.old_cursor, False)
+            deleted = connection.execute(
+                "DELETE FROM capture_source WHERE source_id=? AND lifecycle='retiring' "
+                "AND retirement_cursor=? AND coverage_digest=?",
+                (step.source_id, step.old_cursor, step.coverage_digest),
+            )
+            if deleted.rowcount != 1:
+                raise ReadyBundleError("typed retirement source changed before removal")
+            proposed = None
+        state.mark_publication_changed()
+    return _RetirementResult(proposed, True)
+
+
+def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _RetirementStep, proposed: int | None) -> str:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            row = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,committed_count,committed_sha256,coverage_digest,retirement_cursor "
+                    "FROM capture_source WHERE source_id=?",
+                    (step.source_id,),
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        _typed_fail_stop(audio_store, f"ambiguous typed retirement could not be inspected: {error}")
+    if proposed is None and row is None:
+        return "proposed"
+    if row is not None and tuple(row[:4]) == (
+        "retiring",
+        step.committed_count,
+        step.coverage_digest,
+        step.coverage_digest,
+    ):
+        if row[4] == proposed:
+            return "proposed"
+        if row[4] == step.old_cursor:
+            return "old"
+    return "third"
+
+
+def _typed_fail_stop(audio_store: InternalAudioStore, message: str) -> NoReturn:
+    audio_store._fail_stop(message)

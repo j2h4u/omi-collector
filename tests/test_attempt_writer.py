@@ -73,6 +73,7 @@ class FakeTarget:
     prepare_leg_result: object = "prepared"
     append_readonly: list[bool] = field(default_factory=list)
     append_offsets: list[int] = field(default_factory=list)
+    append_tails: list[bytes] = field(default_factory=list)
     second_append_started: threading.Event = field(default_factory=threading.Event)
 
     def _record(self, name: str, value: bytes | object = None) -> None:
@@ -101,11 +102,12 @@ class FakeTarget:
             raise OSError("read begin failed after close")
         return notice
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
         self.thread_ids.add(threading.get_ident())
         self.calls.append(("append", offset, bytes(chunk)))
         self.append_readonly.append(chunk.readonly)
         self.append_offsets.append(offset)
+        self.append_tails.append(tail)
         if len(self.append_offsets) == 2:
             self.second_append_started.set()
         self.append_started.set()
@@ -119,6 +121,10 @@ class FakeTarget:
 
     def checkpoint(self) -> object:
         self._record("checkpoint")
+        return self.checkpoint_result
+
+    def interrupt(self) -> object:
+        self._record("interrupt")
         return self.checkpoint_result
 
     def seal(self, done_notice: object) -> object:
@@ -185,8 +191,8 @@ class ProcessLifetimeTarget:
         self.flags[0] = 1
         return None
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
-        del offset, chunk
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+        del offset, chunk, tail
         self.entered.set()
         if not self.release.poll(15):
             raise TimeoutError("parent did not release the writer target")
@@ -194,6 +200,10 @@ class ProcessLifetimeTarget:
         return None
 
     def checkpoint(self) -> object:
+        self.flags[1] = 1
+        return None
+
+    def interrupt(self) -> object:
         self.flags[1] = 1
         return None
 
@@ -423,6 +433,31 @@ async def _test_arena_is_shared_and_data_waits_for_read_begin() -> None:
         assert writer.progress.submitted == RECORD_SIZE
         assert writer.progress.written == RECORD_SIZE
         await writer.close()
+
+
+def test_partial_tail_is_drained_before_interruption() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        arena = bytearray(RECORD_SIZE * 2)
+        first = b"x" * RECORD_SIZE
+        tail = b"partial"
+        arena[: RECORD_SIZE + len(tail)] = first + tail
+        async with _owned_writer(target, arena, config=WriterConfig(chunk_records=1)) as writer:
+            await writer.start()
+            await writer.prepare_leg(10, 2)
+            await writer.read_begin("begin")
+            assert writer.publish(RECORD_SIZE, tail)
+
+            assert await writer.interrupt() == "checkpointed"
+
+            assert target.calls[-2:] == [
+                ("append", 0, first),
+                ("interrupt", 0, None),
+            ]
+            assert target.append_tails[-1] == tail
+            assert writer.written_high_water == RECORD_SIZE
+
+    asyncio.run(exercise())
 
 
 def test_submit_read_begin_is_nonblocking_and_orders_data() -> None:

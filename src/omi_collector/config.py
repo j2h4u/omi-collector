@@ -157,17 +157,15 @@ class MemoryConfig:
 
 @dataclass(frozen=True, slots=True)
 class DurabilityConfig:
-    """Disk admission, checkpoint, and file-hash batching limits."""
+    """Disk admission and I/O batching limits."""
 
     staging_headroom_bytes: int = 16 * 1024 * 1024
     staging_overhead_fraction: float = 0.10
-    checkpoint_records: int = 1024
     io_chunk_bytes: int = 1024 * 1024
 
     def __post_init__(self) -> None:
         _require_positive_int(self.staging_headroom_bytes, "staging_headroom_bytes")
         _require_fraction(self.staging_overhead_fraction, "staging_overhead_fraction")
-        _require_positive_int(self.checkpoint_records, "checkpoint_records")
         _require_positive_int(self.io_chunk_bytes, "io_chunk_bytes")
 
 

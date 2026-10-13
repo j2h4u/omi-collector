@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Event
 from time import monotonic
 from typing import Protocol
@@ -237,9 +236,11 @@ class QuarantineMaintenance:
         if not self._maintenance_due(should_defer):
             return
         await self._recover_and_publish()
+        while self._staging.publication_followup_due() and not should_defer():
+            await self._recover_and_publish()
         if should_defer():
             return
-        await self._sweep_terminal_retired(should_defer)
+        await self._refresh_utc_projection()
         if should_defer():
             return
         await self._sweep_terminal_quarantine(should_defer)
@@ -263,6 +264,12 @@ class QuarantineMaintenance:
             return False
         return monotonic() >= self._quarantine_retry_not_before
 
+    async def _refresh_utc_projection(self) -> None:
+        try:
+            await joined_to_thread(self._staging.refresh_utc_projection)
+        except Exception as error:  # noqa: BLE001 - projection is retryable idle metadata
+            self._runtime.debug_exception("utc_projection_refresh_failed", error)
+
     async def _sweep_terminal_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
             removed = await joined_to_thread(
@@ -274,8 +281,8 @@ class QuarantineMaintenance:
                 return
             self._runtime.debug_exception("terminal_quarantine_sweep_failed", error)
         else:
-            for path in removed:
-                self._runtime.debug_event("terminal_quarantine_deleted", source=path.name)
+            for source_id in removed:
+                self._runtime.debug_event("terminal_quarantine_deleted", source=source_id)
 
     async def _salvage_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
@@ -403,70 +410,20 @@ class QuarantineMaintenance:
         attempt = await joined_to_thread(self._staging.open_attempt, descriptor.attempt_id)
         try:
             recovery = await joined_to_thread(attempt.recover)
-        except BaseException:
+            return self._durable_sql_frontier(descriptor, recovery)
+        finally:
             await joined_to_thread(attempt.close)
-            raise
-        await joined_to_thread(self._staging.retain_validated_attempt, descriptor.attempt_id, attempt)
-        try:
-            return await joined_to_thread(self._activate_pending_frontier, descriptor)
-        except Exception as error:
-            if not self._runtime.is_device_busy_error(error):
-                raise
-            # A competing writer owns the only lease that may promote the
-            # tail. Preserve this attempt and defer promotion to the normal
-            # writer admission retry. The authenticated raw boundary keeps
-            # that later admission's arena consistent with the promotion.
-            return self._authenticated_tail_frontier(descriptor, recovery)
 
     @staticmethod
-    def _authenticated_tail_frontier(descriptor: AttemptDescriptorShape, recovery: RecoveryShape) -> int:
+    def _durable_sql_frontier(descriptor: AttemptDescriptorShape, recovery: RecoveryShape) -> int:
         if recovery.raw_bytes % RECORD_SIZE:
-            raise OpportunisticSyncError("validated recovery returned an unaligned raw tail")
+            raise OpportunisticSyncError("typed recovery returned an unaligned durable frontier")
         raw_records = recovery.raw_bytes // RECORD_SIZE
-        if recovery.valid_records > raw_records or raw_records > descriptor.packet_count:
-            raise OpportunisticSyncError("validated recovery returned inconsistent raw-tail bounds")
-        return descriptor.start_sequence + raw_records
+        if recovery.valid_records != raw_records or raw_records > descriptor.packet_count:
+            raise OpportunisticSyncError("typed recovery returned inconsistent durable bounds")
+        return descriptor.start_sequence + recovery.valid_records
 
-    def _activate_pending_frontier(self, descriptor: AttemptDescriptorShape) -> int:
-        """Promote an aligned raw tail under a lease before admission sizes RAM.
-
-        Startup validation authenticates the raw tail but deliberately leaves it
-        unconsumable.  Acquire the same staging lease boundary used by the
-        writer, consume that authenticated tail into the checkpoint, and close
-        the temporary handle before returning the authoritative frontier to
-        reconciliation.  A later writer reopens the already-promoted attempt.
-        """
-        with self._staging.device_lock(operation="resume_pending_attempt") as lease:
-            resumed = self._staging.resume_streaming_attempt(lease)
-            if resumed is None or resumed.attempt_id != descriptor.attempt_id:
-                raise OpportunisticSyncError("validated pending attempt disappeared before lease-bound resume")
-            try:
-                prefix = resumed.durable_prefix
-                durable_next = prefix.next_sequence
-                end = descriptor.start_sequence + descriptor.packet_count
-                if isinstance(durable_next, bool) or not isinstance(durable_next, int):
-                    raise OpportunisticSyncError("lease-bound resume returned an invalid durable frontier")
-                if not descriptor.start_sequence <= durable_next <= end:
-                    raise OpportunisticSyncError("lease-bound resume returned an inconsistent durable frontier")
-                return durable_next
-            finally:
-                resumed.close()
-
-    async def _sweep_terminal_retired(self, should_defer: Callable[[], bool]) -> None:
-        try:
-            removed = await joined_to_thread(
-                self._staging.sweep_terminal_retired,
-                should_defer=should_defer,
-            )
-        except Exception as error:  # noqa: BLE001 - sweep failure preserves collection and evidence
-            if self._runtime.is_device_busy_error(error):
-                return
-            self._runtime.debug_exception("terminal_retired_sweep_failed", error)
-            return
-        for path in removed:
-            self._runtime.debug_event("terminal_retired_partial_deleted", attempt_id=path.name)
-
-    async def _salvage_quarantined_prefix(self, source: Path, should_defer: Callable[[], bool]) -> bool:
+    async def _salvage_quarantined_prefix(self, source: str, should_defer: Callable[[], bool]) -> bool:
         source_state = await joined_to_thread(self._staging.quarantine_state, source)
         if source_state in {QuarantineState.PUBLISHED, QuarantineState.UNPROCESSABLE}:
             return True
@@ -476,8 +433,8 @@ class QuarantineMaintenance:
         }[source_state]
         state = quarantine_transition(QuarantineState.RECOVERING, recovery_event).state
         try:
-            result = await joined_to_thread(
-                self._runtime.publish_quarantined_prefix,
+            admission = await joined_to_thread(
+                self._runtime.admit_quarantined_prefix,
                 source,
                 self._staging,
                 should_defer=should_defer,
@@ -487,34 +444,22 @@ class QuarantineMaintenance:
             raise
         except Exception as error:  # noqa: BLE001 - the runtime classifies supported salvage failures
             return await self._handle_quarantine_publish_error(source, state, error)
-        published = quarantine_transition(state, QuarantineEvent.OUTPUT_COMMITTED)
-        if published.action is not QuarantineAction.MARK_PUBLISHED:
-            return True
-        try:
-            await joined_to_thread(self._staging.mark_quarantine_published, source)
-        except Exception as error:  # noqa: BLE001 - retain source until a later lifecycle pass
-            retained = quarantine_transition(published.state, QuarantineEvent.MARK_FAILED)
-            assert retained.action is QuarantineAction.KEEP
-            self._runtime.debug_exception("quarantine_terminal_mark_failed", error, source=source.name)
-            return True
-        acknowledged = quarantine_transition(published.state, QuarantineEvent.MARK_COMMITTED)
-        assert acknowledged.state is QuarantineState.PUBLISHED
-        publication = result
         self._quarantine_retry_number = 0
         self._quarantine_retry_not_before = 0.0
         self._runtime.debug_event(
-            "quarantine_prefix_published",
-            source=source.name,
-            bundle=publication.bundle_path.name,
-            deduplicated=publication.deduplicated,
+            "quarantine_prefix_admitted",
+            source=source,
+            start_sequence=admission.start_sequence,
+            next_sequence=admission.next_sequence,
+            record_count=admission.record_count,
         )
-        await report_activity(self._activity, "prefix_published")
+        await report_activity(self._activity, "prefix_admitted")
         await self._recover_and_publish()
         return True
 
     async def _handle_quarantine_publish_error(
         self,
-        source: Path,
+        source: str,
         state: QuarantineState,
         error: Exception,
     ) -> bool:
@@ -542,7 +487,7 @@ class QuarantineMaintenance:
         retry = quarantine_transition(state, QuarantineEvent.RETRYABLE_FAILURE)
         if retry.action is not QuarantineAction.KEEP:
             return True
-        self._runtime.debug_exception("quarantine_prefix_publish_retryable", error, source=source.name)
+        self._runtime.debug_exception("quarantine_prefix_publish_retryable", error, source=source)
         backoff = self._config.retry.quarantine_publish_backoff_seconds
         self._quarantine_retry_not_before = monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
         self._quarantine_retry_number += 1
@@ -550,8 +495,8 @@ class QuarantineMaintenance:
 
     async def _mark_quarantine(
         self,
-        source: Path,
-        marker: Callable[[Path, str], None],
+        source: str,
+        marker: Callable[[str, str], None],
         event: str,
         reason: str,
     ) -> bool:
@@ -561,11 +506,11 @@ class QuarantineMaintenance:
             self._runtime.debug_exception(
                 "quarantine_invalid_marker_preserved",
                 marking_error,
-                source=source.name,
+                source=source,
             )
             return False
         else:
-            self._runtime.debug_event(event, source=source.name)
+            self._runtime.debug_event(event, source=source)
             return True
 
     async def _quarantine_pending(

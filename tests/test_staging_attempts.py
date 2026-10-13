@@ -1,1146 +1,251 @@
-"""Focused attempts staging ownership tests."""
+"""Focused SQL-backed attempt sequencing tests."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from errno import EXDEV
+import sqlite3
+from contextlib import closing
 from hashlib import sha256
-from os import PathLike, fsync
 from pathlib import Path
-from shutil import rmtree
-from types import SimpleNamespace
-from typing import BinaryIO, cast
+from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters import quarantine, staging_filesystem
 from omi_collector.capture.adapters.attempts import (
-    RecordGapError,
-    RecordMismatchError,
+    RecordAcceptanceError,
     RecordRegressionError,
+    SqliteStagedAttempt,
 )
-from omi_collector.capture.adapters.collector_state_db import StateKind
-from omi_collector.capture.adapters.staging_contract import AttemptStateError, DiskSpaceError
-from omi_collector.capture.adapters.staging_writer import StagingWriter
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from omi_collector.config import CollectorConfig, DurabilityConfig, StagingRetentionConfig
-from staging_test_factory import StagingStore
-
-_CAPTURE_ROOTS: set[Path] = set()
-
-
-class _NonEmptyDigest:
-    def __init__(self, wrapped: object, observe: Callable[[bytes], None] | None = None) -> None:
-        self._wrapped = wrapped
-        self._observe = observe
-
-    def update(self, data: bytes) -> None:
-        if not data:
-            raise AssertionError("streaming hash attempted an empty update")
-        if self._observe is not None:
-            self._observe(data)
-        self._wrapped.update(data)  # type: ignore[attr-defined]
-
-    def hexdigest(self) -> str:
-        return self._wrapped.hexdigest()  # type: ignore[attr-defined,no-any-return]
-
-
-def _capture_root(tmp_path: Path) -> Path:
-    root = tmp_path.parent / f"{tmp_path.name}-captures"
-    if tmp_path not in _CAPTURE_ROOTS:
-        rmtree(root, ignore_errors=True)
-        _CAPTURE_ROOTS.add(tmp_path)
-    return root
-
-
-@pytest.fixture(autouse=True)
-def _isolate_capture_root(tmp_path: Path) -> None:
-    rmtree(_capture_root(tmp_path), ignore_errors=True)
+from omi_collector.capture.adapters.collector_state_db import StateDB
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, read_capture_source
+from omi_collector.capture.adapters.staging_contract import AttemptStateError
+from omi_collector.capture.adapters.staging_filesystem import StagingIO
+from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
 
 
 def _record(marker: int) -> bytes:
-    return marker.to_bytes(4, "big") + bytes((marker,)) * (RECORD_SIZE - 4)
+    return marker.to_bytes(4, "big") + bytes((marker,)) * (AUDIO_RECORD_SIZE - 4)
 
 
-def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
-    attempt.record_read_begin(ReadBeginNotification(100, count))
-    attempt._stream_hash = _NonEmptyDigest(attempt._stream_hash)
-    return attempt
-
-
-def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
-    attempt.record_read_begin(ReadBeginNotification(100, count))
-    attempt._stream_hash = _NonEmptyDigest(attempt._stream_hash)
-    return attempt
-
-
-def _attempt_row(attempt: object) -> dict[str, object]:
-    return cast(dict[str, object], attempt._filesystem._read_attempt_row(attempt.attempt_id))  # type: ignore[attr-defined]
-
-
-def _checkpoint(attempt: object) -> dict[str, object]:
-    return cast(dict[str, object], _attempt_row(attempt)["checkpoint"])
-
-
-def _write_row_field(attempt: object, field: str, value: object) -> None:
-    row = _attempt_row(attempt)
-    row[field] = value
-    attempt._filesystem.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, row)  # type: ignore[attr-defined]
-
-
-def _rewrite_checkpoint(attempt: object, field: str, value: object) -> None:
-    checkpoint = _checkpoint(attempt)
-    checkpoint[field] = value
-    _write_row_field(attempt, "checkpoint", checkpoint)
-
-
-def _replace_with_symlink(path: Path, target: Path, payload: bytes | str) -> None:
-    path.unlink()
-    path.symlink_to(target)
-    if isinstance(payload, bytes):
-        target.write_bytes(payload)
-    else:
-        target.write_text(payload, encoding="utf-8")
-
-
-def _guard_rename_to_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_rename = staging_filesystem.os.rename
-
-    def guarded_rename(
-        source: str | bytes | PathLike[str] | PathLike[bytes],
-        destination: str | bytes | PathLike[str] | PathLike[bytes],
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-    ) -> None:
-        if src_dir_fd is None or dst_dir_fd is None or src_dir_fd != dst_dir_fd:
-            raise OSError(EXDEV, "simulated cross-mount rename")
-        real_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
-
-    monkeypatch.setattr(staging_filesystem.os, "rename", guarded_rename)
-
-
-class _RecordingStream:
-    def __init__(self, wrapped: object) -> None:
-        self.wrapped = wrapped
-        self.writes: list[bytes] = []
-
-    def write(self, payload: bytes) -> int:
-        self.writes.append(payload)
-        return cast(int, self.wrapped.write(payload))  # type: ignore[attr-defined]
-
-    def flush(self) -> None:
-        self.wrapped.flush()  # type: ignore[attr-defined]
-
-    def fileno(self) -> int:
-        return cast(int, self.wrapped.fileno())  # type: ignore[attr-defined]
-
-    def close(self) -> None:
-        self.wrapped.close()  # type: ignore[attr-defined]
-
-
-class _ReadCountingStream:
-    def __init__(self, wrapped: BinaryIO, reads: list[int]) -> None:
-        self._wrapped = wrapped
-        self._reads = reads
-
-    def read(self, size: int = -1) -> bytes:
-        self._reads[0] += 1
-        return self._wrapped.read(size)
-
-    def fileno(self) -> int:
-        return self._wrapped.fileno()
-
-    def close(self) -> None:
-        self._wrapped.close()
-
-    def __enter__(self) -> _ReadCountingStream:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        self.close()
-
-
-def test_prepare_persists_descriptor_before_returning(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
-
-    assert attempt.path.parent == tmp_path / "attempts"
-    assert attempt.path.name == attempt.attempt_id
-    assert _attempt_row(attempt)["descriptor"] is not None
-    assert (
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id).descriptor.start_sequence
-        == 100
+def _store(tmp_path: Path) -> StagingStore:
+    spool = tmp_path / "spool"
+    return StagingStore(
+        spool,
+        tmp_path / "captures",
+        state_db=StateDB(spool / "collector-state.sqlite3"),
+        io=StagingIO(),
     )
 
 
-def test_accept_chunk_requires_read_begin_and_exact_order_and_size(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
-    with pytest.raises(AttemptStateError, match="READ_BEGIN"):
-        attempt.accept_chunk(100, _record(1))
-
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    with pytest.raises(AttemptStateError, match="positive multiple"):
-        attempt.accept_chunk(100, b"short")
-    with pytest.raises(AttemptStateError, match="next expected"):
-        attempt.accept_chunk(101, _record(1))
-    attempt.accept_chunk(100, _record(1))
-    attempt.accept_chunk(101, _record(2))
-
-    assert (attempt.path / "records.bin").read_bytes() == _record(1) + _record(2)
+def _attempt(store: StagingStore, count: int = 2) -> SqliteStagedAttempt:
+    attempt = store.prepare_streaming_attempt(100, count)
+    attempt.prepare_leg(100, count)
+    attempt.record_read_begin(ReadBeginNotification(100, count))
+    return attempt
 
 
-def test_streaming_accept_chunk_replays_overlap_and_appends_one_suffix(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=3)
-    first, second, third = _record(1), _record(2), _record(3)
-    attempt.accept_chunk(100, first)
-    attempt.checkpoint()
-    attempt.begin_recovery(100, 3)
-
-    attempt.accept_chunk(100, first + second + third)
-    assert (attempt.path / "records.bin").read_bytes() == first + second + third
-
-
-def test_streaming_recovery_rejects_a_leg_beyond_the_original_range(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=3)
-    first, second = _record(1), _record(2)
-    attempt.accept_chunk(100, first + second)
-    attempt.checkpoint()
-
-    with pytest.raises(RecordRegressionError):
-        attempt.begin_recovery(102, 2)
-
-    assert (attempt.path / "records.bin").read_bytes() == first + second
-    attempt.close()
-
-
-def test_streaming_chunk_crossing_hash_boundary_persists_the_boundary_prefix(tmp_path: Path) -> None:
-    records = tuple(_record(index % 256) for index in range(1, 1026))
-    attempt = _started_streaming_attempt(tmp_path, count=len(records))
-    attempt.accept_chunk(100, b"".join(records[:1023]))
-    attempt.accept_chunk(1123, b"".join(records[1023:]))
-
-    checkpoint = _checkpoint(attempt)
-    assert checkpoint["record_count"] == 1024
-    assert checkpoint["raw_sha256"] == sha256(b"".join(records[:1024])).hexdigest()
-    assert attempt.durable_prefix.next_sequence == 1124
-    assert (attempt.path / "records.bin").read_bytes() == b"".join(records)
-    attempt.close()
-
-
-def test_streaming_chunk_hash_advances_once_across_checkpoint_boundary(
-    tmp_path: Path,
-) -> None:
-    real_sha256 = sha256
-    records = _record(1) + _record(2) + _record(3)
-    updates: list[bytes] = []
-
-    def observe_update(data: bytes) -> None:
-        offset = sum(len(part) for part in updates)
-        assert offset + len(data) <= len(records)
-        assert data == records[offset : offset + len(data)]
-        updates.append(bytes(data))
-
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(durability=DurabilityConfig(checkpoint_records=2)),
-    )
-    attempt = store.prepare_streaming_attempt(100, 3)
+def test_typed_attempt_commits_records_and_exposes_bounded_source_pages(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
     try:
-        attempt.record_read_begin(ReadBeginNotification(100, 3))
-        attempt._stream_hash = _NonEmptyDigest(attempt._stream_hash, observe_update)
-        attempt.accept_chunk(100, records)
+        raw = _record(1) + _record(2)
+        attempt.accept_chunk(100, raw)
 
-        checkpoint = _checkpoint(attempt)
-        boundary_bytes = 2 * RECORD_SIZE
-        assert checkpoint["record_count"] == 2
-        assert checkpoint["raw_sha256"] == real_sha256(records[:boundary_bytes]).hexdigest()
-        assert updates
-        assert all(updates)
-        assert b"".join(updates) == records
-        raw_bytes = (attempt.path / "records.bin").read_bytes()
-        assert raw_bytes == records
-        assert len(raw_bytes) == 3 * RECORD_SIZE
+        page = attempt.source_page(limit=2)
+
+        assert attempt.path is None
+        assert page.source.committed_count == 2
+        assert page.source.committed_sha256 == sha256(raw).hexdigest()
+        assert b"".join(record.raw_bytes for record in page.records) == raw
+        assert not (store.attempts_root / attempt.attempt_id).exists()
     finally:
         attempt.close()
 
 
-def test_streaming_accept_chunk_writes_the_appended_suffix_once(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=3)
-    stream = _RecordingStream(cast(object, attempt._stream_raw))
-    attempt._stream_raw = cast("BinaryIO", stream)
-    attempt.accept_chunk(100, _record(1) + _record(2) + _record(3))
+def test_typed_complete_seal_returns_durable_source_result_and_sealed_lifecycle(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, 1)
+    try:
+        raw = _record(1)
+        attempt.accept_chunk(100, raw)
 
-    assert stream.writes == [_record(1) + _record(2) + _record(3)]
+        result = attempt.seal(DoneNotification(0, 101))
 
-
-def test_streaming_accept_chunk_matches_per_record_hash_and_checkpoint(tmp_path: Path) -> None:
-    records = b"".join(_record(index % 256) for index in range(1025))
-    per_record = _started_streaming_attempt(tmp_path / "per-record", count=1025)
-    chunked = _started_streaming_attempt(tmp_path / "chunked", count=1025)
-    for index in range(1025):
-        per_record.accept_chunk(100 + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
-    chunked.accept_chunk(100, records)
-
-    assert (per_record.path / "records.bin").read_bytes() == (chunked.path / "records.bin").read_bytes()
-    per_checkpoint = _checkpoint(per_record)
-    chunk_checkpoint = _checkpoint(chunked)
-    assert per_checkpoint["record_count"] == chunk_checkpoint["record_count"] == 1024
-    assert per_checkpoint["raw_sha256"] == chunk_checkpoint["raw_sha256"]
-    assert per_record.durable_prefix == chunked.durable_prefix
+        assert result.source_id == attempt.attempt_id
+        assert result.start_sequence == 100
+        assert result.next_sequence == 101
+        assert result.record_count == 1
+        assert result.raw_sha256 == sha256(raw).hexdigest()
+        assert attempt.source.lifecycle == "sealed_waiting"
+    finally:
+        attempt.close()
 
 
-@pytest.mark.parametrize("records", [b"", b"short", _record(1) + b"torn"])
-def test_streaming_accept_chunk_rejects_malformed_payload(tmp_path: Path, records: bytes) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=2)
+@pytest.mark.parametrize(
+    ("damage", "reason"),
+    (("payload", "digest"), ("missing", "count"), ("ordinal", "ordinal")),
+)
+def test_restart_inspection_and_seal_authenticate_canonical_records(tmp_path: Path, damage: str, reason: str) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, 1)
+    try:
+        attempt.accept_chunk(100, _record(1))
+        with closing(store.state_db.open_connection()) as connection:
+            if damage == "payload":
+                connection.execute(
+                    "UPDATE capture_record SET payload = ? WHERE source_id = ? AND ordinal = 0",
+                    (bytes((9,)) * (AUDIO_RECORD_SIZE - 4), attempt.attempt_id),
+                )
+            elif damage == "missing":
+                connection.execute(
+                    "DELETE FROM capture_record WHERE source_id = ? AND ordinal = 0", (attempt.attempt_id,)
+                )
+            else:
+                connection.execute(
+                    "UPDATE capture_record SET ordinal = 1 WHERE source_id = ? AND ordinal = 0", (attempt.attempt_id,)
+                )
+            connection.commit()
 
-    with pytest.raises(AttemptStateError, match="positive multiple"):
-        attempt.accept_chunk(100, records)
+        with pytest.raises(AttemptStateError, match=reason):
+            store.open_attempt(attempt.attempt_id)
+        with pytest.raises(AttemptStateError, match=reason):
+            attempt.seal(DoneNotification(0, 101))
 
-    assert (attempt.path / "records.bin").read_bytes() == b""
+        source = read_capture_source(store.state_db, attempt.attempt_id)
+        assert source is not None and source.lifecycle == "receiving"
+    finally:
+        attempt.close()
 
 
-def test_streaming_accept_chunk_rejects_gap_and_mutated_replay(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=3)
+def test_typed_interruption_retains_partial_tail_and_restart_completes_exact_record(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
     first, second = _record(1), _record(2)
-    attempt.accept_chunk(100, first + second)
-    attempt.checkpoint()
-    attempt.begin_recovery(100, 3)
+    try:
+        attempt.accept_chunk(100, first, tail=second[:37])
+        attempt.interrupt()
+    finally:
+        attempt.close()
 
-    with pytest.raises(RecordGapError):
-        attempt.accept_chunk(102, _record(3) + _record(4))
-    with pytest.raises(RecordMismatchError):
-        attempt.accept_chunk(100, _record(9))
-
-    assert (attempt.path / "records.bin").read_bytes() == first + second
-
-
-def test_streaming_checkpoint_is_bounded_and_flushes_an_explicit_tail(tmp_path: Path) -> None:
-    sync_calls = 0
-
-    def track_sync(fd: int) -> None:
-        nonlocal sync_calls
-        sync_calls += 1
-        fsync(fd)
-
-    attempt = _started_streaming_attempt(tmp_path, count=1025, fsync_fn=track_sync)
-    before_records = sync_calls
-    for index in range(1023):
-        attempt.accept_chunk(100 + index, _record((index + 1) % 256))
-    assert sync_calls == before_records
-
-    attempt.accept_chunk(1123, _record(1024 % 256))
-    # The checkpoint row commits in SQLite; the injectable filesystem sync is
-    # used only for the raw file boundary.
-    assert sync_calls == before_records + 1
-    attempt.accept_chunk(1124, _record(1025 % 256))
-    assert sync_calls == before_records + 1
-
-    attempt.checkpoint()
-    assert sync_calls == before_records + 2
-    assert (attempt.path / "records.bin").stat().st_size == 1025 * RECORD_SIZE
-    attempt.close()
-
-
-def test_streaming_checkpoints_never_rehash_the_growing_raw_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=1024)
-    monkeypatch.setattr(
-        Path,
-        "read_bytes",
-        lambda _path: (_ for _ in ()).throw(AssertionError("streaming staging must not use read_bytes")),
-    )
-    for index in range(1024):
-        attempt.accept_chunk(100 + index, _record(index % 256))
-    attempt.checkpoint()
-
-    attempt.seal(DoneNotification(0, 1124))
-
-
-def test_durability_config_projects_headroom_overhead_and_checkpoint_batching(tmp_path: Path) -> None:
-    durability = DurabilityConfig(
-        staging_headroom_bytes=10,
-        staging_overhead_fraction=0.5,
-        checkpoint_records=2,
-        io_chunk_bytes=7,
-    )
-    config = CollectorConfig(durability=durability)
-    expected_required = (2 * 3 * RECORD_SIZE) + max(10, 3 * RECORD_SIZE // 2)
-
-    def statvfs(_: str | Path) -> object:
-        return SimpleNamespace(f_bavail=expected_required, f_frsize=1)
-
-    store = StagingStore(tmp_path, _capture_root(tmp_path), statvfs_fn=statvfs, config=config)
-    attempt = store.prepare_streaming_attempt(100, 3)
-    attempt.record_read_begin(ReadBeginNotification(100, 3))
-    attempt.accept_chunk(100, _record(1))
-    attempt.accept_chunk(101, _record(2))
-
-    checkpoint = _checkpoint(attempt)
-    assert expected_required == 3330
-    assert checkpoint["record_count"] == 2
-
-
-def test_resumed_attempt_rechecks_remaining_capacity_before_its_next_read(tmp_path: Path) -> None:
-    durability = DurabilityConfig(
-        staging_headroom_bytes=10,
-        staging_overhead_fraction=0.5,
-        checkpoint_records=2,
-        io_chunk_bytes=7,
-    )
-    config = CollectorConfig(durability=durability)
-    total_raw_bytes = 3 * RECORD_SIZE
-    reserve_bytes = max(10, total_raw_bytes // 2)
-    initial_required = (2 * total_raw_bytes) + reserve_bytes
-    resumed_required = (2 * RECORD_SIZE) + total_raw_bytes + reserve_bytes
-
-    def space(available: int) -> Callable[[str | Path], object]:
-        return lambda _path: SimpleNamespace(f_bavail=available, f_frsize=1)
-
-    initial_store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        statvfs_fn=space(initial_required),
-        config=config,
-    )
-    attempt = initial_store.prepare_streaming_attempt(100, 3)
-    attempt.prepare_leg(100, 3)
-    attempt.record_read_begin(ReadBeginNotification(100, 3))
-    first = _record(1)
-    attempt.accept_chunk(100, first)
-    attempt.checkpoint()
-    attempt.close(durable=True)
-
-    restarted = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        statvfs_fn=space(resumed_required - 1),
-        config=config,
-    )
-    with restarted.device_lock() as lease:
-        resumed = restarted.resume_streaming_attempt(lease)
-        assert resumed is not None
-        with pytest.raises(DiskSpaceError, match=f"need {resumed_required} bytes"):
-            resumed.prepare_leg(101, 2)
-        assert (resumed.path / "records.bin").read_bytes() == first
-        resumed.close(durable=True)
-
-
-def test_writer_close_failure_preserves_recoverable_prefix_without_terminal_marker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    writer = StagingWriter(store, 100, 1)
-    writer.prepare_leg(100, 1)
-    writer.read_begin(ReadBeginNotification(100, 1))
-    assert writer.publish_prefix() is None
-    attempt = writer._attempt
-    assert attempt is not None
-    original_close = attempt.close
-
-    def fail_close(*, durable: bool = False) -> None:
-        del durable
-        raise OSError("simulated writer close failure")
-
-    monkeypatch.setattr(attempt, "close", fail_close)
-    with pytest.raises(OSError, match="writer close failure"):
-        writer.close()
-    monkeypatch.setattr(attempt, "close", original_close)
-    attempt.close(durable=True)
-
-    assert _attempt_row(attempt)["prefix_publication"] is not None
-    assert _attempt_row(attempt)["terminal_retirement"] is None
-    assert store.sweep_terminal_retired() == ()
-    assert attempt.path.exists()
-
-
-def test_terminal_marker_write_failure_leaves_only_recoverable_prefix(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-
-    def wall_clock_ns() -> int:
-        return now
-
-    monkeypatch.setattr(quarantine, "_wall_clock_ns", wall_clock_ns)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    assert attempt.publish_prefix() is not None
-    attempt.close(durable=True)
-    write_attempt_field = store._filesystem._write_attempt_field
-
-    def fail_terminal_marker_write(attempt_id: str, field: str, value: object) -> None:
-        if field == "terminal_retirement":
-            raise OSError("simulated terminal marker fsync failure")
-        write_attempt_field(attempt_id, field, value)
-
-    monkeypatch.setattr(store._filesystem, "_write_attempt_field", fail_terminal_marker_write)
-    with pytest.raises(OSError, match="terminal marker fsync failure"):
-        store.terminalize_prefix_attempt(attempt.attempt_id)
-
-    now += 1_000_000_000
-    assert _attempt_row(attempt)["prefix_publication"] is not None
-    assert _attempt_row(attempt)["terminal_retirement"] is None
-    assert store.sweep_terminal_retired() == ()
-    assert attempt.path.exists()
-
-
-def test_streaming_rejects_malformed_sequence_and_count(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=1)
-    with pytest.raises(AttemptStateError, match="next expected"):
-        attempt.accept_chunk(101, _record(1))
-    attempt.accept_chunk(100, _record(1))
-    with pytest.raises(AttemptStateError, match="exceeds READ_BEGIN"):
-        attempt.accept_chunk(101, _record(2))
-
-
-def test_streaming_reopen_does_not_rehash_or_trust_a_partial_prefix(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=3)
-    first = _record(1)
-    attempt.accept_chunk(100, first)
-    attempt.checkpoint()
-    attempt.close()
-    before = (attempt.path / "records.bin").read_bytes()
-
-    reopened = StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-    with pytest.raises(AttemptStateError, match="no trusted live durable prefix"):
-        _ = reopened.durable_prefix
-    assert (attempt.path / "records.bin").read_bytes() == before
-    reopened.close()
-
-
-def test_streaming_resume_promotes_only_an_aligned_post_checkpoint_tail(tmp_path: Path) -> None:
-    first_store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = first_store.prepare_streaming_attempt(100, 3)
-    attempt.record_read_begin(ReadBeginNotification(100, 3))
-    first, second = _record(1), _record(2)
-    attempt.accept_chunk(100, first)
-    attempt.checkpoint()
-    attempt.accept_chunk(101, second)
-    attempt.close(durable=True)
-    checkpoint_before = _checkpoint(attempt)
-
-    restarted = StagingStore(tmp_path, _capture_root(tmp_path))
-    with restarted.device_lock() as lease:
-        resumed = restarted.resume_streaming_attempt(lease)
-        assert resumed is not None
-        assert resumed.durable_prefix.record_count == 2
-        assert resumed.durable_prefix.raw_sha256 == sha256(first + second).hexdigest()
-        assert _checkpoint(resumed)["record_count"] == 2
-        resumed.close()
-
-    assert checkpoint_before["record_count"] == 1
-    assert (attempt.path / "records.bin").read_bytes() == first + second
-    assert attempt.path.exists()
-
-
-def test_close_is_non_durable_by_default_and_durable_close_syncs_raw(tmp_path: Path) -> None:
-    raw_syncs: list[Path] = []
-
-    def record_raw_sync(fd: int) -> None:
-        try:
-            target = Path(f"/proc/self/fd/{fd}").resolve()
-        except OSError:
-            target = Path()
-        if target.name == "records.bin":
-            raw_syncs.append(target)
-        fsync(fd)
-
-    attempt = _started_streaming_attempt(tmp_path, fsync_fn=record_raw_sync)
-    attempt.accept_chunk(100, _record(1))
-    before_close = len(raw_syncs)
-    attempt.close()
-    assert len(raw_syncs) == before_close
-
-    durable = _started_streaming_attempt(tmp_path / "durable", fsync_fn=record_raw_sync)
-    durable.accept_chunk(100, _record(2))
-    before_durable_close = len(raw_syncs)
-    durable.close(durable=True)
-    assert raw_syncs[before_durable_close:] == [durable.path / "records.bin"]
-
-
-def test_resume_does_not_promote_already_checkpointed_raw_bytes(tmp_path: Path) -> None:
-    raw_syncs = 0
-
-    def count_raw_sync(fd: int) -> None:
-        nonlocal raw_syncs
-        if Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin":
-            raw_syncs += 1
-        fsync(fd)
-
-    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=count_raw_sync)
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt.close()
-    before = raw_syncs
-
-    restarted = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=count_raw_sync)
+    restarted = _store(tmp_path)
     with restarted.device_lock() as lease:
         resumed = restarted.resume_streaming_attempt(lease)
         assert resumed is not None
         try:
-            assert resumed.durable_prefix.record_count == 1
-            assert raw_syncs == before
+            resumed.prepare_leg(101, 1)
+            resumed.record_read_begin(ReadBeginNotification(101, 1))
+            resumed.accept_chunk(101, second)
+
+            page = resumed.source_page(limit=2)
+            assert tuple(record.raw_bytes for record in page.records) == (first, second)
+            assert resumed.source.committed_count == 2
+        finally:
+            resumed.close()
+    with closing(restarted.state_db.open_connection(read_only=True)) as connection:
+        count = cast(sqlite3.Row, connection.execute("SELECT COUNT(*) FROM capture_tail").fetchone())
+        assert count[0] == 0
+
+
+def test_typed_process_death_recovers_receiving_source_and_partial_tail(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
+    first, second = _record(7), _record(8)
+    source_id = attempt.attempt_id
+    attempt.accept_chunk(100, first, tail=second[:41])
+
+    # Closing the process-owned connection without an interruption transition
+    # models a hard exit after the durable drain commit.
+    attempt.close()
+    source = read_capture_source(store.state_db, source_id)
+    assert source is not None and source.lifecycle == "receiving"
+
+    restarted = _store(tmp_path)
+    with restarted.device_lock() as lease:
+        resumed = restarted.resume_streaming_attempt(lease)
+        assert resumed is not None
+        try:
+            assert resumed.source.lifecycle == "interrupted"
+            resumed.prepare_leg(101, 1)
+            resumed.record_read_begin(ReadBeginNotification(101, 1))
+            resumed.accept_chunk(101, second)
+            assert tuple(record.raw_bytes for record in resumed.source_page(limit=2).records) == (first, second)
+        finally:
+            resumed.close()
+
+    with closing(restarted.state_db.open_connection(read_only=True)) as connection:
+        tail_count = cast(sqlite3.Row, connection.execute("SELECT COUNT(*) FROM capture_tail").fetchone())
+    assert tail_count[0] == 0
+
+
+def test_typed_restart_leg_recovery_from_interrupted_source_replays_in_order(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
+    first, second = _record(3), _record(4)
+    try:
+        attempt.accept_chunk(100, first)
+        attempt.interrupt()
+    finally:
+        attempt.close()
+
+    restarted = _store(tmp_path)
+    with restarted.device_lock() as lease:
+        resumed = restarted.resume_streaming_attempt(lease)
+        assert resumed is not None
+        try:
+            resumed.prepare_leg(101, 1)
+            resumed.record_read_begin(ReadBeginNotification(101, 1))
+            resumed.accept_chunk(101, second)
+            assert resumed.durable_prefix.record_count == 2
         finally:
             resumed.close()
 
 
-def test_prefix_publication_fsyncs_raw_evidence_before_bundle_is_visible(tmp_path: Path) -> None:
-    raw_sync_paths: list[Path] = []
-    armed = False
-    fail_raw_sync = False
-
-    def fail_first_raw_sync(fd: int) -> None:
-        nonlocal fail_raw_sync
-        target = Path(f"/proc/self/fd/{fd}").resolve()
-        if target.name == "records.bin" and armed:
-            raw_sync_paths.append(target)
-            if fail_raw_sync:
-                fail_raw_sync = False
-                raise OSError("raw prefix sync failed")
-        fsync(fd)
-
-    attempt = _started_streaming_attempt(tmp_path, count=1, fsync_fn=fail_first_raw_sync)
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt.close()
-    armed = True
-    fail_raw_sync = True
-    restarted = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_first_raw_sync)
-    resumed = None
-    try:
-        with pytest.raises(OSError, match="raw prefix sync failed"), restarted.device_lock() as lease:
-            resumed = restarted.resume_streaming_attempt(lease)
-            assert resumed is not None
-            resumed.publish_prefix()
-    finally:
-        if resumed is not None:
-            resumed.close(durable=True)
-
-    assert len(raw_sync_paths) == 2
-    assert raw_sync_paths[0] == attempt.path / "records.bin"
-    assert attempt.path.exists()
-    assert _attempt_row(attempt)["prefix_publication"] is None
-
-
-def test_seal_requires_raw_fsync_before_publishing_bundle(tmp_path: Path) -> None:
-    raw_sync_paths: list[Path] = []
-    armed = False
-
-    def fail_raw_sync(fd: int) -> None:
-        nonlocal armed
-        target = Path(f"/proc/self/fd/{fd}").resolve()
-        if armed and target.name == "records.bin":
-            raw_sync_paths.append(target)
-            armed = False
-            raise OSError("raw seal sync failed")
-        fsync(fd)
-
-    attempt = _started_streaming_attempt(tmp_path, count=1, fsync_fn=fail_raw_sync)
-    attempt.accept_chunk(100, _record(1))
-    armed = True
-    try:
-        with pytest.raises(OSError, match="raw seal sync failed"):
-            attempt.seal(DoneNotification(0, 101))
-    finally:
-        attempt.close(durable=True)
-
-    assert raw_sync_paths == [attempt.path / "records.bin"]
-    assert attempt.path.is_dir()
-    assert (attempt.path / "records.bin").read_bytes() == _record(1)
-    assert not tuple(_capture_root(tmp_path).glob("100-101-*"))
-
-
-def test_replayed_prefix_publication_deduplicates_without_changing_bundle(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=1)
-    try:
-        attempt.accept_chunk(100, _record(1))
-        attempt.checkpoint()
-
-        first = attempt.publish_prefix()
-        assert first is not None
-        assert first.deduplicated is False
-        before = {entry.name: entry.read_bytes() for entry in first.bundle_path.iterdir()}
-
-        replay = attempt.publish_prefix()
-
-        assert replay is not None
-        assert replay.deduplicated is True
-        assert {entry.name: entry.read_bytes() for entry in replay.bundle_path.iterdir()} == before
-    finally:
-        attempt.close(durable=True)
-
-
-def test_resume_fsync_failure_does_not_promote_uncheckpointed_tail(tmp_path: Path) -> None:
-    fail_raw_sync = False
-
-    def fail_when_armed(fd: int) -> None:
-        if fail_raw_sync and Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin":
-            raise OSError("tail promotion sync failed")
-        fsync(fd)
-
-    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_when_armed)
-    attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt.accept_chunk(101, _record(2))
-    attempt.close(durable=True)
-    checkpoint = _checkpoint(attempt).copy()
-    raw = _record(1) + _record(2)
-    fail_raw_sync = True
-
-    restarted = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fail_when_armed)
-    with pytest.raises(OSError, match="tail promotion sync failed"), restarted.device_lock() as lease:
-        restarted.resume_streaming_attempt(lease)
-
-    assert _checkpoint(attempt) == checkpoint
-    assert (attempt.path / "records.bin").read_bytes() == raw
-    assert attempt.path.is_dir()
-
-
-def test_empty_published_prefix_with_wrong_empty_digest_still_blocks_terminalization(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.checkpoint()
-    assert attempt.publish_prefix() is None
-    attempt.close(durable=True)
-    _rewrite_checkpoint(attempt, "raw_sha256", "f" * 64)
-    corrupted = _checkpoint(attempt).copy()
-
-    with pytest.raises(AttemptStateError):
-        store.open_attempt(attempt.attempt_id)
-    assert store.pending_attempts() == (attempt.descriptor,)
-    with pytest.raises(AttemptStateError):
-        store.terminalize_prefix_attempt(attempt.attempt_id)
-
-    assert _checkpoint(attempt) == corrupted
-    assert _attempt_row(attempt)["prefix_publication"] is not None
-    assert _attempt_row(attempt)["terminal_retirement"] is None
-    assert attempt.path.exists()
-
-
-def test_large_resume_hashes_raw_evidence_in_one_streaming_pass(
+def test_typed_failed_drain_commit_cannot_advance_frontier_or_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt(100, 4097)
-    attempt.record_read_begin(ReadBeginNotification(100, 4097))
-    for index in range(4097):
-        attempt.accept_chunk(100 + index, _record(index % 256))
-    attempt.close(durable=True)
+    store = _store(tmp_path)
+    attempt = _attempt(store, 1)
 
-    reads = [0]
-    original_open = Path.open
+    def fail_commit() -> None:
+        raise sqlite3.OperationalError("simulated drain commit failure")
 
-    def count_raw_reads(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
-        stream = cast(Callable[..., object], original_open)(path, mode, *args, **kwargs)
-        if path.name == "records.bin" and mode == "rb":
-            return _ReadCountingStream(cast(BinaryIO, stream), reads)
-        return stream
-
-    monkeypatch.setattr(Path, "open", count_raw_reads)
-    with store.device_lock() as lease:
-        resumed = store.resume_streaming_attempt(lease)
-        assert resumed is not None
-        assert resumed.durable_prefix.record_count == 4097
-        resumed.close()
-
-    # The 4097-record stream is 2 chunks at the configured 1 MiB size plus
-    # one EOF read. Promotion performs only a metadata fsync open, never a
-    # second payload read or read_bytes allocation.
-    assert reads[0] == 3
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing",
-        "malformed",
-        "version",
-        "identity",
-        "hash",
-        "short",
-        "unaligned",
-        "oversized",
-        "raw_symlink",
-        "raw_nonregular",
-    ],
-)
-def test_streaming_resume_rejects_damaged_checkpoint_or_raw_evidence(tmp_path: Path, damage: str) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt.close(durable=True)
-    raw = attempt.path / "records.bin"
-
-    actions: dict[str, Callable[[], object]] = {
-        "missing": lambda: _write_row_field(attempt, "checkpoint", None),
-        "malformed": lambda: _write_row_field(attempt, "checkpoint", []),
-        "version": lambda: _rewrite_checkpoint(attempt, "version", 2),
-        "identity": lambda: _rewrite_checkpoint(attempt, "attempt_id", "f" * 32),
-        "hash": lambda: _rewrite_checkpoint(attempt, "raw_sha256", "0" * 64),
-        "short": lambda: raw.write_bytes(b""),
-        "unaligned": lambda: raw.write_bytes(raw.read_bytes() + b"torn"),
-        "oversized": lambda: raw.write_bytes(raw.read_bytes() + _record(2) + _record(3)),
-        "raw_symlink": lambda: _replace_with_symlink(raw, tmp_path / "outside-raw", _record(1)),
-        "raw_nonregular": lambda: (raw.unlink(), raw.mkdir()),
-    }
-    actions[damage]()
-
-    with pytest.raises(AttemptStateError):
-        store.open_attempt(attempt.attempt_id)
-    assert attempt.path.exists()
-    assert _attempt_row(attempt)["descriptor"] is not None
-
-
-def test_reopen_rejects_unaligned_or_out_of_bounds_streaming_bytes(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.close()
-    raw = attempt.path / "records.bin"
-    raw.write_bytes(b"torn")
-    with pytest.raises(AttemptStateError, match="record aligned"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-    raw.write_bytes(_record(1) + _record(2) + _record(3))
-    with pytest.raises(AttemptStateError, match="exceeds"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [("attempt_id", 7), ("start_sequence", "100"), ("read_begin_start", True)],
-)
-def test_open_rejects_malformed_descriptor_fields(tmp_path: Path, field: str, value: object) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
-    payload: dict[str, object] = {
-        "attempt_id": attempt.attempt_id,
-        "schema_version": 2,
-        "start_sequence": 100,
-        "packet_count": 2,
-        "record_size": RECORD_SIZE,
-        "read_begin_start": None,
-        "read_begin_count": None,
-    }
-    payload[field] = value
-    _write_row_field(attempt, "descriptor", payload)
-
-    with pytest.raises(AttemptStateError, match="malformed"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-
-def test_open_rejects_non_object_and_invalid_descriptor_identity(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
-    descriptor = {
-        "attempt_id": attempt.attempt_id,
-        "schema_version": 2,
-        "start_sequence": 100,
-        "packet_count": 2,
-        "record_size": RECORD_SIZE,
-        "read_begin_start": None,
-        "read_begin_count": None,
-    }
-    _write_row_field(attempt, "descriptor", [])
-    with pytest.raises(AttemptStateError, match="malformed"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-    descriptor["record_size"] = RECORD_SIZE + 1
-    _write_row_field(attempt, "descriptor", descriptor)
-    with pytest.raises(AttemptStateError, match="identity or record size"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-    descriptor["record_size"] = RECORD_SIZE
-    descriptor["attempt_id"] = "b" * 32
-    _write_row_field(attempt, "descriptor", descriptor)
-    with pytest.raises(AttemptStateError, match="identity does not match"):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-
-@pytest.mark.parametrize(
-    ("read_begin_start", "read_begin_count", "message"),
-    [(100, None, "incomplete READ_BEGIN"), (100, 3, "does not match requested range")],
-)
-def test_open_rejects_invalid_persisted_read_begin(
-    tmp_path: Path, read_begin_start: int, read_begin_count: int | None, message: str
-) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 2)
-    descriptor = {
-        "attempt_id": attempt.attempt_id,
-        "schema_version": 2,
-        "start_sequence": 100,
-        "packet_count": 2,
-        "record_size": RECORD_SIZE,
-        "read_begin_start": read_begin_start,
-        "read_begin_count": read_begin_count,
-    }
-    _write_row_field(attempt, "descriptor", descriptor)
-
-    with pytest.raises(AttemptStateError, match=message):
-        StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-
-
-def test_read_begin_is_idempotent_and_rejects_mismatch(tmp_path: Path) -> None:
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, 1)
-    with pytest.raises(AttemptStateError, match="does not match"):
-        attempt.record_read_begin(ReadBeginNotification(101, 1))
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    with pytest.raises(AttemptStateError, match="already persisted"):
-        attempt.record_read_begin(ReadBeginNotification(100, 2))
-
-
-@pytest.mark.parametrize(
-    ("start_sequence", "packet_count"),
-    [(-1, 1), (1, 0), (True, 1), (1, 1 << 32)],
-)
-def test_prepare_validates_sequences_and_counts(tmp_path: Path, start_sequence: int, packet_count: int) -> None:
-    with pytest.raises(AttemptStateError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(start_sequence, packet_count)
-
-
-def test_accept_chunk_validates_sequence_and_count_overflow(tmp_path: Path) -> None:
-    attempt = _started_attempt(tmp_path, count=1)
-    with pytest.raises(AttemptStateError, match="start_sequence"):
-        attempt.accept_chunk(-1, _record(1))
-    attempt.accept_chunk(100, _record(1))
-    with pytest.raises(AttemptStateError, match="exceeds READ_BEGIN"):
-        attempt.accept_chunk(101, _record(2))
-
-
-class _PartialWriteStream:
-    def __init__(self, wrapped: object, *, write_then_raise: bool) -> None:
-        self._wrapped = wrapped
-        self._write_then_raise = write_then_raise
-        self.partial_size = RECORD_SIZE // 2
-
-    def write(self, payload: bytes) -> int:
-        written = self._wrapped.write(payload[: self.partial_size])  # type: ignore[attr-defined]
-        if self._write_then_raise:
-            raise OSError("simulated partial raw write")
-        return cast(int, written)
-
-    def flush(self) -> None:
-        self._wrapped.flush()  # type: ignore[attr-defined]
-
-    def fileno(self) -> int:
-        return cast(int, self._wrapped.fileno())  # type: ignore[attr-defined]
-
-    def close(self) -> None:
-        self._wrapped.close()  # type: ignore[attr-defined]
-
-
-def test_failure_latch_rejects_followup_data_after_partial_write_error(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=2)
-    payload = _record(1)
-    stream = _PartialWriteStream(cast(object, attempt._stream_raw), write_then_raise=True)
-    attempt._stream_raw = cast("BinaryIO", stream)
-
-    with pytest.raises(OSError, match="partial raw write"):
-        attempt.accept_chunk(100, payload)
-
-    preserved = (attempt.path / "records.bin").read_bytes()
-    assert preserved == payload[: stream.partial_size]
-    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
-        attempt.accept_chunk(100, payload)
-    assert (attempt.path / "records.bin").read_bytes() == preserved
-    recovery = attempt.recover()
-    assert recovery.clean is False
-    assert recovery.raw_bytes == len(preserved)
-    assert recovery.issue == "streaming attempt has preserved partial evidence"
-    attempt.close()
-
-
-def test_failure_latch_rejects_followup_data_after_short_write(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=2)
-    payload = _record(1)
-    stream = _PartialWriteStream(cast(object, attempt._stream_raw), write_then_raise=False)
-    attempt._stream_raw = cast("BinaryIO", stream)
-
-    with pytest.raises(OSError, match="streaming raw write was short"):
-        attempt.accept_chunk(100, payload)
-
-    preserved = (attempt.path / "records.bin").read_bytes()
-    assert preserved == payload[: stream.partial_size]
-    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
-        attempt.accept_chunk(100, payload)
-    assert (attempt.path / "records.bin").read_bytes() == preserved
-    recovery = attempt.recover()
-    assert recovery.clean is False
-    assert recovery.raw_bytes == len(preserved)
-    assert recovery.issue == "streaming attempt has preserved partial evidence"
-    attempt.close()
-
-
-def test_failure_latch_rejects_followup_data_after_checkpoint_fsync_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sync_order: list[str] = []
-
-    def track_raw_sync(fd: int) -> None:
-        if Path(f"/proc/self/fd/{fd}").resolve().name == "records.bin":
-            sync_order.append("raw_fsync")
-        fsync(fd)
-
-    config = CollectorConfig(durability=DurabilityConfig(checkpoint_records=1))
-    store = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=track_raw_sync, config=config)
-    attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-
-    def fail_checkpoint(*_args: object, **_kwargs: object) -> None:
-        sync_order.append("checkpoint_db_commit")
-        raise OSError("simulated checkpoint commit failure")
-
-    monkeypatch.setattr(store._filesystem, "_write_checkpoint", fail_checkpoint)
-
-    with pytest.raises(OSError, match="checkpoint commit failure"):
-        attempt.accept_chunk(100, _record(1))
-    assert sync_order[-2:] == ["raw_fsync", "checkpoint_db_commit"]
-
-    raw_path = attempt.path / "records.bin"
-    preserved = raw_path.read_bytes()
-    checkpoint = _checkpoint(attempt)
-    assert preserved == _record(1)
-    assert checkpoint["record_count"] == 0
-    # The raw fsync and in-memory frontier advance precede the failed DB write;
-    # the persisted row remains the only restart authority.
-    assert attempt.durable_prefix.record_count == 1
-    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
-        attempt.accept_chunk(101, _record(2))
-    assert raw_path.read_bytes() == preserved
-    recovery = attempt.recover()
-    assert recovery.clean is False
-    assert recovery.raw_bytes == len(preserved)
-    assert recovery.issue == "streaming attempt has preserved partial evidence"
-    attempt.close()
-
-
-def _recovery_result_attempt(tmp_path: Path, *, count: int, checkpoint_records: int):
-    config = CollectorConfig(durability=DurabilityConfig(checkpoint_records=checkpoint_records))
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path), config=config).prepare_streaming_attempt(100, count)
-    attempt.record_read_begin(ReadBeginNotification(100, count))
-    return attempt
-
-
-@pytest.mark.parametrize(("start_sequence", "packet_count"), [(99, 2), (102, 3)])
-def test_recovery_result_rejects_each_out_of_range_bound(
-    tmp_path: Path, start_sequence: int, packet_count: int
-) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=4)
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-
-    with pytest.raises(RecordRegressionError):
-        attempt.begin_recovery(start_sequence, packet_count)
-
-
-def test_recovery_result_allows_shorter_continuation_within_original_range(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=4)
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-
-    prefix = attempt.begin_recovery(101, 1)
-    attempt.accept_chunk(101, _record(2))
-
-    assert prefix.next_sequence == 101
-    assert (attempt.path / "records.bin").read_bytes() == _record(1) + _record(2)
-
-
-def test_recovery_result_rejects_empty_public_chunk(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.begin_recovery(100, 2)
-
-    with pytest.raises(AttemptStateError, match="positive multiple"):
-        attempt.accept_chunk(100, b"")
-
-    assert (attempt.path / "records.bin").read_bytes() == b""
-
-
-class _FailedRawWrite:
-    def __init__(self, stream: BinaryIO) -> None:
-        self._stream = stream
-
-    def write(self, _payload: bytes) -> int:
-        raise OSError("injected raw write failure")
-
-    def flush(self) -> None:
-        self._stream.flush()
-
-    def fileno(self) -> int:
-        return self._stream.fileno()
-
-    def close(self) -> None:
-        self._stream.close()
-
-
-def test_recovery_result_reports_failed_stream_as_partial_evidence(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=2)
-    assert attempt._stream_raw is not None
-    # Inject the storage failure at the raw-write boundary; accept_chunk remains
-    # the public operation that drives the attempt into its failed state.
-    attempt._stream_raw = cast(BinaryIO, _FailedRawWrite(attempt._stream_raw))
+    monkeypatch.setattr(attempt._audio_store, "_commit", fail_commit)
     try:
-        with pytest.raises(OSError, match="injected raw write failure"):
-            attempt.accept_chunk(100, _record(1))
-
-        recovery = attempt.recover()
-        assert recovery is not None
-        assert recovery.clean is False
-        assert recovery.raw_bytes == 0
-        assert recovery.issue == "streaming attempt has preserved partial evidence"
+        with pytest.raises(RecordAcceptanceError, match="ambiguous drain was rolled back"):
+            attempt.accept_chunk(100, _record(5))
+        assert attempt.durable_prefix.record_count == 0
+        with pytest.raises(AttemptStateError, match="incomplete"):
+            attempt.seal(DoneNotification(0, 101))
     finally:
         attempt.close()
 
 
-def test_recovery_result_rejects_raw_evidence_without_read_begin(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
+def test_typed_attempt_rejects_data_before_read_begin_and_sequence_regression(tmp_path: Path) -> None:
+    store = _store(tmp_path)
     attempt = store.prepare_streaming_attempt(100, 2)
-    attempt_id = attempt.attempt_id
-    attempt.close()
-    (attempt.path / "records.bin").write_bytes(_record(1))
-
-    recovery = StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt_id).recover()
-
-    assert recovery.clean is False
-    assert recovery.raw_bytes == RECORD_SIZE
-    assert recovery.issue == "READ_BEGIN is not persisted"
-
-
-def test_recovery_result_accepts_full_records_at_checkpoint_limit(tmp_path: Path) -> None:
-    attempt = _recovery_result_attempt(tmp_path, count=2, checkpoint_records=2)
-    attempt.accept_chunk(100, _record(1) + _record(2))
-
-    recovery = attempt.recover()
-
-    assert recovery.clean is True
-    assert recovery.valid_records == 2
-    assert recovery.raw_bytes == 2 * RECORD_SIZE
-    assert recovery.issue is None
+    try:
+        with pytest.raises(AttemptStateError, match="receiving"):
+            attempt.accept_chunk(100, _record(1))
+        attempt.prepare_leg(100, 2)
+        attempt.record_read_begin(ReadBeginNotification(100, 2))
+        with pytest.raises(RecordRegressionError, match="precedes"):
+            attempt.accept_chunk(99, _record(1))
+    finally:
+        attempt.close()
 
 
-def test_recovery_result_accepts_complete_uncheckpointed_tail(tmp_path: Path) -> None:
-    attempt = _recovery_result_attempt(tmp_path, count=3, checkpoint_records=4)
-    attempt.accept_chunk(100, _record(1) + _record(2) + _record(3))
+def test_typed_replay_mismatch_retains_blocking_evidence(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
+    try:
+        attempt.accept_chunk(100, _record(1))
 
-    recovery = attempt.recover()
+        with pytest.raises(RecordAcceptanceError, match="replay conflicts"):
+            attempt.accept_chunk(100, _record(9))
 
-    assert recovery.clean is True
-    assert recovery.valid_records == 0
-    assert recovery.raw_bytes == 3 * RECORD_SIZE
-    assert recovery.issue is None
+        assert attempt.source.lifecycle == "blocked"
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            count = cast(sqlite3.Row, connection.execute("SELECT COUNT(*) FROM capture_conflict").fetchone())
+            assert count[0] == 1
+    finally:
+        attempt.close()

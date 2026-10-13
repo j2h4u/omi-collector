@@ -2,20 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-
-from ...config import DEFAULT_CONFIG
-from ..domain.ring_protocol import RECORD_SIZE
-from .staging_contract import (
-    _RAW_NAME,
-    AttemptDescriptor,
-    AttemptStateError,
-    DurablePrefix,
-    _checkpoint_from_json,
-)
-from .staging_filesystem import StagingFilesystem, _hash_prefix, _never_defer, _require_regular_file
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,41 +14,3 @@ class Recovery:
     raw_bytes: int
     clean: bool
     issue: str | None
-
-
-def _published_prefix(
-    source: Path,
-    descriptor: AttemptDescriptor,
-    filesystem: StagingFilesystem,
-    *,
-    io_chunk_bytes: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
-    should_defer: Callable[[], bool] = _never_defer,
-) -> DurablePrefix:
-    raw_path = source / _RAW_NAME
-    _require_regular_file(raw_path, "published partial raw")
-    row = filesystem._read_attempt_row(descriptor.attempt_id)
-    checkpoint_value = row["checkpoint"]
-    if not isinstance(checkpoint_value, dict):
-        raise AttemptStateError("published partial checkpoint is malformed")
-    checkpoint = _checkpoint_from_json(checkpoint_value, descriptor.attempt_id)
-    raw_size = raw_path.stat().st_size
-    if raw_size % RECORD_SIZE or checkpoint.record_count > descriptor.packet_count:
-        raise AttemptStateError("published partial range is invalid")
-    prefix_size = checkpoint.record_count * RECORD_SIZE
-    if (
-        raw_size < prefix_size
-        or _hash_prefix(
-            raw_path,
-            prefix_size,
-            chunk_size=io_chunk_bytes or filesystem._durability.io_chunk_bytes,
-            should_defer=should_defer,
-        )
-        != checkpoint.raw_sha256
-    ):
-        raise AttemptStateError("published partial prefix is invalid")
-    return DurablePrefix(
-        descriptor.start_sequence,
-        descriptor.start_sequence + checkpoint.record_count,
-        checkpoint.record_count,
-        checkpoint.raw_sha256,
-    )

@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from hashlib import sha256
 from json import dumps
 from pathlib import Path
 from struct import pack
 
 import pytest
 
-from omi_collector.capture.adapters.attempts import StagedAttempt
-from omi_collector.capture.adapters.bundle_contract import BundleManifest
+from omi_collector.capture.adapters.attempts import SqliteStagedAttempt
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_closures import (
@@ -25,18 +23,19 @@ from omi_collector.capture.adapters.ready_closures import (
     remove,
 )
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
-from staging_test_factory import StagingStore, attempt_payload, closure_rows
+from staging_test_factory import StagingStore, attempt_source, closure_rows
 
 
 def _record(sequence: int) -> bytes:
-    return pack(">I", sequence) + bytes(RECORD_SIZE - 4)
+    return pack(">I", sequence) + bytes((2, 8, 1)) + bytes(RECORD_SIZE - 7)
 
 
-def _partial(tmp_path: Path) -> tuple[StagingStore, StagedAttempt]:
+def _partial(tmp_path: Path) -> tuple[StagingStore, SqliteStagedAttempt]:
     store = StagingStore(tmp_path / "spool", tmp_path / "capture")
     attempt = store.prepare_streaming_attempt(10, 2)
+    attempt.prepare_leg(10, 2)
     attempt.record_read_begin(ReadBeginNotification(10, 2))
     attempt.accept_chunk(10, _record(10))
     attempt.checkpoint()
@@ -72,14 +71,14 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
     ready.chmod(0o2750)
     config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02))
     store = StagingStore.from_paths(base.paths, publication_root=ready, config=config)
-    raw = bytes((0, 0, 0, 100, 2, 8, 0x55)) + bytes(RECORD_SIZE - 7)
-    digest = sha256(raw).hexdigest()
-    draft = store.capture_root / "one"
-    draft.mkdir(parents=True)
-    (draft / "records.bin").write_bytes(raw)
-    (draft / "manifest.json").write_text(
-        dumps(BundleManifest(2, 10, 11, 1, RECORD_SIZE, digest).as_dict()), encoding="utf-8"
-    )
+    writer = store.make_staging_writer(10, 1)
+    writer.prepare()
+    writer.prepare_leg(10, 1)
+    writer.read_begin(ReadBeginNotification(10, 1))
+    writer.append_chunk(0, memoryview(_record(10)))
+    writer.seal(DoneNotification(0, 11))
+    attempt_id = writer.attempt_id
+    writer.close()
     store.append_ready_closure(11, "drained")
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
 
@@ -95,18 +94,18 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
     asyncio.run(visit())
     restarted = StagingStore.from_paths(base.paths, publication_root=ready, config=config)
     assert restarted.recover_and_publish().state == "waiting"
-    assert draft.exists()
+    assert attempt_source(restarted, attempt_id) is not None
     assert not tuple(ready.iterdir())
     restarted.append_ready_closure(11, "drained")
     assert restarted.recover_and_publish().state == "published"
-    assert not draft.exists()
+    assert attempt_source(restarted, attempt_id) is None
 
 
 def test_visit_begin_reuses_active_writer_lease_across_threads(tmp_path: Path) -> None:
     store = StagingStore(tmp_path / "spool", tmp_path / "draft")
     store.append_ready_closure(11, "drained")
 
-    with store.device_lock(recover_capture_temporaries=False) as lease:
+    with store.device_lock() as lease:
         marker = asyncio.run(asyncio.to_thread(store.begin_ready_visit))
         lease.require_active()
 
@@ -328,20 +327,17 @@ def test_remove_rejects_empty_or_mismatched_queue_without_changing_bytes(tmp_pat
 
 
 def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_path: Path) -> None:
-    base, _attempt = _partial(tmp_path)
+    base, attempt = _partial(tmp_path)
     ready = tmp_path / "ready"
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
     store = StagingStore.from_paths(base.paths, publication_root=ready)
-    with store.device_lock() as lease:
-        resumed = store.resume_streaming_attempt(lease)
-        assert resumed is not None
-        publication = resumed.publish_prefix()
-        assert publication is not None
-        resumed.close(durable=True)
+    store.terminalize_prefix_attempt(attempt.attempt_id)
+    source = attempt_source(store, attempt.attempt_id)
+    assert source is not None and source.lifecycle == "sealed_waiting"
     store.append_ready_closure(11, "legacy_prefix_publication")
     assert store.recover_and_publish().state == "waiting"
-    assert publication.bundle_path.exists()
+    assert attempt_source(store, attempt.attempt_id) is not None
     assert not tuple(ready.iterdir())
     assert closure_rows(store) == [{"next_sequence": 11, "reason": "legacy_prefix_publication"}]
 
@@ -352,7 +348,6 @@ def test_interrupted_close_publishes_ordinary_pending_prefix(tmp_path: Path) -> 
     closure = store.close_pending_prefix("absence")
 
     assert closure is not None and closure.next_sequence == 11
-    attempt_state = attempt_payload(store, attempt.attempt_id)
-    assert attempt_state is not None and attempt_state["prefix_publication"] is not None
-    assert attempt_state["terminal_retirement"] is not None
+    source = attempt_source(store, attempt.attempt_id)
+    assert source is not None and source.lifecycle == "sealed_waiting"
     assert store.pending_attempts() == ()

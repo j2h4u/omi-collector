@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -136,12 +138,15 @@ def _staging(operator_config: OperatorConfig, *, state_db: StateDB | None = None
     from omi_collector.capture.adapters.collector_state_db import StateDBError
     from omi_collector.capture.adapters.staging_filesystem import StagingIO, StagingPaths
     from omi_collector.capture.adapters.staging_store import StagingStore
-    from omi_collector.state_migration import StateMigrationError, open_runtime_state
+    from omi_collector.state_migration import InternalAudioCutoverRequiredError, StateMigrationError, open_runtime_state
 
     layout = operator_config.storage
     if state_db is None:
         try:
             state_db = open_runtime_state(layout)
+        except InternalAudioCutoverRequiredError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=78) from error
         except (StateMigrationError, StateDBError) as error:
             typer.echo(str(error), err=True)
             raise typer.Exit(code=1) from error
@@ -165,7 +170,7 @@ def _command_state(loaded: OperatorConfig) -> Iterator[StateDB]:
     """Hold the one Collector guard before any writable state or BLE work."""
     from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
     from omi_collector.capture.adapters.collector_state_db import StateDBError
-    from omi_collector.state_migration import StateMigrationError, open_runtime_state
+    from omi_collector.state_migration import InternalAudioCutoverRequiredError, StateMigrationError, open_runtime_state
 
     try:
         _require_host_singleton(loaded)
@@ -173,6 +178,9 @@ def _command_state(loaded: OperatorConfig) -> Iterator[StateDB]:
             state_db = open_runtime_state(loaded.storage)
             with _capture_cli().phy_state_context(state_db):
                 yield state_db
+    except InternalAudioCutoverRequiredError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
     except (CollectorGuardError, StateMigrationError, StateDBError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
@@ -414,13 +422,12 @@ def config_check(
 @app.command("migrate-state")
 def migrate_collector_state(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
-    legacy_phy_state_home: Annotated[
-        Path | None, typer.Option("--legacy-phy-state-home", help="Prior operator PHY state home.")
-    ] = None,
 ) -> None:
-    """Cut over stopped Collector control state to its single SQLite database."""
+    """Cut over stopped v1 Collector SQLite and private audio to v2."""
     from omi_collector.capture.adapters.collector_state_db import StateDBError
-    from omi_collector.state_migration import StateMigrationError, migrate_state
+    from omi_collector.capture.adapters.legacy_audio_import import LegacyAudioImportError
+    from omi_collector.internal_audio_migration import InternalAudioMigrationError, migrate_internal_audio
+    from omi_collector.state_migration import StateMigrationError
 
     loaded = _load_config(config_path)
     try:
@@ -430,31 +437,22 @@ def migrate_collector_state(
             not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}
         ):
             raise StateMigrationError("confirm the Collector service is stopped before state migration")
-        homes = None
-        if legacy_phy_state_home is not None:
-            homes = (Path("/var/lib/omi-collector"), legacy_phy_state_home)
-        result = migrate_state(loaded.storage, legacy_phy_state_homes=homes)
-    except (StateMigrationError, StateDBError, OSError, ValueError) as error:
+        result = migrate_internal_audio(
+            loaded.storage,
+            release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
+        )
+    except (
+        StateMigrationError,
+        InternalAudioMigrationError,
+        StateDBError,
+        LegacyAudioImportError,
+        sqlite3.DatabaseError,
+        OSError,
+        ValueError,
+    ) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
-
-
-@app.command("cleanup-attempts")
-def cleanup_attempts(
-    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
-) -> None:
-    """Sweep authenticated terminal raw while the service is stopped."""
-    loaded = _load_config(config_path)
-    service_state = _systemd_service_status()
-    if loaded.path == DEFAULT_CONFIG_PATH and (
-        not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}
-    ):
-        typer.echo("stop the Collector service before terminal attempt cleanup", err=True)
-        raise typer.Exit(code=1)
-    with _command_state(loaded) as state_db:
-        removed = _staging(loaded, state_db=state_db).sweep_terminal_retired()
-    typer.echo(json.dumps({"removed": len(removed)}, sort_keys=True, separators=(",", ":")))
 
 
 @app.command()

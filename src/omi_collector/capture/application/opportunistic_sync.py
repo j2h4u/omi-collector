@@ -41,11 +41,15 @@ from .visit_machine import RecoveryDisposition
 
 
 class CollectionPreservedCancelledError(asyncio.CancelledError):
-    """Cancellation completed cleanup while retaining an operator-inspectable path."""
+    """Cancellation completed cleanup while retaining durable local custody."""
 
-    def __init__(self, preserved_path: Path, kind: str) -> None:
-        super().__init__(f"{kind} preserved at {preserved_path}")
+    def __init__(self, preserved_path: Path | None, kind: str, *, preserved_source_id: str | None = None) -> None:
+        if (preserved_path is None) == (preserved_source_id is None):
+            raise ValueError("preserved custody requires exactly one path or source ID")
+        location = str(preserved_path) if preserved_path is not None else f"SQL source {preserved_source_id}"
+        super().__init__(f"{kind} preserved at {location}")
         self.preserved_path = preserved_path
+        self.preserved_source_id = preserved_source_id
         self.kind = kind
 
 
@@ -109,14 +113,14 @@ async def run_opportunistic_collector(
     finally:
         try:
             finalization = await reconciler.finalize_active()
-            if (
-                cancelled
-                and finalization.checkpoint_error is None
-                and finalization.close_error is None
-                and finalization.preserved_path is not None
-                and finalization.preserved_kind is not None
-            ):
-                raise CollectionPreservedCancelledError(finalization.preserved_path, finalization.preserved_kind)
+            finalization_succeeded = finalization.checkpoint_error is None and finalization.close_error is None
+            custody_retained = finalization.preserved_path is not None or finalization.preserved_source_id is not None
+            if cancelled and finalization_succeeded and custody_retained and finalization.preserved_kind is not None:
+                raise CollectionPreservedCancelledError(
+                    finalization.preserved_path,
+                    finalization.preserved_kind,
+                    preserved_source_id=finalization.preserved_source_id,
+                )
         except BaseException:
             unwinding = True
             raise

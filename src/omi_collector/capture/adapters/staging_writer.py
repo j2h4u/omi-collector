@@ -3,7 +3,7 @@
 ``AttemptWriter`` owns a worker thread, but intentionally knows nothing about
 the on-disk staging protocol.  This module is the narrow synchronous target
 between the two: it acquires one device lease and then keeps the
-``StagingStore`` and ``StagedAttempt`` behind methods that are called only by
+``StagingStore`` and its typed SQL attempt behind methods called only by
 that worker thread.
 
 Construction is side-effect free.  The lease, partial attempt, and any
@@ -19,8 +19,7 @@ from contextlib import AbstractContextManager
 from threading import get_ident
 
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from .attempts import StagedAttempt
-from .publication import SealResult
+from .attempts import DurableSqliteSeal, SqliteStagedAttempt
 from .ready_bundles import ReadyOutcome
 from .staging_contract import AttemptDescriptor, DurablePrefix
 from .staging_filesystem import DeviceLock
@@ -59,7 +58,7 @@ class StagingWriter:
         self._packet_count = packet_count
         self._lease_context: AbstractContextManager[DeviceLock] | None = None
         self._lease: DeviceLock | None = None
-        self._attempt: StagedAttempt | None = None
+        self._attempt: SqliteStagedAttempt | None = None
         self._owner_thread: int | None = None
         self._prepared = False
         self._read_started = False
@@ -103,6 +102,13 @@ class StagingWriter:
         self._require_prepared()
         assert self._attempt is not None
         return self._attempt.attempt_id
+
+    @property
+    def durable_prefix(self) -> DurablePrefix:
+        """Return the authenticated prefix exposed while preparing the target."""
+        self._require_prepared()
+        assert self._attempt is not None
+        return self._attempt.durable_prefix
 
     def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefix:
         """Prepare an initial or in-process recovery range before READ."""
@@ -154,7 +160,7 @@ class StagingWriter:
         self._attempt.record_read_begin(notice)
         self._read_started = True
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> None:
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
         """Map an arena-relative byte offset to the exact ring sequence."""
         self._enter("append_chunk")
         self._require_ready_for_data()
@@ -167,14 +173,20 @@ class StagingWriter:
         if not chunk.c_contiguous:
             raise ValueError("chunk must be C-contiguous")
         byte_count = chunk.nbytes
-        if byte_count <= 0 or byte_count % RECORD_SIZE:
-            raise ValueError(f"chunk must be a positive multiple of {RECORD_SIZE} bytes")
+        if byte_count % RECORD_SIZE:
+            raise ValueError(f"chunk must be a multiple of {RECORD_SIZE} bytes")
+        if not isinstance(tail, bytes) or len(tail) >= RECORD_SIZE:
+            raise ValueError(f"tail must be bytes shorter than {RECORD_SIZE} bytes")
+        if byte_count == 0 and not tail:
+            raise ValueError("drain must contain records or a partial tail")
         if offset + byte_count > self._active_count * RECORD_SIZE:
             raise ValueError("chunk exceeds the prepared READ leg")
+        if offset + byte_count + len(tail) > self._active_count * RECORD_SIZE:
+            raise ValueError("tail exceeds the prepared READ leg")
         assert self._attempt is not None
         self._require_lease()
         sequence = self._active_start + offset // RECORD_SIZE
-        self._attempt.accept_chunk(sequence, chunk)
+        self._attempt.accept_chunk(sequence, chunk, tail)
 
     def checkpoint(self) -> DurablePrefix:
         """Checkpoint through the existing staging API."""
@@ -184,10 +196,20 @@ class StagingWriter:
         self._require_lease()
         return self._attempt.checkpoint()
 
-    def seal(self, done_notice: DoneNotification) -> SealResult:
+    def interrupt(self) -> DurablePrefix:
+        """Persist interruption after the writer has drained its exact frontier."""
+        self._enter("interrupt")
+        self._require_ready_for_data()
+        assert self._attempt is not None
+        self._require_lease()
+        self._attempt.interrupt()
+        self._read_started = False
+        return self._attempt.durable_prefix
+
+    def seal(self, done_notice: DoneNotification) -> DurableSqliteSeal:
         """Validate and publish through the existing staging API."""
         self._enter("seal")
-        self._require_ready_for_data()
+        self._require_ready_for_read()
         if not isinstance(done_notice, DoneNotification):
             raise TypeError("done_notice must be a DoneNotification")
         if self._sealed:
@@ -207,17 +229,24 @@ class StagingWriter:
         assert self._lease is not None
         return self._store.publish_ready(self._lease)
 
-    def publish_prefix(self) -> SealResult | None:
+    def publish_prefix(self) -> DurableSqliteSeal | None:
         """Publish the checkpoint-authenticated prefix through staging."""
         self._enter("publish_prefix")
-        self._require_ready_for_data()
+        self._require_ready_for_read()
         assert self._attempt is not None
         self._require_lease()
         result = self._attempt.publish_prefix()
+        if result.record_count == 0:
+            self._store.quarantine_attempt_source(self._attempt.attempt_id)
+            self._store.mark_quarantine_unprocessable(
+                self._attempt.attempt_id,
+                "device cursor advanced before any durable records",
+            )
+            self._sealed = True
+            return None
         self._prefix_published = True
         self._sealed = True
-        if result is not None:
-            self._store.publication_input_changed()
+        self._store.publication_input_changed()
         return result
 
     def close(self) -> None:

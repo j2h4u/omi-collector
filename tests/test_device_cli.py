@@ -20,6 +20,7 @@ from typer.testing import CliRunner
 from fakes import ScriptedRingSession, WriteStep
 from omi_collector import cli as operator_cli
 from omi_collector.capture import cli as device_cli
+from omi_collector.capture.adapters.attempts import DurableSqliteSeal
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
@@ -1217,6 +1218,33 @@ def test_sealed_collect_output_contains_only_bundle_metadata(tmp_path: Path) -> 
         "status": "sealed",
     }
     assert "records.bin" not in rendered
+
+
+def test_sql_custody_output_identifies_source_without_claiming_public_bundle() -> None:
+    result = CollectionResult(
+        RingInfo(10, 11, 100, 0, RECORD_SIZE),
+        1,
+        DurableSqliteSeal("a" * 32, 10, 11, 1, "b" * 64),
+        next_sequence=11,
+        advance_confirmed=True,
+    )
+    metrics = device_cli.DownloadMetrics(1.0, RECORD_SIZE, float(RECORD_SIZE), 1.0, 0, None)
+
+    collect = cast(dict[str, object], json.loads(device_cli.render_collect(result)))
+    sync = cast(dict[str, object], json.loads(device_cli.render_sync(result, metrics)))
+
+    assert collect == {
+        "source_id": "a" * 32,
+        "raw_sha256": "b" * 64,
+        "next_sequence": 11,
+        "record_count": 1,
+        "start_sequence": 10,
+        "status": "sealed",
+    }
+    assert sync["source_id"] == "a" * 32
+    assert sync["raw_sha256"] == "b" * 64
+    assert sync["advance_confirmed"] is True
+    assert "bundle_path" not in sync
 
 
 def test_help_has_no_manual_destructive_ring_commands() -> None:

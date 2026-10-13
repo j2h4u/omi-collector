@@ -26,6 +26,11 @@ from omi_collector.capture.application.collector import (
     advance_leg,
     read_leg,
 )
+from omi_collector.capture.application.ring_transport import (
+    NotificationOverflowError,
+    NotificationProtocolError,
+    RingTransportDisconnectedError,
+)
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     STATUS_STORAGE_NOT_READY,
@@ -142,6 +147,7 @@ class FakeWriter:
     target_threads: list[int] = field(default_factory=list)
     expected_start: int = 10
     expected_count: int = 2
+    published_tails: list[bytes] = field(default_factory=list)
 
     async def start(self) -> None:
         self.calls.append("start")
@@ -157,9 +163,10 @@ class FakeWriter:
         future.set_result(None)
         return future
 
-    def publish(self, high_water: int) -> None:
+    def publish(self, high_water: int, tail: bytes = b"") -> None:
         self.calls.append(f"publish:{high_water}")
         self.submitted_high_water = high_water
+        self.published_tails.append(tail)
 
     async def barrier(self) -> str:
         self.calls.append("barrier")
@@ -167,6 +174,11 @@ class FakeWriter:
             raise OSError("blocked target failed")
         await asyncio.to_thread(self._target_write)
         return "checkpointed"
+
+    async def interrupt(self) -> str:
+        self.calls.append("interrupt")
+        await asyncio.to_thread(self._target_write)
+        return "interrupted"
 
     def _target_write(self) -> None:
         self.target_threads.append(threading.get_ident())
@@ -212,8 +224,8 @@ class BlockingWriterTarget:
         self.calls.append("read_begin")
         return None
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
-        del offset, chunk
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+        del offset, chunk, tail
         self.calls.append("append")
         self.append_threads.append(threading.get_ident())
         if len(self.append_threads) == 1:
@@ -224,6 +236,9 @@ class BlockingWriterTarget:
 
     def checkpoint(self) -> None:
         self.calls.append("checkpoint")
+
+    def interrupt(self) -> None:
+        self.calls.append("interrupt")
 
     def seal(self, done_notice: object) -> object:
         del done_notice
@@ -638,6 +653,39 @@ def test_read_leg_timeout_is_reset_by_continuous_notifications() -> None:
     asyncio.run(scenario())
 
 
+def test_cancelled_partial_read_flushes_tail_before_writer_interruption() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        partial_seen = asyncio.Event()
+
+        class PartialSession(BurstSession):
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    yield _data(record[:37])
+                    partial_seen.set()
+                    await asyncio.Event().wait()
+
+                return stream()
+
+        session = PartialSession(())
+        writer = FakeWriter()
+        task = asyncio.create_task(
+            read_leg(session, TransferArena(10, 2, max_bytes=2 * RECORD_SIZE), writer, 10, 2, ReadLegOptions(1))
+        )
+        await asyncio.wait_for(partial_seen.wait(), 1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert writer.published_tails == [record[:37]]
+        assert writer.calls[-1] == "interrupt"
+        assert session.writes[-1] == encode_stop_command()
+
+    asyncio.run(scenario())
+
+
 def test_read_leg_timeout_still_fails_after_idle_gap() -> None:
     async def scenario() -> None:
         record = _record(1)
@@ -648,6 +696,44 @@ def test_read_leg_timeout_still_fails_after_idle_gap() -> None:
 
         with pytest.raises(TransferInterruptedError, match="timed out during READ"):
             await read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.03))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        NotificationOverflowError("notification queue overflowed"),
+        RingTransportDisconnectedError("transport disconnected"),
+        NotificationProtocolError("invalid transport notification"),
+    ],
+    ids=["overflow", "disconnect", "protocol"],
+)
+def test_transport_failure_stops_and_interrupts_writer(transport_error: BaseException) -> None:
+    async def scenario() -> None:
+        record = _record(1)
+
+        class FailingSession(BurstSession):
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    yield _data(record)
+                    raise transport_error
+
+                return stream()
+
+        session = FailingSession(())
+        writer = FakeWriter()
+        arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+
+        with pytest.raises(TransferInterruptedError) as caught:
+            await read_leg(session, arena, writer, 10, 2, ReadLegOptions(1))
+
+        assert caught.value.__cause__ is transport_error
+        assert caught.value.received_records == 1
+        assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        assert writer.calls[-1] == "interrupt"
+        assert "barrier" not in writer.calls
 
     asyncio.run(scenario())
 

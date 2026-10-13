@@ -352,6 +352,8 @@ def read_capture_source(state_db: StateDB, source_id: str) -> CaptureSource | No
     try:
         with closing(state_db.open_connection(read_only=True)) as connection:
             return _read_capture_source(connection, source_id)
+    except InternalAudioStoreError:
+        raise
     except (sqlite3.DatabaseError, StateDBError) as error:
         raise InternalAudioStoreError("source read failed") from error
 
@@ -386,15 +388,12 @@ def authenticate_capture_source(
                 if not rows:
                     break
                 for ordinal_value, timestamp_value, payload_value in rows:
-                    ordinal = _uint32(cast(int, ordinal_value), "source record ordinal")
-                    if ordinal != count:
-                        raise InternalAudioStoreError("source record ordinals are not contiguous")
-                    timestamp = _uint32(cast(int, timestamp_value), "device timestamp")
-                    payload = _bytes(payload_value)
-                    digest.update(_record_bytes(timestamp.to_bytes(4, "big") + payload))
+                    digest.update(_authenticated_record_bytes(ordinal_value, timestamp_value, payload_value, count))
                     count += 1
                 after_ordinal = count - 1
             current = _read_capture_source(connection, source_id)
+    except InternalAudioStoreError:
+        raise
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise InternalAudioStoreError("source record authentication failed") from error
     if current != source:
@@ -404,6 +403,17 @@ def authenticate_capture_source(
     if digest.hexdigest() != source.committed_sha256:
         raise InternalAudioStoreError("source record digest does not match checkpoint")
     return source
+
+
+def _authenticated_record_bytes(
+    ordinal_value: object, timestamp_value: object, payload_value: object, expected: int
+) -> bytes:
+    ordinal = _uint32(cast(int, ordinal_value), "source record ordinal")
+    if ordinal != expected:
+        raise InternalAudioStoreError("source record ordinals are not contiguous")
+    timestamp = _uint32(cast(int, timestamp_value), "device timestamp")
+    payload = _bytes(payload_value)
+    return _record_bytes(timestamp.to_bytes(4, "big") + payload)
 
 
 class InternalAudioStore:
@@ -731,6 +741,8 @@ class InternalAudioStore:
                 return _read_record_page(self._publication_reader, source_id, after_ordinal, limit)
             with closing(self.state_db.open_connection(read_only=True)) as connection:
                 return _read_record_page(connection, source_id, after_ordinal, limit)
+        except InternalAudioStoreError:
+            raise
         except (sqlite3.DatabaseError, StateDBError) as error:
             raise InternalAudioStoreError("record page read failed") from error
 

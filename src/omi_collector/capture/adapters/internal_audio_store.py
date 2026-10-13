@@ -881,21 +881,29 @@ class InternalAudioStore:
         return self._append_replay(source, suffix, expected_sha256, tail)
 
     def _prefix_digest(self, source_id: str, count: int) -> str:
+        source_id = _source_id(source_id)
         digest = hashlib.sha256()
         after_ordinal = -1
         hashed_count = 0
-        while hashed_count < count:
-            page = self.read_record_page(
-                source_id,
-                after_ordinal,
-                min(self.chunk_limit, count - hashed_count),
-            )
-            if not page or any(record.ordinal != hashed_count + index for index, record in enumerate(page)):
-                raise InternalAudioStoreError("replay prefix is not contiguous")
-            for record in page:
-                digest.update(record.raw_bytes)
-            hashed_count += len(page)
-            after_ordinal = page[-1].ordinal
+        try:
+            with closing(self.state_db.open_connection(read_only=True)) as connection:
+                while hashed_count < count:
+                    page = _read_record_page(
+                        connection,
+                        source_id,
+                        after_ordinal,
+                        min(self.chunk_limit, count - hashed_count),
+                    )
+                    if not page or any(record.ordinal != hashed_count + index for index, record in enumerate(page)):
+                        raise InternalAudioStoreError("replay prefix is not contiguous")
+                    for record in page:
+                        digest.update(record.raw_bytes)
+                    hashed_count += len(page)
+                    after_ordinal = page[-1].ordinal
+        except InternalAudioStoreError:
+            raise
+        except (sqlite3.DatabaseError, StateDBError) as error:
+            raise InternalAudioStoreError("record page read failed") from error
         return digest.hexdigest()
 
     def _commit_replay_tail(

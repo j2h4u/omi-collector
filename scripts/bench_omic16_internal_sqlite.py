@@ -36,11 +36,10 @@ from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.capture.domain.transfer_arena import TransferArena
-from omi_collector.config import DEFAULT_CONFIG, CollectorConfig
+from omi_collector.config import DEFAULT_CONFIG, MAX_WRITER_CHUNK_RECORDS, CollectorConfig
 
 TOTAL_RECORDS = 684_816
 CHUNK_RECORDS = DEFAULT_CONFIG.writer.chunk_records
-MAX_CHUNK_RECORDS = 128
 RATE_BYTES = 1_048_576
 MIN_RESOURCE_BYTES = 3 * 1024**3
 MAX_ARENA_BYTES = 512 * 1024**2
@@ -120,7 +119,7 @@ class ObservedStagingWriter(StagingWriter):
 
     def __init__(self, store: StagingStore, start_sequence: int, packet_count: int) -> None:
         super().__init__(store, start_sequence, packet_count)
-        self.commit_ms_by_record_count: dict[int, list[float]] = {1: [], MAX_CHUNK_RECORDS: []}
+        self.commit_ms_by_record_count: dict[int, list[float]] = {1: [], CHUNK_RECORDS: []}
 
     def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
         record_count = chunk.nbytes // RECORD_SIZE
@@ -192,8 +191,8 @@ def parse_args() -> BenchConfig:
         parser.error(f"records must be 1..{MAX_RECORDS}; rate-bytes and max-seconds must be positive")
     if arena_bytes > MAX_ARENA_BYTES:
         parser.error(f"records exceed the production 512 MiB arena: {arena_bytes} bytes")
-    if CHUNK_RECORDS > MAX_CHUNK_RECORDS:
-        parser.error(f"production writer chunk exceeds the {MAX_CHUNK_RECORDS}-record maximum: {CHUNK_RECORDS}")
+    if CHUNK_RECORDS > MAX_WRITER_CHUNK_RECORDS:
+        parser.error(f"production writer chunk exceeds the {MAX_WRITER_CHUNK_RECORDS}-record maximum: {CHUNK_RECORDS}")
     return args
 
 
@@ -556,7 +555,7 @@ def publication_metrics(context: BenchmarkContext) -> dict[str, object]:
 
 def benchmark_metrics(context: BenchmarkContext, capture: CaptureResult) -> dict[str, object]:
     queue_latency = capture.queue_latency
-    full_k_commits = sorted(context.target.commit_ms_by_record_count[MAX_CHUNK_RECORDS])
+    full_k_commits = sorted(context.target.commit_ms_by_record_count[CHUNK_RECORDS])
     one_record_commits = sorted(context.target.commit_ms_by_record_count[1])
     return {
         "root": str(context.root),

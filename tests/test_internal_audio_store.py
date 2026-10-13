@@ -592,7 +592,9 @@ def test_short_exact_replay_authenticates_its_durable_prefix(tmp_path: Path) -> 
             )
 
 
-def test_long_prefix_replay_digest_reads_bounded_pages(tmp_path: Path) -> None:
+def test_long_prefix_replay_digest_reuses_one_connection_for_bounded_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     records = [_record(index, index % 251) for index in range(130)]
     with InternalAudioStore(db) as store:
@@ -603,6 +605,19 @@ def test_long_prefix_replay_digest_reads_bounded_pages(tmp_path: Path) -> None:
         assert store.commit_drain(source_id, 128, records[128:], DrainCheckpoint(1, expected_sha256=full_digest)) == 130
         before = store.get_source(source_id)
         prefix_digest = hashlib.sha256(b"".join(records[:129])).hexdigest()
+        page_calls: list[tuple[sqlite3.Connection, int, int]] = []
+        original_read_page = internal_audio_store._read_record_page
+
+        def tracked_read_page(
+            connection: sqlite3.Connection,
+            requested_source_id: str,
+            after_ordinal: int,
+            limit: int,
+        ) -> tuple[internal_audio_store.CaptureRecord, ...]:
+            page_calls.append((connection, after_ordinal, limit))
+            return original_read_page(connection, requested_source_id, after_ordinal, limit)
+
+        monkeypatch.setattr(internal_audio_store, "_read_record_page", tracked_read_page)
 
         assert (
             store.commit_drain(
@@ -613,6 +628,13 @@ def test_long_prefix_replay_digest_reads_bounded_pages(tmp_path: Path) -> None:
             )
             == 130
         )
+        assert [(after_ordinal, limit) for _, after_ordinal, limit in page_calls] == [
+            (127, 1),
+            (-1, 128),
+            (127, 1),
+        ]
+        assert page_calls[0][0] is not page_calls[1][0]
+        assert page_calls[1][0] is page_calls[2][0]
         assert store.get_source(source_id) == before
 
 

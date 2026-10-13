@@ -568,7 +568,7 @@ def _load_retained_recovery(layout: StorageLayout) -> _RetainedRecovery | None:
     """Authenticate the known, separately retained sparse rescue package."""
     manifest_path = _recovery_manifest_path(layout)
     if not _path_present(manifest_path):
-        if _path_present(manifest_path.parent) or layout.root == Path("/srv/pipelines/omi"):
+        if _path_present(manifest_path.parent):
             raise StateMigrationError("the retained recovery passport is missing")
         return None
     _require_directory(manifest_path.parent.parent)

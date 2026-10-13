@@ -411,6 +411,9 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
   expectations.
 - [Best practices](docs/BEST_PRACTICES.md) — concise operational and QA
   guidance.
+- [Internal SQLite capture plan](docs/OMIC-16-IMPLEMENTATION-PLAN.md) and
+  [review receipt](docs/qa/2026-10-13-omic-16-plan-review.md) — approved design
+  and remaining implementation gates.
 - [Transfer-quality evidence](docs/QUALITY_METRICS.md) — the durable metric
   journal and how operators interpret its records.
 - [Service audit tracker](docs/SERVICE_AUDIT.md) — root-cause fixes and

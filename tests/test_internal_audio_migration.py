@@ -199,13 +199,16 @@ def test_cutover_receipt_binds_setgid_parent_and_resume_keeps_effective_migrator
         migrate_internal_audio(layout, release_metadata=release)
     candidate = next(parent.glob(".collector-state.sqlite3.migrating.*"))
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
-        receipt = json.loads(
-            cast(
-                str,
-                connection.execute(
-                    "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
-                ).fetchone()[0],
-            )
+        receipt = cast(
+            dict[str, object],
+            json.loads(
+                cast(
+                    str,
+                    connection.execute(
+                        "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
+                    ).fetchone()[0],
+                )
+            ),
         )
     assert receipt["uid"] == os.geteuid()
     assert receipt["gid"] == original_egid + 1

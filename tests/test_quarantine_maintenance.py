@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 import time
@@ -760,6 +761,7 @@ def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def scenario() -> None:
+        caplog.set_level(logging.DEBUG, logger="omi_collector.debug")
         store = _publication_store(tmp_path)
         calls = 0
         events: list[tuple[str, str | None]] = []
@@ -782,10 +784,28 @@ def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
 
         assert calls == 1
         assert events == [("ready_publication_blocked", "RuntimeError")]
-        assert "ready_publication_failure" in caplog.text
+        diagnostic = [
+            record
+            for record in caplog.records
+            if record.name == "omi_collector.debug" and "ready_publication_failure" in record.getMessage()
+        ]
+        assert len(diagnostic) == 1
+        assert "ready_publication_failure" in diagnostic[0].getMessage()
+        assert '"phase":"publication"' in diagnostic[0].getMessage()
+        assert "RuntimeError at" in diagnostic[0].getMessage()
         assert "unexpected publication fault" not in caplog.text
         assert store.publication_retry_schedule() is None
         await maintenance.close()
+
+        from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+
+        def bad_clock(_self: object) -> None:
+            raise ValueError("clock metadata sentinel")
+
+        monkeypatch.setattr(ClockStateStore, "segment_map", bad_clock)
+        type(store)._recover_and_publish_unlocked(store)
+        assert "clock metadata unavailable; publishing ready audio without UTC normalization" in caplog.text
+        assert "clock metadata sentinel" in caplog.text
 
     _run(scenario())
 

@@ -252,15 +252,11 @@ class StagingStore:
         except Exception as error:
             if not isinstance(error, ReadyBundleError):
                 debug_exception(
-                    "ready_publication_failure", error, logger=_LOGGER, phase=phase, error_type=type(error).__name__
+                    "ready_publication_failure",
+                    error,
+                    phase="publication" if phase == "publication_effect" else "query",
                 )
-                _LOGGER.exception(
-                    "ready publication failed unexpectedly",
-                    extra={
-                        "debug_event": "ready_publication_failure",
-                        "debug_fields": {"phase": phase, "error_type": type(error).__name__},
-                    },
-                )
+                _LOGGER.exception("ready publication failed unexpectedly", exc_info=Exception("details redacted"))
             try:
                 revision = self._publication_revision()
             except OSError as revision_error:

@@ -34,6 +34,7 @@ from omi_collector.capture.adapters.staging_contract import AttemptDescriptor, D
 from omi_collector.capture.adapters.staging_filesystem import StagingIO
 from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
+from omi_collector.capture.application.owned_work import joined_to_thread
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.capture.domain.transfer_arena import TransferArena
 from omi_collector.config import DEFAULT_CONFIG, MAX_WRITER_CHUNK_RECORDS, CollectorConfig
@@ -512,7 +513,8 @@ async def run_writer(context: BenchmarkContext) -> CaptureResult:
             raise RuntimeError("writer did not retain the durable seal result")
         seal_ms = (time.perf_counter() - seal_started) * 1000
     await context.writer.close()
-    count, digest, pages, page_size, freelist, db_bytes = verify(
+    count, digest, pages, page_size, freelist, db_bytes = await joined_to_thread(
+        verify,
         context.db,
         seal_result.source_id,
         context.expected,
@@ -610,23 +612,15 @@ async def cleanup(context: BenchmarkContext) -> None:
                 retained = True
                 print(json.dumps({"retained": str(context.root), "close_error": str(error)}))
     if not retained:
-        shutil.rmtree(context.root)
+        await joined_to_thread(shutil.rmtree, context.root)
         print(json.dumps({"cleaned": str(context.root), "exists_after": context.root.exists()}))
 
 
-async def run(args: BenchConfig) -> None:
-    started = time.perf_counter()
-    deadline = time.monotonic() + args.max_seconds
-    config = (
-        replace(DEFAULT_CONFIG, ready=replace(DEFAULT_CONFIG.ready, target_audio_seconds=args.records * 0.02))
-        if args.publication
-        else DEFAULT_CONFIG
-    )
-    context = make_context(args, started, deadline, config)
+async def run(context: BenchmarkContext) -> None:
     try:
         capture = await run_writer(context)
         metrics = benchmark_metrics(context, capture)
-        metrics.update(publication_metrics(context))
+        metrics.update(await joined_to_thread(publication_metrics, context))
         print(json.dumps(metrics, sort_keys=True))
     finally:
         await cleanup(context)
@@ -639,7 +633,15 @@ def main() -> None:
         raise RuntimeError("ionice is required to run the capacity replay at idle I/O priority")
     subprocess.run((ionice, "-c", "3", "-p", str(os.getpid())), check=True, capture_output=True)
     args = parse_args()
-    asyncio.run(run(args))
+    started = time.perf_counter()
+    deadline = time.monotonic() + args.max_seconds
+    config = (
+        replace(DEFAULT_CONFIG, ready=replace(DEFAULT_CONFIG.ready, target_audio_seconds=args.records * 0.02))
+        if args.publication
+        else DEFAULT_CONFIG
+    )
+    context = make_context(args, started, deadline, config)
+    asyncio.run(run(context))
 
 
 if __name__ == "__main__":

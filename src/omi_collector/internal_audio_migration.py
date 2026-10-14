@@ -454,7 +454,8 @@ def _candidate_is_prepared(
             for attempt in inventory.attempts:
                 verify_imported_attempt(candidate, attempt)
             _verify_quarantines(candidate, inventory)
-            return True
+        _assert_no_journal(path)
+        return True
     except OSError, sqlite3.DatabaseError, InternalAudioMigrationError, LegacyAudioImportError:
         return False
 

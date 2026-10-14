@@ -57,7 +57,10 @@ def test_real_service_and_operator_handoff_access() -> None:
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires real service and operator principals")
-def test_real_principal_cutover_resume_recovers_candidate_journal(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("journal_state", ["cold", "hot"])
+def test_real_principal_cutover_resume_recovers_candidate_journal(
+    monkeypatch: pytest.MonkeyPatch, journal_state: str
+) -> None:
     try:
         service = pwd.getpwnam("omi-collector")
         operator_group = grp.getgrnam("j2h4u")
@@ -67,29 +70,15 @@ def test_real_principal_cutover_resume_recovers_candidate_journal(monkeypatch: p
         root = Path(temporary)
         os.chown(root, service.pw_uid, operator_group.gr_gid)
         root.chmod(0o2750)
-        complete_root = root / "complete"
-        complete_root.mkdir()
-        os.chown(complete_root, service.pw_uid, operator_group.gr_gid)
-        complete_root.chmod(0o2750)
-        complete_layout = _layout(complete_root)
-        complete_release = _release(complete_root)
-        _v1(complete_layout)
-        _, complete_raw = _draft(complete_layout)
-        _chown_real_layout(complete_layout, service.pw_uid, operator_group.gr_gid)
         monkeypatch.setattr(migration, "_verify_handoff_access", _REAL_HANDOFF_ACCESS)
-        assert migrate_internal_audio(complete_layout, release_metadata=complete_release) == {
-            "imported_sources": 1,
-            "removed_files": 2,
-        }
-        assert not tuple(complete_layout.draft.iterdir())
-        _assert_real_audio_parity(complete_layout, complete_raw)
-        _assert_real_database_owner(complete_layout.collector.state_db, service.pw_uid, operator_group.gr_gid)
+        _run_real_complete_migration(root, service.pw_uid, operator_group.gr_gid)
         layout = _layout(root)
         release = _release(root)
         _v1(layout)
         _, resumed_raw = _draft(layout)
+        if journal_state == "hot":
+            _seed_retained_padding(layout.collector.state_db)
         _chown_real_layout(layout, service.pw_uid, operator_group.gr_gid)
-        monkeypatch.setattr(migration, "_verify_handoff_access", _REAL_HANDOFF_ACCESS)
         activate = migration._activate_candidate
 
         def interrupt(*_args: object) -> dict[str, int]:
@@ -99,30 +88,48 @@ def test_real_principal_cutover_resume_recovers_candidate_journal(monkeypatch: p
         with pytest.raises(RuntimeError, match="interrupted after candidate creation"):
             migrate_internal_audio(layout, release_metadata=release)
         candidate = next(layout.collector.root.glob(".collector-state.sqlite3.migrating.*"))
-        # Force SQLite to leave a real hot journal while retaining the prepared candidate.
-        subprocess.run(
-            (
-                sys.executable,
-                "-c",
-                (
-                    "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1],isolation_level=None); "
-                    "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); "
-                    "c.execute(\"UPDATE state SET payload='interrupted'\"); os._exit(0)"
-                ),
-                str(candidate),
-            ),
-            check=True,
-        )
-        journal = candidate.with_name(candidate.name + "-journal")
-        assert journal.is_file()
+        journal = _leave_hot_journal(candidate) if journal_state == "hot" else _leave_cold_journal(candidate)
         journal_info = journal.stat()
         assert (journal_info.st_uid, journal_info.st_gid) == (os.geteuid(), operator_group.gr_gid)
         monkeypatch.setattr(migration, "_activate_candidate", activate)
+        backup = migration._backup_and_convert
+        rebuilds = 0
+
+        def count_rebuilds(
+            source: sqlite3.Connection, path: Path, receipt: dict[str, object], inventory: migration._Inventory
+        ) -> None:
+            nonlocal rebuilds
+            rebuilds += 1
+            backup(source, path, receipt, inventory)
+
+        monkeypatch.setattr(migration, "_backup_and_convert", count_rebuilds)
         assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 2}
+        assert rebuilds == int(journal_state == "cold")
         assert not candidate.exists()
         assert not journal.exists()
         _assert_real_audio_parity(layout, resumed_raw)
         _assert_real_database_owner(layout.collector.state_db, service.pw_uid, operator_group.gr_gid)
+        if journal_state == "hot":
+            with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+                assert connection.execute(
+                    "SELECT count(*) FROM state WHERE kind='padding' AND payload=?", ("x" * 1000,)
+                ).fetchone() == (1000,)
+
+
+def _run_real_complete_migration(root: Path, service_uid: int, operator_gid: int) -> None:
+    complete_root = root / "complete"
+    complete_root.mkdir()
+    os.chown(complete_root, service_uid, operator_gid)
+    complete_root.chmod(0o2750)
+    layout = _layout(complete_root)
+    release = _release(complete_root)
+    _v1(layout)
+    _, raw = _draft(layout)
+    _chown_real_layout(layout, service_uid, operator_gid)
+    assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 2}
+    assert not tuple(layout.draft.iterdir())
+    _assert_real_audio_parity(layout, raw)
+    _assert_real_database_owner(layout.collector.state_db, service_uid, operator_gid)
 
 
 def _layout(tmp_path: Path) -> StorageLayout:
@@ -174,6 +181,60 @@ def _assert_real_audio_parity(layout: StorageLayout, raw: bytes) -> None:
             ),
         )
         assert receipt["phase"] == "COMPLETE"
+
+
+def _seed_retained_padding(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executemany(
+            "INSERT INTO state VALUES ('padding', ?, ?)",
+            ((str(index), "x" * 1000) for index in range(1000)),
+        )
+        connection.commit()
+
+
+def _leave_hot_journal(path: Path) -> Path:
+    subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            (
+                "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); "
+                "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); "
+                "c.execute('UPDATE state SET payload=? WHERE kind=?', ('y' * 1000, 'padding')); os._exit(0)"
+            ),
+            str(path),
+        ),
+        check=True,
+        timeout=10,
+    )
+    journal = path.with_name(path.name + "-journal")
+    assert journal.is_file()
+    with (
+        pytest.raises(sqlite3.DatabaseError) as error,
+        closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as connection,
+    ):
+        connection.execute("PRAGMA integrity_check").fetchone()
+    assert error.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+    return journal
+
+
+def _leave_cold_journal(path: Path) -> Path:
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA journal_mode=PERSIST").fetchone() == ("persist",)
+        original = cast(
+            str,
+            connection.execute("SELECT payload FROM state WHERE kind='runtime_status' AND id='current'").fetchone()[0],
+        )
+        connection.execute("UPDATE state SET payload='temporary' WHERE kind='runtime_status' AND id='current'")
+        connection.commit()
+        connection.execute("UPDATE state SET payload=? WHERE kind='runtime_status' AND id='current'", (original,))
+        connection.commit()
+    journal = path.with_name(path.name + "-journal")
+    assert journal.is_file()
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert journal.is_file()
+    return journal
 
 
 def _v1(layout: StorageLayout) -> None:
@@ -587,7 +648,57 @@ def test_cutover_refuses_candidate_inode_change_before_removal_or_adoption(
         assert connection.execute("PRAGMA user_version").fetchone() == (1,)
 
 
-def test_cutover_rebuilds_nonadoptable_candidate_after_real_hot_journal(
+def test_cutover_rebuilds_prepared_candidate_with_cold_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout = _layout(tmp_path)
+    release = _release(tmp_path)
+    _v1(layout)
+    draft, raw = _draft(layout)
+    activate = migration._activate_candidate
+
+    def stop_after_prepare(*_args: object) -> dict[str, int]:
+        raise RuntimeError("simulated prepared candidate crash")
+
+    monkeypatch.setattr(migration, "_activate_candidate", stop_after_prepare)
+    with pytest.raises(RuntimeError, match="prepared candidate crash"):
+        migrate_internal_audio(layout, release_metadata=release)
+    candidate = next(layout.collector.root.glob(".collector-state.sqlite3.migrating.*"))
+    with closing(sqlite3.connect(candidate)) as connection:
+        prepared_receipt = cast(
+            tuple[str],
+            connection.execute(
+                "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
+            ).fetchone(),
+        )
+    journal = _leave_cold_journal(candidate)
+    with closing(sqlite3.connect(f"{candidate.as_uri()}?mode=ro", uri=True)) as connection:
+        assert (
+            connection.execute(
+                "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
+            ).fetchone()
+            == prepared_receipt
+        )
+
+    backup = migration._backup_and_convert
+    rebuilds = 0
+
+    def count_rebuilds(
+        source: sqlite3.Connection, path: Path, receipt: dict[str, object], inventory: migration._Inventory
+    ) -> None:
+        nonlocal rebuilds
+        rebuilds += 1
+        backup(source, path, receipt, inventory)
+
+    monkeypatch.setattr(migration, "_backup_and_convert", count_rebuilds)
+    monkeypatch.setattr(migration, "_activate_candidate", activate)
+    assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 2}
+    assert rebuilds == 1
+    assert not draft.exists()
+    assert not candidate.exists()
+    assert not journal.exists()
+    _assert_real_audio_parity(layout, raw)
+
+
+def test_cutover_refuses_journal_appearing_after_identity_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     layout = _layout(tmp_path)
@@ -602,81 +713,44 @@ def test_cutover_rebuilds_nonadoptable_candidate_after_real_hot_journal(
     monkeypatch.setattr(migration, "_activate_candidate", stop_after_prepare)
     with pytest.raises(RuntimeError, match="prepared candidate crash"):
         migrate_internal_audio(layout, release_metadata=release)
-    candidate = next(layout.collector.root.glob(".collector-state.sqlite3.migrating.*"))
-    with closing(sqlite3.connect(candidate)) as connection:
-        row = cast(
-            str,
-            connection.execute(
-                "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
-            ).fetchone()[0],
-        )
-        receipt = cast(dict[str, object], json.loads(row))
-        connection.execute(
-            "UPDATE state SET payload=? WHERE kind='migration' AND id='internal_audio_cutover'",
-            (json.dumps({**receipt, "phase": "BUILDING"}),),
-        )
-        connection.commit()
-    child = subprocess.run(
-        (
-            sys.executable,
-            "-c",
-            """
-import os
-import sqlite3
-import sys
-connection = sqlite3.connect(sys.argv[1], isolation_level=None)
-connection.execute("BEGIN IMMEDIATE")
-connection.execute("UPDATE state SET payload='hot' WHERE kind='runtime_status' AND id='current'")
-os._exit(0)
-""",
-            str(candidate),
-        ),
-        check=True,
-        timeout=10,
-    )
-    assert child.returncode == 0
-    assert (candidate.parent / f"{candidate.name}-journal").is_file()
-
     monkeypatch.setattr(migration, "_activate_candidate", activate)
-    assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 2}
-    assert not draft.exists()
-    assert not candidate.exists()
-    assert not (candidate.parent / f"{candidate.name}-journal").exists()
+    candidate = next(layout.collector.root.glob(".collector-state.sqlite3.migrating.*"))
+    prepared = migration._candidate_is_prepared
+
+    def create_journal_after_snapshot(
+        path: Path, source: sqlite3.Connection, receipt: dict[str, object], inventory: migration._Inventory
+    ) -> bool:
+        _leave_cold_journal(path)
+        return prepared(path, source, receipt, inventory)
+
+    monkeypatch.setattr(migration, "_candidate_is_prepared", create_journal_after_snapshot)
+    with pytest.raises(InternalAudioMigrationError, match="candidate journal identity changed during cutover"):
+        migrate_internal_audio(layout, release_metadata=release)
+    assert candidate.is_file()
+    assert candidate.with_name(candidate.name + "-journal").is_file()
+    assert draft.exists()
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
 
 
 def test_cutover_recovers_hot_canonical_v1_journal_before_inventory(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     release = _release(tmp_path)
     _v1(layout)
-    _draft(layout)
-    child = subprocess.run(
-        (
-            sys.executable,
-            "-c",
-            """
-import os
-import sqlite3
-import sys
-connection = sqlite3.connect(sys.argv[1], isolation_level=None)
-connection.execute("BEGIN IMMEDIATE")
-connection.execute("UPDATE state SET payload='transient' WHERE kind='runtime_status' AND id='current'")
-os._exit(0)
-""",
-            str(layout.collector.state_db),
-        ),
-        check=True,
-        timeout=10,
-    )
-    assert child.returncode == 0
-    journal = layout.collector.root / "collector-state.sqlite3-journal"
-    assert journal.is_file()
+    _, raw = _draft(layout)
+    _seed_retained_padding(layout.collector.state_db)
+    journal = _leave_hot_journal(layout.collector.state_db)
 
     assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 2}
 
     assert not journal.exists()
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         retained = cast(str, connection.execute("SELECT payload FROM state WHERE kind='runtime_status'").fetchone()[0])
+        assert connection.execute(
+            "SELECT count(*) FROM state WHERE kind='padding' AND payload=?", ("x" * 1000,)
+        ).fetchone() == (1000,)
     assert json.loads(retained) == {"last_error": "тест"}
+    _assert_real_audio_parity(layout, raw)
 
 
 def test_fresh_cutover_requires_empty_root_and_hands_off_database(tmp_path: Path) -> None:

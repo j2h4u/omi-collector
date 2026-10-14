@@ -15,6 +15,7 @@ from omi_collector.capture.adapters.firmware_observations import (
     parse_legacy_firmware,
     read_firmware_observations,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import RingInfo
 from omi_collector.config import FirmwareObservationConfig
 
@@ -167,6 +168,30 @@ def test_writer_retries_database_failure_and_reports_one_error_per_episode(tmp_p
     (observation,) = read_firmware_observations(db)
     assert observation.dropped_packets == 3
     assert len(errors) == 1
+
+
+def test_writer_reports_corruption_once_and_does_not_retry(tmp_path: Path) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    reported = Event()
+    calls: list[RingInfo] = []
+    errors: list[Exception] = []
+
+    class CorruptStore(FirmwareObservationStore):
+        def record(self, info: RingInfo) -> bool:
+            calls.append(info)
+            raise fatal
+
+    def on_error(error: Exception) -> None:
+        errors.append(error)
+        reported.set()
+
+    writer = FirmwareObservationWriter(CorruptStore(_db(tmp_path)), on_error=on_error)
+    writer.observe(_info(1))
+    assert reported.wait(1)
+    writer.observe(_info(2))
+    writer.close()
+    assert calls == [_info(1)]
+    assert errors == [fatal]
 
 
 def test_writer_replaces_stalled_mailbox_with_latest_observation(tmp_path: Path) -> None:

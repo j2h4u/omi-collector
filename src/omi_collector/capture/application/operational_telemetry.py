@@ -21,6 +21,7 @@ from ...config import DEFAULT_CONFIG
 from ..domain.clock_state import ClockIntent, ClockRange
 from ..domain.ring_protocol import RingInfo, RingStatus
 from .ports import ClockStatePort, StorageLeaseFactory
+from .storage_fault import FatalInternalAudioStorageError
 
 TIME_SERVICE_UUID = "19b10030-e8f2-537e-4f6c-d104768a1214"
 TIME_WRITE_UUID = "19b10031-e8f2-537e-4f6c-d104768a1214"
@@ -161,6 +162,8 @@ async def collect_operational_telemetry(
             status = await _bounded_optional(telemetry_clock.status_reader(), telemetry_clock.operation_timeout)
         except asyncio.CancelledError:
             raise
+        except FatalInternalAudioStorageError:
+            raise
         except Exception:  # noqa: BLE001 - optional status is advisory
             status = None
     observation, sample = await _build_observation(
@@ -278,6 +281,8 @@ async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: Cloc
             await _sync_clock(sync)
     except asyncio.CancelledError:
         raise
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - a held writer lease defers optional clock mutation
         sync.emit(
             {
@@ -318,6 +323,8 @@ async def _sync_clock(sync: _ClockSync) -> None:
         event.update(action="none", outcome="host_probe_timeout")
         sync.emit(event)
         return
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - trust is best effort
         trusted = False
     event["host_ntp_synchronized"] = trusted
@@ -349,6 +356,8 @@ async def _sync_trusted_state_clock(sync: _ClockSync, event: dict[str, object], 
             source_id=sync.session_id,
             tolerance_seconds=CLOCK_DRIFT_THRESHOLD_SECONDS,
         )
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - a missing durable range must block time writes
         event.update(action="none", outcome="evidence_persist_failed")
         sync.emit(event)
@@ -373,6 +382,8 @@ async def _correct_drift(sync: _ClockSync, store: ClockStatePort, event: dict[st
     intent = ClockIntent(uuid4().hex, "prepared", sample.epoch, target, midpoint, sync.info_before.write_sequence)
     try:
         store.prepare(intent)
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - no BLE write without a committed intent
         event.update(action="none", outcome="intent_persist_failed")
         return
@@ -384,12 +395,16 @@ async def _correct_drift(sync: _ClockSync, store: ClockStatePort, event: dict[st
     if event.get("outcome") in {"target_stale", "time_write_missing"}:
         try:
             store.cancel_prepared(intent.operation_id)
+        except FatalInternalAudioStorageError:
+            raise
         except Exception:  # noqa: BLE001 - retained prepared intent is conservative
             event["outcome"] = "result_persist_failed"
         return
     info_after = await _read_boundary_after(sync, event)
     try:
         _persist_clock_result(sync, intent, readback, info_after, event)
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - durable intent remains the recovery authority
         event["outcome"] = "result_persist_failed"
 
@@ -432,6 +447,8 @@ async def _read_boundary_after(sync: _ClockSync, event: dict[str, object]) -> Ri
         return None
     try:
         info = await _bounded_optional(sync.info_reader(), sync.operation_timeout)
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - an unavailable boundary remains uncertain
         return None
     if isinstance(info, RingInfo):
@@ -656,6 +673,8 @@ async def _emit_safe(emit: OperationalEmitter, event: dict[str, object], timeout
     try:
         await _bounded_optional(_emit(emit, event), timeout)
     except asyncio.CancelledError:
+        raise
+    except FatalInternalAudioStorageError:
         raise
     except Exception:  # noqa: BLE001 - telemetry is auxiliary
         return

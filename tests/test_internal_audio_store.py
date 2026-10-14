@@ -27,6 +27,7 @@ from omi_collector.capture.adapters.internal_audio_store import (
     validate_source_stream,
 )
 from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 
 
 def test_capture_space_reserve_uses_total_growth_and_one_bounded_journal(
@@ -457,6 +458,8 @@ def test_authentication_preserves_structured_sqlite_read_error(
     expected = (
         FatalInternalAudioStorageError
         if sqlite_errorcode in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}
+        else TransientInternalAudioStorageError
+        if sqlite_errorcode == sqlite3.SQLITE_BUSY
         else CaptureSourceReadError
     )
     with pytest.raises(expected) as raised:
@@ -480,13 +483,41 @@ def test_authentication_preserves_sqlite_code_from_open_connection(
     expected = (
         FatalInternalAudioStorageError
         if sqlite_errorcode in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}
-        else CaptureSourceReadError
+        else TransientInternalAudioStorageError
     )
     with pytest.raises(expected) as raised:
         authenticate_capture_source(db, "a" * 32)
     assert raised.value.sqlite_errorcode == sqlite_errorcode
-    assert isinstance(raised.value.__cause__, StateDBError)
-    assert raised.value.__cause__.sqlite_errorcode == sqlite_errorcode
+    assert raised.value.__cause__ is failure
+
+
+@pytest.mark.parametrize(
+    ("sqlite_errorcode", "expected"),
+    [
+        (sqlite3.SQLITE_BUSY, TransientInternalAudioStorageError),
+        (sqlite3.SQLITE_LOCKED, TransientInternalAudioStorageError),
+        (sqlite3.SQLITE_CORRUPT, FatalInternalAudioStorageError),
+        (sqlite3.SQLITE_NOTADB, FatalInternalAudioStorageError),
+    ],
+)
+def test_publication_record_page_preserves_sqlite_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sqlite_errorcode: int, expected: type[Exception]
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    failure = sqlite3.DatabaseError("simulated page fault")
+    failure.sqlite_errorcode = sqlite_errorcode
+
+    def fail_page(*_args: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(internal_audio_store, "_read_record_page", fail_page)
+    with InternalAudioStore(db) as store, store.publication_reader(), pytest.raises(expected) as raised:
+        store.read_record_page("a" * 32)
+    assert (
+        cast(FatalInternalAudioStorageError | TransientInternalAudioStorageError, raised.value).sqlite_errorcode
+        == sqlite_errorcode
+    )
+    assert raised.value.__cause__ is failure
 
 
 def test_authentication_raw_oserror_is_not_a_structured_read_error(

@@ -88,6 +88,13 @@ class QuarantineMaintenance:
         if self._publication_fatal is not None:
             raise self._publication_fatal
 
+    def record_storage_fatal(self, error: FatalInternalAudioStorageError) -> None:
+        """Wake the owner when an auxiliary writer observes corrupt SQLite."""
+
+        if self._publication_fatal is None:
+            self._publication_fatal = error
+            self._publication_fatal_event.set()
+
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
         if self._startup_state is not None:
@@ -197,8 +204,7 @@ class QuarantineMaintenance:
         try:
             task.result()
         except FatalInternalAudioStorageError as error:
-            self._publication_fatal = error
-            self._publication_fatal_event.set()
+            self.record_storage_fatal(error)
             return
         except asyncio.CancelledError:
             pass
@@ -289,6 +295,8 @@ class QuarantineMaintenance:
     async def _refresh_utc_projection(self) -> None:
         try:
             await joined_to_thread(self._staging.refresh_utc_projection)
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as error:  # noqa: BLE001 - projection is retryable idle metadata
             self._runtime.debug_exception("utc_projection_refresh_failed", error)
 
@@ -299,6 +307,8 @@ class QuarantineMaintenance:
                     self._staging.sweep_terminal_quarantine,
                     should_defer=should_defer,
                 )
+            except FatalInternalAudioStorageError:
+                raise
             except Exception as error:  # noqa: BLE001 - expiry failures preserve evidence
                 if not self._runtime.is_device_busy_error(error):
                     self._runtime.debug_exception("terminal_quarantine_sweep_failed", error)
@@ -315,6 +325,8 @@ class QuarantineMaintenance:
                 self._staging.quarantined_attempts,
                 should_defer=should_defer,
             )
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as error:  # noqa: BLE001 - no unsafe inference from unreadable quarantine
             self._runtime.debug_exception("quarantine_scan_failed", error)
             return
@@ -475,6 +487,8 @@ class QuarantineMaintenance:
         except asyncio.CancelledError:
             quarantine_transition(state, QuarantineEvent.CANCEL)
             raise
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as error:  # noqa: BLE001 - the runtime classifies supported salvage failures
             return await self._handle_quarantine_publish_error(source, state, error)
         self._quarantine_retry_number = 0
@@ -535,6 +549,8 @@ class QuarantineMaintenance:
     ) -> bool:
         try:
             await joined_to_thread(marker, source, reason)
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as marking_error:  # noqa: BLE001 - source remains safe
             self._runtime.debug_exception(
                 "quarantine_invalid_marker_preserved",

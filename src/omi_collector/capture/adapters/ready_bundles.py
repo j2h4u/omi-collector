@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import NoReturn, Protocol, cast
 
 from ...config import ReadyConfig
+from ..application.storage_fault import TransientInternalAudioStorageError
 from ..domain.internal_audio_machine import (
     QUARANTINE_CUSTODY_HOLD_REASONS,
     AudioAction,
@@ -48,7 +49,7 @@ from ..domain.internal_audio_machine import (
 from ..domain.opus_duration import inspect_20ms_record
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
 from .clock_segments import ClockSegmentMap
-from .collector_state_db import StateDB, StateDBError, StateKind
+from .collector_state_db import StateDB, StateDBError, StateKind, raise_if_sqlite_corrupt, raise_if_sqlite_storage_fault
 from .internal_audio_store import (
     CaptureRecord,
     CaptureSource,
@@ -516,6 +517,7 @@ def _retire_one(
             with state_db.transaction() as transaction:
                 transaction.put(StateKind.READY_PUBLICATION, bundle_id, retired_entry)
         except (OSError, ValueError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
             raise ReadyBundleError("ready retirement could not be recorded") from error
         bundles[bundle_id] = retired_entry
     elif state == "retired":
@@ -650,6 +652,7 @@ def _read_ledger(state_db: StateDB) -> dict[str, object]:
     try:
         rows = state_db.list(StateKind.READY_PUBLICATION)
     except (OSError, ValueError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("ready publication ledger is unreadable") from error
     bundles: dict[str, object] = {}
     frontier = 0
@@ -1303,6 +1306,7 @@ def _typed_source_admissions(
                     continue
                 admissions.append(admitted)
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed publication source state is unreadable") from error
     return tuple(sorted(admissions, key=lambda item: (item.snapshot.sequence_start, item.snapshot.source_id)))
 
@@ -1889,6 +1893,7 @@ def _load_active_typed_cohort(audio_store: InternalAudioStore) -> _TypedCohort |
     except ReadyBundleError:
         raise
     except (OSError, StateDBError, sqlite3.DatabaseError, ValueError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed publication cohort is unreadable") from error
     frozen = tuple(
         _persisted_admission(audio_store, expected, member, certifications)
@@ -2029,12 +2034,14 @@ def _create_typed_cohort(
                 state.mark_publication_changed()
             return proposed
         except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_corrupt(error)
             durable = _load_active_for_reconciliation(audio_store)
             if durable is not None and _same_typed_cohort(durable, proposed):
                 return durable
             if durable is None and attempt == 0:
                 continue
             if durable is None:
+                raise_if_sqlite_storage_fault(error)
                 raise ReadyBundleError("typed cohort acceptance was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed cohort acceptance has a third state")
     raise AssertionError("unreachable")
@@ -2043,7 +2050,7 @@ def _create_typed_cohort(
 def _load_active_for_reconciliation(audio_store: InternalAudioStore) -> _TypedCohort | None:
     try:
         return _load_active_typed_cohort(audio_store)
-    except (ReadyBundleError, InternalAudioStoreError) as error:
+    except (ReadyBundleError, InternalAudioStoreError, TransientInternalAudioStorageError) as error:
         _typed_fail_stop(audio_store, f"ambiguous typed cohort could not be inspected: {error}")
 
 
@@ -2201,12 +2208,14 @@ def _commit_typed_ready_custody(audio_store: InternalAudioStore, commit: _Custod
             _commit_typed_ready_custody_once(audio_store, commit)
             return None if commit.all_complete else commit.proposed
         except (InternalAudioStoreError, StateDBError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_corrupt(error)
             state = _inspect_typed_ready_custody(audio_store, commit)
             if state == "proposed":
                 return None if commit.all_complete else commit.proposed
             if state == "old" and attempt == 0:
                 continue
             if state == "old":
+                raise_if_sqlite_storage_fault(error)
                 raise ReadyBundleError("typed ready custody commit was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed ready custody commit has a third state")
     raise AssertionError("unreachable")
@@ -2296,10 +2305,12 @@ def _complete_empty_typed_cohort(audio_store: InternalAudioStore, cohort: _Typed
                 raise ReadyBundleError("typed completed cohort changed")
             state.mark_publication_changed()
     except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_corrupt(error)
         durable = _load_active_for_reconciliation(audio_store)
         if durable is None:
             return
         if _same_typed_cohort(durable, cohort):
+            raise_if_sqlite_storage_fault(error)
             raise ReadyBundleError("typed completed cohort deletion was rolled back") from error
         _typed_fail_stop(audio_store, "ambiguous typed cohort completion has a third state")
 
@@ -2340,10 +2351,9 @@ def _ensure_typed_stage(
             _insert_typed_stage(audio_store, cohort, proposed)
             return proposed
         except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_corrupt(error)
             durable_cohort = _load_active_for_reconciliation(audio_store)
-            durable = (
-                None if durable_cohort is None else _load_typed_stage(audio_store, durable_cohort, key, page_limit)
-            )
+            durable = _load_stage_for_reconciliation(audio_store, durable_cohort, key, page_limit)
             if (
                 durable_cohort is not None
                 and _same_typed_cohort(durable_cohort, replace(cohort, lifecycle="staging"))
@@ -2359,9 +2369,24 @@ def _ensure_typed_stage(
             ):
                 continue
             if durable_cohort is not None and _same_typed_cohort(durable_cohort, cohort) and durable is None:
+                raise_if_sqlite_storage_fault(error)
                 raise ReadyBundleError("typed stage intent was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed stage intent has a third state")
     raise AssertionError("unreachable")
+
+
+def _load_stage_for_reconciliation(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort | None,
+    key: _StageKey,
+    page_limit: int,
+) -> _TypedStage | None:
+    if cohort is None:
+        return None
+    try:
+        return _load_typed_stage(audio_store, cohort, key, page_limit)
+    except TransientInternalAudioStorageError:
+        _typed_fail_stop(audio_store, "ambiguous typed stage intent could not be inspected")
 
 
 def _insert_typed_stage(audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _TypedStage) -> None:
@@ -2521,6 +2546,7 @@ def _load_typed_stage(
                 )
             )
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed stage intent is unreadable") from error
     header = _parse_stage_header(row, key, len(raw_ranges))
     by_source = {item.snapshot.source_id: item for item in cohort.admissions}
@@ -2783,6 +2809,7 @@ def _publish_typed_group_with_error_boundary(
     except InternalAudioStoreError:
         raise
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed ready group could not be published") from error
 
 
@@ -2810,6 +2837,7 @@ def _resume_persisted_typed_stage(
     except InternalAudioStoreError:
         raise
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed ready group could not be published") from error
 
 
@@ -2826,6 +2854,7 @@ def _persisted_typed_stage_key(
                 )
             )
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed stage intent is unreadable") from error
     if len(rows) != 1:
         raise ReadyBundleError("STAGING cohort does not own exactly one typed stage intent")
@@ -2905,7 +2934,7 @@ def _latch_typed_durability_failure(
             if changed.rowcount != 1:
                 raise ReadyDurabilityFatalError("READY durability failure latch lost its compare-and-swap")
             state.mark_publication_changed()
-    except ReadyDurabilityFatalError:
+    except FatalInternalAudioStorageError:
         raise
     except Exception as error:
         if _typed_durability_failure_is_latched(audio_store, cohort, stage):
@@ -2928,7 +2957,8 @@ def _typed_durability_failure_is_latched(
                     (stage.stage_id, cohort.cohort_id),
                 )
             )
-    except OSError, StateDBError, sqlite3.DatabaseError:
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_corrupt(error)
         return False
     return row is not None and tuple(row) == (
         "staging",
@@ -2997,6 +3027,7 @@ def _require_typed_stage_space(audio_store: InternalAudioStore, cohort: _TypedCo
     except ReadyBundleError:
         raise
     except (OSError, StateDBError, sqlite3.DatabaseError, TypeError, IndexError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed publication space reserve could not be inspected") from error
 
 
@@ -3211,12 +3242,14 @@ def _commit_typed_stage(
             _commit_typed_stage_once(audio_store, proposal)
             return
         except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_corrupt(error)
             final_state = _inspect_typed_final(audio_store, proposal)
             if final_state == "proposed":
                 return
             if final_state == "old" and attempt == 0:
                 continue
             if final_state == "old":
+                raise_if_sqlite_storage_fault(error)
                 raise ReadyBundleError("typed ready final commit was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed ready final commit has a third state")
     raise AssertionError("unreachable")
@@ -3260,6 +3293,7 @@ def _typed_coverage_proposals(
                     continue
                 proposals.append(_typed_coverage_proposal(connection, admission))
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed coverage state is unreadable") from error
     return tuple(proposals)
 
@@ -3335,6 +3369,7 @@ def _commit_typed_replay_coverage(
         with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
             proposal = _typed_coverage_proposal(connection, admission)
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed replay coverage state is unreadable") from error
     for attempt in range(2):
         try:
@@ -3345,12 +3380,14 @@ def _commit_typed_replay_coverage(
                 state.mark_publication_changed()
             return
         except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_corrupt(error)
             current = _typed_source_coverage_state(audio_store, proposal.source_id)
             if current == proposal.proposed:
                 return
             if current == proposal.old and attempt == 0:
                 continue
             if current == proposal.old:
+                raise_if_sqlite_storage_fault(error)
                 raise ReadyBundleError("typed replay coverage commit was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed replay coverage commit has a third state")
     raise AssertionError("unreachable")
@@ -3367,7 +3404,8 @@ def _typed_source_coverage_state(audio_store: InternalAudioStore, source_id: str
                     (source_id,),
                 )
             )
-    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+    except (OSError, StateDBError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
+        raise_if_sqlite_corrupt(error)
         _typed_fail_stop(audio_store, f"typed replay coverage could not be inspected: {error}")
     return None if row is None else tuple(row)
 
@@ -3381,12 +3419,14 @@ def _block_typed_custody_conflict(
             _block_typed_custody_conflict_once(audio_store, disposition)
             return
         except (InternalAudioStoreError, StateDBError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_corrupt(error)
             state = _inspect_typed_conflict_disposition(audio_store, disposition)
             if state == "proposed":
                 return
             if state == "old" and attempt == 0:
                 continue
             if state == "old":
+                raise_if_sqlite_storage_fault(error)
                 raise ReadyBundleError("typed conflict disposition was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed conflict disposition has a third state")
     raise AssertionError("unreachable")
@@ -3411,6 +3451,7 @@ def _typed_conflict_disposition(
                 )
             )
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed conflict source state is unreadable") from error
     if row is None:
         raise ReadyBundleError("typed conflict source disappeared")
@@ -3635,7 +3676,15 @@ def _inspect_typed_conflict_disposition(
                 )
             )
         active = _load_active_for_reconciliation(audio_store) if disposition.cohort is not None else None
-    except (OSError, StateDBError, sqlite3.DatabaseError, ReadyBundleError, InternalAudioStoreError) as error:
+    except (
+        OSError,
+        StateDBError,
+        sqlite3.DatabaseError,
+        ReadyBundleError,
+        InternalAudioStoreError,
+        TransientInternalAudioStorageError,
+    ) as error:
+        raise_if_sqlite_corrupt(error)
         _typed_fail_stop(audio_store, f"typed conflict disposition could not be inspected: {error}")
     proposed_cohort = (
         disposition.cohort is None
@@ -3825,7 +3874,14 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
                 )
                 for item in proposal.coverage
             )
-    except (OSError, StateDBError, sqlite3.DatabaseError, ReadyBundleError) as error:
+    except (
+        OSError,
+        StateDBError,
+        sqlite3.DatabaseError,
+        ReadyBundleError,
+        TransientInternalAudioStorageError,
+    ) as error:
+        raise_if_sqlite_corrupt(error)
         _typed_fail_stop(audio_store, f"ambiguous typed final commit could not be inspected: {error}")
     proposed_sources = all(
         row is not None and tuple(row) == item.proposed
@@ -3885,6 +3941,7 @@ def _retire_one_typed_source(audio_store: InternalAudioStore, page_limit: int) -
                 )
             )
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed retirement state is unreadable") from error
     if row is None:
         return False
@@ -3925,12 +3982,14 @@ def _advance_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
                 _typed_fail_stop(audio_store, "typed retirement advanced an unexpected cursor")
             return True
         except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_corrupt(error)
             state = _inspect_typed_retirement(audio_store, step, proposed)
             if state == "proposed":
                 return True
             if state == "old" and attempt == 0:
                 continue
             if state == "old":
+                raise_if_sqlite_storage_fault(error)
                 raise ReadyBundleError("typed retirement step was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed retirement has a third state")
     raise AssertionError("unreachable typed retirement retry state")
@@ -4035,7 +4094,8 @@ def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
                     (step.source_id,),
                 )
             )
-    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+    except (OSError, StateDBError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
+        raise_if_sqlite_corrupt(error)
         _typed_fail_stop(audio_store, f"ambiguous typed retirement could not be inspected: {error}")
     if proposed is None and row is None:
         return "proposed"

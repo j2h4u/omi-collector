@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import quote
 
+from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
+
 _SCHEMA_VERSION = 2
 _LEGACY_SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5_000
@@ -45,7 +47,29 @@ class StateDBError(RuntimeError):
         self.sqlite_errorcode = sqlite_errorcode
 
 
+def raise_if_sqlite_storage_fault(error: BaseException) -> None:
+    """Classify only the error being handled, never an arbitrary cause chain."""
+
+    code = getattr(error, "sqlite_errorcode", None)
+    if type(code) is not int:
+        return
+    primary = code & 0xFF
+    if primary in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
+        raise FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=code) from error
+    if primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        raise TransientInternalAudioStorageError("canonical audio database is busy", sqlite_errorcode=code) from error
+
+
+def raise_if_sqlite_corrupt(error: BaseException) -> None:
+    """Stop before attempted reconciliation can hide a corrupt SQLite page."""
+
+    code = getattr(error, "sqlite_errorcode", None)
+    if type(code) is int and code & 0xFF in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
+        raise FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=code) from error
+
+
 def _database_failure(message: str, error: BaseException) -> StateDBError:
+    raise_if_sqlite_storage_fault(error)
     return StateDBError(message, sqlite_errorcode=getattr(error, "sqlite_errorcode", None))
 
 
@@ -246,10 +270,10 @@ class StateDB(_Operations):
             if mode != _STATE_DB_MODE:
                 self.path.chmod(_STATE_DB_MODE)
         except (OSError, sqlite3.DatabaseError) as error:
-            connection.rollback()
+            _rollback(connection)
             raise _database_failure("state database initialization failed", error) from error
         except BaseException:
-            connection.rollback()
+            _rollback(connection)
             raise
         finally:
             connection.close()

@@ -15,6 +15,7 @@ from typing import cast
 from uuid import uuid4
 
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
+from ..application.storage_fault import TransientInternalAudioStorageError
 from ..domain.quarantine_machine import QuarantineState
 from ..domain.ready_machine import (
     CaptureBegin,
@@ -40,7 +41,7 @@ from ..domain.ready_machine import (
 from . import quarantine, ready_closures
 from .attempts import SqliteAttemptInspection, SqliteStagedAttempt
 from .clock_segments import ClockSegmentError, ClockSegmentMap
-from .collector_state_db import StateDB, StateDBError, StateKind
+from .collector_state_db import StateDB, StateDBError, StateKind, raise_if_sqlite_storage_fault
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
 from .debug_logging import debug_event, debug_exception
 from .internal_audio_store import (
@@ -112,7 +113,9 @@ def _debug_publication_failure(
     )
 
 
-def _publication_io_reason(error: OSError) -> str:
+def _publication_io_reason(error: OSError | TransientInternalAudioStorageError) -> str:
+    if isinstance(error, TransientInternalAudioStorageError):
+        return "publication_sqlite_busy"
     if error.errno in {errno.EACCES, errno.EPERM}:
         return "publication_access_denied"
     return "publication_io_error"
@@ -198,10 +201,10 @@ class StagingStore:
 
     def _execute_publication_command(self, command: PublicationCommand, held_lease: DeviceLock | None) -> ReadyOutcome:
         while command.action is PublicationAction.CHECK_INPUT:
-            probe_error: OSError | None = None
+            probe_error: OSError | TransientInternalAudioStorageError | None = None
             try:
                 revision: object = self._publication_revision()
-            except OSError as error:
+            except (OSError, TransientInternalAudioStorageError) as error:
                 _debug_publication_failure(error, phase="input_revision")
                 revision = _UNKNOWN_REVISION
                 probe_error = error
@@ -246,7 +249,7 @@ class StagingStore:
         except DeviceAlreadyRunningError as error:
             _debug_publication_failure(error, phase="device_lock", path=self._filesystem.lock_path)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="publication_lock_busy"), running.revision
-        except OSError as error:
+        except (OSError, TransientInternalAudioStorageError) as error:
             _debug_publication_failure(error, phase=phase)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), running.revision
         except Exception as error:
@@ -254,12 +257,12 @@ class StagingStore:
                 debug_exception(
                     "ready_publication_failure",
                     error,
-                    phase="publication" if phase == "publication_effect" else "query",
+                    phase=phase,
                 )
                 _LOGGER.exception("ready publication failed unexpectedly", exc_info=Exception("details redacted"))
             try:
                 revision = self._publication_revision()
-            except OSError as revision_error:
+            except (OSError, TransientInternalAudioStorageError) as revision_error:
                 if isinstance(error, ReadyBundleError):
                     _debug_publication_failure(error, phase="publication_effect")
                 _debug_publication_failure(revision_error, phase="post_effect_revision")
@@ -402,6 +405,7 @@ class StagingStore:
                     ).fetchall(),
                 )
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
             raise StagingError("typed draft frontier is unreadable") from error
         return max((int.from_bytes(cast(bytes, row[0]), "big") + cast(int, row[1]) for row in rows), default=None)
 
@@ -497,6 +501,7 @@ class StagingStore:
                     ).fetchall(),
                 )
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
             raise ReadyBundleError("typed publication source inventory is unreadable") from error
         return tuple(str(row[0]) for row in rows)
 
@@ -707,6 +712,7 @@ class StagingStore:
                     ).fetchall(),
                 )
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
             raise AttemptStateError("typed attempt inventory is unreadable") from error
         sources: list[CaptureSource] = []
         try:

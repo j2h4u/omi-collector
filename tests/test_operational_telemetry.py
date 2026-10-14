@@ -39,6 +39,7 @@ from omi_collector.capture.application.operational_telemetry import (
 )
 from omi_collector.capture.application.opportunistic_sync import run_opportunistic_collector
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockAnchor, ClockIntent, ClockRange, ClockState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo, RingStatus
 from omi_collector.config import DEFAULT_CONFIG
@@ -938,6 +939,37 @@ def test_failed_intent_commit_prevents_ble_set_time() -> None:
 
     assert session.writes == []
     assert _clock_event(events)["outcome"] == "intent_persist_failed"
+
+
+@pytest.mark.parametrize("failing_operation", ("state", "observe", "prepare"))
+def test_corrupt_clock_evidence_stops_preflight_before_audio_or_time_write(failing_operation: str) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+
+    class CorruptClockStore(FakeClockStateStore):
+        def state(self) -> ClockState:
+            if failing_operation == "state":
+                raise fatal
+            return super().state()
+
+        def _fail_if(self, operation: str) -> None:
+            if operation == failing_operation:
+                raise fatal
+
+    session = FakeOperationalSession({TIME_READ_UUID: pack("<I", 1010)})
+    store = CorruptClockStore()
+    ticks = iter((1000.0,) * 8)
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        asyncio.run(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                _info(),
+                _event_emitter([]),
+                clock=TelemetryClock(lambda: next(ticks), lambda _timeout: True, 0.5, state_store=store),
+            )
+        )
+    assert raised.value is fatal
+    assert session.writes == []
 
 
 def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:

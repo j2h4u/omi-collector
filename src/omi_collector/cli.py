@@ -12,7 +12,7 @@ from collections.abc import Callable, Coroutine, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, suppress
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, ClassVar, Never, Protocol, cast
 from uuid import uuid4
 
 import typer
@@ -138,6 +138,10 @@ def _staging(operator_config: OperatorConfig, *, state_db: StateDB | None = None
     from omi_collector.capture.adapters.collector_state_db import StateDBError
     from omi_collector.capture.adapters.staging_filesystem import StagingIO, StagingPaths
     from omi_collector.capture.adapters.staging_store import StagingStore
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
     from omi_collector.state_migration import InternalAudioCutoverRequiredError, StateMigrationError, open_runtime_state
 
     layout = operator_config.storage
@@ -147,6 +151,12 @@ def _staging(operator_config: OperatorConfig, *, state_db: StateDB | None = None
         except InternalAudioCutoverRequiredError as error:
             typer.echo(str(error), err=True)
             raise typer.Exit(code=78) from error
+        except FatalInternalAudioStorageError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=78) from error
+        except TransientInternalAudioStorageError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=1) from error
         except (StateMigrationError, StateDBError) as error:
             typer.echo(str(error), err=True)
             raise typer.Exit(code=1) from error
@@ -171,6 +181,7 @@ def _command_state(loaded: OperatorConfig) -> Iterator[StateDB]:
     from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
     from omi_collector.capture.adapters.collector_state_db import StateDBError
     from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
     from omi_collector.state_migration import InternalAudioCutoverRequiredError, StateMigrationError, open_runtime_state
 
     try:
@@ -185,6 +196,9 @@ def _command_state(loaded: OperatorConfig) -> Iterator[StateDB]:
     except FatalInternalAudioStorageError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=78) from error
+    except TransientInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
     except (CollectorGuardError, StateMigrationError, StateDBError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
@@ -317,9 +331,12 @@ class SyncProgressReporter:
             signal = OperationalSignal.UNCHANGED
             if self._staging is not None:
                 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+                from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 
                 try:
                     pending = ClockStateStore(self._staging.state_db).state().intent
+                except FatalInternalAudioStorageError:
+                    raise
                 except Exception:  # noqa: BLE001 - unreadable evidence cannot prove recovery
                     pass
                 else:
@@ -770,8 +787,6 @@ def _quality_status_callback(
 async def _supervise_operational_status(
     operation: Coroutine[object, object, object], operational_status: OperationalStatusStore
 ) -> object:
-    from omi_collector.capture.adapters.operational_status import OperationalStatusError
-
     capture_task = asyncio.create_task(operation)
     failure_task = asyncio.create_task(operational_status.wait_failure())
     try:
@@ -784,8 +799,8 @@ async def _supervise_operational_status(
             except asyncio.CancelledError:
                 pass
             except Exception as cleanup_error:
-                raise OperationalStatusError("operational status persistence failed") from cleanup_error
-            raise OperationalStatusError("operational status persistence failed") from failure
+                raise _status_cleanup_error(failure, cleanup_error) from cleanup_error
+            _raise_status_failure(failure)
         return await capture_task
     except asyncio.CancelledError:
         if not capture_task.done():
@@ -795,13 +810,42 @@ async def _supervise_operational_status(
         except asyncio.CancelledError:
             pass
         except Exception as cleanup_error:
-            raise OperationalStatusError("capture cleanup failed during cancellation") from cleanup_error
+            raise _status_cleanup_error(
+                cleanup_error, cleanup_error, message="capture cleanup failed during cancellation"
+            ) from cleanup_error
         raise
     finally:
         if not failure_task.done():
             failure_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await failure_task
+
+
+def _raise_status_failure(
+    failure: BaseException,
+) -> Never:
+    from omi_collector.capture.adapters.operational_status import OperationalStatusError
+    from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+
+    if isinstance(failure, FatalInternalAudioStorageError):
+        raise failure
+    raise OperationalStatusError("operational status persistence failed") from failure
+
+
+def _status_cleanup_error(
+    failure: BaseException,
+    cleanup_error: BaseException,
+    *,
+    message: str = "operational status persistence failed",
+) -> Exception:
+    from omi_collector.capture.adapters.operational_status import OperationalStatusError
+    from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+
+    if isinstance(cleanup_error, FatalInternalAudioStorageError):
+        return cleanup_error
+    if isinstance(failure, FatalInternalAudioStorageError):
+        return failure
+    return OperationalStatusError(message)
 
 
 @device.command("metrics")

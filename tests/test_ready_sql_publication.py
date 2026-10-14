@@ -146,9 +146,17 @@ def _ready_bytes(outcome: ReadyOutcome) -> bytes:
     return b"".join(result.path.joinpath("records.bin").read_bytes() for result in published)
 
 
-def _fault_transaction(store: InternalAudioStore, boundary: int, *, rollback: bool):
+def _fault_transaction(
+    store: InternalAudioStore, boundary: int, *, rollback: bool, sqlite_errorcode: int | None = None
+):
     original = store.publication_transaction
     calls = 0
+
+    def failure(message: str) -> sqlite3.DatabaseError:
+        error = sqlite3.DatabaseError(message)
+        if sqlite_errorcode is not None:
+            error.sqlite_errorcode = sqlite_errorcode
+        return error
 
     @contextmanager
     def injected():
@@ -161,10 +169,10 @@ def _fault_transaction(store: InternalAudioStore, boundary: int, *, rollback: bo
         if rollback:
             with original() as transaction:
                 yield transaction
-                raise sqlite3.DatabaseError("simulated rollback")
+                raise failure("simulated rollback")
         with original() as transaction:
             yield transaction
-        raise sqlite3.DatabaseError("simulated commit ambiguity")
+        raise failure("simulated commit ambiguity")
 
     return original, injected
 
@@ -435,6 +443,40 @@ def test_sql_ready_durability_latch_failure_propagates_shared_fatal_error(
         _publish(store, (source,), ready)
     assert commits == 3
     store.close()
+
+
+def test_sql_ready_latch_does_not_swallow_corrupt_database_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(database) as store:
+        source = _source(store, "a" * 32, 100, (_record(100, 1),))
+        ready = tmp_path / "ready"
+        ready.mkdir()
+        ready.chmod(0o2750)
+        import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+        monkeypatch.setattr(ready_bundles.os, "fsync", lambda _descriptor: (_ for _ in ()).throw(OSError(5, "EIO")))
+        monkeypatch.setattr(ready_bundles, "_typed_durability_failure_is_latched", lambda *_args: True)
+        original_commit = store._commit
+        commits = 0
+        fatal = FatalInternalAudioStorageError(
+            "canonical audio database is corrupt", sqlite_errorcode=sqlite3.SQLITE_CORRUPT
+        )
+
+        def fail_latch_commit() -> None:
+            nonlocal commits
+            commits += 1
+            if commits == 3:
+                raise fatal
+            original_commit()
+
+        monkeypatch.setattr(store, "_commit", fail_latch_commit)
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            _publish(store, (source,), ready)
+
+        assert raised.value is fatal
+        assert commits == 3
 
 
 def test_sql_ready_rename_eio_latches_before_custody_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1322,8 +1364,9 @@ def test_sql_subrange_reads_bound_each_page_and_source_lookup_scales_with_pages(
 
 @pytest.mark.parametrize("boundary", (1, 2, 3), ids=("cohort", "stage", "final"))
 @pytest.mark.parametrize("rollback", (False, True), ids=("commit_then_raise", "rollback_then_raise"))
+@pytest.mark.parametrize("sqlite_errorcode", (None, sqlite3.SQLITE_BUSY), ids=("ordinary", "busy"))
 def test_sql_publication_reconciles_ambiguous_transaction_boundaries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: int, rollback: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: int, rollback: bool, sqlite_errorcode: int | None
 ) -> None:
     database = StateDB(tmp_path / "state.sqlite3")
     store = InternalAudioStore(database)
@@ -1331,7 +1374,7 @@ def test_sql_publication_reconciles_ambiguous_transaction_boundaries(
     ready = tmp_path / "ready"
     ready.mkdir()
     ready.chmod(0o2750)
-    original, injected = _fault_transaction(store, boundary, rollback=rollback)
+    original, injected = _fault_transaction(store, boundary, rollback=rollback, sqlite_errorcode=sqlite_errorcode)
     monkeypatch.setattr(store, "publication_transaction", injected)
 
     outcome = _publish(store, (source,), ready)
@@ -1358,3 +1401,24 @@ def test_sql_publication_reconciles_ambiguous_transaction_boundaries(
             is None
         )
     store.close()
+
+
+@pytest.mark.parametrize("sqlite_errorcode", (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB))
+def test_sql_publication_stops_on_structured_corrupt_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sqlite_errorcode: int
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(database) as store:
+        source = _source(store, "a" * 32, 100, (_record(100, 1),))
+        ready = tmp_path / "ready"
+        ready.mkdir()
+        ready.chmod(0o2750)
+        _original, injected = _fault_transaction(store, 1, rollback=True, sqlite_errorcode=sqlite_errorcode)
+        monkeypatch.setattr(store, "publication_transaction", injected)
+
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            _publish(store, (source,), ready)
+
+        assert raised.value.sqlite_errorcode == sqlite_errorcode
+        assert store.get_source(source._source_id) is not None
+        assert not tuple(ready.iterdir())

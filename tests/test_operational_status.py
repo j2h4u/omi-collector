@@ -14,6 +14,7 @@ from omi_collector.capture.adapters.operational_status import (
     OperationalStatusStore,
     read_operational_status,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.operational_status_machine import (
     OperationalDimension,
     OperationalSignal,
@@ -199,6 +200,42 @@ def test_supervisor_cancels_and_awaits_capture_after_snapshot_failure(
     asyncio.run(run())
     store.close()
     assert cleaned == [True]
+
+
+def test_corrupt_status_write_stops_supervised_capture_after_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omi_collector.cli import _supervise_operational_status
+
+    db = _db(tmp_path)
+    store = OperationalStatusStore(db, OperationalIdentity(BOOT, INVOCATION))
+    store.initialize()
+    cleaned: list[bool] = []
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+
+    async def capture() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.append(True)
+
+    def fail(_kind: StateKind, _item_id: str, _payload: dict[str, object]) -> None:
+        raise fatal
+
+    monkeypatch.setattr(db, "put", fail)
+
+    async def run() -> None:
+        operation = asyncio.create_task(_supervise_operational_status(capture(), store))
+        await asyncio.sleep(0)
+        store.update(OperationalDimension.QUALITY, OperationalSignal.BLOCK)
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await operation
+        assert raised.value is fatal
+
+    asyncio.run(run())
+    assert cleaned == [True]
+    assert store.failure is fatal
+    store.close()
 
 
 def test_closed_writer_ignores_late_updates(tmp_path: Path) -> None:

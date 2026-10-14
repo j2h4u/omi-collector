@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -34,6 +35,7 @@ from .session_lifecycle import (
 from .session_lifecycle import (
     bounded as _bounded,
 )
+from .storage_fault import FatalInternalAudioStorageError
 from .visit_machine import RecoveryDisposition
 
 # Cached status and optional characteristics are useful observations, but they
@@ -63,6 +65,22 @@ class _Run:
     maintenance: QuarantineMaintenance
 
 
+@dataclass(slots=True)
+class _BackgroundFatalOwner:
+    maintenance: QuarantineMaintenance
+    task: asyncio.Task[object]
+    cleanup_started: bool = False
+    notified: bool = False
+
+    def record(self, error: FatalInternalAudioStorageError) -> None:
+        self.maintenance.record_storage_fatal(error)
+        if self.notified:
+            return
+        self.notified = True
+        if not self.cleanup_started:
+            self.task.cancel()
+
+
 async def run_opportunistic_collector(
     provider: SessionProvider,
     staging: StagingPort,
@@ -79,23 +97,18 @@ async def run_opportunistic_collector(
     validate_policy(options.policy, options.config.presence.max_drain_cooldown_seconds)
     validate_presence_policy(options)
     loop = asyncio.get_running_loop()
-
-    def report_observation_error(error: Exception) -> None:
-        runtime.debug_exception("firmware_observation_writer_error", error, operation="observe")
-        if options.operational is None:
-            return
-        try:
-            loop.call_soon_threadsafe(_start_observation_error_task, options)
-        except RuntimeError:
-            return
+    owner = asyncio.current_task()
+    assert owner is not None
 
     options = _configure_clock_state(options, staging, runtime)
     maintenance = QuarantineMaintenance(staging, options.activity, runtime, config=options.config)
+    fatal_owner = _BackgroundFatalOwner(maintenance, owner)
+    _bind_metrics_fatal(options, loop, fatal_owner.record)
     if options.clock_lease is None:
         options = replace(options, clock_lease=staging.clock_mutation_lease)
 
     observation_writer = runtime.make_observation_writer(
-        staging, options.config.firmware_observations, report_observation_error
+        staging, options.config.firmware_observations, _observation_error_reporter(options, runtime, loop, fatal_owner)
     )
     run = _Run(provider, staging, options, observation_writer, runtime, maintenance)
     reconciler = BatchReconciler(staging, options, runtime, maintenance.quarantine_attempt_source)
@@ -107,10 +120,18 @@ async def run_opportunistic_collector(
             return await lifecycle.run_with_presence()
         return await lifecycle.run_direct()
     except BaseException as error:
-        cancelled = isinstance(error, asyncio.CancelledError)
         unwinding = True
+        if isinstance(error, asyncio.CancelledError):
+            maintenance._raise_publication_fatal()
+            cancelled = True
         raise
     finally:
+        fatal_owner.cleanup_started = True
+        await _finalize_run(run, reconciler, cancelled=cancelled, unwinding=unwinding)
+
+
+async def _finalize_run(run: _Run, reconciler: BatchReconciler, *, cancelled: bool, unwinding: bool) -> None:
+    try:
         try:
             finalization = await reconciler.finalize_active()
             finalization_succeeded = finalization.checkpoint_error is None and finalization.close_error is None
@@ -129,9 +150,33 @@ async def run_opportunistic_collector(
                 await _close_observation_writer(run, unwinding=unwinding)
             finally:
                 try:
-                    await maintenance.close()
+                    await run.maintenance.close()
                 finally:
                     _close_quality_metrics(run)
+    finally:
+        await asyncio.sleep(0)
+        run.maintenance._raise_publication_fatal()
+
+
+def _observation_error_reporter(
+    options: OpportunisticOptions,
+    runtime: CaptureRuntimePort,
+    loop: asyncio.AbstractEventLoop,
+    owner: _BackgroundFatalOwner,
+) -> Callable[[Exception], None]:
+    def report(error: Exception) -> None:
+        if isinstance(error, FatalInternalAudioStorageError):
+            loop.call_soon_threadsafe(owner.record, error)
+            return
+        runtime.debug_exception("firmware_observation_writer_error", error, operation="observe")
+        if options.operational is None:
+            return
+        try:
+            loop.call_soon_threadsafe(_start_observation_error_task, options)
+        except RuntimeError:
+            return
+
+    return report
 
 
 def _configure_clock_state(
@@ -139,6 +184,16 @@ def _configure_clock_state(
 ) -> OpportunisticOptions:
     """Supply the one active clock state capability to each session."""
     return replace(options, clock_state_store=options.clock_state_store or runtime.make_clock_state_store(staging))
+
+
+def _bind_metrics_fatal(
+    options: OpportunisticOptions,
+    loop: asyncio.AbstractEventLoop,
+    callback: Callable[[FatalInternalAudioStorageError], None],
+) -> None:
+    register = getattr(options.quality_metrics, "set_fatal_callback", None)
+    if callable(register):
+        register(lambda error: loop.call_soon_threadsafe(callback, error))
 
 
 def _validate_composition(staging: object, runtime: object) -> None:
@@ -172,6 +227,8 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
     def observe_info(info: RingInfo) -> None:
         try:
             run.observation_writer.observe(info)
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as error:  # noqa: BLE001 - observations are best effort
             _schedule_observation_error(run.options, error, run.runtime)
 
@@ -259,6 +316,8 @@ async def _close_observation_writer(run: _Run, *, unwinding: bool) -> None:
             # Preserve the cancellation or error already being unwound by the
             # collector; observation teardown must never replace it.
             return
+        raise
+    except FatalInternalAudioStorageError:
         raise
     except Exception as error:  # noqa: BLE001 - observation teardown is best effort
         run.runtime.debug_exception("firmware_observation_writer_error", error, operation="close")

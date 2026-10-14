@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import quote
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, raise_if_sqlite_storage_fault
 from omi_collector.storage_layout import StorageLayout
 
 
@@ -47,6 +47,7 @@ def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
             "Collector SQLite or journal access needs stopped-service repair"
         ) from error
     except (OSError, sqlite3.DatabaseError, UnicodeError, ValueError, TypeError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise StateMigrationError("Collector SQLite state cannot be validated") from error
 
 

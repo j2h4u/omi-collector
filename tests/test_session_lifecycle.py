@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -67,8 +68,13 @@ from omi_collector.capture.application.session_lifecycle import (
     presence_attempt_outcome,
     recoverable_session_outcome,
     report_session_error,
+    session_retry_outcome,
     storage_not_ready_delay,
     validate_policy,
+)
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
 )
 from omi_collector.capture.application.visit_machine import DrainConfirmed, RecoveryDisposition
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
@@ -1228,6 +1234,15 @@ def test_validate_policy_rejects_empty_or_oversized_batch_capacity(policy: Retry
 
 def test_validate_policy_accepts_exact_fit_batch_capacity() -> None:
     validate_policy(RetryPolicy(batch_records=2, arena_max_bytes=2 * RECORD_SIZE))
+
+
+def test_sqlite_busy_retries_session_but_corruption_stops_it() -> None:
+    busy = TransientInternalAudioStorageError("database busy", sqlite_errorcode=sqlite3.SQLITE_BUSY)
+    fatal = FatalInternalAudioStorageError("database corrupt", sqlite_errorcode=sqlite3.SQLITE_CORRUPT)
+
+    assert session_retry_outcome(busy, connected=False) == "retry"
+    assert session_retry_outcome(busy, connected=True) == "connected_interrupted"
+    assert session_retry_outcome(fatal, connected=True) is None
 
 
 def test_recoverable_session_outcome_keeps_contended_device_lease_retryable(tmp_path: Path) -> None:

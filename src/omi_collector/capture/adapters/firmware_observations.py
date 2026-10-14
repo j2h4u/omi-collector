@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, FirmwareObservationConfig
+from ..application.storage_fault import FatalInternalAudioStorageError
 from ..domain.ring_protocol import RingInfo
 from .collector_state_db import StateDB, StateDBError, StateKind
 
@@ -266,6 +267,9 @@ class FirmwareObservationWriter:
                 self._pending = None
             try:
                 self._store.record(item)
+            except FatalInternalAudioStorageError as error:
+                self._report_error(error)
+                return
             except Exception as error:  # noqa: BLE001
                 if not self._failure_active:
                     self._failure_active = True

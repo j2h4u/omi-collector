@@ -12,6 +12,11 @@ from typer.testing import CliRunner
 
 import omi_collector.cli as cli
 import omi_collector.internal_audio_migration as migration
+from omi_collector.capture.adapters.collector_state_db import raise_if_sqlite_storage_fault
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
+)
 from omi_collector.cli import app
 from omi_collector.internal_audio_migration import (
     InternalAudioMigrationError,
@@ -92,6 +97,42 @@ def _snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
 
 def _assert_compatible(result: dict[str, object], schema_version: int | None) -> None:
     assert result == {"schema_version": schema_version, "status": "migration_compatible"}
+
+
+@pytest.mark.parametrize(
+    ("sqlite_errorcode", "error_type"),
+    [
+        (sqlite3.SQLITE_CORRUPT, FatalInternalAudioStorageError),
+        (sqlite3.SQLITE_NOTADB, FatalInternalAudioStorageError),
+        (sqlite3.SQLITE_BUSY, TransientInternalAudioStorageError),
+        (sqlite3.SQLITE_LOCKED, TransientInternalAudioStorageError),
+    ],
+)
+def test_state_db_classifies_direct_sqlite_fault_codes(sqlite_errorcode: int, error_type: type[Exception]) -> None:
+    error = sqlite3.DatabaseError("sentinel")
+    error.sqlite_errorcode = sqlite_errorcode
+
+    with pytest.raises(error_type) as raised:
+        raise_if_sqlite_storage_fault(error)
+
+    assert raised.value.sqlite_errorcode == sqlite_errorcode  # type: ignore[attr-defined]
+
+
+def test_actual_notadb_startup_exits_78_before_ble_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout = _layout(tmp_path)
+    config_path = tmp_path / "config.toml"
+    layout.collector.state_db.write_bytes(b"not a SQLite database")
+
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "absent-installed-config.toml")
+    monkeypatch.setattr(cli, "_capture_cli", lambda: pytest.fail("BLE composition must not start"))
+
+    result = CliRunner().invoke(
+        app,
+        ["device", "sync", "--config", str(config_path), "--confirm-sync"],
+    )
+
+    assert result.exit_code == 78, result.output
+    assert "database" in result.output.lower()
 
 
 def test_preflight_accepts_empty_and_supported_v1_without_mutation(tmp_path: Path) -> None:

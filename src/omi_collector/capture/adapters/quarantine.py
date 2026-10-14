@@ -9,6 +9,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from typing import cast
 
+from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from ..domain.internal_audio_machine import (
     QUARANTINE_CUSTODY_HOLD_REASONS,
     AudioAction,
@@ -31,7 +32,7 @@ from ..domain.internal_audio_machine import (
 from ..domain.quarantine_machine import (
     QuarantineState,
 )
-from .collector_state_db import StateDBError, StateTransaction
+from .collector_state_db import StateDBError, StateTransaction, raise_if_sqlite_corrupt, raise_if_sqlite_storage_fault
 from .internal_audio_store import (
     DEFAULT_CHUNK_LIMIT,
     MAX_CHUNK_LIMIT,
@@ -44,7 +45,6 @@ from .staging_contract import (
     AttemptStateError,
     PendingAttemptError,
     StagingError,
-    _raise_if_corrupt_sqlite_error,
     _validate_attempt_id,
 )
 from .staging_filesystem import (
@@ -96,6 +96,7 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
                 "ORDER BY source_id"
             ).fetchall()
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine inventory is unreadable") from error
     typed_rows = cast(list[tuple[object]], rows)
     return tuple(str(row[0]) for row in typed_rows)
@@ -135,6 +136,7 @@ def _typed_quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tup
                     filesystem._terminal_retention_seconds,
                 )
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine admission failed") from error
     return source_ids
 
@@ -408,6 +410,7 @@ def _hold_source_authentication_mismatch(
             if changed.rowcount != 1:
                 raise StagingError("typed quarantine source changed during integrity hold")
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_corrupt(error)
         _reconcile_source_authentication_hold(filesystem, source_id, before, proposed, error)
 
 
@@ -418,17 +421,22 @@ def _reconcile_source_authentication_hold(
     proposed: tuple[object, ...] | None,
     error: BaseException,
 ) -> None:
+    if before is None or proposed is None:
+        raise_if_sqlite_storage_fault(error)
+        raise StagingError("typed quarantine integrity hold failed before mutation") from error
     try:
         with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
             durable_row = _source_row(connection, source_id)
-    except (OSError, sqlite3.DatabaseError, StateDBError) as inspect_error:
-        raise StagingError("typed quarantine integrity hold outcome is unreadable") from inspect_error
+    except (OSError, sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspect_error:
+        raise_if_sqlite_corrupt(inspect_error)
+        raise FatalInternalAudioStorageError("typed quarantine integrity hold outcome is unreadable") from inspect_error
     durable = None if durable_row is None else durable_row[1]
     if proposed is not None and durable == proposed:
         return
     if before is not None and durable == before:
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine integrity hold rolled back") from error
-    raise StagingError("typed quarantine integrity hold has an ambiguous third state") from error
+    raise FatalInternalAudioStorageError("typed quarantine integrity hold has an ambiguous third state") from error
 
 
 def admit_quarantined_prefix(
@@ -469,7 +477,7 @@ def admit_quarantined_prefix(
     except AttemptStateError, QuarantinePublishError, QuarantineSalvageDeferredError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError, TypeError, ValueError) as error:
-        _raise_if_corrupt_sqlite_error(error)
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine prefix admission failed") from error
 
 
@@ -510,6 +518,7 @@ def quarantine_attempt_source(filesystem: StagingFilesystem, attempt_id: str) ->
     except AttemptStateError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine source transition failed") from error
     return attempt_id
 
@@ -541,9 +550,13 @@ def _typed_terminalize_prefix(filesystem: StagingFilesystem, attempt_id: str) ->
     try:
         with _typed_transaction(filesystem) as connection:
             row = cast(
-                tuple[object] | None,
+                tuple[object, object, object] | None,
                 connection.execute(
-                    "SELECT lifecycle FROM capture_source WHERE source_id = ? AND source_type = 'attempt'",
+                    "SELECT lifecycle, committed_count, "
+                    "EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) OR "
+                    "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) OR "
+                    "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id) "
+                    "FROM capture_source WHERE source_id = ? AND source_type = 'attempt'",
                     (attempt_id,),
                 ).fetchone(),
             )
@@ -558,6 +571,17 @@ def _typed_terminalize_prefix(filesystem: StagingFilesystem, attempt_id: str) ->
                 return
             if decision.action is not AudioAction.PERSIST or decision.next_phase is not AudioPhase.SEALED_WAITING:
                 raise AttemptStateError(decision.reason)
+            if type(row[1]) is not int:
+                raise AttemptStateError("typed prefix committed count is invalid")
+            if row[1] == 0 or bool(row[2]):
+                _typed_quarantine_row(
+                    connection,
+                    attempt_id,
+                    lifecycle,
+                    "terminal prefix residual",
+                    filesystem._terminal_retention_seconds,
+                )
+                return
             cursor = connection.execute(
                 "UPDATE capture_source SET lifecycle = 'sealed_waiting', terminal_time = ? "
                 "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
@@ -568,6 +592,7 @@ def _typed_terminalize_prefix(filesystem: StagingFilesystem, attempt_id: str) ->
     except AttemptStateError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed prefix terminalization failed") from error
 
 
@@ -629,6 +654,7 @@ def _typed_mark_unprocessable(filesystem: StagingFilesystem, source_id: str, rea
     except AttemptStateError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine terminal state failed") from error
 
 
@@ -673,6 +699,7 @@ def _typed_sweep_terminal_quarantine(
                 state.mark_publication_changed()
                 state.finish()
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine retention sweep failed") from error
     return SweepResult(tuple(removed), progressed)
 
@@ -1055,7 +1082,8 @@ def _quarantine_state(filesystem: StagingFilesystem, source_id: str) -> Quaranti
         if row[0] in {None, "unclassified"}:
             return QuarantineState.RETRYABLE
         return QuarantineState.PUBLISHED if row[0] == "published_prefix" else QuarantineState.UNPROCESSABLE
-    except OSError, sqlite3.DatabaseError, StateDBError:
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         return QuarantineState.INVALID_EVIDENCE
 
 
@@ -1078,6 +1106,7 @@ def pending_attempts(filesystem: StagingFilesystem) -> tuple[AttemptDescriptor, 
                 ).fetchall(),
             )
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise PendingAttemptError("typed partial staging cannot be inspected") from error
     from .internal_audio_store import decode_uint64
 

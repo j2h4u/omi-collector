@@ -23,6 +23,10 @@ from omi_collector.capture.adapters.ready_bundles import (
     finalize_typed_sources,
 )
 from omi_collector.capture.adapters.staging_contract import StagingError
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
+)
 from omi_collector.capture.domain.quarantine_machine import QuarantineState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, StagingRetentionConfig, WriterConfig
@@ -591,7 +595,8 @@ def test_authentication_hold_reconciles_complete_durable_row(tmp_path: Path, dur
             assert store.quarantined_attempts() == ()
         else:
             with pytest.raises(
-                StagingError, match="rolled back" if durable_state == "rolled_back" else "ambiguous third state"
+                StagingError if durable_state == "rolled_back" else FatalInternalAudioStorageError,
+                match="rolled back" if durable_state == "rolled_back" else "ambiguous third state",
             ) as raised:
                 quarantine_module._reconcile_source_authentication_hold(
                     store._filesystem, source_id, before, proposed, failure
@@ -616,6 +621,34 @@ def test_authentication_hold_reconciles_complete_durable_row(tmp_path: Path, dur
         else:
             assert durable[columns.index("terminal_time")] is None
             assert durable[columns.index("certified_prefix_count")] is None
+    finally:
+        attempt.close()
+
+
+def test_authentication_hold_unreadable_commit_outcome_stops_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    try:
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            row = quarantine_module._source_row(connection, source_id)
+        assert row is not None
+        before = row[1]
+        proposed = ("changed", *before[1:])
+        busy = TransientInternalAudioStorageError("database busy", sqlite_errorcode=sqlite3.SQLITE_BUSY)
+
+        def unreadable(*_args: object) -> None:
+            raise busy
+
+        with monkeypatch.context() as patch:
+            patch.setattr(quarantine_module, "_source_row", unreadable)
+            with pytest.raises(FatalInternalAudioStorageError, match="unreadable") as raised:
+                quarantine_module._reconcile_source_authentication_hold(
+                    store._filesystem, source_id, before, proposed, busy
+                )
+        assert raised.value.__cause__ is busy
     finally:
         attempt.close()
 
@@ -672,6 +705,62 @@ def test_zero_checkpoint_with_real_record_enters_hold_at_quarantine_open(tmp_pat
             )
     finally:
         attempt.close()
+
+
+def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    config = CollectorConfig(
+        ready=ReadyConfig(target_audio_seconds=0.02),
+        staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+    )
+    bootstrap = StagingStore(tmp_path / "spool", tmp_path / "capture", config=config)
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    store = StagingStore.from_paths(bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config)
+    zero = _attempt(store, start=100, count=1)
+    sealed = _attempt(store, start=101, count=1)
+    try:
+        zero.accept_chunk(100, b"", b"partial-tail")
+        zero.interrupt()
+        zero_id = zero.attempt_id
+        zero.close(durable=True)
+        store.terminalize_prefix_attempt(zero_id)
+
+        raw = _opus_record(2, 2)
+        sealed.accept_chunk(101, raw)
+        sealed.seal(DoneNotification(0, 102))
+        sealed_id = sealed.attempt_id
+        sealed.close(durable=True)
+        store.terminalize_prefix_attempt(sealed_id)
+        store.append_ready_closure(102, "drained")
+
+        zero_row = _source_row(store, zero_id)
+        assert zero_row is not None and zero_row[:4] == (
+            "quarantine",
+            "blocked",
+            "terminal prefix residual",
+            "unprocessable",
+        )
+        assert zero_row[6] is not None
+        now += 1_000_000_000
+        assert store.sweep_terminal_quarantine().removed_source_ids == (zero_id,)
+        published = store.recover_and_publish()
+        assert published.state is ReadyOutcomeState.PUBLISHED
+        assert published.published[0].path.joinpath("records.bin").read_bytes() == raw
+
+        restarted = StagingStore.from_paths(
+            bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config
+        )
+        assert restarted.sweep_terminal_quarantine().removed_source_ids == ()
+        assert attempt_source(restarted, zero_id) is None
+        assert attempt_source(restarted, sealed_id) is not None
+    finally:
+        zero.close()
+        sealed.close()
 
 
 def test_unclassified_evidence_cannot_expire_or_starve_later_terminal_source(

@@ -42,6 +42,7 @@ from .session_lifecycle import bounded as _bounded
 from .session_lifecycle import report_activity as _report_activity
 from .session_lifecycle import report_finalization_error as _report_finalization_error
 from .session_lifecycle import sleep as _sleep
+from .storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 
 
 class CursorConsistencyError(OpportunisticSyncError):
@@ -232,7 +233,11 @@ class BatchReconciler:
         # Closing the writer deliberately makes its target identity
         # inaccessible. Retain it first so teardown cannot mask the cause.
         attempt_id = batch.writer.attempt_id
-        checkpoint_error, close_error = await _finalize_batch(batch, self._run.options, self._run.runtime)
+        try:
+            checkpoint_error, close_error = await _finalize_batch(batch, self._run.options, self._run.runtime)
+        finally:
+            if isinstance(batch.writer.failure, (FatalInternalAudioStorageError, TransientInternalAudioStorageError)):
+                raise batch.writer.failure
         preserved_path = batch.seal.bundle_path if isinstance(batch.seal, SealResultShape) else None
         preserved_source_id = None if preserved_path is not None else attempt_id
         preserved_kind = "sealed bundle" if preserved_path is not None else "internal audio source"
@@ -618,6 +623,12 @@ async def _read_leg_with_progress(
             await pump
     except collector.TransferInterruptedError as error:
         _note_quality_counters(quality, error.counters)
+        if isinstance(batch.writer.failure, (FatalInternalAudioStorageError, TransientInternalAudioStorageError)):
+            raise batch.writer.failure from error
+        raise
+    except Exception as error:
+        if isinstance(batch.writer.failure, (FatalInternalAudioStorageError, TransientInternalAudioStorageError)):
+            raise batch.writer.failure from error
         raise
     else:
         _note_quality_counters(quality, result.counters)

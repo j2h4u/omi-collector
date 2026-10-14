@@ -16,7 +16,7 @@ import pytest
 
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
-from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
+from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 from omi_collector.capture.application.ports import StagingPort
 from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
@@ -24,6 +24,7 @@ from omi_collector.capture.application.quarantine_maintenance import (
     PendingStartupState,
     QuarantineMaintenance,
 )
+from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
 from omi_collector.config import CollectorConfig, RetryConfig
 from staging_test_factory import StagingStore, attempt_source, closure_rows
@@ -211,6 +212,41 @@ def test_background_publication_fatal_stops_retry_and_reaches_presence_owner(
                 await asyncio.wait_for(maintenance.wait_for_presence_attempt(Presence(), lambda _: None), timeout=2)
             assert calls == 1
         finally:
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_auxiliary_writer_fatal_wakes_idle_presence_owner(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
+        fatal = FatalInternalAudioStorageError("canonical audio database is corrupt")
+
+        async def wait_for_fatal(*_args: object) -> None:
+            await maintenance._publication_fatal_event.wait()
+
+        maintenance._prepare_and_run = wait_for_fatal  # type: ignore[method-assign]
+
+        class Presence:
+            closed = False
+
+            async def wait_for_attempt(self) -> PresenceWake:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        presence = Presence()
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(presence, lambda _: None))
+        try:
+            await asyncio.sleep(0)
+            maintenance.record_storage_fatal(fatal)
+            with pytest.raises(FatalInternalAudioStorageError, match="corrupt"):
+                await asyncio.wait_for(owner, timeout=2)
+        finally:
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
             await maintenance.close()
 
     _run(scenario())
@@ -719,6 +755,44 @@ def test_transient_publication_retry_settles_and_clears_schedule(
     _run(scenario())
 
 
+@pytest.mark.parametrize("phase", ["revision", "effect"])
+def test_publication_busy_is_transient_and_keeps_input_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    store = _publication_store(tmp_path)
+    assert store._publication_root is not None
+    before = tuple(store._publication_root.iterdir())
+    busy = TransientInternalAudioStorageError("database is busy", sqlite_errorcode=sqlite3.SQLITE_BUSY)
+
+    if phase == "revision":
+        monkeypatch.setattr(store, "_publication_revision", lambda: (_ for _ in ()).throw(busy))
+    else:
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", lambda: (_ for _ in ()).throw(busy))
+
+    outcome = store.publish_ready()
+
+    assert outcome.state is ReadyOutcomeState.TRANSIENT
+    assert store.publication_retry_schedule() is not None
+    assert tuple(store._publication_root.iterdir()) == before
+
+
+def test_publication_semantic_mismatch_is_blocked_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _publication_store(tmp_path)
+    monkeypatch.setattr(
+        store,
+        "_recover_and_publish_unlocked",
+        lambda: (_ for _ in ()).throw(ReadyBundleError("semantic mismatch")),
+    )
+
+    outcome = store.publish_ready()
+
+    assert outcome.state is ReadyOutcomeState.BLOCKED
+    assert outcome.reason == "semantic mismatch"
+    assert store.publication_retry_schedule() is None
+
+
 @pytest.mark.parametrize(
     ("successful_result", "success_event"),
     [
@@ -791,7 +865,7 @@ def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
         ]
         assert len(diagnostic) == 1
         assert "ready_publication_failure" in diagnostic[0].getMessage()
-        assert '"phase":"publication"' in diagnostic[0].getMessage()
+        assert '"phase":"publication_effect"' in diagnostic[0].getMessage()
         assert "RuntimeError at" in diagnostic[0].getMessage()
         errors = [
             record

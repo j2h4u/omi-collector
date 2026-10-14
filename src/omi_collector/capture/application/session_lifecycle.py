@@ -69,6 +69,7 @@ from .session_machine import (
 from .session_machine import (
     transition as transition_session,
 )
+from .storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from .visit_machine import (
     AttemptGranted,
     CloseFailed,
@@ -613,6 +614,8 @@ class SessionLifecycle:
                     quality.phy_policy,
                 )
             )
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as metrics_error:  # noqa: BLE001 - metrics cannot stop audio capture
             self.run.runtime.debug_exception(
                 "quality_metrics_write_error", metrics_error, event_type="advertisement_observation"
@@ -648,6 +651,8 @@ class SessionLifecycle:
                 quality.advertisement_rssi_dbm,
             )
             metrics.record_transfer_session(metric)
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as metrics_error:  # noqa: BLE001 - metrics cannot stop audio capture
             self.run.runtime.debug_exception(
                 "quality_metrics_write_error", metrics_error, event_type="transfer_session"
@@ -665,6 +670,8 @@ class SessionLifecycle:
                         result = self.run.callbacks.observe_info(info)
                         if inspect.isawaitable(result):
                             await result
+                    except FatalInternalAudioStorageError:
+                        raise
                     except Exception as error:  # noqa: BLE001 - observation is best effort
                         self.run.runtime.debug_exception(
                             "firmware_observation_writer_error", error, operation="observe"
@@ -728,6 +735,8 @@ class SessionLifecycle:
             return "completed"
         except asyncio.CancelledError:
             raise
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as error:  # noqa: BLE001 - optional telemetry
             await report_session_error(options.activity, "telemetry", error, self.run.runtime)
             return "degraded"
@@ -750,6 +759,8 @@ class SessionLifecycle:
                 ),
             )
         except asyncio.CancelledError:
+            raise
+        except FatalInternalAudioStorageError:
             raise
         except Exception as error:  # noqa: BLE001 - battery refresh is optional
             await report_session_error(options.activity, "telemetry", error, self.run.runtime)
@@ -811,6 +822,8 @@ def _record_clock_correction(
                 quality.firmware_version,
             )
         )
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - metrics cannot stop audio capture
         return
 
@@ -945,6 +958,7 @@ def _retryable(
             NotificationOverflowError,
             RingTransportDisconnectedError,
             RingTransportUnavailableError,
+            TransientInternalAudioStorageError,
             TimeoutError,
         ),
     )

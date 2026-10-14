@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
 from json import JSONDecodeError, loads
 from pathlib import Path
 from typing import cast
 
-from ..application.storage_fault import FatalInternalAudioStorageError
+from ..application.storage_fault import FatalInternalAudioStorageError as FatalInternalAudioStorageError
 from ..domain.ring_protocol import RECORD_SIZE
 
 _DESCRIPTOR_NAME = "attempt.json"
@@ -32,12 +31,6 @@ _MAX_READ_PACKET_COUNT = (1 << 32) - 1
 
 class StagingError(RuntimeError):
     """Base error for local staging failures."""
-
-
-def _raise_if_corrupt_sqlite_error(error: BaseException) -> None:
-    code = getattr(error, "sqlite_errorcode", None)
-    if type(code) is int and code & 0xFF in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
-        raise FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=code) from error
 
 
 class DiskSpaceError(StagingError):

@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Final, NoReturn, Protocol, cast
 
 from ...config import MAX_WRITER_CHUNK_RECORDS
+from ..application.storage_fault import TransientInternalAudioStorageError
 from ..domain.clock_state import ClockState
 from ..domain.internal_audio_machine import (
     AudioAction,
@@ -32,8 +33,16 @@ from ..domain.internal_audio_machine import (
     transition,
 )
 from .clock_segments import ClockSegmentMap
-from .collector_state_db import StateDB, StateDBError, StateTransaction, _decode, _encode, install_audio_schema
-from .staging_contract import _raise_if_corrupt_sqlite_error
+from .collector_state_db import (
+    StateDB,
+    StateDBError,
+    StateTransaction,
+    _decode,
+    _encode,
+    install_audio_schema,
+    raise_if_sqlite_corrupt,
+    raise_if_sqlite_storage_fault,
+)
 
 __all__ = [
     "AUDIO_PAYLOAD_SIZE",
@@ -117,6 +126,7 @@ def capture_space_requirement(state_db: StateDB, record_count: int, chunk_record
         filesystem = os.statvfs(state_db.path.parent)
         available = filesystem.f_bavail * filesystem.f_frsize
     except (OSError, sqlite3.DatabaseError, StateDBError, TypeError, AttributeError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise InternalAudioStoreError("capture space reserve could not be inspected") from error
     return database_growth + journal_bytes, available
 
@@ -260,6 +270,7 @@ def clock_mapping_revision(state_db: StateDB) -> str:
             payload = _clock_payload_text(connection)
         return hashlib.sha256((payload if payload is not None else _DEFAULT_CLOCK_PAYLOAD).encode("utf-8")).hexdigest()
     except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise InternalAudioStoreError("clock mapping revision could not be read") from error
 
 
@@ -296,6 +307,7 @@ def refresh_utc_projection(state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUN
     except InternalAudioStoreError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError, TypeError, ValueError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise InternalAudioStoreError("UTC projection refresh failed") from error
 
 
@@ -307,6 +319,7 @@ def _clock_projection_snapshot(state_db: StateDB) -> tuple[str | None, str, Cloc
         state = ClockState.from_payload(_decode(authoritative))
         return payload, hashlib.sha256(authoritative.encode("utf-8")).hexdigest(), ClockSegmentMap.from_state(state)
     except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError, TypeError, ValueError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise InternalAudioStoreError("clock mapping snapshot is invalid") from error
 
 
@@ -374,6 +387,7 @@ def read_capture_source(state_db: StateDB, source_id: str) -> CaptureSource | No
     except InternalAudioStoreError:
         raise
     except (sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise InternalAudioStoreError("source read failed") from error
 
 
@@ -397,7 +411,7 @@ def authenticate_capture_source(
     except InternalAudioStoreError:
         raise
     except (sqlite3.DatabaseError, StateDBError) as error:
-        _raise_if_corrupt_sqlite_error(error)
+        raise_if_sqlite_storage_fault(error)
         raise _capture_source_read_error(error) from error
     except OSError as error:
         raise InternalAudioStoreError("source record authentication failed") from error
@@ -493,7 +507,10 @@ class InternalAudioStore:
             self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
         except sqlite3.DatabaseError as error:
             if self._connection is not None:
-                self._connection.close()
+                with suppress(sqlite3.DatabaseError):
+                    self._connection.close()
+                self._connection = None
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("audio writer connection setup failed") from error
 
     def close(self) -> None:
@@ -518,6 +535,7 @@ class InternalAudioStore:
         except InternalAudioStoreError:
             raise
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("publication reader failed") from error
         finally:
             if self._publication_reader is not None:
@@ -542,9 +560,17 @@ class InternalAudioStore:
             state.finish()
             self._commit()
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
-            self._reopen()
-            raise InternalAudioStoreError("publication commit requires durable-state inspection") from error
+            try:
+                self._reopen()
+            except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
+                raise_if_sqlite_corrupt(inspection_error)
+                self._fail_stop("publication commit could not be inspected")
+            raise InternalAudioStoreError(
+                "publication commit requires durable-state inspection",
+                sqlite_errorcode=getattr(error, "sqlite_errorcode", None),
+            ) from error
         except BaseException:
             self._rollback()
             raise
@@ -594,6 +620,7 @@ class InternalAudioStore:
             self._rollback()
             raise InternalAudioStoreError("source already exists or is invalid") from error
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
             return self._recover_create(_CreateRequest(source_id, source_type, start, limit, generation), error)
         result = self.get_source(source_id)
@@ -647,7 +674,9 @@ class InternalAudioStore:
             )
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("leg preparation was not confirmed durable") from error
         return self._require_source(source.source_id)
 
@@ -682,7 +711,9 @@ class InternalAudioStore:
             )
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("READ_BEGIN was not confirmed durable") from error
         return self._require_source(source.source_id)
 
@@ -707,7 +738,9 @@ class InternalAudioStore:
             )
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("interruption was not confirmed durable") from error
         return self._require_source(source.source_id)
 
@@ -753,6 +786,7 @@ class InternalAudioStore:
             self._rollback()
             raise
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
             return self._recover_seal(source, proposed, error)
         return proposed
@@ -769,6 +803,7 @@ class InternalAudioStore:
             try:
                 return _read_capture_source(self._publication_reader, source_id)
             except sqlite3.DatabaseError as error:
+                raise_if_sqlite_storage_fault(error)
                 raise InternalAudioStoreError("source read failed") from error
         return read_capture_source(self.state_db, source_id)
 
@@ -787,6 +822,7 @@ class InternalAudioStore:
         except InternalAudioStoreError:
             raise
         except (sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("record page read failed") from error
 
     def commit_drain(
@@ -876,6 +912,7 @@ class InternalAudioStore:
             self._rollback()
             raise InternalAudioStoreError("drain violates source constraints") from error
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
             return self._recover_ambiguous(
                 source, expected, parsed, new_count, digest, desired_tail, previous_tail, error
@@ -942,6 +979,7 @@ class InternalAudioStore:
         except InternalAudioStoreError:
             raise
         except (sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("record page read failed") from error
         return digest.hexdigest()
 
@@ -959,6 +997,7 @@ class InternalAudioStore:
             self._rollback()
             raise
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
             self._recover_ambiguous(
                 source,
@@ -1016,6 +1055,7 @@ class InternalAudioStore:
             self._rollback()
             raise InternalAudioStoreError("drain violates source constraints") from error
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
             return self._recover_ambiguous(
                 source, source.committed_count, parsed, new_count, digest, desired_tail, previous_tail, error
@@ -1051,6 +1091,7 @@ class InternalAudioStore:
                         digest.update(timestamp.to_bytes(4, "big") + payload)
                         count += 1
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("source digest read failed") from error
         if count != source.committed_count:
             raise InternalAudioStoreError("source rows do not match committed count")
@@ -1155,7 +1196,9 @@ class InternalAudioStore:
             self._rollback()
             raise
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_corrupt(error)
             self._rollback()
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("replay conflict could not be retained") from error
 
     def _resolve_tail(
@@ -1259,7 +1302,8 @@ class InternalAudioStore:
             actual_tail = self._read_tail(source.source_id)
             proposed_rows = self.read_record_page(source.source_id, expected - 1, len(records)) if records else ()
             authenticated = self._digest_state(current) if current is not None else None
-        except (sqlite3.DatabaseError, StateDBError) as inspection_error:
+        except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
+            raise_if_sqlite_corrupt(inspection_error)
             self._fail_stop(f"ambiguous drain could not be inspected: {inspection_error}")
         if current is None or authenticated is None:
             self._fail_stop("source disappeared after ambiguous commit")
@@ -1272,6 +1316,7 @@ class InternalAudioStore:
             return new_count
         if current == source and not proposed_rows and actual_tail == previous_tail:
             self._publish_digest(source.source_id, source.committed_count, source.committed_sha256, authenticated)
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("ambiguous drain was rolled back") from error
         self._fail_stop("ambiguous drain commit could not be reconciled")
         raise AssertionError("fail-stop must raise")
@@ -1280,7 +1325,8 @@ class InternalAudioStore:
         try:
             self._reopen()
             source = self.get_source(request.source_id)
-        except (sqlite3.DatabaseError, StateDBError) as inspection_error:
+        except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
+            raise_if_sqlite_corrupt(inspection_error)
             self._fail_stop(f"ambiguous source creation could not be inspected: {inspection_error}")
         expected = CaptureSource(
             request.source_id,
@@ -1302,6 +1348,7 @@ class InternalAudioStore:
         if source is not None and source == expected:
             return source
         if source is None:
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("ambiguous source creation was rolled back") from error
         self._fail_stop("ambiguous source creation could not be reconciled")
         raise AssertionError("fail-stop must raise")
@@ -1313,11 +1360,13 @@ class InternalAudioStore:
             self._reopen()
             current = self.get_source(source.source_id)
             tail = self._read_tail(source.source_id)
-        except (sqlite3.DatabaseError, StateDBError) as inspection_error:
+        except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
+            raise_if_sqlite_corrupt(inspection_error)
             self._fail_stop(f"ambiguous seal could not be inspected: {inspection_error}")
         if current == proposed and tail is None:
             return proposed
         if current == source and tail is None:
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("ambiguous seal was rolled back") from error
         self._fail_stop("ambiguous seal commit could not be reconciled")
         raise AssertionError("fail-stop must raise")
@@ -1327,6 +1376,7 @@ class InternalAudioStore:
             with closing(self.state_db.open_connection(read_only=True)) as connection:
                 return self._tail_from_connection(connection, source_id)
         except sqlite3.DatabaseError as error:
+            raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("tail read failed") from error
 
     def _tail_from_connection(self, connection: sqlite3.Connection, source_id: str) -> CaptureTail | None:
@@ -1358,7 +1408,11 @@ class InternalAudioStore:
         if self._connection is not None:
             self._connection.close()
         self._connection = self.state_db.open_connection()
-        self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+        try:
+            self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+        except sqlite3.DatabaseError as error:
+            raise_if_sqlite_storage_fault(error)
+            raise
 
     def _check_thread(self) -> None:
         if threading.get_ident() != self._owner_thread:

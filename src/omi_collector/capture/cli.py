@@ -365,6 +365,7 @@ def _quality_metrics(
 ) -> SQLiteQualityMetrics | None:
     """Build auxiliary evidence storage without making capture depend on it."""
     from .adapters.debug_logging import debug_event, debug_exception, set_runtime_status_sink
+    from .application.storage_fault import FatalInternalAudioStorageError
 
     try:
         metrics = SQLiteQualityMetrics(
@@ -380,6 +381,8 @@ def _quality_metrics(
         set_runtime_status_sink(runtime_logger, metrics.record_runtime_status)
         debug_event("quality_metrics_ready", logger=debug_logger)
         return metrics
+    except FatalInternalAudioStorageError:
+        raise
     except Exception as error:  # noqa: BLE001 - provenance/journal setup is auxiliary
         if operational_signal is not None:
             operational_signal(OperationalSignal.BLOCK)

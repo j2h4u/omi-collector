@@ -19,6 +19,7 @@ from omi_collector.capture.adapters.quality_metrics import (
     validate_quality_event,
 )
 from omi_collector.capture.application.quality_metrics import ClockCorrectionMetric, SequenceLossMetric
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.operational_status_machine import OperationalSignal
 from omi_collector.config import QualityMetricsConfig
 
@@ -92,6 +93,25 @@ def test_database_failure_signals_quality_block(
     assert OperationalSignal.BLOCK in signals
     assert "quality metrics write_failed" in caplog.text
     assert writer.dropped_records == 0
+
+
+def test_background_fatal_is_retained_and_raised_by_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path)
+    writer = SQLiteQualityMetrics(database, release_version="1.2.3")
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt")
+    written = Event()
+
+    def fail_write(_item_id: str, _payload: dict[str, object]) -> None:
+        written.set()
+        raise fatal
+
+    monkeypatch.setattr(writer, "_put_quality_event", fail_write)
+    writer.record_sequence_loss(_loss(1))
+    assert written.wait(2)
+
+    with pytest.raises(FatalInternalAudioStorageError, match="corrupt"):
+        writer.close(timeout_seconds=2)
+    assert not writer._thread.is_alive()
 
 
 def test_close_waits_for_inflight_database_work_and_joins_before_return(

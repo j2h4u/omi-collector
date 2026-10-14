@@ -108,6 +108,7 @@ from omi_collector.capture.application.session_lifecycle import (
     session_retry_outcome,
     validate_presence_policy,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     STATUS_STORAGE_NOT_READY,
@@ -3628,6 +3629,37 @@ async def test_seal_failure_never_advances(tmp_path: Path, monkeypatch: pytest.M
 
 
 @_async_test
+async def test_fatal_writer_failure_after_data_survives_barrier_and_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    append = StagingWriter.append_chunk
+
+    def fail_after_commit(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        append(self, offset, chunk, tail)
+        raise fatal
+
+    monkeypatch.setattr(StagingWriter, "append_chunk", fail_after_commit)
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(Provider([session]), store, _options(batch_records=1))
+    assert raised.value is fatal
+    assert encode_advance_command(11) not in session.writes
+    pending = store.pending_attempts()
+    assert len(pending) == 1
+    source = _attempt_source(store, pending[0].attempt_id)
+    assert source is not None and source.committed_count == 1
+    assert _source_records(store, source.source_id) == _record(10)
+
+
+@_async_test
 async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(tmp_path: Path) -> None:
     latched = OSError("latched disk failure")
     wrapped = WriterFailedError("writer boundary failed")
@@ -4179,6 +4211,123 @@ async def test_cancellation_reports_typed_source_custody(tmp_path: Path, phase: 
         release_advance.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@_async_test
+async def test_background_quality_corruption_stops_active_read_after_preserving_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = asyncio.Event()
+
+    class GatedSession(ScriptedRingSession):
+        async def write_control(self, payload: bytes) -> None:
+            await super().write_control(payload)
+            if payload == encode_read_command(10, 2):
+                entered.set()
+
+    session = GatedSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_record(10)))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    journal = _quality_metrics(store.state_db)
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+
+    def fail_quality(_item_id: str, _payload: dict[str, object]) -> None:
+        raise fatal
+
+    monkeypatch.setattr(journal, "_put_quality_event", fail_quality)
+    task = asyncio.create_task(
+        run_opportunistic_collector(
+            Provider([session]), store, replace(_options(), quality_metrics=journal, host_time=lambda: 1000.0)
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        journal._queue.put(("quality", {}, "fault"))
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await asyncio.wait_for(task, 5)
+        assert raised.value is fatal
+        pending = store.pending_attempts()
+        assert len(pending) == 1
+        source = _attempt_source(store, pending[0].attempt_id)
+        assert source is not None
+        assert source.committed_count == 1
+        assert _source_records(store, source.source_id) == _record(10)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@_async_test
+async def test_firmware_corruption_reported_during_writer_close_is_fatal_after_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    closed = threading.Event()
+
+    class FailingObservationWriter:
+        def __init__(self, on_error: Callable[[Exception], None]) -> None:
+            self.on_error = on_error
+
+        def observe(self, _info: RingInfo) -> None:
+            return None
+
+        def close(self) -> None:
+            self.on_error(fatal)
+            closed.set()
+
+    def make_writer(
+        _runtime: OpportunisticRuntime,
+        _staging: StagingStore,
+        _config: object,
+        on_error: Callable[[Exception], None],
+    ) -> FailingObservationWriter:
+        return FailingObservationWriter(on_error)
+
+    monkeypatch.setattr(OpportunisticRuntime, "make_observation_writer", make_writer)
+    session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(
+            Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
+        )
+    assert raised.value is fatal
+    assert closed.is_set()
+
+
+@_async_test
+async def test_corrupt_clock_state_read_stops_preflight_before_audio_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+
+    def fail_state(_store: ClockStateStore) -> object:
+        raise fatal
+
+    monkeypatch.setattr(ClockStateStore, "state", fail_state)
+
+    class ClockSession(ScriptedRingSession):
+        async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+            if uuid == TIME_READ_UUID:
+                return pack("<I", 1010)
+            return None
+
+    session = ClockSession(_status(), (WriteStep(b"\x10", (_info(10, 11),)),))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(
+            Provider([session]),
+            store,
+            replace(_options(), host_time=lambda: 1000.0, host_clock_synchronized=lambda _timeout: True),
+        )
+    assert raised.value is fatal
+    assert session.writes == [b"\x10"]
+    assert store.pending_attempts() == ()
 
 
 class _StalledFinalCheckpointProbe:

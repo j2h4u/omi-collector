@@ -305,3 +305,60 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
         assert attempt_source(store, source_id) is None
     finally:
         attempt.close()
+
+
+def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    config = CollectorConfig(
+        ready=ReadyConfig(target_audio_seconds=0.02),
+        staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+        writer=WriterConfig(chunk_records=1),
+    )
+    bootstrap = StagingStore(tmp_path / "spool", tmp_path / "capture", config=config)
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    store = StagingStore.from_paths(bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config)
+    attempt = store.prepare_streaming_attempt(100, 3)
+    attempt.prepare_leg(100, 3)
+    attempt.record_read_begin(ReadBeginNotification(100, 3))
+    raw = _record(100) + _record(101)
+    try:
+        attempt.accept_chunk(100, raw, b"retained-tail")
+        source_id = attempt.attempt_id
+        attempt.interrupt()
+        attempt.close(durable=True)
+        store.terminalize_prefix_attempt(source_id)
+        _add_quarantine_residue(store, source_id)
+
+        admission = store.admit_quarantined_prefix(source_id)
+        assert (admission.record_count, admission.raw_sha256) == (2, sha256(raw).hexdigest())
+        store.append_ready_closure(102, "drained")
+        published = store.recover_and_publish()
+        assert published.state is ReadyOutcomeState.PUBLISHED
+        assert published.retirement_pending
+        assert _source_canonical_custody(store, source_id)[:2] == (1, 1)
+        assert _source_residue(store, source_id) == (1, 1, 1)
+
+        now += 1_000_000_000
+        restarted = StagingStore.from_paths(
+            bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config
+        )
+        for _ in range(8):
+            restarted.sweep_terminal_quarantine()
+            if _source_residue(restarted, source_id) == (0, 0, 0):
+                break
+        assert _source_residue(restarted, source_id) == (0, 0, 0)
+        assert _source_canonical_custody(restarted, source_id)[:2] == (1, 1)
+        assert restarted.publication_followup_due()
+        for _ in range(8):
+            restarted.recover_and_publish()
+            if attempt_source(restarted, source_id) is None:
+                break
+        assert attempt_source(restarted, source_id) is None
+        assert not restarted.recover_and_publish().retirement_pending
+    finally:
+        attempt.close()

@@ -782,7 +782,8 @@ def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
 
         assert calls == 1
         assert events == [("ready_publication_blocked", "RuntimeError")]
-        assert "unexpected publication fault" in caplog.text
+        assert "ready_publication_failure" in caplog.text
+        assert "unexpected publication fault" not in caplog.text
         assert store.publication_retry_schedule() is None
         await maintenance.close()
 

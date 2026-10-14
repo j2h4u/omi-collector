@@ -206,7 +206,7 @@ _TYPED_BTREE_PAGES_PER_LEVEL = 3
 # identifiers and clock text are counted separately below. Round that <160-byte
 # fixed part up to one explicit 256-byte per-row bound.
 _TYPED_METADATA_ROW_BYTES = 256
-_TYPED_STAGE_RANGE_COLUMNS = 14
+_TYPED_STAGE_RANGE_COLUMNS = 15
 _TYPED_STAGE_IDENTITY_PARTS = 3
 _DURABILITY_IO_FAILURE = "durability_io_error"
 
@@ -1003,6 +1003,7 @@ class _TypedCohort:
 class _StageRange:
     slice: _TypedSlice
     time_range: dict[str, object]
+    time_range_ordinal: int
     device_start: int
     device_end: int
     utc_start: int | None
@@ -1012,6 +1013,7 @@ class _StageRange:
 @dataclass(frozen=True, slots=True)
 class _StageRangeRow:
     ordinal: int
+    time_range_ordinal: int
     source_id: str
     start: int
     count: int
@@ -2400,10 +2402,10 @@ def _insert_typed_stage(audio_store: InternalAudioStore, cohort: _TypedCohort, s
             ),
         )
         connection.executemany(
-            "INSERT INTO ready_stage_range(stage_id,range_ordinal,source_id,start_ordinal,record_count,"
+            "INSERT INTO ready_stage_range(stage_id,range_ordinal,time_range_ordinal,source_id,start_ordinal,record_count,"
             "sequence_start,next_sequence,device_start,device_end,utc_start,utc_end,utc_observation_id,"
             "utc_offset_seconds,utc_uncertainty_seconds,utc_confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (_stage_range_values(stage.stage_id, index, item) for index, item in enumerate(stage.rows)),
         )
         state.mark_publication_changed()
@@ -2424,6 +2426,7 @@ def _stage_range_values(stage_id: str, index: int, item: _StageRange) -> tuple[o
     return (
         stage_id,
         index,
+        item.time_range_ordinal,
         item.slice.admission.snapshot.source_id,
         item.slice.start_ordinal,
         item.slice.record_count,
@@ -2440,7 +2443,7 @@ def _stage_range_values(stage_id: str, index: int, item: _StageRange) -> tuple[o
 def _stage_ranges(group: _TypedGroup, page_limit: int) -> tuple[_StageRange, ...]:
     rows: list[_StageRange] = []
     for item in group.slices:
-        for time_range in group.ranges:
+        for time_range_ordinal, time_range in enumerate(group.ranges):
             start = max(item.start_sequence, cast(int, time_range["start_sequence"]))
             end = min(item.next_sequence, cast(int, time_range["next_sequence"]))
             if start >= end:
@@ -2465,6 +2468,7 @@ def _stage_ranges(group: _TypedGroup, page_limit: int) -> tuple[_StageRange, ...
                         "next_sequence": end,
                         "utc": utc,
                     },
+                    time_range_ordinal,
                     device_start,
                     device_end,
                     utc_start,
@@ -2509,7 +2513,7 @@ def _load_typed_stage(
                 return None
             raw_ranges = _sql_all(
                 connection.execute(
-                    "SELECT range_ordinal,source_id,start_ordinal,record_count,sequence_start,next_sequence,"
+                    "SELECT range_ordinal,time_range_ordinal,source_id,start_ordinal,record_count,sequence_start,next_sequence,"
                     "device_start,device_end,utc_start,utc_end,utc_observation_id,utc_offset_seconds,"
                     "utc_uncertainty_seconds,utc_confidence FROM ready_stage_range "
                     "WHERE stage_id=? ORDER BY range_ordinal",
@@ -2527,7 +2531,7 @@ def _load_typed_stage(
         raise ReadyBundleError("typed stage has no frozen ranges")
     if any(item.slice.start_ordinal < item.slice.admission.cursor for item in stage_rows):
         raise ReadyBundleError("typed stage precedes its cohort member cursor")
-    ranges = _merge_frozen_ranges(tuple(item.time_range for item in stage_rows))
+    ranges = _rebuild_frozen_ranges(stage_rows)
     slices = tuple(item.slice for item in stage_rows)
     group = _typed_group_from_frozen(slices, ranges, page_limit)
     if key.group_identity.rsplit(":", maxsplit=1)[-1] != _bundle_id(group.facts):
@@ -2621,6 +2625,7 @@ def _stage_range_from_row(
     return _StageRange(
         slice_,
         {"start_sequence": sequence[0], "next_sequence": sequence[1], "utc": utc},
+        row.time_range_ordinal,
         endpoints[0],
         endpoints[1],
         cast(int | None, row.utc_start),
@@ -2631,27 +2636,28 @@ def _stage_range_from_row(
 def _parse_stage_range_row(raw: tuple[object, ...]) -> _StageRangeRow:
     if len(raw) != _TYPED_STAGE_RANGE_COLUMNS:
         raise ReadyBundleError("typed stage ranges are invalid")
-    if not isinstance(raw[1], str) or not _is_nonnegative_int(raw[2]):
+    if not _is_nonnegative_int(raw[1]) or not isinstance(raw[2], str) or not _is_nonnegative_int(raw[3]):
         raise ReadyBundleError("typed stage ranges are invalid")
-    if not _is_nonnegative_int(raw[0]) or not _is_nonnegative_int(raw[3]) or raw[3] == 0:
+    if not _is_nonnegative_int(raw[0]) or not _is_nonnegative_int(raw[4]) or raw[4] == 0:
         raise ReadyBundleError("typed stage ranges are invalid")
-    if not isinstance(raw[4], bytes) or not isinstance(raw[5], bytes):
+    if not isinstance(raw[5], bytes) or not isinstance(raw[6], bytes):
         raise ReadyBundleError("typed stage ranges are invalid")
     return _StageRangeRow(
         ordinal=cast(int, raw[0]),
-        source_id=raw[1],
-        start=cast(int, raw[2]),
-        count=cast(int, raw[3]),
-        sequence_start=raw[4],
-        next_sequence=raw[5],
-        device_start=raw[6],
-        device_end=raw[7],
-        utc_start=raw[8],
-        utc_end=raw[9],
-        observation=raw[10],
-        offset=raw[11],
-        uncertainty=raw[12],
-        confidence=raw[13],
+        time_range_ordinal=cast(int, raw[1]),
+        source_id=raw[2],
+        start=cast(int, raw[3]),
+        count=cast(int, raw[4]),
+        sequence_start=raw[5],
+        next_sequence=raw[6],
+        device_start=raw[7],
+        device_end=raw[8],
+        utc_start=raw[9],
+        utc_end=raw[10],
+        observation=raw[11],
+        offset=raw[12],
+        uncertainty=raw[13],
+        confidence=raw[14],
     )
 
 
@@ -2694,14 +2700,22 @@ def _frozen_utc_mapping(
     return result
 
 
-def _merge_frozen_ranges(rows: tuple[dict[str, object], ...]) -> tuple[dict[str, object], ...]:
-    merged: list[dict[str, object]] = []
-    for item in rows:
-        if merged and merged[-1]["next_sequence"] == item["start_sequence"] and merged[-1]["utc"] == item["utc"]:
-            merged[-1] = {**merged[-1], "next_sequence": item["next_sequence"]}
+def _rebuild_frozen_ranges(rows: tuple[_StageRange, ...]) -> tuple[dict[str, object], ...]:
+    ranges: list[dict[str, object]] = []
+    for row in rows:
+        item = row.time_range
+        if row.time_range_ordinal == len(ranges):
+            if ranges and cast(int, ranges[-1]["next_sequence"]) > cast(int, item["start_sequence"]):
+                raise ReadyBundleError("typed stage time ranges overlap")
+            ranges.append(dict(item))
+        elif row.time_range_ordinal == len(ranges) - 1:
+            previous = ranges[-1]
+            if previous["next_sequence"] != item["start_sequence"] or previous["utc"] != item["utc"]:
+                raise ReadyBundleError("typed stage time range continuation changed")
+            previous["next_sequence"] = item["next_sequence"]
         else:
-            merged.append(dict(item))
-    return tuple(merged)
+            raise ReadyBundleError("typed stage time range ordinals are invalid")
+    return tuple(ranges)
 
 
 def _typed_group_from_frozen(

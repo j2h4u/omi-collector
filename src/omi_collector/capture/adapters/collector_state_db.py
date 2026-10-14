@@ -621,7 +621,7 @@ _AUDIO_DDL = (
     ),
     _ddl(
         "CREATE TABLE ready_stage_range ("
-        "stage_id TEXT NOT NULL, range_ordinal INTEGER NOT NULL CHECK (range_ordinal BETWEEN 0 AND 4294967295), source_id TEXT NOT NULL,"
+        "stage_id TEXT NOT NULL, range_ordinal INTEGER NOT NULL CHECK (range_ordinal BETWEEN 0 AND 4294967295), time_range_ordinal INTEGER NOT NULL CHECK (time_range_ordinal BETWEEN 0 AND 4294967295), source_id TEXT NOT NULL,"
         "start_ordinal INTEGER NOT NULL CHECK (start_ordinal BETWEEN 0 AND 4294967295), record_count INTEGER NOT NULL CHECK (record_count BETWEEN 0 AND 4294967295),"
         "sequence_start BLOB NOT NULL CHECK (length(sequence_start) = 8), next_sequence BLOB NOT NULL CHECK (length(next_sequence) = 8 AND next_sequence > sequence_start),"
         "device_start INTEGER NOT NULL CHECK (device_start BETWEEN 0 AND 4294967295), device_end INTEGER NOT NULL CHECK (device_end BETWEEN 0 AND 4294967295),"

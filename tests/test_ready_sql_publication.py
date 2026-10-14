@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import closing, contextmanager
 from hashlib import sha256
+from json import loads
 from multiprocessing.connection import Connection
 from pathlib import Path
 from struct import pack
@@ -13,7 +14,7 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
+from omi_collector.capture.adapters.clock_segments import ClockSegment, ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
@@ -31,6 +32,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     finalize_typed_sources,
 )
 from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+from omi_collector.capture.domain.clock_state import ClockIntent, ClockRange, ClockState
 from omi_collector.config import ReadyConfig
 from omi_collector.state_migration import open_runtime_state
 from omi_collector.storage_layout import load_operator_config
@@ -80,6 +82,36 @@ def _source(
         connection.execute("UPDATE capture_source SET lifecycle=? WHERE source_id=?", (lifecycle, source_id))
         connection.commit()
     return _Source(store, source_id)
+
+
+def _boundary_sources(store: InternalAudioStore, records: tuple[bytes, bytes, bytes]) -> tuple[_Source, _Source]:
+    return (
+        _source(store, "a" * 32, 100, records[:2]),
+        _source(store, "b" * 32, 102, records[2:]),
+    )
+
+
+def _boundary_publish(
+    store: InternalAudioStore, sources: tuple[_Source, _Source], ready: Path, clock: ClockSegmentMap
+) -> ReadyOutcome:
+    return finalize_typed_sources(
+        store,
+        sources,
+        ready,
+        config=ReadyConfig(target_audio_seconds=0.02),
+        clock_segments=clock,
+        frontier=103,
+        drained=True,
+    )
+
+
+def _empty_window_clock() -> ClockSegmentMap:
+    return ClockSegmentMap.from_state(
+        ClockState(
+            (ClockRange(100, 103, 0.0, 0.0, "confirmed", "same"),),
+            ClockIntent("empty", "uncertain", 0, 0, 0.0, 101, 101),
+        )
+    )
 
 
 def _certify(
@@ -1096,6 +1128,125 @@ def test_sql_stage_reuses_frozen_clock_mapping_after_restart(tmp_path: Path, mon
     assert b'"observation_id":"old"' in manifest
     assert b'"observation_id":"new"' not in manifest
     store.close()
+
+
+@pytest.mark.parametrize("boundary", ["empty_uncertain_window", "overflow_clear_next_to_unknown"])
+def test_sql_stage_restarts_with_original_equal_mapping_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    if boundary == "empty_uncertain_window":
+        records = (_record(100, 1), _record(101, 2), _record(102, 3))
+        clock = _empty_window_clock()
+    else:
+        records = (_record((1 << 32) - 1, 1), _record(101, 2), _record(102, 3))
+        clock = ClockSegmentMap((ClockSegment("overflow", 100, 101, 1.0, 0.0),))
+
+    fresh_ready = tmp_path / "fresh-ready"
+    fresh_ready.mkdir()
+    fresh_ready.chmod(0o2750)
+    with InternalAudioStore(StateDB(tmp_path / "fresh.sqlite3")) as fresh_store:
+        fresh = _boundary_publish(fresh_store, _boundary_sources(fresh_store, records), fresh_ready, clock)
+    assert fresh.state is ReadyOutcomeState.PUBLISHED
+    fresh_bundle = fresh.published[0]
+    expected_manifest = fresh_bundle.path.joinpath("manifest.json").read_bytes()
+    expected_ranges = cast(list[dict[str, object]], cast(dict[str, object], loads(expected_manifest))["time_ranges"])
+    assert [(item["start_sequence"], item["next_sequence"], item["utc"] is not None) for item in expected_ranges] == [
+        (100, 101, boundary == "empty_uncertain_window"),
+        (101, 103, boundary == "empty_uncertain_window"),
+    ]
+
+    database = StateDB(tmp_path / "restarted.sqlite3")
+    ready = tmp_path / "restart-ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+    original = ready_bundles._write_typed_stage
+
+    def stop_after_intent(*_args: object, **_kwargs: object) -> None:
+        raise OSError("restart after durable stage intent")
+
+    with InternalAudioStore(database) as store:
+        sources = _boundary_sources(store, records)
+        monkeypatch.setattr(ready_bundles, "_write_typed_stage", stop_after_intent)
+        with pytest.raises(ReadyBundleError, match="could not be published"):
+            _boundary_publish(store, sources, ready, clock)
+    monkeypatch.setattr(ready_bundles, "_write_typed_stage", original)
+    with closing(database.open_connection(read_only=True)) as connection:
+        rows = cast(
+            list[sqlite3.Row],
+            connection.execute("SELECT time_range_ordinal FROM ready_stage_range ORDER BY range_ordinal").fetchall(),
+        )
+        frozen_ordinals = tuple(row[0] for row in rows)
+    assert frozen_ordinals == (0, 1, 1)
+
+    with InternalAudioStore(database) as restarted:
+        resumed = _boundary_publish(
+            restarted,
+            (_Source(restarted, "a" * 32), _Source(restarted, "b" * 32)),
+            ready,
+            ClockSegmentMap(()),
+        )
+    assert resumed.state is ReadyOutcomeState.PUBLISHED
+    resumed_bundle = resumed.published[0]
+    assert resumed_bundle.bundle_id == fresh_bundle.bundle_id
+    assert (
+        resumed_bundle.path.joinpath("records.bin").read_bytes()
+        == fresh_bundle.path.joinpath("records.bin").read_bytes()
+    )
+    assert resumed_bundle.path.joinpath("manifest.json").read_bytes() == expected_manifest
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("skip_ordinal", "ordinals are invalid"),
+        ("reorder_ordinal", "ordinals are invalid"),
+        ("change_mapping_within_range", "continuation changed"),
+    ],
+)
+def test_sql_stage_rejects_changed_frozen_range_partition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, reason: str
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    records = (_record(100, 1), _record(101, 2), _record(102, 3))
+    import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+    original = ready_bundles._write_typed_stage
+
+    def stop_after_intent(*_args: object, **_kwargs: object) -> None:
+        raise OSError("restart after durable stage intent")
+
+    with InternalAudioStore(database) as store:
+        monkeypatch.setattr(ready_bundles, "_write_typed_stage", stop_after_intent)
+        with pytest.raises(ReadyBundleError, match="could not be published"):
+            _boundary_publish(store, _boundary_sources(store, records), ready, _empty_window_clock())
+    monkeypatch.setattr(ready_bundles, "_write_typed_stage", original)
+    with closing(database.open_connection()) as connection:
+        if mutation == "skip_ordinal":
+            connection.execute("UPDATE ready_stage_range SET time_range_ordinal=2 WHERE range_ordinal=1")
+        elif mutation == "reorder_ordinal":
+            connection.execute("UPDATE ready_stage_range SET time_range_ordinal=1 WHERE range_ordinal=0")
+        else:
+            connection.execute(
+                "UPDATE ready_stage_range SET utc_offset_seconds=1.0, utc_start=103, utc_end=103 WHERE range_ordinal=2"
+            )
+        connection.commit()
+
+    with InternalAudioStore(database) as restarted:
+        with pytest.raises(ReadyBundleError, match=reason):
+            _boundary_publish(
+                restarted,
+                (_Source(restarted, "a" * 32), _Source(restarted, "b" * 32)),
+                ready,
+                ClockSegmentMap(()),
+            )
+        assert restarted.get_source("a" * 32) is not None
+        assert restarted.get_source("b" * 32) is not None
+    assert not tuple(ready.iterdir())
 
 
 def test_staging_restart_resumes_persisted_group_instead_of_replanning_ready_overlap(

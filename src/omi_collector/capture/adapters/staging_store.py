@@ -42,7 +42,7 @@ from .attempts import SqliteAttemptInspection, SqliteStagedAttempt
 from .clock_segments import ClockSegmentError, ClockSegmentMap
 from .collector_state_db import StateDB, StateDBError, StateKind
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
-from .debug_logging import debug_event
+from .debug_logging import debug_event, debug_exception
 from .internal_audio_store import (
     AUDIO_RECORD_SIZE,
     CaptureSource,
@@ -251,7 +251,16 @@ class StagingStore:
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), running.revision
         except Exception as error:
             if not isinstance(error, ReadyBundleError):
-                _LOGGER.exception("ready publication failed unexpectedly")
+                debug_exception(
+                    "ready_publication_failure", error, logger=_LOGGER, phase=phase, error_type=type(error).__name__
+                )
+                _LOGGER.exception(
+                    "ready publication failed unexpectedly",
+                    extra={
+                        "debug_event": "ready_publication_failure",
+                        "debug_fields": {"phase": phase, "error_type": type(error).__name__},
+                    },
+                )
             try:
                 revision = self._publication_revision()
             except OSError as revision_error:

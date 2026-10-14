@@ -396,7 +396,10 @@ def test_replay_conflict_requires_quarantine_admission_before_publication(
     retained = _source_row(store, source_id)
     assert retained is not None and retained[3] == "unclassified"
     with closing(store.state_db.open_connection(read_only=True)) as connection:
-        assert connection.execute("SELECT 1 FROM capture_conflict WHERE source_id = ?", (source_id,)).fetchone() is not None
+        assert (
+            connection.execute("SELECT 1 FROM capture_conflict WHERE source_id = ?", (source_id,)).fetchone()
+            is not None
+        )
 
     admission = store.admit_quarantined_prefix(source_id)
     assert (admission.record_count, admission.raw_sha256) == (1, sha256(raw).hexdigest())

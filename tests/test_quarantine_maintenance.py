@@ -499,7 +499,9 @@ def test_integrity_hold_preserves_source_and_next_maintenance_pass_admits_other_
         assert first_before is not None and first_after is not None
         assert first_after["records"] == first_before["records"]
         assert cast(tuple[object, ...], first_after["source"])[1:4] == (
-            "blocked", "source_authentication_mismatch", "unclassified"
+            "blocked",
+            "source_authentication_mismatch",
+            "unclassified",
         )
         assert _terminal_state(store, first) is None
         assert _terminal_state(store, second) == "published"

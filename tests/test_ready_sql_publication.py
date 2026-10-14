@@ -420,10 +420,15 @@ def test_sql_ready_rename_eio_latches_before_custody_commit(tmp_path: Path, monk
     with pytest.raises(ReadyBundleError, match="durability I/O failure"):
         _publish(store, (source,), ready)
     with closing(database.open_connection(read_only=True)) as connection:
-        assert connection.execute("SELECT failure_reason FROM ready_output_stage").fetchone()[0] == "durability_io_error"
-        assert connection.execute(
-            "SELECT count(*) FROM capture_record WHERE source_id=?", (source._source_id,)
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT failure_reason FROM ready_output_stage").fetchone()[0] == "durability_io_error"
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM capture_record WHERE source_id=?", (source._source_id,)
+            ).fetchone()[0]
+            == 1
+        )
     with pytest.raises(ReadyBundleError, match="durability I/O failure"):
         _publish(store, (source,), ready)
     store.close()

@@ -577,11 +577,13 @@ def test_ambiguous_reopen_failure_fail_stops_all_mutators(tmp_path: Path, monkey
             raise sqlite3.OperationalError("commit result is ambiguous")
 
         def failed_reopen() -> None:
-            raise sqlite3.OperationalError("reopen failed")
+            failure = sqlite3.OperationalError("reopen failed")
+            failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise failure
 
         monkeypatch.setattr(store, "_commit", ambiguous_commit)
         monkeypatch.setattr(store, "_reopen", failed_reopen)
-        with pytest.raises(InternalAudioStoreError):
+        with pytest.raises(FatalInternalAudioStorageError, match="ambiguous drain"):
             store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1))
         with pytest.raises(InternalAudioStoreError, match="fail-stopped"):
             store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1))
@@ -1096,7 +1098,7 @@ def test_seal_ambiguity_reconciles_only_exact_old_or_proposed_state(
                     expected_sha256=digest,
                 )
         else:
-            with pytest.raises(InternalAudioStoreError, match="could not be reconciled"):
+            with pytest.raises(FatalInternalAudioStorageError, match="could not be reconciled"):
                 store.seal_source(
                     source_id,
                     leg_generation=1,

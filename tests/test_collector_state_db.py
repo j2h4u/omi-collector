@@ -10,11 +10,25 @@ from typing import NoReturn, cast
 import pytest
 
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind, _Operations
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
+)
 
 
+@pytest.mark.parametrize(
+    ("sqlite_errorcode", "expected"),
+    [
+        (None, StateDBError),
+        (sqlite3.SQLITE_BUSY, TransientInternalAudioStorageError),
+        (sqlite3.SQLITE_CORRUPT, FatalInternalAudioStorageError),
+        (sqlite3.SQLITE_NOTADB, FatalInternalAudioStorageError),
+    ],
+)
 @pytest.mark.parametrize("operation", ["get", "list", "put", "delete"])
-@pytest.mark.parametrize("sqlite_errorcode", [None, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
-def test_state_operation_preserves_sqlite_errorcode(operation: str, sqlite_errorcode: int | None) -> None:
+def test_state_operation_classifies_sqlite_errorcode(
+    operation: str, sqlite_errorcode: int | None, expected: type[Exception]
+) -> None:
     failure = sqlite3.OperationalError("injected database failure")
     if sqlite_errorcode is not None:
         failure.sqlite_errorcode = sqlite_errorcode
@@ -24,7 +38,7 @@ def test_state_operation_preserves_sqlite_errorcode(operation: str, sqlite_error
             raise failure
 
     operations = _Operations(cast(sqlite3.Connection, FailingConnection()))
-    with pytest.raises(StateDBError) as raised:
+    with pytest.raises(expected) as raised:
         if operation == "get":
             operations.get(StateKind.FIRMWARE, "current")
         elif operation == "list":
@@ -33,7 +47,7 @@ def test_state_operation_preserves_sqlite_errorcode(operation: str, sqlite_error
             operations.put(StateKind.FIRMWARE, "current", {"value": 1})
         else:
             operations.delete(StateKind.FIRMWARE, "current")
-    assert raised.value.sqlite_errorcode == sqlite_errorcode
+    assert getattr(raised.value, "sqlite_errorcode", None) == sqlite_errorcode
     assert raised.value.__cause__ is failure
 
 

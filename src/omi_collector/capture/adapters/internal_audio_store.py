@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Final, NoReturn, Protocol, cast
 
 from ...config import MAX_WRITER_CHUNK_RECORDS
-from ..application.storage_fault import TransientInternalAudioStorageError
+from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from ..domain.clock_state import ClockState
 from ..domain.internal_audio_machine import (
     AudioAction,
@@ -1302,7 +1302,12 @@ class InternalAudioStore:
             actual_tail = self._read_tail(source.source_id)
             proposed_rows = self.read_record_page(source.source_id, expected - 1, len(records)) if records else ()
             authenticated = self._digest_state(current) if current is not None else None
-        except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
+        except (
+            sqlite3.DatabaseError,
+            StateDBError,
+            InternalAudioStoreError,
+            TransientInternalAudioStorageError,
+        ) as inspection_error:
             raise_if_sqlite_corrupt(inspection_error)
             self._fail_stop(f"ambiguous drain could not be inspected: {inspection_error}")
         if current is None or authenticated is None:
@@ -1325,7 +1330,12 @@ class InternalAudioStore:
         try:
             self._reopen()
             source = self.get_source(request.source_id)
-        except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
+        except (
+            sqlite3.DatabaseError,
+            StateDBError,
+            InternalAudioStoreError,
+            TransientInternalAudioStorageError,
+        ) as inspection_error:
             raise_if_sqlite_corrupt(inspection_error)
             self._fail_stop(f"ambiguous source creation could not be inspected: {inspection_error}")
         expected = CaptureSource(
@@ -1360,7 +1370,12 @@ class InternalAudioStore:
             self._reopen()
             current = self.get_source(source.source_id)
             tail = self._read_tail(source.source_id)
-        except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
+        except (
+            sqlite3.DatabaseError,
+            StateDBError,
+            InternalAudioStoreError,
+            TransientInternalAudioStorageError,
+        ) as inspection_error:
             raise_if_sqlite_corrupt(inspection_error)
             self._fail_stop(f"ambiguous seal could not be inspected: {inspection_error}")
         if current == proposed and tail is None:
@@ -1425,7 +1440,7 @@ class InternalAudioStore:
 
     def _fail_stop(self, message: str) -> NoReturn:
         self._failed = True
-        raise InternalAudioStoreError(message)
+        raise FatalInternalAudioStorageError(message)
 
     def _require_connection(self) -> sqlite3.Connection:
         if self._connection is None:

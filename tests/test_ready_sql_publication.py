@@ -20,7 +20,6 @@ from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
     DrainCheckpoint,
     InternalAudioStore,
-    InternalAudioStoreError,
     encode_uint64,
 )
 from omi_collector.capture.adapters.ready_bundles import (
@@ -32,6 +31,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     finalize_typed_sources,
 )
 from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockIntent, ClockRange, ClockState
 from omi_collector.config import ReadyConfig
 from omi_collector.state_migration import open_runtime_state
@@ -147,12 +147,19 @@ def _ready_bytes(outcome: ReadyOutcome) -> bytes:
 
 
 def _fault_transaction(
-    store: InternalAudioStore, boundary: int, *, rollback: bool, sqlite_errorcode: int | None = None
+    store: InternalAudioStore,
+    boundary: int,
+    *,
+    rollback: bool,
+    sqlite_errorcode: int | None = None,
+    classified_busy: bool = False,
 ):
     original = store.publication_transaction
     calls = 0
 
-    def failure(message: str) -> sqlite3.DatabaseError:
+    def failure(message: str) -> sqlite3.DatabaseError | TransientInternalAudioStorageError:
+        if classified_busy:
+            return TransientInternalAudioStorageError(message, sqlite_errorcode=sqlite3.SQLITE_BUSY)
         error = sqlite3.DatabaseError(message)
         if sqlite_errorcode is not None:
             error.sqlite_errorcode = sqlite_errorcode
@@ -477,6 +484,49 @@ def test_sql_ready_latch_does_not_swallow_corrupt_database_fault(
 
         assert raised.value is fatal
         assert commits == 3
+
+
+def test_sql_ready_eio_refusal_latch_readback_busy_remains_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(database) as store:
+        source = _source(store, "a" * 32, 100, (_record(100, 1),))
+        ready = tmp_path / "ready"
+        ready.mkdir()
+        ready.chmod(0o2750)
+        import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+        monkeypatch.setattr(
+            ready_bundles.os,
+            "fsync",
+            lambda _descriptor: (_ for _ in ()).throw(OSError(5, "simulated EIO")),
+        )
+        original_commit = store._commit
+        commits = 0
+        latch_failed = False
+
+        def fail_latch_commit() -> None:
+            nonlocal commits, latch_failed
+            commits += 1
+            if commits == 3:
+                latch_failed = True
+                raise sqlite3.DatabaseError("simulated latch SQL failure")
+            original_commit()
+
+        monkeypatch.setattr(store, "_commit", fail_latch_commit)
+        busy = TransientInternalAudioStorageError("database is busy", sqlite_errorcode=sqlite3.SQLITE_BUSY)
+        original_open_connection = database.open_connection
+
+        def fail_latch_readback(*, read_only: bool = False) -> sqlite3.Connection:
+            if latch_failed and read_only:
+                raise busy
+            return original_open_connection(read_only=read_only)
+
+        monkeypatch.setattr(database, "open_connection", fail_latch_readback)
+
+        with pytest.raises(FatalInternalAudioStorageError):
+            _publish(store, (source,), ready)
 
 
 def test_sql_ready_rename_eio_latches_before_custody_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -907,7 +957,7 @@ def test_sql_durable_third_state_fail_stops_publication(
     _original, injected = _third_state_transaction(store, boundary)
     monkeypatch.setattr(store, "publication_transaction", injected)
 
-    with pytest.raises(InternalAudioStoreError, match="third state"):
+    with pytest.raises(FatalInternalAudioStorageError, match="third state"):
         _publish(store, (source,), ready)
 
     assert store._failed is True
@@ -1400,6 +1450,29 @@ def test_sql_publication_reconciles_ambiguous_transaction_boundaries(
             connection.execute("SELECT 1 FROM capture_source WHERE source_id=?", (source._source_id,)).fetchone()
             is None
         )
+    store.close()
+
+
+@pytest.mark.parametrize("boundary", (1, 2, 3), ids=("cohort", "stage", "final"))
+@pytest.mark.parametrize("rollback", (False, True), ids=("commit_then_raise", "rollback_then_raise"))
+def test_sql_publication_reconciles_classified_busy_at_transaction_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: int, rollback: bool
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    store = InternalAudioStore(database)
+    source = _source(store, "a" * 32, 100, (_record(100, 1),))
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    original, injected = _fault_transaction(store, boundary, rollback=rollback, classified_busy=True)
+    monkeypatch.setattr(store, "publication_transaction", injected)
+
+    outcome = _publish(store, (source,), ready)
+    monkeypatch.setattr(store, "publication_transaction", original)
+
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    assert len(outcome.published) == 1
+    assert outcome.published[0].path.joinpath("records.bin").read_bytes() == _record(100, 1)
     store.close()
 
 

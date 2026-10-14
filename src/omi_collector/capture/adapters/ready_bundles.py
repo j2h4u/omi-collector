@@ -2033,7 +2033,7 @@ def _create_typed_cohort(
                 )
                 state.mark_publication_changed()
             return proposed
-        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
             raise_if_sqlite_corrupt(error)
             durable = _load_active_for_reconciliation(audio_store)
             if durable is not None and _same_typed_cohort(durable, proposed):
@@ -2207,7 +2207,12 @@ def _commit_typed_ready_custody(audio_store: InternalAudioStore, commit: _Custod
         try:
             _commit_typed_ready_custody_once(audio_store, commit)
             return None if commit.all_complete else commit.proposed
-        except (InternalAudioStoreError, StateDBError, sqlite3.DatabaseError) as error:
+        except (
+            InternalAudioStoreError,
+            StateDBError,
+            sqlite3.DatabaseError,
+            TransientInternalAudioStorageError,
+        ) as error:
             raise_if_sqlite_corrupt(error)
             state = _inspect_typed_ready_custody(audio_store, commit)
             if state == "proposed":
@@ -2304,7 +2309,7 @@ def _complete_empty_typed_cohort(audio_store: InternalAudioStore, cohort: _Typed
             if cursor.rowcount != 1:
                 raise ReadyBundleError("typed completed cohort changed")
             state.mark_publication_changed()
-    except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+    except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
         raise_if_sqlite_corrupt(error)
         durable = _load_active_for_reconciliation(audio_store)
         if durable is None:
@@ -2350,7 +2355,7 @@ def _ensure_typed_stage(
         try:
             _insert_typed_stage(audio_store, cohort, proposed)
             return proposed
-        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
             raise_if_sqlite_corrupt(error)
             durable_cohort = _load_active_for_reconciliation(audio_store)
             durable = _load_stage_for_reconciliation(audio_store, durable_cohort, key, page_limit)
@@ -2385,7 +2390,7 @@ def _load_stage_for_reconciliation(
         return None
     try:
         return _load_typed_stage(audio_store, cohort, key, page_limit)
-    except TransientInternalAudioStorageError:
+    except ReadyBundleError, InternalAudioStoreError, TransientInternalAudioStorageError:
         _typed_fail_stop(audio_store, "ambiguous typed stage intent could not be inspected")
 
 
@@ -2957,7 +2962,7 @@ def _typed_durability_failure_is_latched(
                     (stage.stage_id, cohort.cohort_id),
                 )
             )
-    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+    except (OSError, StateDBError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
         raise_if_sqlite_corrupt(error)
         return False
     return row is not None and tuple(row) == (
@@ -3241,7 +3246,7 @@ def _commit_typed_stage(
         try:
             _commit_typed_stage_once(audio_store, proposal)
             return
-        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
             raise_if_sqlite_corrupt(error)
             final_state = _inspect_typed_final(audio_store, proposal)
             if final_state == "proposed":
@@ -3379,7 +3384,7 @@ def _commit_typed_replay_coverage(
                 _apply_typed_coverage(connection, (proposal,))
                 state.mark_publication_changed()
             return
-        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
             raise_if_sqlite_corrupt(error)
             current = _typed_source_coverage_state(audio_store, proposal.source_id)
             if current == proposal.proposed:
@@ -3418,7 +3423,12 @@ def _block_typed_custody_conflict(
         try:
             _block_typed_custody_conflict_once(audio_store, disposition)
             return
-        except (InternalAudioStoreError, StateDBError, sqlite3.DatabaseError) as error:
+        except (
+            InternalAudioStoreError,
+            StateDBError,
+            sqlite3.DatabaseError,
+            TransientInternalAudioStorageError,
+        ) as error:
             raise_if_sqlite_corrupt(error)
             state = _inspect_typed_conflict_disposition(audio_store, disposition)
             if state == "proposed":
@@ -3981,7 +3991,7 @@ def _advance_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
             if actual != proposed:
                 _typed_fail_stop(audio_store, "typed retirement advanced an unexpected cursor")
             return True
-        except (InternalAudioStoreError, sqlite3.DatabaseError) as error:
+        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
             raise_if_sqlite_corrupt(error)
             state = _inspect_typed_retirement(audio_store, step, proposed)
             if state == "proposed":

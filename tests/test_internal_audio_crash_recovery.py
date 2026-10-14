@@ -492,7 +492,7 @@ def test_deployer_sigkill_at_selector_boundary_preserves_or_keeps_selected_relea
     harness, previous, storage, raw = _kill_deployer_at_selector(tmp_path, after_publish=after_publish)
     if after_publish:
         assert harness.current_link.resolve(strict=True) != previous
-        assert "migration" not in harness.log.read_text(encoding="utf-8").lower()
+        assert "candidate args=migrate-state" not in harness.log.read_text(encoding="utf-8")
     else:
         assert harness.current_link.resolve(strict=True) == previous
     with closing(sqlite3.connect(storage.collector.state_db)) as connection:

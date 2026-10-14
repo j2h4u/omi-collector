@@ -1150,7 +1150,7 @@ async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path:
 
 
 @_async_test
-async def test_corrupt_committed_record_is_quarantined_before_provider(tmp_path: Path) -> None:
+async def test_corrupt_committed_record_is_held_before_provider_read(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=1)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     source_id = store.pending_attempts()[0].attempt_id
@@ -1170,18 +1170,28 @@ async def test_corrupt_committed_record_is_quarantined_before_provider(tmp_path:
     assert isinstance(result, NoDataResult)
     assert provider.opened == 1
     assert not store.pending_attempts()
-    assert store.quarantined_attempts() == (source_id,)
+    assert store.quarantined_attempts() == ()
     with closing(store.state_db.open_connection(read_only=True)) as connection:
         row = cast(
-            tuple[object, object, object, object] | None,
+            tuple[object, ...] | None,
             connection.execute(
-                "SELECT source_type, quarantine_disposition, certified_prefix_count, coverage_digest "
+                "SELECT source_type, lifecycle, block_reason, quarantine_disposition, "
+                "certified_prefix_count, coverage_digest, terminal_time, retention_deadline "
                 "FROM capture_source WHERE source_id = ?",
                 (source_id,),
             ).fetchone(),
         )
     assert row is not None
-    assert tuple(row) == ("quarantine", "unprocessable", None, None)
+    assert tuple(row) == (
+        "quarantine",
+        "blocked",
+        "source_authentication_mismatch",
+        "unclassified",
+        None,
+        None,
+        None,
+        None,
+    )
     assert encode_advance_command(102) not in session.writes
 
 

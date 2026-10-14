@@ -256,9 +256,11 @@ def test_replay_conflict_with_uncheckpointed_canonical_row_is_an_indefinite_inte
             None,
             None,
         )
-        assert connection.execute(
-            "SELECT COUNT(*) FROM capture_record WHERE source_id = ?", (source_id,)
-        ).fetchone() == (1,)
+        count_row = cast(
+            sqlite3.Row | None,
+            connection.execute("SELECT COUNT(*) FROM capture_record WHERE source_id = ?", (source_id,)).fetchone(),
+        )
+        assert count_row is not None and count_row[0] == 1
 
 
 def test_drain_accepts_overlapping_prefix_and_appends_suffix(tmp_path: Path) -> None:

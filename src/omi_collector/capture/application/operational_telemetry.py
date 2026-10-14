@@ -317,12 +317,17 @@ async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: Cloc
             raise
         finally:
             if entered:
-                await joined_to_thread(
-                    lease.__exit__,
-                    type(primary) if primary is not None else None,
-                    primary,
-                    primary.__traceback__ if primary is not None else None,
-                )
+                try:
+                    await joined_to_thread(
+                        lease.__exit__,
+                        type(primary) if primary is not None else None,
+                        primary,
+                        primary.__traceback__ if primary is not None else None,
+                    )
+                except BaseException as cleanup_error:
+                    if isinstance(primary, FatalInternalAudioStorageError):
+                        raise primary from cleanup_error
+                    raise
     except asyncio.CancelledError:
         raise
     except FatalInternalAudioStorageError:
@@ -565,8 +570,8 @@ class _ClockReadback:
 
 async def _write_and_verify(write: _ClockWrite) -> _ClockReadback:
     reader, writer, target, event = write.reader, write.writer, write.target, write.event
-    write_started = await joined_to_thread(write.host_time)
     monotonic_started = await joined_to_thread(write.host_monotonic)
+    write_started = await joined_to_thread(write.host_time)
     if not target <= write_started <= target + 2:
         event.update(action="none", outcome="target_stale")
         return _ClockReadback(None, write_started, write_started, monotonic_started, monotonic_started)

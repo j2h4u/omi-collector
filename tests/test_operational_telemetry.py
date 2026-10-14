@@ -972,6 +972,106 @@ def test_corrupt_clock_evidence_stops_preflight_before_audio_or_time_write(faili
     assert session.writes == []
 
 
+def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit() -> None:
+    fatal = FatalInternalAudioStorageError("clock state is corrupt", sqlite_errorcode=11)
+    exit_started = threading.Event()
+    release_exit = threading.Event()
+    exit_completed = threading.Event()
+
+    class CorruptClockStore(FakeClockStateStore):
+        def state(self) -> ClockState:
+            raise fatal
+
+    class HeldLease:
+        def __enter__(self) -> HeldLease:
+            return self
+
+        def require_active(self) -> None:
+            return None
+
+        def __exit__(self, _type: object, value: object, _traceback: object) -> None:
+            assert value is fatal
+            exit_started.set()
+            if not release_exit.wait(5):
+                raise TimeoutError("held clock lease exit was not released")
+            exit_completed.set()
+
+    session = FakeOperationalSession({TIME_READ_UUID: pack("<I", 1010)})
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                _info(),
+                _event_emitter([]),
+                clock=TelemetryClock(
+                    now=lambda: 1000.0,
+                    synchronized=lambda _timeout: True,
+                    state_store=CorruptClockStore(),
+                    mutation_lease=HeldLease,
+                ),
+            )
+        )
+        try:
+            assert await asyncio.to_thread(exit_started.wait, 5)
+            task.cancel()
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            assert not done
+            assert not exit_completed.is_set()
+        finally:
+            release_exit.set()
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await task
+        assert raised.value is fatal
+        assert exit_completed.is_set()
+
+    asyncio.run(scenario())
+    assert session.writes == []
+
+
+def test_clock_target_becomes_stale_while_monotonic_preparation_waits() -> None:
+    monotonic_started = threading.Event()
+    release_monotonic = threading.Event()
+    wall_now = [1000.0]
+    event: dict[str, object] = {}
+    session = FakeOperationalSession({})
+
+    def held_monotonic() -> float:
+        monotonic_started.set()
+        if not release_monotonic.wait(5):
+            raise TimeoutError("held monotonic preparation was not released")
+        return 1.0
+
+    async def scenario() -> operational_telemetry._ClockReadback:
+        task = asyncio.create_task(
+            operational_telemetry._write_and_verify(
+                operational_telemetry._ClockWrite(
+                    session.read_optional_characteristic,
+                    session.write_optional_characteristic,
+                    1000,
+                    event,
+                    1.0,
+                    lambda: wall_now[0],
+                    held_monotonic,
+                    None,
+                )
+            )
+        )
+        try:
+            assert await asyncio.to_thread(monotonic_started.wait, 5)
+            wall_now[0] = 1003.0
+        finally:
+            release_monotonic.set()
+        return await task
+
+    readback = asyncio.run(scenario())
+    assert readback.epoch is None
+    assert event["outcome"] == "target_stale"
+    assert session.writes == []
+
+
 def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:
     session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
     events: list[dict[str, object]] = []

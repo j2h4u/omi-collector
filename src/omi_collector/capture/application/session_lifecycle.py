@@ -529,7 +529,12 @@ class SessionLifecycle:
                 execution.machine = transition_session(execution.machine, event)
             raise
         finally:
-            await self._record_session_quality(quality, execution.outcome, execution.teardown_error, terminal_error)
+            try:
+                await self._record_session_quality(quality, execution.outcome, execution.teardown_error, terminal_error)
+            except BaseException as cleanup_error:
+                if isinstance(terminal_error, FatalInternalAudioStorageError):
+                    raise terminal_error from cleanup_error
+                raise
 
     async def _run_guarded_session_effects(
         self,

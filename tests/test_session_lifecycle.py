@@ -15,6 +15,7 @@ from typing import Literal, Never, cast
 
 import pytest
 
+from omi_collector import cli as operator_cli
 from omi_collector.capture.adapters import ready_closures
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 from omi_collector.capture.adapters.collector_guard import collector_guard
@@ -1789,6 +1790,94 @@ def test_run_session_records_one_terminal_transfer_metric_without_masking_sessio
         "fatal_with_teardown": ("failed", "fatal_error"),
     }[terminal_case]
     assert (metric.outcome, metric.termination_class) == expected
+
+
+def test_fatal_read_survives_repeated_cancellation_during_terminal_metric_and_exits_78(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_db = StateDB(tmp_path / "corrupt-state.sqlite3")
+    state_db.path.write_bytes(b"not a SQLite database")
+    clock_store = ClockStateStore(state_db)
+    observed_fatals: list[FatalInternalAudioStorageError] = []
+    metric_started = Event()
+    release_metric = Event()
+    metric_completed = Event()
+    info = RingInfo(10, 10, 100, 1, 512)
+
+    class HeldMetrics(_RecordingLifecycleMetrics):
+        def record_transfer_session(self, metric: TransferSessionMetric) -> None:
+            metric_started.set()
+            if not release_metric.wait(5):
+                raise TimeoutError("held terminal metric was not released")
+            super().record_transfer_session(metric)
+            metric_completed.set()
+
+    metrics = HeldMetrics()
+    session = _TerminalMetricSession()
+    context = _TerminalMetricContext("fatal", session, RuntimeError("unexpected teardown"))
+
+    async def connected_step(
+        _session: RingSession,
+        _current: RingInfo | None,
+        _read_info: InfoReader,
+        phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        assert phase.quality is not None
+        phase.quality.note_read(0.25, 3)
+        try:
+            await asyncio.to_thread(clock_store.state)
+        except FatalInternalAudioStorageError as error:
+            observed_fatals.append(error)
+            raise
+        raise AssertionError("corrupt clock state read unexpectedly succeeded")
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        lambda _candidate: context,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            quality_metrics=metrics,  # type: ignore[arg-type]
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(SessionLifecycle(run).run_session(context))
+        try:
+            assert await asyncio.to_thread(metric_started.wait, 5)
+            task.cancel()
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            assert not done
+            assert not metric_completed.is_set()
+        finally:
+            release_metric.set()
+        await task
+
+    with pytest.raises(operator_cli.typer.Exit) as raised:
+        operator_cli._run_device_operation(scenario())
+    assert raised.value.exit_code == 78
+    assert len(observed_fatals) == 1
+    assert raised.value.__cause__ is observed_fatals[0]
+    assert observed_fatals[0].sqlite_errorcode == sqlite3.SQLITE_NOTADB
+    assert metric_completed.is_set()
+    assert len(metrics.transfers) == 1
+    assert metrics.transfers[0].termination_class == "fatal_error"
 
 
 @pytest.mark.parametrize("progress_kind", ("unchanged", "completed_batch", "durable_frontier"))

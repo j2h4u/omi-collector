@@ -349,11 +349,14 @@ def test_sql_ready_durability_failure_latches_stage_and_preserves_custody(
                 "SELECT p.lifecycle, s.failure_reason FROM publication_cohort AS p, ready_output_stage AS s"
             ).fetchone(),
         )
-        source_rows = connection.execute(
-            "SELECT lifecycle, committed_count, (SELECT count(*) FROM capture_record WHERE source_id=?) "
-            "FROM capture_source WHERE source_id=?",
-            (source._source_id, source._source_id),
-        ).fetchone()
+        source_rows = cast(
+            tuple[str, int, int] | None,
+            connection.execute(
+                "SELECT lifecycle, committed_count, (SELECT count(*) FROM capture_record WHERE source_id=?) "
+                "FROM capture_source WHERE source_id=?",
+                (source._source_id, source._source_id),
+            ).fetchone(),
+        )
     assert tuple(stage) == ("staging", "durability_io_error")
     assert source_rows is not None and tuple(source_rows) == ("sealed_waiting", 1, 1)
     assert database.list(StateKind.READY_PUBLICATION) == ()

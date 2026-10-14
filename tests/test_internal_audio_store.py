@@ -256,13 +256,9 @@ def test_replay_conflict_with_uncheckpointed_canonical_row_is_an_indefinite_inte
             None,
             None,
         )
-        assert (
-            connection.execute("SELECT COUNT(*) FROM capture_record WHERE source_id = ?", (source_id,)).fetchone()
-            is not None
-        )
-        assert tuple(
-            connection.execute("SELECT COUNT(*) FROM capture_record WHERE source_id = ?", (source_id,)).fetchone()
-        ) == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM capture_record WHERE source_id = ?", (source_id,)
+        ).fetchone() == (1,)
 
 
 def test_drain_accepts_overlapping_prefix_and_appends_suffix(tmp_path: Path) -> None:
@@ -448,7 +444,8 @@ def test_authentication_preserves_structured_sqlite_read_error(
 ) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     failure = sqlite3.OperationalError("read failure")
-    failure.sqlite_errorcode = sqlite_errorcode
+    if sqlite_errorcode is not None:
+        failure.sqlite_errorcode = sqlite_errorcode
 
     def fail_read(_connection: sqlite3.Connection, _source_id: str) -> internal_audio_store.CaptureSource | None:
         raise failure

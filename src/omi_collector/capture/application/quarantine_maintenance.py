@@ -10,7 +10,6 @@ from time import monotonic
 from typing import Protocol
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
-from ..adapters.staging_contract import FatalInternalAudioStorageError
 from ..domain.quarantine_machine import (
     QuarantineAction,
     QuarantineEvent,
@@ -34,6 +33,7 @@ from .session_lifecycle import (
     joined_to_thread,
     report_activity,
 )
+from .storage_fault import FatalInternalAudioStorageError
 from .visit_machine import RecoveryDisposition
 
 

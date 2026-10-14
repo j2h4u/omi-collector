@@ -2830,9 +2830,7 @@ def _persisted_typed_stage_key(
         cohort_id != cohort.cohort_id
         or cursor != str(cohort.cursor)
         or not _is_sha256(bundle_id)
-        or stage_id != expected_stage_id
-        or owner_token != expected_stage_id
-        or owned_path != str(expected_path)
+        or (stage_id, owner_token, owned_path) != (expected_stage_id, expected_stage_id, str(expected_path))
     ):
         raise ReadyBundleError("typed stage ownership is invalid")
     return _StageKey(stage_id, identity, expected_path)

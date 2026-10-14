@@ -8,6 +8,7 @@ from json import JSONDecodeError, loads
 from pathlib import Path
 from typing import cast
 
+from ..application.storage_fault import FatalInternalAudioStorageError
 from ..domain.ring_protocol import RECORD_SIZE
 
 _DESCRIPTOR_NAME = "attempt.json"
@@ -31,14 +32,6 @@ _MAX_READ_PACKET_COUNT = (1 << 32) - 1
 
 class StagingError(RuntimeError):
     """Base error for local staging failures."""
-
-
-class FatalInternalAudioStorageError(RuntimeError):
-    """Storage integrity is uncertain and automatic capture must stop."""
-
-    def __init__(self, message: str, *, sqlite_errorcode: int | None = None) -> None:
-        super().__init__(message)
-        self.sqlite_errorcode = sqlite_errorcode
 
 
 def _raise_if_corrupt_sqlite_error(error: BaseException) -> None:

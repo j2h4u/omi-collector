@@ -1482,10 +1482,10 @@ def _canonical_journal_identity(path: Path) -> tuple[int, int, int]:
         journal_info = journal.lstat()
     except OSError as error:
         raise InternalAudioMigrationError("canonical SQLite rollback journal is unavailable") from error
+    if not stat.S_ISREG(canonical_info.st_mode) or not stat.S_ISREG(journal_info.st_mode):
+        raise InternalAudioMigrationError("canonical SQLite rollback journal is unsafe")
     if (
-        not stat.S_ISREG(canonical_info.st_mode)
-        or not stat.S_ISREG(journal_info.st_mode)
-        or journal_info.st_dev != canonical_info.st_dev
+        journal_info.st_dev != canonical_info.st_dev
         or journal_info.st_uid != canonical_info.st_uid
         or journal_info.st_gid != canonical_info.st_gid
         or journal_info.st_nlink != 1

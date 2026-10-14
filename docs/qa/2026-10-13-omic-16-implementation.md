@@ -14,6 +14,8 @@ The one-way migrator imports supported v1 private audio and state into a verifie
 | Capacity | The [pre-code measurements](2026-10-13-omic-16-stage1-measurements.md) and 128-record production-engine writer and publication smokes are available. Largest retained-batch replay through the actual image, measured live peak ingress, and the accepted lag/barrier comparison remain pending. |
 | Hardware behavior | No real pendant capture or RF throughput proof from this candidate. |
 
+A duplicate `just unit` run on the test-only descendant was stopped with TERM to release the serial QA slot for final-image capacity replay. Its exit 143 is an aborted diagnostic, not a failed code gate. The completed `just unit` on the unchanged source revision and the full `just crap-check` suite on the descendant are the acceptance results above.
+
 Acceptance tracking for the current candidate:
 
 - [x] Persist and reload one owned STAGING group and its frozen ranges after restart, including a READY middle overlap and an authenticated low-space output retry.

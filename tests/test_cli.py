@@ -59,6 +59,8 @@ def _layout(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     layout = load_operator_config(path).storage
+    layout.collector.root.mkdir(parents=True, exist_ok=True)
+    layout.collector.root.chmod(0o2750)
     if not layout.collector.state_db.exists():
         db = StateDB(layout.collector.state_db)
         db.put(StateKind.MIGRATION, "current", {"version": 1, "phase": "complete"})

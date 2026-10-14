@@ -222,6 +222,38 @@ def test_preflight_keeps_unrelated_readonly_failure_as_refusal(tmp_path: Path, m
     }
 
 
+def test_cli_hot_journal_recovery_uses_exact_json_and_preserves_v1_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 120\n', encoding="utf-8"
+    )
+    layout = load_operator_config(config).storage
+    layout.collector.root.mkdir()
+    layout.collector.root.chmod(0o2750)
+    layout.draft.mkdir()
+    layout.publication.root.mkdir()
+    _make_true_hot_journal(layout.collector.state_db)
+    release_dir = tmp_path / "share" / "omi-collector"
+    release_dir.mkdir(parents=True)
+    (release_dir / "release.json").write_text(json.dumps({"source_revision": "a" * 40}), encoding="utf-8")
+    monkeypatch.setattr(cli.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(cli, "_require_host_singleton", lambda _loaded: None)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
+
+    preflight = CliRunner().invoke(app, ["check-state-migration", "--config", str(config)])
+    assert preflight.exit_code == 1
+    assert json.loads(preflight.output) == {
+        "reason": "canonical_hot_journal",
+        "status": "migration_recovery_required",
+    }
+    recovery = CliRunner().invoke(app, ["recover-state-journal", "--config", str(config)])
+    assert recovery.exit_code == 0
+    assert json.loads(recovery.output) == {"schema_version": 1, "status": "migration_compatible"}
+    assert not layout.collector.state_db.with_name("collector-state.sqlite3-journal").exists()
+
+
 @pytest.mark.parametrize("artifact", ["unattributable_quarantine", "retired_attempt", "foreign_scratch"])
 def test_preflight_refuses_unsupported_v1_artifacts_without_mutation(tmp_path: Path, artifact: str) -> None:
     layout = _layout(tmp_path)

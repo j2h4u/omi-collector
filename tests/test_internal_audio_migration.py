@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import sqlite3
+import stat
 import subprocess
 import sys
 from contextlib import closing
@@ -55,6 +56,75 @@ def test_real_service_and_operator_handoff_access() -> None:
         assert not list(root.glob(".collector-state.access.*"))
 
 
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires real service and operator principals")
+def test_real_principal_cutover_resume_recovers_candidate_journal(monkeypatch: pytest.MonkeyPatch) -> None:
+    try:
+        service = pwd.getpwnam("omi-collector")
+        operator_group = grp.getgrnam("j2h4u")
+    except KeyError:
+        pytest.skip("production service/operator principals are unavailable")
+    with TemporaryDirectory(prefix="omi-collector-real-migration-", dir="/var/tmp") as temporary:
+        root = Path(temporary)
+        os.chown(root, service.pw_uid, operator_group.gr_gid)
+        root.chmod(0o2750)
+        complete_root = root / "complete"
+        complete_root.mkdir()
+        os.chown(complete_root, service.pw_uid, operator_group.gr_gid)
+        complete_root.chmod(0o2750)
+        complete_layout = _layout(complete_root)
+        complete_release = _release(complete_root)
+        _v1(complete_layout)
+        _, complete_raw = _draft(complete_layout)
+        _chown_real_layout(complete_layout, service.pw_uid, operator_group.gr_gid)
+        monkeypatch.setattr(migration, "_verify_handoff_access", _REAL_HANDOFF_ACCESS)
+        assert migrate_internal_audio(complete_layout, release_metadata=complete_release) == {
+            "imported_sources": 1,
+            "removed_files": 2,
+        }
+        assert not tuple(complete_layout.draft.iterdir())
+        _assert_real_audio_parity(complete_layout, complete_raw)
+        _assert_real_database_owner(complete_layout.collector.state_db, service.pw_uid, operator_group.gr_gid)
+        layout = _layout(root)
+        release = _release(root)
+        _v1(layout)
+        _, resumed_raw = _draft(layout)
+        _chown_real_layout(layout, service.pw_uid, operator_group.gr_gid)
+        monkeypatch.setattr(migration, "_verify_handoff_access", _REAL_HANDOFF_ACCESS)
+        activate = migration._activate_candidate
+
+        def interrupt(*_args: object) -> dict[str, int]:
+            raise RuntimeError("interrupted after candidate creation")
+
+        monkeypatch.setattr(migration, "_activate_candidate", interrupt)
+        with pytest.raises(RuntimeError, match="interrupted after candidate creation"):
+            migrate_internal_audio(layout, release_metadata=release)
+        candidate = next(layout.collector.root.glob(".collector-state.sqlite3.migrating.*"))
+        # Force SQLite to leave a real hot journal while retaining the prepared candidate.
+        subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1],isolation_level=None); "
+                    "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); "
+                    "c.execute(\"UPDATE state SET payload='interrupted'\"); os._exit(0)"
+                ),
+                str(candidate),
+            ),
+            check=True,
+        )
+        journal = candidate.with_name(candidate.name + "-journal")
+        assert journal.is_file()
+        journal_info = journal.stat()
+        assert (journal_info.st_uid, journal_info.st_gid) == (os.geteuid(), operator_group.gr_gid)
+        monkeypatch.setattr(migration, "_activate_candidate", activate)
+        assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 2}
+        assert not candidate.exists()
+        assert not journal.exists()
+        _assert_real_audio_parity(layout, resumed_raw)
+        _assert_real_database_owner(layout.collector.state_db, service.pw_uid, operator_group.gr_gid)
+
+
 def _layout(tmp_path: Path) -> StorageLayout:
     config = tmp_path / "config.toml"
     config.write_text(
@@ -72,6 +142,38 @@ def _release(tmp_path: Path) -> Path:
     path = tmp_path / "release.json"
     path.write_text(json.dumps({"source_revision": "a" * 40}), encoding="utf-8")
     return path
+
+
+def _chown_real_layout(layout: StorageLayout, uid: int, gid: int) -> None:
+    os.chown(layout.collector.root, uid, gid)
+    os.chown(layout.draft, uid, gid)
+    os.chown(layout.publication.root, uid, gid)
+
+
+def _assert_real_database_owner(path: Path, uid: int, gid: int) -> None:
+    info = path.stat()
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (uid, gid, 0o640)
+
+
+def _assert_real_audio_parity(layout: StorageLayout, raw: bytes) -> None:
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        rows = cast(
+            list[tuple[int, bytes]],
+            connection.execute("SELECT device_timestamp,payload FROM capture_record ORDER BY ordinal").fetchall(),
+        )
+        assert b"".join(timestamp.to_bytes(4, "big") + payload for timestamp, payload in rows) == raw
+        receipt = cast(
+            dict[str, object],
+            json.loads(
+                cast(
+                    str,
+                    connection.execute(
+                        "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
+                    ).fetchone()[0],
+                )
+            ),
+        )
+        assert receipt["phase"] == "COMPLETE"
 
 
 def _v1(layout: StorageLayout) -> None:

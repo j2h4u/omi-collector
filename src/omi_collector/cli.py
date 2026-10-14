@@ -483,10 +483,15 @@ def check_collector_state_migration(
 ) -> None:
     """Read-only check that Collector state can be migrated by this release."""
     from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
     from omi_collector.internal_audio_migration import inspect_internal_audio_migration
     from omi_collector.state_migration import StateMigrationError
 
     loaded = _load_config(config_path)
+    exit_code = 1
     try:
         _require_host_singleton(loaded)
         if stopped:
@@ -506,11 +511,15 @@ def check_collector_state_migration(
                 loaded.storage,
                 release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
             )
+    except (FatalInternalAudioStorageError, TransientInternalAudioStorageError) as error:
+        result = {"detail": str(error), "reason": "inspection_failed", "status": "migration_refused"}
+        if isinstance(error, FatalInternalAudioStorageError):
+            exit_code = 78
     except (CollectorGuardError, StateMigrationError, OSError, ValueError) as error:
         result = {"detail": str(error), "reason": "inspection_failed", "status": "migration_refused"}
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
     if result["status"] != "migration_compatible":
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exit_code)
 
 
 @app.command()
@@ -826,8 +835,9 @@ def _raise_status_failure(
 ) -> Never:
     from omi_collector.capture.adapters.operational_status import OperationalStatusError
     from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 
-    if isinstance(failure, FatalInternalAudioStorageError):
+    if isinstance(failure, (FatalInternalAudioStorageError, TransientInternalAudioStorageError)):
         raise failure
     raise OperationalStatusError("operational status persistence failed") from failure
 
@@ -840,11 +850,16 @@ def _status_cleanup_error(
 ) -> Exception:
     from omi_collector.capture.adapters.operational_status import OperationalStatusError
     from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 
-    if isinstance(cleanup_error, FatalInternalAudioStorageError):
-        return cleanup_error
     if isinstance(failure, FatalInternalAudioStorageError):
         return failure
+    if isinstance(cleanup_error, FatalInternalAudioStorageError):
+        return cleanup_error
+    if isinstance(failure, TransientInternalAudioStorageError):
+        return failure
+    if isinstance(cleanup_error, TransientInternalAudioStorageError):
+        return cleanup_error
     return OperationalStatusError(message)
 
 
@@ -855,6 +870,10 @@ def device_metrics(
 ) -> None:
     """Report metrics for the source bundles currently visible to the collector."""
     from omi_collector.capture.adapters.collector_state_db import StateDBError
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
     from omi_collector.spool_metrics import SpoolMetricsError
     from omi_collector.state_migration import StateMigrationError, open_runtime_state
 
@@ -867,7 +886,10 @@ def device_metrics(
             loaded.storage.publication.root,
             state_db=open_runtime_state(loaded.storage, read_only=True),
         )
-    except (SpoolMetricsError, StateDBError, StateMigrationError) as error:
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except (SpoolMetricsError, StateDBError, StateMigrationError, TransientInternalAudioStorageError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(json.dumps(cast(_JsonResult, result).as_dict(), sort_keys=True, separators=(",", ":")))
@@ -882,6 +904,10 @@ def device_status(
     """Summarize current backlog, publication, transfers, and confirmed loss."""
     from omi_collector.capture.adapters.operational_status import OperationalIdentity
     from omi_collector.capture.application.operational_telemetry import system_host_boot_id
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
     from omi_collector.operator_status import OperatorStatusError
 
     try:
@@ -901,7 +927,10 @@ def device_status(
             hours=hours,
             identity=OperationalIdentity(system_host_boot_id(), invocation_id),
         )
-    except OperatorStatusError as error:
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except (OperatorStatusError, TransientInternalAudioStorageError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     result["service"] = service_status

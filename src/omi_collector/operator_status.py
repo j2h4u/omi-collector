@@ -14,7 +14,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
+from omi_collector.capture.adapters.collector_state_db import (
+    StateDB,
+    StateDBError,
+    StateKind,
+    raise_if_sqlite_storage_fault,
+)
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, ConfirmedLossFact, read_confirmed_losses
 from omi_collector.capture.adapters.debug_logging import read_runtime_status
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservation, read_firmware_observations
@@ -302,6 +307,7 @@ def _custody_hold_count(db: StateDB) -> int:
                 ).fetchone(),
             )
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
         raise OperatorStatusError("custody hold inventory is unreadable") from error
     count = None if row is None else cast(object, row[0])
     if type(count) is not int:

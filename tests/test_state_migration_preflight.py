@@ -359,3 +359,34 @@ def test_check_state_migration_cli_requires_stopped_service_only_when_requested(
         "status": "migration_refused",
     }
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "exit_code"),
+    (
+        (FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=26), 78),
+        (TransientInternalAudioStorageError("canonical audio database is busy", sqlite_errorcode=5), 1),
+    ),
+)
+def test_check_state_migration_reports_classified_fault_as_structured_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, exit_code: int
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 120\n', encoding="utf-8"
+    )
+
+    def fail_inspection(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(cli, "_require_host_singleton", lambda _loaded: None)
+    monkeypatch.setattr(migration, "inspect_internal_audio_migration", fail_inspection)
+    result = CliRunner().invoke(app, ["check-state-migration", "--config", str(config)])
+
+    assert result.exit_code == exit_code
+    assert isinstance(result.exception, SystemExit)
+    assert json.loads(result.output) == {
+        "detail": str(failure),
+        "reason": "inspection_failed",
+        "status": "migration_refused",
+    }

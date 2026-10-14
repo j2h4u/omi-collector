@@ -25,6 +25,7 @@ from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError, StagingError
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
+from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockIntent
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
@@ -814,6 +815,39 @@ def test_device_status_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyP
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.strip() == "status evidence is malformed"
+
+
+@pytest.mark.parametrize("command", ("metrics", "status"))
+@pytest.mark.parametrize(
+    ("failure", "exit_code"),
+    (
+        (FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11), 78),
+        (TransientInternalAudioStorageError("canonical audio database is busy", sqlite_errorcode=5), 1),
+    ),
+)
+def test_read_only_device_commands_refuse_classified_sqlite_faults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    failure: Exception,
+    exit_code: int,
+) -> None:
+    from omi_collector import state_migration
+
+    config_path = _layout(tmp_path)
+
+    def fail_open(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(state_migration, "open_runtime_state", fail_open)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": False})
+    result = CliRunner().invoke(app, ["device", command, "--config", str(config_path)])
+
+    assert result.exit_code == exit_code
+    assert isinstance(result.exception, SystemExit)
+    assert result.stdout == ""
+    assert result.stderr.strip() == str(failure)
+    assert "Traceback" not in result.output
 
 
 def _sync_progress(  # noqa: PLR0913

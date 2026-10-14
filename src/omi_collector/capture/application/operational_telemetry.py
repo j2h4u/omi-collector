@@ -324,9 +324,9 @@ async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: Cloc
                         primary,
                         primary.__traceback__ if primary is not None else None,
                     )
-                except BaseException as cleanup_error:
+                except BaseException:
                     if isinstance(primary, FatalInternalAudioStorageError):
-                        raise primary from cleanup_error
+                        raise primary from primary.__cause__
                     raise
     except asyncio.CancelledError:
         raise

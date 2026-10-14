@@ -739,6 +739,8 @@ def test_session_guard_reports_only_its_own_failures(monkeypatch: pytest.MonkeyP
 
 def test_session_guard_keeps_first_fatal_if_reporting_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     fatal = FatalInternalAudioStorageError("guard failed")
+    original_sqlite_error = sqlite3.DatabaseError("original SQLite corruption")
+    fatal.__cause__ = original_sqlite_error
     reporting_failure = FatalInternalAudioStorageError("reporter failed")
 
     class Guard:
@@ -772,7 +774,8 @@ def test_session_guard_keeps_first_fatal_if_reporting_fails(monkeypatch: pytest.
     with pytest.raises(FatalInternalAudioStorageError) as raised:
         _run(SessionLifecycle(run).run_session(_PhyTestContext([])))
     assert raised.value is fatal
-    assert raised.value.__cause__ is reporting_failure
+    assert raised.value.__cause__ is original_sqlite_error
+    assert raised.value.__context__ is reporting_failure
 
 
 def test_session_guard_cancellation_does_not_report_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1792,6 +1795,25 @@ def test_run_session_records_one_terminal_transfer_metric_without_masking_sessio
     assert (metric.outcome, metric.termination_class) == expected
 
 
+async def _cancel_during_held_terminal_metric(
+    task: asyncio.Task[object], metric_started: Event, release_metric: Event, metric_completed: Event
+) -> None:
+    try:
+        assert await asyncio.to_thread(metric_started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not metric_completed.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        done, _pending = await asyncio.wait({task}, timeout=0.05)
+        assert not done
+        assert not metric_completed.is_set()
+    finally:
+        release_metric.set()
+    await task
+
+
 def test_fatal_read_survives_repeated_cancellation_during_terminal_metric_and_exits_78(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1800,6 +1822,7 @@ def test_fatal_read_survives_repeated_cancellation_during_terminal_metric_and_ex
     state_db.path.write_bytes(b"not a SQLite database")
     clock_store = ClockStateStore(state_db)
     observed_fatals: list[FatalInternalAudioStorageError] = []
+    original_causes: list[BaseException | None] = []
     metric_started = Event()
     release_metric = Event()
     metric_completed = Event()
@@ -1829,6 +1852,7 @@ def test_fatal_read_survives_repeated_cancellation_during_terminal_metric_and_ex
             await asyncio.to_thread(clock_store.state)
         except FatalInternalAudioStorageError as error:
             observed_fatals.append(error)
+            original_causes.append(error.__cause__)
             raise
         raise AssertionError("corrupt clock state read unexpectedly succeeded")
 
@@ -1858,16 +1882,7 @@ def test_fatal_read_survives_repeated_cancellation_during_terminal_metric_and_ex
 
     async def scenario() -> None:
         task = asyncio.create_task(SessionLifecycle(run).run_session(context))
-        try:
-            assert await asyncio.to_thread(metric_started.wait, 5)
-            task.cancel()
-            task.cancel()
-            done, _pending = await asyncio.wait({task}, timeout=0.05)
-            assert not done
-            assert not metric_completed.is_set()
-        finally:
-            release_metric.set()
-        await task
+        await _cancel_during_held_terminal_metric(task, metric_started, release_metric, metric_completed)
 
     with pytest.raises(operator_cli.typer.Exit) as raised:
         operator_cli._run_device_operation(scenario())
@@ -1875,6 +1890,8 @@ def test_fatal_read_survives_repeated_cancellation_during_terminal_metric_and_ex
     assert len(observed_fatals) == 1
     assert raised.value.__cause__ is observed_fatals[0]
     assert observed_fatals[0].sqlite_errorcode == sqlite3.SQLITE_NOTADB
+    assert observed_fatals[0].__cause__ is original_causes[0]
+    assert isinstance(original_causes[0], sqlite3.DatabaseError)
     assert metric_completed.is_set()
     assert len(metrics.transfers) == 1
     assert metrics.transfers[0].termination_class == "fatal_error"

@@ -531,9 +531,9 @@ class SessionLifecycle:
         finally:
             try:
                 await self._record_session_quality(quality, execution.outcome, execution.teardown_error, terminal_error)
-            except BaseException as cleanup_error:
+            except BaseException:
                 if isinstance(terminal_error, FatalInternalAudioStorageError):
-                    raise terminal_error from cleanup_error
+                    raise terminal_error from terminal_error.__cause__
                 raise
 
     async def _run_guarded_session_effects(
@@ -558,9 +558,9 @@ class SessionLifecycle:
             if error is not body_error:
                 try:
                     await report_session_error(self.run.options.activity, guard_phase, error, self.run.runtime)
-                except BaseException as reporting_error:
+                except BaseException:
                     if isinstance(error, FatalInternalAudioStorageError):
-                        raise error from reporting_error
+                        raise error from error.__cause__
                     raise
             raise
 

@@ -310,5 +310,5 @@ async def create_quality_metrics_owned[T](factory: Callable[..., T], *args: obje
                     raise
                 except BaseException:  # noqa: BLE001 - retain the primary factory outcome unless cleanup is fatal
                     if isinstance(primary, FatalInternalAudioStorageError):
-                        raise primary from None
+                        raise primary from primary.__cause__
         raise

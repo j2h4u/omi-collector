@@ -135,9 +135,9 @@ class ScopedPhyGuard(AbstractAsyncContextManager["ScopedPhyGuard"]):
         except BaseException as primary:
             try:
                 await join_owned(self._restore_after_failed_enter())
-            except BaseException as cleanup:
+            except BaseException:
                 if isinstance(primary, FatalInternalAudioStorageError):
-                    raise primary from cleanup
+                    raise primary from primary.__cause__
                 raise
             raise
         return self
@@ -146,9 +146,9 @@ class ScopedPhyGuard(AbstractAsyncContextManager["ScopedPhyGuard"]):
         del exc_type, traceback
         try:
             await join_owned(self._restore_and_clear_marker())
-        except BaseException as cleanup:
+        except BaseException:
             if isinstance(exc, FatalInternalAudioStorageError):
-                raise exc from cleanup
+                raise exc from exc.__cause__
             raise
         return False
 

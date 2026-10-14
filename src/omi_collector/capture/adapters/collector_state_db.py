@@ -375,7 +375,7 @@ class StateDB(_Operations):
                     connection.close()
                 except sqlite3.DatabaseError as close_error:
                     if isinstance(pending, FatalInternalAudioStorageError):
-                        raise pending from close_error
+                        raise pending from pending.__cause__
                     raise FatalInternalAudioStorageError("state write transaction could not be closed") from close_error
                 finally:
                     self._active.write_connection = None
@@ -390,11 +390,14 @@ class StateDB(_Operations):
     def _rollback_managed_write(self, connection: sqlite3.Connection, error: BaseException) -> None:
         """Attempt one rollback while retaining the first direct corruption fault."""
 
-        corruption: FatalInternalAudioStorageError | None = None
-        try:
-            raise_if_sqlite_corrupt(error)
-        except FatalInternalAudioStorageError as classified:
-            corruption = classified
+        corruption: FatalInternalAudioStorageError | None = (
+            error if isinstance(error, FatalInternalAudioStorageError) else None
+        )
+        if corruption is None:
+            try:
+                raise_if_sqlite_corrupt(error)
+            except FatalInternalAudioStorageError as classified:
+                corruption = classified
         if connection.in_transaction:
             try:
                 connection.rollback()
@@ -407,6 +410,8 @@ class StateDB(_Operations):
                 if corruption is None:
                     raise_if_sqlite_corrupt(rollback_error)
         if corruption is not None:
+            if corruption is error:
+                raise corruption
             raise corruption from error
 
     def _connect(self) -> sqlite3.Connection:

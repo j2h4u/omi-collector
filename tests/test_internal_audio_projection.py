@@ -282,11 +282,13 @@ def test_projection_stale_seeks_use_mapping_revision_index(
 
 @pytest.mark.parametrize("rollback_phase", ["before", "after"])
 @pytest.mark.parametrize("sqlite_errorcode", [sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
+@pytest.mark.parametrize("incoming_classified", [False, True])
 def test_projection_preserves_direct_corruption_when_rollback_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     rollback_phase: str,
     sqlite_errorcode: int,
+    incoming_classified: bool,
 ) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     _create_receiving_source(db, (_record(100, 1),))
@@ -294,6 +296,8 @@ def test_projection_preserves_direct_corruption_when_rollback_fails(
     _set_clock_path(db.path, payload)
     failure = sqlite3.DatabaseError("direct projection corruption")
     failure.sqlite_errorcode = sqlite_errorcode
+    incoming = FatalInternalAudioStorageError("direct projection corruption", sqlite_errorcode=sqlite_errorcode)
+    incoming.__cause__ = failure
     rollback_failure = sqlite3.DatabaseError("rollback did not settle")
     original_rollback = sqlite3.Connection.rollback
 
@@ -302,6 +306,8 @@ def test_projection_preserves_direct_corruption_when_rollback_fails(
             "UPDATE capture_record SET utc_timestamp = 999 WHERE source_id = ? AND ordinal = 0",
             ("a" * 32,),
         )
+        if incoming_classified:
+            raise incoming
         raise failure
 
     def failing_rollback(connection: sqlite3.Connection) -> None:
@@ -313,6 +319,8 @@ def test_projection_preserves_direct_corruption_when_rollback_fails(
     monkeypatch.setattr(_GuardedConnection, "rollback", failing_rollback)
     with pytest.raises(FatalInternalAudioStorageError) as raised:
         refresh_utc_projection(db)
+    if incoming_classified:
+        assert raised.value is incoming
     assert raised.value.sqlite_errorcode == sqlite_errorcode
     assert raised.value.__cause__ is failure
     assert _rows(db)[0][2:] == (None, None)

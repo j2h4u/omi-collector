@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 from collections.abc import Awaitable, Callable
 from functools import wraps
@@ -403,6 +404,8 @@ async def test_body_fatal_identity_survives_cleanup_failure(tmp_path: Path, monk
     db, runner = _db(tmp_path), FakeRunner()
     guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
     fatal = FatalInternalAudioStorageError("primary storage failure")
+    original_sqlite_error = sqlite3.DatabaseError("original SQLite corruption")
+    fatal.__cause__ = original_sqlite_error
 
     def failed_delete(_snapshot: tuple[str, ...]) -> None:
         raise RuntimeError("cleanup failed")
@@ -412,4 +415,5 @@ async def test_body_fatal_identity_survives_cleanup_failure(tmp_path: Path, monk
         async with guard:
             raise fatal
     assert caught.value is fatal
+    assert caught.value.__cause__ is original_sqlite_error
     assert _marker(db) is not None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import sqlite3
 import threading
 import time
 from collections.abc import Mapping
@@ -972,15 +973,23 @@ def test_corrupt_clock_evidence_stops_preflight_before_audio_or_time_write(faili
     assert session.writes == []
 
 
-def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit() -> None:
-    fatal = FatalInternalAudioStorageError("clock state is corrupt", sqlite_errorcode=11)
+def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit(tmp_path: Path) -> None:
+    state_db = StateDB(tmp_path / "corrupt-state.sqlite3")
+    state_db.path.write_bytes(b"not a SQLite database")
+    observed_fatals: list[FatalInternalAudioStorageError] = []
+    original_causes: list[BaseException | None] = []
     exit_started = threading.Event()
     release_exit = threading.Event()
     exit_completed = threading.Event()
 
-    class CorruptClockStore(FakeClockStateStore):
+    class CorruptClockStore(ClockStateStore):
         def state(self) -> ClockState:
-            raise fatal
+            try:
+                return super().state()
+            except FatalInternalAudioStorageError as error:
+                observed_fatals.append(error)
+                original_causes.append(error.__cause__)
+                raise
 
     class HeldLease:
         def __enter__(self) -> HeldLease:
@@ -990,7 +999,7 @@ def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit() ->
             return None
 
         def __exit__(self, _type: object, value: object, _traceback: object) -> None:
-            assert value is fatal
+            assert value is observed_fatals[0]
             exit_started.set()
             if not release_exit.wait(5):
                 raise TimeoutError("held clock lease exit was not released")
@@ -1008,7 +1017,7 @@ def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit() ->
                 clock=TelemetryClock(
                     now=lambda: 1000.0,
                     synchronized=lambda _timeout: True,
-                    state_store=CorruptClockStore(),
+                    state_store=CorruptClockStore(state_db),
                     mutation_lease=HeldLease,
                 ),
             )
@@ -1016,7 +1025,11 @@ def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit() ->
         try:
             assert await asyncio.to_thread(exit_started.wait, 5)
             task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert not exit_completed.is_set()
             task.cancel()
+            await asyncio.sleep(0)
             done, _pending = await asyncio.wait({task}, timeout=0.05)
             assert not done
             assert not exit_completed.is_set()
@@ -1024,7 +1037,10 @@ def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit() ->
             release_exit.set()
         with pytest.raises(FatalInternalAudioStorageError) as raised:
             await task
-        assert raised.value is fatal
+        assert raised.value is observed_fatals[0]
+        assert raised.value.__cause__ is original_causes[0]
+        assert isinstance(original_causes[0], sqlite3.DatabaseError)
+        assert raised.value.sqlite_errorcode == sqlite3.SQLITE_NOTADB
         assert exit_completed.is_set()
 
     asyncio.run(scenario())

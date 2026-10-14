@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.attempts import RecordAcceptanceError
 from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateKind
@@ -524,6 +525,97 @@ def test_corrupt_source_digest_becomes_indefinite_custody_hold(tmp_path: Path, m
         now += 73 * 3600 * 1_000_000_000
         assert not store.sweep_terminal_quarantine().progressed
         assert _source_row(store, source_id) is not None
+    finally:
+        attempt.close()
+
+
+@pytest.mark.parametrize("durable_state", ["committed", "rolled_back", "partial"])
+def test_authentication_hold_reconciles_complete_durable_row(tmp_path: Path, durable_state: str) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    raw = _record(1)
+    try:
+        attempt.accept_chunk(100, raw)
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET quarantine_disposition='published_prefix', "
+                "certified_prefix_count=1, coverage_digest=?, terminal_time='1000', retention_deadline='2000' "
+                "WHERE source_id=?",
+                (sha256(raw).hexdigest(), source_id),
+            )
+            connection.commit()
+            current = quarantine_module._source_row(connection, source_id)
+            assert current is not None
+            columns, before_row = current
+            assert type(before_row) is tuple
+            before = tuple(before_row)
+            changes: dict[str, object] = {
+                "source_type": "quarantine",
+                "lifecycle": "blocked",
+                "block_reason": "source_authentication_mismatch",
+                "quarantine_disposition": "unclassified",
+                "quarantine_opaque": 0,
+                "terminal_reason": None,
+                "terminal_time": None,
+                "retention_deadline": None,
+                "certified_prefix_count": None,
+                "coverage_digest": None,
+                "retirement_cursor": None,
+            }
+            proposed = tuple(changes.get(column, value) for column, value in zip(columns, before, strict=True))
+            if durable_state == "committed":
+                connection.execute(
+                    "UPDATE capture_source SET block_reason='source_authentication_mismatch', "
+                    "quarantine_disposition='unclassified', terminal_time=NULL, retention_deadline=NULL, "
+                    "certified_prefix_count=NULL, coverage_digest=NULL, retirement_cursor=NULL "
+                    "WHERE source_id=?",
+                    (source_id,),
+                )
+            elif durable_state == "partial":
+                connection.execute(
+                    "UPDATE capture_source SET block_reason='source_authentication_mismatch' WHERE source_id=?",
+                    (source_id,),
+                )
+            connection.commit()
+            actual = quarantine_module._source_row(connection, source_id)
+            assert actual is not None
+            durable = tuple(actual[1])
+
+        failure = sqlite3.OperationalError("injected ambiguous commit")
+        if durable_state == "committed":
+            quarantine_module._reconcile_source_authentication_hold(
+                store._filesystem, source_id, before, proposed, failure
+            )
+            assert durable == proposed
+            assert store.quarantined_attempts() == ()
+        else:
+            with pytest.raises(
+                StagingError, match="rolled back" if durable_state == "rolled_back" else "ambiguous third state"
+            ) as raised:
+                quarantine_module._reconcile_source_authentication_hold(
+                    store._filesystem, source_id, before, proposed, failure
+                )
+            assert raised.value.__cause__ is failure
+            assert durable != proposed
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            after = quarantine_module._source_row(connection, source_id)
+            retained = cast(
+                sqlite3.Row | None,
+                connection.execute(
+                    "SELECT payload FROM capture_record WHERE source_id=? AND ordinal=0", (source_id,)
+                ).fetchone(),
+            )
+        assert after is not None and tuple(after[1]) == durable
+        assert retained is not None and retained[0] == raw[4:]
+        if durable_state == "rolled_back":
+            assert durable == before
+        elif durable_state == "partial":
+            assert durable[columns.index("terminal_time")] == "1000"
+            assert durable[columns.index("certified_prefix_count")] == 1
+        else:
+            assert durable[columns.index("terminal_time")] is None
+            assert durable[columns.index("certified_prefix_count")] is None
     finally:
         attempt.close()
 

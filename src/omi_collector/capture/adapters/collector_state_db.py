@@ -45,6 +45,10 @@ class StateDBError(RuntimeError):
         self.sqlite_errorcode = sqlite_errorcode
 
 
+def _database_failure(message: str, error: BaseException) -> StateDBError:
+    return StateDBError(message, sqlite_errorcode=getattr(error, "sqlite_errorcode", None))
+
+
 class _Operations:
     """Operations bound to one connection, shared by DB and transaction handles."""
 
@@ -58,7 +62,7 @@ class _Operations:
                 self._connection.execute("SELECT payload FROM state WHERE kind = ? AND id = ?", (kind.value, item_id))
             )
         except sqlite3.DatabaseError as error:
-            raise StateDBError("state database read failed") from error
+            raise _database_failure("state database read failed", error) from error
         return _decode(_row_text(row, 0)) if row is not None else None
 
     def list(self, kind: StateKind, *, limit: int | None = None) -> tuple[tuple[str, dict[str, object]], ...]:
@@ -73,7 +77,7 @@ class _Operations:
                 parameters += (limit,)
             rows = _fetchall(self._connection.execute(query, parameters))
         except sqlite3.DatabaseError as error:
-            raise StateDBError("state database list failed") from error
+            raise _database_failure("state database list failed", error) from error
         return tuple((_row_text(row, 0), _decode(_row_text(row, 1))) for row in rows)
 
     def put(self, kind: StateKind, item_id: str, payload: dict[str, object]) -> None:
@@ -94,14 +98,14 @@ class _Operations:
                 (kind.value, item_id, encoded),
             )
         except sqlite3.DatabaseError as error:
-            raise StateDBError("state database write failed") from error
+            raise _database_failure("state database write failed", error) from error
 
     def delete(self, kind: StateKind, item_id: str) -> bool:
         _validate_key(kind, item_id)
         try:
             cursor = self._connection.execute("DELETE FROM state WHERE kind = ? AND id = ?", (kind.value, item_id))
         except sqlite3.DatabaseError as error:
-            raise StateDBError("state database delete failed") from error
+            raise _database_failure("state database delete failed", error) from error
         return cursor.rowcount == 1
 
 
@@ -143,7 +147,7 @@ class StateTransaction(_Operations):
                 )
             )
         except sqlite3.DatabaseError as error:
-            raise StateDBError("state payload size query failed") from error
+            raise _database_failure("state payload size query failed", error) from error
         if row is None:
             raise StateDBError("state payload size is invalid")
         size = _row_int(row, 0)
@@ -205,9 +209,7 @@ class StateDB(_Operations):
         except (OSError, sqlite3.DatabaseError) as error:
             if connection is not None:
                 connection.close()
-            raise StateDBError(
-                "state database is unavailable", sqlite_errorcode=getattr(error, "sqlite_errorcode", None)
-            ) from error
+            raise _database_failure("state database is unavailable", error) from error
         except BaseException:
             if connection is not None:
                 connection.close()
@@ -245,7 +247,7 @@ class StateDB(_Operations):
                 self.path.chmod(_STATE_DB_MODE)
         except (OSError, sqlite3.DatabaseError) as error:
             connection.rollback()
-            raise StateDBError("state database initialization failed") from error
+            raise _database_failure("state database initialization failed", error) from error
         except BaseException:
             connection.rollback()
             raise
@@ -266,7 +268,7 @@ class StateDB(_Operations):
             _validate_schema(connection)
             _validate_audio_schema(connection)
         except sqlite3.DatabaseError as error:
-            raise StateDBError("state database validation failed") from error
+            raise _database_failure("state database validation failed", error) from error
         finally:
             connection.close()
 
@@ -289,7 +291,7 @@ class StateDB(_Operations):
         except sqlite3.DatabaseError as error:
             if write:
                 _rollback(connection)
-            raise StateDBError("state database transaction failed") from error
+            raise _database_failure("state database transaction failed", error) from error
         except BaseException:
             if write:
                 _rollback(connection)
@@ -332,7 +334,7 @@ class StateDB(_Operations):
             connection.commit()
         except sqlite3.DatabaseError as error:
             _rollback(connection)
-            raise StateDBError("state database transaction failed") from error
+            raise _database_failure("state database transaction failed", error) from error
         except BaseException:
             _rollback(connection)
             raise
@@ -345,7 +347,7 @@ class StateDB(_Operations):
             try:
                 result = _fetchone(connection.execute("PRAGMA integrity_check"))
             except sqlite3.DatabaseError as error:
-                raise StateDBError("state database integrity check failed") from error
+                raise _database_failure("state database integrity check failed", error) from error
         if result is None or _row_text(result, 0) != "ok":
             raise StateDBError("state database integrity check failed")
 
@@ -377,9 +379,7 @@ class StateDB(_Operations):
         except (OSError, sqlite3.DatabaseError) as error:
             if connection is not None:
                 connection.close()
-            raise StateDBError(
-                "state database is unavailable", sqlite_errorcode=getattr(error, "sqlite_errorcode", None)
-            ) from error
+            raise _database_failure("state database is unavailable", error) from error
         except BaseException:
             if connection is not None:
                 connection.close()

@@ -5,10 +5,36 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NoReturn, cast
 
 import pytest
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind, _Operations
+
+
+@pytest.mark.parametrize("operation", ["get", "list", "put", "delete"])
+@pytest.mark.parametrize("sqlite_errorcode", [None, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
+def test_state_operation_preserves_sqlite_errorcode(operation: str, sqlite_errorcode: int | None) -> None:
+    failure = sqlite3.OperationalError("injected database failure")
+    if sqlite_errorcode is not None:
+        failure.sqlite_errorcode = sqlite_errorcode
+
+    class FailingConnection:
+        def execute(self, *_args: object, **_kwargs: object) -> NoReturn:
+            raise failure
+
+    operations = _Operations(cast(sqlite3.Connection, FailingConnection()))
+    with pytest.raises(StateDBError) as raised:
+        if operation == "get":
+            operations.get(StateKind.FIRMWARE, "current")
+        elif operation == "list":
+            operations.list(StateKind.FIRMWARE)
+        elif operation == "put":
+            operations.put(StateKind.FIRMWARE, "current", {"value": 1})
+        else:
+            operations.delete(StateKind.FIRMWARE, "current")
+    assert raised.value.sqlite_errorcode == sqlite_errorcode
+    assert raised.value.__cause__ is failure
 
 
 def test_state_db_round_trip_is_canonical_and_reopens_in_a_fresh_process(tmp_path: Path) -> None:

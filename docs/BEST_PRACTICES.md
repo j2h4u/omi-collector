@@ -276,9 +276,13 @@ same guard before opening writable state or performing BLE work. Read-only
 is active.
 
 The canonical systemd deployer fsyncs the sealed release and managed Python
-tree, screens backup space, and only then stops the service and durably selects
-the new release. It invokes that release's `omi-collector migrate-state
---config PATH` before restart. Migration takes the stable guard,
+tree and screens backup space. It runs the new release's read-only
+`check-state-migration` inventory before stopping the service, then repeats it
+with `--stopped` under the stable guard before durably selecting the new
+release. Both checks must accept the same supported state and private-artifact
+inventory; drift or foreign scratch blocks selection. The deployer then invokes
+the selected release's `omi-collector migrate-state --config PATH` before
+restart. Migration takes the stable guard,
 inventories the deployed v1 SQLite database and private files, reserves space
 for a full candidate backup, typed growth, rollback journal, and filesystem
 headroom, then records a source receipt. It builds and verifies a v2 candidate
@@ -297,6 +301,17 @@ receipts before BLE, with exit status 78 preventing a restart loop. Missing or
 unknown database state fails separately; runtime never creates a replacement.
 Never remove or replace `collector.lock` during migration, and never restart
 the old release after the new selector is durable.
+
+A mismatched canonical record or checkpoint stays in blocked, unclassified
+quarantine custody without an expiry deadline. Ordinary salvage and terminal
+classification must leave it untouched until an explicit custody resolution;
+only terminal residual evidence may expire. Canonical records remain pinned by
+their independent publication references. READY materialization that observes
+`EIO` must durably latch its stage, preserve source rows, and refuse later
+publication retries. If that refusal cannot be recorded, the collector exits
+with status 78 so systemd does not restart it into another capture attempt.
+Confirmed SQLite `CORRUPT` or `NOTADB` is likewise fatal; transient read faults
+remain retryable.
 
 The retained ready-bundle ACK checkpoint under `work` is a real publication
 dependency. The producer must grant the trusted collector UID a numeric read

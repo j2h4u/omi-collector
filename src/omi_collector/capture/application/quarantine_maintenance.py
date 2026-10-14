@@ -202,8 +202,8 @@ class QuarantineMaintenance:
             return
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001 - ordinary retry failures already became safe outcomes
-            pass
+        except Exception as error:  # noqa: BLE001 - unexpected retry failures remain visible
+            self._runtime.debug_exception("ready_publication_retry_failed", error)
         if self._staging.publication_followup_due():
             self._start_publication_retry()
 

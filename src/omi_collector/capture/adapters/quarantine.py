@@ -375,7 +375,7 @@ def _source_row(connection: sqlite3.Connection, source_id: str) -> tuple[tuple[s
     row = cast(tuple[object, ...] | None, cursor.fetchone())
     if row is None:
         return None
-    return tuple(column[0] for column in cursor.description), row
+    return tuple(column[0] for column in cursor.description), tuple(row)
 
 
 def _hold_source_authentication_mismatch(

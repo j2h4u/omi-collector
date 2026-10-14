@@ -1621,6 +1621,32 @@ def test_successful_publication_retry_schedule_finishes_without_a_second_invocat
     _run(scenario())
 
 
+def test_unexpected_publication_retry_failure_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        store = _publication_store(tmp_path)
+        failure = RuntimeError("unexpected publication failure")
+        observed: list[tuple[str, BaseException]] = []
+
+        async def fail_recover() -> None:
+            raise failure
+
+        runtime = OpportunisticRuntime()
+        monkeypatch.setattr(runtime, "debug_exception", lambda event, error, **_fields: observed.append((event, error)))
+        maintenance = QuarantineMaintenance(store, None, runtime)
+        monkeypatch.setattr(maintenance, "_recover_and_publish", fail_recover)
+        try:
+            maintenance.schedule_publication_retry()
+            task = maintenance._publication_retry_task
+            assert task is not None
+            assert (await asyncio.gather(task, return_exceptions=True)) == [failure]
+            await asyncio.sleep(0)
+            assert observed == [("ready_publication_retry_failed", failure)]
+        finally:
+            await maintenance.close()
+
+    _run(scenario())
+
+
 def test_publication_retry_timer_observes_exact_deadline_and_saturates_backoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

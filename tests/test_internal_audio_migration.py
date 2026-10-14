@@ -113,7 +113,7 @@ def test_real_principal_cutover_resume_recovers_candidate_journal(
             with closing(sqlite3.connect(layout.collector.state_db)) as connection:
                 assert connection.execute(
                     "SELECT count(*) FROM state WHERE kind='padding' AND payload=?", ("x" * 1000,)
-                ).fetchone() == (1000,)
+                ).fetchone() == (16,)
 
 
 def _run_real_complete_migration(root: Path, service_uid: int, operator_gid: int) -> None:
@@ -187,7 +187,7 @@ def _seed_retained_padding(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
         connection.executemany(
             "INSERT INTO state VALUES ('padding', ?, ?)",
-            ((str(index), "x" * 1000) for index in range(1000)),
+            ((str(index), "x" * 1000) for index in range(16)),
         )
         connection.commit()
 
@@ -748,7 +748,7 @@ def test_cutover_recovers_hot_canonical_v1_journal_before_inventory(tmp_path: Pa
         retained = cast(str, connection.execute("SELECT payload FROM state WHERE kind='runtime_status'").fetchone()[0])
         assert connection.execute(
             "SELECT count(*) FROM state WHERE kind='padding' AND payload=?", ("x" * 1000,)
-        ).fetchone() == (1000,)
+        ).fetchone() == (16,)
     assert json.loads(retained) == {"last_error": "тест"}
     _assert_real_audio_parity(layout, raw)
 

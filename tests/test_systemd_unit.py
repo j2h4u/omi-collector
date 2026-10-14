@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ class _DeploymentScenario:
     preflight_drift: bool = False
     migration_activates: bool = False
     migration_failure: bool = False
+    recovery_required: bool = False
 
 
 _DEFAULT_SCENARIO = _DeploymentScenario()
@@ -520,7 +522,12 @@ def _write_build_fakes(
         'printf \'%s\\n\' \'    calls=$((calls + 1)); printf "%s\\n" "$calls" > "$call_file"\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_DRIFT:-0}" == 1 && "$calls" == 1 ]]; then printf "foreign drift\\n" > "${DEPLOY_STATE_FILE%/*}/.collector-state.sqlite3.migrating.foreign"; fi\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_FAIL_AT:-0}" == "$calls" ]]; then printf "{\\"detail\\":\\"injected refusal\\",\\"reason\\":\\"state_validation_failed\\",\\"status\\":\\"migration_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    if [[ "${DEPLOY_RECOVERY_REQUIRED:-0}" == 1 && "$calls" == 2 ]]; then printf "{\\"reason\\":\\"canonical_hot_journal\\",\\"status\\":\\"migration_recovery_required\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    printf "{\\"schema_version\\":null,\\"status\\":\\"migration_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
+        "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
+        "printf '%s\\n' 'if [[ \"$1\" == recover-state-journal ]]; then' >> \"$entrypoint\"\n"
+        'printf \'%s\\n\' \'    python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\\"PRAGMA integrity_check\\").fetchone(); c.close()" "$DEPLOY_STATE_FILE"\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":1,\\"status\\":\\"migration_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"$1\" == migrate-state ]]; then' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    printf "migration selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
@@ -835,6 +842,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "DEPLOY_MIGRATION_FAIL": "1" if scenario.migration_failure else "0",
         "DEPLOY_PREFLIGHT_FAIL_AT": str(scenario.preflight_failure_at or 0),
         "DEPLOY_PREFLIGHT_DRIFT": "1" if scenario.preflight_drift else "0",
+        "DEPLOY_RECOVERY_REQUIRED": "1" if scenario.recovery_required else "0",
         "DEPLOY_PREFLIGHT_CALL_FILE": str(tmp_path / "preflight.calls"),
         "DEPLOY_STATE_FILE": str(state_file),
         "DEPLOY_CURRENT_LINK": str(current_link),
@@ -878,6 +886,27 @@ def _canonical_state(harness: _DeploymentHarness, *, version: int, phase: str, c
                 (json.dumps({"format": 1, "phase": "BUILDING"}),),
             )
         connection.commit()
+
+
+def _make_true_hot_journal(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("INSERT INTO state VALUES ('runtime_status','current',?)", ('{"last_error":"original"}',))
+        connection.executemany(
+            "INSERT INTO state VALUES ('padding',?,?)",
+            ((str(index), "x" * 1000) for index in range(1000)),
+        )
+        connection.commit()
+    subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1],isolation_level=None); "
+            "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)",
+            str(path),
+        ),
+        check=True,
+    )
+    assert path.with_name(path.name + "-journal").is_file()
 
 
 def _run_deployer(harness: _DeploymentHarness, caller_cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -1620,6 +1649,40 @@ def test_deployer_migrates_stopped_state_before_service_restart(tmp_path: Path) 
     )
     for root in data_roots:
         assert root.stat().st_mode & 0o7777 == 0o2750
+
+
+def test_deployer_recovers_true_hot_journal_before_selector_and_full_migration(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(recovery_required=True))
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    state_file.parent.mkdir(parents=True)
+    _canonical_state(harness, version=1, phase="complete")
+    _make_true_hot_journal(state_file)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode == 0, result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    recovery = "candidate args=recover-state-journal"
+    selector = "migration selector="
+    assert recovery in commands
+    assert commands.index("systemctl args=stop omi-collector.service") < commands.index(recovery)
+    assert commands.index(recovery) < commands.index(selector)
+    assert not state_file.with_name(state_file.name + "-journal").exists()
+
+
+def test_deployer_does_not_recover_on_arbitrary_preflight_refusal(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=1, recovery_required=True))
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    state_file.parent.mkdir(parents=True)
+    _canonical_state(harness, version=1, phase="complete")
+    _make_true_hot_journal(state_file)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    commands = harness.log.read_text(encoding="utf-8")
+    assert "candidate args=recover-state-journal" not in commands
+    assert state_file.with_name(state_file.name + "-journal").exists()
 
 
 def test_deployer_prepares_lock_for_empty_existing_collector_root(tmp_path: Path) -> None:

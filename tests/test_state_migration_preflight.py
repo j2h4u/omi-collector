@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
+import sys
 from contextlib import closing
 from pathlib import Path
 from typing import cast
@@ -20,6 +22,7 @@ from omi_collector.capture.application.storage_fault import (
 from omi_collector.cli import app
 from omi_collector.internal_audio_migration import (
     InternalAudioMigrationError,
+    recover_canonical_journal,
     inspect_internal_audio_migration,
     migrate_internal_audio,
 )
@@ -39,6 +42,7 @@ def _layout(tmp_path: Path) -> StorageLayout:
     )
     layout = load_operator_config(config).storage
     layout.collector.root.mkdir()
+    layout.collector.root.chmod(0o2750)
     layout.draft.mkdir()
     layout.publication.root.mkdir()
     return layout
@@ -99,6 +103,32 @@ def _assert_compatible(result: dict[str, object], schema_version: int | None) ->
     assert result == {"schema_version": schema_version, "status": "migration_compatible"}
 
 
+def _make_true_hot_journal(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("CREATE TABLE state(kind TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL)")
+        connection.execute("PRAGMA user_version=1")
+        connection.execute(
+            "INSERT INTO state VALUES ('migration','current',?)", (json.dumps({"phase": "complete", "version": 1}),)
+        )
+        connection.execute("INSERT INTO state VALUES ('runtime_status','current',?)", ('{"last_error":"original"}',))
+        connection.executemany(
+            "INSERT INTO state VALUES ('padding',?,?)",
+            ((str(index), "x" * 1000) for index in range(1000)),
+        )
+        connection.commit()
+    subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); "
+            "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)",
+            str(path),
+        ),
+        check=True,
+    )
+    assert path.with_name(path.name + "-journal").is_file()
+
+
 @pytest.mark.parametrize(
     ("sqlite_errorcode", "error_type"),
     [
@@ -151,6 +181,43 @@ def test_preflight_accepts_empty_and_supported_v1_without_mutation(tmp_path: Pat
     _assert_compatible(inspect_internal_audio_migration(layout, release_metadata=release), 1)
 
     assert _snapshot(layout.root) == before
+
+
+def test_preflight_reports_true_hot_journal_without_mutation_and_narrow_recovery_restores_payload(
+    tmp_path: Path,
+) -> None:
+    release = _release(tmp_path)
+    layout = _layout(tmp_path)
+    _make_true_hot_journal(layout.collector.state_db)
+    before = _snapshot(layout.root)
+
+    assert inspect_internal_audio_migration(layout, release_metadata=release) == {
+        "reason": "canonical_hot_journal",
+        "status": "migration_recovery_required",
+    }
+    assert _snapshot(layout.root) == before
+    recovered = recover_canonical_journal(layout, release_metadata=release)
+    assert recovered == {"schema_version": 1, "status": "migration_compatible"}
+    assert not layout.collector.state_db.with_name("collector-state.sqlite3-journal").exists()
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("SELECT payload FROM state WHERE kind='runtime_status'").fetchone() == (
+            '{"last_error":"original"}',
+        )
+
+
+def test_preflight_keeps_unrelated_readonly_failure_as_refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    release = _release(tmp_path)
+    layout = _layout(tmp_path)
+    _v1(layout)
+    error = sqlite3.DatabaseError("read-only failure")
+    error.sqlite_errorcode = sqlite3.SQLITE_READONLY
+    monkeypatch.setattr(migration, "_connect_read_only", lambda _path: (_ for _ in ()).throw(error))
+
+    assert inspect_internal_audio_migration(layout, release_metadata=release) == {
+        "detail": "read-only failure",
+        "reason": "inspection_failed",
+        "status": "migration_refused",
+    }
 
 
 @pytest.mark.parametrize("artifact", ["unattributable_quarantine", "retired_attempt", "foreign_scratch"])
@@ -387,6 +454,7 @@ def test_check_state_migration_reports_classified_fault_as_structured_refusal(
     assert isinstance(result.exception, SystemExit)
     assert json.loads(result.output) == {
         "detail": str(failure),
+        "fault": "fatal" if exit_code == 78 else "transient",
         "reason": "inspection_failed",
         "status": "migration_refused",
     }

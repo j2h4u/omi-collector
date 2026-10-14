@@ -512,7 +512,12 @@ def check_collector_state_migration(
                 release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
             )
     except (FatalInternalAudioStorageError, TransientInternalAudioStorageError) as error:
-        result = {"detail": str(error), "reason": "inspection_failed", "status": "migration_refused"}
+        result = {
+            "detail": str(error),
+            "fault": "fatal" if isinstance(error, FatalInternalAudioStorageError) else "transient",
+            "reason": "inspection_failed",
+            "status": "migration_refused",
+        }
         if isinstance(error, FatalInternalAudioStorageError):
             exit_code = 78
     except (CollectorGuardError, StateMigrationError, OSError, ValueError) as error:
@@ -520,6 +525,45 @@ def check_collector_state_migration(
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
     if result["status"] != "migration_compatible":
         raise typer.Exit(code=exit_code)
+
+
+@app.command("recover-state-journal")
+def recover_collector_state_journal(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Recover only a verified hot SQLite journal under the stopped-service guard."""
+    from omi_collector.capture.adapters.collector_guard import CollectorGuardError
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
+    from omi_collector.internal_audio_migration import InternalAudioMigrationError, recover_canonical_journal
+    from omi_collector.state_migration import StateMigrationError
+
+    loaded = _load_config(config_path)
+    try:
+        _require_host_singleton(loaded)
+        service_state = _systemd_service_status()
+        if not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}:
+            raise StateMigrationError("confirm the Collector service is stopped before journal recovery")
+        result = recover_canonical_journal(
+            loaded.storage,
+            release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
+        )
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except (
+        CollectorGuardError,
+        InternalAudioMigrationError,
+        StateMigrationError,
+        TransientInternalAudioStorageError,
+        sqlite3.DatabaseError,
+        OSError,
+    ) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
 @app.command()

@@ -279,13 +279,17 @@ The canonical systemd deployer fsyncs the sealed release and managed Python
 tree and screens backup space. It runs the new release's read-only
 `check-state-migration` inventory before stopping the service, then repeats it
 with `--stopped` under the stable guard before durably selecting the new
-release. Both checks must accept the same supported state and private-artifact
-inventory; drift or foreign scratch blocks selection. The deployer then invokes
+release. A verified hot canonical rollback journal is the sole recoverable
+preflight result: after stopping the service, `recover-state-journal` performs
+SQLite rollback under the stable guard and a full read-only preflight must then
+accept the state. Other drift or foreign scratch blocks selection. The deployer then invokes
 the selected release's `omi-collector migrate-state --config PATH` before
 restart. Migration takes the stable guard,
 inventories the deployed v1 SQLite database and private files, reserves space
 for a full candidate backup, typed growth, rollback journal, and filesystem
-headroom, then records a source receipt. It builds and verifies a v2 candidate
+headroom, then records a source receipt bound to the real setgid Collector
+directory, its inherited candidate group, and the migrator's effective identity.
+It builds and verifies a v2 candidate
 on the same filesystem, activates it, deletes only inventoried old private
 files, verifies service and operator access, and marks the receipt complete
 last. The command does not archive old raw audio or alter public ready bundles.

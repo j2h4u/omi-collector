@@ -50,6 +50,7 @@ _FORMAT = 1
 _TYPED_SCHEMA = 2
 _SHA256_LENGTH = 64
 _DATABASE_MODE = 0o640
+_COLLECTOR_PARENT_MODE = 0o2750
 _CANDIDATE_PREFIX = ".collector-state.sqlite3.migrating."
 _UUID = re.compile(r"[0-9a-f]{32}\Z")
 _REVISION = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -62,6 +63,10 @@ _PRIVATE_ROOTS = ("collector/attempts", "collector/quarantine", "draft")
 
 class InternalAudioMigrationError(RuntimeError):
     """Forward cutover stopped before any unverified custody change."""
+
+
+class _CanonicalJournalRecoveryRequiredError(InternalAudioMigrationError):
+    """The canonical database needs SQLite rollback before read-only inspection."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +165,8 @@ def inspect_internal_audio_migration(layout: StorageLayout, *, release_metadata:
                         "reason": "unsupported_schema",
                         "status": "migration_refused",
                     }
+    except _CanonicalJournalRecoveryRequiredError:
+        return {"reason": "canonical_hot_journal", "status": "migration_recovery_required"}
     except InternalAudioMigrationError as error:
         return {"detail": str(error), "reason": "state_validation_failed", "status": "migration_refused"}
     except (
@@ -178,6 +185,29 @@ def inspect_internal_audio_migration(layout: StorageLayout, *, release_metadata:
     return {"schema_version": schema_version, "status": "migration_compatible"}
 
 
+def recover_canonical_journal(layout: StorageLayout, *, release_metadata: Path) -> dict[str, object]:
+    """Perform only SQLite crash recovery under the stopped-service lock."""
+
+    with collector_guard(layout.collector.lock):
+        inspection = inspect_internal_audio_migration(layout, release_metadata=release_metadata)
+        if inspection.get("status") == "migration_compatible":
+            return inspection
+        if inspection != {"reason": "canonical_hot_journal", "status": "migration_recovery_required"}:
+            raise InternalAudioMigrationError("canonical journal recovery was not approved by read-only inspection")
+        path = layout.collector.state_db
+        before = _canonical_journal_identity(path)
+        with closing(_connect(path)):
+            pass
+        info = path.lstat()
+        if (info.st_dev, info.st_ino, info.st_uid) != before:
+            raise InternalAudioMigrationError("canonical SQLite identity changed during journal recovery")
+        _assert_no_journal(path)
+        inspection = inspect_internal_audio_migration(layout, release_metadata=release_metadata)
+        if inspection.get("status") != "migration_compatible":
+            raise InternalAudioMigrationError("canonical state remains incompatible after SQLite recovery")
+        return inspection
+
+
 def _validate_missing_database(layout: StorageLayout) -> None:
     inventory = _inventory(layout)
     if inventory.entries or _old_control_present(layout) or _any_ready_entry(layout):
@@ -185,6 +215,7 @@ def _validate_missing_database(layout: StorageLayout) -> None:
 
 
 def _validate_v1_preflight(layout: StorageLayout, source: sqlite3.Connection) -> None:
+    _candidate_parent_identity(layout.collector.root)
     inventory = _inventory(layout, source)
     source_sha = _logical_digest(source)
     _validate_v1_control(source)
@@ -269,6 +300,7 @@ def _create_empty(layout: StorageLayout) -> dict[str, int]:
 
 
 def _migrate_v1(layout: StorageLayout, source: sqlite3.Connection, revision: str) -> dict[str, int]:
+    parent = _candidate_parent_identity(layout.collector.root)
     inventory = _inventory(layout, source)
     source_sha = _logical_digest(source)
     _validate_v1_control(source)
@@ -286,6 +318,8 @@ def _migrate_v1(layout: StorageLayout, source: sqlite3.Connection, revision: str
             "candidate": "",
             "uid": os.geteuid(),
             "gid": os.getegid(),
+            "candidate_gid": parent["gid"],
+            "parent": parent,
             "files": [entry.as_dict() for entry in inventory.entries],
             "quarantines": [{"id": item.item_id, "row": item.row} for item in inventory.quarantines],
         }
@@ -293,6 +327,7 @@ def _migrate_v1(layout: StorageLayout, source: sqlite3.Connection, revision: str
         _put_receipt(source, receipt)
     else:
         _validate_v1_receipt(receipt, layout, inventory, source_sha)
+    _assert_candidate_parent(layout.collector.root, receipt)
     candidate = layout.collector.root / cast(str, receipt["candidate"])
     journal = candidate.parent / f"{candidate.name}-journal"
     journal_identity = None
@@ -309,6 +344,7 @@ def _migrate_v1(layout: StorageLayout, source: sqlite3.Connection, revision: str
         _remove_owned_candidate_journal(candidate, receipt, journal_identity)
     if resumed_receipt:
         _require_candidate_space(layout, source, inventory)
+    _assert_candidate_parent(layout.collector.root, receipt)
     _backup_and_convert(source, candidate, receipt, inventory)
     if not _candidate_is_prepared(candidate, source, receipt, inventory):
         raise InternalAudioMigrationError("candidate parity failed after conversion")
@@ -437,6 +473,7 @@ def _activate_candidate(
     receipt: dict[str, object],
     inventory: _Inventory,
 ) -> dict[str, int]:
+    _assert_candidate_parent(layout.collector.root, receipt)
     _assert_inventory_exact(inventory, _inventory(layout, source))
     if _logical_digest(source) != receipt["source_sha256"]:
         raise InternalAudioMigrationError("v1 source changed before activation")
@@ -445,6 +482,8 @@ def _activate_candidate(
     _assert_no_journal(candidate.path)
     _assert_candidate_identity(candidate.path, receipt, candidate.identity)
     _require_typed_schema(candidate.path, "prepared candidate")
+    _assert_candidate_parent(layout.collector.root, receipt)
+    _assert_candidate_identity(candidate.path, receipt, candidate.identity)
     candidate.path.replace(layout.collector.state_db)
     _fsync_directory(layout.collector.root)
     with closing(_connect(layout.collector.state_db)) as canonical:
@@ -978,13 +1017,22 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
     if path.is_symlink() or not path.is_file():
         raise InternalAudioMigrationError(f"SQLite database path is unsafe: {path}")
     uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
+    connection: sqlite3.Connection | None = None
     try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA foreign_keys = ON")
         _integrity_check(connection)
+    except sqlite3.DatabaseError as error:
+        if connection is not None:
+            connection.close()
+        if getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_READONLY_ROLLBACK:
+            _canonical_journal_identity(path)
+            raise _CanonicalJournalRecoveryRequiredError("canonical SQLite needs rollback recovery") from error
+        raise
     except BaseException:
-        connection.close()
+        if connection is not None:
+            connection.close()
         raise
     return connection
 
@@ -1109,6 +1157,8 @@ def _validate_receipt_shape(receipt: dict[str, object], layout: StorageLayout) -
         "candidate",
         "uid",
         "gid",
+        "candidate_gid",
+        "parent",
         "files",
         "quarantines",
     }
@@ -1124,11 +1174,17 @@ def _validate_receipt_shape(receipt: dict[str, object], layout: StorageLayout) -
         raise InternalAudioMigrationError("cutover receipt identity is invalid")
     if not isinstance(source_sha, str) or not _is_sha256(source_sha):
         raise InternalAudioMigrationError("cutover receipt identity is invalid")
-    if candidate != _CANDIDATE_PREFIX + uuid or type(receipt["uid"]) is not int or type(receipt["gid"]) is not int:
+    if (
+        candidate != _CANDIDATE_PREFIX + uuid
+        or type(receipt["uid"]) is not int
+        or type(receipt["gid"]) is not int
+        or type(receipt["candidate_gid"]) is not int
+    ):
         raise InternalAudioMigrationError("cutover receipt identity is invalid")
     path = layout.collector.root / cast(str, candidate)
     if path.parent != layout.collector.root:
         raise InternalAudioMigrationError("cutover candidate escapes Collector root")
+    _assert_candidate_parent(layout.collector.root, receipt)
     _receipt_entries(receipt)
     _receipt_quarantines(receipt)
 
@@ -1286,8 +1342,9 @@ def _v1_payload(connection: sqlite3.Connection, kind: str, item_id: str) -> dict
 
 
 def _check_owned_candidate(path: Path, receipt: dict[str, object]) -> tuple[int, int]:
+    _assert_candidate_parent(path.parent, receipt)
     info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != receipt["uid"] or info.st_gid != receipt["gid"]:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != receipt["uid"] or info.st_gid != receipt["candidate_gid"]:
         raise InternalAudioMigrationError("candidate is not owned by the cutover migrator")
     return info.st_dev, info.st_ino
 
@@ -1298,13 +1355,15 @@ def _assert_candidate_identity(path: Path, receipt: dict[str, object], expected:
 
 
 def _check_owned_candidate_journal(path: Path, receipt: dict[str, object]) -> tuple[int, int]:
+    _assert_candidate_parent(path.parent, receipt)
     info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != receipt["uid"] or info.st_gid != receipt["gid"]:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != receipt["uid"] or info.st_gid != receipt["candidate_gid"]:
         raise InternalAudioMigrationError("candidate journal is not owned by the cutover migrator")
     return info.st_dev, info.st_ino
 
 
 def _remove_owned_candidate_journal(path: Path, receipt: dict[str, object], expected: tuple[int, int] | None) -> None:
+    _assert_candidate_parent(path.parent, receipt)
     journal = path.parent / f"{path.name}-journal"
     if journal.exists() or journal.is_symlink():
         if expected is None or _check_owned_candidate_journal(journal, receipt) != expected:
@@ -1316,6 +1375,7 @@ def _remove_owned_candidate_journal(path: Path, receipt: dict[str, object], expe
 def _remove_owned_candidate(
     path: Path, receipt: dict[str, object], expected: tuple[int, int], journal_identity: tuple[int, int] | None
 ) -> None:
+    _assert_candidate_parent(path.parent, receipt)
     _assert_candidate_identity(path, receipt, expected)
     _remove_owned_candidate_journal(path, receipt, journal_identity)
     _assert_candidate_identity(path, receipt, expected)
@@ -1341,6 +1401,30 @@ def _release_revision(path: Path) -> str:
 def _assert_real_canonical(path: Path) -> None:
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise InternalAudioMigrationError("canonical SQLite path is unsafe")
+
+
+def _candidate_parent_identity(path: Path) -> dict[str, int]:
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise InternalAudioMigrationError("cutover candidate parent is unavailable") from error
+    mode = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISDIR(info.st_mode) or mode != _COLLECTOR_PARENT_MODE:
+        raise InternalAudioMigrationError("cutover candidate parent is not a real setgid Collector directory")
+    return {"dev": info.st_dev, "ino": info.st_ino, "uid": info.st_uid, "gid": info.st_gid, "mode": mode}
+
+
+def _assert_candidate_parent(path: Path, receipt: dict[str, object]) -> None:
+    expected = receipt.get("parent")
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != {"dev", "ino", "uid", "gid", "mode"}
+        or any(type(value) is not int for value in expected.values())
+        or expected["gid"] != receipt.get("candidate_gid")
+    ):
+        raise InternalAudioMigrationError("cutover candidate parent receipt is invalid")
+    if _candidate_parent_identity(path) != expected:
+        raise InternalAudioMigrationError("cutover candidate parent changed")
 
 
 def _old_control_present(layout: StorageLayout) -> bool:
@@ -1389,6 +1473,25 @@ def _assert_no_journal(path: Path) -> None:
     journal = path.parent / f"{path.name}-journal"
     if journal.exists() or journal.is_symlink():
         raise InternalAudioMigrationError(f"SQLite journal remains after recovery: {path.name}")
+
+
+def _canonical_journal_identity(path: Path) -> tuple[int, int, int]:
+    journal = path.parent / f"{path.name}-journal"
+    try:
+        canonical_info = path.lstat()
+        journal_info = journal.lstat()
+    except OSError as error:
+        raise InternalAudioMigrationError("canonical SQLite rollback journal is unavailable") from error
+    if (
+        not stat.S_ISREG(canonical_info.st_mode)
+        or not stat.S_ISREG(journal_info.st_mode)
+        or journal_info.st_dev != canonical_info.st_dev
+        or journal_info.st_uid != canonical_info.st_uid
+        or journal_info.st_gid != canonical_info.st_gid
+        or journal_info.st_nlink != 1
+    ):
+        raise InternalAudioMigrationError("canonical SQLite rollback journal is unsafe")
+    return canonical_info.st_dev, canonical_info.st_ino, canonical_info.st_uid
 
 
 def _fsync_file(path: Path) -> None:

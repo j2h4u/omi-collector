@@ -417,6 +417,7 @@ def _seed_deployer_storage(harness: _DeploymentHarness) -> tuple[StorageLayout, 
         publication=PublicationLayout(state_file.parent.parent / "ready"),
     )
     storage.collector.root.mkdir(parents=True, exist_ok=True)
+    storage.collector.root.chmod(0o2750)
     storage.collector.attempts.mkdir(exist_ok=True)
     storage.collector.quarantine.mkdir(exist_ok=True)
     storage.draft.mkdir(exist_ok=True)

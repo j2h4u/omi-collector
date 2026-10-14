@@ -62,6 +62,7 @@ def _layout(tmp_path: Path) -> StorageLayout:
     )
     layout = load_operator_config(config).storage
     layout.collector.root.mkdir()
+    layout.collector.root.chmod(0o2750)
     layout.draft.mkdir()
     layout.publication.root.mkdir()
     return layout
@@ -171,6 +172,99 @@ def test_one_way_cutover_imports_draft_preserves_other_rows_and_deletes_only_old
     assert b"".join(timestamp.to_bytes(4, "big") + payload for timestamp, payload in rows) == raw
     connection.close()
     assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 0}
+
+
+def test_cutover_receipt_binds_setgid_parent_and_resume_keeps_effective_migrator_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = _layout(tmp_path)
+    release = _release(tmp_path)
+    _v1(layout)
+    _draft(layout)
+    parent = layout.collector.root
+    original_egid = os.getegid()
+    candidate_gid = next((gid for gid in os.getgroups() if gid != original_egid), None)
+    if candidate_gid is None:
+        pytest.skip("test needs a distinct supplementary group")
+    os.chown(parent, os.getuid(), candidate_gid)
+    parent.chmod(0o2750)
+    monkeypatch.setattr(migration.os, "getegid", lambda: original_egid + 1)
+    activate = migration._activate_candidate
+
+    def interrupt(*_args: object) -> dict[str, int]:
+        raise RuntimeError("interrupted after candidate creation")
+
+    monkeypatch.setattr(migration, "_activate_candidate", interrupt)
+    with pytest.raises(RuntimeError, match="interrupted after candidate creation"):
+        migrate_internal_audio(layout, release_metadata=release)
+    candidate = next(parent.glob(".collector-state.sqlite3.migrating.*"))
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        receipt = json.loads(
+            cast(
+                str,
+                connection.execute(
+                    "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
+                ).fetchone()[0],
+            )
+        )
+    assert receipt["uid"] == os.geteuid()
+    assert receipt["gid"] == original_egid + 1
+    assert receipt["candidate_gid"] == candidate_gid
+    assert receipt["parent"] == {
+        "dev": parent.stat().st_dev,
+        "ino": parent.stat().st_ino,
+        "uid": parent.stat().st_uid,
+        "gid": candidate_gid,
+        "mode": 0o2750,
+    }
+    assert candidate.stat().st_uid == os.geteuid()
+    assert candidate.stat().st_gid == candidate_gid
+    monkeypatch.setattr(migration, "_activate_candidate", activate)
+    assert migrate_internal_audio(layout, release_metadata=release) == {"imported_sources": 1, "removed_files": 2}
+
+
+@pytest.mark.parametrize("drift", ["parent", "candidate", "journal"])
+def test_cutover_refuses_bound_identity_drift_before_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    layout = _layout(tmp_path)
+    release = _release(tmp_path)
+    _v1(layout)
+    _draft(layout)
+    activate = migration._activate_candidate
+
+    def interrupt(*_args: object) -> dict[str, int]:
+        raise RuntimeError("interrupted after candidate creation")
+
+    monkeypatch.setattr(migration, "_activate_candidate", interrupt)
+    with pytest.raises(RuntimeError, match="interrupted after candidate creation"):
+        migrate_internal_audio(layout, release_metadata=release)
+    candidate = next(layout.collector.root.glob(".collector-state.sqlite3.migrating.*"))
+    if drift == "parent":
+        candidate.parent.chmod(0o0750)
+    elif drift == "candidate":
+        wrong_gid = next(gid for gid in os.getgroups() if gid != candidate.parent.stat().st_gid)
+        os.chown(candidate, os.getuid(), wrong_gid)
+    else:
+        subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); "
+                "c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='journal' "
+                "WHERE kind='runtime_status' AND id='current'\"); os._exit(0)",
+                str(candidate),
+            ),
+            check=True,
+        )
+        journal = candidate.parent / f"{candidate.name}-journal"
+        assert journal.exists()
+        wrong_gid = next(gid for gid in os.getgroups() if gid != candidate.parent.stat().st_gid)
+        os.chown(journal, os.getuid(), wrong_gid)
+    monkeypatch.setattr(migration, "_activate_candidate", activate)
+    with pytest.raises(InternalAudioMigrationError):
+        migrate_internal_audio(layout, release_metadata=release)
+    assert candidate.exists()
 
 
 def test_cutover_refuses_unknown_private_artifact_before_source_receipt(tmp_path: Path) -> None:

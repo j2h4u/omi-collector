@@ -468,25 +468,43 @@ function validate_candidate_config {
 
 function check_candidate_state_migration {
     # args
-    local -r environment="$1" config_file="$2" stopped="$3"
+    local -r environment="$1" config_file="$2" stopped="$3" output_name="$4"
 
     # vars
-    local output
+    local output command_status
     local -a stopped_args=()
 
     # code
     if [[ "$stopped" == 'true' ]]; then
         stopped_args+=( '--stopped' )
     fi
-    output=$("${environment}/bin/omi-collector" check-state-migration --config "$config_file" "${stopped_args[@]}") \
-        || die 'candidate refused the Collector state migration preflight'
-    case "$output" in
-        '{"schema_version":null,"status":"migration_compatible"}'|\
-        '{"schema_version":1,"status":"migration_compatible"}'|\
-        '{"schema_version":2,"status":"migration_compatible"}')
-            ;;
-        *) die 'candidate returned an unexpected Collector state migration preflight record' ;;
-    esac
+    if output=$("${environment}/bin/omi-collector" check-state-migration --config "$config_file" "${stopped_args[@]}"); then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    if (( command_status == 0 )); then
+        case "$output" in
+            '{"schema_version":null,"status":"migration_compatible"}'|\
+            '{"schema_version":1,"status":"migration_compatible"}'|\
+            '{"schema_version":2,"status":"migration_compatible"}')
+                printf -v "$output_name" '%s' 'compatible'
+                return ;;
+            *) die 'candidate returned an unexpected Collector state migration preflight record' ;;
+        esac
+    fi
+    if (( command_status == 1 )) && [[ "$output" == '{"reason":"canonical_hot_journal","status":"migration_recovery_required"}' ]]; then
+        printf -v "$output_name" '%s' 'recovery_required'
+        return
+    fi
+    die 'candidate refused the Collector state migration preflight'
+}
+
+function recover_stopped_canonical_journal {
+    local -r environment="$1" config_file="$2"
+
+    "$environment/bin/omi-collector" recover-state-journal --config "$config_file" \
+        || die 'candidate refused guarded Collector SQLite journal recovery'
 }
 
 function migrate_stopped_collector_state {
@@ -680,6 +698,7 @@ declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user
 declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
 declare state_file
+declare migration_preflight_state
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
 declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0
@@ -861,13 +880,19 @@ persist_sealed_tree "$staged_environment" "$deployments_dir" "$sealer_python"
 screen_cutover_backup_space "$state_file" "$sealer_python"
 validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
 provision_operator_data_access "${state_file%/collector/collector-state.sqlite3}" "$account_user" "$operator_group"
-check_candidate_state_migration "$staged_environment" "$config_file" 'false'
+check_candidate_state_migration "$staged_environment" "$config_file" 'false' migration_preflight_state
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"
 [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
 prepare_service_singleton_lock "${state_file%/*}/collector.lock" "$runuser_bin" "$account_user" "$account_group" \
     || die 'could not prepare the stable Collector singleton lock for migration'
-check_candidate_state_migration "$staged_environment" "$config_file" 'true'
+check_candidate_state_migration "$staged_environment" "$config_file" 'true' migration_preflight_state
+if [[ "$migration_preflight_state" == 'recovery_required' ]]; then
+    recover_stopped_canonical_journal "$staged_environment" "$config_file"
+    check_candidate_state_migration "$staged_environment" "$config_file" 'true' migration_preflight_state
+    [[ "$migration_preflight_state" == 'compatible' ]] \
+        || die 'Collector state still needs recovery after guarded SQLite rollback'
+fi
 selection_published=1
 publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"
 migrate_stopped_collector_state "$current_link" "$config_file" "$state_file" \

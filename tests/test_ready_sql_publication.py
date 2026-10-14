@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import shutil
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing, contextmanager
@@ -29,6 +30,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     _TypedStage,
     finalize_typed_sources,
 )
+from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 from omi_collector.config import ReadyConfig
 from omi_collector.state_migration import open_runtime_state
 from omi_collector.storage_layout import load_operator_config
@@ -302,6 +304,153 @@ def test_sql_stage_rebuilds_after_interruption(tmp_path: Path, monkeypatch: pyte
     outcome = _publish(store, (source,), ready)
     assert outcome.state is ReadyOutcomeState.PUBLISHED
     assert not tuple(path for path in ready.iterdir() if path.name.startswith("."))
+    store.close()
+
+
+@pytest.mark.parametrize("target", ("file", "manifest", "stage", "parent"))
+def test_sql_ready_durability_failure_latches_stage_and_preserves_custody(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    store = InternalAudioStore(database)
+    raw = _record(100, 1)
+    source = _source(store, "a" * 32, 100, (raw,))
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+    original_fsync = ready_bundles.os.fsync
+    failed = False
+
+    def fail_target(descriptor: int) -> None:
+        nonlocal failed
+        descriptor_path = Path(f"/proc/self/fd/{descriptor}").readlink()
+        matches = {
+            "file": descriptor_path.name == "records.bin",
+            "manifest": descriptor_path.name == "manifest.json",
+            "stage": descriptor_path.name.endswith(".stage"),
+            "parent": descriptor_path == ready,
+        }
+        if matches[target] and not failed:
+            failed = True
+            raise OSError(5, "simulated READY durability failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(ready_bundles.os, "fsync", fail_target)
+    with pytest.raises(ReadyBundleError, match="durability I/O failure"):
+        _publish(store, (source,), ready)
+    assert failed
+
+    with closing(database.open_connection(read_only=True)) as connection:
+        stage = cast(
+            tuple[str, str],
+            connection.execute(
+                "SELECT p.lifecycle, s.failure_reason FROM publication_cohort AS p, ready_output_stage AS s"
+            ).fetchone(),
+        )
+        source_rows = connection.execute(
+            "SELECT lifecycle, committed_count, (SELECT count(*) FROM capture_record WHERE source_id=?) "
+            "FROM capture_source WHERE source_id=?",
+            (source._source_id, source._source_id),
+        ).fetchone()
+    assert stage == ("staging", "durability_io_error")
+    assert source_rows == ("sealed_waiting", 1, 1)
+    assert database.list(StateKind.READY_PUBLICATION) == ()
+
+    with pytest.raises(ReadyBundleError, match="durability I/O failure"):
+        _publish(store, (source,), ready)
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM capture_record WHERE source_id=?", (source._source_id,)
+            ).fetchone()[0]
+            == 1
+        )
+    store.close()
+
+
+def test_sql_ready_durability_latch_failure_propagates_shared_fatal_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    store = InternalAudioStore(database)
+    source = _source(store, "a" * 32, 100, (_record(100, 1),))
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError(5, "simulated EIO")
+
+    monkeypatch.setattr(ready_bundles.os, "fsync", fail_fsync)
+    original_commit = store._commit
+    commits = 0
+
+    def fail_latch_commit() -> None:
+        nonlocal commits
+        commits += 1
+        if commits == 3:
+            raise sqlite3.DatabaseError("simulated latch SQL failure")
+        original_commit()
+
+    monkeypatch.setattr(store, "_commit", fail_latch_commit)
+    with pytest.raises(FatalInternalAudioStorageError):
+        _publish(store, (source,), ready)
+    assert commits == 3
+    store.close()
+
+
+def test_sql_restart_reuses_materialized_output_before_rejecting_second_copy_for_space(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    store = InternalAudioStore(database)
+    first_raw = _record(100, 1)
+    second_raw = _record(103, 2)
+    first = _source(store, "a" * 32, 100, (first_raw,))
+    second = _source(store, "b" * 32, 103, (second_raw,))
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+    original_commit = ready_bundles._commit_typed_stage_once
+
+    def stop_after_materialization(*_args: object, **_kwargs: object) -> None:
+        raise ReadyBundleError("simulated restart after materialization")
+
+    monkeypatch.setattr(ready_bundles, "_commit_typed_stage_once", stop_after_materialization)
+    with pytest.raises(ReadyBundleError, match="after materialization"):
+        _publish(store, (first, second), ready, frontier=104)
+    monkeypatch.setattr(ready_bundles, "_commit_typed_stage_once", original_commit)
+    first_destination = tuple(path for path in ready.iterdir() if not path.name.startswith("."))
+    assert len(first_destination) == 1
+    assert first_destination[0].joinpath("records.bin").read_bytes() == first_raw
+
+    class _Space:
+        f_frsize = 4096
+
+        def __init__(self, available: int) -> None:
+            self.f_bavail = available
+
+    statvfs_calls = 0
+
+    def changing_space(_path: Path) -> _Space:
+        nonlocal statvfs_calls
+        statvfs_calls += 1
+        return _Space(10**9 if statvfs_calls == 1 else 0)
+
+    monkeypatch.setattr(ready_bundles.os, "statvfs", changing_space)
+    with pytest.raises(ReadyBundleError, match="insufficient filesystem space"):
+        _publish(store, (first, second), ready, frontier=104)
+    assert statvfs_calls == 2
+    assert first_destination[0].joinpath("records.bin").read_bytes() == first_raw
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM capture_record WHERE source_id=?", (second._source_id,)
+        ).fetchone()[0] == 1
     store.close()
 
 
@@ -909,6 +1058,58 @@ def test_sql_stage_reuses_frozen_clock_mapping_after_restart(tmp_path: Path, mon
     assert b'"observation_id":"old"' in manifest
     assert b'"observation_id":"new"' not in manifest
     store.close()
+
+
+def test_staging_restart_resumes_persisted_group_instead_of_replanning_ready_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    store = InternalAudioStore(database)
+    records = (_record(100, 1), _record(101, 2), _record(102, 3))
+    source = _source(store, "a" * 32, 100, records)
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+
+    seed_database = StateDB(tmp_path / "seed.sqlite3")
+    with InternalAudioStore(seed_database) as seed_store:
+        middle = _source(seed_store, "f" * 32, 101, (records[1],))
+        seed_ready = tmp_path / "seed-ready"
+        seed_ready.mkdir()
+        seed_ready.chmod(0o2750)
+        seeded = _publish(seed_store, (middle,), seed_ready, frontier=102)
+        installed = seeded.published[0]
+        shutil.copytree(installed.path, ready / installed.bundle_id)
+    for item_id, payload in seed_database.list(StateKind.READY_PUBLICATION):
+        database.put(StateKind.READY_PUBLICATION, item_id, payload)
+
+    import omi_collector.capture.adapters.ready_bundles as ready_bundles
+
+    original = ready_bundles._write_typed_stage
+
+    def stop_after_intent(*_args: object, **_kwargs: object) -> None:
+        raise OSError("stop after authoritative stage intent")
+
+    monkeypatch.setattr(ready_bundles, "_write_typed_stage", stop_after_intent)
+    with pytest.raises(ReadyBundleError, match="could not be published"):
+        _publish(store, (source,), ready, frontier=103)
+    with closing(database.open_connection(read_only=True)) as connection:
+        frozen = cast(
+            tuple[int, int],
+            connection.execute("SELECT start_ordinal,record_count FROM ready_stage_range").fetchone(),
+        )
+    assert frozen == (0, 1)
+    store.close()
+
+    monkeypatch.setattr(ready_bundles, "_write_typed_stage", original)
+    with InternalAudioStore(database) as restarted:
+        outcome = _publish(restarted, (_Source(restarted, source._source_id),), ready, frontier=103)
+
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    assert tuple(result.path.joinpath("records.bin").read_bytes() for result in outcome.published) == (
+        records[0],
+        records[2],
+    )
 
 
 def test_sql_subrange_reads_bound_each_page_and_source_lookup_scales_with_pages(tmp_path: Path) -> None:

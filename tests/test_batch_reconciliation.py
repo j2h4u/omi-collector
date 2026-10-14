@@ -54,7 +54,14 @@ from omi_collector.capture.domain.ring_protocol import (
     RingStatus,
 )
 from omi_collector.config import DEFAULT_CONFIG, WriterConfig
-from staging_test_factory import StagingStore, attempt_records, attempt_source, closure_payload, closure_rows
+from staging_test_factory import (
+    StagingStore,
+    attempt_records,
+    attempt_source,
+    closure_payload,
+    closure_rows,
+    storage_call,
+)
 
 
 def _record(value: int) -> bytes:
@@ -70,21 +77,24 @@ def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
 
 
 def _seed_partial(spool: Path, capture_root: Path) -> tuple[StagingStore, CaptureSource, tuple[bytes, ...]]:
-    store = StagingStore(spool, capture_root)
-    attempt = store.prepare_streaming_attempt(100, 2)
-    try:
-        attempt.prepare_leg(100, 2)
-        attempt.record_read_begin(ReadBeginNotification(100, 2))
-        attempt.accept_chunk(100, _record(100))
-        prefix = attempt.checkpoint()
-    finally:
-        attempt.close(durable=True)
+    def seed() -> tuple[StagingStore, CaptureSource, tuple[bytes, ...]]:
+        store = StagingStore(spool, capture_root)
+        attempt = store.prepare_streaming_attempt(100, 2)
+        try:
+            attempt.prepare_leg(100, 2)
+            attempt.record_read_begin(ReadBeginNotification(100, 2))
+            attempt.accept_chunk(100, _record(100))
+            prefix = attempt.checkpoint()
+        finally:
+            attempt.close(durable=True)
 
-    assert prefix.next_sequence == 101
-    descriptor = store.pending_attempts()[0]
-    source = attempt_source(store, descriptor.attempt_id)
-    assert source is not None
-    return store, source, attempt_records(store, descriptor.attempt_id)
+        assert prefix.next_sequence == 101
+        descriptor = store.pending_attempts()[0]
+        source = attempt_source(store, descriptor.attempt_id)
+        assert source is not None
+        return store, source, attempt_records(store, descriptor.attempt_id)
+
+    return storage_call(seed)
 
 
 @_async_test
@@ -387,11 +397,11 @@ class _WriterProxy:
     async def publish_prefix(self) -> SealResultShape | DurableSealShape | None:
         return await self.writer.publish_prefix()
 
-    async def close(self, *, timeout: float) -> None:
+    async def close(self) -> None:
         if self.restore_clock is not None:
             restore, self.restore_clock = self.restore_clock, None
             restore()
-        await self.writer.close(timeout=timeout)
+        await self.writer.close()
         if self.close_fault is not None:
             raise self.close_fault
 
@@ -457,7 +467,7 @@ class _Runtime(OpportunisticRuntime):
 async def _close_real_writers(runtime: _Runtime) -> None:
     for proxy in runtime.proxies:
         if proxy.thread.is_alive():
-            await proxy.writer.close(timeout=DEFAULT_CONFIG.transfer.sync_timeout_seconds)
+            await proxy.writer.close()
         assert not proxy.thread.is_alive()
 
 
@@ -548,7 +558,7 @@ def _install_confirmed_loss_retry_observers(
 
 
 def _assert_confirmed_loss(store: StagingStore, loss_id: str) -> None:
-    [fact] = read_confirmed_losses(store.state_db)
+    [fact] = storage_call(lambda: read_confirmed_losses(store.state_db))
     assert fact.loss_id == loss_id
     assert (fact.start_sequence, fact.end_sequence) == (101, 103)
     assert fact.missing_record_count == 2
@@ -1035,7 +1045,7 @@ async def test_read_failure_preserves_transfer_error_while_progress_callback_is_
     ("primary_kind", "close_error", "expected_kind"),
     [
         ("ordinary", WriterError("recognized close failure"), "primary"),
-        ("writer", TimeoutError("recognized close timeout"), "cause"),
+        ("writer", WriterError("recognized close failure"), "cause"),
         ("ordinary", RuntimeError("unexpected close failure"), "close"),
         ("ordinary", WriterFailedError("recognized writer-failed close"), "primary"),
     ],
@@ -1076,7 +1086,12 @@ async def test_admission_error_precedence_closes_real_writer(
         await session.close()
 
 
-async def _admit_partial_and_cancel(reconciler: BatchReconciler, runtime: _Runtime) -> ScriptedRingSession:
+async def _admit_partial_and_cancel(
+    reconciler: BatchReconciler,
+    runtime: _Runtime,
+    *,
+    expected_interrupt_error: BaseException | None = None,
+) -> ScriptedRingSession:
     read = WriteStep(
         b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big"),
         (_wire_begin(100, 2), _wire_record(100)),
@@ -1100,6 +1115,10 @@ async def _admit_partial_and_cancel(reconciler: BatchReconciler, runtime: _Runti
             await task
         except asyncio.CancelledError:
             return session
+        except BaseException as error:
+            if error is expected_interrupt_error:
+                return session
+            raise
         raise AssertionError("connected collection should remain active until cancelled")
     except BaseException:
         if not task.done():
@@ -1140,10 +1159,11 @@ async def test_finalize_retains_first_checkpoint_error_when_late_seal_is_absent(
     runtime = _Runtime()
     first = OSError("checkpoint failed")
     runtime.checkpoint_fault = first
-    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
+    interrupt_error = WriterError("interruption acknowledgement failed")
+    runtime.interrupt_fault = interrupt_error
     runtime.late_seal_fault = late_fault
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
-    session = await _admit_partial_and_cancel(reconciler, runtime)
+    session = await _admit_partial_and_cancel(reconciler, runtime, expected_interrupt_error=interrupt_error)
     source_id = runtime.proxies[0].attempt_id
     try:
         result = await reconciler.finalize_active()
@@ -1322,19 +1342,20 @@ async def test_finalize_sealed_batch_skips_checkpoint_and_second_seal_adoption(t
 
 @pytest.mark.parametrize(
     "close_error",
-    [OSError("close failed"), CollectorTimeoutError("close timed out"), WriterError("writer close failed")],
-    ids=["oserror", "timeout", "writer"],
+    [OSError("close failed"), WriterError("writer close failed")],
+    ids=["oserror", "writer"],
 )
 @_async_test
 async def test_failed_close_does_not_adopt_seal_again(tmp_path: Path, close_error: BaseException) -> None:
     runtime = _Runtime()
     checkpoint_error = OSError("checkpoint failed")
     runtime.checkpoint_fault = checkpoint_error
-    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
+    interrupt_error = WriterError("interruption acknowledgement failed")
+    runtime.interrupt_fault = interrupt_error
     runtime.close_fault = close_error
     runtime.late_seal_fault = RuntimeError("late adoption is forbidden after failed close")
     _store, reconciler = _make_reconciler(tmp_path, runtime, _options())
-    session = await _admit_partial_and_cancel(reconciler, runtime)
+    session = await _admit_partial_and_cancel(reconciler, runtime, expected_interrupt_error=interrupt_error)
     source_id = runtime.proxies[0].attempt_id
     try:
         result = await reconciler.finalize_active()
@@ -1351,11 +1372,12 @@ async def test_failed_close_does_not_adopt_seal_again(tmp_path: Path, close_erro
 
 
 @_async_test
-async def test_checkpoint_after_session_times_out_at_exact_writer_deadline(
+async def test_checkpoint_after_session_propagates_writer_error_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = _Runtime()
-    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
+    interrupt_error = WriterError("interruption acknowledgement failed")
+    runtime.interrupt_fault = interrupt_error
     timeout = 1.0
     sleep_calls: list[float] = []
 
@@ -1365,7 +1387,7 @@ async def test_checkpoint_after_session_times_out_at_exact_writer_deadline(
 
     options = replace(_options(), timeouts=TransferTimeouts(1, timeout), sleep=forbidden_sleep)
     _store, reconciler = _make_reconciler(tmp_path, runtime, options)
-    session = await _admit_partial_and_cancel(reconciler, runtime)
+    session = await _admit_partial_and_cancel(reconciler, runtime, expected_interrupt_error=interrupt_error)
     loop = asyncio.get_running_loop()
     original_time = loop.time
     fake_now = [original_time()]
@@ -1375,9 +1397,9 @@ async def test_checkpoint_after_session_times_out_at_exact_writer_deadline(
     proxy.checkpoint_hook = lambda: fake_now.__setitem__(0, fake_now[0] + timeout)
     monkeypatch.setattr(loop, "time", lambda: fake_now[0])
     try:
-        with pytest.raises(CollectorTimeoutError) as caught:
+        with pytest.raises(WriterError) as caught:
             await reconciler.checkpoint_after_session()
-        assert caught.value.__cause__ is not_ready
+        assert caught.value is not_ready
         assert sleep_calls == []
         assert proxy.checkpoint_calls == 1
         assert proxy.thread.is_alive()
@@ -1388,11 +1410,12 @@ async def test_checkpoint_after_session_times_out_at_exact_writer_deadline(
 
 
 @_async_test
-async def test_finalize_times_out_at_exact_writer_deadline_without_retry(
+async def test_finalize_propagates_checkpoint_error_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = _Runtime()
-    runtime.interrupt_fault = WriterError("interruption acknowledgement failed")
+    interrupt_error = WriterError("interruption acknowledgement failed")
+    runtime.interrupt_fault = interrupt_error
     timeout = 1.0
     sleep_calls: list[float] = []
 
@@ -1402,7 +1425,7 @@ async def test_finalize_times_out_at_exact_writer_deadline_without_retry(
 
     options = replace(_options(), timeouts=TransferTimeouts(1, timeout), sleep=forbidden_sleep)
     _store, reconciler = _make_reconciler(tmp_path, runtime, options)
-    session = await _admit_partial_and_cancel(reconciler, runtime)
+    session = await _admit_partial_and_cancel(reconciler, runtime, expected_interrupt_error=interrupt_error)
     loop = asyncio.get_running_loop()
     original_time = loop.time
     fake_now = [original_time()]
@@ -1414,8 +1437,7 @@ async def test_finalize_times_out_at_exact_writer_deadline_without_retry(
     monkeypatch.setattr(loop, "time", lambda: fake_now[0])
     try:
         result = await reconciler.finalize_active()
-        assert isinstance(result.checkpoint_error, CollectorTimeoutError)
-        assert result.checkpoint_error.__cause__ is not_ready
+        assert result.checkpoint_error is not_ready
         assert result.close_error is None
         assert sleep_calls == []
         assert not proxy.thread.is_alive()

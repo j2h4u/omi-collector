@@ -155,7 +155,7 @@ def test_child_task_publishes_after_writer_releases(tmp_path: Path) -> None:
 
     async def publish_from_child_task() -> object | None:
         async def publish() -> object | None:
-            return store.publish_ready()
+            return await asyncio.to_thread(store.publish_ready)
 
         return await asyncio.create_task(publish())
 

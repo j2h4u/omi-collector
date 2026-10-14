@@ -85,10 +85,10 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
     async def visit() -> None:
         await maintenance.enter_capture_priority()
         try:
-            assert load(store.state_db)[0].reason == "collecting"
-            assert store.publish_ready().reason == "capture_active"
+            assert (await asyncio.to_thread(load, store.state_db))[0].reason == "collecting"
+            assert (await asyncio.to_thread(store.publish_ready)).reason == "capture_active"
         finally:
-            maintenance.exit_capture_priority()
+            await maintenance.exit_capture_priority()
             await maintenance.close()
 
     asyncio.run(visit())

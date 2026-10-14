@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
 import stat
+import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import cast, overload
 from urllib.parse import quote
 
 from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
+from .sqlite_admission import admit_exclusive
 
 _SCHEMA_VERSION = 2
 _LEGACY_SCHEMA_VERSION = 1
@@ -130,7 +133,10 @@ class _Operations:
             cursor = self._connection.execute("DELETE FROM state WHERE kind = ? AND id = ?", (kind.value, item_id))
         except sqlite3.DatabaseError as error:
             raise _database_failure("state database delete failed", error) from error
-        return cursor.rowcount == 1
+        try:
+            return cursor.rowcount == 1
+        finally:
+            cursor.close()
 
 
 class StateTransaction(_Operations):
@@ -192,6 +198,98 @@ class StateTransaction(_Operations):
             self._bump_generation()
 
 
+class _GuardedCursor(sqlite3.Cursor):
+    """Reject a stale raw handle before it touches a different write owner."""
+
+    _state_db: StateDB
+    _owner: sqlite3.Connection
+
+    def _check(self) -> None:
+        self._state_db._check_sql_thread(self._owner)
+
+    def execute(self, sql: str, parameters: object = (), /) -> _GuardedCursor:
+        self._check()
+        super().execute(sql, cast(tuple[object, ...] | dict[str, object], parameters))
+        return self
+
+    def executemany(self, sql: str, parameters: Iterable[object], /) -> _GuardedCursor:
+        self._check()
+        super().executemany(sql, cast(Iterable[tuple[object, ...] | dict[str, object]], parameters))
+        return self
+
+    def fetchone(self) -> sqlite3.Row | None:
+        self._check()
+        return cast(sqlite3.Row | None, super().fetchone())
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        self._check()
+        return cast(list[sqlite3.Row], super().fetchall())
+
+    def fetchmany(self, size: int | None = 1) -> list[sqlite3.Row]:
+        self._check()
+        return cast(list[sqlite3.Row], super().fetchmany(size))
+
+    def __next__(self) -> sqlite3.Row:
+        self._check()
+        return cast(sqlite3.Row, super().__next__())
+
+
+class _GuardedConnection(sqlite3.Connection):
+    """Retain the shared-instance check even for a previously opened handle."""
+
+    _state_db: StateDB
+
+    def bind(self, state_db: StateDB) -> None:
+        self._state_db = state_db
+
+    def _check(self) -> None:
+        self._state_db._check_sql_thread(self)
+
+    @overload
+    def cursor(self, factory: None = None) -> sqlite3.Cursor: ...
+
+    @overload
+    def cursor[CursorT: sqlite3.Cursor](self, factory: Callable[[sqlite3.Connection], CursorT]) -> CursorT: ...
+
+    def cursor(self, factory: Callable[[sqlite3.Connection], sqlite3.Cursor] | None = None) -> sqlite3.Cursor:
+        self._check()
+        if factory not in {None, _GuardedCursor}:
+            raise StateDBError("custom state database cursors are unsupported")
+        cursor = cast(_GuardedCursor, super().cursor(factory=_GuardedCursor))
+        cursor._state_db = self._state_db
+        cursor._owner = self
+        return cursor
+
+    def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+        self._check()
+        return self.cursor().execute(sql, cast(tuple[object, ...] | dict[str, object], parameters))
+
+    def executemany(self, sql: str, parameters: Iterable[object], /) -> sqlite3.Cursor:
+        self._check()
+        return self.cursor().executemany(sql, cast(Iterable[tuple[object, ...] | dict[str, object]], parameters))
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        self._check()
+        return super().executescript(sql_script)
+
+    def commit(self) -> None:
+        self._check()
+        super().commit()
+
+    def rollback(self) -> None:
+        self._check()
+        super().rollback()
+
+
+def _guarded_connect(uri: str, state_db: StateDB) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None, factory=_GuardedConnection
+    )
+    if isinstance(connection, _GuardedConnection):
+        connection.bind(state_db)
+    return connection
+
+
 class StateDB(_Operations):
     """Thread-safe facade; each call owns and closes its SQLite connection."""
 
@@ -199,6 +297,7 @@ class StateDB(_Operations):
         self.path = Path(path).absolute()
         self.read_only = read_only
         self._active = threading.local()
+        self._access_lock = threading.RLock()
         self._allow_create = not read_only and not self.path.exists()
         if read_only:
             _require_directory(self.path.parent)
@@ -207,7 +306,92 @@ class StateDB(_Operations):
             _ensure_directory(self.path.parent)
             self._initialize()
 
+    def _check_sql_thread(self, connection: sqlite3.Connection) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise StateDBError("state database access on the event-loop thread")
+        owner = getattr(self._active, "write_connection", None)
+        if owner is not None and owner is not connection:
+            raise StateDBError("another state connection owns the write transaction")
+
+    @contextmanager
+    def access(self, connection: sqlite3.Connection | None = None) -> Iterator[None]:
+        """Serialize this instance's active SQL, including cursor and transaction life."""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise StateDBError("state database access on the event-loop thread")
+        with self._access_lock:
+            owner = getattr(self._active, "write_connection", None)
+            if owner is not None and owner is not connection:
+                raise StateDBError("another state connection owns the write transaction")
+            self._active.access_depth = getattr(self._active, "access_depth", 0) + 1
+            try:
+                yield
+            finally:
+                self._active.access_depth -= 1
+                if self._active.access_depth == 0:
+                    owner = cast(sqlite3.Connection | None, getattr(self._active, "write_connection", None))
+                    if owner is not None:
+                        if owner.in_transaction:
+                            raise StateDBError("state write transaction escaped its access guard")
+                        self._active.write_connection = None
+
+    def begin_exclusive(self, connection: sqlite3.Connection) -> None:
+        """Admit this guarded connection as this thread's sole write owner."""
+
+        if getattr(self._active, "access_depth", 0) == 0:
+            raise StateDBError("write admission requires the state access guard")
+        owner = getattr(self._active, "write_connection", None)
+        if owner is not None and owner is not connection:
+            raise StateDBError("another state connection owns the write transaction")
+        admit_exclusive(connection)
+        self._active.write_connection = connection
+
+    def end_write(self, connection: sqlite3.Connection) -> None:
+        """Release ownership only after the transaction has actually ended."""
+
+        if getattr(self._active, "access_depth", 0) == 0:
+            raise StateDBError("write completion requires the state access guard")
+        if getattr(self._active, "write_connection", None) is not connection:
+            raise StateDBError("state write owner is invalid")
+        if connection.in_transaction:
+            raise StateDBError("state write transaction is still active")
+        self._active.write_connection = None
+
+    def _close_managed_write(self, connection: sqlite3.Connection) -> None:
+        """Retain a prior corruption fatal if rollback itself could not settle."""
+
+        if getattr(self._active, "write_connection", None) is connection:
+            if connection.in_transaction:
+                pending = sys.exception()
+                try:
+                    connection.close()
+                except sqlite3.DatabaseError as close_error:
+                    if isinstance(pending, FatalInternalAudioStorageError):
+                        raise pending from close_error
+                    raise FatalInternalAudioStorageError("state write transaction could not be closed") from close_error
+                finally:
+                    self._active.write_connection = None
+                if not isinstance(pending, FatalInternalAudioStorageError):
+                    raise FatalInternalAudioStorageError(
+                        "state write transaction could not be rolled back"
+                    ) from pending
+                return
+            self.end_write(connection)
+        connection.close()
+
     def _connect(self) -> sqlite3.Connection:
+        with self.access():
+            return self._connect_unlocked()
+
+    def _connect_unlocked(self) -> sqlite3.Connection:
         connection: sqlite3.Connection | None = None
         try:
             if self.path.is_symlink():
@@ -216,7 +400,7 @@ class StateDB(_Operations):
                 raise StateDBError("state database does not exist")
             mode = "ro" if self.read_only else "rwc" if self._allow_create and not self.path.exists() else "rw"
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
-            connection = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+            connection = _guarded_connect(uri, self)
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             connection.execute("PRAGMA synchronous = EXTRA")
@@ -240,12 +424,16 @@ class StateDB(_Operations):
             raise
 
     def _initialize(self) -> None:
-        connection = self._connect()
+        with self.access():
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
+        connection = self._connect_unlocked()
         try:
             mode = _fetchone(connection.execute("PRAGMA journal_mode = DELETE"))
             if mode is None or _row_text(mode, 0).lower() != "delete":
                 raise StateDBError("state database journal mode is unsupported")
-            connection.execute("BEGIN IMMEDIATE")
+            self.begin_exclusive(connection)
             version = _user_version(connection)
             tables = {
                 name
@@ -276,10 +464,14 @@ class StateDB(_Operations):
             _rollback(connection)
             raise
         finally:
-            connection.close()
+            self._close_managed_write(connection)
 
     def _validate_existing(self) -> None:
-        connection = self._connect()
+        with self.access():
+            self._validate_existing_locked()
+
+    def _validate_existing_locked(self) -> None:
+        connection = self._connect_unlocked()
         try:
             version = _user_version(connection)
             tables = {
@@ -305,23 +497,27 @@ class StateDB(_Operations):
         self._ensure_outside_transaction()
         if write and self.read_only:
             raise StateDBError("state database is read-only")
-        connection = self._connect()
-        try:
-            if write:
-                connection.execute("BEGIN IMMEDIATE")
-            yield connection
-            if write:
-                connection.commit()
-        except sqlite3.DatabaseError as error:
-            if write:
-                _rollback(connection)
-            raise _database_failure("state database transaction failed", error) from error
-        except BaseException:
-            if write:
-                _rollback(connection)
-            raise
-        finally:
-            connection.close()
+        with self.access():
+            connection = self._connect_unlocked()
+            try:
+                if write:
+                    self.begin_exclusive(connection)
+                yield connection
+                if write:
+                    connection.commit()
+            except sqlite3.DatabaseError as error:
+                if write:
+                    _rollback(connection)
+                raise _database_failure("state database transaction failed", error) from error
+            except BaseException:
+                if write:
+                    _rollback(connection)
+                raise
+            finally:
+                if write:
+                    self._close_managed_write(connection)
+                else:
+                    connection.close()
 
     def get(self, kind: StateKind, item_id: str) -> dict[str, object] | None:
         with self._connection_for_call() as connection:
@@ -348,23 +544,24 @@ class StateDB(_Operations):
         self._ensure_outside_transaction()
         if self.read_only:
             raise StateDBError("state database is read-only")
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._active.in_transaction = True
-            transaction = StateTransaction(connection)
-            yield transaction
-            transaction.finish()
-            connection.commit()
-        except sqlite3.DatabaseError as error:
-            _rollback(connection)
-            raise _database_failure("state database transaction failed", error) from error
-        except BaseException:
-            _rollback(connection)
-            raise
-        finally:
-            self._active.in_transaction = False
-            connection.close()
+        with self.access():
+            connection = self._connect_unlocked()
+            try:
+                self.begin_exclusive(connection)
+                self._active.in_transaction = True
+                transaction = StateTransaction(connection)
+                yield transaction
+                transaction.finish()
+                connection.commit()
+            except sqlite3.DatabaseError as error:
+                _rollback(connection)
+                raise _database_failure("state database transaction failed", error) from error
+            except BaseException:
+                _rollback(connection)
+                raise
+            finally:
+                self._active.in_transaction = False
+                self._close_managed_write(connection)
 
     def integrity_check(self) -> None:
         with self._connection_for_call() as connection:
@@ -377,6 +574,11 @@ class StateDB(_Operations):
 
     def open_connection(self, *, read_only: bool = False) -> sqlite3.Connection:
         """Open a configured connection for a persistent typed-store caller."""
+
+        with self.access():
+            return self._open_connection_unlocked(read_only=read_only)
+
+    def _open_connection_unlocked(self, *, read_only: bool = False) -> sqlite3.Connection:
 
         if self.path.is_symlink():
             raise StateDBError("state database must not be a symlink")
@@ -391,7 +593,7 @@ class StateDB(_Operations):
         connection: sqlite3.Connection | None = None
         try:
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
-            connection = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+            connection = _guarded_connect(uri, self)
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             connection.execute("PRAGMA synchronous = EXTRA")
@@ -471,14 +673,20 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _fetchone(cursor: sqlite3.Cursor) -> sqlite3.Row | None:
-    result = cast(object, cursor.fetchone())
+    try:
+        result = cast(object, cursor.fetchone())
+    finally:
+        cursor.close()
     if result is not None and not isinstance(result, sqlite3.Row):
         raise StateDBError("state database returned an invalid row")
     return result
 
 
 def _fetchall(cursor: sqlite3.Cursor) -> list[sqlite3.Row]:
-    result = cast(object, cursor.fetchall())
+    try:
+        result = cast(object, cursor.fetchall())
+    finally:
+        cursor.close()
     if not isinstance(result, list):
         raise StateDBError("state database returned invalid rows")
     rows: list[sqlite3.Row] = []

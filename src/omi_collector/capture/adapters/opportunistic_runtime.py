@@ -7,6 +7,7 @@ from threading import Thread
 from typing import cast
 
 from ...config import FirmwareObservationConfig, WriterConfig
+from ..application.owned_work import join_owned, joined_to_thread
 from ..application.ports import (
     BatchWriterPort,
     CaptureRuntimePort,
@@ -19,6 +20,7 @@ from ..application.ports import (
     StagingPort,
     StagingWriterTargetPort,
 )
+from ..application.storage_fault import FatalInternalAudioStorageError
 from ..domain.operational_status_machine import PublicationOutcome
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .attempt_writer import AttemptWriter, WriterError, WriterFailedError, WriterProgress
@@ -119,11 +121,15 @@ class _BatchWriter:
     async def start(self) -> None:
         if self._initial_prefix is not None:
             return
-        result = await self._writer.start()
-        if not isinstance(result, DurablePrefixShape):
-            raise TypeError("writer returned an invalid initial durable prefix")
-        self._attempt_id = self._target.attempt_id
-        self._initial_prefix = result
+
+        async def settle() -> None:
+            result = await self._writer.start()
+            if not isinstance(result, DurablePrefixShape):
+                raise TypeError("writer returned an invalid initial durable prefix")
+            self._attempt_id = self._target.attempt_id
+            self._initial_prefix = result
+
+        await join_owned(settle())
 
     @property
     def initial_prefix(self) -> DurablePrefixShape:
@@ -137,11 +143,14 @@ class _BatchWriter:
         return self._interrupted_prefix
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefixShape:
-        result = await self._writer.prepare_leg(start_sequence, record_count)
-        if not isinstance(result, DurablePrefixShape):
-            raise TypeError("writer returned an invalid durable prefix")
-        self._interrupted_prefix = None
-        return result
+        async def settle() -> DurablePrefixShape:
+            result = await self._writer.prepare_leg(start_sequence, record_count)
+            if not isinstance(result, DurablePrefixShape):
+                raise TypeError("writer returned an invalid durable prefix")
+            self._interrupted_prefix = None
+            return result
+
+        return await join_owned(settle())
 
     async def read_begin(self, notice: ReadBeginNotification) -> object:
         return await self._writer.read_begin(notice)
@@ -159,11 +168,14 @@ class _BatchWriter:
         return result
 
     async def interrupt(self) -> DurablePrefixShape:
-        result = await self._writer.interrupt()
-        if not isinstance(result, DurablePrefixShape):
-            raise TypeError("writer returned an invalid interrupted prefix")
-        self._interrupted_prefix = result
-        return result
+        async def settle() -> DurablePrefixShape:
+            result = await self._writer.interrupt()
+            if not isinstance(result, DurablePrefixShape):
+                raise TypeError("writer returned an invalid interrupted prefix")
+            self._interrupted_prefix = result
+            return result
+
+        return await join_owned(settle())
 
     async def seal(self, done_notice: DoneNotification) -> SealResultShape | DurableSealShape:
         result = await self._writer.seal(done_notice)
@@ -183,8 +195,8 @@ class _BatchWriter:
             raise TypeError("writer returned an invalid prefix publication")
         return result
 
-    async def close(self, *, timeout: float) -> None:
-        await self._writer.close(timeout=timeout)
+    async def close(self) -> None:
+        await self._writer.close()
 
     def publish(self, high_water: int, tail: bytes = b"") -> bool:
         return self._writer.publish(high_water, tail)
@@ -275,3 +287,28 @@ class OpportunisticRuntime(CaptureRuntimePort):
 
     def debug_exception(self, event: str, error: BaseException, **fields: object) -> None:
         cast(Callable[..., None], debug_exception)(event, error, **fields)
+
+
+async def create_quality_metrics_owned[T](factory: Callable[..., T], *args: object, **kwargs: object) -> T:
+    """Own a quality factory result across cancellation and join any untransferred worker."""
+    settled: list[T] = []
+
+    def construct() -> T:
+        result = factory(*args, **kwargs)
+        settled.append(result)
+        return result
+
+    try:
+        return await joined_to_thread(construct)
+    except BaseException as primary:
+        if settled:
+            close = cast(Callable[[], object] | None, getattr(settled[0], "close", None))
+            if close is not None:
+                try:
+                    await joined_to_thread(close)
+                except FatalInternalAudioStorageError:
+                    raise
+                except BaseException:  # noqa: BLE001 - retain the primary factory outcome unless cleanup is fatal
+                    if isinstance(primary, FatalInternalAudioStorageError):
+                        raise primary from None
+        raise

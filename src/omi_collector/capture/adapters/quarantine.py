@@ -54,6 +54,20 @@ from .staging_filesystem import (
 )
 
 
+def _db_one(cursor: sqlite3.Cursor) -> sqlite3.Row | tuple[object, ...] | None:
+    try:
+        return cast(sqlite3.Row | tuple[object, ...] | None, cursor.fetchone())
+    finally:
+        cursor.close()
+
+
+def _db_all(cursor: sqlite3.Cursor) -> list[sqlite3.Row] | list[tuple[object, ...]]:
+    try:
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+
+
 class QuarantinePublishError(ValueError):
     """Typed quarantine evidence cannot authenticate a scheduler prefix."""
 
@@ -88,13 +102,18 @@ def _seconds_to_nanoseconds(seconds: float) -> int:
 def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
     """Return only parseable typed quarantine sources; opaque evidence is terminal."""
     try:
-        with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
-            rows = connection.execute(
-                "SELECT source_id FROM capture_source "
-                "WHERE source_type = 'quarantine' AND COALESCE(quarantine_opaque, 0) = 0 "
-                "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " "
-                "ORDER BY source_id"
-            ).fetchall()
+        with (
+            closing(filesystem.state_db.open_connection(read_only=True)) as connection,
+            filesystem.state_db.access(connection),
+        ):
+            rows = _db_all(
+                connection.execute(
+                    "SELECT source_id FROM capture_source "
+                    "WHERE source_type = 'quarantine' AND COALESCE(quarantine_opaque, 0) = 0 "
+                    "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " "
+                    "ORDER BY source_id"
+                )
+            )
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine inventory is unreadable") from error
@@ -105,14 +124,18 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
 @contextmanager
 def _typed_transaction(filesystem: StagingFilesystem) -> Iterator[sqlite3.Connection]:
     """Run one typed quarantine mutation with explicit rollback on failure."""
-    with closing(filesystem.state_db.open_connection()) as connection:
+    with closing(filesystem.state_db.open_connection()) as connection, filesystem.state_db.access(connection):
+        filesystem.state_db.begin_exclusive(connection)
         try:
-            connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except BaseException:
-            connection.rollback()
+            if connection.in_transaction:
+                connection.rollback()
             raise
+        finally:
+            if not connection.in_transaction:
+                filesystem.state_db.end_write(connection)
 
 
 def _typed_quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tuple[str, ...]:
@@ -120,11 +143,13 @@ def _typed_quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tup
         with _typed_transaction(filesystem) as connection:
             rows = cast(
                 list[tuple[object, object]],
-                connection.execute(
-                    "SELECT source_id, lifecycle FROM capture_source "
-                    "WHERE source_type = 'attempt' AND lifecycle IN "
-                    "('prepared','leg_prepared','receiving','interrupted') ORDER BY source_id"
-                ).fetchall(),
+                _db_all(
+                    connection.execute(
+                        "SELECT source_id, lifecycle FROM capture_source "
+                        "WHERE source_type = 'attempt' AND lifecycle IN "
+                        "('prepared','leg_prepared','receiving','interrupted') ORDER BY source_id"
+                    )
+                ),
             )
             source_ids = tuple(str(row[0]) for row in rows)
             for row in rows:
@@ -158,12 +183,14 @@ def _typed_quarantine_row(
         raise AttemptStateError(decision.reason)
     row = cast(
         tuple[object, object] | None,
-        connection.execute(
-            "SELECT committed_count, EXISTS (SELECT 1 FROM capture_record WHERE source_id = ?) "
-            "FROM capture_source "
-            "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
-            (source_id, source_id, lifecycle),
-        ).fetchone(),
+        _db_one(
+            connection.execute(
+                "SELECT committed_count, EXISTS (SELECT 1 FROM capture_record WHERE source_id = ?) "
+                "FROM capture_source "
+                "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
+                (source_id, source_id, lifecycle),
+            )
+        ),
     )
     if row is None:
         raise AttemptStateError("typed attempt changed before quarantine classification")
@@ -312,13 +339,15 @@ def _retention_clock_or_default(
 def _read_typed_admission_snapshot(connection: sqlite3.Connection, source_id: str) -> _TypedAdmissionSnapshot:
     row = cast(
         tuple[object, ...] | None,
-        connection.execute(
-            "SELECT lifecycle, sequence_start, committed_count, committed_sha256, "
-            "certified_prefix_count, coverage_digest, quarantine_opaque, quarantine_disposition, "
-            "terminal_time, retention_deadline, block_reason FROM capture_source "
-            "WHERE source_id = ? AND source_type = 'quarantine'",
-            (source_id,),
-        ).fetchone(),
+        _db_one(
+            connection.execute(
+                "SELECT lifecycle, sequence_start, committed_count, committed_sha256, "
+                "certified_prefix_count, coverage_digest, quarantine_opaque, quarantine_disposition, "
+                "terminal_time, retention_deadline, block_reason FROM capture_source "
+                "WHERE source_id = ? AND source_type = 'quarantine'",
+                (source_id,),
+            )
+        ),
     )
     if row is None:
         raise QuarantinePublishError("typed quarantine source does not exist")
@@ -374,10 +403,13 @@ _SOURCE_HOLD_CHANGES: dict[str, object] = {
 
 def _source_row(connection: sqlite3.Connection, source_id: str) -> tuple[tuple[str, ...], tuple[object, ...]] | None:
     cursor = connection.execute("SELECT * FROM capture_source WHERE source_id = ?", (source_id,))
-    row = cast(tuple[object, ...] | None, cursor.fetchone())
-    if row is None:
-        return None
-    return tuple(column[0] for column in cursor.description), tuple(row)
+    try:
+        row = cast(tuple[object, ...] | None, cursor.fetchone())
+        if row is None:
+            return None
+        return tuple(column[0] for column in cursor.description), tuple(row)
+    finally:
+        cursor.close()
 
 
 def _hold_source_authentication_mismatch(
@@ -425,7 +457,10 @@ def _reconcile_source_authentication_hold(
         raise_if_sqlite_storage_fault(error)
         raise StagingError("typed quarantine integrity hold failed before mutation") from error
     try:
-        with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(filesystem.state_db.open_connection(read_only=True)) as connection,
+            filesystem.state_db.access(connection),
+        ):
             durable_row = _source_row(connection, source_id)
     except (OSError, sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspect_error:
         raise_if_sqlite_corrupt(inspect_error)
@@ -451,7 +486,10 @@ def admit_quarantined_prefix(
     if should_defer():
         raise QuarantineSalvageDeferredError("quarantine admission deferred")
     try:
-        with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(filesystem.state_db.open_connection(read_only=True)) as connection,
+            filesystem.state_db.access(connection),
+        ):
             inspected = _read_typed_admission_snapshot(connection, source_id)
         if not inspected.certification_consistent:
             _hold_source_authentication_mismatch(filesystem, source_id, inspected)
@@ -495,9 +533,11 @@ def quarantine_attempt_source(filesystem: StagingFilesystem, attempt_id: str) ->
         with _typed_transaction(filesystem) as connection:
             row = cast(
                 tuple[object, object] | None,
-                connection.execute(
-                    "SELECT source_type, lifecycle FROM capture_source WHERE source_id = ?", (attempt_id,)
-                ).fetchone(),
+                _db_one(
+                    connection.execute(
+                        "SELECT source_type, lifecycle FROM capture_source WHERE source_id = ?", (attempt_id,)
+                    )
+                ),
             )
             if row is None:
                 raise AttemptStateError("typed quarantine source does not exist")
@@ -551,14 +591,16 @@ def _typed_terminalize_prefix(filesystem: StagingFilesystem, attempt_id: str) ->
         with _typed_transaction(filesystem) as connection:
             row = cast(
                 tuple[object, object, object] | None,
-                connection.execute(
-                    "SELECT lifecycle, committed_count, "
-                    "EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) OR "
-                    "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) OR "
-                    "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id) "
-                    "FROM capture_source WHERE source_id = ? AND source_type = 'attempt'",
-                    (attempt_id,),
-                ).fetchone(),
+                _db_one(
+                    connection.execute(
+                        "SELECT lifecycle, committed_count, "
+                        "EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) OR "
+                        "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) OR "
+                        "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id) "
+                        "FROM capture_source WHERE source_id = ? AND source_type = 'attempt'",
+                        (attempt_id,),
+                    )
+                ),
             )
             if row is None:
                 raise AttemptStateError("typed prefix source does not exist")
@@ -620,11 +662,13 @@ def _typed_mark_unprocessable(filesystem: StagingFilesystem, source_id: str, rea
         with _typed_transaction(filesystem) as connection:
             current = cast(
                 tuple[object, object, object, object, object] | None,
-                connection.execute(
-                    "SELECT lifecycle, quarantine_disposition, terminal_reason, retention_deadline, block_reason "
-                    "FROM capture_source WHERE source_id = ? AND source_type = 'quarantine'",
-                    (source_id,),
-                ).fetchone(),
+                _db_one(
+                    connection.execute(
+                        "SELECT lifecycle, quarantine_disposition, terminal_reason, retention_deadline, block_reason "
+                        "FROM capture_source WHERE source_id = ? AND source_type = 'quarantine'",
+                        (source_id,),
+                    )
+                ),
             )
             if current is None:
                 raise AttemptStateError("typed quarantine source does not exist")
@@ -707,11 +751,13 @@ def _typed_sweep_terminal_quarantine(
 def _classify_one_typed_opaque(filesystem: StagingFilesystem, connection: sqlite3.Connection, now: int) -> None:
     row = cast(
         tuple[object] | None,
-        connection.execute(
-            "SELECT source_id FROM capture_source WHERE source_type = 'quarantine' "
-            "AND quarantine_opaque = 1 AND quarantine_disposition = 'unclassified' "
-            "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " ORDER BY source_id LIMIT 1"
-        ).fetchone(),
+        _db_one(
+            connection.execute(
+                "SELECT source_id FROM capture_source WHERE source_type = 'quarantine' "
+                "AND quarantine_opaque = 1 AND quarantine_disposition = 'unclassified' "
+                "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " ORDER BY source_id LIMIT 1"
+            )
+        ),
     )
     if row is not None:
         _classify_typed_opaque(filesystem, connection, str(row[0]), (None, "blocked", "unclassified", 1), now)
@@ -738,14 +784,16 @@ def _canonical_delete_eligible_sql() -> str:
 def _next_expired_typed_source(connection: sqlite3.Connection, now: int) -> str | None:
     row = cast(
         tuple[object] | None,
-        connection.execute(
-            "SELECT source_id FROM capture_source WHERE " + _expired_typed_source_sql() + " AND ("
-            "EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) OR "
-            "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) OR "
-            "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id) OR "
-            "(" + _canonical_delete_eligible_sql() + ")) ORDER BY source_id LIMIT 1",
-            (now, now),
-        ).fetchone(),
+        _db_one(
+            connection.execute(
+                "SELECT source_id FROM capture_source WHERE " + _expired_typed_source_sql() + " AND ("
+                "EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) OR "
+                "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) OR "
+                "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id) OR "
+                "(" + _canonical_delete_eligible_sql() + ")) ORDER BY source_id LIMIT 1",
+                (now, now),
+            )
+        ),
     )
     return None if row is None else str(row[0])
 
@@ -755,11 +803,13 @@ def _sweep_one_typed_source(
 ) -> tuple[bool, int]:
     row = cast(
         tuple[object, object, object, object, object] | None,
-        connection.execute(
-            "SELECT retention_deadline, lifecycle, quarantine_disposition, quarantine_opaque, block_reason "
-            "FROM capture_source WHERE source_id = ?",
-            (source_id,),
-        ).fetchone(),
+        _db_one(
+            connection.execute(
+                "SELECT retention_deadline, lifecycle, quarantine_disposition, quarantine_opaque, block_reason "
+                "FROM capture_source WHERE source_id = ?",
+                (source_id,),
+            )
+        ),
     )
     if row is None or not _typed_retention_expired(row, now):
         return False, 0
@@ -798,11 +848,13 @@ def _sweep_one_typed_source(
 def _canonical_references(connection: sqlite3.Connection, source_id: str) -> tuple[bool, bool]:
     row = cast(
         tuple[object, object],
-        connection.execute(
-            "SELECT EXISTS (SELECT 1 FROM publication_cohort_member WHERE source_id = ?), "
-            "EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?)",
-            (source_id, source_id),
-        ).fetchone(),
+        _db_one(
+            connection.execute(
+                "SELECT EXISTS (SELECT 1 FROM publication_cohort_member WHERE source_id = ?), "
+                "EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?)",
+                (source_id, source_id),
+            )
+        ),
     )
     return bool(row[0]), bool(row[1])
 
@@ -916,13 +968,15 @@ def _classify_standalone_typed_evidence(
 def _sweep_one_expired_standalone(connection: sqlite3.Connection, now: int, limit: int) -> int:
     row = cast(
         tuple[object, object] | None,
-        connection.execute(
-            "SELECT evidence_id, disposition FROM capture_evidence WHERE source_id IS NULL "
-            "AND disposition IN ('published_prefix','unprocessable') "
-            "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
-            "AND CAST(retention_deadline AS INTEGER) <= ? ORDER BY evidence_id LIMIT 1",
-            (now,),
-        ).fetchone(),
+        _db_one(
+            connection.execute(
+                "SELECT evidence_id, disposition FROM capture_evidence WHERE source_id IS NULL "
+                "AND disposition IN ('published_prefix','unprocessable') "
+                "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
+                "AND CAST(retention_deadline AS INTEGER) <= ? ORDER BY evidence_id LIMIT 1",
+                (now,),
+            )
+        ),
     )
     if row is None:
         return 0
@@ -1068,14 +1122,19 @@ def _valid_quarantine_identity(entry_name: str, row: dict[str, object]) -> bool:
 def _quarantine_state(filesystem: StagingFilesystem, source_id: str) -> QuarantineState:
     """Classify one typed quarantine source without mutating its evidence."""
     try:
-        with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(filesystem.state_db.open_connection(read_only=True)) as connection,
+            filesystem.state_db.access(connection),
+        ):
             row = cast(
                 tuple[object, object] | None,
-                connection.execute(
-                    "SELECT quarantine_disposition, quarantine_opaque FROM capture_source "
-                    "WHERE source_id = ? AND source_type = 'quarantine'",
-                    (source_id,),
-                ).fetchone(),
+                _db_one(
+                    connection.execute(
+                        "SELECT quarantine_disposition, quarantine_opaque FROM capture_source "
+                        "WHERE source_id = ? AND source_type = 'quarantine'",
+                        (source_id,),
+                    )
+                ),
             )
         if row is None or row[1] == 1:
             return QuarantineState.INVALID_EVIDENCE
@@ -1096,14 +1155,19 @@ def assert_no_pending(filesystem: StagingFilesystem) -> None:
 def pending_attempts(filesystem: StagingFilesystem) -> tuple[AttemptDescriptor, ...]:
     """Return active partial attempts from typed SQL custody."""
     try:
-        with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(filesystem.state_db.open_connection(read_only=True)) as connection,
+            filesystem.state_db.access(connection),
+        ):
             rows = cast(
                 list[tuple[object, object, object]],
-                connection.execute(
-                    "SELECT source_id, sequence_start, sequence_limit FROM capture_source "
-                    "WHERE source_type = 'attempt' AND lifecycle IN "
-                    "('prepared','leg_prepared','receiving','interrupted') ORDER BY source_id"
-                ).fetchall(),
+                _db_all(
+                    connection.execute(
+                        "SELECT source_id, sequence_start, sequence_limit FROM capture_source "
+                        "WHERE source_type = 'attempt' AND lifecycle IN "
+                        "('prepared','leg_prepared','receiving','interrupted') ORDER BY source_id"
+                    )
+                ),
             )
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise_if_sqlite_storage_fault(error)

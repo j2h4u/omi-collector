@@ -14,6 +14,7 @@ from typing import cast
 
 import pytest
 
+import omi_collector.capture.adapters.ready_bundles as ready_bundles
 from omi_collector.capture.adapters.clock_segments import ClockSegment, ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import (
@@ -1495,3 +1496,37 @@ def test_sql_publication_stops_on_structured_corrupt_commit(
         assert raised.value.sqlite_errorcode == sqlite_errorcode
         assert store.get_source(source._source_id) is not None
         assert not tuple(ready.iterdir())
+
+
+def test_sql_publication_preserves_first_corruption_fatal_after_rollback_cleanup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(database) as store:
+        source = _source(store, "a" * 32, 100, (_record(100, 1),))
+        ready = tmp_path / "ready"
+        ready.mkdir()
+        ready.chmod(0o2750)
+        _original, injected = _fault_transaction(store, 1, rollback=True, sqlite_errorcode=sqlite3.SQLITE_CORRUPT)
+        monkeypatch.setattr(store, "publication_transaction", injected)
+        rollback = store._rollback
+
+        def failing_cleanup() -> None:
+            rollback()
+            raise RuntimeError("later cleanup failure")
+
+        monkeypatch.setattr(store, "_rollback", failing_cleanup)
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            _publish(store, (source,), ready)
+        assert raised.value.sqlite_errorcode == sqlite3.SQLITE_CORRUPT
+        assert store.get_source(source._source_id) is not None
+
+
+def test_sql_publication_read_helper_closes_materialized_cursor() -> None:
+    connection = sqlite3.connect(":memory:")
+    cursor = connection.execute("SELECT 1 UNION ALL SELECT 2")
+
+    assert ready_bundles._sql_all(cursor) == ((1,), (2,))
+    with pytest.raises(sqlite3.ProgrammingError):
+        cursor.fetchall()
+    connection.close()

@@ -123,6 +123,8 @@ class SQLiteQualityMetrics(QualityMetricsPort):
         self._state_lock = Lock()
         self._closed = False
         self._stop_enqueued = False
+        self._configured_pending = False
+        self._block_pending = False
         self._dropped_records = 0
         self._shutdown_timeout = config.shutdown_join_seconds
         self._logger = diagnostic_logger or logging.getLogger(__name__)
@@ -135,8 +137,9 @@ class SQLiteQualityMetrics(QualityMetricsPort):
         self._thread.start()
 
     def set_operational_signal(self, callback: Callable[[OperationalSignal], None]) -> None:
-        self._operational_signal = callback
-        self._signal(OperationalSignal.CONFIGURED)
+        with self._state_lock:
+            self._operational_signal = callback
+            self._configured_pending = True
 
     def set_fatal_callback(self, callback: Callable[[FatalInternalAudioStorageError], None]) -> None:
         with self._state_lock:
@@ -198,6 +201,7 @@ class SQLiteQualityMetrics(QualityMetricsPort):
                             self._queue.get_nowait()
                         except queue.Empty:
                             continue
+                        self._block_pending = True
                         drop_reason = "shutdown_queue_overflow"
         if drop_reason is not None:
             self._record_drop(drop_reason)
@@ -242,7 +246,9 @@ class SQLiteQualityMetrics(QualityMetricsPort):
 
     def _run(self) -> None:
         while True:
+            self._deliver_pending_signals()
             queued = self._queue.get()
+            self._deliver_pending_signals()
             if queued is None:
                 return
             try:
@@ -283,11 +289,33 @@ class SQLiteQualityMetrics(QualityMetricsPort):
         self._signal(OperationalSignal.BLOCK)
 
     def _signal(self, signal: OperationalSignal) -> None:
-        if self._operational_signal is not None:
+        if signal is OperationalSignal.BLOCK:
+            with self._state_lock:
+                self._block_pending = True
+            return
+        if signal is OperationalSignal.CLEAR and self._operational_signal is not None:
+            self._deliver_pending_signals()
             try:
                 self._operational_signal(signal)
             except Exception:  # noqa: BLE001 - status reporting must not affect collection
                 return
+
+    def _deliver_pending_signals(self) -> None:
+        with self._state_lock:
+            callback = self._operational_signal
+            configured, blocked = self._configured_pending, self._block_pending
+            self._configured_pending = self._block_pending = False
+        if callback is None:
+            return
+        for signal, pending in (
+            (OperationalSignal.CONFIGURED, configured),
+            (OperationalSignal.BLOCK, blocked),
+        ):
+            if pending:
+                try:
+                    callback(signal)
+                except Exception:  # noqa: BLE001 - status reporting must not affect collection
+                    continue
 
     def _diagnose(self, event: str, error: BaseException | None = None) -> None:
         try:

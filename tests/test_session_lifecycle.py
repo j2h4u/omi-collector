@@ -237,6 +237,9 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
     async def enter() -> None:
         events.append("enter")
 
+    async def exit_priority() -> None:
+        events.append("exit")
+
     async def close(_reason: str, _drain_cursor: int | None) -> None:
         events.append("close")
         raise OSError("closure failed")
@@ -255,7 +258,7 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
         drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
         close_visit=close,
         enter_capture_priority=enter,
-        exit_capture_priority=lambda: events.append("exit"),
+        exit_capture_priority=exit_priority,
     )
     with pytest.raises(FrozenInstanceError):
         callbacks.exit_capture_priority = None  # type: ignore[reportAttributeAccessIssue]
@@ -367,7 +370,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
         events: list[str] = []
         spool = tmp_path / "spool"
         spool.mkdir()
-        state_db = StateDB(spool / "collector-state.sqlite3")
+        state_db = await asyncio.to_thread(StateDB, spool / "collector-state.sqlite3")
         bootstrap = StagingStore(spool, tmp_path / "captures", state_db=state_db)
         ready = tmp_path / "ready"
         ready.mkdir(mode=0o2750)
@@ -399,7 +402,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
 
         async def close(_reason: str, _drain_cursor: int | None) -> None:
             await asyncio.sleep(0)
-            store.append_ready_closure(10, "drained")
+            await asyncio.to_thread(store.append_ready_closure, 10, "drained")
             events.append("closure")
             assert "publish" not in events
 
@@ -455,6 +458,9 @@ def test_restart_closure_keeps_priority_through_followup_inspection() -> None:
     async def enter() -> None:
         events.append("enter")
 
+    async def exit_priority() -> None:
+        events.append("exit")
+
     async def stop() -> None:
         raise RuntimeError("stop after restart inspection")
 
@@ -473,7 +479,7 @@ def test_restart_closure_keeps_priority_through_followup_inspection() -> None:
         close_visit=close,
         load_recovery=load_recovery,
         enter_capture_priority=enter,
-        exit_capture_priority=lambda: events.append("exit"),
+        exit_capture_priority=exit_priority,
     )
     run = SessionLifecycleRun(
         provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),

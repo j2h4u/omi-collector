@@ -974,3 +974,13 @@ def test_corrupt_quarantine_state_is_retained_without_mutation(tmp_path: Path) -
     assert store.sweep_terminal_quarantine().removed_source_ids == ()
     assert _source_row(store, source_id) == before
     attempt.close()
+
+
+def test_quarantine_read_helper_closes_materialized_cursor() -> None:
+    connection = sqlite3.connect(":memory:")
+    cursor = connection.execute("SELECT 1")
+
+    assert quarantine_module._db_one(cursor) == (1,)
+    with pytest.raises(sqlite3.ProgrammingError):
+        cursor.fetchone()
+    connection.close()

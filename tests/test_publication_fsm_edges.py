@@ -342,7 +342,7 @@ async def _exercise_retry_deadline(scenario: _RetryScenario) -> None:
     counts, clock = scenario.counts, scenario.clock
     backoff, attempts, ready_root = scenario.backoff, scenario.attempts, scenario.ready_root
     clock[0] = asyncio.get_running_loop().time()
-    first = store.recover_and_publish()
+    first = await asyncio.to_thread(store.recover_and_publish)
     assert first.state is ReadyOutcomeState.TRANSIENT
     assert first.reason == "publication_lock_busy"
     schedule = store.publication_retry_schedule()
@@ -369,7 +369,7 @@ async def _exercise_retry_deadline(scenario: _RetryScenario) -> None:
     assert retry_task is not None
     await retry_task
     await asyncio.sleep(0)
-    assert store.recover_and_publish().state is ReadyOutcomeState.WAITING
+    assert (await asyncio.to_thread(store.recover_and_publish)).state is ReadyOutcomeState.WAITING
     await maintenance.close()
     assert attempts[0] == 2 and counts[0] > 0 and counts[1] > 0
     assert not tuple(ready_root.iterdir())
@@ -377,7 +377,7 @@ async def _exercise_retry_deadline(scenario: _RetryScenario) -> None:
     assert not store.publication_timer_fired(generation, deadline)
     maintenance.schedule_publication_retry()
     for _ in range(3):
-        assert store.recover_and_publish().state is ReadyOutcomeState.WAITING
+        assert (await asyncio.to_thread(store.recover_and_publish)).state is ReadyOutcomeState.WAITING
     assert attempts[0] == 2 and tuple(counts) == final_counts
 
 
@@ -427,7 +427,7 @@ async def _exercise_shutdown(scenario: _ShutdownScenario) -> None:
             closing.cancel()
             await asyncio.sleep(0)
             assert not closing.done()
-        assert store.recover_and_publish().reason == "publication_closed"
+        assert (await asyncio.to_thread(store.recover_and_publish)).reason == "publication_closed"
         assert not store.publication_timer_fired(0, 0.0)
         maintenance.schedule_publication_retry()
         assert tuple(counts) == reads_at_shutdown and calls == [1]
@@ -440,7 +440,7 @@ async def _exercise_shutdown(scenario: _ShutdownScenario) -> None:
         assert len(tuple(ready_root.iterdir())) == 1
         closed_counts = tuple(counts)
         assert closed_counts[0] >= reads_at_shutdown[0] and closed_counts[1] >= reads_at_shutdown[1]
-        assert store.recover_and_publish().reason == "publication_closed"
+        assert (await asyncio.to_thread(store.recover_and_publish)).reason == "publication_closed"
         assert not store.publication_timer_fired(0, 0.0)
         maintenance.schedule_publication_retry()
         assert tuple(counts) == closed_counts

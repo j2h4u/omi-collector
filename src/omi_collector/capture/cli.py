@@ -7,7 +7,6 @@ factories with fakes, so CLI tests never need Bluetooth or sudo access.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import signal
@@ -25,7 +24,7 @@ from ..config import DEFAULT_CONFIG, CollectorConfig
 from ..core import package_version
 from .adapters.bleak_transport import BleakPresenceObserver, BleakRingTransport, Device
 from .adapters.collector_state_db import StateDB
-from .adapters.opportunistic_runtime import OpportunisticRuntime
+from .adapters.opportunistic_runtime import OpportunisticRuntime, create_quality_metrics_owned
 from .adapters.phy_guard import PhyStateError, ScopedPhyGuard
 from .adapters.publication import SealResult
 from .adapters.quality_metrics import SQLiteQualityMetrics, source_revision_from_release_metadata
@@ -35,10 +34,12 @@ from .application.opportunistic_sync import (
     CollectionPreservedCancelledError,
     run_opportunistic_collector,
 )
+from .application.owned_work import invoke_owned
 from .application.ports import DurableSealShape
 from .application.presence import PresencePolicy, PresenceScheduler
 from .application.ring_transport import CandidateUnavailableError, RingSession
 from .application.session_lifecycle import ActivityEvent, OpportunisticOptions, RetryPolicy
+from .application.stop_intent import StopIntent
 from .domain.operational_status_machine import OperationalSignal, PublicationOutcome
 from .domain.ring_protocol import RingInfo, RingStatus
 
@@ -227,19 +228,25 @@ async def recover_phy(adapter: str) -> None:
     await make_guard(adapter).recover()
 
 
-async def probe(address: str, adapter: str) -> RingStatus:
+async def probe(address: str, adapter: str, *, stop_intent: StopIntent | None = None) -> RingStatus:
     """Read cached safe ring status while scoped to LE 1M."""
     _require_supported_adapter(adapter)
+    if stop_intent is not None:
+        stop_intent.check()
     async with make_guard(adapter), make_transport(address) as session:
         return await collector.probe(session)
     raise RuntimeError("device session ended without a probe result")
 
 
-async def info(address: str, adapter: str) -> RingInfo:
+async def info(address: str, adapter: str, *, stop_intent: StopIntent | None = None) -> RingInfo:
     """Request safe ring sequence metadata while scoped to LE 1M."""
     _require_supported_adapter(adapter)
+    if stop_intent is not None:
+        stop_intent.check()
     async with make_guard(adapter), make_transport(address) as session:
-        return await collector.ring_info(session, timeout=TRANSFER_TIMEOUTS.info)
+        if stop_intent is None:
+            return await collector.ring_info(session, timeout=TRANSFER_TIMEOUTS.info)
+        return await collector.ring_info(session, timeout=TRANSFER_TIMEOUTS.info, stop_intent=stop_intent)
     raise RuntimeError("device session ended without an INFO result")
 
 
@@ -248,10 +255,14 @@ async def collect(
     adapter: str,
     staging: StagingStore,
     max_records: int,
+    *,
+    stop_intent: StopIntent | None = None,
 ) -> collector.CollectResult:
     """Persist one deliberately bounded READ batch through the coordinator."""
     _require_supported_adapter(adapter)
     _validate_max_records(max_records)
+    if stop_intent is not None:
+        stop_intent.check()
 
     def provider(candidate: object | None):
         return _guarded_transport(adapter, address, device_selector=cast(BLEDevice | None, candidate))
@@ -264,8 +275,9 @@ async def collect(
             advance_enabled=False,
             stop_after_drained=True,
         ),
-        quality_metrics=_quality_metrics(staging, DEFAULT_CONFIG),
+        quality_metrics=await create_quality_metrics_owned(_quality_metrics, staging, DEFAULT_CONFIG),
         phy_policy="force_1m",
+        stop_intent=stop_intent,
     )
     return await run_opportunistic_collector(provider, staging, options, runtime=OpportunisticRuntime())
 
@@ -284,6 +296,7 @@ async def sync(  # noqa: PLR0913
     config: CollectorConfig = DEFAULT_CONFIG,
     operational_quality_signal: Callable[[OperationalSignal], None] | None = None,
     record_publication: Callable[[PublicationOutcome], None] | None = None,
+    stop_intent: StopIntent | None = None,
 ) -> collector.CollectResult:
     """Run until cancelled, draining RAM-admitted batches while the pendant is near.
 
@@ -347,9 +360,12 @@ async def sync(  # noqa: PLR0913
         activity=_activity_callback(progress),
         operational=_operational_callback(progress),
         presence=presence,
-        quality_metrics=_quality_metrics(staging, config, debug_logger, operational_signal=operational_quality_signal),
+        quality_metrics=await create_quality_metrics_owned(
+            _quality_metrics, staging, config, debug_logger, operational_signal=operational_quality_signal
+        ),
         phy_policy="force_1m" if force_1m else "auto",
         config=config,
+        stop_intent=stop_intent,
     )
     return await run_opportunistic_collector(
         provider, staging, options, runtime=OpportunisticRuntime(record_publication)
@@ -367,6 +383,7 @@ def _quality_metrics(
     from .adapters.debug_logging import debug_event, debug_exception, set_runtime_status_sink
     from .application.storage_fault import FatalInternalAudioStorageError
 
+    metrics: SQLiteQualityMetrics | None = None
     try:
         metrics = SQLiteQualityMetrics(
             staging.state_db,
@@ -384,6 +401,13 @@ def _quality_metrics(
     except FatalInternalAudioStorageError:
         raise
     except Exception as error:  # noqa: BLE001 - provenance/journal setup is auxiliary
+        if metrics is not None:
+            try:
+                metrics.close()
+            except FatalInternalAudioStorageError:
+                raise
+            except Exception as close_error:  # noqa: BLE001 - preserve auxiliary fallback after join
+                debug_exception("quality_metrics_writer_error", close_error, logger=debug_logger, operation="close")
         if operational_signal is not None:
             operational_signal(OperationalSignal.BLOCK)
         debug_exception("quality_metrics_configuration_error", error, logger=debug_logger)
@@ -408,9 +432,7 @@ def _progress_callback(progress: ProgressReporter | None) -> collector.ProgressC
             records,
             total,
         )
-        result = progress(update)
-        if inspect.isawaitable(result):
-            await result
+        await invoke_owned(progress, update)
 
     return report
 
@@ -420,29 +442,26 @@ def _activity_callback(progress: ProgressReporter | None) -> Callable[[ActivityE
         return None
 
     async def report(event: ActivityEvent) -> None:
-        result = progress(
-            DownloadProgress(
-                0.0,
-                0,
-                0.0,
-                0.0,
-                0,
-                None,
-                0,
-                0,
-                state=event.state,
-                retry_seconds=event.retry_seconds,
-                phase=event.phase,
-                error_type=event.error_type,
-                error_message=event.error_message,
-                reason=event.reason,
-                duration_seconds=event.duration_seconds,
-                next_attempt_in_seconds=event.next_attempt_in_seconds,
-                lock_context=event.lock_context,
-            )
+        update = DownloadProgress(
+            0.0,
+            0,
+            0.0,
+            0.0,
+            0,
+            None,
+            0,
+            0,
+            state=event.state,
+            retry_seconds=event.retry_seconds,
+            phase=event.phase,
+            error_type=event.error_type,
+            error_message=event.error_message,
+            reason=event.reason,
+            duration_seconds=event.duration_seconds,
+            next_attempt_in_seconds=event.next_attempt_in_seconds,
+            lock_context=event.lock_context,
         )
-        if inspect.isawaitable(result):
-            await result
+        await invoke_owned(progress, update)
 
     return report
 
@@ -452,11 +471,8 @@ def _operational_callback(progress: ProgressReporter | None) -> OperationalProgr
         return None
 
     async def report(event: Mapping[str, object]) -> None:
-        result = progress(
-            DownloadProgress(0.0, 0, 0.0, 0.0, 0, None, 0, 0, state="operational", operational_event=event)
-        )
-        if inspect.isawaitable(result):
-            await result
+        update = DownloadProgress(0.0, 0, 0.0, 0.0, 0, None, 0, 0, state="operational", operational_event=event)
+        await invoke_owned(progress, update)
 
     return report
 
@@ -512,34 +528,35 @@ def download_metrics(result: collector.CollectResult, elapsed_seconds: float) ->
     return DownloadMetrics(elapsed, payload_bytes, bytes_per_second, records_per_second, remaining, eta)
 
 
-def run[T](operation: Coroutine[object, object, T]) -> T:
+def run[T](operation: Coroutine[object, object, T], *, stop_intent: StopIntent | None = None) -> T:
     """Run an operational coroutine and restore scoped state when SIGTERM arrives."""
-    if sys.platform == "win32":
+    if sys.platform == "win32" and stop_intent is None:
         return asyncio.run(operation)
-    return asyncio.run(_run_posix_operation(operation))
+    return asyncio.run(_run_posix_operation(operation, stop_intent=stop_intent))
 
 
-async def _run_posix_operation[T](operation: Coroutine[object, object, T]) -> T:
-    """Cancel the active task on SIGTERM so async context managers can exit."""
-    terminated = False
+async def _run_posix_operation[T](
+    operation: Coroutine[object, object, T], *, stop_intent: StopIntent | None = None
+) -> T:
+    """Attach shared command stop ownership to the operation root task."""
+    if stop_intent is None:
+        local_intent = StopIntent()
+        with local_intent.installed():
+            return await _run_posix_operation(operation, stop_intent=local_intent)
+    intent = stop_intent
     task = asyncio.create_task(operation)
-
-    def cancel_for_sigterm() -> None:
-        nonlocal terminated
-        terminated = True
-        task.cancel()
-
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, cancel_for_sigterm)
+    intent.attach(loop, task)
     try:
         return await task
     except asyncio.CancelledError as error:
-        if terminated:
+        if intent.requested:
             detail = f"; {error}" if isinstance(error, CollectionPreservedCancelledError) else ""
-            raise OperationInterruptedError(f"operation interrupted by SIGTERM after cleanup{detail}") from error
+            signame = signal.Signals(intent.signal_number or signal.SIGTERM).name
+            raise OperationInterruptedError(f"operation interrupted by {signame} after cleanup{detail}") from error
         raise
     finally:
-        loop.remove_signal_handler(signal.SIGTERM)
+        intent.detach(task)
 
 
 def render_status(status: RingStatus) -> str:

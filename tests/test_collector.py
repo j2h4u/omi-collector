@@ -186,19 +186,26 @@ class FakeWriter:
 
 
 class PendingReadBeginWriter(FakeWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_begin_future: asyncio.Future[object] | None = None
+
     def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
         del notice
         self.calls.append("read_begin")
-        return asyncio.get_running_loop().create_future()
+        self.read_begin_future = asyncio.get_running_loop().create_future()
+        return self.read_begin_future
 
 
 class PendingBarrierWriter(FakeWriter):
     def __init__(self) -> None:
         super().__init__()
         self.release_barrier = asyncio.Event()
+        self.barrier_started = asyncio.Event()
 
     async def barrier(self) -> str:
         self.calls.append("barrier")
+        self.barrier_started.set()
         await self.release_barrier.wait()
         return "checkpointed"
 
@@ -756,40 +763,44 @@ def test_read_control_write_timeout_stops_and_reports_counters() -> None:
     asyncio.run(scenario())
 
 
-def test_read_begin_wait_timeout_stops_and_reports_counters() -> None:
+def test_read_begin_storage_wait_outlives_ble_deadline() -> None:
     async def scenario() -> None:
         record = _record(1)
         session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
         writer = PendingReadBeginWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        with pytest.raises(TransferInterruptedError, match="timed out waiting for writer after READ") as caught:
-            await asyncio.wait_for(
-                read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)),
-                1,
-            )
-
-        assert caught.value.received_records == 2
-        assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)))
+        for _ in range(20):
+            if writer.read_begin_future is not None:
+                break
+            await asyncio.sleep(0)
+        assert writer.read_begin_future is not None
+        await asyncio.sleep(0.03)
+        assert not pending.done()
+        writer.read_begin_future.set_result(None)
+        result = await asyncio.wait_for(pending, 1)
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert session.writes == [encode_read_command(10, 2)]
 
     asyncio.run(scenario())
 
 
-def test_writer_barrier_timeout_stops_and_reports_counters() -> None:
+def test_writer_barrier_storage_wait_outlives_ble_deadline() -> None:
     async def scenario() -> None:
         record = _record(1)
         session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
         writer = PendingBarrierWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        with pytest.raises(TransferInterruptedError, match="timed out waiting for writer after READ") as caught:
-            await asyncio.wait_for(
-                read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)),
-                1,
-            )
-
-        assert caught.value.received_records == 2
-        assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)))
+        await asyncio.wait_for(writer.barrier_started.wait(), 1)
+        await asyncio.sleep(0.03)
+        assert not pending.done()
+        writer.release_barrier.set()
+        result = await asyncio.wait_for(pending, 1)
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert session.writes == [encode_read_command(10, 2)]
 
     asyncio.run(scenario())
 

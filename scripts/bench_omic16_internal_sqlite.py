@@ -511,7 +511,7 @@ async def run_writer(context: BenchmarkContext) -> CaptureResult:
         if not isinstance(seal_result, DurableSqliteSeal) or retained_seal != seal_result:
             raise RuntimeError("writer did not retain the durable seal result")
         seal_ms = (time.perf_counter() - seal_started) * 1000
-    await context.writer.close(timeout=30)
+    await context.writer.close()
     count, digest, pages, page_size, freelist, db_bytes = verify(
         context.db,
         seal_result.source_id,
@@ -604,7 +604,7 @@ async def cleanup(context: BenchmarkContext) -> None:
     retained = False
     if context.writer is not None and context.writer.thread.is_alive():
         try:
-            await context.writer.close(timeout=30)
+            await context.writer.close()
         except Exception as error:  # noqa: BLE001 - preserve fixture if writer cannot safely close
             if context.writer.thread.is_alive():
                 retained = True

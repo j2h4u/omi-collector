@@ -233,8 +233,6 @@ class WriterConfig:
     chunk_records: int = MAX_WRITER_CHUNK_RECORDS
     max_control_commands: int = 32
     state_poll_seconds: float = 0.001
-    close_timeout_seconds: float = 5.0
-    join_poll_seconds: float = 0.005
 
     def __post_init__(self) -> None:
         _require_positive_int(self.chunk_records, "chunk_records")
@@ -242,20 +240,16 @@ class WriterConfig:
             raise ValueError(f"chunk_records must not exceed {MAX_WRITER_CHUNK_RECORDS}")
         _require_positive_int(self.max_control_commands, "max_control_commands")
         _require_positive_float(self.state_poll_seconds, "state_poll_seconds")
-        _require_positive_float(self.close_timeout_seconds, "close_timeout_seconds")
-        _require_positive_float(self.join_poll_seconds, "join_poll_seconds")
 
 
 @dataclass(frozen=True, slots=True)
 class FirmwareObservationConfig:
-    """Retry and bounded shutdown controls for firmware observations."""
+    """Retry timing for firmware observations."""
 
     retry_backoff_seconds: tuple[float, ...] = (0.05, 0.25, 1.0, 5.0)
-    close_timeout_seconds: float = 0.5
 
     def __post_init__(self) -> None:
         _require_non_empty_positive(self.retry_backoff_seconds, "retry_backoff_seconds")
-        _require_positive_float(self.close_timeout_seconds, "close_timeout_seconds")
 
 
 @dataclass(frozen=True, slots=True)

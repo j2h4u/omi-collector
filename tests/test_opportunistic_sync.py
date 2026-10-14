@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, closing
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
-from functools import partial, wraps
+from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from shutil import rmtree
@@ -45,7 +45,6 @@ from omi_collector.capture.adapters.staging_contract import (
     StagingError,
 )
 from omi_collector.capture.adapters.staging_filesystem import StagingIO
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application import batch_reconciliation, session_lifecycle
 from omi_collector.capture.application.batch_reconciliation import (
@@ -67,11 +66,6 @@ from omi_collector.capture.application.collector import (
 from omi_collector.capture.application.operational_telemetry import (
     BATTERY_UUID,
     TIME_READ_UUID,
-    OperationalEmitter,
-    TelemetryClock,
-)
-from omi_collector.capture.application.operational_telemetry import (
-    collect_operational_telemetry as _collect_operational_telemetry,
 )
 from omi_collector.capture.application.opportunistic_sync import CollectionPreservedCancelledError
 from omi_collector.capture.application.opportunistic_sync import (
@@ -79,7 +73,6 @@ from omi_collector.capture.application.opportunistic_sync import (
 )
 from omi_collector.capture.application.ports import (
     BatchWriterPort,
-    CaptureRuntimePort,
     StagingPort,
     StorageLeaseContext,
 )
@@ -121,7 +114,15 @@ from omi_collector.capture.domain.ring_protocol import (
     encode_stop_command,
 )
 from omi_collector.capture.domain.transfer_arena import TransferArena
-from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, ReadyConfig, RetryConfig, StagingRetentionConfig
+from omi_collector.config import (
+    DEFAULT_CONFIG,
+    CollectorConfig,
+    ReadyConfig,
+    RetryConfig,
+    StagingRetentionConfig,
+    TelemetryConfig,
+)
+from staging_test_factory import StagingStore, storage_call
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -147,18 +148,6 @@ async def run_opportunistic_collector(
 ) -> CollectionResult | NoDataResult:
     """Test helper that injects the concrete runtime at every call site."""
     return await _run_opportunistic_collector(provider, staging, options, runtime=_runtime())
-
-
-async def _finalize_with_short_transfer_timeout(
-    finalize: Callable[
-        [batch_reconciliation._Batch, OpportunisticOptions, CaptureRuntimePort],
-        Awaitable[tuple[BaseException | None, BaseException | None]],
-    ],
-    batch: batch_reconciliation._Batch,
-    options: OpportunisticOptions,
-    runtime: CaptureRuntimePort,
-) -> tuple[BaseException | None, BaseException | None]:
-    return await finalize(batch, replace(options, timeouts=TransferTimeouts(0.03, 0.03)), runtime)
 
 
 def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
@@ -202,7 +191,7 @@ def _staging_store(
     spool.mkdir(parents=True, exist_ok=True)
     state_db = _test_state_databases.get(spool)
     if state_db is None or not state_db.path.is_file():
-        state_db = StateDB(spool / "collector-state.sqlite3")
+        state_db = storage_call(lambda: StateDB(spool / "collector-state.sqlite3"))
         _test_state_databases[spool] = state_db
     return StagingStore(spool, capture_root, state_db=state_db, io=StagingIO(config=config))
 
@@ -212,19 +201,24 @@ def _quality_metrics(state_db: StateDB) -> SQLiteQualityMetrics:
 
 
 def _quality_events(journal: SQLiteQualityMetrics, state_db: StateDB) -> tuple[dict[str, object], ...]:
-    assert journal.close()
-    return read_quality_events(state_db, datetime.min.replace(tzinfo=UTC), datetime.max.replace(tzinfo=UTC))
+    def read() -> tuple[dict[str, object], ...]:
+        assert journal.close()
+        return read_quality_events(state_db, datetime.min.replace(tzinfo=UTC), datetime.max.replace(tzinfo=UTC))
+
+    return storage_call(read)
 
 
 def _ready_closure_rows(store: StagingStore) -> list[dict[str, object]]:
-    return [
-        {"next_sequence": closure.next_sequence, "reason": closure.reason}
-        for closure in ready_closures.load(store.state_db)
-    ]
+    return storage_call(
+        lambda: [
+            {"next_sequence": closure.next_sequence, "reason": closure.reason}
+            for closure in ready_closures.load(store.state_db)
+        ]
+    )
 
 
 def _attempt_source(store: StagingStore, source_id: str) -> CaptureSource | None:
-    return read_capture_source(store.state_db, source_id)
+    return storage_call(lambda: read_capture_source(store.state_db, source_id))
 
 
 def _sealed_records(store: StagingStore, seal: DurableSqliteSeal) -> bytes:
@@ -232,13 +226,16 @@ def _sealed_records(store: StagingStore, seal: DurableSqliteSeal) -> bytes:
 
 
 def _source_records(store: StagingStore, source_id: str) -> bytes:
-    with InternalAudioStore(store.state_db) as audio_store:
-        payloads: list[bytes] = []
-        after_ordinal = -1
-        while records := audio_store.read_record_page(source_id, after_ordinal):
-            payloads.extend(record.raw_bytes for record in records)
-            after_ordinal = records[-1].ordinal
-        return b"".join(payloads)
+    def read() -> bytes:
+        with InternalAudioStore(store.state_db) as audio_store:
+            payloads: list[bytes] = []
+            after_ordinal = -1
+            while records := audio_store.read_record_page(source_id, after_ordinal):
+                payloads.extend(record.raw_bytes for record in records)
+                after_ordinal = records[-1].ordinal
+            return b"".join(payloads)
+
+    return storage_call(read)
 
 
 @pytest.fixture(autouse=True)
@@ -492,15 +489,19 @@ class _SealResultBatchWriter:
     def failure(self) -> BaseException | None:
         return self.writer.failure
 
+    @property
+    def interrupted_prefix(self) -> None:
+        return None
+
     async def checkpoint(self) -> DurablePrefix:
         return cast(DurablePrefix, await self.writer.checkpoint())
 
     async def await_seal_result(self) -> SealResult | None:
         return cast(SealResult | None, await self.writer.await_seal_result())
 
-    async def close(self, *, timeout: float) -> None:
+    async def close(self) -> None:
         self.close_requested.set()
-        await self.writer.close(timeout=timeout)
+        await self.writer.close()
 
 
 @asynccontextmanager
@@ -523,7 +524,7 @@ async def _real_batch_writer(
         yield writer
     finally:
         try:
-            await writer.close(timeout=DEFAULT_CONFIG.transfer.sync_timeout_seconds)
+            await writer.close()
         finally:
             await asyncio.to_thread(writer.thread.join, DEFAULT_CONFIG.transfer.sync_timeout_seconds)
             assert not writer.thread.is_alive()
@@ -845,16 +846,19 @@ def _patch_observation_writer(
 
 
 def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: int = 100) -> bytes:
-    store = _staging_store(root, _capture_root(root))
-    attempt = store.prepare_streaming_attempt(start, count)
-    attempt.prepare_leg(start, count)
-    attempt.record_read_begin(ReadBeginNotification(start, count))
-    records = _records(start, count)
-    if persisted:
-        attempt.accept_chunk(start, memoryview(records[: persisted * RECORD_SIZE]))
-    attempt.checkpoint()
-    attempt.close(durable=True)
-    return records
+    def seed() -> bytes:
+        store = _staging_store(root, _capture_root(root))
+        attempt = store.prepare_streaming_attempt(start, count)
+        attempt.prepare_leg(start, count)
+        attempt.record_read_begin(ReadBeginNotification(start, count))
+        records = _records(start, count)
+        if persisted:
+            attempt.accept_chunk(start, memoryview(records[: persisted * RECORD_SIZE]))
+        attempt.checkpoint()
+        attempt.close(durable=True)
+        return records
+
+    return storage_call(seed)
 
 
 def test_retry_policy_requires_explicit_drain_cooldown() -> None:
@@ -1140,8 +1144,7 @@ async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path:
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     ranges = ((100, 2),) if kind == "single" else ((100, 2), (102, 2))
     for start, count in ranges:
-        attempt = store.prepare_streaming_attempt(start, count)
-        attempt.close()
+        storage_call(lambda start=start, count=count: store.prepare_streaming_attempt(start, count).close())
     provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))])
     result = await run_opportunistic_collector(provider, store, _options())
 
@@ -1157,13 +1160,17 @@ async def test_corrupt_committed_record_is_held_before_provider_read(tmp_path: P
     source_id = store.pending_attempts()[0].attempt_id
     changed_payload = b"x" * (AUDIO_RECORD_SIZE - 4)
     assert records[4:RECORD_SIZE] != changed_payload
-    with closing(store.state_db.open_connection()) as connection:
-        updated = connection.execute(
-            "UPDATE capture_record SET payload = ? WHERE source_id = ? AND ordinal = 0",
-            (changed_payload, source_id),
-        )
-        connection.commit()
-    assert updated.rowcount == 1
+
+    def corrupt() -> int:
+        with closing(store.state_db.open_connection()) as connection:
+            updated = connection.execute(
+                "UPDATE capture_record SET payload = ? WHERE source_id = ? AND ordinal = 0",
+                (changed_payload, source_id),
+            )
+            connection.commit()
+            return updated.rowcount
+
+    assert storage_call(corrupt) == 1
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))
     provider = Provider([session])
     result = await run_opportunistic_collector(provider, _staging_store(tmp_path, _capture_root(tmp_path)), _options())
@@ -1172,16 +1179,20 @@ async def test_corrupt_committed_record_is_held_before_provider_read(tmp_path: P
     assert provider.opened == 1
     assert not store.pending_attempts()
     assert store.quarantined_attempts() == ()
-    with closing(store.state_db.open_connection(read_only=True)) as connection:
-        row = cast(
-            tuple[object, ...] | None,
-            connection.execute(
-                "SELECT source_type, lifecycle, block_reason, quarantine_disposition, "
-                "certified_prefix_count, coverage_digest, terminal_time, retention_deadline "
-                "FROM capture_source WHERE source_id = ?",
-                (source_id,),
-            ).fetchone(),
-        )
+
+    def read_source() -> tuple[object, ...] | None:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                tuple[object, ...] | None,
+                connection.execute(
+                    "SELECT source_type, lifecycle, block_reason, quarantine_disposition, "
+                    "certified_prefix_count, coverage_digest, terminal_time, retention_deadline "
+                    "FROM capture_source WHERE source_id = ?",
+                    (source_id,),
+                ).fetchone(),
+            )
+
+    row = storage_call(read_source)
     assert row is not None
     assert tuple(row) == (
         "quarantine",
@@ -1310,14 +1321,20 @@ async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     attempt_id = store.pending_attempts()[0].attempt_id
-    with store.device_lock() as lease:
-        sealed = store.resume_streaming_attempt(lease)
-        assert sealed is not None
-        try:
-            sealed_result = sealed.seal(DoneNotification(0, 102))
-        finally:
-            sealed.close()
-    assert sealed_result.source_id == sealed.attempt_id
+
+    def seal_resumed() -> DurableSqliteSeal:
+        with store.device_lock() as lease:
+            sealed = store.resume_streaming_attempt(lease)
+            assert sealed is not None
+            try:
+                result = sealed.seal(DoneNotification(0, 102))
+                assert isinstance(result, DurableSqliteSeal)
+                return result
+            finally:
+                sealed.close()
+
+    sealed_result = storage_call(seal_resumed)
+    assert sealed_result.source_id == attempt_id
     assert _attempt_source(store, sealed_result.source_id) is not None
     session = ScriptedRingSession(
         _status(),
@@ -1366,14 +1383,18 @@ async def test_post_seal_cursor_ahead_keeps_old_bundle_and_starts_at_fresh_curso
     assert result.next_sequence == 104
     assert encode_advance_command(102) not in session.writes
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    with closing(store.state_db.open_connection(read_only=True)) as connection:
-        sources = cast(
-            list[tuple[str, bytes, bytes, int]],
-            connection.execute(
-                "SELECT source_id, sequence_start, sequence_limit, committed_count "
-                "FROM capture_source WHERE source_type = 'attempt' ORDER BY sequence_start"
-            ).fetchall(),
-        )
+
+    def read_sources() -> list[tuple[str, bytes, bytes, int]]:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                list[tuple[str, bytes, bytes, int]],
+                connection.execute(
+                    "SELECT source_id, sequence_start, sequence_limit, committed_count "
+                    "FROM capture_source WHERE source_type = 'attempt' ORDER BY sequence_start"
+                ).fetchall(),
+            )
+
+    sources = storage_call(read_sources)
     assert [(int.from_bytes(row[1], "big"), int.from_bytes(row[2], "big"), row[3]) for row in sources] == [
         (100, 102, 2),
         (103, 104, 1),
@@ -1497,23 +1518,28 @@ async def test_startup_sweep_retains_aged_sealed_source_until_publication_ack(
         _capture_root(tmp_path),
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.prepare_leg(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(100))
-    attempt.checkpoint()
-    attempt.publish_prefix()
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
+
+    def seed() -> str:
+        attempt = store.prepare_streaming_attempt(100, 1)
+        attempt.prepare_leg(100, 1)
+        attempt.record_read_begin(ReadBeginNotification(100, 1))
+        attempt.accept_chunk(100, _record(100))
+        attempt.checkpoint()
+        attempt.publish_prefix()
+        attempt.close(durable=True)
+        return attempt.attempt_id
+
+    attempt_id = storage_call(seed)
+    storage_call(lambda: store.terminalize_prefix_attempt(attempt_id))
     now += 1_000_000_000
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))
 
     result = await run_opportunistic_collector(Provider([session]), store, _options())
 
     assert isinstance(result, NoDataResult)
-    source = _attempt_source(store, attempt.attempt_id)
+    source = _attempt_source(store, attempt_id)
     assert source is not None and source.lifecycle == "sealed_waiting"
-    assert _source_records(store, attempt.attempt_id) == _record(100)
+    assert _source_records(store, attempt_id) == _record(100)
 
 
 @_async_test
@@ -1541,14 +1567,19 @@ async def test_maintenance_cadence_retains_sealed_source_until_publication_ack(
             staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
         ),
     )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.prepare_leg(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(100))
-    attempt.checkpoint()
-    attempt.publish_prefix()
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
+
+    def seed() -> str:
+        attempt = store.prepare_streaming_attempt(100, 1)
+        attempt.prepare_leg(100, 1)
+        attempt.record_read_begin(ReadBeginNotification(100, 1))
+        attempt.accept_chunk(100, _record(100))
+        attempt.checkpoint()
+        attempt.publish_prefix()
+        attempt.close(durable=True)
+        return attempt.attempt_id
+
+    attempt_id = storage_call(seed)
+    storage_call(lambda: store.terminalize_prefix_attempt(attempt_id))
     drained = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))])
 
     class RetryThenDrain:
@@ -1577,9 +1608,9 @@ async def test_maintenance_cadence_retains_sealed_source_until_publication_ack(
 
     assert isinstance(result, NoDataResult)
     assert provider.calls == 2
-    source = _attempt_source(store, attempt.attempt_id)
+    source = _attempt_source(store, attempt_id)
     assert source is not None and source.lifecycle == "sealed_waiting"
-    assert _source_records(store, attempt.attempt_id) == _record(100)
+    assert _source_records(store, attempt_id) == _record(100)
 
 
 @_async_test
@@ -1969,13 +2000,18 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt(100, 3)
-    attempt.prepare_leg(100, 3)
-    attempt.record_read_begin(ReadBeginNotification(100, 3))
-    attempt.accept_chunk(100, _record(100))
-    attempt.checkpoint()
-    attempt.accept_chunk(101, _record(101))
-    attempt.close(durable=True)
+
+    def seed() -> str:
+        attempt = store.prepare_streaming_attempt(100, 3)
+        attempt.prepare_leg(100, 3)
+        attempt.record_read_begin(ReadBeginNotification(100, 3))
+        attempt.accept_chunk(100, _record(100))
+        attempt.checkpoint()
+        attempt.accept_chunk(101, _record(101))
+        attempt.close(durable=True)
+        return attempt.attempt_id
+
+    attempt_id = storage_call(seed)
 
     original_arena = batch_reconciliation.TransferArena
     checkpoint_counts_at_allocation: list[int] = []
@@ -1987,7 +2023,7 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
         max_bytes: int,
         record_size: int = RECORD_SIZE,
     ) -> TransferArena:
-        source = _attempt_source(store, attempt.attempt_id)
+        source = _attempt_source(store, attempt_id)
         assert source is not None
         checkpoint_counts_at_allocation.append(source.committed_count)
         return original_arena(start_sequence, total_records, max_bytes=max_bytes, record_size=record_size)
@@ -2095,14 +2131,18 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
         "blocked",
         0,
     )
-    with closing(store.state_db.open_connection(read_only=True)) as connection:
-        terminal = cast(
-            tuple[object, object] | None,
-            connection.execute(
-                "SELECT quarantine_disposition, retention_deadline FROM capture_source WHERE source_id = ?",
-                (empty_source_id,),
-            ).fetchone(),
-        )
+
+    def read_terminal() -> tuple[object, object] | None:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                tuple[object, object] | None,
+                connection.execute(
+                    "SELECT quarantine_disposition, retention_deadline FROM capture_source WHERE source_id = ?",
+                    (empty_source_id,),
+                ).fetchone(),
+            )
+
+    terminal = storage_call(read_terminal)
     assert terminal is not None and terminal[0] == "unprocessable" and terminal[1] is not None
     assert any(event.get("event") == "loss_detected" for event in operational_events)
     metrics = _quality_events(journal, store.state_db)
@@ -2125,7 +2165,8 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     }
     deadline = int(cast(str, terminal[1]))
     monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: deadline)
-    assert store.sweep_terminal_quarantine().removed_source_ids == (empty_source_id,)
+    sweep = storage_call(store.sweep_terminal_quarantine)
+    assert sweep.removed_source_ids == (empty_source_id,)
     assert _attempt_source(store, empty_source_id) is None
 
 
@@ -2893,48 +2934,21 @@ async def test_default_preflight_skips_cached_status_without_telemetry(tmp_path:
 
 
 @_async_test
-async def test_presence_preflight_budget_covers_status_and_optional_reads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storage_deadline(
+    tmp_path: Path,
 ) -> None:
-    config = CollectorConfig(retry=RetryConfig(presence_preflight_budget_seconds=0.05))
+    config = CollectorConfig(
+        retry=RetryConfig(presence_preflight_budget_seconds=0.001),
+        telemetry=TelemetryConfig(optional_operation_timeout_seconds=0.02),
+    )
     order: list[str] = []
     cancellation: list[str] = []
-    telemetry_awaitables: list[Awaitable[object]] = []
-    telemetry_timeouts: list[float] = []
-    timed_out_telemetry: list[Awaitable[object]] = []
-
-    def telemetry_factory(
-        session_arg: RingSession,
-        status: RingStatus | None,
-        info: RingInfo,
-        emit: OperationalEmitter | None,
-        *,
-        clock: TelemetryClock | None = None,
-    ) -> Awaitable[None]:
-        awaitable = _collect_operational_telemetry(session_arg, status, info, emit, clock=clock)
-        telemetry_awaitables.append(awaitable)
-        return awaitable
-
-    real_bounded = session_lifecycle.bounded
-
-    async def bounded_spy(awaitable: Awaitable[T], timeout: float) -> T:
-        if telemetry_awaitables and awaitable is telemetry_awaitables[0]:
-            telemetry_timeouts.append(timeout)
-            try:
-                return await real_bounded(awaitable, timeout)
-            except session_lifecycle.collector.CollectorTimeoutError:
-                timed_out_telemetry.append(awaitable)
-                raise
-        return await real_bounded(awaitable, timeout)
-
-    monkeypatch.setattr(session_lifecycle, "collect_operational_telemetry", telemetry_factory)
-    monkeypatch.setattr(session_lifecycle, "bounded", bounded_spy)
 
     class SlowPreflightSession(ScriptedRingSession):
         async def read_status(self) -> RingStatus:
             order.append("status")
             try:
-                await asyncio.sleep(config.retry.presence_preflight_budget_seconds * 0.75)
+                await asyncio.sleep(config.telemetry.optional_operation_timeout_seconds * 0.75)
                 return self._status
             finally:
                 cancellation.append("status")
@@ -2955,8 +2969,8 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(
 
     session = SlowPreflightSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
 
-    def emit(_event: Mapping[str, object]) -> None:
-        return None
+    async def emit(_event: Mapping[str, object]) -> None:
+        await asyncio.sleep(0.01)
 
     result = await asyncio.wait_for(
         run_opportunistic_collector(
@@ -2976,10 +2990,6 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(
     assert isinstance(result, NoDataResult)
     assert order[:3] == ["info", "optional", "status"]
     assert "optional" in order
-    assert len(telemetry_awaitables) == len(telemetry_timeouts) == 1
-    assert telemetry_timeouts[0] > 0
-    assert telemetry_timeouts[0] <= config.retry.presence_preflight_budget_seconds
-    assert timed_out_telemetry == telemetry_awaitables
     assert cancellation.count("status") == 1
     assert cancellation.count("optional") >= 1
 
@@ -3152,7 +3162,7 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
 
     assert isinstance(result, CollectionResult)
     assert session.clock_read
-    clock_state = ClockStateStore(store.state_db).state()
+    clock_state = storage_call(lambda: ClockStateStore(store.state_db).state())
     assert clock_state.intent is None
     assert clock_state.anchor is not None
     assert clock_state.anchor.sequence_frontier == 11
@@ -3489,15 +3499,19 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
         assert (source.source_type, source.lifecycle, source.committed_count) == ("quarantine", "blocked", 0)
         assert source.committed_count == 0
         assert _source_records(store, source_id) == b""
-        with closing(store.state_db.open_connection(read_only=True)) as connection:
-            terminal = cast(
-                tuple[object, object, object] | None,
-                connection.execute(
-                    "SELECT quarantine_disposition, terminal_reason, retention_deadline "
-                    "FROM capture_source WHERE source_id = ?",
-                    (source_id,),
-                ).fetchone(),
-            )
+
+        def read_terminal() -> tuple[object, object, object] | None:
+            with closing(store.state_db.open_connection(read_only=True)) as connection:
+                return cast(
+                    tuple[object, object, object] | None,
+                    connection.execute(
+                        "SELECT quarantine_disposition, terminal_reason, retention_deadline "
+                        "FROM capture_source WHERE source_id = ?",
+                        (source_id,),
+                    ).fetchone(),
+                )
+
+        terminal = storage_call(read_terminal)
         assert terminal is not None
         assert terminal[0] == "unprocessable" and isinstance(terminal[1], str) and terminal[1]
         assert terminal[2] is not None
@@ -3591,11 +3605,15 @@ async def test_cursor_regression_after_advance_ack_rejects_drain_and_keeps_sqlit
         await run_opportunistic_collector(Provider([session]), store, _options(batch_records=3))
 
     assert session.writes.count(encode_advance_command(102)) == 1
-    with closing(store.state_db.open_connection(read_only=True)) as connection:
-        source_rows = cast(
-            list[tuple[str]],
-            connection.execute("SELECT source_id FROM capture_source WHERE source_type='attempt'").fetchall(),
-        )
+
+    def read_source_rows() -> list[tuple[str]]:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                list[tuple[str]],
+                connection.execute("SELECT source_id FROM capture_source WHERE source_type='attempt'").fetchall(),
+            )
+
+    source_rows = storage_call(read_source_rows)
     assert len(source_rows) == 1
     source_id = source_rows[0][0]
     source = _attempt_source(store, source_id)
@@ -3838,14 +3856,13 @@ async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, mon
         reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
         reconciler._state.batch = batch
 
-        async def fail_close(*, timeout: float) -> None:
-            del timeout
+        async def fail_close() -> None:
             raise TimeoutError("writer close did not complete")
 
         with monkeypatch.context() as patch:
             patch.setattr(writer, "close", fail_close)
             with pytest.raises(TimeoutError, match="writer close"):
-                await batch_reconciliation._complete_batch(reconciler._state, batch, _options())
+                await batch_reconciliation._complete_batch(reconciler._state, batch)
 
         assert reconciler._state.batch is batch
         assert reconciler._state.last_result is None
@@ -3853,7 +3870,7 @@ async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, mon
 
 
 @_async_test
-async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_path: Path) -> None:
+async def test_cancelled_owned_seal_is_adopted_before_uncertain_advance_retries(tmp_path: Path) -> None:
     target = _BlockingSealTarget(tmp_path / "sealed")
     writer = _SealResultBatchWriter(target)
     try:
@@ -3870,12 +3887,13 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
             durable,
         )
 
-        timed_out = asyncio.create_task(
-            batch_reconciliation._bounded(writer.writer.seal(DoneNotification(0, 11)), 0.01)
-        )
+        sealing = asyncio.create_task(writer.writer.seal(DoneNotification(0, 11)))
         assert await asyncio.to_thread(target.seal_started.wait, 1)
-        with pytest.raises(batch_reconciliation.collector.CollectorTimeoutError):
-            await timed_out
+        sealing.cancel()
+        sealing.cancel()
+        await asyncio.sleep(0)
+        assert not sealing.done()
+        assert writer.thread.is_alive()
 
         async def quarantine(_attempt_id: str) -> None:
             return None
@@ -3892,6 +3910,8 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
         assert not adoption.done()
         assert target.seal_calls == 1
         target.release_seal.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sealing
         await adoption
         assert batch.seal == SealResult(tmp_path / "sealed", False)
 
@@ -3926,11 +3946,11 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
     finally:
         target.release_seal.set()
         if writer.thread.is_alive():
-            await writer.close(timeout=2)
+            await writer.close()
 
 
 @_async_test
-async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tmp_path: Path) -> None:
+async def test_finalization_joins_pending_seal_and_reports_bundle(tmp_path: Path) -> None:
     target = _BlockingSealTarget(tmp_path / "sealed")
     writer = _SealResultBatchWriter(target)
     try:
@@ -3946,12 +3966,13 @@ async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tm
             cast(BatchWriterPort, writer),
             durable,
         )
-        timed_out = asyncio.create_task(
-            batch_reconciliation._bounded(writer.writer.seal(DoneNotification(0, 11)), 0.01)
-        )
+        sealing = asyncio.create_task(writer.writer.seal(DoneNotification(0, 11)))
         assert await asyncio.to_thread(target.seal_started.wait, 1)
-        with pytest.raises(batch_reconciliation.collector.CollectorTimeoutError):
-            await timed_out
+        sealing.cancel()
+        sealing.cancel()
+        await asyncio.sleep(0)
+        assert not sealing.done()
+        assert writer.thread.is_alive()
 
         async def quarantine(_attempt_id: str) -> None:
             return None
@@ -3964,11 +3985,16 @@ async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tm
         )
         reconciler._state.batch = batch
         finalizing = asyncio.create_task(reconciler.finalize_active())
-        assert await asyncio.to_thread(writer.close_requested.wait, 1)
+        await asyncio.sleep(0)
+        assert not finalizing.done()
+        assert target.seal_calls == 1
         target.release_seal.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sealing
         result = await finalizing
         assert result.checkpoint_error is None
         assert result.close_error is None
+        assert writer.close_requested.is_set()
         assert result.preserved_path == tmp_path / "sealed"
         assert result.preserved_kind == "sealed bundle"
         await asyncio.to_thread(writer.thread.join, 1)
@@ -3977,7 +4003,7 @@ async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tm
     finally:
         target.release_seal.set()
         if writer.thread.is_alive():
-            await writer.close(timeout=2)
+            await writer.close()
 
 
 @_async_test
@@ -4103,12 +4129,16 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     attempt_id = store.pending_attempts()[0].attempt_id
-    with store.device_lock() as lease:
-        attempt = store.resume_streaming_attempt(lease)
-        assert attempt is not None
-        attempt.publish_prefix()
-        store.terminalize_prefix_attempt_held(attempt_id, lease)
-        attempt.close()
+
+    def close_published() -> None:
+        with store.device_lock() as lease:
+            attempt = store.resume_streaming_attempt(lease)
+            assert attempt is not None
+            attempt.publish_prefix()
+            store.terminalize_prefix_attempt_held(attempt_id, lease)
+            attempt.close()
+
+    storage_call(close_published)
     scanning = asyncio.Event()
 
     class Observer:
@@ -4130,13 +4160,14 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
         scan_ready.result()
         assert not task.done()
         assert provider.opened == 0
-        assert store.pending_attempts() == ()
+        pending, recovery = storage_call(lambda: (store.pending_attempts(), store.inspect_recovery()))
+        assert pending == ()
         source = _attempt_source(store, attempt_id)
         assert source is not None
         assert source.lifecycle == "sealed_waiting"
         assert source.committed_count == 2
         assert source.committed_sha256 == sha256(records).hexdigest()
-        assert not store.inspect_recovery()[1], "durable closure must cover retained drafts"
+        assert not recovery[1], "durable closure must cover retained drafts"
         checks_completed = True
     finally:
         await _finish_task(task, cancel=True)
@@ -4341,7 +4372,6 @@ class _StalledFinalCheckpointProbe:
         self.activity = activity
         self.original_checkpoint = StagingWriter.checkpoint
         self.original_target_close = StagingWriter.close
-        self.original_interrupt = AttemptWriter.interrupt
         self.original_writer_close = AttemptWriter.close
         self.original_publish = AttemptWriter.publish
         self.read_begin_completed = _patch_read_begin_completion(monkeypatch)
@@ -4352,9 +4382,9 @@ class _StalledFinalCheckpointProbe:
             assert self.release_checkpoint.wait(2)
             return self.original_checkpoint(writer)
 
-        async def lost_interrupt_ack(writer: AttemptWriter) -> object:
-            await self.original_interrupt(writer)
-            raise OSError("durable interrupt acknowledgment was lost")
+        async def failed_interrupt_admission(writer: AttemptWriter) -> object:
+            del writer
+            raise OSError("interrupt was not admitted")
 
         def observed_target_close(writer: StagingWriter) -> object:
             try:
@@ -4362,10 +4392,10 @@ class _StalledFinalCheckpointProbe:
             finally:
                 self.target_closed.set()
 
-        async def observed_writer_close(writer: AttemptWriter, *, timeout: float | None = None) -> object:
+        async def observed_writer_close(writer: AttemptWriter) -> object:
             self.close_attempted.set()
             self.closed_writers.append(writer)
-            return await self.original_writer_close(writer, timeout=timeout)
+            return await self.original_writer_close(writer)
 
         def observed_publish(writer: AttemptWriter, high_water: int, tail: bytes = b"") -> bool:
             published = self.original_publish(writer, high_water, tail)
@@ -4375,18 +4405,80 @@ class _StalledFinalCheckpointProbe:
 
         monkeypatch.setattr(StagingWriter, "checkpoint", stalled_checkpoint)
         monkeypatch.setattr(StagingWriter, "close", observed_target_close)
-        monkeypatch.setattr(AttemptWriter, "interrupt", lost_interrupt_ack)
+        monkeypatch.setattr(AttemptWriter, "interrupt", failed_interrupt_admission)
         monkeypatch.setattr(AttemptWriter, "close", observed_writer_close)
         monkeypatch.setattr(AttemptWriter, "publish", observed_publish)
-        monkeypatch.setattr(
-            batch_reconciliation,
-            "_finalize_batch",
-            partial(_finalize_with_short_transfer_timeout, batch_reconciliation._finalize_batch),
-        )
 
 
 @_async_test
-async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
+async def test_repeated_cancel_during_interrupt_retains_custody_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = asyncio.Event()
+    interrupted = threading.Event()
+    release_interrupt = threading.Event()
+    submitted = threading.Event()
+    read_begin_completed = _patch_read_begin_completion(monkeypatch)
+    original_interrupt = StagingWriter.interrupt
+    original_publish = AttemptWriter.publish
+
+    def held_interrupt(writer: StagingWriter) -> DurablePrefix:
+        interrupted.set()
+        assert release_interrupt.wait(2)
+        return original_interrupt(writer)
+
+    def observed_publish(writer: AttemptWriter, high_water: int, tail: bytes = b"") -> bool:
+        published = original_publish(writer, high_water, tail)
+        if published:
+            submitted.set()
+        return published
+
+    monkeypatch.setattr(StagingWriter, "interrupt", held_interrupt)
+    monkeypatch.setattr(AttemptWriter, "publish", observed_publish)
+
+    class BlockingReadSession(ScriptedRingSession):
+        async def write_control(self, payload: bytes) -> None:
+            await super().write_control(payload)
+            if payload == encode_read_command(10, 1):
+                entered.set()
+
+    session = BlockingReadSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    task = asyncio.create_task(run_opportunistic_collector(Provider([session]), store, _options(batch_records=1)))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert await asyncio.to_thread(submitted.wait, 5)
+        assert await asyncio.to_thread(read_begin_completed.wait, 5)
+        task.cancel()
+        assert await asyncio.to_thread(interrupted.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_interrupt.set()
+        with pytest.raises(CollectionPreservedCancelledError) as raised:
+            await task
+        source_id = raised.value.preserved_source_id
+        assert source_id is not None
+        source = _attempt_source(store, source_id)
+        assert source is not None and source.committed_count == 1
+        assert _source_records(store, source_id) == _record(10)
+        assert encode_advance_command(11) not in session.writes
+        with store.device_lock():
+            pass
+    finally:
+        release_interrupt.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@_async_test
+async def test_slow_final_checkpoint_joins_close_and_releases_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     activity: list[ActivityEvent] = []
@@ -4406,35 +4498,32 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
         ),
     )
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    async with asyncio.TaskGroup() as tasks:
-        task = tasks.create_task(
-            run_opportunistic_collector(
-                Provider([session]),
-                store,
-                _options(batch_records=1, activity=activity),
-            )
-        )
-        try:
-            await asyncio.wait_for(probe.entered.wait(), 5)
-            assert await asyncio.to_thread(probe.data_submitted.wait, 5)
-            assert await asyncio.to_thread(probe.read_begin_completed.wait, 5)
-            task.cancel()
+    task = asyncio.create_task(
+        run_opportunistic_collector(Provider([session]), store, _options(batch_records=1, activity=activity))
+    )
+    try:
+        await asyncio.wait_for(probe.entered.wait(), 5)
+        assert await asyncio.to_thread(probe.data_submitted.wait, 5)
+        assert await asyncio.to_thread(probe.read_begin_completed.wait, 5)
+        task.cancel()
 
-            assert await asyncio.to_thread(probe.checkpoint_started.wait, 5)
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        assert await asyncio.to_thread(probe.checkpoint_started.wait, 5)
+        await asyncio.sleep(0.05)
+        assert not task.done(), "admitted checkpoint must finish before cancellation returns"
+        assert not probe.target_closed.is_set()
+        probe.release_checkpoint.set()
+        with pytest.raises(OSError, match="interrupt was not admitted"):
+            await task
 
-            assert probe.close_attempted.is_set()
-            assert not probe.target_closed.is_set()
-            errors = {event.state: event for event in activity}
-            assert errors["writer_checkpoint_error"].error_type == "CollectorTimeoutError"
-            assert errors["writer_close_error"].error_type == "CollectorTimeoutError"
-        finally:
-            task.cancel()
-            probe.release_checkpoint.set()
-            await asyncio.gather(task, return_exceptions=True)
-            for writer in probe.closed_writers:
-                await asyncio.to_thread(writer.thread.join, 5)
+        assert probe.close_attempted.is_set()
+        assert probe.target_closed.is_set()
+        assert not any(event.error_type == "CollectorTimeoutError" for event in activity)
+    finally:
+        task.cancel()
+        probe.release_checkpoint.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for writer in probe.closed_writers:
+            await asyncio.to_thread(writer.thread.join, 5)
 
     assert await asyncio.to_thread(probe.target_closed.wait, 1)
     assert len(probe.closed_writers) == 1
@@ -4442,11 +4531,15 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
     assert not probe.closed_writers[0].thread.is_alive()
     with _staging_store(tmp_path, _capture_root(tmp_path)).device_lock():
         pass
-    with closing(store.state_db.open_connection(read_only=True)) as connection:
-        source_rows = cast(
-            list[tuple[str]],
-            connection.execute("SELECT source_id FROM capture_source WHERE source_type='attempt'").fetchall(),
-        )
+
+    def read_source_rows() -> list[tuple[str]]:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                list[tuple[str]],
+                connection.execute("SELECT source_id FROM capture_source WHERE source_type='attempt'").fetchall(),
+            )
+
+    source_rows = storage_call(read_source_rows)
     assert len(source_rows) == 1
     source_id = source_rows[0][0]
     source = _attempt_source(store, source_id)

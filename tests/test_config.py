@@ -46,11 +46,8 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.writer.chunk_records == 128
     assert DEFAULT_CONFIG.writer.max_control_commands == 32
     assert DEFAULT_CONFIG.writer.state_poll_seconds == 0.001
-    assert DEFAULT_CONFIG.writer.close_timeout_seconds == 5.0
-    assert DEFAULT_CONFIG.writer.join_poll_seconds == 0.005
     assert isinstance(DEFAULT_CONFIG.firmware_observations, FirmwareObservationConfig)
     assert DEFAULT_CONFIG.firmware_observations.retry_backoff_seconds == (0.05, 0.25, 1.0, 5.0)
-    assert DEFAULT_CONFIG.firmware_observations.close_timeout_seconds == 0.5
     assert DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds == 5.0
     assert isinstance(DEFAULT_CONFIG.observability, ObservabilityConfig)
     assert DEFAULT_CONFIG.observability.max_error_chain_entries == 8
@@ -81,6 +78,12 @@ def test_staging_retention_default_is_terminal_lifecycle_window() -> None:
     assert DEFAULT_CONFIG.staging_retention.terminal_retention_seconds == 72.0 * 60.0 * 60.0
 
 
+@pytest.mark.parametrize("factory", [WriterConfig, FirmwareObservationConfig])
+def test_retired_close_timeout_config_key_fails_fast(factory: type[object]) -> None:
+    with pytest.raises(TypeError, match="close_timeout_seconds"):
+        factory(close_timeout_seconds=1.0)  # type: ignore[call-arg]
+
+
 @pytest.mark.parametrize(
     ("factory", "field", "value"),
     [
@@ -92,7 +95,6 @@ def test_staging_retention_default_is_terminal_lifecycle_window() -> None:
         (BleConfig, "preflight_settle_seconds", 0.0),
         (BleConfig, "att_mtu_query_timeout_seconds", 0.0),
         (WriterConfig, "chunk_records", 0),
-        (FirmwareObservationConfig, "close_timeout_seconds", 0.0),
         (ObservabilityConfig, "max_error_chain_entries", 0),
         (ObservabilityConfig, "max_error_entry_chars", 0),
         (DebugLogConfig, "max_bytes", 0),

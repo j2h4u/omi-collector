@@ -121,6 +121,20 @@ def _publication_io_reason(error: OSError | TransientInternalAudioStorageError) 
     return "publication_io_error"
 
 
+def _db_one(cursor: sqlite3.Cursor) -> sqlite3.Row | tuple[object, ...] | None:
+    try:
+        return cast(sqlite3.Row | tuple[object, ...] | None, cursor.fetchone())
+    finally:
+        cursor.close()
+
+
+def _db_all(cursor: sqlite3.Cursor) -> list[sqlite3.Row] | list[tuple[object, ...]]:
+    try:
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+
+
 class StagingStore:
     """Stage transport state in spool and publish bundles in capture_root."""
 
@@ -396,13 +410,18 @@ class StagingStore:
 
     def _cached_draft_frontier(self) -> int | None:
         try:
-            with closing(self._state_db.open_connection(read_only=True)) as connection:
+            with (
+                closing(self._state_db.open_connection(read_only=True)) as connection,
+                self._state_db.access(connection),
+            ):
                 rows = cast(
                     list[tuple[object, object]],
-                    connection.execute(
-                        "SELECT sequence_start, committed_count FROM capture_source "
-                        "WHERE source_type = 'draft' AND committed_count > 0"
-                    ).fetchall(),
+                    _db_all(
+                        connection.execute(
+                            "SELECT sequence_start, committed_count FROM capture_source "
+                            "WHERE source_type = 'draft' AND committed_count > 0"
+                        )
+                    ),
                 )
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
             raise_if_sqlite_storage_fault(error)
@@ -491,14 +510,19 @@ class StagingStore:
     def _typed_publication_source_ids(self) -> tuple[str, ...]:
         """List SQL sources that the canonical publisher can admit or resume."""
         try:
-            with closing(self._state_db.open_connection(read_only=True)) as connection:
+            with (
+                closing(self._state_db.open_connection(read_only=True)) as connection,
+                self._state_db.access(connection),
+            ):
                 rows = cast(
                     list[tuple[object]],
-                    connection.execute(
-                        "SELECT source_id FROM capture_source "
-                        "WHERE lifecycle IN ('sealed_waiting','blocked') "
-                        "ORDER BY sequence_start, source_id"
-                    ).fetchall(),
+                    _db_all(
+                        connection.execute(
+                            "SELECT source_id FROM capture_source "
+                            "WHERE lifecycle IN ('sealed_waiting','blocked') "
+                            "ORDER BY sequence_start, source_id"
+                        )
+                    ),
                 )
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
             raise_if_sqlite_storage_fault(error)
@@ -703,13 +727,18 @@ class StagingStore:
             lifecycles += ",'sealed_waiting'"
         lifecycles += ")"
         try:
-            with closing(self._state_db.open_connection(read_only=True)) as connection:
+            with (
+                closing(self._state_db.open_connection(read_only=True)) as connection,
+                self._state_db.access(connection),
+            ):
                 rows = cast(
                     list[tuple[object]],
-                    connection.execute(
-                        "SELECT source_id FROM capture_source "
-                        f"WHERE source_type = 'attempt' AND lifecycle IN {lifecycles} ORDER BY source_id"
-                    ).fetchall(),
+                    _db_all(
+                        connection.execute(
+                            "SELECT source_id FROM capture_source "
+                            f"WHERE source_type = 'attempt' AND lifecycle IN {lifecycles} ORDER BY source_id"
+                        )
+                    ),
                 )
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
             raise_if_sqlite_storage_fault(error)

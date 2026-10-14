@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 from shutil import rmtree
@@ -176,7 +177,7 @@ def test_mutating_cli_distinguishes_required_cutover_from_sqlite_busy(
         connection.execute("PRAGMA user_version=1")
         connection.commit()
 
-    monkeypatch.setattr(cli, "_service_locked", lambda *_args: None)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
     cutover = CliRunner().invoke(app, ["service", "--config", str(config_path)])
     assert cutover.exit_code == 78
     assert "requires stopped-service internal audio cutover" in cutover.output
@@ -194,7 +195,7 @@ def test_mutating_cli_stops_restart_loop_for_inaccessible_hot_journal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config_path = _layout(tmp_path)
-    monkeypatch.setattr(cli, "_service_locked", lambda *_args: None)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
     state_file = load_operator_config(config_path).storage.collector.state_db
     subprocess.run(
         (
@@ -227,7 +228,7 @@ os._exit(0)
 
 def test_mutating_cli_recovers_accessible_hot_journal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
-    monkeypatch.setattr(cli, "_service_locked", lambda *_args: None)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
     state_file = load_operator_config(config_path).storage.collector.state_db
     subprocess.run(
         (
@@ -261,7 +262,7 @@ def test_mutating_cli_stops_for_nonregular_journal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, journal_kind: str
 ) -> None:
     config_path = _layout(tmp_path)
-    monkeypatch.setattr(cli, "_service_locked", lambda *_args: None)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
     state_file = load_operator_config(config_path).storage.collector.state_db
     journal = state_file.parent / f"{state_file.name}-journal"
     if journal_kind == "directory":
@@ -320,7 +321,7 @@ def test_service_runs_under_one_guarded_state_scope(monkeypatch: pytest.MonkeyPa
         calls.append("guard-exit")
 
     monkeypatch.setattr(cli, "_command_state", fake_command_state)
-    monkeypatch.setattr(cli, "_service_locked", lambda *_args: calls.append("service"))
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: calls.append("service"))
 
     result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
 
@@ -386,10 +387,32 @@ def test_service_announces_readiness_after_preflight(monkeypatch: pytest.MonkeyP
     assert sync_options[0]["log_level"] is cli.SyncLogLevel.INFO
     from omi_collector.capture.adapters.operational_status import OperationalStatusStore
 
-    status = cast(OperationalStatusStore, sync_options[0]["operational_status"])
+    context = cast(cli._SyncContext, sync_options[0]["context"])
+    assert context.stop_intent is not None
+    status = cast(OperationalStatusStore, context.operational_status)
     assert status.identity.boot_id == "00000000-0000-0000-0000-000000000001"
     assert isinstance(status.identity.invocation_id, str) and len(status.identity.invocation_id) == 32
     assert status._closed
+
+
+def test_service_term_during_synchronous_startup_suppresses_readiness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _layout(tmp_path)
+    previous = signal.getsignal(signal.SIGTERM)
+
+    @contextmanager
+    def interrupted_state(_loaded: object) -> Iterator[StateDB]:
+        signal.raise_signal(signal.SIGTERM)
+        yield cast(StateDB, object())
+
+    monkeypatch.setattr(cli, "_command_state", interrupted_state)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: pytest.fail("service ran after TERM"))
+
+    result = CliRunner().invoke(app, ["service", "--config", str(path)])
+    assert result.exit_code == 143
+    assert "deployment_ready" not in result.output
+    assert signal.getsignal(signal.SIGTERM) is previous
 
 
 def test_service_does_not_announce_readiness_for_invalid_config(tmp_path: Path) -> None:

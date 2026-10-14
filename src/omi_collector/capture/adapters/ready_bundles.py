@@ -1124,11 +1124,17 @@ class _StageHeader:
 
 
 def _sql_one(cursor: sqlite3.Cursor) -> tuple[object, ...] | None:
-    return cast(tuple[object, ...] | None, cursor.fetchone())
+    try:
+        return cast(tuple[object, ...] | None, cursor.fetchone())
+    finally:
+        cursor.close()
 
 
 def _sql_all(cursor: sqlite3.Cursor) -> tuple[tuple[object, ...], ...]:
-    return tuple(cast(list[tuple[object, ...]], cursor.fetchall()))
+    try:
+        return tuple(cast(list[tuple[object, ...]], cursor.fetchall()))
+    finally:
+        cursor.close()
 
 
 def _require_cohort_decision(
@@ -1283,19 +1289,24 @@ def _typed_source_admissions(
         supplied[snapshot.source_id] = (reader, snapshot)
     admissions: list[_TypedAdmission] = []
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             for source_id, (reader, supplied_snapshot) in supplied.items():
                 current = audio_store.get_source(source_id)
                 if current is None or current != supplied_snapshot:
                     raise ReadyBundleError("typed publication source snapshot changed")
                 row = cast(
                     tuple[object, ...] | None,
-                    connection.execute(
-                        "SELECT certified_prefix_count, coverage_digest, block_reason, "
-                        "quarantine_disposition, terminal_time, retention_deadline "
-                        "FROM capture_source WHERE source_id=?",
-                        (source_id,),
-                    ).fetchone(),
+                    _sql_one(
+                        connection.execute(
+                            "SELECT certified_prefix_count, coverage_digest, block_reason, "
+                            "quarantine_disposition, terminal_time, retention_deadline "
+                            "FROM capture_source WHERE source_id=?",
+                            (source_id,),
+                        )
+                    ),
                 )
                 if row is None:
                     raise ReadyBundleError("typed publication source disappeared")
@@ -1844,7 +1855,10 @@ def _typed_cohort_id(
 
 def _load_active_typed_cohort(audio_store: InternalAudioStore) -> _TypedCohort | None:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             rows = _sql_all(
                 connection.execute(
                     "SELECT cohort_id,lifecycle,accepted_permit,drained_threshold,closure_frontier,cursor,config_digest "
@@ -2530,7 +2544,10 @@ def _load_typed_stage(
     page_limit: int,
 ) -> _TypedStage | None:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             row = _sql_one(
                 connection.execute(
                     "SELECT group_identity,owned_path,expected_bundle_digest,expected_record_count,"
@@ -2852,7 +2869,10 @@ def _persisted_typed_stage_key(
     cohort: _TypedCohort,
 ) -> _StageKey:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             rows = _sql_all(
                 connection.execute(
                     "SELECT stage_id,group_identity,owned_path,owner_token FROM ready_output_stage ORDER BY stage_id"
@@ -2953,7 +2973,10 @@ def _typed_durability_failure_is_latched(
     stage: _TypedStage,
 ) -> bool:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             row = _sql_one(
                 connection.execute(
                     "SELECT p.lifecycle,p.cursor,s.group_identity,s.owned_path,s.owner_token,s.failure_reason "
@@ -3016,9 +3039,16 @@ def _require_typed_stage_space(audio_store: InternalAudioStore, cohort: _TypedCo
     stage_bytes = _typed_output_reserve_bytes(stage)
     database = audio_store.state_db.path
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
-            page_size = cast(int, connection.execute("PRAGMA page_size").fetchone()[0])
-            page_count = cast(int, connection.execute("PRAGMA page_count").fetchone()[0])
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
+            page_size_row = _sql_one(connection.execute("PRAGMA page_size"))
+            page_count_row = _sql_one(connection.execute("PRAGMA page_count"))
+        if page_size_row is None or page_count_row is None:
+            raise ReadyBundleError("typed publication SQLite page accounting is unavailable")
+        page_size = cast(int, page_size_row[0])
+        page_count = cast(int, page_count_row[0])
         if page_size <= 0 or page_count <= 0:
             raise ReadyBundleError("typed publication SQLite page accounting is invalid")
         database_bytes = _typed_database_reserve_bytes(page_size, page_count, cohort, stage)
@@ -3292,7 +3322,10 @@ def _typed_coverage_proposals(
 ) -> tuple[_SourceCoverage, ...]:
     proposals: list[_SourceCoverage] = []
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             for item, admission in zip(progress, cohort.admissions, strict=True):
                 if item.old_cursor == admission.admitted_count or item.new_cursor != admission.admitted_count:
                     continue
@@ -3371,7 +3404,10 @@ def _commit_typed_replay_coverage(
     proofs: tuple[tuple[str, dict[str, object]], ...],
 ) -> None:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             proposal = _typed_coverage_proposal(connection, admission)
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
         raise_if_sqlite_storage_fault(error)
@@ -3400,7 +3436,10 @@ def _commit_typed_replay_coverage(
 
 def _typed_source_coverage_state(audio_store: InternalAudioStore, source_id: str) -> tuple[object, ...] | None:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             row = _sql_one(
                 connection.execute(
                     "SELECT lifecycle,source_type,block_reason,quarantine_disposition,terminal_time,retention_deadline,"
@@ -3448,7 +3487,10 @@ def _typed_conflict_disposition(
     cohort: _TypedCohort | None,
 ) -> _ConflictDisposition:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             row = _typed_conflict_source_row(connection, admission.snapshot.source_id)
             cohort_row = (
                 None
@@ -3670,7 +3712,10 @@ def _inspect_typed_conflict_disposition(
     disposition: _ConflictDisposition,
 ) -> str:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             source = _typed_conflict_source_row(connection, disposition.admission.snapshot.source_id)
             accepted_row = (
                 None
@@ -3846,7 +3891,10 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
     cohort, stage = proposal.cohort, proposal.stage
     try:
         ledger = _read_ledger(audio_store.state_db)
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             cohort_row = _sql_one(
                 connection.execute(
                     "SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?",
@@ -3937,7 +3985,10 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
 
 def _retire_one_typed_source(audio_store: InternalAudioStore, page_limit: int) -> bool:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             row = _sql_one(
                 connection.execute(
                     "SELECT source_id,committed_count,committed_sha256,coverage_digest,retirement_cursor "
@@ -4096,7 +4147,10 @@ def _retire_typed_source_once(audio_store: InternalAudioStore, step: _Retirement
 
 def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _RetirementStep, proposed: int | None) -> str:
     try:
-        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
             row = _sql_one(
                 connection.execute(
                     "SELECT lifecycle,committed_count,committed_sha256,coverage_digest,retirement_cursor "

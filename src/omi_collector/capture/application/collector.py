@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -41,7 +40,9 @@ from ..domain.ring_protocol import (
     parse_read_begin_notification,
 )
 from ..domain.transfer_arena import TransferArena
+from .owned_work import join_owned
 from .ring_transport import RingSession, RingTransportDisconnectedError, RingTransportError
+from .stop_intent import StopIntent
 
 _OPTIONAL_OPTIONS_ARG_COUNT = 3
 
@@ -204,6 +205,7 @@ class ReadLegOptions:
     progress: ProgressCallback | None = None
     cleanup_timeout: float | None = None
     progress_mailbox: ProgressMailbox | None = None
+    stop_intent: StopIntent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,9 +273,11 @@ async def probe(session: RingSession) -> RingStatus:
     return await session.read_status()
 
 
-async def ring_info(session: RingSession, *, timeout: float) -> RingInfo:
+async def ring_info(session: RingSession, *, timeout: float, stop_intent: StopIntent | None = None) -> RingInfo:
     _require_timeout(timeout)
     stream = session.notifications()
+    if stop_intent is not None:
+        stop_intent.check()
     await session.write_control(encode_info_command())
     try:
         async with asyncio.timeout(timeout):
@@ -315,7 +319,11 @@ async def read_leg(
 
     # Preparation is deliberately before issuing READ.  Once READ is issued,
     # only BLE notification/control awaits are permitted until terminal DONE.
+    if options.stop_intent is not None:
+        options.stop_intent.check()
     await writer.start()
+    if options.stop_intent is not None:
+        options.stop_intent.check()
     await writer.prepare_leg(start, count)
     stream = session.notifications()
     state = _IngestState(
@@ -328,6 +336,8 @@ async def read_leg(
     )
     terminal = False
     try:
+        if options.stop_intent is not None:
+            options.stop_intent.check()
         await _await_with_timeout(session.write_control(encode_read_command(start, count)), options.timeout)
         terminal = await _ingest_notifications(stream, state, arena, writer, options.timeout)
     except TimeoutError as error:
@@ -338,8 +348,7 @@ async def read_leg(
     except asyncio.CancelledError:
         state.progress_mailbox.finish()
         await _stop_best_effort(session, options.cleanup_timeout)
-        wait_timeout = options.cleanup_timeout if options.cleanup_timeout is not None else options.timeout
-        await _persist_interrupted_writer(state, writer, wait_timeout)
+        await _persist_interrupted_writer(state, writer)
         raise
     except (RingProtocolError, RingTransferError, RingTransportError, MemoryError, ValueError, OSError) as error:
         state.failure_message = str(error)
@@ -351,7 +360,7 @@ async def read_leg(
         raise RingTransferError("READ ended without terminal DONE")
     # These waits are intentionally after DONE.  READ_BEGIN remains ordered
     # ahead of the barrier in the writer's command queue.
-    await _finish_read(session, state, arena, writer, options)
+    await _finish_read(state, arena, writer)
     counters = _leg_counters(arena, writer, baselines)
     return ReadLegResult(
         start,
@@ -404,13 +413,17 @@ async def report_progress(result: ReadLegResult, callback: ProgressCallback) -> 
         await callback_result
 
 
-async def advance_leg(session: RingSession, next_sequence: int, *, timeout: float) -> None:
+async def advance_leg(
+    session: RingSession, next_sequence: int, *, timeout: float, stop_intent: StopIntent | None = None
+) -> None:
     """Issue one ADVANCE, distinguishing rejection from unknown outcome."""
     _require_timeout(timeout)
     if isinstance(next_sequence, bool) or not isinstance(next_sequence, int):
         raise TypeError("next_sequence must be an integer")
     try:
         stream = session.notifications()
+        if stop_intent is not None:
+            stop_intent.check()
         await session.write_control(encode_advance_command(next_sequence))
         async with asyncio.timeout(timeout):
             payload = await anext(stream)
@@ -488,8 +501,7 @@ async def _interrupt(
     options: ReadLegOptions,
 ) -> TransferInterruptedError:
     await _stop_best_effort(session, options.cleanup_timeout)
-    wait_timeout = options.cleanup_timeout if options.cleanup_timeout is not None else options.timeout
-    await _persist_interrupted_writer(state, writer, wait_timeout)
+    await _persist_interrupted_writer(state, writer)
     return TransferInterruptedError(
         state.failure_message, _leg_counters(arena, writer, state.baselines), cause=state.failure_cause
     )
@@ -498,13 +510,12 @@ async def _interrupt(
 async def _persist_interrupted_writer(
     state: _IngestState,
     writer: IngestWriter,
-    wait_timeout: float,
 ) -> None:
-    """Best-effort the queued READ_BEGIN, exact frontier, and interruption in order."""
-    with suppress(BaseException):
-        await _await_with_timeout(_await_read_begin(state.read_begin_future), wait_timeout)
-    with suppress(BaseException):
-        await _await_with_timeout(_await_writer_interrupt(writer), wait_timeout)
+    """Wait for queued READ_BEGIN, exact frontier, and interruption in order."""
+    if not state.started:
+        return
+    await _await_read_begin(state.read_begin_future)
+    await _await_writer_interrupt(writer)
 
 
 def _capture_leg_baselines(arena: TransferArena, writer: IngestWriter) -> _LegBaselines:
@@ -532,7 +543,7 @@ def _enqueue_read_begin(writer: IngestWriter, notice: ReadBeginNotification) -> 
 
 async def _await_read_begin(future: asyncio.Future[object] | None) -> None:
     if future is not None:
-        await future
+        await join_owned(future)
 
 
 async def _await_with_timeout(awaitable: Awaitable[object], timeout: float) -> object:
@@ -541,19 +552,13 @@ async def _await_with_timeout(awaitable: Awaitable[object], timeout: float) -> o
 
 
 async def _finish_read(
-    session: RingSession,
     state: _IngestState,
     arena: TransferArena,
     writer: IngestWriter,
-    options: ReadLegOptions,
 ) -> object:
     try:
-        await _await_with_timeout(_await_read_begin(state.read_begin_future), options.timeout)
-        return await _await_with_timeout(_await_writer_barrier(writer), options.timeout)
-    except TimeoutError as error:
-        state.failure_message = "timed out waiting for writer after READ"
-        state.failure_cause = error
-        raise await _interrupt(session, state, arena, writer, options) from error
+        await _await_read_begin(state.read_begin_future)
+        return await _await_writer_barrier(writer)
     except asyncio.CancelledError:
         raise
     except BaseException as error:

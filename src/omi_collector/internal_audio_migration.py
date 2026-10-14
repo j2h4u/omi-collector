@@ -40,6 +40,7 @@ from omi_collector.capture.adapters.legacy_audio_import import (
     verify_imported_draft,
 )
 from omi_collector.capture.adapters.quarantine import _validate_quarantine_payload
+from omi_collector.capture.adapters.sqlite_admission import admit_exclusive
 from omi_collector.capture.adapters.staging_contract import AttemptStateError
 from omi_collector.config import StagingRetentionConfig
 from omi_collector.state_migration import StateMigrationError, _assert_private_audio_gone
@@ -544,7 +545,7 @@ def _recover_interrupted_fresh(layout: StorageLayout, canonical: sqlite3.Connect
     _validate_interrupted_fresh(layout, canonical)
     _handoff_canonical(layout.collector.state_db)
     _verify_handoff_access(layout.collector.state_db)
-    canonical.execute("BEGIN IMMEDIATE")
+    admit_exclusive(canonical)
     try:
         canonical.execute(
             "INSERT INTO state(kind,id,payload) VALUES ('migration','current',?) "
@@ -1070,7 +1071,7 @@ def _read_receipt(connection: sqlite3.Connection) -> dict[str, object] | None:
 def _put_receipt(connection: sqlite3.Connection, receipt: dict[str, object]) -> None:
     payload = json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        admit_exclusive(connection)
         connection.execute(
             "INSERT INTO state(kind,id,payload) VALUES ('migration',?,?) "
             "ON CONFLICT(kind,id) DO UPDATE SET payload=excluded.payload",

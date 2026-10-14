@@ -127,6 +127,8 @@ def test_production_unit_uses_one_config_and_the_selected_release() -> None:
 
     assert service["User"] == "omi-collector"
     assert service["Group"] == "omi-collector"
+    assert service["Type"] == "exec"
+    assert service["TimeoutStopSec"] == "180s"
     assert service["ExecStartPre"] == "+/usr/local/sbin/omi-collector-bluetooth-ready"
     assert "EnvironmentFile" not in service
     assert service["ExecStart"] == (
@@ -665,7 +667,7 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
     initial_invocation = "a" * 32
     restarted_invocation = "b" * 32
     crash_clause = (
-        f"if (( count > 1 )); then pid=5252; restarts=1; invocation={restarted_invocation}; fi\n"
+        f"if (( count > 2 )); then pid=5252; restarts=1; invocation={restarted_invocation}; fi\n"
         if scenario.crash_loop
         else ""
     )

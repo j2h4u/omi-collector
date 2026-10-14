@@ -18,7 +18,7 @@ from typing import Never
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, RingInfo
 from ..domain.transfer_arena import TransferArena
 from . import batch_machine, collector
-from .operational_telemetry import OperationalEmitter
+from .owned_work import invoke_owned
 from .ports import (
     AttemptDescriptorShape,
     BatchWriterPort,
@@ -41,7 +41,7 @@ from .session_lifecycle import (
 from .session_lifecycle import bounded as _bounded
 from .session_lifecycle import report_activity as _report_activity
 from .session_lifecycle import report_finalization_error as _report_finalization_error
-from .session_lifecycle import sleep as _sleep
+from .stop_intent import StopIntent
 from .storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 
 
@@ -191,16 +191,14 @@ class BatchReconciler:
             self._state.visit_frontier = None
             return
         if batch.seal is None and batch.writer.progress.submitted:
-            durable = await _checkpoint_for_finalization(batch, self._run.options, self._run.runtime)
+            durable = await _checkpoint_batch(batch)
             self._state.pending_durable_next = durable.next_sequence
             _retain_durable_frontier(self._state, durable)
             if durable.record_count:
-                await _bounded(batch.writer.publish_prefix(), self._run.options.timeouts.transfer)
+                await batch.writer.publish_prefix()
         elif batch.seal is not None and batch.count:
             self._state.visit_frontier = max(self._state.visit_frontier or batch.end, batch.end)
-        await _bounded(
-            batch.writer.close(timeout=self._run.options.timeouts.transfer), self._run.options.timeouts.transfer
-        )
+        await batch.writer.close()
         self._state.batch = None
         self._state.pending_descriptor = None
         self._state.pending_durable_next = None
@@ -263,31 +261,20 @@ async def _checkpoint_after_session(state: _State, run: _Run) -> None:
     batch = state.batch
     if batch is None or batch.seal is not None:
         return
-    if await _adopt_completed_session_result(state, batch, run.options):
+    if await _adopt_completed_session_result(state, batch):
         return
     if not batch.writer.progress.submitted:
         return
-    # A transport-originated interruption can arrive immediately after
-    # READ_BEGIN was queued.  Do not mutate the staging target to synchronize:
-    # a second prepare would reset its read-begin state.  Instead wait only for
-    # the writer boundary's queued begin command, under the normal transfer
-    # deadline, then issue the checkpoint.
-    deadline = asyncio.get_running_loop().time() + run.options.timeouts.transfer
-    while True:
-        try:
-            await _checkpoint_batch(batch, run.options)
-            if batch.durable is not None:
-                state.pending_durable_next = batch.durable.next_sequence
-                _retain_durable_frontier(state, batch.durable)
-            return
-        except BaseException as error:
-            if run.runtime.is_writer_failed(error):
-                _raise_writer_cause(batch.writer, error)
-            if not run.runtime.is_writer_error(error):
-                raise
-            if asyncio.get_running_loop().time() >= deadline:
-                raise collector.CollectorTimeoutError("writer did not complete READ_BEGIN before checkpoint") from error
-            await _sleep(run.options.sleep, run.options.config.writer.state_poll_seconds)
+    # The writer queue already orders this checkpoint after READ_BEGIN.
+    try:
+        await _checkpoint_batch(batch)
+    except BaseException as error:
+        if run.runtime.is_writer_failed(error):
+            _raise_writer_cause(batch.writer, error)
+        raise
+    if batch.durable is not None:
+        state.pending_durable_next = batch.durable.next_sequence
+        _retain_durable_frontier(state, batch.durable)
 
 
 async def _run_connected_step(
@@ -301,6 +288,7 @@ async def _run_connected_step(
     """Finish one in-memory batch or decide the connected session is drained."""
     if current is None:
         phase.value = "info"
+        _check_stop_intent(context.run.options.stop_intent)
         current = await info(session)
     phase.value = "read/reconcile"
     run = context.run
@@ -318,13 +306,13 @@ async def _run_connected_step(
         reconciled = await _read_and_seal(context, session, current, batch, phase)
         if reconciled is None:
             phase.value = "info"
+            _check_stop_intent(run.options.stop_intent)
             fresh = await info(session)
             return await _run_connected_step(context, session, fresh, info=info, phase=phase)
         if not run.options.policy.advance_enabled:
             await _complete_batch(
                 state,
                 batch,
-                run.options,
                 advance_confirmed=False,
             )
             return "collected", current
@@ -332,7 +320,7 @@ async def _run_connected_step(
         return await _advance_batch(context, session, current, batch, info=info)
 
     if not run.options.policy.advance_enabled:
-        await _complete_batch(state, batch, run.options, advance_confirmed=False)
+        await _complete_batch(state, batch, advance_confirmed=False)
         return "collected", current
     phase.value = "advance"
     return await _advance_batch(context, session, current, batch, info=info)
@@ -342,6 +330,7 @@ async def _ensure_batch(current: RingInfo, run: _Run, state: _State) -> _Batch |
     batch = state.batch
     if batch is not None:
         return batch
+    _check_stop_intent(run.options.stop_intent)
     pending = state.pending_descriptor
     if pending is not None and _pending_incompatible(current, pending, state.pending_durable_next):
         await run.quarantine_attempt(pending.attempt_id)
@@ -420,6 +409,7 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
     if arena_count < 0:
         raise CursorRegressionError("device cursor is outside the pending batch")
     arena = TransferArena(arena_start, arena_count, max_bytes=run.options.policy.arena_max_bytes)
+    _check_stop_intent(run.options.stop_intent)
     writer = run.runtime.make_batch_writer(
         run.staging,
         start,
@@ -429,6 +419,7 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
         config=run.options.config.writer,
     )
     try:
+        _check_stop_intent(run.options.stop_intent)
         await writer.start()
         prepared_prefix = writer.initial_prefix
         if durable_next is not None and prepared_prefix.next_sequence != durable_next:
@@ -436,15 +427,15 @@ async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve or
     except BaseException as error:
         if run.runtime.is_writer_failed(error):
             try:
-                await writer.close(timeout=run.options.timeouts.transfer)
+                await writer.close()
             except BaseException as close_error:
-                if not (run.runtime.is_writer_error(close_error) or isinstance(close_error, asyncio.TimeoutError)):
+                if not run.runtime.is_writer_error(close_error):
                     raise
             _raise_writer_cause(writer, error)
         try:
-            await writer.close(timeout=run.options.timeouts.transfer)
+            await writer.close()
         except BaseException as close_error:
-            if not (run.runtime.is_writer_error(close_error) or isinstance(close_error, asyncio.TimeoutError)):
+            if not run.runtime.is_writer_error(close_error):
                 raise
         raise
     return _Batch(current, start, end, arena, writer, prepared_prefix)
@@ -474,10 +465,7 @@ async def _read_and_seal(
     batch_machine.transition(seal_precondition, batch_machine.Event.SEAL_REQUEST)
     await _report_activity(run.options.activity, "sealing")
     try:
-        sealed = await _bounded(
-            batch.writer.seal(DoneNotification(0, batch.end)),
-            run.options.timeouts.transfer,
-        )
+        sealed = await batch.writer.seal(DoneNotification(0, batch.end))
     except BaseException as error:
         if run.runtime.is_writer_failed(error):
             _raise_writer_cause(batch.writer, error)
@@ -502,6 +490,7 @@ async def _advance_batch(
     # Never make an ADVANCE decision from the INFO that admitted the batch.
     # The writer has sealed first; this INFO is the sole cursor observation for
     # the destructive command.
+    _check_stop_intent(run.options.stop_intent)
     current = await info(session)
     await _report_activity(run.options.activity, "advancing")
     action = batch_machine.CursorAction(_advance_action(current, batch))
@@ -512,27 +501,30 @@ async def _advance_batch(
         # The immutable bundle is already safe.  Do not issue an old ADVANCE
         # when fresh INFO proves another actor/firmware state has moved on;
         # release the lease and let the next step start at the live cursor.
-        await _complete_batch(
-            state, batch, run.options, advance_confirmed=action is batch_machine.CursorAction.CONFIRMED
-        )
+        await _complete_batch(state, batch, advance_confirmed=action is batch_machine.CursorAction.CONFIRMED)
         return None, current
     assert decision.command is batch_machine.Command.ADVANCE
     try:
         await _bounded(
-            collector.advance_leg(session, batch.end, timeout=run.options.timeouts.info), run.options.timeouts.info
+            collector.advance_leg(
+                session,
+                batch.end,
+                timeout=run.options.timeouts.info,
+                stop_intent=run.options.stop_intent,
+            ),
+            run.options.timeouts.info,
         )
     except collector.AdvanceUncertainError, collector.CollectorTimeoutError:
         batch_machine.transition(_batch_milestone(batch), batch_machine.Event.ADVANCE_UNCERTAIN)
         raise
+    _check_stop_intent(run.options.stop_intent)
     confirmed = await info(session)
     action = batch_machine.CursorAction(_advance_action(confirmed, batch))
     decision = batch_machine.transition(_batch_milestone(batch), batch_machine.Event.ADVANCE_ACK_INFO, action)
     if decision.command is batch_machine.Command.REJECT:
         raise _sealed_cursor_rejection(confirmed, batch, action, "INFO after ADVANCE acknowledgment")
     if decision.command is batch_machine.Command.CLOSE:
-        await _complete_batch(
-            state, batch, run.options, advance_confirmed=action is batch_machine.CursorAction.CONFIRMED
-        )
+        await _complete_batch(state, batch, advance_confirmed=action is batch_machine.CursorAction.CONFIRMED)
         return None, confirmed
     # Cursor below end means ADVANCE was not applied. The next connected step
     # does another fresh INFO and repeats only this idempotent command.
@@ -575,7 +567,7 @@ async def _read_or_reconcile(
     read_start = max(cursor, prefix.next_sequence)
     await joined_to_thread(run.staging.require_capture_space, batch.end - read_start)
     await _read_leg_with_progress(session, batch, read_start, options, phase.quality)
-    prefix = await _checkpoint_batch(batch, options)
+    prefix = await _checkpoint_batch(batch)
     if current.read_sequence > prefix.next_sequence:
         raise CursorConsistencyError("device cursor passed the writer checkpoint")
     return None
@@ -594,6 +586,7 @@ async def _read_leg_with_progress(
         options.timeouts.transfer,
         cleanup_timeout=options.timeouts.info,
         progress_mailbox=mailbox,
+        stop_intent=options.stop_intent,
     )
     requested_records = batch.end - read_start
     started_at = options.clock()
@@ -701,7 +694,7 @@ async def _publish_cursor_ahead(
         cursor,
         occurred_at,
     )
-    published = await _bounded(batch.writer.publish_prefix(), options.timeouts.transfer)
+    published = await batch.writer.publish_prefix()
     await _report_loss_detected(
         options,
         {
@@ -741,24 +734,15 @@ async def _report_loss_detected(options: OpportunisticOptions, event: dict[str, 
     if options.operational is None:
         return
     try:
-        await _bounded(
-            _invoke_operational(options.operational, event),
-            min(options.timeouts.transfer, options.config.retry.presence_preflight_budget_seconds),
-        )
+        await invoke_owned(options.operational, event)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - operational telemetry is best effort
         return
 
 
-async def _invoke_operational(emitter: OperationalEmitter, event: dict[str, object]) -> None:
-    result = emitter(event)
-    if inspect.isawaitable(result):
-        await result
-
-
-async def _checkpoint_batch(batch: _Batch, options: OpportunisticOptions) -> DurablePrefixShape:
-    durable = await _bounded(batch.writer.checkpoint(), options.timeouts.transfer)
+async def _checkpoint_batch(batch: _Batch) -> DurablePrefixShape:
+    durable = await batch.writer.checkpoint()
     batch.durable = durable
     return durable
 
@@ -772,18 +756,18 @@ def _adopt_interrupted_prefix(batch: _Batch) -> DurablePrefixShape | None:
     return durable
 
 
-async def _adopt_seal_result(batch: _Batch, options: OpportunisticOptions) -> bool:
+async def _adopt_seal_result(batch: _Batch) -> bool:
     """Record a seal command that outlived its original bounded await."""
-    sealed = await _bounded(batch.writer.await_seal_result(), options.timeouts.transfer)
+    sealed = await batch.writer.await_seal_result()
     if sealed is None:
         return False
     batch.seal = sealed
     return True
 
 
-async def _adopt_completed_session_result(state: _State, batch: _Batch, options: OpportunisticOptions) -> bool:
+async def _adopt_completed_session_result(state: _State, batch: _Batch) -> bool:
     """Adopt a terminal writer acknowledgment before issuing another checkpoint."""
-    if await _adopt_seal_result(batch, options):
+    if await _adopt_seal_result(batch):
         return True
     interrupted = _adopt_interrupted_prefix(batch)
     if interrupted is None:
@@ -798,19 +782,18 @@ async def _finalize_batch(
 ) -> tuple[BaseException | None, BaseException | None]:
     """Attempt checkpoint and close independently during coordinator teardown.
 
-    A blocked checkpoint must not prevent the close command from being queued.
-    The writer owns the lease until that close command completes and its thread
-    joins, so failures remain observable without claiming the batch was closed.
+    The final close drains the same admitted frontier and owns the lease through
+    worker exit, so failures remain observable without claiming the batch closed.
     """
     checkpoint_error: BaseException | None = None
     try:
         if batch.seal is None:
             try:
-                sealed = await _adopt_seal_result(batch, options)
+                sealed = await _adopt_seal_result(batch)
                 interrupted = _adopt_interrupted_prefix(batch) is not None
                 if not sealed and not interrupted and batch.writer.progress.submitted:
-                    await _checkpoint_for_finalization(batch, options, runtime)
-            except (OSError, collector.CollectorTimeoutError) as error:
+                    await _checkpoint_batch(batch)
+            except OSError as error:
                 checkpoint_error = error
                 await _report_finalization_error(options.activity, "checkpoint", error, runtime)
             except Exception as error:
@@ -832,8 +815,8 @@ async def _close_finalizing_batch(
     if not batch.writer.thread.is_alive():
         return None, False
     try:
-        await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
-    except (OSError, collector.CollectorTimeoutError) as error:
+        await batch.writer.close()
+    except OSError as error:
         await _report_finalization_error(options.activity, "close", error, runtime)
         return error, False
     except Exception as error:
@@ -852,9 +835,9 @@ async def _adopt_seal_after_close(
 ) -> BaseException | None:
     """Reconcile a seal completed ahead of the close command that followed it."""
     try:
-        if await _adopt_seal_result(batch, options):
+        if await _adopt_seal_result(batch):
             return None
-    except (OSError, collector.CollectorTimeoutError) as error:
+    except OSError as error:
         return await _retain_finalization_error(options, runtime, checkpoint_error, error)
     except Exception as error:
         if not (runtime.is_staging_error(error) or runtime.is_writer_error(error)):
@@ -874,26 +857,6 @@ async def _retain_finalization_error(
         return current
     await _report_finalization_error(options.activity, "checkpoint", error, runtime)
     return error
-
-
-async def _checkpoint_for_finalization(
-    batch: _Batch, options: OpportunisticOptions, runtime: CaptureRuntimePort
-) -> DurablePrefixShape:
-    """Wait briefly for queued READ_BEGIN before the final durability barrier."""
-    deadline = asyncio.get_running_loop().time() + options.timeouts.transfer
-    while True:
-        try:
-            return await _checkpoint_batch(batch, options)
-        except BaseException as error:
-            if runtime.is_writer_failed(error):
-                raise
-            if not runtime.is_writer_error(error):
-                raise
-            if asyncio.get_running_loop().time() >= deadline:
-                raise collector.CollectorTimeoutError(
-                    "writer did not complete READ_BEGIN before final checkpoint"
-                ) from error
-            await _sleep(options.sleep, options.config.writer.state_poll_seconds)
 
 
 async def _continue_after_prefix(
@@ -920,7 +883,7 @@ async def _continue_after_prefix(
             batch.info, prefix.record_count, publication.seal, prefix.next_sequence, False
         )
     _retain_durable_frontier(state, prefix)
-    await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
+    await batch.writer.close()
     state.batch = None
     state.pending_descriptor = None
     state.pending_durable_next = None
@@ -932,7 +895,7 @@ async def _quarantine_discontinuous_attempt(
 ) -> None:
     """Release and quarantine a discontinuous attempt without diagnostic metadata."""
     attempt_id = batch.writer.attempt_id
-    await _bounded(batch.writer.close(timeout=run.options.timeouts.transfer), run.options.timeouts.transfer)
+    await batch.writer.close()
     await run.quarantine_attempt(attempt_id)
 
 
@@ -960,6 +923,11 @@ def _advance_action(current: RingInfo, batch: _Batch) -> str:
     return "repeat"
 
 
+def _check_stop_intent(stop_intent: StopIntent | None) -> None:
+    if stop_intent is not None:
+        stop_intent.check()
+
+
 def _sealed_cursor_rejection(
     current: RingInfo,
     batch: _Batch,
@@ -972,12 +940,10 @@ def _sealed_cursor_rejection(
     )
 
 
-async def _complete_batch(
-    state: _State, batch: _Batch, options: OpportunisticOptions, *, advance_confirmed: bool = True
-) -> None:
+async def _complete_batch(state: _State, batch: _Batch, *, advance_confirmed: bool = True) -> None:
     assert batch.seal is not None
     assert batch.info is not None
-    await _bounded(batch.writer.close(timeout=options.timeouts.transfer), options.timeouts.transfer)
+    await batch.writer.close()
     batch_machine.transition(_batch_milestone(batch), batch_machine.Event.WRITER_CLOSED)
     state.last_result = collector.CollectionResult(batch.info, batch.count, batch.seal, batch.end, advance_confirmed)
     if batch.count:

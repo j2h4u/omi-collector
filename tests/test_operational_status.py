@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import stat
+import threading
 from itertools import product
 from pathlib import Path
 
@@ -167,8 +168,36 @@ def test_write_failure_latches_for_service_supervision_without_raising_from_call
     store.update(OperationalDimension.QUALITY, OperationalSignal.BLOCK)
 
     assert store.failure is not None
+    assert store.as_dict()["quality"] == "clear"
     assert read_operational_status(db, identity)["quality"] == "clear"
     assert asyncio.run(store.wait_failure()) is store.failure
+    store.close()
+
+
+def test_slow_status_write_does_not_publish_proposal_or_block_readers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = _db(tmp_path)
+    store = OperationalStatusStore(db, OperationalIdentity(BOOT, INVOCATION))
+    store.initialize()
+    entered, release = threading.Event(), threading.Event()
+    real_put = db.put
+
+    def delayed_put(kind: StateKind, item_id: str, payload: dict[str, object]) -> None:
+        entered.set()
+        assert release.wait(2)
+        real_put(kind, item_id, payload)
+
+    monkeypatch.setattr(db, "put", delayed_put)
+    thread = threading.Thread(target=store.update, args=(OperationalDimension.QUALITY, OperationalSignal.CLEAR))
+    thread.start()
+    assert entered.wait(2)
+    assert store.as_dict()["quality"] == "unknown"
+    assert store.failure is None
+    release.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert store.as_dict()["quality"] == "clear"
     store.close()
 
 
@@ -196,7 +225,7 @@ def test_supervisor_cancels_and_awaits_capture_after_snapshot_failure(
     async def run() -> None:
         operation = asyncio.create_task(_supervise_operational_status(capture(), store))
         await asyncio.sleep(0)
-        store.update(OperationalDimension.QUALITY, OperationalSignal.BLOCK)
+        await asyncio.to_thread(store.update, OperationalDimension.QUALITY, OperationalSignal.BLOCK)
         with pytest.raises(OperationalStatusError, match="persistence failed"):
             await operation
 
@@ -230,7 +259,7 @@ def test_corrupt_status_write_stops_supervised_capture_after_cleanup(
     async def run() -> None:
         operation = asyncio.create_task(_supervise_operational_status(capture(), store))
         await asyncio.sleep(0)
-        store.update(OperationalDimension.QUALITY, OperationalSignal.BLOCK)
+        await asyncio.to_thread(store.update, OperationalDimension.QUALITY, OperationalSignal.BLOCK)
         with pytest.raises(FatalInternalAudioStorageError) as raised:
             await operation
         assert raised.value is fatal
@@ -267,8 +296,8 @@ def test_busy_status_write_rolls_back_memory_and_notifies_supervisor(
     async def run() -> None:
         operation = asyncio.create_task(_supervise_operational_status(capture(), store))
         await asyncio.sleep(0)
-        store.update(OperationalDimension.QUALITY, OperationalSignal.BLOCK)
-        assert store.as_dict()["quality"] == "unknown"
+        await asyncio.to_thread(store.update, OperationalDimension.QUALITY, OperationalSignal.BLOCK)
+        assert (await asyncio.to_thread(store.as_dict))["quality"] == "unknown"
         assert store.failure is busy
         with pytest.raises(TransientInternalAudioStorageError) as raised:
             await operation
@@ -305,7 +334,7 @@ def test_supervisor_preserves_first_fatal_after_fatal_capture_cleanup(
     async def run() -> None:
         operation = asyncio.create_task(_supervise_operational_status(capture(), store))
         await asyncio.sleep(0)
-        store.update(OperationalDimension.QUALITY, OperationalSignal.BLOCK)
+        await asyncio.to_thread(store.update, OperationalDimension.QUALITY, OperationalSignal.BLOCK)
         with pytest.raises(FatalInternalAudioStorageError) as raised:
             await operation
         assert raised.value is original

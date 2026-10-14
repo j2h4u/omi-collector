@@ -449,19 +449,19 @@ def test_terminal_sweep_repeats_only_while_progressing_and_stops_for_capture(
 
 def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
-        _seed_streaming_partial(store, count=2)
-        attempt_id = store.pending_attempts()[0].attempt_id
-        source = store.quarantine_attempt_source(attempt_id)
-        before = _source_snapshot(store, source)
+        store = await asyncio.to_thread(_store, tmp_path)
+        await asyncio.to_thread(_seed_streaming_partial, store, 2)
+        attempt_id = (await asyncio.to_thread(store.pending_attempts))[0].attempt_id
+        source = await asyncio.to_thread(store.quarantine_attempt_source, attempt_id)
+        before = await asyncio.to_thread(_source_snapshot, store, source)
 
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         await maintenance.run_once(lambda: True)
 
-        assert _source_snapshot(store, source) == before
+        assert await asyncio.to_thread(_source_snapshot, store, source) == before
         await maintenance.run_once(lambda: False)
-        assert _terminal_state(store, source) == "published"
-        admitted = _source_snapshot(store, source)
+        assert await asyncio.to_thread(_terminal_state, store, source) == "published"
+        admitted = await asyncio.to_thread(_source_snapshot, store, source)
         assert admitted is not None
         assert cast(tuple[object, ...], admitted["source"])[4] == 2
 
@@ -472,9 +472,9 @@ def test_run_once_admits_two_real_sources_into_sql_and_runs_normal_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
-        sources = _quarantine_sources(store, (1, 2))
-        before = {source: _source_snapshot(store, source) for source in sources}
+        store = await asyncio.to_thread(_store, tmp_path)
+        sources = await asyncio.to_thread(_quarantine_sources, store, (1, 2))
+        before = await asyncio.to_thread(lambda: {source: _source_snapshot(store, source) for source in sources})
         runtime = OpportunisticRuntime()
         original_admit = runtime.admit_quarantined_prefix
         calls: list[str] = []
@@ -491,10 +491,11 @@ def test_run_once_admits_two_real_sources_into_sql_and_runs_normal_recovery(
             await maintenance.close()
 
         assert calls == list(sources)
-        assert all(_terminal_state(store, source) == "published" for source in sources)
+        terminal_states = [await asyncio.to_thread(_terminal_state, store, source) for source in sources]
+        assert all(state == "published" for state in terminal_states)
         for source in sources:
             prior = before[source]
-            current = _source_snapshot(store, source)
+            current = await asyncio.to_thread(_source_snapshot, store, source)
             assert prior is not None and current is not None
             assert current["records"] == prior["records"]
             row = cast(tuple[object, ...], current["source"])
@@ -508,11 +509,11 @@ def test_integrity_hold_preserves_source_and_next_maintenance_pass_admits_other_
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
-        first, second = _quarantine_sources(store, (1, 2))
-        _corrupt_quarantined_digest(store, first)
-        first_before = _source_snapshot(store, first)
-        second_before = _source_snapshot(store, second)
+        store = await asyncio.to_thread(_store, tmp_path)
+        first, second = await asyncio.to_thread(_quarantine_sources, store, (1, 2))
+        await asyncio.to_thread(_corrupt_quarantined_digest, store, first)
+        first_before = await asyncio.to_thread(_source_snapshot, store, first)
+        second_before = await asyncio.to_thread(_source_snapshot, store, second)
         runtime = OpportunisticRuntime()
         original_admit = runtime.admit_quarantined_prefix
         calls: list[str] = []
@@ -532,7 +533,7 @@ def test_integrity_hold_preserves_source_and_next_maintenance_pass_admits_other_
             await maintenance.close()
 
         assert calls == [first, second]
-        first_after = _source_snapshot(store, first)
+        first_after = await asyncio.to_thread(_source_snapshot, store, first)
         assert first_before is not None and first_after is not None
         assert first_after["records"] == first_before["records"]
         assert cast(tuple[object, ...], first_after["source"])[1:4] == (
@@ -540,9 +541,9 @@ def test_integrity_hold_preserves_source_and_next_maintenance_pass_admits_other_
             "source_authentication_mismatch",
             "unclassified",
         )
-        assert _terminal_state(store, first) is None
-        assert _terminal_state(store, second) == "published"
-        second_after = _source_snapshot(store, second)
+        assert await asyncio.to_thread(_terminal_state, store, first) is None
+        assert await asyncio.to_thread(_terminal_state, store, second) == "published"
+        second_after = await asyncio.to_thread(_source_snapshot, store, second)
         assert second_before is not None and second_after is not None
         assert second_after["records"] == second_before["records"]
 
@@ -560,9 +561,9 @@ def test_run_once_stops_after_retryable_or_deferred_source_without_touching_the_
     reason: str,
 ) -> None:
     async def scenario() -> None:
-        store = _store(tmp_path)
-        sources = _quarantine_sources(store, (1, 2))
-        before = {source: _source_snapshot(store, source) for source in sources}
+        store = await asyncio.to_thread(_store, tmp_path)
+        sources = await asyncio.to_thread(_quarantine_sources, store, (1, 2))
+        before = await asyncio.to_thread(lambda: {source: _source_snapshot(store, source) for source in sources})
         runtime = OpportunisticRuntime()
         original_admit = runtime.admit_quarantined_prefix
         calls: list[str] = []
@@ -581,8 +582,10 @@ def test_run_once_stops_after_retryable_or_deferred_source_without_touching_the_
             await maintenance.close()
 
         assert calls == [sources[0]]
-        assert all(_source_snapshot(store, source) == before[source] for source in sources)
-        assert all(_terminal_state(store, source) is None for source in sources)
+        snapshots = [await asyncio.to_thread(_source_snapshot, store, source) for source in sources]
+        terminal_states = [await asyncio.to_thread(_terminal_state, store, source) for source in sources]
+        assert all(snapshot == before[source] for source, snapshot in zip(sources, snapshots, strict=True))
+        assert all(state is None for state in terminal_states)
 
     _run(scenario())
 
@@ -615,21 +618,25 @@ def test_presence_startup_state_binds_once_after_a_completed_attempt(tmp_path: P
             async def close(self) -> None:
                 return None
 
-        store = _store(tmp_path)
-        _seed_streaming_partial(store, count=1)
+        store = await asyncio.to_thread(_store, tmp_path)
+        await asyncio.to_thread(_seed_streaming_partial, store, 1)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         bound: list[PendingStartupState] = []
 
         await maintenance.wait_for_presence_attempt(Presence(), bound.append)
         pending = bound[0].pending
         assert pending is not None
-        with store.device_lock() as lease:
-            completed = store.resume_streaming_attempt(lease)
-            assert completed is not None
-            completed.publish_prefix()
-            completed.close(durable=True)
-        store.terminalize_prefix_attempt(pending.attempt_id)
-        assert store.pending_attempts() == ()
+
+        def complete_pending() -> None:
+            with store.device_lock() as lease:
+                completed = store.resume_streaming_attempt(lease)
+                assert completed is not None
+                completed.publish_prefix()
+                completed.close(durable=True)
+            store.terminalize_prefix_attempt(pending.attempt_id)
+
+        await asyncio.to_thread(complete_pending)
+        assert await asyncio.to_thread(store.pending_attempts) == ()
 
         # A second wake must not bind maintenance's cached, now-completed
         # descriptor back into the reconciler.
@@ -892,7 +899,7 @@ def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
             raise ValueError("clock metadata sentinel")
 
         monkeypatch.setattr(ClockStateStore, "segment_map", bad_clock)
-        type(store)._recover_and_publish_unlocked(store)
+        await asyncio.to_thread(type(store)._recover_and_publish_unlocked, store)
         assert "clock metadata unavailable; publishing ready audio without UTC normalization" in caplog.text
         assert "clock metadata sentinel" in caplog.text
 
@@ -1088,7 +1095,7 @@ def test_capture_priority_joins_running_retry_and_defers_new_requests(
             assert recovery.finished.is_set()
             await asyncio.sleep(0)
             assert recovery.calls == 1
-            maintenance.exit_capture_priority()
+            await maintenance.exit_capture_priority()
             for _ in range(20):
                 if recovery.calls == 2:
                     break
@@ -1128,7 +1135,7 @@ def test_capture_priority_resumes_running_retry_without_new_request(
             assert recovery.finished.is_set()
             assert recovery.calls == 1
 
-            maintenance.exit_capture_priority()
+            await maintenance.exit_capture_priority()
             for _ in range(100):
                 if recovery.calls == 2:
                     break
@@ -1174,7 +1181,7 @@ def test_capture_priority_defers_pending_publication_timer_until_exit(
             assert maintenance._publication_retry_handle is None
             assert store.publication_retry_schedule() is None
 
-            maintenance.exit_capture_priority()
+            await maintenance.exit_capture_priority()
             assert await asyncio.to_thread(resumed.wait, 1)
             assert calls == 2
         finally:
@@ -1210,7 +1217,7 @@ def test_cancelled_capture_priority_entry_joins_retry_before_releasing_gate(
                 try:
                     await maintenance.enter_capture_priority()
                 finally:
-                    maintenance.exit_capture_priority()
+                    await maintenance.exit_capture_priority()
 
             entering = asyncio.create_task(enter())
             await asyncio.sleep(0)
@@ -1233,8 +1240,8 @@ def test_cancelled_capture_priority_entry_joins_retry_before_releasing_gate(
 
 def test_visit_begin_failure_releases_capture_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
-        store = _publication_store(tmp_path)
-        store.append_ready_closure(11, "drained")
+        store = await asyncio.to_thread(_publication_store, tmp_path)
+        await asyncio.to_thread(store.append_ready_closure, 11, "drained")
         original = store.begin_ready_visit
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         monkeypatch.setattr(store, "begin_ready_visit", lambda: (_ for _ in ()).throw(OSError("storage unavailable")))
@@ -1242,12 +1249,12 @@ def test_visit_begin_failure_releases_capture_priority(tmp_path: Path, monkeypat
         with pytest.raises(OSError, match="storage unavailable"):
             await maintenance.enter_capture_priority()
         assert store.publication_wake_admitted()
-        assert closure_rows(store)[0]["reason"] == "drained"
+        assert (await asyncio.to_thread(closure_rows, store))[0]["reason"] == "drained"
 
         monkeypatch.setattr(store, "begin_ready_visit", original)
         await maintenance.enter_capture_priority()
-        assert closure_rows(store)[0]["reason"] == "collecting"
-        maintenance.exit_capture_priority()
+        assert (await asyncio.to_thread(closure_rows, store))[0]["reason"] == "collecting"
+        await maintenance.exit_capture_priority()
         await maintenance.close()
 
     _run(scenario())
@@ -1257,8 +1264,8 @@ def test_cancelled_visit_begin_joins_storage_before_releasing_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        store = _publication_store(tmp_path)
-        store.append_ready_closure(11, "drained")
+        store = await asyncio.to_thread(_publication_store, tmp_path)
+        await asyncio.to_thread(store.append_ready_closure, 11, "drained")
         started = threading.Event()
         release = threading.Event()
         original = store.begin_ready_visit
@@ -1448,21 +1455,24 @@ def test_invalidated_startup_state_prioritizes_sealed_prefix_over_new_pending_at
             async def close(self) -> None:
                 return None
 
-        store = _store(tmp_path)
-        _seed_streaming_partial(store, 1)
+        store = await asyncio.to_thread(_store, tmp_path)
+        await asyncio.to_thread(_seed_streaming_partial, store, 1)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         bound: list[PendingStartupState] = []
         await maintenance.wait_for_presence_attempt(Presence(), bound.append)
         first = bound[0].pending
         assert first is not None
 
-        with store.device_lock() as lease:
-            completed = store.resume_streaming_attempt(lease)
-            assert completed is not None
-            completed.publish_prefix()
-            completed.close(durable=True)
-        store.terminalize_prefix_attempt(first.attempt_id)
-        _seed_streaming_partial(store, 1)
+        def complete_first() -> None:
+            with store.device_lock() as lease:
+                completed = store.resume_streaming_attempt(lease)
+                assert completed is not None
+                completed.publish_prefix()
+                completed.close(durable=True)
+            store.terminalize_prefix_attempt(first.attempt_id)
+
+        await asyncio.to_thread(complete_first)
+        await asyncio.to_thread(_seed_streaming_partial, store, 1)
 
         maintenance.invalidate_startup_state()
         await maintenance.wait_for_presence_attempt(Presence(), bound.append)
@@ -1881,7 +1891,7 @@ async def _exercise_capture_priority_coalescing(
         assert recovery.calls == 1
         recovery.release[0].set()
         await entering
-        maintenance.exit_capture_priority()
+        await maintenance.exit_capture_priority()
         await _wait_for_thread_event(recovery.started[1])
         publication = maintenance._publication_retry_task
         assert publication is not None

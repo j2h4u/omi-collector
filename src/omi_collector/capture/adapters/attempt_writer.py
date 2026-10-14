@@ -23,6 +23,7 @@ from threading import Event, Lock, Thread
 from typing import Protocol, runtime_checkable
 
 from ...config import DEFAULT_CONFIG, WriterConfig
+from ..application.owned_work import join_owned
 from ..domain.ring_protocol import RECORD_SIZE
 from .attempt_writer_machine import (
     Admit,
@@ -141,10 +142,6 @@ class WriterFailedError(WriterError):
 
 class WriterQueueFullError(WriterError):
     """The bounded control-command queue is full."""
-
-
-class WriterShutdownTimeoutError(WriterError):
-    """The target did not finish orderly close within the requested bound."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,7 +361,7 @@ class AttemptWriter:
         """Prepare the target attempt on the dedicated thread."""
         future = self._admit(StartRequested(), lambda _high_water, _tail: PrepareCommand())
         if future is not None:
-            return await future
+            return await join_owned(future)
         return None
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> object:
@@ -374,11 +371,11 @@ class AttemptWriter:
         future = self._admit(LegRequested(), lambda _high_water, _tail: PrepareLegCommand(start_sequence, record_count))
         if future is None:
             return None
-        return await future
+        return await join_owned(future)
 
     async def read_begin(self, notice: object) -> object:
         """Record READ_BEGIN through the target thread."""
-        return await self.submit_read_begin(notice)
+        return await join_owned(self.submit_read_begin(notice))
 
     def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
         """Queue READ_BEGIN without waiting for target or disk progress."""
@@ -400,7 +397,7 @@ class AttemptWriter:
         future = self._admit(CheckpointRequested(), CheckpointCommand)
         if future is None:
             return None
-        return await future
+        return await join_owned(future)
 
     async def barrier(self) -> object:
         """Alias for :meth:`checkpoint`, emphasizing ordering semantics."""
@@ -411,7 +408,7 @@ class AttemptWriter:
         future = self._admit(CheckpointRequested(), InterruptCommand)
         if future is None:
             return None
-        return await future
+        return await join_owned(future)
 
     async def seal(self, done_notice: object = None) -> object:
         """Flush published bytes and seal, unless the target has failed."""
@@ -422,7 +419,7 @@ class AttemptWriter:
         )
         if future is None:
             return None
-        return await asyncio.shield(future)
+        return await join_owned(future)
 
     async def await_seal_result(self) -> object | None:
         """Return the retained seal result, waiting if a seal command is still running."""
@@ -432,7 +429,7 @@ class AttemptWriter:
             pending = self._seal_pending
         if pending is None:
             return None
-        return await asyncio.shield(pending)
+        return await join_owned(pending)
 
     async def publish_prefix(self) -> object:
         """Flush published bytes and publish the durable prefix on the writer thread."""
@@ -443,62 +440,26 @@ class AttemptWriter:
         )
         if future is None:
             return None
-        return await future
+        return await join_owned(future)
 
-    async def close(self, *, timeout: float | None = None) -> object:
-        """Orderly-close the target, with idempotent bounded waiting.
-
-        If the caller is cancelled, the close command remains owned by the
-        writer thread and is given the same bounded opportunity to finish;
-        cancellation is then re-raised.  A target that remains blocked yields
-        :class:`WriterShutdownTimeoutError` rather than being silently abandoned.
-        """
-        if timeout is None:
-            timeout = self._config.close_timeout_seconds
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+    async def close(self) -> object:
+        """Drain and join the target worker, preserving its settled outcome."""
         future = self._admit(CloseRequested(), CloseCommand)
         assert future is not None
-        try:
-            await asyncio.wait_for(asyncio.shield(future), timeout)
-        except asyncio.CancelledError:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise WriterShutdownTimeoutError("writer close timed out after cancellation") from None
-            try:
-                result = await asyncio.wait_for(asyncio.shield(future), remaining)
-            except TimeoutError as exc:
-                raise WriterShutdownTimeoutError("writer close timed out after cancellation") from exc
-            except WriterFailedError:
-                await self._join_until(deadline)
-                raise
-            await self._join_until(deadline)
-            del result
-            raise
-        except TimeoutError as exc:
-            raise WriterShutdownTimeoutError(f"writer close timed out after {timeout:.3f}s") from exc
-        except WriterFailedError:
-            await self._join_until(deadline)
-            raise
-        return await self._join_until(deadline, result=future)
 
-    async def _join_until(
-        self,
-        deadline: float,
-        *,
-        result: asyncio.Future[object] | None = None,
-    ) -> object:
-        """Join without blocking the event loop, preserving the close deadline."""
-        while self._thread.is_alive():
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise WriterShutdownTimeoutError("writer thread did not exit before close deadline")
-            await asyncio.sleep(min(self._config.join_poll_seconds, remaining))
-        if result is None:
-            return None
-        return result.result()
+        async def finish() -> object:
+            result: object | None = None
+            failure: BaseException | None = None
+            try:
+                result = await asyncio.shield(future)
+            except BaseException as error:  # noqa: BLE001 - join before propagating any settled result
+                failure = error
+            await asyncio.to_thread(self._thread.join)
+            if failure is not None:
+                raise failure
+            return result
+
+        return await join_owned(finish())
 
     def _loop_for_completion(self) -> asyncio.AbstractEventLoop:
         if self._loop is not None:
@@ -801,7 +762,6 @@ __all__ = [
     "WriterProgress",
     "WriterQueueFullError",
     "WriterResult",
-    "WriterShutdownTimeoutError",
     "WriterSnapshot",
     "WriterState",
     "WriterTarget",

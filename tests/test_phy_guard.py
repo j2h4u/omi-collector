@@ -7,6 +7,7 @@ import sys
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from pathlib import Path
+from threading import Thread
 from typing import cast
 
 import pytest
@@ -27,6 +28,25 @@ from omi_collector.config import DEFAULT_CONFIG
 
 ORIGINAL = ("BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX")
 TEMPORARY = ORIGINAL[:-2]
+
+
+def storage_call[T](function: Callable[[], T]) -> T:
+    result: list[T] = []
+    error: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result.append(function())
+        except BaseException as exception:  # noqa: BLE001
+            error.append(exception)
+
+    thread = Thread(target=run)
+    thread.start()
+    thread.join()
+    if error:
+        raise error[0]
+    assert result
+    return result[0]
 
 
 def _async_test[**P](function: Callable[P, Awaitable[None]]) -> Callable[P, None]:
@@ -82,11 +102,11 @@ class FakeProcess:
 
 
 def _db(tmp_path: Path) -> StateDB:
-    return StateDB(tmp_path / "collector" / "collector-state.sqlite3")
+    return storage_call(lambda: StateDB(tmp_path / "collector" / "collector-state.sqlite3"))
 
 
 def _marker(db: StateDB) -> dict[str, object] | None:
-    return db.get(StateKind.PHY_RESTORATION, "hci0")
+    return storage_call(lambda: db.get(StateKind.PHY_RESTORATION, "hci0"))
 
 
 def test_phy_deadlines_project_from_runtime_config() -> None:
@@ -199,7 +219,11 @@ async def test_restore_failure_leaves_db_marker_for_next_run(tmp_path: Path) -> 
 @_async_test
 async def test_stale_marker_recovers_before_new_temporary_selection(tmp_path: Path) -> None:
     db, runner = _db(tmp_path), FakeRunner(selected=TEMPORARY)
-    db.put(StateKind.PHY_RESTORATION, "hci0", {"adapter": "hci0", "selected_phys": list(ORIGINAL), "version": 2})
+    storage_call(
+        lambda: db.put(
+            StateKind.PHY_RESTORATION, "hci0", {"adapter": "hci0", "selected_phys": list(ORIGINAL), "version": 2}
+        )
+    )
     with collector_guard(db.path.parent / "collector.lock"):
         async with ScopedPhyGuard("hci0", state_db=db, runner=runner):
             assert runner.selected == TEMPORARY
@@ -211,7 +235,7 @@ async def test_stale_marker_recovers_before_new_temporary_selection(tmp_path: Pa
 async def test_malformed_marker_fails_closed_before_controller_changes(tmp_path: Path) -> None:
     db, runner = _db(tmp_path), FakeRunner()
     bad_marker = {"adapter": "hci0", "selected_phys": [], "version": 2}
-    db.put(StateKind.PHY_RESTORATION, "hci0", bad_marker)
+    storage_call(lambda: db.put(StateKind.PHY_RESTORATION, "hci0", bad_marker))
     with collector_guard(db.path.parent / "collector.lock"):
         with pytest.raises(PhyStateError):
             await ScopedPhyGuard("hci0", state_db=db, runner=runner).recover()
@@ -225,10 +249,12 @@ async def test_marker_mutation_before_cleanup_is_detected(tmp_path: Path) -> Non
     with collector_guard(db.path.parent / "collector.lock"):
         with pytest.raises(PhyStateError, match="marker changed"):
             async with ScopedPhyGuard("hci0", state_db=db, runner=runner):
-                db.put(
-                    StateKind.PHY_RESTORATION,
-                    "hci0",
-                    {"adapter": "hci0", "selected_phys": list(TEMPORARY), "version": 2},
+                storage_call(
+                    lambda: db.put(
+                        StateKind.PHY_RESTORATION,
+                        "hci0",
+                        {"adapter": "hci0", "selected_phys": list(TEMPORARY), "version": 2},
+                    )
                 )
         assert _marker(db) is not None
 

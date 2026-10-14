@@ -115,7 +115,7 @@ def test_writer_close_waits_for_inflight_database_write_and_final_mailbox_value(
                 assert release.wait(1)
             return super().record(info)
 
-    writer = FirmwareObservationWriter(StalledStore(db), config=FirmwareObservationConfig(close_timeout_seconds=0.01))
+    writer = FirmwareObservationWriter(StalledStore(db))
     writer.observe(_info(1))
     assert entered.wait(1)
     writer.observe(_info(2))
@@ -156,7 +156,7 @@ def test_writer_retries_database_failure_and_reports_one_error_per_episode(tmp_p
 
     writer = FirmwareObservationWriter(
         FlakyStore(db),
-        config=FirmwareObservationConfig(retry_backoff_seconds=(0.001,), close_timeout_seconds=1),
+        config=FirmwareObservationConfig(retry_backoff_seconds=(0.001,)),
         on_error=errors.append,
     )
     writer.observe(_info(3))
@@ -209,7 +209,7 @@ def test_writer_replaces_stalled_mailbox_with_latest_observation(tmp_path: Path)
                 assert release.wait(1)
             return super().record(info)
 
-    writer = FirmwareObservationWriter(StalledStore(db), config=FirmwareObservationConfig(close_timeout_seconds=1))
+    writer = FirmwareObservationWriter(StalledStore(db))
     writer.observe(_info(1))
     assert entered.wait(1)
     writer.observe(_info(2))

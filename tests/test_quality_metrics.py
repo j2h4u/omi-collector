@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from threading import Event, Thread
 import pytest
 
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.opportunistic_runtime import create_quality_metrics_owned
 from omi_collector.capture.adapters.quality_metrics import (
     QualityMetricsError,
     SQLiteQualityMetrics,
@@ -149,6 +151,58 @@ def test_close_waits_for_inflight_database_work_and_joins_before_return(
     assert results == [True]
     assert not writer._thread.is_alive()
     assert len(database.list(StateKind.QUALITY_EVENT)) == 1
+
+
+def test_full_queue_records_block_on_worker_before_later_clear(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path)
+    writer = SQLiteQualityMetrics(database, release_version="1.2.3", config=QualityMetricsConfig(queue_max_records=1))
+    signals: list[OperationalSignal] = []
+    writer.set_operational_signal(signals.append)
+    entered, release = Event(), Event()
+
+    def blocked_write(_item_id: str, _payload: dict[str, object]) -> None:
+        entered.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(writer, "_put_quality_event", blocked_write)
+    writer.record_sequence_loss(_loss(1))
+    assert entered.wait(2)
+    writer.record_sequence_loss(_loss(2))
+    writer.record_sequence_loss(_loss(3))
+    release.set()
+    assert writer.close(timeout_seconds=2)
+    assert signals[0] is OperationalSignal.CONFIGURED
+    assert OperationalSignal.BLOCK in signals
+    assert signals.index(OperationalSignal.BLOCK) < signals.index(OperationalSignal.CLEAR)
+
+
+def test_cancelled_quality_factory_closes_and_joins_created_worker(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    started, release = Event(), Event()
+    created: list[SQLiteQualityMetrics] = []
+
+    def factory() -> SQLiteQualityMetrics:
+        started.set()
+        assert release.wait(2)
+        worker = SQLiteQualityMetrics(database, release_version="1.2.3")
+        created.append(worker)
+        return worker
+
+    async def scenario() -> None:
+        task = asyncio.create_task(create_quality_metrics_owned(factory))
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("factory cancellation was not preserved")
+
+    asyncio.run(scenario())
+    assert len(created) == 1
+    assert not created[0]._thread.is_alive()
 
 
 def test_quality_writer_rejects_nonfinite_payload_before_queueing(tmp_path: Path) -> None:

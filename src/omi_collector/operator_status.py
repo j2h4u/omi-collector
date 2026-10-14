@@ -297,15 +297,18 @@ def collect_operator_status(
 def _custody_hold_count(db: StateDB) -> int:
     """Count SQL audio held indefinitely after unresolved custody conflicts."""
     try:
-        with closing(db.open_connection(read_only=True)) as connection:
-            row = cast(
-                sqlite3.Row | None,
+        with (
+            closing(db.open_connection(read_only=True)) as connection,
+            db.access(connection),
+            closing(
                 connection.execute(
                     "SELECT COUNT(*) FROM capture_source WHERE source_type='quarantine' "
                     "AND lifecycle='blocked' AND block_reason IN (?, ?)",
                     tuple(sorted(QUARANTINE_CUSTODY_HOLD_REASONS)),
-                ).fetchone(),
-            )
+                )
+            ) as cursor,
+        ):
+            row = cast(sqlite3.Row | None, cursor.fetchone())
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise_if_sqlite_storage_fault(error)
         raise OperatorStatusError("custody hold inventory is unreadable") from error

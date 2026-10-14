@@ -797,7 +797,7 @@ def test_verified_set_time_persists_intent_before_write_and_keeps_exact_boundary
 
     class InspectingSession(FakeOperationalSession):
         async def write_optional_characteristic(self, uuid: str, value: bytes) -> object:
-            observed_intents.append(store.state().intent)
+            observed_intents.append((await asyncio.to_thread(store.state)).intent)
             return await super().write_optional_characteristic(uuid, value)
 
     session = InspectingSession(session.values, readback=session.readback)

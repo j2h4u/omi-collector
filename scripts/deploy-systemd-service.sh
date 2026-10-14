@@ -16,6 +16,9 @@ function handle_signal {
     local -ri exit_status="$2"
 
     # code
+    if (( selection_published && ! deployment_committed )); then
+        readiness_observation_failed=1
+    fi
     die "deployment interrupted by ${signal_name}" "$exit_status"
 }
 
@@ -48,6 +51,37 @@ function read_service_snapshot {
     [[ "$active_state" == active && "$process_id" =~ ^[1-9][0-9]*$ && "$restart_count" =~ ^[0-9]+$ \
         && "$invocation_id" =~ ^[[:xdigit:]]{32}$ ]] || return 1
     printf '%s|%s|%s\n' "$process_id" "$restart_count" "$invocation_id"
+}
+
+function read_service_readiness_snapshot {
+    # args
+    local -r unit_name="$1"
+
+    # vars
+    local active_state process_id restart_count invocation_id output line key value
+
+    # code
+    output=$(systemctl show "$unit_name" --property=ActiveState --property=MainPID --property=NRestarts \
+        --property=InvocationID) || return 1
+    active_state=''
+    process_id=''
+    restart_count=''
+    invocation_id=''
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            ActiveState) active_state=$value ;;
+            MainPID) process_id=$value ;;
+            NRestarts) restart_count=$value ;;
+            InvocationID) invocation_id=$value ;;
+        esac
+    done <<< "$output"
+
+    [[ "$active_state" == active || "$active_state" == activating || "$active_state" == failed \
+        || "$active_state" == inactive || "$active_state" == deactivating ]] || return 1
+    [[ "$restart_count" =~ ^[0-9]+$ && "$invocation_id" =~ ^[[:xdigit:]]{32}$ ]] || return 1
+    printf '%s|%s|%s|%s\n' "$active_state" "$process_id" "$restart_count" "$invocation_id"
 }
 
 function validate_operator_config_file {
@@ -701,9 +735,11 @@ declare state_file
 declare migration_preflight_state
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
-declare -i attempt readiness_seen=0 selection_published=0 deployment_committed=0
+declare readiness_snapshot readiness_state readiness_pid readiness_restarts readiness_invocation
+declare -i readiness_seen=0 selection_published=0 deployment_committed=0
+declare -i readiness_observation_failed=0
 declare -i service_quiesced=0 release_created=0 deployment_lock_fd=-1
-declare -ri readiness_poll_attempts=5 readiness_poll_interval_seconds=1 stability_interval_seconds=6
+declare -ri readiness_poll_interval_seconds=1 stability_interval_seconds=6
 
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve script directory'
 repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
@@ -742,8 +778,8 @@ function cleanup {
     local -ri preserve_recovery="${1:-0}"
 
     # code
+    [[ -e "$temporary_link" || -L "$temporary_link" ]] && rm -f -- "$temporary_link"
     if (( ! preserve_recovery )); then
-        [[ -e "$temporary_link" || -L "$temporary_link" ]] && rm -f -- "$temporary_link"
         if (( release_created && ! deployment_committed && ! selection_published )); then
             if [[ "$release_path" == "${deployments_dir}"/release-* && -d "$release_path" && ! -L "$release_path" ]]; then
                 rm -rf -- "$release_path" || printf 'ERROR: could not remove unpublished deployment: %s\n' "$release_path" >&2
@@ -771,6 +807,25 @@ function finalize {
         selection_published=0
     elif (( ! service_quiesced && ! selection_published )); then
         : # The deployer has not stopped the service or attempted selector publication.
+    elif (( selector_readable && readiness_observation_failed )) \
+        && [[ "$selected_target" == "releases/${release_name}" ]] \
+        && readiness_snapshot=$(read_service_readiness_snapshot "$service_name") \
+        && IFS='|' read -r readiness_state readiness_pid readiness_restarts readiness_invocation <<< "$readiness_snapshot" \
+        && [[ "$readiness_state" == active || "$readiness_state" == activating ]] \
+        && [[ "$readiness_pid" =~ ^[1-9][0-9]*$ ]]; then
+        local -r expected_identity="$initial_snapshot"
+        local -r observed_identity="${readiness_pid}|${readiness_restarts}|${readiness_invocation}"
+        if [[ "$observed_identity" == "$expected_identity" ]]; then
+            selection_published=0
+            printf 'ERROR: selected release is unverified, running in the same invocation; invocation=%s\n' \
+                "$readiness_invocation" >&2
+            recovery_failed=1
+        else
+            selection_published=1
+            if ! systemctl stop "$service_name"; then recovery_failed=1; fi
+            printf 'ERROR: selected new release requires forward Collector recovery; service is stopped and recovery state retained\n' >&2
+            recovery_failed=1
+        fi
     elif (( selector_readable )) && [[ "$selected_target" == "releases/${release_name}" ]]; then
         selection_published=1
         if ! systemctl stop "$service_name"; then
@@ -903,21 +958,39 @@ initial_snapshot=$(read_service_snapshot "$service_name") \
 service_quiesced=0
 IFS='|' read -r _ _ initial_invocation <<< "$initial_snapshot"
 expected_readiness=$(printf '{"config":"%s","status":"deployment_ready"}' "$config_file")
-for (( attempt = 1; attempt <= readiness_poll_attempts; attempt++ )); do
+while (( ! readiness_seen )); do
+    readiness_snapshot=$(read_service_readiness_snapshot "$service_name") || {
+        readiness_observation_failed=1
+        die "could not observe ${service_name} while waiting for readiness"
+    }
+    IFS='|' read -r readiness_state readiness_pid readiness_restarts readiness_invocation <<< "$readiness_snapshot"
+    if [[ "$readiness_state" == failed || "$readiness_state" == inactive || "$readiness_state" == deactivating ]]; then
+        die "${service_name} entered ${readiness_state} before readiness"
+    fi
+    [[ "$readiness_pid" =~ ^[1-9][0-9]*$ ]] \
+        || { readiness_observation_failed=1; die "${service_name} has no live main process while waiting for readiness"; }
+    if [[ "${readiness_pid}|${readiness_restarts}|${readiness_invocation}" != "$initial_snapshot" ]]; then
+        die "${service_name} changed invocation before readiness"
+    fi
     journal_output=$(journalctl --unit "$service_name" "_SYSTEMD_INVOCATION_ID=${initial_invocation}" --output cat --no-pager) \
-        || die "could not read ${service_name} journal for readiness"
+        || { readiness_observation_failed=1; die "could not read ${service_name} journal for readiness"; }
     if grep --fixed-strings --line-regexp -- "$expected_readiness" <<< "$journal_output" &> /dev/null; then
         readiness_seen=1
         break
     fi
-    if (( attempt < readiness_poll_attempts )); then
-        sleep "$readiness_poll_interval_seconds" || die 'could not wait for application readiness'
+    if grep --fixed-strings -- '"status":"deployment_ready"' <<< "$journal_output" &> /dev/null; then
+        die "${service_name} did not announce readiness for ${config_file}: readiness event config does not match"
     fi
+    sleep "$readiness_poll_interval_seconds" || { readiness_observation_failed=1; die 'could not wait for application readiness'; }
 done
-(( readiness_seen )) || die "${service_name} did not announce readiness for ${config_file}"
-sleep "$stability_interval_seconds" || die 'could not wait for the deployment stability interval'
-final_snapshot=$(read_service_snapshot "$service_name") \
-    || die "${service_name} did not remain active during the stability interval"
+sleep "$stability_interval_seconds" || {
+    readiness_observation_failed=1
+    die 'could not wait for the deployment stability interval'
+}
+final_snapshot=$(read_service_snapshot "$service_name") || {
+    readiness_observation_failed=1
+    die "${service_name} did not remain active during the stability interval"
+}
 [[ "$final_snapshot" == "$initial_snapshot" ]] || die "${service_name} restarted during the stability interval"
 IFS='|' read -r final_pid final_restarts _ <<< "$final_snapshot"
 

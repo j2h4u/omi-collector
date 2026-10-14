@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterable, Iterator
-from contextlib import closing, contextmanager, suppress
+from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from dataclasses import dataclass, replace
 from typing import Final, NoReturn, Protocol, cast
 
@@ -114,7 +114,7 @@ def capture_space_requirement(state_db: StateDB, record_count: int, chunk_record
     if type(chunk_records) is not int or chunk_records <= 0 or chunk_records > MAX_CHUNK_LIMIT:
         raise ValueError("chunk records must be within the typed writer bound")
     try:
-        with closing(state_db.open_connection(read_only=True)) as connection:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
             page_size = _pragma_positive_int(connection, "page_size")
             freelist_count = _pragma_nonnegative_int(connection, "freelist_count")
         reusable_bytes = freelist_count * page_size
@@ -132,14 +132,16 @@ def capture_space_requirement(state_db: StateDB, record_count: int, chunk_record
 
 
 def _pragma_positive_int(connection: sqlite3.Connection, name: str) -> int:
-    row = cast(tuple[object] | None, connection.execute(f"PRAGMA {name}").fetchone())
+    with closing(connection.execute(f"PRAGMA {name}")) as cursor:
+        row = cast(tuple[object] | None, cursor.fetchone())
     if row is None or type(row[0]) is not int or row[0] <= 0:
         raise InternalAudioStoreError(f"SQLite {name} is invalid")
     return cast(int, row[0])
 
 
 def _pragma_nonnegative_int(connection: sqlite3.Connection, name: str) -> int:
-    row = cast(tuple[object] | None, connection.execute(f"PRAGMA {name}").fetchone())
+    with closing(connection.execute(f"PRAGMA {name}")) as cursor:
+        row = cast(tuple[object] | None, cursor.fetchone())
     if row is None or type(row[0]) is not int or row[0] < 0:
         raise InternalAudioStoreError(f"SQLite {name} is invalid")
     return cast(int, row[0])
@@ -266,7 +268,7 @@ def clock_mapping_revision(state_db: StateDB) -> str:
     """Hash the exact authoritative clock payload bytes used by SQL clients."""
 
     try:
-        with closing(state_db.open_connection(read_only=True)) as connection:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
             payload = _clock_payload_text(connection)
         return hashlib.sha256((payload if payload is not None else _DEFAULT_CLOCK_PAYLOAD).encode("utf-8")).hexdigest()
     except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError) as error:
@@ -280,30 +282,40 @@ def refresh_utc_projection(state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUN
     limit = _chunk_limit(chunk_limit)
     payload, revision, segments = _clock_projection_snapshot(state_db)
     try:
-        with closing(state_db.open_connection()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if _clock_payload_text(connection) != payload:
-                connection.rollback()
-                return 0
-            rows = _stale_projection_rows(connection, revision, limit)
-            for source_id, ordinal, sequence_start, device_timestamp, old_revision in rows:
-                utc_timestamp = _project_utc_timestamp(
-                    segments,
-                    decode_sequence(sequence_start) + ordinal,
-                    device_timestamp,
-                )
-                changed = connection.execute(
-                    "UPDATE capture_record SET utc_timestamp = ?, mapping_revision = ? "
-                    "WHERE source_id = ? AND ordinal = ? AND mapping_revision IS ? "
-                    "AND EXISTS (SELECT 1 FROM capture_source "
-                    "WHERE capture_source.source_id = capture_record.source_id "
-                    "AND capture_source.lifecycle NOT IN ('covered','retiring'))",
-                    (utc_timestamp, revision, source_id, ordinal, old_revision),
-                )
-                if changed.rowcount != 1:
-                    raise InternalAudioStoreError("UTC projection row changed during refresh")
-            connection.commit()
-            return len(rows)
+        with closing(state_db.open_connection()) as connection, state_db.access(connection):
+            admitted = False
+            try:
+                state_db.begin_exclusive(connection)
+                admitted = True
+                if _clock_payload_text(connection) != payload:
+                    return 0
+                rows = _stale_projection_rows(connection, revision, limit)
+                for source_id, ordinal, sequence_start, device_timestamp, old_revision in rows:
+                    utc_timestamp = _project_utc_timestamp(
+                        segments,
+                        decode_sequence(sequence_start) + ordinal,
+                        device_timestamp,
+                    )
+                    changed = connection.execute(
+                        "UPDATE capture_record SET utc_timestamp = ?, mapping_revision = ? "
+                        "WHERE source_id = ? AND ordinal = ? AND mapping_revision IS ? "
+                        "AND EXISTS (SELECT 1 FROM capture_source "
+                        "WHERE capture_source.source_id = capture_record.source_id "
+                        "AND capture_source.lifecycle NOT IN ('covered','retiring'))",
+                        (utc_timestamp, revision, source_id, ordinal, old_revision),
+                    )
+                    try:
+                        if changed.rowcount != 1:
+                            raise InternalAudioStoreError("UTC projection row changed during refresh")
+                    finally:
+                        changed.close()
+                connection.commit()
+                return len(rows)
+            finally:
+                if admitted:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    state_db.end_write(connection)
     except InternalAudioStoreError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError, TypeError, ValueError) as error:
@@ -313,7 +325,7 @@ def refresh_utc_projection(state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUN
 
 def _clock_projection_snapshot(state_db: StateDB) -> tuple[str | None, str, ClockSegmentMap]:
     try:
-        with closing(state_db.open_connection(read_only=True)) as connection:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
             payload = _clock_payload_text(connection)
         authoritative = payload if payload is not None else _DEFAULT_CLOCK_PAYLOAD
         state = ClockState.from_payload(_decode(authoritative))
@@ -382,7 +394,7 @@ def read_capture_source(state_db: StateDB, source_id: str) -> CaptureSource | No
 
     source_id = _source_id(source_id)
     try:
-        with closing(state_db.open_connection(read_only=True)) as connection:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
             return _read_capture_source(connection, source_id)
     except InternalAudioStoreError:
         raise
@@ -402,7 +414,7 @@ def authenticate_capture_source(
     source_id = _source_id(source_id)
     limit = _chunk_limit(page_limit)
     try:
-        with closing(state_db.open_connection(read_only=True)) as connection:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
             source = _read_capture_source(connection, source_id)
             if source is None:
                 raise InternalAudioStoreError("source does not exist")
@@ -440,14 +452,14 @@ def _scan_authenticated_records(
     count = 0
     digest = hashlib.sha256()
     while True:
-        rows = cast(
-            list[tuple[object, object, object]],
+        with closing(
             connection.execute(
                 "SELECT ordinal, device_timestamp, payload FROM capture_record "
                 "WHERE source_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?",
                 (source_id, count - 1, limit),
-            ).fetchall(),
-        )
+            )
+        ) as cursor:
+            rows = cast(list[tuple[object, object, object]], cursor.fetchall())
         if not rows:
             return count, digest.hexdigest(), None
         for ordinal_value, timestamp_value, payload_value in rows:
@@ -502,9 +514,11 @@ class InternalAudioStore:
         self._digest_cache: dict[str, tuple[int, str, _HashState]] = {}
         self._connection: sqlite3.Connection | None = None
         self._publication_reader: sqlite3.Connection | None = None
+        self._write_access: AbstractContextManager[None] | None = None
         try:
             self._connection = state_db.open_connection()
-            self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            with state_db.access(self._connection):
+                self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}").close()
         except sqlite3.DatabaseError as error:
             if self._connection is not None:
                 with suppress(sqlite3.DatabaseError):
@@ -515,11 +529,14 @@ class InternalAudioStore:
 
     def close(self) -> None:
         self._check_thread()
+        if self._write_access is not None:
+            self._rollback()
         if self._publication_reader is not None:
             self._publication_reader.close()
             self._publication_reader = None
         if self._connection is not None:
-            self._connection.close()
+            with self.state_db.access(self._connection):
+                self._connection.close()
             self._connection = None
 
     @contextmanager
@@ -554,14 +571,13 @@ class InternalAudioStore:
         self._check_writer()
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             state = StateTransaction(connection)
             yield state, connection
             state.finish()
             self._commit()
         except sqlite3.DatabaseError as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             try:
                 self._reopen()
             except (sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as inspection_error:
@@ -596,7 +612,7 @@ class InternalAudioStore:
         generation = 0
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             connection.execute(
                 "INSERT INTO capture_source(source_id, source_type, lifecycle, sequence_start, sequence_limit, "
                 "current_leg_generation, current_leg_start, current_leg_count, committed_sha256) "
@@ -620,8 +636,7 @@ class InternalAudioStore:
             self._rollback()
             raise InternalAudioStoreError("source already exists or is invalid") from error
         except sqlite3.DatabaseError as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             return self._recover_create(_CreateRequest(source_id, source_type, start, limit, generation), error)
         result = self.get_source(source_id)
         if result is None:
@@ -656,7 +671,7 @@ class InternalAudioStore:
             raise InternalAudioStoreError("leg generation is exhausted")
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._check_source_snapshot(connection, source)
             connection.execute(
                 "UPDATE capture_source SET lifecycle=?, prepared_start=?, prepared_count=?, "
@@ -674,8 +689,7 @@ class InternalAudioStore:
             )
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("leg preparation was not confirmed durable") from error
         return self._require_source(source.source_id)
@@ -703,7 +717,7 @@ class InternalAudioStore:
             return source
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._check_source_snapshot(connection, source)
             connection.execute(
                 "UPDATE capture_source SET lifecycle=?, read_begin_start=?, read_begin_count=? WHERE source_id=?",
@@ -711,8 +725,7 @@ class InternalAudioStore:
             )
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("READ_BEGIN was not confirmed durable") from error
         return self._require_source(source.source_id)
@@ -730,7 +743,7 @@ class InternalAudioStore:
             raise InternalAudioStoreError("interruption is invalid for this source")
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._check_source_snapshot(connection, source)
             connection.execute(
                 "UPDATE capture_source SET lifecycle=? WHERE source_id=?",
@@ -738,8 +751,7 @@ class InternalAudioStore:
             )
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("interruption was not confirmed durable") from error
         return self._require_source(source.source_id)
@@ -773,7 +785,7 @@ class InternalAudioStore:
         proposed = replace(source, lifecycle=next_phase.value)
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._check_source_snapshot(connection, source)
             if self._tail_from_connection(connection, source.source_id) is not None:
                 raise InternalAudioStoreError("complete source still has a partial tail")
@@ -786,8 +798,7 @@ class InternalAudioStore:
             self._rollback()
             raise
         except sqlite3.DatabaseError as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             return self._recover_seal(source, proposed, error)
         return proposed
 
@@ -801,7 +812,8 @@ class InternalAudioStore:
         source_id = _source_id(source_id)
         if self._publication_reader is not None:
             try:
-                return _read_capture_source(self._publication_reader, source_id)
+                with self.state_db.access(self._publication_reader):
+                    return _read_capture_source(self._publication_reader, source_id)
             except sqlite3.DatabaseError as error:
                 raise_if_sqlite_storage_fault(error)
                 raise InternalAudioStoreError("source read failed") from error
@@ -816,8 +828,9 @@ class InternalAudioStore:
         limit = _page_limit(limit, self.chunk_limit)
         try:
             if self._publication_reader is not None:
-                return _read_record_page(self._publication_reader, source_id, after_ordinal, limit)
-            with closing(self.state_db.open_connection(read_only=True)) as connection:
+                with self.state_db.access(self._publication_reader):
+                    return _read_record_page(self._publication_reader, source_id, after_ordinal, limit)
+            with closing(self.state_db.open_connection(read_only=True)) as connection, self.state_db.access(connection):
                 return _read_record_page(connection, source_id, after_ordinal, limit)
         except InternalAudioStoreError:
             raise
@@ -891,7 +904,7 @@ class InternalAudioStore:
         desired_tail = self._resolve_tail(source, previous_tail, tail, new_count, parsed)
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._recheck_source(connection, source)
             self._recheck_tail(connection, source.source_id, previous_tail)
             connection.executemany(
@@ -912,8 +925,7 @@ class InternalAudioStore:
             self._rollback()
             raise InternalAudioStoreError("drain violates source constraints") from error
         except sqlite3.DatabaseError as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             return self._recover_ambiguous(
                 source, expected, parsed, new_count, digest, desired_tail, previous_tail, error
             )
@@ -962,7 +974,7 @@ class InternalAudioStore:
         after_ordinal = -1
         hashed_count = 0
         try:
-            with closing(self.state_db.open_connection(read_only=True)) as connection:
+            with closing(self.state_db.open_connection(read_only=True)) as connection, self.state_db.access(connection):
                 while hashed_count < count:
                     page = _read_record_page(
                         connection,
@@ -988,7 +1000,7 @@ class InternalAudioStore:
     ) -> None:
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._recheck_source(connection, source)
             self._recheck_tail(connection, source.source_id, previous)
             self._write_tail(connection, source.source_id, desired, previous)
@@ -997,8 +1009,7 @@ class InternalAudioStore:
             self._rollback()
             raise
         except sqlite3.DatabaseError as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             self._recover_ambiguous(
                 source,
                 source.committed_count,
@@ -1034,7 +1045,7 @@ class InternalAudioStore:
         desired_tail = self._resolve_tail(source, previous_tail, tail, new_count, parsed)
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._recheck_source(connection, source)
             self._recheck_tail(connection, source.source_id, previous_tail)
             connection.executemany(
@@ -1055,8 +1066,7 @@ class InternalAudioStore:
             self._rollback()
             raise InternalAudioStoreError("drain violates source constraints") from error
         except sqlite3.DatabaseError as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             return self._recover_ambiguous(
                 source, source.committed_count, parsed, new_count, digest, desired_tail, previous_tail, error
             )
@@ -1070,7 +1080,7 @@ class InternalAudioStore:
         digest: _HashState = hashlib.sha256()
         count = 0
         try:
-            with closing(self.state_db.open_connection(read_only=True)) as connection:
+            with closing(self.state_db.open_connection(read_only=True)) as connection, self.state_db.access(connection):
                 while True:
                     with closing(
                         connection.execute(
@@ -1126,7 +1136,7 @@ class InternalAudioStore:
             raise InternalAudioStoreError("rejected evidence is outside the bounded chunk")
         connection = self._require_connection()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._start_write(connection)
             self._recheck_source(connection, source)
             row = _fetchone(
                 connection.execute(
@@ -1196,8 +1206,7 @@ class InternalAudioStore:
             self._rollback()
             raise
         except sqlite3.DatabaseError as error:
-            raise_if_sqlite_corrupt(error)
-            self._rollback()
+            self._rollback_after_error(error)
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("replay conflict could not be retained") from error
 
@@ -1388,7 +1397,7 @@ class InternalAudioStore:
 
     def _read_tail(self, source_id: str) -> CaptureTail | None:
         try:
-            with closing(self.state_db.open_connection(read_only=True)) as connection:
+            with closing(self.state_db.open_connection(read_only=True)) as connection, self.state_db.access(connection):
                 return self._tail_from_connection(connection, source_id)
         except sqlite3.DatabaseError as error:
             raise_if_sqlite_storage_fault(error)
@@ -1414,17 +1423,63 @@ class InternalAudioStore:
 
     def _commit(self) -> None:
         self._require_connection().commit()
+        self._finish_write()
 
     def _rollback(self) -> None:
+        if self._write_access is None:
+            return
+        connection = self._require_connection()
         with suppress(sqlite3.DatabaseError):
-            self._require_connection().rollback()
+            connection.rollback()
+        if connection.in_transaction:
+            self._fail_stop("audio writer rollback could not be confirmed")
+        self._finish_write()
+
+    def _rollback_after_error(self, error: BaseException) -> None:
+        """Settle the transaction without losing a direct corruption fatal."""
+
+        corruption: FatalInternalAudioStorageError | None = None
+        try:
+            raise_if_sqlite_corrupt(error)
+        except FatalInternalAudioStorageError as classified:
+            corruption = classified
+        try:
+            self._rollback()
+        except BaseException:
+            if corruption is not None:
+                raise corruption from error
+            raise
+        if corruption is not None:
+            raise corruption from error
+
+    def _start_write(self, connection: sqlite3.Connection) -> None:
+        if self._write_access is not None:
+            raise InternalAudioStoreError("audio writer transaction is already active")
+        scope = self.state_db.access(connection)
+        scope.__enter__()
+        try:
+            self.state_db.begin_exclusive(connection)
+        except BaseException:
+            scope.__exit__(None, None, None)
+            raise
+        self._write_access = scope
+
+    def _finish_write(self) -> None:
+        scope = self._write_access
+        if scope is None:
+            raise InternalAudioStoreError("audio writer transaction is not active")
+        self.state_db.end_write(self._require_connection())
+        self._write_access = None
+        scope.__exit__(None, None, None)
 
     def _reopen(self) -> None:
         if self._connection is not None:
-            self._connection.close()
+            with self.state_db.access(self._connection):
+                self._connection.close()
         self._connection = self.state_db.open_connection()
         try:
-            self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            with self.state_db.access(self._connection):
+                self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}").close()
         except sqlite3.DatabaseError as error:
             raise_if_sqlite_storage_fault(error)
             raise
@@ -1584,14 +1639,20 @@ def _bounded_records(records: Iterable[bytes], limit: int) -> tuple[bytes, ...]:
 
 
 def _fetchone(cursor: sqlite3.Cursor) -> sqlite3.Row | None:
-    result = cast(object, cursor.fetchone())
+    try:
+        result = cast(object, cursor.fetchone())
+    finally:
+        cursor.close()
     if result is not None and not isinstance(result, sqlite3.Row):
         raise InternalAudioStoreError("audio database returned an invalid row")
     return result
 
 
 def _fetchall(cursor: sqlite3.Cursor) -> list[sqlite3.Row]:
-    result = cast(object, cursor.fetchall())
+    try:
+        result = cast(object, cursor.fetchall())
+    finally:
+        cursor.close()
     if not isinstance(result, list) or any(not isinstance(row, sqlite3.Row) for row in result):
         raise InternalAudioStoreError("audio database returned invalid rows")
     return result

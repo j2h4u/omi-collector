@@ -1169,33 +1169,19 @@ def test_run_uses_windows_asyncio_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert device_cli.run(operation()) == 17
 
 
-def test_posix_runner_converts_fake_sigterm_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeLoop:
-        def add_signal_handler(self, _signal: signal.Signals, callback: Callable[[], object]) -> None:
-            callback()
-
-        def remove_signal_handler(self, _signal: signal.Signals) -> bool:
-            return True
-
-    monkeypatch.setattr(device_cli.asyncio, "get_running_loop", lambda: FakeLoop())
+def test_posix_runner_converts_fake_sigterm_cancellation() -> None:
+    from omi_collector.capture.application.stop_intent import StopIntent
 
     async def operation() -> None:
-        return
+        await asyncio.Future()
 
+    intent = StopIntent()
+    intent.request(signal.SIGTERM)
     with pytest.raises(device_cli.OperationInterruptedError, match="after cleanup"):
-        asyncio.run(device_cli._run_posix_operation(operation()))
+        asyncio.run(device_cli._run_posix_operation(operation(), stop_intent=intent))
 
 
-def test_posix_runner_reraises_unrelated_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeLoop:
-        def add_signal_handler(self, _signal: signal.Signals, _callback: object) -> None:
-            return
-
-        def remove_signal_handler(self, _signal: signal.Signals) -> bool:
-            return True
-
-    monkeypatch.setattr(device_cli.asyncio, "get_running_loop", lambda: FakeLoop())
-
+def test_posix_runner_reraises_unrelated_cancellation() -> None:
     async def operation() -> None:
         raise asyncio.CancelledError
 

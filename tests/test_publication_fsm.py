@@ -111,12 +111,12 @@ def test_capture_begin_fences_foreground_publication_before_durable_visit(
         assert await asyncio.to_thread(entered.wait, 2)
         capture = asyncio.create_task(maintenance.enter_capture_priority())
         await asyncio.sleep(0)
-        assert store.recover_and_publish().reason == "capture_active"
+        assert (await asyncio.to_thread(store.recover_and_publish)).reason == "capture_active"
         assert not capture.done()
         release.set()
         await capture
-        assert store.recover_and_publish().reason == "capture_active"
-        maintenance.exit_capture_priority()
+        assert (await asyncio.to_thread(store.recover_and_publish)).reason == "capture_active"
+        await maintenance.exit_capture_priority()
         await maintenance.close()
         await asyncio.gather(publication, return_exceptions=True)
 

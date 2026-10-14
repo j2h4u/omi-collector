@@ -150,14 +150,20 @@ class QuarantineMaintenance:
             self._publication_effect_tasks.discard(task)
         state = getattr(outcome, "state", None)
         if state == "published":
-            self._runtime.debug_event("ready_publication_published")
+            await joined_to_thread(self._runtime.debug_event, "ready_publication_published")
         elif state == "blocked":
-            self._runtime.debug_event("ready_publication_blocked", reason=getattr(outcome, "reason", None))
+            await joined_to_thread(
+                self._runtime.debug_event, "ready_publication_blocked", reason=getattr(outcome, "reason", None)
+            )
         elif state == "transient":
-            self._runtime.debug_event("ready_publication_transient", reason=getattr(outcome, "reason", None))
+            await joined_to_thread(
+                self._runtime.debug_event, "ready_publication_transient", reason=getattr(outcome, "reason", None)
+            )
             self._arm_publication_timer()
         else:
-            self._runtime.debug_event("ready_publication_waiting", reason=getattr(outcome, "reason", None))
+            await joined_to_thread(
+                self._runtime.debug_event, "ready_publication_waiting", reason=getattr(outcome, "reason", None)
+            )
 
     async def ensure_publication_ready(self) -> None:
         """Run one bounded local recovery attempt without blocking BLE forever."""
@@ -235,12 +241,12 @@ class QuarantineMaintenance:
             self._staging.publication_quiesced()
             await joined_to_thread(self._staging.begin_ready_visit)
         except BaseException:
-            self.exit_capture_priority()
+            await self.exit_capture_priority()
             raise
 
-    def exit_capture_priority(self) -> None:
+    async def exit_capture_priority(self) -> None:
         """Release foreground priority and resume one deferred publication."""
-        if self._staging.publication_capture_end():
+        if await joined_to_thread(self._staging.publication_capture_end):
             self._start_publication_retry()
 
     async def close(self) -> None:

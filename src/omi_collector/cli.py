@@ -10,6 +10,7 @@ import sys
 import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, suppress
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Never, Protocol, cast
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from omi_collector.capture.adapters.collector_state_db import StateDB
     from omi_collector.capture.adapters.operational_status import OperationalStatusStore
     from omi_collector.capture.adapters.staging_store import StagingStore
+    from omi_collector.capture.application.stop_intent import StopIntent
     from omi_collector.capture.cli import DownloadProgress
     from omi_collector.capture.domain.operational_status_machine import OperationalSignal
     from omi_collector.storage_layout import OperatorConfig
@@ -39,7 +41,7 @@ class _CaptureCli(Protocol):
 
     def phy_state_context(self, state_db: object) -> AbstractContextManager[None]: ...
 
-    def run(self, operation: Coroutine[object, object, object]) -> object: ...
+    def run(self, operation: Coroutine[object, object, object], *, stop_intent: StopIntent | None = None) -> object: ...
 
     def phy_check(self, adapter: str) -> Coroutine[object, object, object]: ...
 
@@ -224,6 +226,12 @@ class SyncLogLevel(StrEnum):
 
     INFO = "INFO"
     DEBUG = "DEBUG"
+
+
+@dataclass(frozen=True, slots=True)
+class _SyncContext:
+    operational_status: OperationalStatusStore | None = None
+    stop_intent: StopIntent | None = None
 
 
 class SyncProgressReporter:
@@ -571,12 +579,22 @@ def service(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Run the long-lived single-pendant collector."""
+    from omi_collector.capture.application.stop_intent import StopIntent, StopRequestedError
+
     loaded = _load_config(config_path)
-    with _command_state(loaded) as state_db:
-        _service_locked(loaded, state_db)
+    stop_intent = StopIntent()
+    with stop_intent.installed():
+        try:
+            with _command_state(loaded) as state_db:
+                stop_intent.check()
+                _service_locked(loaded, state_db, stop_intent=stop_intent)
+        except StopRequestedError as error:
+            raise typer.Exit(code=stop_intent.exit_code) from error
 
 
-def _service_locked(loaded: OperatorConfig, state_db: StateDB) -> None:
+def _service_locked(loaded: OperatorConfig, state_db: StateDB, *, stop_intent: StopIntent | None = None) -> None:
+    if stop_intent is not None:
+        stop_intent.check()
     staging = _staging(loaded, state_db=state_db)
     _preflight_storage(staging)
     from omi_collector.capture.adapters.operational_status import (
@@ -604,22 +622,24 @@ def _service_locked(loaded: OperatorConfig, state_db: StateDB) -> None:
             operational_status.close()
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
-    typer.echo(
-        json.dumps(
-            {"config": str(loaded.path), "status": "deployment_ready"},
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        err=True,
-    )
     try:
         assert operational_status is not None
+        if stop_intent is not None:
+            stop_intent.check()
+        typer.echo(
+            json.dumps(
+                {"config": str(loaded.path), "status": "deployment_ready"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            err=True,
+        )
         _sync(
             loaded,
             staging,
             force_1m=False,
             log_level=SyncLogLevel.INFO,
-            operational_status=operational_status,
+            context=_SyncContext(operational_status, stop_intent),
         )
     finally:
         operational_status.close()
@@ -769,9 +789,13 @@ def _sync(
     *,
     force_1m: bool,
     log_level: SyncLogLevel,
-    operational_status: OperationalStatusStore | None = None,
+    context: _SyncContext | None = None,
 ) -> None:
     """Run one foreground sync using validated configuration and storage."""
+    if context is None:
+        context = _SyncContext()
+    operational_status = context.operational_status
+    stop_intent = context.stop_intent
     started = time.monotonic()
     from omi_collector.capture.adapters.debug_logging import (
         close_debug_logging,
@@ -781,6 +805,8 @@ def _sync(
 
     debug_logger = configure_debug_logging(loaded.storage.collector.root)
     try:
+        if stop_intent is not None:
+            stop_intent.check()
         report_progress = SyncProgressReporter(
             log_level,
             debug_logger=debug_logger,
@@ -808,10 +834,11 @@ def _sync(
             record_publication=(
                 operational_status.record_publication_outcome if operational_status is not None else None
             ),
+            **({"stop_intent": stop_intent} if stop_intent is not None else {}),
         )
         if operational_status is not None:
             sync_operation = _supervise_operational_status(sync_operation, operational_status)
-        result = _run_device_operation(sync_operation)
+        result = _run_device_operation(sync_operation, stop_intent=stop_intent)
         metrics = _capture_cli().download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
         typer.echo(_capture_cli().render_sync(cast(object, result), metrics))
     except Exception as error:
@@ -1011,18 +1038,27 @@ def _initialize_confirmed_loss_ledger(staging: StagingStore) -> None:
         raise typer.Exit(code=1) from error
 
 
-def _run_device_operation(operation: Coroutine[object, object, object]) -> object:
+def _run_device_operation(
+    operation: Coroutine[object, object, object], *, stop_intent: StopIntent | None = None
+) -> object:
     capture_cli = _capture_cli()
     from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.stop_intent import StopRequestedError
 
     try:
-        return capture_cli.run(operation)
+        if stop_intent is None:
+            return capture_cli.run(operation)
+        return capture_cli.run(operation, stop_intent=stop_intent)
     except FatalInternalAudioStorageError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=78) from error
     except capture_cli.OperationInterruptedError as error:
         typer.echo(str(error), err=True)
-        raise typer.Exit(code=0) from error
+        raise typer.Exit(
+            code=stop_intent.exit_code if stop_intent is not None and stop_intent.requested else 0
+        ) from error
+    except StopRequestedError as error:
+        raise typer.Exit(code=stop_intent.exit_code if stop_intent is not None else 1) from error
     except Exception as error:  # User-facing boundary; BaseException remains unsuppressed.
         typer.echo(f"device operation failed: {type(error).__name__}", err=True)
         raise typer.Exit(code=1) from error

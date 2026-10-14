@@ -250,9 +250,11 @@ def test_cutover_refuses_bound_identity_drift_before_removal(
             (
                 sys.executable,
                 "-c",
-                "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); "
-                "c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='journal' "
-                "WHERE kind='runtime_status' AND id='current'\"); os._exit(0)",
+                (
+                    "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); "
+                    "c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='journal' "
+                    "WHERE kind='runtime_status' AND id='current'\"); os._exit(0)"
+                ),
                 str(candidate),
             ),
             check=True,

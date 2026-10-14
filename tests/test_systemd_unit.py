@@ -900,8 +900,10 @@ def _make_true_hot_journal(path: Path) -> None:
         (
             sys.executable,
             "-c",
-            "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1],isolation_level=None); "
-            "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)",
+            (
+                "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1],isolation_level=None); "
+                "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)"
+            ),
             str(path),
         ),
         check=True,

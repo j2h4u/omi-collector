@@ -22,9 +22,9 @@ from omi_collector.capture.application.storage_fault import (
 from omi_collector.cli import app
 from omi_collector.internal_audio_migration import (
     InternalAudioMigrationError,
-    recover_canonical_journal,
     inspect_internal_audio_migration,
     migrate_internal_audio,
+    recover_canonical_journal,
 )
 from omi_collector.storage_layout import StorageLayout, load_operator_config
 
@@ -120,8 +120,10 @@ def _make_true_hot_journal(path: Path) -> None:
         (
             sys.executable,
             "-c",
-            "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); "
-            "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)",
+            (
+                "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); "
+                "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)"
+            ),
             str(path),
         ),
         check=True,

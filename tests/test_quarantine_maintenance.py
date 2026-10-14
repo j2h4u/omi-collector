@@ -793,6 +793,21 @@ def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
         assert "ready_publication_failure" in diagnostic[0].getMessage()
         assert '"phase":"publication"' in diagnostic[0].getMessage()
         assert "RuntimeError at" in diagnostic[0].getMessage()
+        errors = [
+            record
+            for record in caplog.records
+            if record.name == "omi_collector.capture.adapters.staging_store" and record.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert errors[0].getMessage() == "ready publication failed unexpectedly"
+        assert errors[0].exc_info is not None
+        logged_type, logged_error, logged_traceback = errors[0].exc_info
+        assert logged_type is Exception
+        assert isinstance(logged_error, Exception)
+        assert str(logged_error) == "details redacted"
+        assert logged_traceback is None
+        assert logged_error.__context__ is None
+        assert logged_error.__cause__ is None
         assert "unexpected publication fault" not in caplog.text
         assert store.publication_retry_schedule() is None
         await maintenance.close()

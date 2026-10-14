@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import sqlite3
+import sys
 import threading
 import time
 from collections.abc import Iterable, Iterator
@@ -282,12 +283,12 @@ def refresh_utc_projection(state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUN
     limit = _chunk_limit(chunk_limit)
     payload, revision, segments = _clock_projection_snapshot(state_db)
     try:
-        with closing(state_db.open_connection()) as connection, state_db.access(connection):
-            admitted = False
+        with state_db.access():
+            connection = state_db.open_connection()
             try:
                 state_db.begin_exclusive(connection)
-                admitted = True
                 if _clock_payload_text(connection) != payload:
+                    connection.commit()
                     return 0
                 rows = _stale_projection_rows(connection, revision, limit)
                 for source_id, ordinal, sequence_start, device_timestamp, old_revision in rows:
@@ -311,11 +312,11 @@ def refresh_utc_projection(state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUN
                         changed.close()
                 connection.commit()
                 return len(rows)
+            except BaseException as error:
+                state_db._rollback_managed_write(connection, error)
+                raise
             finally:
-                if admitted:
-                    if connection.in_transaction:
-                        connection.rollback()
-                    state_db.end_write(connection)
+                state_db._close_managed_write(connection)
     except InternalAudioStoreError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError, UnicodeError, TypeError, ValueError) as error:
@@ -1432,8 +1433,26 @@ class InternalAudioStore:
         with suppress(sqlite3.DatabaseError):
             connection.rollback()
         if connection.in_transaction:
-            self._fail_stop("audio writer rollback could not be confirmed")
+            self._abandon_unsettled_write(connection)
         self._finish_write()
+
+    def _abandon_unsettled_write(self, connection: sqlite3.Connection) -> NoReturn:
+        """Close a failed writer and release its instance guard on the owner thread."""
+
+        scope = self._write_access
+        if scope is None:
+            raise InternalAudioStoreError("audio writer transaction is not active")
+        pending = sys.exception()
+        self._failed = True
+        try:
+            self.state_db._close_managed_write(connection)
+        finally:
+            self._connection = None
+            self._write_access = None
+            scope.__exit__(None, None, None)
+        if isinstance(pending, FatalInternalAudioStorageError):
+            raise pending
+        raise FatalInternalAudioStorageError("audio writer rollback could not be confirmed") from pending
 
     def _rollback_after_error(self, error: BaseException) -> None:
         """Settle the transaction without losing a direct corruption fatal."""

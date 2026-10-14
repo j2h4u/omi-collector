@@ -11,8 +11,8 @@ import json
 import logging
 import signal
 import sys
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Callable, Coroutine, Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +37,7 @@ from .application.opportunistic_sync import (
 from .application.owned_work import invoke_owned
 from .application.ports import DurableSealShape
 from .application.presence import PresencePolicy, PresenceScheduler
-from .application.ring_transport import CandidateUnavailableError, RingSession
+from .application.ring_transport import CandidateUnavailableError
 from .application.session_lifecycle import ActivityEvent, OpportunisticOptions, RetryPolicy
 from .application.stop_intent import StopIntent
 from .domain.operational_status_machine import OperationalSignal, PublicationOutcome
@@ -265,7 +265,9 @@ async def collect(
         stop_intent.check()
 
     def provider(candidate: object | None):
-        return _guarded_transport(adapter, address, device_selector=cast(BLEDevice | None, candidate))
+        if candidate is not None:
+            return make_transport(address, adapter=adapter, device_selector=cast(BLEDevice, candidate))
+        return make_transport(address, adapter=adapter)
 
     options = OpportunisticOptions(
         timeouts=TRANSFER_TIMEOUTS,
@@ -277,6 +279,7 @@ async def collect(
         ),
         quality_metrics=await create_quality_metrics_owned(_quality_metrics, staging, DEFAULT_CONFIG),
         phy_policy="force_1m",
+        session_guard=lambda: make_guard(adapter),
         stop_intent=stop_intent,
     )
     return await run_opportunistic_collector(provider, staging, options, runtime=OpportunisticRuntime())
@@ -309,22 +312,12 @@ async def sync(  # noqa: PLR0913
         # Reusing a disconnected Bleak client can retain stale subscriptions.
         if presence is not None and candidate is None:
             raise CandidateUnavailableError("automatic connection requires a stable scanner candidate")
-        if force_1m:
-            return _guarded_transport(
-                adapter,
-                address,
-                device_selector=cast(BLEDevice | None, candidate),
-                phy_policy="force_1m",
-                link_terminal_callback=link_terminal_callback,
-                debug_logger=debug_logger,
-                att_mtu_query_timeout_seconds=config.ble.att_mtu_query_timeout_seconds,
-            )
         if candidate is not None:
             return make_transport(
                 address,
                 device_selector=cast(BLEDevice | None, candidate),
                 adapter=adapter,
-                phy_policy="auto",
+                phy_policy="force_1m" if force_1m else "auto",
                 link_terminal_callback=link_terminal_callback,
                 debug_logger=debug_logger,
                 att_mtu_query_timeout_seconds=config.ble.att_mtu_query_timeout_seconds,
@@ -333,7 +326,7 @@ async def sync(  # noqa: PLR0913
         return make_transport(
             address,
             adapter=adapter,
-            phy_policy="auto",
+            phy_policy="force_1m" if force_1m else "auto",
             link_terminal_callback=link_terminal_callback,
             debug_logger=debug_logger,
             att_mtu_query_timeout_seconds=config.ble.att_mtu_query_timeout_seconds,
@@ -364,6 +357,7 @@ async def sync(  # noqa: PLR0913
             _quality_metrics, staging, config, debug_logger, operational_signal=operational_quality_signal
         ),
         phy_policy="force_1m" if force_1m else "auto",
+        session_guard=(lambda: make_guard(adapter)) if force_1m else None,
         config=config,
         stop_intent=stop_intent,
     )
@@ -475,41 +469,6 @@ def _operational_callback(progress: ProgressReporter | None) -> OperationalProgr
         await invoke_owned(progress, update)
 
     return report
-
-
-@asynccontextmanager
-async def _guarded_transport(  # noqa: PLR0913
-    adapter: str,
-    address: str,
-    *,
-    device_selector: BLEDevice | None = None,
-    att_mtu_query_timeout_seconds: float = DEFAULT_CONFIG.ble.att_mtu_query_timeout_seconds,
-    phy_policy: str = "auto",
-    link_terminal_callback: Callable[[dict[str, object]], object] | None = None,
-    debug_logger: logging.Logger | None = None,
-) -> AsyncIterator[RingSession]:
-    """Apply weak-RF PHY fallback only while one BLE session is connected."""
-    if device_selector is None:
-        transport = make_transport(
-            address,
-            adapter=adapter,
-            att_mtu_query_timeout_seconds=att_mtu_query_timeout_seconds,
-            phy_policy=phy_policy,
-            link_terminal_callback=link_terminal_callback,
-            debug_logger=debug_logger,
-        )
-    else:
-        transport = make_transport(
-            address,
-            device_selector=device_selector,
-            adapter=adapter,
-            att_mtu_query_timeout_seconds=att_mtu_query_timeout_seconds,
-            phy_policy=phy_policy,
-            link_terminal_callback=link_terminal_callback,
-            debug_logger=debug_logger,
-        )
-    async with make_guard(adapter), transport as session:
-        yield session
 
 
 def download_metrics(result: collector.CollectResult, elapsed_seconds: float) -> DownloadMetrics:

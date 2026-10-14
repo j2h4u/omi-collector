@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import cast
 
 from ...config import DEFAULT_CONFIG
+from ..application.owned_work import join_owned, joined_to_thread
+from ..application.storage_fault import FatalInternalAudioStorageError
 from .collector_guard import guard_is_held
 from .collector_state_db import StateDB, StateKind
 
@@ -119,25 +121,35 @@ class ScopedPhyGuard(AbstractAsyncContextManager["ScopedPhyGuard"]):
     async def recover(self) -> None:
         """Restore a stale marker while the outer Collector guard is held."""
         self._require_guard()
-        await self._recover_stale_marker()
+        await join_owned(self._recover_stale_marker())
 
     async def __aenter__(self) -> ScopedPhyGuard:
         self._require_guard()
         try:
-            await self._recover_stale_marker()
+            await join_owned(self._recover_stale_marker())
             snapshot = await self._selected_phys()
             temporary = _temporary_phys(snapshot)
             self._snapshot = snapshot
-            self._write_marker(snapshot)
+            await joined_to_thread(self._write_marker, snapshot)
             await self._set_selected_phys(temporary)
-        except BaseException:
-            await self._restore_after_failed_enter()
+        except BaseException as primary:
+            try:
+                await join_owned(self._restore_after_failed_enter())
+            except BaseException as cleanup:
+                if isinstance(primary, FatalInternalAudioStorageError):
+                    raise primary from cleanup
+                raise
             raise
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        del exc_type, exc, traceback
-        await self._restore_and_clear_marker()
+        del exc_type, traceback
+        try:
+            await join_owned(self._restore_and_clear_marker())
+        except BaseException as cleanup:
+            if isinstance(exc, FatalInternalAudioStorageError):
+                raise exc from cleanup
+            raise
         return False
 
     def _require_guard(self) -> None:
@@ -145,14 +157,14 @@ class ScopedPhyGuard(AbstractAsyncContextManager["ScopedPhyGuard"]):
             raise PhyGuardBusyError("Collector process guard is required for PHY changes")
 
     async def _recover_stale_marker(self) -> None:
-        marker = self._read_marker()
+        marker = await joined_to_thread(self._read_marker)
         if marker is None:
             return
         snapshot = _parse_db_marker(marker, self.adapter)
         await self._set_selected_phys(snapshot)
         if await self._selected_phys() != snapshot:
             raise PhyStateError("PHY recovery restore verification failed")
-        self._delete_marker(snapshot)
+        await joined_to_thread(self._delete_marker, snapshot)
 
     async def _restore_after_failed_enter(self) -> None:
         if self._snapshot is None:
@@ -165,7 +177,7 @@ class ScopedPhyGuard(AbstractAsyncContextManager["ScopedPhyGuard"]):
         await self._set_selected_phys(self._snapshot)
         if await self._selected_phys() != self._snapshot:
             raise PhyStateError("PHY restore verification failed")
-        self._delete_marker(self._snapshot)
+        await joined_to_thread(self._delete_marker, self._snapshot)
 
     async def _selected_phys(self) -> tuple[str, ...]:
         result = await self._run(_BLUETOOTHCTL)

@@ -7,7 +7,7 @@ import sys
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from typing import cast
 
 import pytest
@@ -24,6 +24,7 @@ from omi_collector.capture.adapters.phy_guard import (
     parse_selected_phys,
     run_bluetoothctl,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.config import DEFAULT_CONFIG
 
 ORIGINAL = ("BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX")
@@ -295,3 +296,120 @@ def test_reap_returns_after_process_exited() -> None:
     process.returncode = 0
     asyncio.run(phy_guard._terminate_and_reap(cast(asyncio.subprocess.Process, process)))
     assert not process.terminated and not process.killed
+
+
+@pytest.mark.parametrize("method_name", ["_read_marker", "_write_marker", "_delete_marker"])
+@_async_test
+async def test_held_marker_storage_keeps_loop_responsive_and_guard_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method_name: str
+) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    entered, release = Event(), Event()
+    original = cast(Callable[..., object], getattr(guard, method_name))
+
+    def held(*args: object) -> object:
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(guard, method_name, held)
+    with collector_guard(db.path.parent / "collector.lock"):
+
+        async def visit() -> None:
+            async with guard:
+                assert runner.selected == TEMPORARY
+
+        task = asyncio.create_task(visit())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+            await asyncio.wait_for(asyncio.sleep(0.01), 0.1)
+            assert not task.done()
+        finally:
+            release.set()
+        await asyncio.wait_for(task, 5)
+    assert runner.selected == ORIGINAL
+    assert _marker(db) is None
+
+
+@_async_test
+async def test_repeated_cancel_after_marker_commit_joins_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    entered, release = Event(), Event()
+    original = guard._write_marker
+
+    def held(snapshot: tuple[str, ...]) -> None:
+        original(snapshot)
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(guard, "_write_marker", held)
+    with collector_guard(db.path.parent / "collector.lock"):
+        task = asyncio.create_task(guard.__aenter__())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+            task.cancel()
+            task.cancel()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert runner.selected == ORIGINAL
+    assert _marker(db) is None
+
+
+@_async_test
+async def test_repeated_cancel_during_marker_delete_waits_for_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    entered, release = Event(), Event()
+    original = guard._delete_marker
+
+    def held(snapshot: tuple[str, ...]) -> None:
+        entered.set()
+        assert release.wait(5)
+        original(snapshot)
+
+    monkeypatch.setattr(guard, "_delete_marker", held)
+
+    async def visit() -> None:
+        async with guard:
+            assert runner.selected == TEMPORARY
+
+    with collector_guard(db.path.parent / "collector.lock"):
+        task = asyncio.create_task(visit())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+            assert _marker(db) is not None
+            task.cancel()
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=0.02)
+            assert not done, "guard exit must remain owned while marker deletion is held"
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert runner.selected == ORIGINAL
+    assert _marker(db) is None
+
+
+@_async_test
+async def test_body_fatal_identity_survives_cleanup_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    fatal = FatalInternalAudioStorageError("primary storage failure")
+
+    def failed_delete(_snapshot: tuple[str, ...]) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(guard, "_delete_marker", failed_delete)
+    with collector_guard(db.path.parent / "collector.lock"), pytest.raises(FatalInternalAudioStorageError) as caught:
+        async with guard:
+            raise fatal
+    assert caught.value is fatal
+    assert _marker(db) is not None

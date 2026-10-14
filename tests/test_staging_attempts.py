@@ -48,6 +48,9 @@ def test_typed_attempt_inventory_wraps_raw_sqlite_read_failure(tmp_path: Path, m
     store = _store(tmp_path)
 
     class BrokenCursor:
+        def close(self) -> None:
+            pass
+
         def fetchall(self) -> NoReturn:
             raise sqlite3.DatabaseError("injected read failure")
 

@@ -10,13 +10,15 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters.collector_state_db import StateDB
+from omi_collector.capture.adapters import internal_audio_store
+from omi_collector.capture.adapters.collector_state_db import StateDB, _GuardedConnection
 from omi_collector.capture.adapters.internal_audio_store import (
     DrainCheckpoint,
     InternalAudioStore,
     clock_mapping_revision,
     refresh_utc_projection,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockRange, ClockState
 
 
@@ -216,8 +218,8 @@ def test_projection_and_concurrent_capture_serialize_without_losing_new_rows(
 
     def capture() -> None:
         try:
+            capture_started.set()
             with InternalAudioStore(db) as store:
-                capture_started.set()
                 store.commit_drain(
                     source_id,
                     1,
@@ -233,6 +235,7 @@ def test_projection_and_concurrent_capture_serialize_without_losing_new_rows(
     capture_thread = threading.Thread(target=capture, name="capture")
     capture_thread.start()
     assert capture_started.wait(5)
+    assert capture_thread.is_alive()
     release_projection.set()
     projection_thread.join(5)
     capture_thread.join(5)
@@ -275,3 +278,70 @@ def test_projection_stale_seeks_use_mapping_revision_index(
         details = [cast(str, row[3]) for row in plan]
     assert any("capture_record_mapping_revision_idx" in detail for detail in details)
     assert all("SCAN record" not in detail for detail in details)
+
+
+@pytest.mark.parametrize("rollback_phase", ["before", "after"])
+@pytest.mark.parametrize("sqlite_errorcode", [sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
+def test_projection_preserves_direct_corruption_when_rollback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rollback_phase: str,
+    sqlite_errorcode: int,
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    _create_receiving_source(db, (_record(100, 1),))
+    payload = _clock_payload(ClockRange(0, 1, 1000.0, 0.1, "confirmed", "projection"))
+    _set_clock_path(db.path, payload)
+    failure = sqlite3.DatabaseError("direct projection corruption")
+    failure.sqlite_errorcode = sqlite_errorcode
+    rollback_failure = sqlite3.DatabaseError("rollback did not settle")
+    original_rollback = sqlite3.Connection.rollback
+
+    def fail_rows(connection: sqlite3.Connection, _revision: str, _limit: int) -> object:
+        connection.execute(
+            "UPDATE capture_record SET utc_timestamp = 999 WHERE source_id = ? AND ordinal = 0",
+            ("a" * 32,),
+        )
+        raise failure
+
+    def failing_rollback(connection: sqlite3.Connection) -> None:
+        if rollback_phase == "after":
+            original_rollback(connection)
+        raise rollback_failure
+
+    monkeypatch.setattr(internal_audio_store, "_stale_projection_rows", fail_rows)
+    monkeypatch.setattr(_GuardedConnection, "rollback", failing_rollback)
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        refresh_utc_projection(db)
+    assert raised.value.sqlite_errorcode == sqlite_errorcode
+    assert raised.value.__cause__ is failure
+    assert _rows(db)[0][2:] == (None, None)
+    assert db.get_generation() == 0
+
+
+def test_projection_unresolved_ordinary_rollback_is_fatal_and_leaves_no_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    _create_receiving_source(db, (_record(100, 1),))
+    payload = _clock_payload(ClockRange(0, 1, 1000.0, 0.1, "confirmed", "projection"))
+    _set_clock_path(db.path, payload)
+    failure = sqlite3.DatabaseError("ordinary projection failure")
+    rollback_failure = sqlite3.DatabaseError("rollback did not settle")
+
+    def fail_rows(connection: sqlite3.Connection, _revision: str, _limit: int) -> object:
+        connection.execute(
+            "UPDATE capture_record SET utc_timestamp = 999 WHERE source_id = ? AND ordinal = 0",
+            ("a" * 32,),
+        )
+        raise failure
+
+    def failing_rollback(_connection: sqlite3.Connection) -> None:
+        raise rollback_failure
+
+    monkeypatch.setattr(internal_audio_store, "_stale_projection_rows", fail_rows)
+    monkeypatch.setattr(_GuardedConnection, "rollback", failing_rollback)
+    with pytest.raises(FatalInternalAudioStorageError, match="could not be rolled back"):
+        refresh_utc_projection(db)
+    assert _rows(db)[0][2:] == (None, None)
+    assert db.get_generation() == 0

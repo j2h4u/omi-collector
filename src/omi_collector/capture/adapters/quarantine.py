@@ -124,18 +124,18 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
 @contextmanager
 def _typed_transaction(filesystem: StagingFilesystem) -> Iterator[sqlite3.Connection]:
     """Run one typed quarantine mutation with explicit rollback on failure."""
-    with closing(filesystem.state_db.open_connection()) as connection, filesystem.state_db.access(connection):
-        filesystem.state_db.begin_exclusive(connection)
+    state_db = filesystem.state_db
+    with state_db.access():
+        connection = state_db.open_connection()
         try:
+            state_db.begin_exclusive(connection)
             yield connection
             connection.commit()
-        except BaseException:
-            if connection.in_transaction:
-                connection.rollback()
+        except BaseException as error:
+            state_db._rollback_managed_write(connection, error)
             raise
         finally:
-            if not connection.in_transaction:
-                filesystem.state_db.end_write(connection)
+            state_db._close_managed_write(connection)
 
 
 def _typed_quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tuple[str, ...]:

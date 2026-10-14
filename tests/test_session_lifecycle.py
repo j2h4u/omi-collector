@@ -10,14 +10,17 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from struct import pack
+from threading import Event
 from typing import Literal, Never, cast
 
 import pytest
 
 from omi_collector.capture.adapters import ready_closures
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
-from omi_collector.capture.adapters.collector_state_db import StateDB
+from omi_collector.capture.adapters.collector_guard import collector_guard
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.phy_guard import CommandResult, ScopedPhyGuard
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -83,6 +86,73 @@ from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, TelemetryConfi
 
 def _run(coroutine: Coroutine[object, object, object]) -> object:
     return asyncio.run(coroutine)
+
+
+class _PhyTestRunner:
+    def __init__(self) -> None:
+        self.selected = ["BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX"]
+
+    async def __call__(self, argv: tuple[str, ...]) -> CommandResult:
+        if len(argv) == 6:
+            return CommandResult(0, f"selected PHYs: {' '.join(self.selected)}\n")
+        self.selected[:] = argv[6:]
+        return CommandResult(0, "")
+
+
+class _PhyTestContext:
+    def __init__(self, events: list[str], *, hang: bool = False, cancelled: Event | None = None) -> None:
+        self.events = events
+        self.hang = hang
+        self.cancelled = cancelled
+
+    async def __aenter__(self) -> RingSession:
+        if self.hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                assert self.cancelled is not None
+                self.cancelled.set()
+                raise
+        self.events.append("transport-enter")
+        return cast(RingSession, object())
+
+    async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.events.append("transport-exit")
+
+
+async def _phy_test_connected(
+    _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+) -> tuple[str, RingInfo | None]:
+    return "drained", current
+
+
+async def _phy_test_info(_session: RingSession, *, timeout: float) -> RingInfo:
+    del timeout
+    return RingInfo(10, 10, 100, 0, 512)
+
+
+def _phy_test_lifecycle(guard: ScopedPhyGuard) -> SessionLifecycle:
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_phy_test_connected,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    options = OpportunisticOptions(
+        TransferTimeouts(0.005, 1),
+        RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+        session_guard=lambda: guard,
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
+        options=options,
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+    return SessionLifecycle(run)
 
 
 class _ScriptedPresence:
@@ -552,6 +622,58 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
 
     _run(scenario())
     assert events == ["connected", "teardown", "checkpoint"]
+
+
+def test_phy_guard_wait_is_outside_info_timeout_but_transport_entry_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_db = StateDB(tmp_path / "collector-state.sqlite3")
+    events: list[str] = []
+    marker_held = Event()
+    release_marker = Event()
+    runner = _PhyTestRunner()
+    guard = ScopedPhyGuard("hci0", state_db=state_db, runner=runner)
+    write_marker = guard._write_marker
+
+    def held_write_marker(snapshot: tuple[str, ...]) -> None:
+        write_marker(snapshot)
+        marker_held.set()
+        if not release_marker.wait(5):
+            raise TimeoutError("test did not release held PHY marker write")
+
+    monkeypatch.setattr(guard, "_write_marker", held_write_marker)
+
+    lifecycle = _phy_test_lifecycle(guard)
+
+    async def held_marker_scenario() -> str:
+        monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", _phy_test_info)
+        with collector_guard(state_db.path.parent / "collector.lock"):
+            task = asyncio.create_task(lifecycle.run_session(_PhyTestContext(events)))
+            assert await asyncio.to_thread(marker_held.wait, 5), "PHY marker write did not reach held state"
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            assert not done, "session timed out while waiting to enter the PHY guard"
+            assert events == []
+            release_marker.set()
+            return await task
+
+    assert _run(held_marker_scenario()) == "drained"
+    assert events == ["transport-enter", "transport-exit"]
+    assert runner.selected == ["BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX"]
+    assert state_db.get(StateKind.PHY_RESTORATION, "hci0") is None
+
+    timed_out = Event()
+
+    # A fresh guard has no marker delay; its transport entry still obeys INFO's deadline.
+    monkeypatch.setattr(guard, "_write_marker", write_marker)
+
+    async def transport_timeout_scenario() -> str:
+        with collector_guard(state_db.path.parent / "collector.lock"):
+            return await lifecycle.run_session(_PhyTestContext(events, hang=True, cancelled=timed_out))
+
+    assert _run(transport_timeout_scenario()) == "retry"
+    assert timed_out.is_set()
+    assert runner.selected == ["BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX"]
+    assert state_db.get(StateKind.PHY_RESTORATION, "hci0") is None
 
 
 def test_missing_preflight_acknowledgement_blocks_read_and_still_tears_down(

@@ -14,6 +14,7 @@ from struct import pack
 from typing import Protocol, cast
 
 import pytest
+import typer
 from bleak.backends.device import BLEDevice
 from typer.testing import CliRunner
 
@@ -210,6 +211,75 @@ def test_production_factories_construct_monkeypatched_dependencies(
     assert (
         transport.kwargs["att_mtu_query_timeout_seconds"] == device_cli.DEFAULT_CONFIG.ble.att_mtu_query_timeout_seconds
     )
+
+
+def test_service_runtime_injects_one_state_db_into_capture_components(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from omi_collector.capture.adapters import (
+        operational_status,
+        opportunistic_runtime,
+        staging_store,
+    )
+    from omi_collector.capture.application import operational_telemetry, opportunistic_sync
+
+    config_path = _layout(tmp_path)
+    loaded = load_operator_config(config_path)
+    state_db = StateDB(loaded.storage.collector.state_db)
+    status = Mock(wraps=operational_status.OperationalStatusStore)
+    clock = Mock(wraps=opportunistic_runtime.ClockStateStore)
+    quality = Mock(wraps=device_cli.SQLiteQualityMetrics)
+    firmware = Mock(wraps=opportunistic_runtime.FirmwareObservationStore)
+    capture = Mock(wraps=staging_store.InternalAudioStore)
+    real_maintenance = opportunistic_sync.QuarantineMaintenance
+    maintenance = Mock(wraps=real_maintenance)
+    sync = AsyncMock(wraps=device_cli.sync)
+    monkeypatch.setattr(operational_status, "OperationalStatusStore", status)
+    monkeypatch.setattr(opportunistic_runtime, "ClockStateStore", clock)
+    monkeypatch.setattr(device_cli, "SQLiteQualityMetrics", quality)
+    monkeypatch.setattr(opportunistic_runtime, "FirmwareObservationStore", firmware)
+    monkeypatch.setattr(staging_store, "InternalAudioStore", capture)
+    monkeypatch.setattr(opportunistic_sync, "QuarantineMaintenance", maintenance)
+    monkeypatch.setattr(device_cli, "sync", sync)
+
+    startup_ready = asyncio.Event()
+    real_prepare = real_maintenance.prepare_pending_startup
+
+    async def prepare_startup(instance: opportunistic_sync.QuarantineMaintenance) -> object:
+        result = await real_prepare(instance)
+        startup_ready.set()
+        return result
+
+    monkeypatch.setattr(real_maintenance, "prepare_pending_startup", prepare_startup)
+    presence = device_cli.make_presence_scheduler("AA:BB:CC:DD:EE:FF", "hci0", config=loaded.config)
+
+    async def end_after_startup() -> None:
+        await startup_ready.wait()
+        raise RuntimeError("composition observed")
+
+    monkeypatch.setattr(presence, "wait_for_attempt", AsyncMock(side_effect=end_after_startup))
+    monkeypatch.setattr(presence, "close", AsyncMock())
+    monkeypatch.setattr(device_cli, "make_presence_scheduler", lambda *_a, **_k: presence)
+    monkeypatch.setattr(operational_telemetry, "system_host_boot_id", lambda: "00000000-0000-0000-0000-000000000001")
+    monkeypatch.setenv("INVOCATION_ID", "0" * 32)
+
+    with pytest.raises(typer.Exit) as stopped:
+        operator_cli._service_locked(loaded, state_db)
+    assert isinstance(stopped.value.__cause__, RuntimeError)
+    assert str(stopped.value.__cause__) == "composition observed"
+
+    component_dbs = {
+        "capture": cast(StateDB, capture.call_args.args[0]),
+        "staging": cast(StagingStore, sync.call_args.args[2]).state_db,
+        "status": cast(StateDB, status.call_args.args[0]),
+        "clock": cast(StateDB, clock.call_args.args[0]),
+        "quality": cast(StateDB, quality.call_args.args[0]),
+        "firmware": cast(StateDB, firmware.call_args.args[0]),
+        "maintenance": cast(StagingStore, maintenance.call_args.args[0]).state_db,
+    }
+    assert all(component_db is state_db for component_db in component_dbs.values())
 
 
 def test_make_transport_preserves_device_selector_and_nondefault_options(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,6 +481,8 @@ def test_sync_uses_one_guard_and_transport_and_forwards_end_to_end_progress(
             info=device_cli.DEFAULT_CONFIG.transfer.info_timeout_seconds,
             transfer=device_cli.DEFAULT_CONFIG.transfer.sync_timeout_seconds,
         )
+        assert options.session_guard is None
+        assert options.phy_policy == "auto"
         async with provider(None) as connected:
             assert connected is session
         progress = options.progress
@@ -454,6 +526,8 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
         runtime: object,
     ) -> object:
         del runtime
+        assert _options.session_guard is None
+        assert _options.phy_policy == "auto"
         async with provider(None) as connected:
             assert connected is session
         async with provider(BLEDevice("AA:BB", "omi", object())) as connected:
@@ -476,7 +550,9 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
         runtime: object,
     ) -> object:
         del runtime
-        async with provider(None) as connected:
+        assert _options.session_guard is not None
+        assert _options.phy_policy == "force_1m"
+        async with _options.session_guard(), provider(None) as connected:
             assert connected is session
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
@@ -506,7 +582,8 @@ def test_sync_force_1m_enters_and_restores_phy_guard(
             info=device_cli.DEFAULT_CONFIG.transfer.info_timeout_seconds,
             transfer=device_cli.DEFAULT_CONFIG.transfer.sync_timeout_seconds,
         )
-        async with provider(None) as connected:
+        assert options.session_guard is not None
+        async with options.session_guard(), provider(None) as connected:
             assert connected is session
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
@@ -1002,7 +1079,9 @@ def test_collect_cli_wires_bounded_policy_and_provider(
     ) -> object:
         del runtime
         captured.append((provider, options))
-        async with provider(None) as connected:
+        assert options.session_guard is not None
+        assert options.phy_policy == "force_1m"
+        async with options.session_guard(), provider(None) as connected:
             assert connected is session
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 

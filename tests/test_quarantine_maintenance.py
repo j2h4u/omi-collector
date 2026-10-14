@@ -14,6 +14,8 @@ from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters import quarantine
+from omi_collector.capture.adapters.collector_state_db import _GuardedConnection
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
 from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, ReadyOutcome, ReadyOutcomeState
@@ -1249,12 +1251,12 @@ def test_visit_begin_failure_releases_capture_priority(tmp_path: Path, monkeypat
         with pytest.raises(OSError, match="storage unavailable"):
             await maintenance.enter_capture_priority()
         assert store.publication_wake_admitted()
-        assert (await asyncio.to_thread(closure_rows, store))[0]["reason"] == "drained"
 
         monkeypatch.setattr(store, "begin_ready_visit", original)
         await maintenance.enter_capture_priority()
-        assert (await asyncio.to_thread(closure_rows, store))[0]["reason"] == "collecting"
+        assert not store.publication_wake_admitted()
         await maintenance.exit_capture_priority()
+        assert store.publication_wake_admitted()
         await maintenance.close()
 
     _run(scenario())
@@ -1691,11 +1693,11 @@ def test_repeated_owner_cancellation_during_startup_failure_cleanup_preserves_fa
         try:
             assert await asyncio.to_thread(inspection_started.wait, 1)
             release_inspection.set()
-            with pytest.raises(asyncio.CancelledError) as error:
+            with pytest.raises(RuntimeError) as error:
                 done, pending = await asyncio.wait({owner}, timeout=5.0)
                 assert owner in done and not pending
                 owner.result()
-            assert error.value.__cause__ is failure
+            assert error.value is failure
             assert cancellation_cleanup_started.is_set()
             assert owner.done()
         finally:
@@ -1925,3 +1927,66 @@ def test_background_publication_requests_coalesce_to_one_follow_up_in_both_prior
         await _exercise_capture_priority_coalescing(capture_maintenance, capture_recovery)
 
     _run(scenario())
+
+
+@pytest.mark.parametrize("rollback_phase", ["before", "after"])
+@pytest.mark.parametrize("sqlite_errorcode", [sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
+def test_quarantine_preserves_direct_corruption_when_rollback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rollback_phase: str,
+    sqlite_errorcode: int,
+) -> None:
+    store = _store(tmp_path)
+    _seed_streaming_partial(store, 1)
+    source_id = store.pending_attempts()[0].attempt_id
+    before = _source_snapshot(store, source_id)
+    failure = sqlite3.DatabaseError("direct quarantine corruption")
+    failure.sqlite_errorcode = sqlite_errorcode
+    rollback_failure = sqlite3.DatabaseError("rollback did not settle")
+    original_row = quarantine._typed_quarantine_row
+    original_rollback = sqlite3.Connection.rollback
+
+    def fail_row(connection: sqlite3.Connection, source: str, lifecycle: str, reason: str, retention: float) -> None:
+        original_row(connection, source, lifecycle, reason, retention)
+        raise failure
+
+    def failing_rollback(connection: sqlite3.Connection) -> None:
+        if rollback_phase == "after":
+            original_rollback(connection)
+        raise rollback_failure
+
+    monkeypatch.setattr(quarantine, "_typed_quarantine_row", fail_row)
+    monkeypatch.setattr(_GuardedConnection, "rollback", failing_rollback)
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        store.quarantine_pending("rollback fault")
+    assert raised.value.sqlite_errorcode == sqlite_errorcode
+    assert raised.value.__cause__ is failure
+    assert _source_snapshot(store, source_id) == before
+    assert store.pending_attempts()[0].attempt_id == source_id
+
+
+def test_quarantine_unresolved_ordinary_rollback_is_fatal_and_leaves_no_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    _seed_streaming_partial(store, 1)
+    source_id = store.pending_attempts()[0].attempt_id
+    before = _source_snapshot(store, source_id)
+    failure = sqlite3.DatabaseError("ordinary quarantine failure")
+    rollback_failure = sqlite3.DatabaseError("rollback did not settle")
+    original_row = quarantine._typed_quarantine_row
+
+    def fail_row(connection: sqlite3.Connection, source: str, lifecycle: str, reason: str, retention: float) -> None:
+        original_row(connection, source, lifecycle, reason, retention)
+        raise failure
+
+    def failing_rollback(_connection: sqlite3.Connection) -> None:
+        raise rollback_failure
+
+    monkeypatch.setattr(quarantine, "_typed_quarantine_row", fail_row)
+    monkeypatch.setattr(_GuardedConnection, "rollback", failing_rollback)
+    with pytest.raises(FatalInternalAudioStorageError, match="could not be rolled back"):
+        store.quarantine_pending("rollback fault")
+    assert _source_snapshot(store, source_id) == before
+    assert store.pending_attempts()[0].attempt_id == source_id

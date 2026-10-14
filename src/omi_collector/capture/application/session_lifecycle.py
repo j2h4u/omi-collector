@@ -175,6 +175,7 @@ class OpportunisticOptions:
     quality_metrics: QualityMetricsPort | None = None
     clock_state_store: ClockStatePort | None = None
     clock_lease: StorageLeaseFactory | None = None
+    session_guard: Callable[[], AbstractAsyncContextManager[object]] | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
     stop_intent: StopIntent | None = None
@@ -499,7 +500,12 @@ class SessionLifecycle:
         self._storage_not_ready_responses = 0
         await self._record_advertisement_quality(quality)
         try:
-            await self._run_session_effects(context, execution, phase)
+            guard = self.run.options.session_guard
+            if guard is None:
+                await self._run_session_effects(context, execution, phase)
+            else:
+                async with guard():
+                    await self._run_session_effects(context, execution, phase)
             require_session_command(execution.machine, SessionCommand.CHECKPOINT)
             await self.run.callbacks.post_session_checkpoint()
             execution.machine = transition_session(execution.machine, CheckpointResolved())

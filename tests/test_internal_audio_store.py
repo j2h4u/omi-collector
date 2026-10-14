@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 from typing import cast
 
@@ -589,6 +590,58 @@ def test_ambiguous_reopen_failure_fail_stops_all_mutators(tmp_path: Path, monkey
             store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1))
         with pytest.raises(InternalAudioStoreError, match="fail-stopped"):
             store.create_source("e" * 32, "draft", 0, 2)
+
+
+def test_unsettled_writer_rollback_releases_shared_guard_and_retains_first_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    rollback_started, release_rollback, auxiliary_started = Event(), Event(), Event()
+    fatal = FatalInternalAudioStorageError("original writer failure")
+    writer_errors: list[BaseException] = []
+    auxiliary_errors: list[BaseException] = []
+
+    class FailingRollbackConnection(collector_state_db._GuardedConnection):
+        def rollback(self) -> None:
+            rollback_started.set()
+            assert release_rollback.wait(5)
+            raise sqlite3.OperationalError("rollback remained active")
+
+    monkeypatch.setattr(collector_state_db, "_GuardedConnection", FailingRollbackConnection)
+
+    def writer() -> None:
+        try:
+            with InternalAudioStore(db) as store, store.publication_transaction() as (state, _connection):
+                state.put(StateKind.RUNTIME_STATUS, "writer", {"uncommitted": True})
+                raise fatal
+        except BaseException as error:  # noqa: BLE001 - assert the exact worker outcome
+            writer_errors.append(error)
+
+    def auxiliary() -> None:
+        auxiliary_started.set()
+        try:
+            db.put(StateKind.FIRMWARE, "independent", {"committed": True})
+        except BaseException as error:  # noqa: BLE001 - assert the independent writer outcome
+            auxiliary_errors.append(error)
+
+    writer_thread = Thread(target=writer, name="rollback-writer")
+    auxiliary_thread = Thread(target=auxiliary, name="independent-writer")
+    writer_thread.start()
+    try:
+        assert rollback_started.wait(5)
+        auxiliary_thread.start()
+        assert auxiliary_started.wait(5)
+        auxiliary_thread.join(0.05)
+        assert auxiliary_thread.is_alive(), "independent writer must wait for the active write guard"
+    finally:
+        release_rollback.set()
+    writer_thread.join(5)
+    auxiliary_thread.join(5)
+    assert not writer_thread.is_alive() and not auxiliary_thread.is_alive()
+    assert writer_errors == [fatal]
+    assert auxiliary_errors == []
+    assert db.get(StateKind.RUNTIME_STATUS, "writer") is None
+    assert db.get(StateKind.FIRMWARE, "independent") == {"committed": True}
 
 
 def test_uint64_high_start_accepts_max_span_and_refuses_plus_one(tmp_path: Path) -> None:

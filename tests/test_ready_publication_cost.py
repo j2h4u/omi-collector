@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from threading import Event
+from types import TracebackType
+from typing import BinaryIO, TextIO, cast
 
 import pytest
 
-from omi_collector.capture.adapters import ready_bundles
-from omi_collector.capture.adapters.collector_state_db import StateDB
+from omi_collector.capture.adapters import collector_state_db, ready_bundles
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcomeState
 from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
@@ -21,6 +25,38 @@ from test_publication_fsm import _store
 
 def _record(sequence: int) -> bytes:
     return sequence.to_bytes(4, "big") + bytes((2, 8, sequence % 256)) + bytes(AUDIO_RECORD_SIZE - 7)
+
+
+class _HeldReadyOutput:
+    def __init__(self, stream: BinaryIO, started: Event, release: Event) -> None:
+        self.stream = stream
+        self.started = started
+        self.release = release
+
+    def __enter__(self) -> _HeldReadyOutput:
+        self.stream.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        return self.stream.__exit__(exc_type, exc_value, traceback)
+
+    def write(self, data: bytes) -> int:
+        if not self.started.is_set():
+            self.started.set()
+            if not self.release.wait(5):
+                raise TimeoutError("test did not release held READY output write")
+        return self.stream.write(data)
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def fileno(self) -> int:
+        return self.stream.fileno()
 
 
 def _add_source(store: StagingStore, start: int, count: int) -> bytes:
@@ -305,6 +341,102 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
         assert attempt_source(store, source_id) is None
     finally:
         attempt.close()
+
+
+def test_ready_output_write_does_not_hold_shared_database_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asyncio.run(_ready_write_guard_scenario(tmp_path, monkeypatch))
+
+
+async def _ready_write_guard_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = await asyncio.to_thread(_make_chunked_store, tmp_path)
+    expected = b"".join((_record(100), _record(101)))
+    await asyncio.to_thread(_add_source, store, 100, 2)
+    await asyncio.to_thread(store.append_ready_closure, 102, "drained")
+    output_write_started = Event()
+    release_output_write = Event()
+    open_page_cursors: set[int] = set()
+    page_reads = 0
+    original_execute = collector_state_db._GuardedCursor.execute
+    original_close = collector_state_db._GuardedCursor.close
+
+    def track_execute(cursor: collector_state_db._GuardedCursor, sql: str, parameters: object = ()):
+        nonlocal page_reads
+        result = original_execute(cursor, sql, parameters)
+        if "FROM capture_record" in sql:
+            page_reads += 1
+            open_page_cursors.add(id(cursor))
+        return result
+
+    def track_close(cursor: collector_state_db._GuardedCursor) -> None:
+        open_page_cursors.discard(id(cursor))
+        original_close(cursor)
+
+    monkeypatch.setattr(collector_state_db._GuardedCursor, "execute", track_execute)
+    monkeypatch.setattr(collector_state_db._GuardedCursor, "close", track_close)
+    monkeypatch.setattr(
+        Path,
+        "open",
+        _hold_ready_output_write(
+            cast(Callable[..., BinaryIO | TextIO], Path.open),
+            tmp_path / "ready",
+            output_write_started,
+            release_output_write,
+        ),
+    )
+    publication = asyncio.create_task(asyncio.to_thread(store.recover_and_publish))
+    auxiliary: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.to_thread(output_write_started.wait, 3)
+        assert page_reads >= 2 and not open_page_cursors
+        auxiliary = asyncio.create_task(
+            asyncio.to_thread(store.state_db.put, StateKind.QUALITY_EVENT, "independent", {"committed": True})
+        )
+        done, _ = await asyncio.wait({auxiliary}, timeout=3)
+        assert auxiliary in done, "same-StateDB auxiliary transaction stalled during READY output write"
+        await auxiliary
+        release_output_write.set()
+        done, _ = await asyncio.wait({publication}, timeout=3)
+        assert publication in done, "READY publication did not finish after output write release"
+        result = await publication
+        assert result.state is ReadyOutcomeState.PUBLISHED
+        assert await asyncio.to_thread(result.published[0].path.joinpath("records.bin").read_bytes) == expected
+        assert await asyncio.to_thread(store.state_db.get, StateKind.QUALITY_EVENT, "independent") == {
+            "committed": True
+        }
+    finally:
+        release_output_write.set()
+        if not publication.done():
+            await asyncio.gather(publication, return_exceptions=True)
+        if auxiliary is not None and not auxiliary.done():
+            await asyncio.gather(auxiliary, return_exceptions=True)
+
+
+def _make_chunked_store(tmp_path: Path) -> StagingStore:
+    bootstrap = StagingStore(tmp_path / "spool", tmp_path / "capture")
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02), writer=WriterConfig(chunk_records=1))
+    return StagingStore.from_paths(
+        bootstrap.paths,
+        state_db=bootstrap.state_db,
+        publication_root=ready,
+        config=config,
+    )
+
+
+def _hold_ready_output_write(
+    original_open: Callable[..., BinaryIO | TextIO], ready_root: Path, started: Event, release: Event
+) -> Callable[..., BinaryIO | TextIO]:
+    def open_output(path: Path, mode: str = "r", *args: object, **kwargs: object) -> BinaryIO | TextIO:
+        stream = original_open(path, mode, *args, **kwargs)
+        if path.name == ready_bundles._RAW_NAME and ready_root in path.parents and mode == "xb":
+            return cast(BinaryIO, _HeldReadyOutput(cast(BinaryIO, stream), started, release))
+        return stream
+
+    return open_output
 
 
 def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart(

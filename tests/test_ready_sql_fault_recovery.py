@@ -18,7 +18,6 @@ from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
     DrainCheckpoint,
     InternalAudioStore,
-    InternalAudioStoreError,
 )
 from omi_collector.capture.adapters.ready_bundles import (
     ReadyBundleError,
@@ -30,6 +29,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     _TypedPage,
     finalize_typed_sources,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.internal_audio_machine import (
     AudioAction,
     AudioDecision,
@@ -269,7 +269,7 @@ def test_ready_custody_cursor_commit_reconciles_exact_old_and_new_states(
 
         monkeypatch.setattr(ready_bundles, "_commit_typed_ready_custody_once", inject)
         if fault == "third_state":
-            with pytest.raises(InternalAudioStoreError, match="third state"):
+            with pytest.raises(FatalInternalAudioStorageError, match="third state"):
                 _publish(store, (replay,), ready, frontier=102)
             assert store._failed is True
             assert calls == 1
@@ -672,7 +672,7 @@ def test_ready_conflict_remainder_rejects_changed_acceptance_time(
             raise sqlite3.DatabaseError("simulated conflict commit ambiguity")
 
         monkeypatch.setattr(store, "publication_transaction", injected)
-        with pytest.raises(InternalAudioStoreError, match="third state"):
+        with pytest.raises(FatalInternalAudioStorageError, match="third state"):
             _publish_subthreshold(store, (conflict, remainder), ready, 102)
         assert store._failed is True
 
@@ -711,7 +711,7 @@ def test_ready_conflict_disposition_accepts_only_exact_committed_state(
 
         monkeypatch.setattr(store, "publication_transaction", injected)
         if fault == "third_state":
-            with pytest.raises(InternalAudioStoreError, match="third state"):
+            with pytest.raises(FatalInternalAudioStorageError, match="third state"):
                 _publish(store, (source,), ready, frontier=101)
             assert store._failed is True
             state = _conflict_state(database, source.source_id)
@@ -868,7 +868,7 @@ def test_retirement_step_reconciles_only_exact_cursor_states(
 
         monkeypatch.setattr(ready_bundles, "_retire_typed_source_once", inject)
         if fault == "third_state":
-            with pytest.raises(InternalAudioStoreError, match="third state"):
+            with pytest.raises(FatalInternalAudioStorageError, match="third state"):
                 _publish(store, (), ready, frontier=102, page_limit=1)
             assert store._failed is True
             assert calls == 1

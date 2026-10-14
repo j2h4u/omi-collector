@@ -676,6 +676,140 @@ def test_phy_guard_wait_is_outside_info_timeout_but_transport_entry_is_bounded(
     assert state_db.get(StateKind.PHY_RESTORATION, "hci0") is None
 
 
+@pytest.mark.parametrize("site", ("enter", "exit", "body"))
+def test_session_guard_reports_only_its_own_failures(monkeypatch: pytest.MonkeyPatch, site: str) -> None:
+    fault = RuntimeError(f"{site} failed")
+    activity: list[ActivityEvent] = []
+    debug: list[tuple[str, BaseException, object]] = []
+    transport_events: list[str] = []
+    runtime = OpportunisticRuntime()
+    monkeypatch.setattr(
+        runtime,
+        "debug_exception",
+        lambda event, error, **fields: debug.append((event, error, fields.get("phase"))),
+    )
+
+    class Guard:
+        async def __aenter__(self) -> object:
+            if site == "enter":
+                raise fault
+            return object()
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            if site == "exit":
+                raise fault
+
+    async def connected_step(
+        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        if site == "body":
+            raise fault
+        return "drained", current
+
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: _PhyTestContext(transport_events),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), activity=activity.append, session_guard=Guard),
+        runtime=runtime,
+        callbacks=callbacks,
+    )
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", _phy_test_info)
+
+    with pytest.raises(RuntimeError) as raised:
+        _run(SessionLifecycle(run).run_session(_PhyTestContext(transport_events)))
+    assert raised.value is fault
+    reports = [event for event in activity if event.state == "session_error"]
+    assert len(reports) == 1
+    assert len(debug) == 1
+    assert debug[0][0:2] == ("session_error", fault)
+    if site in {"enter", "exit"}:
+        expected_phase = "connect" if site == "enter" else "teardown"
+        assert reports[0].phase == expected_phase
+        assert debug[0][2] == expected_phase
+
+
+def test_session_guard_keeps_first_fatal_if_reporting_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    fatal = FatalInternalAudioStorageError("guard failed")
+    reporting_failure = FatalInternalAudioStorageError("reporter failed")
+
+    class Guard:
+        async def __aenter__(self) -> Never:
+            raise fatal
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    runtime = OpportunisticRuntime()
+
+    def fail_report(_event: str, _error: BaseException, **_fields: object) -> Never:
+        raise reporting_failure
+
+    monkeypatch.setattr(runtime, "debug_exception", fail_report)
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_phy_test_connected,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: _PhyTestContext([]),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), session_guard=Guard),
+        runtime=runtime,
+        callbacks=callbacks,
+    )
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        _run(SessionLifecycle(run).run_session(_PhyTestContext([])))
+    assert raised.value is fatal
+    assert raised.value.__cause__ is reporting_failure
+
+
+def test_session_guard_cancellation_does_not_report_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    activity: list[ActivityEvent] = []
+    debug: list[str] = []
+    cancelled = asyncio.CancelledError("guard cancelled")
+
+    class Guard:
+        async def __aenter__(self) -> Never:
+            raise cancelled
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    runtime = OpportunisticRuntime()
+    monkeypatch.setattr(runtime, "debug_exception", lambda event, _error, **_fields: debug.append(event))
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_phy_test_connected,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: _PhyTestContext([]),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), activity=activity.append, session_guard=Guard),
+        runtime=runtime,
+        callbacks=callbacks,
+    )
+    with pytest.raises(asyncio.CancelledError) as raised:
+        _run(SessionLifecycle(run).run_session(_PhyTestContext([])))
+    assert raised.value is cancelled
+    assert not [event for event in activity if event.state == "session_error"]
+    assert debug == []
+
+
 def test_missing_preflight_acknowledgement_blocks_read_and_still_tears_down(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

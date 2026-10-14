@@ -1944,6 +1944,8 @@ def test_quarantine_preserves_direct_corruption_when_rollback_fails(
     failure = sqlite3.DatabaseError("direct quarantine corruption")
     failure.sqlite_errorcode = sqlite_errorcode
     rollback_failure = sqlite3.DatabaseError("rollback did not settle")
+    rollback_failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    rollback_failure.sqlite_errorname = "SQLITE_BUSY"
     original_row = quarantine._typed_quarantine_row
     original_rollback = sqlite3.Connection.rollback
 
@@ -1962,6 +1964,9 @@ def test_quarantine_preserves_direct_corruption_when_rollback_fails(
         store.quarantine_pending("rollback fault")
     assert raised.value.sqlite_errorcode == sqlite_errorcode
     assert raised.value.__cause__ is failure
+    assert failure.__notes__ == [
+        "Rollback failed (DatabaseError, SQLite code=5, name=SQLITE_BUSY): rollback did not settle"
+    ]
     assert _source_snapshot(store, source_id) == before
     assert store.pending_attempts()[0].attempt_id == source_id
 
@@ -1975,6 +1980,8 @@ def test_quarantine_unresolved_ordinary_rollback_is_fatal_and_leaves_no_mutation
     before = _source_snapshot(store, source_id)
     failure = sqlite3.DatabaseError("ordinary quarantine failure")
     rollback_failure = sqlite3.DatabaseError("rollback did not settle")
+    rollback_failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    rollback_failure.sqlite_errorname = "SQLITE_BUSY"
     original_row = quarantine._typed_quarantine_row
 
     def fail_row(connection: sqlite3.Connection, source: str, lifecycle: str, reason: str, retention: float) -> None:
@@ -1986,7 +1993,11 @@ def test_quarantine_unresolved_ordinary_rollback_is_fatal_and_leaves_no_mutation
 
     monkeypatch.setattr(quarantine, "_typed_quarantine_row", fail_row)
     monkeypatch.setattr(_GuardedConnection, "rollback", failing_rollback)
-    with pytest.raises(FatalInternalAudioStorageError, match="could not be rolled back"):
+    with pytest.raises(FatalInternalAudioStorageError, match="could not be rolled back") as raised:
         store.quarantine_pending("rollback fault")
+    assert raised.value.__cause__ is failure
+    assert failure.__notes__ == [
+        "Rollback failed (DatabaseError, SQLite code=5, name=SQLITE_BUSY): rollback did not settle"
+    ]
     assert _source_snapshot(store, source_id) == before
     assert store.pending_attempts()[0].attempt_id == source_id

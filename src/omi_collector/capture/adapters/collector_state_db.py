@@ -399,6 +399,11 @@ class StateDB(_Operations):
             try:
                 connection.rollback()
             except sqlite3.DatabaseError as rollback_error:
+                error.add_note(
+                    f"Rollback failed ({type(rollback_error).__name__}, "
+                    f"SQLite code={getattr(rollback_error, 'sqlite_errorcode', None)}, "
+                    f"name={getattr(rollback_error, 'sqlite_errorname', None)}): {rollback_error}"
+                )
                 if corruption is None:
                     raise_if_sqlite_corrupt(rollback_error)
         if corruption is not None:

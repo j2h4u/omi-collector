@@ -504,8 +504,7 @@ class SessionLifecycle:
             if guard is None:
                 await self._run_session_effects(context, execution, phase)
             else:
-                async with guard():
-                    await self._run_session_effects(context, execution, phase)
+                await self._run_guarded_session_effects(context, execution, phase, guard)
             require_session_command(execution.machine, SessionCommand.CHECKPOINT)
             await self.run.callbacks.post_session_checkpoint()
             execution.machine = transition_session(execution.machine, CheckpointResolved())
@@ -531,6 +530,34 @@ class SessionLifecycle:
             raise
         finally:
             await self._record_session_quality(quality, execution.outcome, execution.teardown_error, terminal_error)
+
+    async def _run_guarded_session_effects(
+        self,
+        context: AbstractAsyncContextManager[RingSession],
+        execution: _SessionExecution,
+        phase: SessionPhaseState,
+        guard: Callable[[], AbstractAsyncContextManager[object]],
+    ) -> None:
+        """Report guard failures without reporting an already handled body error twice."""
+        guard_phase: SessionPhase = "connect"
+        body_error: BaseException | None = None
+        try:
+            async with guard():
+                guard_phase = "teardown"
+                try:
+                    await self._run_session_effects(context, execution, phase)
+                except BaseException as error:
+                    body_error = error
+                    raise
+        except Exception as error:
+            if error is not body_error:
+                try:
+                    await report_session_error(self.run.options.activity, guard_phase, error, self.run.runtime)
+                except BaseException as reporting_error:
+                    if isinstance(error, FatalInternalAudioStorageError):
+                        raise error from reporting_error
+                    raise
+            raise
 
     async def _run_session_effects(
         self,

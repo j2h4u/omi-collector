@@ -22,7 +22,7 @@ from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBEr
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.publication import SealResult
-from omi_collector.capture.adapters.staging_contract import StagingError
+from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError, StagingError
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
 from omi_collector.capture.domain.clock_state import ClockIntent
@@ -63,6 +63,32 @@ def _layout(tmp_path: Path) -> Path:
         db.put(StateKind.MIGRATION, "current", {"version": 1, "phase": "complete"})
         db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return path
+
+
+def test_fatal_internal_audio_storage_exits_without_service_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    loaded = load_operator_config(_layout(tmp_path))
+    with pytest.raises(cli.typer.Exit) as state_exit, cli._command_state(loaded):
+        raise FatalInternalAudioStorageError("READY latch failed")
+    assert state_exit.value.exit_code == 78
+
+    class FatalCapture:
+        OperationInterruptedError = RuntimeError
+
+        @staticmethod
+        def run(operation: Coroutine[object, object, object]) -> object:
+            operation.close()
+            raise FatalInternalAudioStorageError("READY latch failed")
+
+    monkeypatch.setattr(cli, "_capture_cli", FatalCapture)
+
+    async def operation() -> object:
+        return None
+
+    with pytest.raises(cli.typer.Exit) as operation_exit:
+        cli._run_device_operation(operation())
+    assert operation_exit.value.exit_code == 78
 
 
 def test_mutating_cli_rejects_alternate_root_for_same_adapter_with_different_pendant(
@@ -242,7 +268,7 @@ def test_mutating_cli_stops_for_nonregular_journal(
 
     result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
 
-    assert result.exit_code == 78
+    assert result.exit_code == 78, result.output
     assert "journal is unsafe" in result.output
 
 

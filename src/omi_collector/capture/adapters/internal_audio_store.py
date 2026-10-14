@@ -33,6 +33,7 @@ from ..domain.internal_audio_machine import (
 )
 from .clock_segments import ClockSegmentMap
 from .collector_state_db import StateDB, StateDBError, StateTransaction, _decode, _encode, install_audio_schema
+from .staging_contract import _raise_if_corrupt_sqlite_error
 
 __all__ = [
     "AUDIO_PAYLOAD_SIZE",
@@ -41,6 +42,8 @@ __all__ = [
     "MAX_CHUNK_LIMIT",
     "CaptureRecord",
     "CaptureSource",
+    "CaptureSourceIntegrityError",
+    "CaptureSourceReadError",
     "CaptureTail",
     "DrainCheckpoint",
     "InternalAudioStore",
@@ -81,6 +84,18 @@ _DEFAULT_CLOCK_PAYLOAD = _encode(ClockState().to_payload())
 
 class InternalAudioStoreError(StateDBError):
     """A typed audio operation was refused or could not be made durable."""
+
+
+class CaptureSourceIntegrityError(InternalAudioStoreError):
+    """Canonical source rows do not match their durable authentication checkpoint."""
+
+
+class CaptureSourceReadError(InternalAudioStoreError):
+    """Canonical source authentication failed while reading SQLite state."""
+
+    def __init__(self, message: str, *, sqlite_errorcode: int | None) -> None:
+        super().__init__(message)
+        self.sqlite_errorcode = sqlite_errorcode
 
 
 def capture_space_requirement(state_db: StateDB, record_count: int, chunk_records: int) -> tuple[int, int]:
@@ -372,52 +387,76 @@ def authenticate_capture_source(
 
     source_id = _source_id(source_id)
     limit = _chunk_limit(page_limit)
-    count = 0
-    digest = hashlib.sha256()
-    after_ordinal = -1
     try:
         with closing(state_db.open_connection(read_only=True)) as connection:
             source = _read_capture_source(connection, source_id)
             if source is None:
                 raise InternalAudioStoreError("source does not exist")
-            while True:
-                rows = cast(
-                    list[tuple[object, object, object]],
-                    connection.execute(
-                        "SELECT ordinal, device_timestamp, payload FROM capture_record "
-                        "WHERE source_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?",
-                        (source_id, after_ordinal, limit),
-                    ).fetchall(),
-                )
-                if not rows:
-                    break
-                for ordinal_value, timestamp_value, payload_value in rows:
-                    digest.update(_authenticated_record_bytes(ordinal_value, timestamp_value, payload_value, count))
-                    count += 1
-                after_ordinal = count - 1
+            count, digest, integrity_error = _scan_authenticated_records(connection, source_id, limit)
             current = _read_capture_source(connection, source_id)
     except InternalAudioStoreError:
         raise
-    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+    except (sqlite3.DatabaseError, StateDBError) as error:
+        _raise_if_corrupt_sqlite_error(error)
+        raise _capture_source_read_error(error) from error
+    except OSError as error:
         raise InternalAudioStoreError("source record authentication failed") from error
     if current != source:
         raise InternalAudioStoreError("source changed during record authentication")
+    if integrity_error is not None:
+        raise integrity_error
     if count != source.committed_count:
-        raise InternalAudioStoreError("source record count does not match checkpoint")
-    if digest.hexdigest() != source.committed_sha256:
-        raise InternalAudioStoreError("source record digest does not match checkpoint")
+        raise CaptureSourceIntegrityError("source record count does not match checkpoint")
+    if digest != source.committed_sha256:
+        raise CaptureSourceIntegrityError("source record digest does not match checkpoint")
     return source
+
+
+def _capture_source_read_error(error: sqlite3.DatabaseError | StateDBError) -> CaptureSourceReadError:
+    code = getattr(error, "sqlite_errorcode", None)
+    return CaptureSourceReadError(
+        "source record authentication failed",
+        sqlite_errorcode=code if type(code) is int else None,
+    )
+
+
+def _scan_authenticated_records(
+    connection: sqlite3.Connection, source_id: str, limit: int
+) -> tuple[int, str, CaptureSourceIntegrityError | None]:
+    count = 0
+    digest = hashlib.sha256()
+    while True:
+        rows = cast(
+            list[tuple[object, object, object]],
+            connection.execute(
+                "SELECT ordinal, device_timestamp, payload FROM capture_record "
+                "WHERE source_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?",
+                (source_id, count - 1, limit),
+            ).fetchall(),
+        )
+        if not rows:
+            return count, digest.hexdigest(), None
+        for ordinal_value, timestamp_value, payload_value in rows:
+            try:
+                digest.update(_authenticated_record_bytes(ordinal_value, timestamp_value, payload_value, count))
+            except CaptureSourceIntegrityError as error:
+                return count, digest.hexdigest(), error
+            count += 1
 
 
 def _authenticated_record_bytes(
     ordinal_value: object, timestamp_value: object, payload_value: object, expected: int
 ) -> bytes:
-    ordinal = _uint32(cast(int, ordinal_value), "source record ordinal")
+    if type(ordinal_value) is not int or not 0 <= ordinal_value <= MAX_PROTOCOL_UINT32:
+        raise CaptureSourceIntegrityError("source record ordinal is invalid")
+    ordinal = ordinal_value
     if ordinal != expected:
-        raise InternalAudioStoreError("source record ordinals are not contiguous")
-    timestamp = _uint32(cast(int, timestamp_value), "device timestamp")
-    payload = _bytes(payload_value)
-    return _record_bytes(timestamp.to_bytes(4, "big") + payload)
+        raise CaptureSourceIntegrityError("source record ordinals are not contiguous")
+    if type(timestamp_value) is not int or not 0 <= timestamp_value <= MAX_PROTOCOL_UINT32:
+        raise CaptureSourceIntegrityError("source record timestamp is invalid")
+    if not isinstance(payload_value, bytes) or len(payload_value) != AUDIO_PAYLOAD_SIZE:
+        raise CaptureSourceIntegrityError("source record payload layout is invalid")
+    return timestamp_value.to_bytes(4, "big") + payload_value
 
 
 class InternalAudioStore:
@@ -1059,13 +1098,30 @@ class InternalAudioStore:
             ordinal = _int_value(_value(row, 0)) + 1
             if ordinal > MAX_PROTOCOL_UINT32:
                 raise InternalAudioStoreError("conflict evidence ordinal is exhausted")
+            canonical_row = _fetchone(
+                connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM capture_record WHERE source_id = ?)",
+                    (source.source_id,),
+                )
+            )
+            if canonical_row is None:
+                raise InternalAudioStoreError("canonical record presence is unavailable")
+            canonical_value = _int_value(_value(canonical_row, 0))
+            if canonical_value not in {0, 1}:
+                raise InternalAudioStoreError("canonical record presence is invalid")
+            has_canonical_records = bool(canonical_value)
             now = time.time_ns()
             classification = quarantine_transition(
-                QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(source.committed_count)
+                QuarantineDisposition.UNCLASSIFIED,
+                QuarantineOpened(source.committed_count, has_canonical_records),
             )
             if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
                 raise InternalAudioStoreError(classification.reason)
             assert classification.next_disposition is not None
+            unprocessable = classification.next_disposition is QuarantineDisposition.UNPROCESSABLE
+            block_reason = (
+                "source_authentication_mismatch" if source.committed_count == 0 and has_canonical_records else reason
+            )
             connection.execute(
                 "INSERT INTO capture_conflict(source_id, chunk_ordinal, leg_generation, "
                 "absolute_byte_offset, reason, bytes) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1081,17 +1137,16 @@ class InternalAudioStore:
             connection.execute(
                 "UPDATE capture_source SET source_type = 'quarantine', lifecycle = 'blocked', block_reason = ?, "
                 "quarantine_disposition = ?, quarantine_opaque = 0, "
-                "terminal_reason = CASE WHEN committed_count = 0 "
-                "THEN 'quarantine contains no committed records' ELSE NULL END, "
+                "terminal_reason = ?, "
                 "terminal_time = ?, retention_deadline = ?, "
-                "certified_prefix_count = CASE WHEN committed_count = 0 THEN NULL ELSE committed_count END, "
-                "coverage_digest = CASE WHEN committed_count = 0 THEN NULL ELSE committed_sha256 END "
+                "certified_prefix_count = NULL, coverage_digest = NULL "
                 "WHERE source_id = ?",
                 (
-                    reason,
+                    block_reason,
                     classification.next_disposition.value,
-                    str(now),
-                    str(now + self._terminal_retention_ns),
+                    "quarantine contains no committed records" if unprocessable else None,
+                    str(now) if unprocessable else None,
+                    str(now + self._terminal_retention_ns) if unprocessable else None,
                     source.source_id,
                 ),
             )

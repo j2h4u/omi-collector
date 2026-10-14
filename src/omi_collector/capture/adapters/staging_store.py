@@ -70,6 +70,7 @@ from .staging_contract import (
     AttemptStateError,
     DeviceAlreadyRunningError,
     DiskSpaceError,
+    FatalInternalAudioStorageError,
     PendingAttemptError,
     StagingError,
     _validate_attempt_id,
@@ -240,6 +241,8 @@ class StagingStore:
                 phase = "post_effect_revision"
                 revision = self._publication_revision()
             return outcome, revision
+        except FatalInternalAudioStorageError:
+            raise
         except DeviceAlreadyRunningError as error:
             _debug_publication_failure(error, phase="device_lock", path=self._filesystem.lock_path)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="publication_lock_busy"), running.revision

@@ -39,6 +39,7 @@ from omi_collector.capture.domain.internal_audio_machine import (
     ReadyCustody,
     ResidualExpiry,
     RetirementStep,
+    SourceIntegrityHold,
     Stage,
     TerminalPrefix,
     cohort_transition,
@@ -57,6 +58,7 @@ EVENTS = (
     TerminalPrefix(),
     Interruption(),
     AuthenticatedConflict(),
+    SourceIntegrityHold(),
     ReadyCustody(),
     BeginRetirement(),
     RetirementStep(),
@@ -103,11 +105,14 @@ def test_audio_matrix_refuses_every_unsupported_phase_event_cell() -> None:
         (AudioPhase.SEALED_WAITING, Interruption): AudioAction.INSPECT_ONLY,
         (AudioPhase.SEALED_WAITING, TerminalPrefix): AudioAction.IDEMPOTENT,
         (AudioPhase.BLOCKED, AuthenticatedConflict): AudioAction.BLOCK,
+        (AudioPhase.BLOCKED, SourceIntegrityHold): AudioAction.BLOCK,
         (AudioPhase.BLOCKED, Barrier): AudioAction.INSPECT_ONLY,
         (AudioPhase.BLOCKED, Interruption): AudioAction.INSPECT_ONLY,
         (AudioPhase.COVERED, ReadyCustody): AudioAction.IDEMPOTENT,
         (AudioPhase.COVERED, BeginRetirement): AudioAction.RETIRE,
+        (AudioPhase.COVERED, SourceIntegrityHold): AudioAction.BLOCK,
         (AudioPhase.RETIRING, RetirementStep): AudioAction.RETIRE,
+        (AudioPhase.RETIRING, SourceIntegrityHold): AudioAction.BLOCK,
     }
     for phase, event in product(PHASES, EVENTS):
         decision = transition(phase, event)
@@ -265,7 +270,7 @@ def test_quarantine_prefix_below_threshold_survives_72h() -> None:
 
 
 def test_quarantine_residue_and_canonical_expiry_have_distinct_custody_guards() -> None:
-    assert quarantine_transition(QuarantineDisposition.UNCLASSIFIED, ResidualExpiry()).action is QuarantineAction.RETIRE
+    assert quarantine_transition(QuarantineDisposition.UNCLASSIFIED, ResidualExpiry()).action is QuarantineAction.REFUSE
     assert (
         quarantine_transition(QuarantineDisposition.PUBLISHED_PREFIX, ResidualExpiry(terminal=False)).action
         is QuarantineAction.REFUSE
@@ -289,6 +294,12 @@ def test_quarantine_residue_and_canonical_expiry_have_distinct_custody_guards() 
     assert (
         quarantine_transition(QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(0)).next_disposition
         is QuarantineDisposition.UNPROCESSABLE
+    )
+    assert (
+        quarantine_transition(
+            QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(0, has_canonical_records=True)
+        ).action
+        is QuarantineAction.KEEP
     )
     assert (
         quarantine_transition(QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(-1)).action

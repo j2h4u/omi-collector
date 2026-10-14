@@ -240,7 +240,7 @@ class OpportunisticRuntime(CaptureRuntimePort):
         if isinstance(error, QuarantineCustodyHoldError):
             return "deferred"
         if isinstance(error, QuarantinePublishError):
-            return "unprocessable"
+            return "deferred"
         if isinstance(error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError)):
             return "deferred"
         if isinstance(error, OSError):

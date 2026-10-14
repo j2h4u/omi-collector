@@ -16,6 +16,7 @@ import pytest
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
+from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 from omi_collector.capture.application.ports import StagingPort
 from omi_collector.capture.application.presence import PresencePolicy, PresenceWake
 from omi_collector.capture.application.quarantine_maintenance import (
@@ -175,6 +176,43 @@ def test_pending_startup_result_including_no_pending_is_memoized(tmp_path: Path,
     assert first.pending is None
     assert first.durable_next is None
     assert calls == 1
+
+
+def test_background_publication_fatal_stops_retry_and_reaches_presence_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        store = _publication_store(tmp_path)
+        calls = 0
+
+        def fatal_publication() -> ReadyOutcome:
+            nonlocal calls
+            calls += 1
+            raise FatalInternalAudioStorageError("READY latch failed")
+
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", fatal_publication)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                return None
+
+        try:
+            maintenance.schedule_publication_retry()
+            await asyncio.wait_for(maintenance._publication_fatal_event.wait(), timeout=2)
+            with pytest.raises(FatalInternalAudioStorageError, match="READY latch failed"):
+                maintenance.schedule_publication_retry()
+            with pytest.raises(FatalInternalAudioStorageError, match="READY latch failed"):
+                await asyncio.wait_for(maintenance.wait_for_presence_attempt(Presence(), lambda _: None), timeout=2)
+            assert calls == 1
+        finally:
+            await maintenance.close()
+
+    _run(scenario())
 
 
 def test_multiple_pending_partials_are_quarantined_without_losing_raw_records(tmp_path: Path) -> None:
@@ -429,7 +467,7 @@ def test_run_once_admits_two_real_sources_into_sql_and_runs_normal_recovery(
     _run(scenario())
 
 
-def test_run_once_continues_after_unprocessable_source_and_preserves_its_evidence(
+def test_integrity_hold_preserves_source_and_next_maintenance_pass_admits_other_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
@@ -450,6 +488,9 @@ def test_run_once_continues_after_unprocessable_source_and_preserves_its_evidenc
         maintenance = QuarantineMaintenance(store, None, runtime)
         try:
             await maintenance.run_once(lambda: False)
+            assert calls == [first]
+            maintenance._maintenance_not_before = 0
+            await maintenance.run_once(lambda: False)
         finally:
             await maintenance.close()
 
@@ -457,7 +498,10 @@ def test_run_once_continues_after_unprocessable_source_and_preserves_its_evidenc
         first_after = _source_snapshot(store, first)
         assert first_before is not None and first_after is not None
         assert first_after["records"] == first_before["records"]
-        assert _terminal_state(store, first) == "unprocessable"
+        assert cast(tuple[object, ...], first_after["source"])[1:4] == (
+            "blocked", "source_authentication_mismatch", "unclassified"
+        )
+        assert _terminal_state(store, first) is None
         assert _terminal_state(store, second) == "published"
         second_after = _source_snapshot(store, second)
         assert second_before is not None and second_after is not None

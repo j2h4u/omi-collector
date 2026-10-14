@@ -354,8 +354,8 @@ def test_sql_ready_durability_failure_latches_stage_and_preserves_custody(
             "FROM capture_source WHERE source_id=?",
             (source._source_id, source._source_id),
         ).fetchone()
-    assert stage == ("staging", "durability_io_error")
-    assert source_rows == ("sealed_waiting", 1, 1)
+    assert tuple(stage) == ("staging", "durability_io_error")
+    assert source_rows is not None and tuple(source_rows) == ("sealed_waiting", 1, 1)
     assert database.list(StateKind.READY_PUBLICATION) == ()
 
     with pytest.raises(ReadyBundleError, match="durability I/O failure"):
@@ -399,6 +399,33 @@ def test_sql_ready_durability_latch_failure_propagates_shared_fatal_error(
     with pytest.raises(FatalInternalAudioStorageError):
         _publish(store, (source,), ready)
     assert commits == 3
+    store.close()
+
+
+def test_sql_ready_rename_eio_latches_before_custody_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    store = InternalAudioStore(database)
+    source = _source(store, "a" * 32, 100, (_record(100, 1),))
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    original_rename = Path.rename
+
+    def fail_stage_rename(path: Path, target: Path) -> Path:
+        if path.name.endswith(".stage"):
+            raise OSError(5, "simulated rename EIO")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_stage_rename)
+    with pytest.raises(ReadyBundleError, match="durability I/O failure"):
+        _publish(store, (source,), ready)
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert connection.execute("SELECT failure_reason FROM ready_output_stage").fetchone()[0] == "durability_io_error"
+        assert connection.execute(
+            "SELECT count(*) FROM capture_record WHERE source_id=?", (source._source_id,)
+        ).fetchone()[0] == 1
+    with pytest.raises(ReadyBundleError, match="durability I/O failure"):
+        _publish(store, (source,), ready)
     store.close()
 
 
@@ -448,9 +475,12 @@ def test_sql_restart_reuses_materialized_output_before_rejecting_second_copy_for
     assert statvfs_calls == 2
     assert first_destination[0].joinpath("records.bin").read_bytes() == first_raw
     with closing(database.open_connection(read_only=True)) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM capture_record WHERE source_id=?", (second._source_id,)
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM capture_record WHERE source_id=?", (second._source_id,)
+            ).fetchone()[0]
+            == 1
+        )
     store.close()
 
 
@@ -1098,7 +1128,7 @@ def test_staging_restart_resumes_persisted_group_instead_of_replanning_ready_ove
             tuple[int, int],
             connection.execute("SELECT start_ordinal,record_count FROM ready_stage_range").fetchone(),
         )
-    assert frozen == (0, 1)
+    assert tuple(frozen) == (0, 1)
     store.close()
 
     monkeypatch.setattr(ready_bundles, "_write_typed_stage", original)

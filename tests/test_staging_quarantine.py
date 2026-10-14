@@ -13,7 +13,7 @@ import pytest
 from omi_collector.capture.adapters.attempts import RecordAcceptanceError
 from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateKind
-from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore, InternalAudioStoreError
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine import QuarantineCustodyHoldError, QuarantinePublishError
 from omi_collector.capture.adapters.ready_bundles import (
@@ -21,6 +21,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     SqlitePublicationSource,
     finalize_typed_sources,
 )
+from omi_collector.capture.adapters.staging_contract import StagingError
 from omi_collector.capture.domain.quarantine_machine import QuarantineState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, StagingRetentionConfig, WriterConfig
@@ -197,10 +198,10 @@ def test_ready_custody_conflict_cannot_be_salvaged_or_terminally_deleted(
         generation = store.state_db.get_generation()
 
         assert source_id not in store.quarantined_attempts()
-        with pytest.raises(QuarantineCustodyHoldError, match="READY custody conflict") as admission_error:
+        with pytest.raises(QuarantineCustodyHoldError, match="unresolved custody") as admission_error:
             store.admit_quarantined_prefix(source_id)
         assert OpportunisticRuntime().classify_quarantine_error(admission_error.value) == "deferred"
-        with pytest.raises(QuarantineCustodyHoldError, match="READY custody conflict"):
+        with pytest.raises(QuarantineCustodyHoldError, match="unresolved custody"):
             store.mark_quarantine_unprocessable(source_id, "could not authenticate")
         now += 2_000_000_000
         assert store.sweep_terminal_quarantine().progressed is False
@@ -389,13 +390,13 @@ def test_replay_conflict_requires_quarantine_admission_before_publication(
     assert not tuple(ready.iterdir())
     before = _source_row(store, source_id)
     assert before is not None and before[3] == "unclassified"
-    assert isinstance(before[6], str)
-    now = int(before[6])
+    assert before[6] is None
+    now += 1_000_000_000
     assert store.sweep_terminal_quarantine().removed_source_ids == ()
     retained = _source_row(store, source_id)
     assert retained is not None and retained[3] == "unclassified"
     with closing(store.state_db.open_connection(read_only=True)) as connection:
-        assert connection.execute("SELECT 1 FROM capture_conflict WHERE source_id = ?", (source_id,)).fetchone() is None
+        assert connection.execute("SELECT 1 FROM capture_conflict WHERE source_id = ?", (source_id,)).fetchone() is not None
 
     admission = store.admit_quarantined_prefix(source_id)
     assert (admission.record_count, admission.raw_sha256) == (1, sha256(raw).hexdigest())
@@ -413,7 +414,7 @@ def test_replay_conflict_requires_quarantine_admission_before_publication(
 
     admitted = _source_row(store, source_id)
     assert admitted is not None and isinstance(admitted[6], str)
-    assert admitted[6] == before[6]
+    assert admitted[6] == str(now + 1_000_000_000)
     assert admitted[3] == "published_prefix"
 
 
@@ -460,7 +461,9 @@ def test_standalone_evidence_owns_its_terminal_retention(tmp_path: Path, monkeyp
         )
 
 
-def test_corrupt_source_digest_cannot_be_salvaged_or_discarded(tmp_path: Path) -> None:
+def test_corrupt_source_digest_becomes_indefinite_custody_hold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
     store = _store(tmp_path)
     attempt = _attempt(store, count=1)
     raw = _record(1)
@@ -473,16 +476,17 @@ def test_corrupt_source_digest_cannot_be_salvaged_or_discarded(tmp_path: Path) -
             )
             connection.commit()
 
-        with pytest.raises(QuarantinePublishError):
+        with pytest.raises(QuarantineCustodyHoldError):
             store.admit_quarantined_prefix(source_id)
 
         source = attempt_source(store, source_id)
         assert source is not None and source.committed_count == 1
         with closing(store.state_db.open_connection(read_only=True)) as connection:
             certified = cast(
-                tuple[object, object, object] | None,
+                tuple[object, ...] | None,
                 connection.execute(
-                    "SELECT certified_prefix_count, coverage_digest, committed_sha256 "
+                    "SELECT source_type, lifecycle, block_reason, quarantine_disposition, "
+                    "certified_prefix_count, coverage_digest, committed_sha256, terminal_time, retention_deadline "
                     "FROM capture_source WHERE source_id = ?",
                     (source_id,),
                 ).fetchone(),
@@ -493,10 +497,129 @@ def test_corrupt_source_digest_cannot_be_salvaged_or_discarded(tmp_path: Path) -
                     "SELECT payload FROM capture_record WHERE source_id = ? AND ordinal = 0", (source_id,)
                 ).fetchone(),
             )
-        assert certified is not None and tuple(certified) == (1, sha256(raw).hexdigest(), "0" * 64)
+        assert certified is not None and tuple(certified) == (
+            "quarantine",
+            "blocked",
+            "source_authentication_mismatch",
+            "unclassified",
+            None,
+            None,
+            "0" * 64,
+            None,
+            None,
+        )
         assert record is not None and record[0] == raw[4:]
+        assert source_id not in store.quarantined_attempts()
+        with pytest.raises(QuarantineCustodyHoldError):
+            store.mark_quarantine_unprocessable(source_id, "bad source")
+        monkeypatch.setattr(
+            "omi_collector.capture.adapters.quarantine.authenticate_capture_source",
+            lambda *_args, **_kwargs: pytest.fail("held source was rehashed"),
+        )
+        with pytest.raises(QuarantineCustodyHoldError):
+            store.admit_quarantined_prefix(source_id)
+        now += 73 * 3600 * 1_000_000_000
+        assert not store.sweep_terminal_quarantine().progressed
+        assert _source_row(store, source_id) is not None
     finally:
         attempt.close()
+
+
+def test_authentication_read_failure_defers_without_terminal_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    try:
+        attempt.accept_chunk(100, _record(1))
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        before = _source_row(store, source_id)
+        generation = store.state_db.get_generation()
+
+        def fail_read(*_args: object, **_kwargs: object) -> None:
+            raise InternalAudioStoreError("transient canonical read failure")
+
+        monkeypatch.setattr("omi_collector.capture.adapters.quarantine.authenticate_capture_source", fail_read)
+        with pytest.raises(StagingError, match="authentication is unavailable") as error:
+            store.admit_quarantined_prefix(source_id)
+        assert OpportunisticRuntime().classify_quarantine_error(error.value) == "deferred"
+        assert _source_row(store, source_id) == before
+        assert store.state_db.get_generation() == generation
+    finally:
+        attempt.close()
+
+
+def test_zero_checkpoint_with_real_record_enters_hold_at_quarantine_open(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    try:
+        attempt.accept_chunk(100, _record(1))
+        source_id = attempt.attempt_id
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET committed_count=0, committed_sha256=? WHERE source_id=?",
+                (sha256(b"").hexdigest(), source_id),
+            )
+            connection.commit()
+        store.quarantine_attempt_source(source_id)
+        row = _source_row(store, source_id)
+        assert row is not None and row[:4] == (
+            "quarantine",
+            "blocked",
+            "source_authentication_mismatch",
+            "unclassified",
+        )
+        assert row[6] is None
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM capture_record WHERE source_id=?", (source_id,)).fetchone()[0]
+                == 1
+            )
+    finally:
+        attempt.close()
+
+
+def test_unclassified_evidence_cannot_expire_or_starve_later_terminal_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    unresolved = _attempt(store, start=100, count=2)
+    terminal = _attempt(store, start=200, count=1)
+    try:
+        unresolved.accept_chunk(100, _record(1), b"uncertain tail")
+        unresolved_id = store.quarantine_attempt_source(unresolved.attempt_id)
+        terminal.accept_chunk(200, _record(2))
+        terminal_id = store.quarantine_attempt_source(terminal.attempt_id)
+        store.mark_quarantine_unprocessable(terminal_id, "explicit terminal disposition")
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET terminal_time='1', retention_deadline='1' WHERE source_id=?",
+                (unresolved_id,),
+            )
+            connection.commit()
+        before = _source_row(store, unresolved_id)
+        now += 1_000_000_000
+        assert store.sweep_terminal_quarantine().removed_source_ids == (terminal_id,)
+        assert _source_row(store, unresolved_id) == before
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM capture_record WHERE source_id=?", (unresolved_id,)
+                ).fetchone()[0]
+                == 1
+            )
+            assert (
+                connection.execute("SELECT bytes FROM capture_tail WHERE source_id=?", (unresolved_id,)).fetchone()[0]
+                == b"uncertain tail"
+            )
+    finally:
+        unresolved.close()
+        terminal.close()
 
 
 def test_terminal_quarantine_obeys_retention_deadline_and_keeps_unterminalized_source(

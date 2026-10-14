@@ -230,14 +230,14 @@ def test_durable_loss_remains_visible_without_degrading_clear_status(
     assert quality["confirmed_lost_raw_bytes"] == 10 * RECORD_SIZE
 
 
-def test_status_counts_persistent_ready_conflict_holds_without_changing_health(
+def test_status_counts_persistent_custody_holds_without_changing_health(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
     db = _state_db(layout)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
     now = datetime(2026, 9, 8, 10, tzinfo=UTC)
-    assert collect_operator_status(layout, hours=24, now=now)["ready_conflict_holds"] == 0
+    assert collect_operator_status(layout, hours=24, now=now)["custody_holds"] == 0
 
     with InternalAudioStore(db) as store:
         store.create_source("a" * 32, "attempt", 100, 101)
@@ -250,12 +250,12 @@ def test_status_counts_persistent_ready_conflict_holds_without_changing_health(
         )
         connection.execute(
             "UPDATE capture_source SET source_type='quarantine', lifecycle='blocked', "
-            "block_reason='other' WHERE source_id=?",
+            "block_reason='source_authentication_mismatch' WHERE source_id=?",
             ("b" * 32,),
         )
 
     result = collect_operator_status(layout, hours=24, now=now)
-    assert result["ready_conflict_holds"] == 1
+    assert result["custody_holds"] == 2
     assert result["status"] == "unknown"
 
 

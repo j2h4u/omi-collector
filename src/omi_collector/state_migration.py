@@ -121,7 +121,7 @@ def _check_canonical_access(path: Path, *, read_only: bool) -> None:
     except FileNotFoundError:
         pass
     except OSError as error:
-        if error.errno == errno.ELOOP:
+        if error.errno in {errno.ELOOP, errno.EISDIR}:
             raise InternalAudioCutoverRequiredError(
                 "Collector SQLite journal is unsafe; stopped-service repair required"
             ) from error

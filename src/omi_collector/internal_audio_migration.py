@@ -137,6 +137,124 @@ def migrate_internal_audio(layout: StorageLayout, *, release_metadata: Path) -> 
             raise InternalAudioMigrationError(f"unsupported Collector SQLite schema version: {version}")
 
 
+def inspect_internal_audio_migration(layout: StorageLayout, *, release_metadata: Path) -> dict[str, object]:
+    """Check migration compatibility without opening writable state or changing files."""
+
+    try:
+        _release_revision(release_metadata)
+        path = layout.collector.state_db
+        _assert_real_canonical(path)
+        if not path.exists():
+            _validate_missing_database(layout)
+            schema_version = None
+        else:
+            with closing(_connect_read_only(path)) as canonical:
+                schema_version = _schema_version(canonical)
+                if schema_version == 1:
+                    _validate_v1_preflight(layout, canonical)
+                elif schema_version == _TYPED_SCHEMA:
+                    _validate_v2_preflight(layout, canonical)
+                else:
+                    return {
+                        "detail": f"unsupported Collector SQLite schema version: {schema_version}",
+                        "reason": "unsupported_schema",
+                        "status": "migration_refused",
+                    }
+    except InternalAudioMigrationError as error:
+        return {"detail": str(error), "reason": "state_validation_failed", "status": "migration_refused"}
+    except (
+        OSError,
+        sqlite3.DatabaseError,
+        StateDBError,
+        StateMigrationError,
+        LegacyAudioImportError,
+        ValueError,
+    ) as error:
+        return {
+            "detail": str(error) or type(error).__name__,
+            "reason": "inspection_failed",
+            "status": "migration_refused",
+        }
+    return {"schema_version": schema_version, "status": "migration_compatible"}
+
+
+def _validate_missing_database(layout: StorageLayout) -> None:
+    inventory = _inventory(layout)
+    if inventory.entries or _old_control_present(layout) or _any_ready_entry(layout):
+        raise InternalAudioMigrationError("canonical DB is missing while Collector data exists")
+
+
+def _validate_v1_preflight(layout: StorageLayout, source: sqlite3.Connection) -> None:
+    inventory = _inventory(layout, source)
+    source_sha = _logical_digest(source)
+    _validate_v1_control(source)
+    receipt = _read_receipt(source)
+    _assert_candidate_namespace(layout, receipt)
+    if receipt is None:
+        return
+    _validate_v1_receipt(receipt, layout, inventory, source_sha)
+    candidate = layout.collector.root / cast(str, receipt["candidate"])
+    journal = candidate.parent / f"{candidate.name}-journal"
+    if candidate.exists() or candidate.is_symlink():
+        _check_owned_candidate(candidate, receipt)
+    if journal.exists() or journal.is_symlink():
+        _check_owned_candidate_journal(journal, receipt)
+
+
+def _validate_v2_preflight(layout: StorageLayout, canonical: sqlite3.Connection) -> None:
+    _require_typed_schema(layout.collector.state_db, "activated database")
+    receipt = _read_receipt(canonical)
+    if receipt is None:
+        _validate_interrupted_fresh(layout, canonical)
+        return
+    if receipt.get("phase") == "COMPLETE":
+        fresh = receipt == {"format": _FORMAT, "phase": "COMPLETE", "fresh": True}
+        if not fresh:
+            _validate_complete_receipt(receipt)
+        _assert_complete_v2_read_only(layout, canonical)
+        return
+    _validate_resumable_v2(layout, canonical, receipt)
+
+
+def _assert_complete_v2_read_only(layout: StorageLayout, canonical: sqlite3.Connection) -> None:
+    if _remaining_inventory(layout) or _legacy_mutable_rows(canonical):
+        raise InternalAudioMigrationError("private legacy audio remains after COMPLETE")
+    try:
+        _assert_private_audio_gone(layout, canonical)
+    except StateMigrationError as error:
+        raise InternalAudioMigrationError("private audio or unowned ready scratch remains after COMPLETE") from error
+
+
+def _validate_resumable_v2(
+    layout: StorageLayout, canonical: sqlite3.Connection, receipt: dict[str, object]
+) -> tuple[_FileIdentity, ...]:
+    _validate_receipt_shape(receipt, layout)
+    phase = receipt["phase"]
+    if phase not in {"PREPARED", "CLEANUP_PENDING"}:
+        raise InternalAudioMigrationError("v2 cutover receipt is incomplete")
+    expected = _receipt_entries(receipt)
+    present = _remaining_inventory(layout)
+    _assert_remaining_inventory(expected, present)
+    if phase == "PREPARED" and present != expected:
+        raise InternalAudioMigrationError("prepared cutover lost private audio before cleanup began")
+    if _legacy_mutable_rows(canonical):
+        raise InternalAudioMigrationError("v2 database retained legacy attempt/quarantine rows")
+    return expected
+
+
+def _validate_interrupted_fresh(layout: StorageLayout, canonical: sqlite3.Connection) -> None:
+    try:
+        StateDB(layout.collector.state_db, read_only=True)
+    except StateDBError as error:
+        raise InternalAudioMigrationError("typed database without receipt has unsupported schema") from error
+    if _old_control_present(layout) or _any_ready_entry(layout) or _remaining_inventory(layout):
+        raise InternalAudioMigrationError("typed database without receipt contains Collector data")
+    owner = layout.collector.state_db.lstat()
+    if owner.st_uid not in {os.geteuid(), layout.collector.root.lstat().st_uid}:
+        raise InternalAudioMigrationError("typed database without receipt has unknown owner")
+    _assert_empty_fresh_sql(canonical)
+
+
 def _create_empty(layout: StorageLayout) -> dict[str, int]:
     inventory = _inventory(layout)
     if inventory.entries or _old_control_present(layout) or _any_ready_entry(layout):
@@ -342,17 +460,7 @@ def _resume_v2(layout: StorageLayout, canonical: sqlite3.Connection) -> dict[str
         return _recover_interrupted_fresh(layout, canonical)
     if receipt.get("phase") == "COMPLETE":
         return _resume_complete(layout, canonical, receipt)
-    _validate_receipt_shape(receipt, layout)
-    phase = receipt["phase"]
-    if phase not in {"PREPARED", "CLEANUP_PENDING"}:
-        raise InternalAudioMigrationError("v2 cutover receipt is incomplete")
-    expected = _receipt_entries(receipt)
-    present = _remaining_inventory(layout)
-    _assert_remaining_inventory(expected, present)
-    if phase == "PREPARED" and present != expected:
-        raise InternalAudioMigrationError("prepared cutover lost private audio before cleanup began")
-    if _legacy_mutable_rows(canonical):
-        raise InternalAudioMigrationError("v2 database retained legacy attempt/quarantine rows")
+    expected = _validate_resumable_v2(layout, canonical, receipt)
     _put_receipt(canonical, {**receipt, "phase": "CLEANUP_PENDING"})
     removed = _cleanup_legacy(layout, expected)
     if _remaining_inventory(layout):
@@ -393,20 +501,11 @@ def _resume_complete(
 def _recover_interrupted_fresh(layout: StorageLayout, canonical: sqlite3.Connection) -> dict[str, int]:
     """Finish an empty v2 schema left before the first fresh receipt commit."""
 
-    try:
-        StateDB(layout.collector.state_db, read_only=True)
-    except StateDBError as error:
-        raise InternalAudioMigrationError("typed database without receipt has unsupported schema") from error
-    if _old_control_present(layout) or _any_ready_entry(layout) or _remaining_inventory(layout):
-        raise InternalAudioMigrationError("typed database without receipt contains Collector data")
-    owner = layout.collector.state_db.lstat()
-    if owner.st_uid not in {os.geteuid(), layout.collector.root.lstat().st_uid}:
-        raise InternalAudioMigrationError("typed database without receipt has unknown owner")
+    _validate_interrupted_fresh(layout, canonical)
     _handoff_canonical(layout.collector.state_db)
     _verify_handoff_access(layout.collector.state_db)
     canonical.execute("BEGIN IMMEDIATE")
     try:
-        _assert_empty_fresh_sql(canonical)
         canonical.execute(
             "INSERT INTO state(kind,id,payload) VALUES ('migration','current',?) "
             "ON CONFLICT(kind,id) DO UPDATE SET payload=excluded.payload",
@@ -864,6 +963,21 @@ def _connect(path: Path) -> sqlite3.Connection:
     if path.is_symlink() or not path.is_file():
         raise InternalAudioMigrationError(f"SQLite database path is unsafe: {path}")
     uri = f"file:{quote(path.as_posix(), safe='/')}?mode=rw"
+    connection = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        _integrity_check(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _connect_read_only(path: Path) -> sqlite3.Connection:
+    if path.is_symlink() or not path.is_file():
+        raise InternalAudioMigrationError(f"SQLite database path is unsafe: {path}")
+    uri = f"file:{quote(path.as_posix(), safe='/')}?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
     try:
         connection.execute("PRAGMA busy_timeout = 5000")

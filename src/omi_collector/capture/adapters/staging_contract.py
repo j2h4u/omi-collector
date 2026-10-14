@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from json import JSONDecodeError, loads
 from pathlib import Path
@@ -30,6 +31,20 @@ _MAX_READ_PACKET_COUNT = (1 << 32) - 1
 
 class StagingError(RuntimeError):
     """Base error for local staging failures."""
+
+
+class FatalInternalAudioStorageError(RuntimeError):
+    """Storage integrity is uncertain and automatic capture must stop."""
+
+    def __init__(self, message: str, *, sqlite_errorcode: int | None = None) -> None:
+        super().__init__(message)
+        self.sqlite_errorcode = sqlite_errorcode
+
+
+def _raise_if_corrupt_sqlite_error(error: BaseException) -> None:
+    code = getattr(error, "sqlite_errorcode", None)
+    if type(code) is int and code & 0xFF in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
+        raise FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=code) from error
 
 
 class DiskSpaceError(StagingError):

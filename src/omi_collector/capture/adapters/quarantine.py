@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from ..domain.internal_audio_machine import (
+    QUARANTINE_CUSTODY_HOLD_REASONS,
     AudioAction,
     AudioPhase,
     AuthenticatedConflict,
@@ -20,6 +21,7 @@ from ..domain.internal_audio_machine import (
     QuarantineDisposition,
     QuarantineOpened,
     ResidualExpiry,
+    SourceIntegrityHold,
     TerminalPrefix,
     quarantine_transition,
 )
@@ -33,6 +35,7 @@ from .collector_state_db import StateDBError, StateTransaction
 from .internal_audio_store import (
     DEFAULT_CHUNK_LIMIT,
     MAX_CHUNK_LIMIT,
+    CaptureSourceIntegrityError,
     InternalAudioStoreError,
     authenticate_capture_source,
 )
@@ -41,6 +44,7 @@ from .staging_contract import (
     AttemptStateError,
     PendingAttemptError,
     StagingError,
+    _raise_if_corrupt_sqlite_error,
     _validate_attempt_id,
 )
 from .staging_filesystem import (
@@ -55,7 +59,10 @@ class QuarantinePublishError(ValueError):
 
 
 class QuarantineCustodyHoldError(QuarantinePublishError):
-    """READY byte conflict keeps its canonical SQL audio pending custody review."""
+    """Unresolved audio custody keeps canonical SQL bytes pending review."""
+
+
+_CUSTODY_HOLD_SQL = "(" + ",".join(f"'{reason}'" for reason in sorted(QUARANTINE_CUSTODY_HOLD_REASONS)) + ")"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +92,7 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
             rows = connection.execute(
                 "SELECT source_id FROM capture_source "
                 "WHERE source_type = 'quarantine' AND COALESCE(quarantine_opaque, 0) = 0 "
-                "AND block_reason IS NOT 'ready_overlap_conflict' "
+                "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " "
                 "ORDER BY source_id"
             ).fetchall()
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
@@ -148,38 +155,43 @@ def _typed_quarantine_row(
     if decision.action is not AudioAction.BLOCK or decision.next_phase is not AudioPhase.BLOCKED:
         raise AttemptStateError(decision.reason)
     row = cast(
-        tuple[object] | None,
+        tuple[object, object] | None,
         connection.execute(
-            "SELECT committed_count FROM capture_source "
+            "SELECT committed_count, EXISTS (SELECT 1 FROM capture_record WHERE source_id = ?) "
+            "FROM capture_source "
             "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
-            (source_id, lifecycle),
+            (source_id, source_id, lifecycle),
         ).fetchone(),
     )
     if row is None:
         raise AttemptStateError("typed attempt changed before quarantine classification")
     if type(row[0]) is not int:
         raise AttemptStateError("typed attempt committed count is invalid")
-    classification = quarantine_transition(QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(cast(int, row[0])))
+    has_records = bool(row[1])
+    classification = quarantine_transition(
+        QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(cast(int, row[0]), has_records)
+    )
     if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
         raise AttemptStateError(classification.reason)
     assert classification.next_disposition is not None
-    now = _wall_clock_ns()
-    deadline = now + _seconds_to_nanoseconds(retention_seconds)
+    terminal = classification.action is QuarantineAction.MARK_UNPROCESSABLE
+    now = _wall_clock_ns() if terminal else None
+    deadline = None if now is None else now + _seconds_to_nanoseconds(retention_seconds)
+    block_reason = "source_authentication_mismatch" if row[0] == 0 and has_records else reason
     cursor = connection.execute(
         "UPDATE capture_source SET source_type = 'quarantine', lifecycle = ?, "
         "block_reason = ?, quarantine_disposition = ?, quarantine_opaque = 0, "
-        "terminal_reason = CASE WHEN committed_count = 0 "
-        "THEN 'quarantine contains no committed records' ELSE NULL END, "
+        "terminal_reason = ?, "
         "terminal_time = ?, retention_deadline = ?, "
-        "certified_prefix_count = CASE WHEN committed_count = 0 THEN NULL ELSE committed_count END, "
-        "coverage_digest = CASE WHEN committed_count = 0 THEN NULL ELSE committed_sha256 END "
+        "certified_prefix_count = NULL, coverage_digest = NULL "
         "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
         (
             decision.next_phase.value,
-            reason,
+            block_reason,
             classification.next_disposition.value,
-            str(now),
-            str(deadline),
+            "quarantine contains no canonical records" if terminal else None,
+            str(now) if now is not None else None,
+            str(deadline) if deadline is not None else None,
             source_id,
             lifecycle,
         ),
@@ -209,21 +221,20 @@ class _TypedAdmissionSnapshot:
     disposition: object
     terminal_time: object
     retention_deadline: object
+    certification_consistent: bool
 
 
 def _typed_admission_snapshot(row: tuple[object, ...]) -> _TypedAdmissionSnapshot:
-    if row[10] == "ready_overlap_conflict":
-        raise QuarantineCustodyHoldError("READY custody conflict cannot be admitted as a quarantine prefix")
+    if row[10] in QUARANTINE_CUSTODY_HOLD_REASONS:
+        raise QuarantineCustodyHoldError("unresolved custody cannot be admitted as a quarantine prefix")
     lifecycle = str(row[0])
     count, digest = row[2], row[3]
     if row[6] == 1:
         raise QuarantinePublishError("opaque typed quarantine evidence cannot be admitted")
     if lifecycle not in {"blocked", "covered", "retiring"}:
         raise QuarantinePublishError("typed quarantine source is not eligible for prefix admission")
-    if type(count) is not int or count <= 0 or not isinstance(digest, str):
+    if type(count) is not int or count < 0 or not isinstance(digest, str):
         raise QuarantinePublishError("typed quarantine source has no committed prefix")
-    if row[4] not in {None, count} or row[5] not in {None, digest}:
-        raise QuarantinePublishError("typed quarantine prefix certification is inconsistent")
     if row[7] not in {None, "unclassified", "published_prefix"}:
         raise QuarantinePublishError("typed quarantine source is already terminally unprocessable")
     return _TypedAdmissionSnapshot(
@@ -234,6 +245,7 @@ def _typed_admission_snapshot(row: tuple[object, ...]) -> _TypedAdmissionSnapsho
         row[7],
         row[8],
         row[9],
+        row[4] in {None, count} and row[5] in {None, digest},
     )
 
 
@@ -266,7 +278,7 @@ def _persist_typed_admission(
         "terminal_time = ?, retention_deadline = ? "
         "WHERE source_id = ? AND source_type = 'quarantine' AND lifecycle = ? "
         "AND quarantine_disposition IN ('unclassified') "
-        "AND block_reason IS NOT 'ready_overlap_conflict'",
+        "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL,
         (
             snapshot.record_count,
             snapshot.raw_sha256,
@@ -327,8 +339,11 @@ def _require_authenticated_admission(
 ) -> None:
     try:
         source = authenticate_capture_source(filesystem.state_db, source_id, page_limit=page_limit)
+    except CaptureSourceIntegrityError as error:
+        _hold_source_authentication_mismatch(filesystem, source_id, snapshot)
+        raise QuarantineCustodyHoldError("typed source record checkpoint requires custody review") from error
     except InternalAudioStoreError as error:
-        raise QuarantinePublishError("typed quarantine prefix authentication failed") from error
+        raise StagingError("typed quarantine prefix authentication is unavailable") from error
     if (
         source.source_type != "quarantine"
         or source.lifecycle != snapshot.lifecycle
@@ -336,7 +351,84 @@ def _require_authenticated_admission(
         or source.committed_count != snapshot.record_count
         or source.committed_sha256 != snapshot.raw_sha256
     ):
-        raise QuarantinePublishError("typed quarantine source changed during prefix authentication")
+        raise StagingError("typed quarantine source changed during prefix authentication")
+
+
+_SOURCE_AUTHENTICATION_HOLD = "source_authentication_mismatch"
+_SOURCE_HOLD_CHANGES: dict[str, object] = {
+    "source_type": "quarantine",
+    "lifecycle": "blocked",
+    "block_reason": _SOURCE_AUTHENTICATION_HOLD,
+    "quarantine_disposition": "unclassified",
+    "quarantine_opaque": 0,
+    "terminal_reason": None,
+    "terminal_time": None,
+    "retention_deadline": None,
+    "certified_prefix_count": None,
+    "coverage_digest": None,
+    "retirement_cursor": None,
+}
+
+
+def _source_row(connection: sqlite3.Connection, source_id: str) -> tuple[tuple[str, ...], tuple[object, ...]] | None:
+    cursor = connection.execute("SELECT * FROM capture_source WHERE source_id = ?", (source_id,))
+    row = cast(tuple[object, ...] | None, cursor.fetchone())
+    if row is None:
+        return None
+    return tuple(column[0] for column in cursor.description), row
+
+
+def _hold_source_authentication_mismatch(
+    filesystem: StagingFilesystem, source_id: str, inspected: _TypedAdmissionSnapshot
+) -> None:
+    before: tuple[object, ...] | None = None
+    proposed: tuple[object, ...] | None = None
+    try:
+        with _typed_transaction(filesystem) as connection:
+            current = _read_typed_admission_snapshot(connection, source_id)
+            if current != inspected:
+                raise StagingError("typed quarantine source changed before integrity hold")
+            full_row = _source_row(connection, source_id)
+            if full_row is None:
+                raise StagingError("typed quarantine source vanished before integrity hold")
+            columns, before = full_row
+            phase = AudioPhase(str(before[columns.index("lifecycle")]))
+            decision = audio_transition(phase, SourceIntegrityHold())
+            if decision.action is not AudioAction.BLOCK or decision.next_phase is not AudioPhase.BLOCKED:
+                raise StagingError(decision.reason)
+            proposed = tuple(
+                _SOURCE_HOLD_CHANGES.get(column, value) for column, value in zip(columns, before, strict=True)
+            )
+            assignments = ", ".join(f"{column} = ?" for column in _SOURCE_HOLD_CHANGES)
+            predicates = " AND ".join(f"{column} IS ?" for column in columns)
+            changed = connection.execute(
+                f"UPDATE capture_source SET {assignments} WHERE {predicates}",
+                (*_SOURCE_HOLD_CHANGES.values(), *before),
+            )
+            if changed.rowcount != 1:
+                raise StagingError("typed quarantine source changed during integrity hold")
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        _reconcile_source_authentication_hold(filesystem, source_id, before, proposed, error)
+
+
+def _reconcile_source_authentication_hold(
+    filesystem: StagingFilesystem,
+    source_id: str,
+    before: tuple[object, ...] | None,
+    proposed: tuple[object, ...] | None,
+    error: BaseException,
+) -> None:
+    try:
+        with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
+            durable_row = _source_row(connection, source_id)
+    except (OSError, sqlite3.DatabaseError, StateDBError) as inspect_error:
+        raise StagingError("typed quarantine integrity hold outcome is unreadable") from inspect_error
+    durable = None if durable_row is None else durable_row[1]
+    if proposed is not None and durable == proposed:
+        return
+    if before is not None and durable == before:
+        raise StagingError("typed quarantine integrity hold rolled back") from error
+    raise StagingError("typed quarantine integrity hold has an ambiguous third state") from error
 
 
 def admit_quarantined_prefix(
@@ -353,11 +445,16 @@ def admit_quarantined_prefix(
     try:
         with closing(filesystem.state_db.open_connection(read_only=True)) as connection:
             inspected = _read_typed_admission_snapshot(connection, source_id)
+        if not inspected.certification_consistent:
+            _hold_source_authentication_mismatch(filesystem, source_id, inspected)
+            raise QuarantineCustodyHoldError("typed quarantine prefix certification requires custody review")
         if inspected.disposition == "published_prefix":
             if inspected.terminal_time is None or inspected.retention_deadline is None:
                 raise QuarantinePublishError("typed quarantine retention evidence is incomplete")
             return _quarantine_admission(source_id, inspected)
         _require_authenticated_admission(source_id, inspected, filesystem, page_limit)
+        if inspected.record_count == 0:
+            raise QuarantinePublishError("typed quarantine source has no canonical prefix")
         if should_defer():
             raise QuarantineSalvageDeferredError("quarantine admission deferred")
         now_ns = _wall_clock_ns()
@@ -372,6 +469,7 @@ def admit_quarantined_prefix(
     except AttemptStateError, QuarantinePublishError, QuarantineSalvageDeferredError:
         raise
     except (OSError, sqlite3.DatabaseError, StateDBError, TypeError, ValueError) as error:
+        _raise_if_corrupt_sqlite_error(error)
         raise StagingError("typed quarantine prefix admission failed") from error
 
 
@@ -505,8 +603,8 @@ def _typed_mark_unprocessable(filesystem: StagingFilesystem, source_id: str, rea
             )
             if current is None:
                 raise AttemptStateError("typed quarantine source does not exist")
-            if current[4] == "ready_overlap_conflict":
-                raise QuarantineCustodyHoldError("READY custody conflict cannot be terminally classified")
+            if current[4] in QUARANTINE_CUSTODY_HOLD_REASONS:
+                raise QuarantineCustodyHoldError("unresolved custody cannot be terminally classified")
             if current[1] == "unprocessable":
                 return
             if current[1] not in {None, "unclassified"} or current[0] not in {"blocked", "covered", "retiring"}:
@@ -523,7 +621,7 @@ def _typed_mark_unprocessable(filesystem: StagingFilesystem, source_id: str, rea
                 "certified_prefix_count = NULL, coverage_digest = NULL "
                 "WHERE source_id = ? AND source_type = 'quarantine' AND lifecycle = ? "
                 "AND quarantine_disposition IN ('unclassified') "
-                "AND block_reason IS NOT 'ready_overlap_conflict'",
+                "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL,
                 ("unprocessable", reason, now, deadline, source_id, current[0]),
             )
             if changed.rowcount != 1:
@@ -584,7 +682,8 @@ def _classify_one_typed_opaque(filesystem: StagingFilesystem, connection: sqlite
         tuple[object] | None,
         connection.execute(
             "SELECT source_id FROM capture_source WHERE source_type = 'quarantine' "
-            "AND quarantine_opaque = 1 AND quarantine_disposition = 'unclassified' ORDER BY source_id LIMIT 1"
+            "AND quarantine_opaque = 1 AND quarantine_disposition = 'unclassified' "
+            "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " ORDER BY source_id LIMIT 1"
         ).fetchone(),
     )
     if row is not None:
@@ -594,8 +693,8 @@ def _classify_one_typed_opaque(filesystem: StagingFilesystem, connection: sqlite
 def _expired_typed_source_sql() -> str:
     return (
         "source_type = 'quarantine' AND lifecycle IN ('blocked','covered','retiring') "
-        "AND quarantine_disposition IN ('unclassified','unprocessable','published_prefix') "
-        "AND block_reason IS NOT 'ready_overlap_conflict' "
+        "AND quarantine_disposition IN ('unprocessable','published_prefix') "
+        "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " "
         "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
         "AND CAST(retention_deadline AS INTEGER) <= ?"
     )
@@ -628,9 +727,9 @@ def _sweep_one_typed_source(
     connection: sqlite3.Connection, source_id: str, now: int, chunk_limit: int
 ) -> tuple[bool, int]:
     row = cast(
-        tuple[object, object, object, object] | None,
+        tuple[object, object, object, object, object] | None,
         connection.execute(
-            "SELECT retention_deadline, lifecycle, quarantine_disposition, quarantine_opaque "
+            "SELECT retention_deadline, lifecycle, quarantine_disposition, quarantine_opaque, block_reason "
             "FROM capture_source WHERE source_id = ?",
             (source_id,),
         ).fetchone(),
@@ -743,17 +842,19 @@ def _classify_typed_opaque(
         "terminal_reason = 'opaque typed quarantine evidence', terminal_time = ?, "
         "retention_deadline = ?, certified_prefix_count = NULL, coverage_digest = NULL "
         "WHERE source_id = ? AND source_type = 'quarantine' "
-        "AND quarantine_disposition IN ('unclassified')",
+        "AND quarantine_disposition IN ('unclassified') "
+        "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL,
         (terminal_time, deadline, source_id),
     )
     return True
 
 
-def _typed_retention_expired(row: tuple[object, object, object, object], now: int) -> bool:
+def _typed_retention_expired(row: tuple[object, object, object, object, object], now: int) -> bool:
     if (
         row[0] is None
         or row[1] not in {"blocked", "covered", "retiring"}
-        or row[2] not in {"unclassified", "published_prefix", "unprocessable"}
+        or row[2] not in {"published_prefix", "unprocessable"}
+        or row[4] in QUARANTINE_CUSTODY_HOLD_REASONS
     ):
         return False
     try:

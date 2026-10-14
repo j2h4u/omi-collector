@@ -10,10 +10,12 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters import internal_audio_store
+from omi_collector.capture.adapters import collector_state_db, internal_audio_store
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind, install_audio_schema
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
+    CaptureSourceIntegrityError,
+    CaptureSourceReadError,
     CaptureTail,
     DrainCheckpoint,
     InternalAudioStore,
@@ -24,6 +26,7 @@ from omi_collector.capture.adapters.internal_audio_store import (
     encode_uint64,
     validate_source_stream,
 )
+from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 
 
 def test_capture_space_reserve_uses_total_growth_and_one_bounded_journal(
@@ -218,6 +221,50 @@ def test_drain_replay_is_idempotent_and_mismatch_is_refused(tmp_path: Path) -> N
     conflict.close()
 
 
+def test_replay_conflict_with_uncheckpointed_canonical_row_is_an_indefinite_integrity_hold(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    raw = _record(10, 4)
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        with closing(db.open_connection()) as connection:
+            connection.execute(
+                "INSERT INTO capture_record(source_id, ordinal, device_timestamp, payload) VALUES (?, 0, ?, ?)",
+                (source_id, 10, raw[4:]),
+            )
+            connection.commit()
+        source = store.get_source(source_id)
+        assert source is not None and source.committed_count == 0
+
+        store._block_replay_conflict(source, 0, b"rejected")
+
+    with closing(db.open_connection(read_only=True)) as connection:
+        held = cast(
+            tuple[object, ...],
+            connection.execute(
+                "SELECT lifecycle, block_reason, quarantine_disposition, terminal_reason, terminal_time, "
+                "retention_deadline, certified_prefix_count, coverage_digest FROM capture_source WHERE source_id = ?",
+                (source_id,),
+            ).fetchone(),
+        )
+        assert tuple(held) == (
+            "blocked",
+            "source_authentication_mismatch",
+            "unclassified",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM capture_record WHERE source_id = ?", (source_id,)).fetchone()
+            is not None
+        )
+        assert tuple(
+            connection.execute("SELECT COUNT(*) FROM capture_record WHERE source_id = ?", (source_id,)).fetchone()
+        ) == (1,)
+
+
 def test_drain_accepts_overlapping_prefix_and_appends_suffix(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     first, second, third = _record(1, 1), _record(2, 2), _record(3, 3)
@@ -351,13 +398,17 @@ def test_multi_page_authentication_reuses_one_read_connection(tmp_path: Path, mo
 
 
 @pytest.mark.parametrize(
-    ("mutation", "message"),
+    ("mutation", "message", "ignore_constraints"),
     [
-        ("DELETE FROM capture_record WHERE ordinal = 299", "count"),
-        ("UPDATE capture_record SET payload = zeroblob(440) WHERE ordinal = 299", "digest"),
+        ("DELETE FROM capture_record WHERE ordinal = 299", "count", False),
+        ("UPDATE capture_record SET payload = zeroblob(440) WHERE ordinal = 299", "digest", False),
+        ("UPDATE capture_record SET ordinal = 301 WHERE ordinal = 299", "ordinals", False),
+        ("UPDATE capture_record SET payload = zeroblob(439) WHERE ordinal = 299", "layout", True),
     ],
 )
-def test_authentication_rejects_canonical_row_tampering(tmp_path: Path, mutation: str, message: str) -> None:
+def test_authentication_rejects_canonical_row_tampering(
+    tmp_path: Path, mutation: str, message: str, *, ignore_constraints: bool
+) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     records = [_record(index, index % 251) for index in range(300)]
     with InternalAudioStore(db, chunk_limit=128) as store:
@@ -365,11 +416,93 @@ def test_authentication_rejects_canonical_row_tampering(tmp_path: Path, mutation
         for start in range(0, len(records), 128):
             store.commit_drain(source_id, start, records[start : start + 128], DrainCheckpoint(1))
     with closing(db.open_connection()) as connection:
+        if ignore_constraints:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.execute(mutation)
         connection.commit()
 
-    with pytest.raises(InternalAudioStoreError, match=message):
+    with pytest.raises(CaptureSourceIntegrityError, match=message):
         authenticate_capture_source(db, source_id, page_limit=128)
+
+
+def test_authentication_classifies_metadata_only_digest_mismatch_as_integrity(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    raw = _record(63, 63)
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1))
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "UPDATE capture_source SET committed_sha256 = ? WHERE source_id = ?",
+            ("f" * 64, source_id),
+        )
+        connection.commit()
+
+    with pytest.raises(CaptureSourceIntegrityError, match="digest"):
+        authenticate_capture_source(db, source_id)
+
+
+@pytest.mark.parametrize("sqlite_errorcode", [None, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
+def test_authentication_preserves_structured_sqlite_read_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sqlite_errorcode: int | None
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    failure = sqlite3.OperationalError("read failure")
+    failure.sqlite_errorcode = sqlite_errorcode
+
+    def fail_read(_connection: sqlite3.Connection, _source_id: str) -> internal_audio_store.CaptureSource | None:
+        raise failure
+
+    monkeypatch.setattr(internal_audio_store, "_read_capture_source", fail_read)
+
+    expected = (
+        FatalInternalAudioStorageError
+        if sqlite_errorcode in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}
+        else CaptureSourceReadError
+    )
+    with pytest.raises(expected) as raised:
+        authenticate_capture_source(db, "a" * 32)
+    assert raised.value.sqlite_errorcode == sqlite_errorcode
+    assert raised.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("sqlite_errorcode", [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
+def test_authentication_preserves_sqlite_code_from_open_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sqlite_errorcode: int
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    failure = sqlite3.OperationalError("simulated SQLite open failure")
+    failure.sqlite_errorcode = sqlite_errorcode
+
+    def fail_open(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(collector_state_db.sqlite3, "connect", fail_open)
+    expected = (
+        FatalInternalAudioStorageError
+        if sqlite_errorcode in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}
+        else CaptureSourceReadError
+    )
+    with pytest.raises(expected) as raised:
+        authenticate_capture_source(db, "a" * 32)
+    assert raised.value.sqlite_errorcode == sqlite_errorcode
+    assert isinstance(raised.value.__cause__, StateDBError)
+    assert raised.value.__cause__.sqlite_errorcode == sqlite_errorcode
+
+
+def test_authentication_raw_oserror_is_not_a_structured_read_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+
+    def fail_read(_connection: sqlite3.Connection, _source_id: str) -> internal_audio_store.CaptureSource | None:
+        raise OSError("read failure")
+
+    monkeypatch.setattr(internal_audio_store, "_read_capture_source", fail_read)
+
+    with pytest.raises(InternalAudioStoreError) as raised:
+        authenticate_capture_source(db, "a" * 32)
+    assert type(raised.value) is InternalAudioStoreError
 
 
 def test_authentication_rejects_source_change_after_record_scan(
@@ -397,8 +530,9 @@ def test_authentication_rejects_source_change_after_record_scan(
 
     monkeypatch.setattr(internal_audio_store, "_read_capture_source", change_before_final_check)
 
-    with pytest.raises(InternalAudioStoreError, match="source changed"):
+    with pytest.raises(InternalAudioStoreError, match="source changed") as raised:
         authenticate_capture_source(db, source_id)
+    assert type(raised.value) is InternalAudioStoreError
 
 
 def test_ambiguous_reopen_failure_fail_stops_all_mutators(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

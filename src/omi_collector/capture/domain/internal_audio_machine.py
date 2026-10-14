@@ -95,6 +95,11 @@ class AuthenticatedConflict:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceIntegrityHold:
+    """Retain quarantine bytes whose canonical records contradict their checkpoint."""
+
+
+@dataclass(frozen=True, slots=True)
 class ReadyCustody:
     """Prove complete durable ready custody and source lineage."""
 
@@ -130,6 +135,7 @@ AudioEvent = (
     | TerminalPrefix
     | Interruption
     | AuthenticatedConflict
+    | SourceIntegrityHold
     | ReadyCustody
     | BeginRetirement
     | RetirementStep
@@ -271,6 +277,13 @@ def _conflict(phase: AudioPhase | None, event: object) -> AudioDecision:
     return _refuse(phase, "covered source cannot accept conflict evidence")
 
 
+def _source_integrity_hold(phase: AudioPhase | None, event: object) -> AudioDecision:
+    assert isinstance(event, SourceIntegrityHold)
+    if phase in {AudioPhase.BLOCKED, AudioPhase.COVERED, AudioPhase.RETIRING}:
+        return AudioDecision(AudioPhase.BLOCKED, AudioAction.BLOCK, "source integrity mismatch retained")
+    return _refuse(phase, "integrity hold requires quarantine custody")
+
+
 def _ready_custody(phase: AudioPhase | None, event: object) -> AudioDecision:
     assert isinstance(event, ReadyCustody)
     if event.proved and (
@@ -312,6 +325,7 @@ _AUDIO_HANDLERS: dict[type[object], Callable[[AudioPhase | None, object], AudioD
     TerminalPrefix: _terminal_prefix,
     Interruption: _interruption,
     AuthenticatedConflict: _conflict,
+    SourceIntegrityHold: _source_integrity_hold,
     ReadyCustody: _ready_custody,
     BeginRetirement: _begin_retirement,
     RetirementStep: _retirement_step,
@@ -443,6 +457,9 @@ class QuarantineAction(StrEnum):
     REFUSE = "refuse"
 
 
+QUARANTINE_CUSTODY_HOLD_REASONS = frozenset({"ready_overlap_conflict", "source_authentication_mismatch"})
+
+
 @dataclass(frozen=True, slots=True)
 class CertifiedPrefix:
     checkpoint_certified: bool = True
@@ -460,6 +477,7 @@ class QuarantineOpened:
     """Classify an authenticated capture conflict at the original SQL barrier."""
 
     committed_count: int
+    has_canonical_records: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,14 +525,24 @@ def _quarantine_refuse(disposition: QuarantineDisposition) -> QuarantineDecision
 
 def _quarantine_opened(disposition: QuarantineDisposition, event: object) -> QuarantineDecision:
     assert isinstance(event, QuarantineOpened)
-    if disposition is not QuarantineDisposition.UNCLASSIFIED or type(event.committed_count) is not int:
+    if (
+        disposition is not QuarantineDisposition.UNCLASSIFIED
+        or type(event.committed_count) is not int
+        or type(event.has_canonical_records) is not bool
+    ):
         return _quarantine_refuse(disposition)
     if event.committed_count < 0:
         return _quarantine_refuse(disposition)
     next_disposition = (
-        QuarantineDisposition.UNCLASSIFIED if event.committed_count else QuarantineDisposition.UNPROCESSABLE
+        QuarantineDisposition.UNCLASSIFIED
+        if event.committed_count or event.has_canonical_records
+        else QuarantineDisposition.UNPROCESSABLE
     )
-    action = QuarantineAction.KEEP if event.committed_count else QuarantineAction.MARK_UNPROCESSABLE
+    action = (
+        QuarantineAction.KEEP
+        if event.committed_count or event.has_canonical_records
+        else QuarantineAction.MARK_UNPROCESSABLE
+    )
     return QuarantineDecision(next_disposition, action, "authenticated conflict retained")
 
 
@@ -540,7 +568,7 @@ def _mark_unprocessable(disposition: QuarantineDisposition, event: object) -> Qu
 
 def _residual_expiry(disposition: QuarantineDisposition, event: object) -> QuarantineDecision:
     assert isinstance(event, ResidualExpiry)
-    if not event.terminal:
+    if disposition is QuarantineDisposition.UNCLASSIFIED or not event.terminal:
         return _quarantine_refuse(disposition)
     if not event.age_expired:
         return QuarantineDecision(disposition, QuarantineAction.KEEP, "residual evidence has not expired")

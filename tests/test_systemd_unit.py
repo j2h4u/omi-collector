@@ -47,6 +47,8 @@ class _DeploymentScenario:
     versioned_python_alias: bool = False
     service_work_traversable: bool = True
     service_checkpoint_readable: bool = True
+    preflight_failure_at: int | None = None
+    preflight_drift: bool = False
     migration_activates: bool = False
     migration_failure: bool = False
 
@@ -511,6 +513,15 @@ def _write_build_fakes(
         'entrypoint="$UV_PROJECT_ENVIRONMENT/bin/omi-collector"\n'
         "printf '%s\\n' '#!/usr/bin/env bash' > \"$entrypoint\"\n"
         'printf \'%s\\n\' \'printf "candidate args=%s\\n" "$*" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
+        "printf '%s\\n' 'if [[ \"$1\" == check-state-migration ]]; then' >> \"$entrypoint\"\n"
+        'printf \'%s\\n\' \'    printf "preflight args=%s\\n" "$*" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
+        "printf '%s\\n' '    call_file=\"${DEPLOY_PREFLIGHT_CALL_FILE}\"' >> \"$entrypoint\"\n"
+        'printf \'%s\\n\' \'    calls=0; [[ ! -f "$call_file" ]] || calls=$(<"$call_file")\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    calls=$((calls + 1)); printf "%s\\n" "$calls" > "$call_file"\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_DRIFT:-0}" == 1 && "$calls" == 1 ]]; then printf "foreign drift\\n" > "${DEPLOY_STATE_FILE%/*}/.collector-state.sqlite3.migrating.foreign"; fi\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_FAIL_AT:-0}" == "$calls" ]]; then printf "{\\"detail\\":\\"injected refusal\\",\\"reason\\":\\"state_validation_failed\\",\\"status\\":\\"migration_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":null,\\"status\\":\\"migration_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
+        "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"$1\" == migrate-state ]]; then' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    printf "migration selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    if [[ "${DEPLOY_MIGRATION_ACTIVATES:-0}" == 1 || "${DEPLOY_MIGRATION_FAIL:-0}" != 1 ]]; then mkdir -p -- "${DEPLOY_STATE_FILE%/*}"; : > "$DEPLOY_STATE_FILE"; chmod 0640 "$DEPLOY_STATE_FILE"; fi\' >> "$entrypoint"\n'
@@ -822,6 +833,9 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "DEPLOY_CONFIG_FAIL": "1" if scenario.config_check_failure else "0",
         "DEPLOY_MIGRATION_ACTIVATES": "1" if scenario.migration_activates else "0",
         "DEPLOY_MIGRATION_FAIL": "1" if scenario.migration_failure else "0",
+        "DEPLOY_PREFLIGHT_FAIL_AT": str(scenario.preflight_failure_at or 0),
+        "DEPLOY_PREFLIGHT_DRIFT": "1" if scenario.preflight_drift else "0",
+        "DEPLOY_PREFLIGHT_CALL_FILE": str(tmp_path / "preflight.calls"),
         "DEPLOY_STATE_FILE": str(state_file),
         "DEPLOY_CURRENT_LINK": str(current_link),
         "DEPLOY_LOG": str(context.log),
@@ -910,7 +924,58 @@ def test_deployer_builds_validates_selects_and_seals_one_release(tmp_path: Path)
     ]
     assert "systemctl args=stop omi-collector.service" in commands
     assert "systemctl args=restart omi-collector.service" in commands
+    preflights = [line for line in commands.splitlines() if line.startswith("preflight args=")]
+    assert preflights == [
+        f"preflight args=check-state-migration --config {harness.config_file}",
+        f"preflight args=check-state-migration --config {harness.config_file} --stopped",
+    ]
+    assert commands.index(preflights[0]) < commands.index("systemctl args=stop omi-collector.service")
+    assert commands.index("systemctl args=stop omi-collector.service") < commands.index(preflights[1])
+    assert commands.index(preflights[1]) < commands.index("candidate args=migrate-state")
     assert f"config={harness.config_file}" in result.stdout
+
+
+def test_deployer_preflight_refusal_keeps_previous_service_and_selector_untouched(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=1))
+    previous = _previous_release(harness)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "candidate refused the Collector state migration preflight" in result.stderr
+    assert harness.current_link.resolve(strict=True) == previous
+    commands = harness.log.read_text(encoding="utf-8")
+    assert commands.count("preflight args=") == 1
+    assert "systemctl args=stop omi-collector.service" not in commands
+    assert "systemctl args=start omi-collector.service" not in commands
+    assert "systemctl args=restart omi-collector.service" not in commands
+
+
+def test_deployer_stopped_preflight_catches_drift_before_selector_and_restarts_old_release(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=2, preflight_drift=True))
+    previous = _previous_release(harness)
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    _canonical_state(harness, version=1, phase="complete")
+    before = state_file.read_bytes()
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "candidate refused the Collector state migration preflight" in result.stderr
+    assert harness.current_link.resolve(strict=True) == previous
+    assert state_file.read_bytes() == before
+    drift = state_file.parent / ".collector-state.sqlite3.migrating.foreign"
+    assert drift.read_bytes() == b"foreign drift\n"
+    commands = harness.log.read_text(encoding="utf-8")
+    preflights = [line for line in commands.splitlines() if line.startswith("preflight args=")]
+    assert preflights == [
+        f"preflight args=check-state-migration --config {harness.config_file}",
+        f"preflight args=check-state-migration --config {harness.config_file} --stopped",
+    ]
+    assert commands.count("systemctl args=stop omi-collector.service") == 1
+    assert commands.count("systemctl args=start omi-collector.service") == 1
+    assert "systemctl args=restart omi-collector.service" not in commands
+    assert "candidate args=migrate-state" not in commands
 
 
 def test_deployer_checks_existing_publication_checkpoint_as_service_before_stop(tmp_path: Path) -> None:

@@ -29,6 +29,7 @@ from omi_collector.capture.adapters.quality_metrics import (
     validate_quality_event,
 )
 from omi_collector.capture.application.operational_telemetry import system_host_boot_id
+from omi_collector.capture.domain.internal_audio_machine import QUARANTINE_CUSTODY_HOLD_REASONS
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
 from omi_collector.spool_metrics import collect_spool_metrics
@@ -261,7 +262,7 @@ def collect_operator_status(
         current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
         operational_status = read_operational_status(db, current_identity)
         runtime = _runtime_status(db, end.astimezone(UTC), operational_status)
-        ready_conflict_holds = _ready_conflict_hold_count(db)
+        custody_holds = _custody_hold_count(db)
     except (
         ConfirmedLossError,
         QualityMetricsError,
@@ -280,7 +281,7 @@ def collect_operator_status(
         "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
         "publication": spool.current_window.as_dict(),
         "quality_window": quality.as_dict(),
-        "ready_conflict_holds": ready_conflict_holds,
+        "custody_holds": custody_holds,
         "runtime": runtime,
         "schema_version": 2,
         "status": window_status,
@@ -288,22 +289,23 @@ def collect_operator_status(
     }
 
 
-def _ready_conflict_hold_count(db: StateDB) -> int:
-    """Count SQL audio held indefinitely after an unresolved READY custody conflict."""
+def _custody_hold_count(db: StateDB) -> int:
+    """Count SQL audio held indefinitely after unresolved custody conflicts."""
     try:
         with closing(db.open_connection(read_only=True)) as connection:
             row = cast(
                 sqlite3.Row | None,
                 connection.execute(
                     "SELECT COUNT(*) FROM capture_source WHERE source_type='quarantine' "
-                    "AND lifecycle='blocked' AND block_reason='ready_overlap_conflict'"
+                    "AND lifecycle='blocked' AND block_reason IN (?, ?)",
+                    tuple(sorted(QUARANTINE_CUSTODY_HOLD_REASONS)),
                 ).fetchone(),
             )
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
-        raise OperatorStatusError("READY conflict hold inventory is unreadable") from error
+        raise OperatorStatusError("custody hold inventory is unreadable") from error
     count = None if row is None else cast(object, row[0])
     if type(count) is not int:
-        raise OperatorStatusError("READY conflict hold inventory is invalid")
+        raise OperatorStatusError("custody hold inventory is invalid")
     return cast(int, count)
 
 

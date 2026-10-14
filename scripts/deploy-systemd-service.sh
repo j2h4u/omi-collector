@@ -466,6 +466,29 @@ function validate_candidate_config {
     [[ "$output" == "$expected" ]] || die 'candidate returned an unexpected configuration validation record'
 }
 
+function check_candidate_state_migration {
+    # args
+    local -r environment="$1" config_file="$2" stopped="$3"
+
+    # vars
+    local output
+    local -a stopped_args=()
+
+    # code
+    if [[ "$stopped" == 'true' ]]; then
+        stopped_args+=( '--stopped' )
+    fi
+    output=$("${environment}/bin/omi-collector" check-state-migration --config "$config_file" "${stopped_args[@]}") \
+        || die 'candidate refused the Collector state migration preflight'
+    case "$output" in
+        '{"schema_version":null,"status":"migration_compatible"}'|\
+        '{"schema_version":1,"status":"migration_compatible"}'|\
+        '{"schema_version":2,"status":"migration_compatible"}')
+            ;;
+        *) die 'candidate returned an unexpected Collector state migration preflight record' ;;
+    esac
+}
+
 function migrate_stopped_collector_state {
     # args
     local -r environment="$1" config_file="$2" state_file="$3"
@@ -838,11 +861,13 @@ persist_sealed_tree "$staged_environment" "$deployments_dir" "$sealer_python"
 screen_cutover_backup_space "$state_file" "$sealer_python"
 validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
 provision_operator_data_access "${state_file%/collector/collector-state.sqlite3}" "$account_user" "$operator_group"
+check_candidate_state_migration "$staged_environment" "$config_file" 'false'
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"
 [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
 prepare_service_singleton_lock "${state_file%/*}/collector.lock" "$runuser_bin" "$account_user" "$account_group" \
     || die 'could not prepare the stable Collector singleton lock for migration'
+check_candidate_state_migration "$staged_environment" "$config_file" 'true'
 selection_published=1
 publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"
 migrate_stopped_collector_state "$current_link" "$config_file" "$state_file" \

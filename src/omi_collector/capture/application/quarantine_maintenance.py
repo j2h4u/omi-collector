@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from threading import Event
 from time import monotonic
 from typing import Protocol
 
 from ...config import DEFAULT_CONFIG, CollectorConfig
+from ..adapters.staging_contract import FatalInternalAudioStorageError
 from ..domain.quarantine_machine import (
     QuarantineAction,
     QuarantineEvent,
@@ -81,6 +81,12 @@ class QuarantineMaintenance:
         self._publication_retry_handle: asyncio.TimerHandle | None = None
         self._publication_retry_task: asyncio.Task[None] | None = None
         self._publication_effect_tasks: set[asyncio.Task[object]] = set()
+        self._publication_fatal: FatalInternalAudioStorageError | None = None
+        self._publication_fatal_event = asyncio.Event()
+
+    def _raise_publication_fatal(self) -> None:
+        if self._publication_fatal is not None:
+            raise self._publication_fatal
 
     async def prepare_pending_startup(self) -> PendingStartupState:
         """Inspect and validate restart evidence exactly once."""
@@ -128,6 +134,7 @@ class QuarantineMaintenance:
         self._startup_state_bound = False
 
     async def _recover_and_publish(self) -> None:
+        self._raise_publication_fatal()
         task = asyncio.create_task(joined_to_thread(self._staging.recover_and_publish))
         self._publication_effect_tasks.add(task)
         try:
@@ -151,6 +158,7 @@ class QuarantineMaintenance:
 
     def schedule_publication_retry(self) -> None:
         """Dispatch the canonical owner after a durable input event."""
+        self._raise_publication_fatal()
         if self._staging.publication_wake_admitted():
             self._start_publication_retry()
 
@@ -167,12 +175,16 @@ class QuarantineMaintenance:
 
     def _publication_timer_fired(self, generation: int, deadline: float) -> None:
         self._publication_retry_handle = None
+        if self._publication_fatal is not None:
+            return
         if self._staging.publication_timer_fired(generation, deadline):
             self._start_publication_retry()
         else:
             self._arm_publication_timer()
 
     def _start_publication_retry(self) -> None:
+        if self._publication_fatal is not None:
+            return
         if self._publication_retry_task is not None and not self._publication_retry_task.done():
             return
         task = asyncio.create_task(self._recover_and_publish())
@@ -182,13 +194,22 @@ class QuarantineMaintenance:
     def _consume_publication_retry(self, task: asyncio.Task[None]) -> None:
         if self._publication_retry_task is task:
             self._publication_retry_task = None
-        with suppress(asyncio.CancelledError, Exception):
+        try:
             task.result()
+        except FatalInternalAudioStorageError as error:
+            self._publication_fatal = error
+            self._publication_fatal_event.set()
+            return
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - ordinary retry failures already became safe outcomes
+            pass
         if self._staging.publication_followup_due():
             self._start_publication_retry()
 
     async def enter_capture_priority(self) -> None:
         """Stop background publication and revoke stale drain permission before capture."""
+        self._raise_publication_fatal()
         self._staging.publication_capture_begin()
         try:
             if self._publication_retry_handle is not None:
@@ -204,6 +225,7 @@ class QuarantineMaintenance:
                 await join_owned(
                     asyncio.gather(*(active + ((task,) if task is not None else ())), return_exceptions=True)
                 )
+            self._raise_publication_fatal()
             self._staging.publication_quiesced()
             await joined_to_thread(self._staging.begin_ready_visit)
         except BaseException:
@@ -318,6 +340,7 @@ class QuarantineMaintenance:
         """
         defer_requested = Event()
         presence_task = asyncio.create_task(presence.wait_for_attempt())
+        fatal_task = asyncio.create_task(self._publication_fatal_event.wait())
         maintenance_task: asyncio.Task[None] | None = None
         primary: BaseException | None = None
         permit_returned = False
@@ -329,9 +352,11 @@ class QuarantineMaintenance:
             while True:
                 if maintenance_task is None:
                     done, _ = await asyncio.wait(
-                        {presence_task},
+                        {presence_task, fatal_task},
                         timeout=self._config.retry.maintenance_interval_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    self._raise_publication_fatal()
                     if presence_task in done:
                         wake = presence_task.result()
                         await self.ensure_publication_ready()
@@ -341,7 +366,10 @@ class QuarantineMaintenance:
                     maintenance_task = asyncio.create_task(self.run_once(defer_requested.is_set))
                     continue
 
-                done, _ = await asyncio.wait({presence_task, maintenance_task}, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    {presence_task, maintenance_task, fatal_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                self._raise_publication_fatal()
                 if presence_task in done:
                     wake = presence_task.result()
                     # A scanner wake is not permission to open BLE while local
@@ -368,6 +396,8 @@ class QuarantineMaintenance:
                 raise
             raise
         finally:
+            fatal_task.cancel()
+            await asyncio.gather(fatal_task, return_exceptions=True)
             # ``wait`` returns with one task complete, but always consume the
             # other result too. This keeps task identity scoped to this call.
             if primary is None and maintenance_task is not None:

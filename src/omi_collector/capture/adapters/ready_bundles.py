@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -20,6 +21,7 @@ from typing import NoReturn, Protocol, cast
 
 from ...config import ReadyConfig
 from ..domain.internal_audio_machine import (
+    QUARANTINE_CUSTODY_HOLD_REASONS,
     AudioAction,
     AudioPhase,
     AuthenticatedConflict,
@@ -55,10 +57,19 @@ from .internal_audio_store import (
     decode_uint64,
     encode_uint64,
 )
+from .staging_contract import FatalInternalAudioStorageError
 
 
 class ReadyBundleError(RuntimeError):
     """A draft cannot be safely finalized into a ready bundle."""
+
+
+class ReadyDurabilityFatalError(FatalInternalAudioStorageError):
+    """A READY durability failure could not be recorded safely."""
+
+
+class _ObservedDurabilityIOError(OSError):
+    """An EIO was observed from a write, flush, or durability barrier."""
 
 
 class ConflictingOverlapError(ReadyBundleError):
@@ -196,6 +207,8 @@ _TYPED_BTREE_PAGES_PER_LEVEL = 3
 # fixed part up to one explicit 256-byte per-row bound.
 _TYPED_METADATA_ROW_BYTES = 256
 _TYPED_STAGE_RANGE_COLUMNS = 14
+_TYPED_STAGE_IDENTITY_PARTS = 3
+_DURABILITY_IO_FAILURE = "durability_io_error"
 
 
 def _visible_children(root: Path) -> tuple[Path, ...]:
@@ -840,10 +853,16 @@ def _require_shared_ready_directory(path: Path) -> None:
 
 def _write_file(path: Path, payload: bytes) -> None:
     with path.open("xb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-    path.chmod(_READY_FILE_MODE)
+        try:
+            stream.write(payload)
+        except OSError as error:
+            _raise_if_observed_durability_eio(error)
+        os.fchmod(stream.fileno(), _READY_FILE_MODE)
+        try:
+            stream.flush()
+        except OSError as error:
+            _raise_if_observed_durability_eio(error)
+    _sync_regular_file(path)
 
 
 def _read_json(path: Path) -> object:
@@ -872,9 +891,18 @@ def _digest(path: Path) -> str:
 def _sync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        os.fsync(descriptor)
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            _raise_if_observed_durability_eio(error)
     finally:
         os.close(descriptor)
+
+
+def _raise_if_observed_durability_eio(error: OSError) -> NoReturn:
+    if error.errno == errno.EIO:
+        raise _ObservedDurabilityIOError(error.errno, "READY durability I/O error") from error
+    raise error
 
 
 # The SQL projector shares the public ready contract with the legacy projector,
@@ -1087,6 +1115,7 @@ class _StageHeader:
     frozen_utc_end: int | None
     mapping_revision: str
     owner_token: str
+    failure_reason: str | None
 
 
 def _sql_one(cursor: sqlite3.Cursor) -> tuple[object, ...] | None:
@@ -1297,7 +1326,7 @@ def _typed_admission(
 
 def _blocked_typed_certification(snapshot: CaptureSource, certification: tuple[object, ...]) -> tuple[int, str] | None:
     count, digest, block_reason, disposition, terminal_time, retention_deadline = certification
-    if block_reason == "ready_overlap_conflict":
+    if block_reason in QUARANTINE_CUSTODY_HOLD_REASONS:
         return None
     if snapshot.source_type != "quarantine":
         raise ReadyBundleError("blocked typed publication source lacks quarantine custody")
@@ -2069,7 +2098,12 @@ def _resume_typed_cohort(  # noqa: PLR0913 - resume keeps the frozen storage and
     published: list[ReadyBundleResult] = []
     current: _TypedCohort | None = cohort
     while current is not None:
-        if current.lifecycle == "accepted":
+        if current.lifecycle == "staging":
+            _require_typed_admissions_current(audio_store, current.admissions)
+            result = _resume_persisted_typed_stage(audio_store, ready_root, current, page_limit)
+        else:
+            if current.lifecycle != "accepted":
+                raise ReadyBundleError("typed publication cohort lifecycle is invalid")
             custody_cache = _typed_ready_custody(ready_root, audio_store.state_db, custody_cache)
             custody = custody_cache.custody
             try:
@@ -2082,19 +2116,12 @@ def _resume_typed_cohort(  # noqa: PLR0913 - resume keeps the frozen storage and
                 break
             slices = _accepted_typed_slices(audio_store, current, page_limit, custody, prepared_slices)
             prepared_slices = None
-        else:
-            slices = _normalize_typed_admissions(current.admissions, page_limit)
-        _require_typed_admissions_current(audio_store, current.admissions)
-        if not slices:
-            _complete_empty_typed_cohort(audio_store, current)
-            break
-        group = _typed_groups(slices, page_limit, clock_segments)[0]
-        try:
-            result = _publish_typed_group(audio_store, ready_root, current, group, page_limit)
-        except InternalAudioStoreError:
-            raise
-        except (OSError, StateDBError, sqlite3.DatabaseError) as error:
-            raise ReadyBundleError("typed ready group could not be published") from error
+            _require_typed_admissions_current(audio_store, current.admissions)
+            if not slices:
+                _complete_empty_typed_cohort(audio_store, current)
+                break
+            group = _typed_groups(slices, page_limit, clock_segments)[0]
+            result = _publish_typed_group_with_error_boundary(audio_store, ready_root, current, group, page_limit)
         published.append(result)
         current = _load_active_typed_cohort(audio_store)
         if current is not None and current.cohort_id != cohort.cohort_id:
@@ -2474,7 +2501,7 @@ def _load_typed_stage(
                 connection.execute(
                     "SELECT group_identity,owned_path,expected_bundle_digest,expected_record_count,"
                     "expected_slice_count,frozen_device_start,frozen_device_end,frozen_utc_start,frozen_utc_end,"
-                    "frozen_mapping_revision,owner_token FROM ready_output_stage WHERE stage_id=?",
+                    "frozen_mapping_revision,owner_token,failure_reason FROM ready_output_stage WHERE stage_id=?",
                     (key.stage_id,),
                 )
             )
@@ -2498,9 +2525,13 @@ def _load_typed_stage(
     )
     if not stage_rows:
         raise ReadyBundleError("typed stage has no frozen ranges")
+    if any(item.slice.start_ordinal < item.slice.admission.cursor for item in stage_rows):
+        raise ReadyBundleError("typed stage precedes its cohort member cursor")
     ranges = _merge_frozen_ranges(tuple(item.time_range for item in stage_rows))
     slices = tuple(item.slice for item in stage_rows)
     group = _typed_group_from_frozen(slices, ranges, page_limit)
+    if key.group_identity.rsplit(":", maxsplit=1)[-1] != _bundle_id(group.facts):
+        raise ReadyBundleError("typed stage group identity changed")
     actual_identity = (
         group.output_sha256,
         group.facts.record_count,
@@ -2532,7 +2563,9 @@ def _load_typed_stage(
 
 
 def _parse_stage_header(row: tuple[object, ...], key: _StageKey, range_count: int) -> _StageHeader:
-    identity, path, digest, count, slices, device_start, device_end, utc_start, utc_end, revision, owner = row
+    identity, path, digest, count, slices, device_start, device_end, utc_start, utc_end, revision, owner, failure = row
+    if failure == _DURABILITY_IO_FAILURE:
+        raise ReadyBundleError("typed stage is blocked by a recorded durability I/O failure")
     valid = (
         identity == key.group_identity
         and path == str(key.path)
@@ -2546,6 +2579,7 @@ def _parse_stage_header(row: tuple[object, ...], key: _StageKey, range_count: in
         and type(device_end) is int
         and (utc_start is None or type(utc_start) is int)
         and (utc_end is None or type(utc_end) is int)
+        and failure is None
     )
     if not valid:
         raise ReadyBundleError("typed stage ownership is invalid")
@@ -2553,7 +2587,15 @@ def _parse_stage_header(row: tuple[object, ...], key: _StageKey, range_count: in
     assert isinstance(device_start, int) and isinstance(device_end, int)
     assert isinstance(revision, str) and isinstance(owner, str)
     return _StageHeader(
-        digest, count, device_start, device_end, cast(int | None, utc_start), cast(int | None, utc_end), revision, owner
+        digest,
+        count,
+        device_start,
+        device_end,
+        cast(int | None, utc_start),
+        cast(int | None, utc_end),
+        revision,
+        owner,
+        None,
     )
 
 
@@ -2710,20 +2752,193 @@ def _publish_typed_group(
     page_limit: int,
 ) -> ReadyBundleResult:
     stage = _ensure_typed_stage(audio_store, ready_root, cohort, group, page_limit)
-    result = _materialize_typed_stage(stage, page_limit)
+    result = _materialize_typed_stage_with_failure_latch(audio_store, cohort, stage, page_limit)
     _commit_typed_stage(audio_store, cohort, stage, result)
     return result
+
+
+def _publish_typed_group_with_error_boundary(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _TypedGroup,
+    page_limit: int,
+) -> ReadyBundleResult:
+    try:
+        return _publish_typed_group(audio_store, ready_root, cohort, group, page_limit)
+    except InternalAudioStoreError:
+        raise
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed ready group could not be published") from error
+
+
+def _resume_persisted_typed_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    page_limit: int,
+) -> ReadyBundleResult:
+    try:
+        _require_cohort_decision(
+            CohortPhase.STAGING,
+            OwnedIncompleteRetry(),
+            CohortAction.RECONCILE,
+            CohortPhase.STAGING,
+        )
+        key = _persisted_typed_stage_key(audio_store, ready_root, cohort)
+        stage = _load_typed_stage(audio_store, cohort, key, page_limit)
+        if stage is None:
+            raise ReadyBundleError("STAGING cohort lost its typed stage intent")
+        _require_typed_stage_space(audio_store, cohort, stage)
+        result = _materialize_typed_stage_with_failure_latch(audio_store, cohort, stage, page_limit)
+        _commit_typed_stage(audio_store, cohort, stage, result)
+        return result
+    except InternalAudioStoreError:
+        raise
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed ready group could not be published") from error
+
+
+def _persisted_typed_stage_key(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+) -> _StageKey:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            rows = _sql_all(
+                connection.execute(
+                    "SELECT stage_id,group_identity,owned_path,owner_token FROM ready_output_stage ORDER BY stage_id"
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise ReadyBundleError("typed stage intent is unreadable") from error
+    if len(rows) != 1:
+        raise ReadyBundleError("STAGING cohort does not own exactly one typed stage intent")
+    stage_id, identity, owned_path, owner_token = rows[0]
+    if not all(isinstance(value, str) for value in rows[0]):
+        raise ReadyBundleError("typed stage ownership is invalid")
+    assert isinstance(stage_id, str) and isinstance(identity, str)
+    assert isinstance(owned_path, str) and isinstance(owner_token, str)
+    parts = identity.split(":")
+    if len(parts) != _TYPED_STAGE_IDENTITY_PARTS:
+        raise ReadyBundleError("typed stage group identity is invalid")
+    cohort_id, cursor, bundle_id = parts
+    expected_stage_id = sha256(identity.encode()).hexdigest()
+    expected_path = ready_root / f".{bundle_id}.{expected_stage_id[:16]}.stage"
+    if (
+        cohort_id != cohort.cohort_id
+        or cursor != str(cohort.cursor)
+        or not _is_sha256(bundle_id)
+        or stage_id != expected_stage_id
+        or owner_token != expected_stage_id
+        or owned_path != str(expected_path)
+    ):
+        raise ReadyBundleError("typed stage ownership is invalid")
+    return _StageKey(stage_id, identity, expected_path)
+
+
+def _materialize_typed_stage_with_failure_latch(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _TypedStage,
+    page_limit: int,
+) -> ReadyBundleResult:
+    try:
+        return _materialize_typed_stage(stage, page_limit)
+    except OSError as error:
+        if error.errno != errno.EIO:
+            raise
+        _latch_typed_durability_failure(audio_store, cohort, stage)
+        raise ReadyBundleError("typed stage is blocked by a recorded durability I/O failure") from error
+
+
+def _latch_typed_durability_failure(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _TypedStage,
+) -> None:
+    try:
+        with audio_store.publication_transaction() as (state, connection):
+            cohort_row = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?",
+                    (cohort.cohort_id,),
+                )
+            )
+            stage_row = _sql_one(
+                connection.execute(
+                    "SELECT group_identity,owned_path,owner_token,failure_reason "
+                    "FROM ready_output_stage WHERE stage_id=?",
+                    (stage.stage_id,),
+                )
+            )
+            expected_stage = (stage.group_identity, str(stage.path), stage.owner_token)
+            if (
+                cohort_row is None
+                or tuple(cohort_row) != ("staging", cohort.cursor)
+                or stage_row is None
+                or tuple(stage_row)[:3] != expected_stage
+            ):
+                raise ReadyDurabilityFatalError("READY durability failure could not be attached to its stage")
+            if stage_row[3] == _DURABILITY_IO_FAILURE:
+                return
+            if stage_row[3] is not None:
+                raise ReadyDurabilityFatalError("READY durability failure encountered an invalid stage latch")
+            changed = connection.execute(
+                "UPDATE ready_output_stage SET failure_reason=? WHERE stage_id=? AND group_identity=? "
+                "AND owned_path=? AND owner_token=? AND failure_reason IS NULL",
+                (_DURABILITY_IO_FAILURE, stage.stage_id, *expected_stage),
+            )
+            if changed.rowcount != 1:
+                raise ReadyDurabilityFatalError("READY durability failure latch lost its compare-and-swap")
+            state.mark_publication_changed()
+    except ReadyDurabilityFatalError:
+        raise
+    except Exception as error:
+        if _typed_durability_failure_is_latched(audio_store, cohort, stage):
+            return
+        raise ReadyDurabilityFatalError("READY durability failure could not be recorded") from error
+
+
+def _typed_durability_failure_is_latched(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _TypedStage,
+) -> bool:
+    try:
+        with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
+            row = _sql_one(
+                connection.execute(
+                    "SELECT p.lifecycle,p.cursor,s.group_identity,s.owned_path,s.owner_token,s.failure_reason "
+                    "FROM publication_cohort AS p JOIN ready_output_stage AS s ON s.stage_id=? "
+                    "WHERE p.cohort_id=?",
+                    (stage.stage_id, cohort.cohort_id),
+                )
+            )
+    except OSError, StateDBError, sqlite3.DatabaseError:
+        return False
+    return row is not None and tuple(row) == (
+        "staging",
+        cohort.cursor,
+        stage.group_identity,
+        str(stage.path),
+        stage.owner_token,
+        _DURABILITY_IO_FAILURE,
+    )
 
 
 def _materialize_typed_stage(stage: _TypedStage, page_limit: int) -> ReadyBundleResult:
     bundle_id = _bundle_id(stage.group.facts)
     destination = stage.path.parent / bundle_id
     if os.path.lexists(destination):
-        _require_typed_destination(destination, stage.group)
+        _sync_typed_bundle(destination, stage.group, require_bundle_name=True)
+        _sync_directory(destination.parent)
         _discard_owned_typed_stage(stage.path)
     else:
         if os.path.lexists(stage.path):
             if _complete_typed_stage_matches(stage.path, stage.group):
+                _sync_typed_bundle(stage.path, stage.group, require_bundle_name=False)
                 stage.path.rename(destination)
                 _sync_directory(destination.parent)
             else:
@@ -2733,7 +2948,7 @@ def _materialize_typed_stage(stage: _TypedStage, page_limit: int) -> ReadyBundle
             try:
                 stage.path.rename(destination)
             except FileExistsError:
-                _require_typed_destination(destination, stage.group)
+                _sync_typed_bundle(destination, stage.group, require_bundle_name=True)
                 _discard_owned_typed_stage(stage.path)
             _sync_directory(destination.parent)
     _require_typed_destination(destination, stage.group)
@@ -2751,8 +2966,7 @@ def _write_typed_stage(stage: _TypedStage, page_limit: int) -> None:
 
 
 def _require_typed_stage_space(audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _TypedStage) -> None:
-    manifest = _canonical(_ready_manifest(stage.group.facts, stage.group.output_sha256, stage.group.ranges))
-    stage_bytes = stage.group.facts.record_count * RECORD_SIZE + len(manifest)
+    stage_bytes = _typed_output_reserve_bytes(stage)
     database = audio_store.state_db.path
     try:
         with closing(audio_store.state_db.open_connection(read_only=True)) as connection:
@@ -2772,6 +2986,17 @@ def _require_typed_stage_space(audio_store: InternalAudioStore, cohort: _TypedCo
         raise
     except (OSError, StateDBError, sqlite3.DatabaseError, TypeError, IndexError) as error:
         raise ReadyBundleError("typed publication space reserve could not be inspected") from error
+
+
+def _typed_output_reserve_bytes(stage: _TypedStage) -> int:
+    destination = stage.path.parent / _bundle_id(stage.group.facts)
+    if os.path.lexists(destination):
+        _require_typed_destination(destination, stage.group)
+        return 0
+    if os.path.lexists(stage.path) and _complete_typed_stage_matches(stage.path, stage.group):
+        return 0
+    manifest = _canonical(_ready_manifest(stage.group.facts, stage.group.output_sha256, stage.group.ranges))
+    return stage.group.facts.record_count * RECORD_SIZE + len(manifest)
 
 
 def _typed_database_reserve_bytes(
@@ -2860,6 +3085,30 @@ def _require_typed_destination(path: Path, group: _TypedGroup) -> None:
         raise ReadyBundleError("typed ready destination conflicts with its frozen stage")
 
 
+def _sync_typed_bundle(path: Path, group: _TypedGroup, *, require_bundle_name: bool) -> None:
+    if not _typed_files_match(path, group, require_bundle_name=require_bundle_name):
+        raise ReadyBundleError("typed ready output conflicts with its frozen stage")
+    path.chmod(_READY_DIRECTORY_MODE)
+    _sync_regular_file(path / _RAW_NAME)
+    _sync_regular_file(path / _MANIFEST_NAME)
+    _sync_directory(path)
+
+
+def _sync_regular_file(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fchmod(descriptor, _READY_FILE_MODE)
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            _raise_if_observed_durability_eio(error)
+    finally:
+        os.close(descriptor)
+
+
 def _typed_files_match(path: Path, group: _TypedGroup, *, require_bundle_name: bool) -> bool:
     if path.is_symlink() or not path.is_dir() or {item.name for item in path.iterdir()} != {_RAW_NAME, _MANIFEST_NAME}:
         return False
@@ -2894,6 +3143,7 @@ def _write_typed_stage_files(path: Path, group: _TypedGroup, page_limit: int) ->
     if os.path.lexists(path):
         raise ReadyBundleError("typed ready stage already exists")
     path.mkdir(mode=_READY_DIRECTORY_MODE)
+    path.chmod(_READY_DIRECTORY_MODE)
     digest = sha256()
     range_index = 0
     next_sequence = cast(int, group.ranges[0]["next_sequence"])
@@ -2905,11 +3155,17 @@ def _write_typed_stage_files(path: Path, group: _TypedGroup, page_limit: int) ->
                     range_index += 1
                     next_sequence = cast(int, group.ranges[range_index]["next_sequence"])
                 converted = _convert_record(record.raw_bytes, group.ranges[range_index])
-                output.write(converted)
+                try:
+                    output.write(converted)
+                except OSError as error:
+                    _raise_if_observed_durability_eio(error)
                 digest.update(converted)
-        output.flush()
-        os.fsync(output.fileno())
-    (path / _RAW_NAME).chmod(_READY_FILE_MODE)
+        os.fchmod(output.fileno(), _READY_FILE_MODE)
+        try:
+            output.flush()
+        except OSError as error:
+            _raise_if_observed_durability_eio(error)
+    _sync_regular_file(path / _RAW_NAME)
     if digest.hexdigest() != group.output_sha256:
         raise ReadyBundleError("typed ready output changed while staging")
     _write_file(path / _MANIFEST_NAME, _canonical(_ready_manifest(group.facts, group.output_sha256, group.ranges)))
@@ -3435,7 +3691,7 @@ def _commit_typed_stage_once(audio_store: InternalAudioStore, proposal: _FinalCo
             raise ReadyBundleError("typed cohort changed before final commit")
         stage_row = _sql_one(
             connection.execute(
-                "SELECT group_identity,owned_path,expected_bundle_digest,expected_record_count,owner_token "
+                "SELECT group_identity,owned_path,expected_bundle_digest,expected_record_count,owner_token,failure_reason "
                 "FROM ready_output_stage WHERE stage_id=?",
                 (stage.stage_id,),
             )
@@ -3446,6 +3702,7 @@ def _commit_typed_stage_once(audio_store: InternalAudioStore, proposal: _FinalCo
             stage.group.output_sha256,
             stage.group.facts.record_count,
             stage.owner_token,
+            None,
         ):
             raise ReadyBundleError("typed stage ownership changed before final commit")
         state.put(StateKind.READY_PUBLICATION, proposal.result.bundle_id, proposal.entry)
@@ -3527,7 +3784,7 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
             )
             stage_row = _sql_one(
                 connection.execute(
-                    "SELECT group_identity FROM ready_output_stage WHERE stage_id=?",
+                    "SELECT group_identity,failure_reason FROM ready_output_stage WHERE stage_id=?",
                     (stage.stage_id,),
                 )
             )
@@ -3593,7 +3850,7 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
     expected_control_state = (
         proposal.ledger,
         ("staging", cohort.cursor),
-        (stage.group_identity,),
+        (stage.group_identity, None),
     )
     if durable_control_state == expected_control_state and old_cursors and old_sources:
         return "old"

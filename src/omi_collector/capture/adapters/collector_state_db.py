@@ -40,6 +40,10 @@ class StateKind(StrEnum):
 class StateDBError(RuntimeError):
     """The Collector state database is unsupported, invalid, or unavailable."""
 
+    def __init__(self, message: str, *, sqlite_errorcode: int | None = None) -> None:
+        super().__init__(message)
+        self.sqlite_errorcode = sqlite_errorcode
+
 
 class _Operations:
     """Operations bound to one connection, shared by DB and transaction handles."""
@@ -201,7 +205,9 @@ class StateDB(_Operations):
         except (OSError, sqlite3.DatabaseError) as error:
             if connection is not None:
                 connection.close()
-            raise StateDBError("state database is unavailable") from error
+            raise StateDBError(
+                "state database is unavailable", sqlite_errorcode=getattr(error, "sqlite_errorcode", None)
+            ) from error
         except BaseException:
             if connection is not None:
                 connection.close()
@@ -371,7 +377,9 @@ class StateDB(_Operations):
         except (OSError, sqlite3.DatabaseError) as error:
             if connection is not None:
                 connection.close()
-            raise StateDBError("state database is unavailable") from error
+            raise StateDBError(
+                "state database is unavailable", sqlite_errorcode=getattr(error, "sqlite_errorcode", None)
+            ) from error
         except BaseException:
             if connection is not None:
                 connection.close()
@@ -607,7 +615,8 @@ _AUDIO_DDL = (
         "progress_records INTEGER NOT NULL DEFAULT 0 CHECK (progress_records BETWEEN 0 AND 4294967295), progress_slice INTEGER NOT NULL DEFAULT 0 CHECK (progress_slice >= 0),"
         "frozen_device_start INTEGER CHECK (frozen_device_start IS NULL OR frozen_device_start BETWEEN 0 AND 4294967295), frozen_device_end INTEGER CHECK (frozen_device_end IS NULL OR frozen_device_end BETWEEN 0 AND 4294967295),"
         "frozen_utc_start INTEGER CHECK (frozen_utc_start IS NULL OR frozen_utc_start BETWEEN 0 AND 4294967295), frozen_utc_end INTEGER CHECK (frozen_utc_end IS NULL OR frozen_utc_end BETWEEN 0 AND 4294967295),"
-        "frozen_mapping_revision TEXT CHECK (frozen_mapping_revision IS NULL OR (length(frozen_mapping_revision) = 64 AND lower(frozen_mapping_revision) = frozen_mapping_revision AND frozen_mapping_revision NOT GLOB '*[^0-9a-f]*')), owner_token TEXT NOT NULL"
+        "frozen_mapping_revision TEXT CHECK (frozen_mapping_revision IS NULL OR (length(frozen_mapping_revision) = 64 AND lower(frozen_mapping_revision) = frozen_mapping_revision AND frozen_mapping_revision NOT GLOB '*[^0-9a-f]*')), owner_token TEXT NOT NULL,"
+        "failure_reason TEXT CHECK (failure_reason IS NULL OR failure_reason = 'durability_io_error')"
         ") WITHOUT ROWID"
     ),
     _ddl(

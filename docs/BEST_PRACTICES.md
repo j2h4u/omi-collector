@@ -18,16 +18,18 @@ Use `uv` and keep `uv.lock` synchronized. The required gates are:
 - `just runtime-smoke` — a bounded installed-CLI container smoke;
 - `just verify` — the complete local contract when a local full run is needed.
 
-Do not weaken or locally suppress a gate. Use targeted checks while iterating,
-then freeze and commit the candidate. A reviewed transactional candidate
-installer may deploy that exact branch commit for live feedback before GitHub
-merge or a release tag exists. It must retain the production stop, migration,
-rollback, and storage-integrity safeguards. Record it as a host candidate, not
-as a released version. The final protected-main candidate must pass all five
-required gates in CI before merge; the GitHub release follows live feedback
-and protected merge. Do not require a duplicate local `just verify` solely
-because the same candidate runs in CI. Use an extra local full run only for a
-specific local risk or when CI cannot provide the needed evidence.
+Do not weaken or locally suppress a gate. Use targeted checks while iterating.
+Before a local candidate install, all applicable local tests and linters must
+pass. Complete the five gates above or reuse retained results only when their
+relevant inputs are byte-identical and targeted checks cover an isolated later
+change. Freeze and commit the exact candidate. A reviewed transactional entry
+point may install it for live feedback while preserving production stop,
+migration, rollback, and storage-integrity safeguards. Record it as a host
+candidate, not a released version. Remote CI, PR, security, merge, and release
+are not prerequisites for this local installation. After live feedback, push
+the accepted change and pass the existing remote gates before protected-main
+merge; the GitHub release can follow in the background. See [edge.md](../edge.md)
+for the short workflow sequence.
 
 Runtime QA must run serially at low CPU and idle I/O priority. The canonical
 `just unit` command is bounded to 600 seconds; set

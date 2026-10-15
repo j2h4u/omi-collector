@@ -414,6 +414,8 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
   expectations.
 - [Best practices](docs/BEST_PRACTICES.md) — concise operational and QA
   guidance.
+- [Local candidate workflow](edge.md) — local checks, host feedback, and
+  subsequent GitHub delivery.
 - [Internal SQLite capture plan](docs/OMIC-16-IMPLEMENTATION-PLAN.md) and
   [review receipt](docs/qa/2026-10-13-omic-16-plan-review.md) — approved design
   and remaining implementation gates.

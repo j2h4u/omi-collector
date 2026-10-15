@@ -135,10 +135,11 @@ Replace the placeholder with the pendant Bluetooth address. The optional
 30 seconds of observations with no gap of 10 seconds or more before GATT is
 opened. A timer, a remembered address, or a stale scanner event cannot create
 an automatic connection permit. The fixed configuration location determines
-storage. `[ready]` configures `target_audio_seconds`. Ready publication
-requires a confirmed complete physical-visit drain and the configured audio
-minimum; smaller downloads accumulate across visits, with no age-based flush.
-Duration is the sum of valid 20 ms Opus packet durations.
+storage. `[ready]` sets the minimum cumulative captured Opus duration for
+publishing a ready bundle: `3600` seconds means one hour of audio, not elapsed
+waiting time or a maximum chunk size. Publication happens after a complete
+pendant drain. Smaller drains accumulate in SQLite indefinitely until the
+minimum is reached; downstream VAD does not determine this duration.
 The installer creates the service account, keeps the configuration root-owned
 and readable by both services as mode `0644`, and enables the service. It does not start the
 service unless `--restart` is explicit. Complete the first successful

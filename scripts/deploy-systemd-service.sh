@@ -531,6 +531,9 @@ function check_candidate_state_migration {
         printf -v "$output_name" '%s' 'recovery_required'
         return
     fi
+    if [[ -n "$output" ]]; then
+        printf 'Collector state migration preflight response (exit %s): %s\n' "$command_status" "$output" >&2
+    fi
     die 'candidate refused the Collector state migration preflight'
 }
 

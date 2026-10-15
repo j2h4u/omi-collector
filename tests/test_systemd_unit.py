@@ -1006,6 +1006,10 @@ def test_deployer_preflight_refusal_keeps_previous_service_and_selector_untouche
 
     assert result.returncode != 0
     assert "candidate refused the Collector state migration preflight" in result.stderr
+    assert (
+        "Collector state migration preflight response (exit 1): "
+        '{"detail":"injected refusal","reason":"state_validation_failed","status":"migration_refused"}'
+    ) in result.stderr
     assert harness.current_link.resolve(strict=True) == previous
     commands = harness.log.read_text(encoding="utf-8")
     assert commands.count("preflight args=") == 1

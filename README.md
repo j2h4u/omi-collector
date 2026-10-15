@@ -130,16 +130,17 @@ sudo -u omi-collector bluetoothctl show
 sudo scripts/deploy-systemd-service.sh
 ```
 
-Replace the placeholder with the pendant Bluetooth address. The optional
-`[presence]` section controls automatic scanner admission: the default requires
-30 seconds of observations with no gap of 10 seconds or more before GATT is
-opened. A timer, a remembered address, or a stale scanner event cannot create
-an automatic connection permit. The fixed configuration location determines
-storage. `[ready]` sets the minimum cumulative captured Opus duration for
-publishing a ready bundle: `3600` seconds means one hour of audio, not elapsed
-waiting time or a maximum chunk size. Publication happens after a complete
-pendant drain. Smaller drains accumulate in SQLite indefinitely until the
-minimum is reached; downstream VAD does not determine this duration.
+Replace `pendant_address` with the uppercase Bluetooth address printed by
+`bluetoothctl devices`. `bundle_min_audio_seconds` is the minimum cumulative
+captured Opus duration for publishing a ready bundle: `3600` means one hour of
+audio, not elapsed waiting time or a maximum chunk size. Publication happens
+after a complete pendant drain. Smaller drains accumulate in SQLite
+indefinitely until the minimum is reached; downstream VAD does not determine
+this duration. Automatic scanner admission defaults to 30 seconds of
+observations with no gap of 10 seconds or more before GATT opens. To tune it,
+set both optional flat keys `presence_arrival_stability_seconds` and
+`presence_arrival_max_gap_seconds`; they are omitted from the example because
+the defaults are suitable for most installations.
 The installer creates the service account, keeps the configuration root-owned
 and readable by both services as mode `0644`, and enables the service. It does not start the
 service unless `--restart` is explicit. Complete the first successful

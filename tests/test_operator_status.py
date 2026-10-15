@@ -73,7 +73,7 @@ def test_legacy_rssi_projection_rejects_malformed_observation() -> None:
 def _layout(tmp_path: Path) -> StorageLayout:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n',
+        'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
     (tmp_path / "collector").mkdir()

@@ -95,7 +95,7 @@ def _store(tmp_path: Path) -> StagingStore:
 def _layout(tmp_path: Path) -> Path:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n',
+        'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
     layout = load_operator_config(path).storage

@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from logging import getLogger
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from typing import cast
 from uuid import uuid4
@@ -20,6 +20,10 @@ from ..domain.quarantine_machine import QuarantineState
 from ..domain.ready_machine import (
     CaptureBegin,
     CaptureEnd,
+    Compacting,
+    CompactionDue,
+    CompactionFinished,
+    CompactionProbeFailed,
     Finished,
     InputChanged,
     PublicationAction,
@@ -66,6 +70,7 @@ from .ready_bundles import (
     retire_acknowledged,
     source_revision,
 )
+from .sqlite_compaction import compaction_failure_outcome, pending_compaction_generation, vacuum_pending
 from .staging_contract import (
     AttemptDescriptor,
     AttemptStateError,
@@ -158,6 +163,7 @@ class StagingStore:
         self._publication_lock = Lock()
         self._publication_state = PublicationState()
         self._ready_custody_cache: ReadyCustodyCache | None = None
+        self._compaction_interrupt = Event()
 
     @classmethod
     def from_paths(
@@ -177,6 +183,7 @@ class StagingStore:
         store._publication_lock = Lock()
         store._publication_state = PublicationState()
         store._ready_custody_cache = None
+        store._compaction_interrupt = Event()
         return store
 
     def publish_ready(self, held_lease: DeviceLock | None = None) -> ReadyOutcome:
@@ -233,7 +240,55 @@ class StagingStore:
             assert command.token is not None
             outcome, revision = self._run_publication_effect(command.token, held_lease)
             return self._finish_publication(command, revision, outcome, held_lease)
+        if command.action is PublicationAction.COMPACT:
+            return self._run_compaction(command, held_lease)
         return self._publication_outcome(command)
+
+    def _run_compaction(self, command: PublicationCommand, held_lease: DeviceLock | None) -> ReadyOutcome:
+        assert command.token is not None
+        with self._publication_lock:
+            work = self._publication_state.work
+            admitted = (
+                self._publication_state.mode is PublicationMode.AVAILABLE
+                and isinstance(work, Compacting)
+                and work.token == command.token
+            )
+        if not admitted or not isinstance(work, Compacting):
+            return ReadyOutcome(ReadyOutcomeState.WAITING, reason="capture_active")
+        try:
+            if held_lease is None:
+                with self.device_lock(operation="ready_compaction"):
+                    result = vacuum_pending(self._state_db, work.debt_generation, self._compaction_interrupt)
+            else:
+                self._filesystem.require_device_lock(held_lease)
+                result = vacuum_pending(self._state_db, work.debt_generation, self._compaction_interrupt)
+        except FatalInternalAudioStorageError:
+            raise
+        except DeviceAlreadyRunningError as error:
+            _debug_publication_failure(error, phase="ready_compaction")
+            result = "deferred"
+        except (OSError, sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as error:
+            _debug_publication_failure(error, phase="ready_compaction")
+            result = compaction_failure_outcome(error, self._compaction_interrupt)
+        outcome = ReadyOutcome(
+            ReadyOutcomeState.TRANSIENT if result == "deferred" else ReadyOutcomeState.WAITING,
+            reason=f"compaction_{result}",
+        )
+        next_command = self._publication_event(
+            CompactionFinished(
+                work.token,
+                work.debt_generation,
+                work.revision,
+                PublicationResult.TRANSIENT if result == "deferred" else PublicationResult.SETTLED,
+                monotonic(),
+                self._config.retry.rapid_backoff,
+            )
+        )
+        if next_command.action is PublicationAction.ARM:
+            return self._publication_outcome(next_command)
+        if next_command.action is PublicationAction.CHECK_INPUT:
+            return self._execute_publication_command(next_command, held_lease)
+        return outcome
 
     def _run_publication_effect(self, token: int, held_lease: DeviceLock | None) -> tuple[ReadyOutcome, object]:
         with self._publication_lock:
@@ -310,7 +365,45 @@ class StagingStore:
             return checked
         if next_command.action is PublicationAction.ARM:
             return self._publication_outcome(next_command)
+        if (
+            next_command.action is PublicationAction.NONE
+            and not outcome.retirement_pending
+            and outcome.state not in {ReadyOutcomeState.BLOCKED, ReadyOutcomeState.TRANSIENT}
+            and not self._compaction_interrupt.is_set()
+        ):
+            compacted = self._compact_after_publication(revision, held_lease)
+            if compacted is not None:
+                return compacted
         return outcome
+
+    def _compact_after_publication(self, revision: object, held_lease: DeviceLock | None) -> ReadyOutcome | None:
+        try:
+            generation = pending_compaction_generation(self._state_db)
+        except FatalInternalAudioStorageError:
+            raise
+        except (OSError, ValueError, sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as error:
+            _debug_publication_failure(error, phase="compaction_probe")
+            result = compaction_failure_outcome(error, self._compaction_interrupt)
+            if result == "interrupted":
+                return None
+            self._publication_event(CompactionProbeFailed(revision, monotonic(), self._config.retry.rapid_backoff))
+            return None
+        if generation is None or self._compaction_interrupt.is_set():
+            return None
+        compact = self._publication_event(CompactionDue(revision, generation))
+        if compact.action is PublicationAction.COMPACT:
+            result = self._execute_publication_command(compact, held_lease)
+            with self._publication_lock:
+                work = self._publication_state.work
+            # Surface a nested publication failure without replacing an already
+            # published result with the separate maintenance outcome.
+            if (
+                result.state in {ReadyOutcomeState.BLOCKED, ReadyOutcomeState.TRANSIENT}
+                and isinstance(work, (Settled, RetryWait))
+                and isinstance(work.outcome, ReadyOutcome)
+            ):
+                return result
+        return None
 
     def _publication_revision(self) -> object:
         if self._publication_root is None:
@@ -346,16 +439,23 @@ class StagingStore:
         return command.action is PublicationAction.CHECK_INPUT
 
     def publication_capture_begin(self) -> None:
+        self._compaction_interrupt.set()
         self._publication_event(CaptureBegin())
+
+    def publication_capture_intent(self) -> None:
+        """Interrupt compaction before readiness or a pending presence join."""
+        self._compaction_interrupt.set()
 
     def publication_quiesced(self) -> None:
         self._publication_event(Quiesced())
 
     def publication_capture_end(self) -> bool:
         command = self._publication_event(CaptureEnd())
+        self._compaction_interrupt = Event()
         return command.action is PublicationAction.CHECK_INPUT
 
     def publication_shutdown(self) -> None:
+        self._compaction_interrupt.set()
         self._publication_event(Shutdown())
 
     def publication_input_changed(self) -> bool:

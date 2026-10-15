@@ -783,7 +783,7 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
     python_install = deployment_root / "python"
     config_file = tmp_path / "config.toml"
     config_file.write_text(
-        '[pendant]\naddress = "12:34:56:78:9A:BC"\n[ready]\ntarget_audio_seconds = 3600.0\n',
+        'pendant_address = "12:34:56:78:9A:BC"\nbundle_min_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
     config_file.chmod(0o644)
@@ -815,7 +815,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         context = replace(context, config_file=tmp_path / "pipeline" / "omi" / "config.toml")
         context.config_file.parent.mkdir(parents=True, exist_ok=True)
         context.config_file.write_text(
-            '[pendant]\naddress = "12:34:56:78:9A:BC"\n[ready]\ntarget_audio_seconds = 3600.0\n',
+            'pendant_address = "12:34:56:78:9A:BC"\nbundle_min_audio_seconds = 3600.0\n',
             encoding="utf-8",
         )
         context.config_file.chmod(0o644)

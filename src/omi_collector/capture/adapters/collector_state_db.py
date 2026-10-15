@@ -40,6 +40,7 @@ class StateKind(StrEnum):
     QUALITY_EVENT = "quality_event"
     RUNTIME_STATUS = "runtime_status"
     QUALITY_EVENT_BUDGET = "quality_event_budget"
+    COMPACTION = "compaction"
 
 
 class StateDBError(RuntimeError):

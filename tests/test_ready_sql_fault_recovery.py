@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import threading
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from hashlib import sha256
@@ -29,6 +30,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     _TypedPage,
     finalize_typed_sources,
 )
+from omi_collector.capture.adapters.sqlite_compaction import pending_compaction_generation, vacuum_pending
 from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.internal_audio_machine import (
     AudioAction,
@@ -836,7 +838,10 @@ def _prepare_partly_retired_source(
     return source, ready
 
 
-@pytest.mark.parametrize("fault", ("rolled_back", "committed", "third_state"))
+@pytest.mark.parametrize(
+    "fault",
+    ("rolled_back", "committed", "third_state", "marker_missing", "marker_cleared"),
+)
 def test_retirement_step_reconciles_only_exact_cursor_states(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -864,20 +869,40 @@ def test_retirement_step_reconciles_only_exact_cursor_states(
                         (source.source_id,),
                     )
                     connection.commit()
+            elif fault == "marker_missing":
+                with closing(database.open_connection()) as connection:
+                    connection.execute(
+                        "DELETE FROM state WHERE kind=? AND id=?",
+                        (StateKind.COMPACTION.value, "current"),
+                    )
+            elif fault == "marker_cleared":
+                database.put(StateKind.COMPACTION, "current", {"generation": 2, "pending": False})
             raise sqlite3.DatabaseError("simulated retirement commit ambiguity")
 
         monkeypatch.setattr(ready_bundles, "_retire_typed_source_once", inject)
-        if fault == "third_state":
+        if fault in {"third_state", "marker_missing", "marker_cleared"}:
             with pytest.raises(FatalInternalAudioStorageError, match="third state"):
                 _publish(store, (), ready, frontier=102, page_limit=1)
             assert store._failed is True
             assert calls == 1
+            expected_cursor = 0 if fault == "third_state" else 2
+            assert _source_state(database, source.source_id) == ("retiring", None, expected_cursor, 0)
+            expected_marker = (
+                None
+                if fault == "marker_missing"
+                else {
+                    "generation": 2,
+                    "pending": fault != "marker_cleared",
+                }
+            )
+            assert database.get(StateKind.COMPACTION, "current") == expected_marker
             return
 
         outcome = _publish(store, (), ready, frontier=102, page_limit=1)
         assert outcome.retirement_pending is True
         assert _source_state(database, source.source_id) == ("retiring", None, 2, 0)
         assert calls == (2 if fault == "rolled_back" else 1)
+        assert database.get(StateKind.COMPACTION, "current") == {"generation": 2, "pending": True}
 
 
 def test_retirement_source_removal_reconciles_commit_then_raise(
@@ -901,3 +926,26 @@ def test_retirement_source_removal_reconciles_commit_then_raise(
 
         assert outcome.retirement_pending is True
         assert _source_state(database, source.source_id) is None
+        assert database.get(StateKind.COMPACTION, "current") == {"generation": 1, "pending": True}
+
+
+def test_compaction_ignores_retirement_blocked_by_active_cohort_member(tmp_path: Path) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(database) as store:
+        source, _ = _prepare_partly_retired_source(tmp_path, store, database)
+        database.put(StateKind.COMPACTION, "current", {"generation": 6, "pending": True})
+        with closing(database.open_connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("INSERT INTO publication_cohort(cohort_id,lifecycle) VALUES (?, 'staging')", ("b" * 32,))
+            connection.execute(
+                "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,slice_count,"
+                "admitted_lifecycle,admitted_count,admitted_sha256) VALUES (?,0,?,0,2,'sealed_waiting',2,?)",
+                ("b" * 32, source.source_id, source.source.committed_sha256),
+            )
+            connection.commit()
+
+        assert _source_state(database, source.source_id) == ("retiring", None, 1, 1)
+        assert pending_compaction_generation(database) == 6
+        assert vacuum_pending(database, 6, threading.Event()) == "done"
+        assert database.get(StateKind.COMPACTION, "current") == {"generation": 6, "pending": False}
+        assert _source_state(database, source.source_id) == ("retiring", None, 1, 1)

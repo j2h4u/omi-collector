@@ -291,6 +291,7 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         run.maintenance.schedule_publication_retry()
 
     async def before_direct_attempt() -> None:
+        run.staging.publication_capture_intent()
         await run.maintenance.ensure_publication_ready()
         await run.maintenance.run_once(lambda: False)
 

@@ -37,9 +37,7 @@ def _skip_account_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
 def _layout(tmp_path: Path) -> StorageLayout:
     tmp_path.mkdir(parents=True, exist_ok=True)
     config = tmp_path / "config.toml"
-    config.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 120\n', encoding="utf-8"
-    )
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
     layout = load_operator_config(config).storage
     layout.collector.root.mkdir()
     layout.collector.root.chmod(0o2750)
@@ -226,9 +224,7 @@ def test_cli_hot_journal_recovery_uses_exact_json_and_preserves_v1_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = tmp_path / "config.toml"
-    config.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 120\n', encoding="utf-8"
-    )
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
     layout = load_operator_config(config).storage
     layout.collector.root.mkdir()
     layout.collector.root.chmod(0o2750)
@@ -436,9 +432,7 @@ def test_check_state_migration_cli_requires_stopped_service_only_when_requested(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = tmp_path / "config.toml"
-    config.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 120\n', encoding="utf-8"
-    )
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
     monkeypatch.setattr(cli, "_require_host_singleton", lambda _loaded: None)
     monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "active"})
     calls: list[object] = []
@@ -473,9 +467,7 @@ def test_check_state_migration_reports_classified_fault_as_structured_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, exit_code: int
 ) -> None:
     config = tmp_path / "config.toml"
-    config.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 120\n', encoding="utf-8"
-    )
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
 
     def fail_inspection(*_args: object, **_kwargs: object) -> None:
         raise failure

@@ -113,6 +113,11 @@ def test_runtime_limits_must_be_positive(factory: type[object], field: str, valu
         factory(**{field: value})  # type: ignore[operator]
 
 
+def test_ready_threshold_must_fit_packet_count() -> None:
+    with pytest.raises(ValueError, match="packet threshold"):
+        ReadyConfig(target_audio_seconds=1e308)
+
+
 def test_runtime_ranges_are_coherent() -> None:
     with pytest.raises(ValueError, match="max_scan_recheck"):
         PresenceConfig(scan_recheck_seconds=31.0, max_scan_recheck_seconds=30.0)

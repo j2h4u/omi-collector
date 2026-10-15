@@ -132,9 +132,27 @@ class RetryWait:
 
 
 @dataclass(frozen=True, slots=True)
+class Compacting:
+    token: int
+    revision: object
+    generation: int
+    debt_generation: int
+    failure_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Quiescing:
+    token: int
+    revision: object
+    generation: int
+    debt_generation: int
+    failure_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class PublicationState:
     mode: PublicationMode = PublicationMode.AVAILABLE
-    work: Idle | Running | Settled | RetryWait = Idle()
+    work: Idle | Running | Settled | RetryWait | Compacting | Quiescing = Idle()
     generation: int = 0
     next_token: int = 0
     needs_check: bool = False
@@ -146,6 +164,7 @@ class PublicationAction(StrEnum):
     ARM = "arm"
     CHECK_INPUT = "check_input"
     CANCEL_AND_JOIN = "cancel_and_join"
+    COMPACT = "compact"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +172,7 @@ class PublicationCommand:
     action: PublicationAction = PublicationAction.NONE
     token: int | None = None
     deadline: float | None = None
+    debt_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +192,29 @@ class Finished:
     revision: object
     outcome: object
     result: PublicationResult
+    now: float
+    backoff: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionDue:
+    revision: object
+    debt_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionFinished:
+    token: int
+    debt_generation: int
+    revision: object
+    result: PublicationResult
+    now: float
+    backoff: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionProbeFailed:
+    revision: object
     now: float
     backoff: tuple[float, ...] = ()
 
@@ -203,7 +246,19 @@ class Quiesced:
     pass
 
 
-type PublicationEvent = Wake | InputChanged | Finished | TimerFired | CaptureBegin | CaptureEnd | Shutdown | Quiesced
+type PublicationEvent = (
+    Wake
+    | InputChanged
+    | Finished
+    | TimerFired
+    | CaptureBegin
+    | CaptureEnd
+    | Shutdown
+    | Quiesced
+    | CompactionDue
+    | CompactionFinished
+    | CompactionProbeFailed
+)
 
 
 def publication_transition(
@@ -214,6 +269,8 @@ def publication_transition(
         return _wake(state, event)
     if isinstance(event, Finished):
         return _finished(state, event)
+    if isinstance(event, (CompactionDue, CompactionFinished, CompactionProbeFailed)):
+        return _compaction_transition(state, event)
     if isinstance(event, TimerFired):
         return _timer(state, event)
     if isinstance(event, (InputChanged, CaptureBegin, CaptureEnd, Shutdown, Quiesced)):
@@ -221,24 +278,32 @@ def publication_transition(
     raise ValueError(f"unsupported publication event: {type(event).__name__}")
 
 
+def _compaction_transition(
+    state: PublicationState, event: CompactionDue | CompactionFinished | CompactionProbeFailed
+) -> tuple[PublicationState, PublicationCommand]:
+    if isinstance(event, CompactionDue):
+        return _compaction_due(state, event)
+    if isinstance(event, CompactionFinished):
+        return _compaction_finished(state, event)
+    return _compaction_probe_failed(state, event)
+
+
 def _lifecycle(
     state: PublicationState, event: InputChanged | CaptureBegin | CaptureEnd | Shutdown | Quiesced
 ) -> tuple[PublicationState, PublicationCommand]:
-    if isinstance(event, Shutdown):
-        updated = PublicationState(PublicationMode.CLOSED, state.work, state.generation + 1, state.next_token)
-        return updated, PublicationCommand(PublicationAction.CANCEL_AND_JOIN)
-    if isinstance(event, CaptureBegin):
-        if state.mode is not PublicationMode.AVAILABLE:
-            raise ValueError("capture cannot begin twice or after shutdown")
-        updated = PublicationState(PublicationMode.CAPTURE, state.work, state.generation + 1, state.next_token)
-        return updated, PublicationCommand(PublicationAction.CANCEL_AND_JOIN)
-    if isinstance(event, Quiesced):
-        return PublicationState(state.mode, Idle(), state.generation, state.next_token), PublicationCommand()
+    if isinstance(event, (Shutdown, CaptureBegin, Quiesced)):
+        return _lifecycle_boundary(state, event)
     if isinstance(event, CaptureEnd):
+        if isinstance(state.work, (Compacting, Quiescing)):
+            return state, PublicationCommand()
         if state.mode is not PublicationMode.CAPTURE:
             return state, PublicationCommand()
         updated = PublicationState(PublicationMode.AVAILABLE, Idle(), state.generation + 1, state.next_token, True)
         return updated, PublicationCommand(PublicationAction.CHECK_INPUT)
+    if isinstance(state.work, (Compacting, Quiescing)):
+        return PublicationState(
+            state.mode, state.work, state.generation + 1, state.next_token, True
+        ), PublicationCommand()
     work = state.work if isinstance(state.work, Running) else Idle()
     updated = PublicationState(state.mode, work, state.generation + 1, state.next_token, True)
     action = (
@@ -247,6 +312,28 @@ def _lifecycle(
         else PublicationAction.NONE
     )
     return updated, PublicationCommand(action)
+
+
+def _lifecycle_boundary(
+    state: PublicationState, event: Shutdown | CaptureBegin | Quiesced
+) -> tuple[PublicationState, PublicationCommand]:
+    if isinstance(event, Shutdown):
+        work = _quiescing(state.work)
+        updated = PublicationState(
+            PublicationMode.CLOSED,
+            work,
+            state.generation + (state.mode is not PublicationMode.CLOSED),
+            state.next_token,
+        )
+        return updated, PublicationCommand(PublicationAction.CANCEL_AND_JOIN)
+    if isinstance(event, CaptureBegin):
+        if state.mode is not PublicationMode.AVAILABLE:
+            raise ValueError("capture cannot begin twice or after shutdown")
+        updated = PublicationState(
+            PublicationMode.CAPTURE, _quiescing(state.work), state.generation + 1, state.next_token
+        )
+        return updated, PublicationCommand(PublicationAction.CANCEL_AND_JOIN)
+    return PublicationState(state.mode, Idle(), state.generation, state.next_token), PublicationCommand()
 
 
 def _finished(state: PublicationState, event: Finished) -> tuple[PublicationState, PublicationCommand]:
@@ -276,6 +363,73 @@ def _finished(state: PublicationState, event: Finished) -> tuple[PublicationStat
     raise ValueError(f"unsupported publication result: {event.result!r}")
 
 
+def _quiescing(work: Idle | Running | Settled | RetryWait | Compacting | Quiescing):
+    if isinstance(work, Compacting):
+        return Quiescing(work.token, work.revision, work.generation, work.debt_generation, work.failure_count)
+    return work
+
+
+def _compaction_due(state: PublicationState, event: CompactionDue) -> tuple[PublicationState, PublicationCommand]:
+    if state.mode is not PublicationMode.AVAILABLE or not isinstance(state.work, (Idle, Settled)):
+        return state, PublicationCommand()
+    token = state.next_token + 1
+    work = Compacting(token, event.revision, state.generation, event.debt_generation)
+    return PublicationState(state.mode, work, state.generation, token, state.needs_check), PublicationCommand(
+        PublicationAction.COMPACT, token=token, debt_generation=event.debt_generation
+    )
+
+
+def _compaction_finished(
+    state: PublicationState, event: CompactionFinished
+) -> tuple[PublicationState, PublicationCommand]:
+    work = state.work
+    if not isinstance(work, (Compacting, Quiescing)) or work.token != event.token:
+        return state, PublicationCommand()
+    if isinstance(work, Quiescing) or state.mode is not PublicationMode.AVAILABLE:
+        return state, PublicationCommand()
+    if work.debt_generation != event.debt_generation or work.revision != event.revision:
+        return PublicationState(state.mode, Idle(), state.generation, state.next_token, True), PublicationCommand(
+            PublicationAction.CHECK_INPUT
+        )
+    if event.result is PublicationResult.TRANSIENT:
+        delay = event.backoff[min(work.failure_count, len(event.backoff) - 1)] if event.backoff else 1.0
+        deadline = event.now + delay
+        return PublicationState(
+            state.mode,
+            RetryWait(event.revision, event.result, deadline, work.failure_count + 1),
+            state.generation,
+            state.next_token,
+        ), PublicationCommand(PublicationAction.ARM, deadline=deadline)
+    if event.result is PublicationResult.SETTLED:
+        if work.generation != state.generation or state.needs_check:
+            return PublicationState(
+                state.mode,
+                Settled(event.revision, event.result),
+                state.generation,
+                state.next_token,
+                True,
+            ), PublicationCommand(PublicationAction.CHECK_INPUT)
+        return PublicationState(
+            state.mode, Settled(event.revision, event.result), state.generation, state.next_token
+        ), PublicationCommand()
+    raise ValueError(f"unsupported publication result: {event.result!r}")
+
+
+def _compaction_probe_failed(
+    state: PublicationState, event: CompactionProbeFailed
+) -> tuple[PublicationState, PublicationCommand]:
+    if state.mode is not PublicationMode.AVAILABLE or not isinstance(state.work, (Idle, Settled)):
+        return state, PublicationCommand()
+    delay = event.backoff[0] if event.backoff else 1.0
+    deadline = event.now + delay
+    return PublicationState(
+        state.mode,
+        RetryWait(event.revision, PublicationResult.TRANSIENT, deadline, 1),
+        state.generation,
+        state.next_token,
+    ), PublicationCommand(PublicationAction.ARM, deadline=deadline)
+
+
 def _timer(state: PublicationState, event: TimerFired) -> tuple[PublicationState, PublicationCommand]:
     work = state.work
     if not isinstance(work, RetryWait) or state.mode is not PublicationMode.AVAILABLE:
@@ -290,6 +444,8 @@ def _timer(state: PublicationState, event: TimerFired) -> tuple[PublicationState
 
 def _wake(state: PublicationState, event: Wake) -> tuple[PublicationState, PublicationCommand]:
     if state.mode is not PublicationMode.AVAILABLE:
+        return state, PublicationCommand()
+    if isinstance(state.work, (Compacting, Quiescing)):
         return state, PublicationCommand()
     if event.revision is None:
         return _wake_unprobed(state, event.now)
@@ -314,6 +470,8 @@ def _wake_probed(state: PublicationState, event: Wake) -> tuple[PublicationState
             ), PublicationCommand()
         return state, PublicationCommand()
     if isinstance(work, Settled) and event.revision == work.revision:
+        if state.needs_check:
+            return PublicationState(state.mode, work, state.generation, state.next_token), PublicationCommand()
         return state, PublicationCommand()
     if isinstance(work, RetryWait) and event.revision == work.revision and event.now < work.deadline:
         return state, PublicationCommand(PublicationAction.ARM, deadline=work.deadline)

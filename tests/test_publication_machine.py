@@ -10,6 +10,10 @@ import pytest
 from omi_collector.capture.domain.ready_machine import (
     CaptureBegin,
     CaptureEnd,
+    Compacting,
+    CompactionDue,
+    CompactionFinished,
+    CompactionProbeFailed,
     Finished,
     Idle,
     InputChanged,
@@ -19,6 +23,7 @@ from omi_collector.capture.domain.ready_machine import (
     PublicationResult,
     PublicationState,
     Quiesced,
+    Quiescing,
     RetryWait,
     Running,
     Settled,
@@ -28,7 +33,7 @@ from omi_collector.capture.domain.ready_machine import (
     publication_transition,
 )
 
-type PublicationWork = Idle | Running | Settled | RetryWait
+type PublicationWork = Idle | Running | Settled | RetryWait | Compacting | Quiescing
 
 
 def test_declared_work_states_admit_only_the_expected_wake_action() -> None:
@@ -113,6 +118,9 @@ def test_publication_event_work_and_result_inventories_are_explicit() -> None:
         Wake,
         InputChanged,
         Finished,
+        CompactionDue,
+        CompactionFinished,
+        CompactionProbeFailed,
         TimerFired,
         CaptureBegin,
         CaptureEnd,
@@ -123,7 +131,7 @@ def test_publication_event_work_and_result_inventories_are_explicit() -> None:
     production_work = set(get_args(get_type_hints(PublicationState)["work"]))
 
     assert production_events == event_types
-    assert production_work == {Idle, Running, Settled, RetryWait}
+    assert production_work == {Idle, Running, Settled, RetryWait, Compacting, Quiescing}
     assert {type(event) for event in _matrix_events(object())} == production_events
     assert {type(work) for _name, work in _matrix_work_phases(object())} == production_work
     assert tuple(PublicationResult) == (PublicationResult.SETTLED, PublicationResult.TRANSIENT)
@@ -150,11 +158,14 @@ def _matrix_events(outcome: object) -> tuple[PublicationEvent, ...]:
         Wake("rev", 4.0),
         InputChanged(),
         Finished(3, "rev", outcome, PublicationResult.SETTLED, 5.0),
+        CompactionDue("rev", 7),
+        CompactionFinished(3, 7, "rev", PublicationResult.SETTLED, 5.0),
         TimerFired(0, 5.0, 5.0),
         CaptureBegin(),
         CaptureEnd(),
         Shutdown(),
         Quiesced(),
+        CompactionProbeFailed("rev", 5.0, (2.0,)),
     )
 
 
@@ -164,6 +175,8 @@ def _matrix_work_phases(outcome: object) -> tuple[tuple[str, PublicationWork], .
         ("running", Running(3, "rev", 0)),
         ("settled", Settled("rev", outcome)),
         ("retry-wait", RetryWait("rev", outcome, 5.0, 1)),
+        ("compacting", Compacting(3, "rev", 0, 7)),
+        ("quiescing", Quiescing(3, "rev", 0, 7)),
     )
 
 
@@ -173,26 +186,105 @@ def _matrix_expected_actions() -> dict[tuple[PublicationMode, str], tuple[Public
     check = PublicationAction.CHECK_INPUT
     run = PublicationAction.RUN
     arm = PublicationAction.ARM
+    compact = PublicationAction.COMPACT
     invalid = None
     # Each row lists independent expected commands in event order above.
     return {
-        (PublicationMode.AVAILABLE, "idle"): (run, check, none, none, cancel, none, cancel, none),
-        (PublicationMode.AVAILABLE, "running"): (none, none, none, none, cancel, none, cancel, none),
-        (PublicationMode.AVAILABLE, "settled"): (none, check, none, none, cancel, none, cancel, none),
-        (PublicationMode.AVAILABLE, "retry-wait"): (arm, check, none, check, cancel, none, cancel, none),
-        (PublicationMode.CAPTURE, "idle"): (none, none, none, none, invalid, check, cancel, none),
-        (PublicationMode.CAPTURE, "running"): (none, none, none, none, invalid, check, cancel, none),
-        (PublicationMode.CAPTURE, "settled"): (none, none, none, none, invalid, check, cancel, none),
-        (PublicationMode.CAPTURE, "retry-wait"): (none, none, none, none, invalid, check, cancel, none),
-        (PublicationMode.CLOSED, "idle"): (none, none, none, none, invalid, none, cancel, none),
-        (PublicationMode.CLOSED, "running"): (none, none, none, none, invalid, none, cancel, none),
-        (PublicationMode.CLOSED, "settled"): (none, none, none, none, invalid, none, cancel, none),
-        (PublicationMode.CLOSED, "retry-wait"): (none, none, none, none, invalid, none, cancel, none),
+        (PublicationMode.AVAILABLE, "idle"): (run, check, none, compact, none, none, cancel, none, cancel, none, arm),
+        (PublicationMode.AVAILABLE, "running"): (none, none, none, none, none, none, cancel, none, cancel, none, none),
+        (PublicationMode.AVAILABLE, "settled"): (
+            none,
+            check,
+            none,
+            compact,
+            none,
+            none,
+            cancel,
+            none,
+            cancel,
+            none,
+            arm,
+        ),
+        (PublicationMode.AVAILABLE, "retry-wait"): (
+            arm,
+            check,
+            none,
+            none,
+            none,
+            check,
+            cancel,
+            none,
+            cancel,
+            none,
+            none,
+        ),
+        (PublicationMode.AVAILABLE, "compacting"): (
+            none,
+            none,
+            none,
+            none,
+            none,
+            none,
+            cancel,
+            none,
+            cancel,
+            none,
+            none,
+        ),
+        (PublicationMode.AVAILABLE, "quiescing"): (
+            none,
+            none,
+            none,
+            none,
+            none,
+            none,
+            cancel,
+            none,
+            cancel,
+            none,
+            none,
+        ),
+        (PublicationMode.CAPTURE, "idle"): (none, none, none, none, none, none, invalid, check, cancel, none, none),
+        (PublicationMode.CAPTURE, "running"): (none, none, none, none, none, none, invalid, check, cancel, none, none),
+        (PublicationMode.CAPTURE, "settled"): (none, none, none, none, none, none, invalid, check, cancel, none, none),
+        (PublicationMode.CAPTURE, "retry-wait"): (
+            none,
+            none,
+            none,
+            none,
+            none,
+            none,
+            invalid,
+            check,
+            cancel,
+            none,
+            none,
+        ),
+        (PublicationMode.CAPTURE, "compacting"): (
+            none,
+            none,
+            none,
+            none,
+            none,
+            none,
+            invalid,
+            none,
+            cancel,
+            none,
+            none,
+        ),
+        (PublicationMode.CAPTURE, "quiescing"): (none, none, none, none, none, none, invalid, none, cancel, none, none),
+        (PublicationMode.CLOSED, "idle"): (none, none, none, none, none, none, invalid, none, cancel, none, none),
+        (PublicationMode.CLOSED, "running"): (none, none, none, none, none, none, invalid, none, cancel, none, none),
+        (PublicationMode.CLOSED, "settled"): (none, none, none, none, none, none, invalid, none, cancel, none, none),
+        (PublicationMode.CLOSED, "retry-wait"): (none, none, none, none, none, none, invalid, none, cancel, none, none),
+        (PublicationMode.CLOSED, "compacting"): (none, none, none, none, none, none, invalid, none, cancel, none, none),
+        (PublicationMode.CLOSED, "quiescing"): (none, none, none, none, none, none, invalid, none, cancel, none, none),
     }
 
 
 def _evaluate_lifecycle_matrix() -> tuple[int, int]:
-    """Evaluate 96 representative cells, including explicit invalid lifecycle inputs."""
+    """Evaluate 198 mode, phase, and event cells against independent expectations."""
     events = _matrix_events(object())
     expected = _matrix_expected_actions()
     invalid = None
@@ -215,11 +307,121 @@ def _evaluate_lifecycle_matrix() -> tuple[int, int]:
 
 
 def test_bounded_lifecycle_matrix_covers_all_mode_work_and_event_cells() -> None:
-    """Direct representative states cover 3 modes x 4 work phases x 8 event families."""
+    """Direct representative states cover 3 modes x 6 work phases x 11 event families."""
     successful_cells, invalid_cells = _evaluate_lifecycle_matrix()
-    assert successful_cells == 88
-    assert invalid_cells == 8
-    assert successful_cells + invalid_cells == 96
+    assert successful_cells == 186
+    assert invalid_cells == 12
+    assert successful_cells + invalid_cells == 198
+
+
+def test_compaction_admission_settlement_retry_and_stale_completion() -> None:
+    started, command = publication_transition(PublicationState(), CompactionDue("rev", 8))
+    assert command.action is PublicationAction.COMPACT
+    assert (command.token, command.debt_generation) == (1, 8)
+    assert started.work == Compacting(1, "rev", 0, 8)
+
+    for event in (Wake("other", 1.0), Wake(None, 1.0), InputChanged(), CompactionDue("rev", 8)):
+        unchanged, command = publication_transition(started, event)
+        assert command.action is PublicationAction.NONE
+        assert unchanged.work == started.work
+
+    stale, command = publication_transition(started, CompactionFinished(2, 8, "rev", PublicationResult.SETTLED, 2.0))
+    assert stale is started and command.action is PublicationAction.NONE
+
+    changed_debt, command = publication_transition(
+        started, CompactionFinished(1, 9, "rev", PublicationResult.SETTLED, 2.0)
+    )
+    assert command.action is PublicationAction.CHECK_INPUT
+    assert isinstance(changed_debt.work, Idle)
+
+    retry, command = publication_transition(
+        started, CompactionFinished(1, 8, "rev", PublicationResult.TRANSIENT, 2.0, (3.0,))
+    )
+    assert command.action is PublicationAction.ARM and command.deadline == 5.0
+    assert isinstance(retry.work, RetryWait) and retry.work.failure_count == 1
+
+    settled, command = publication_transition(started, CompactionFinished(1, 8, "rev", PublicationResult.SETTLED, 2.0))
+    assert command.action is PublicationAction.NONE
+    assert settled.work == Settled("rev", PublicationResult.SETTLED)
+
+
+def test_compaction_probe_failure_uses_existing_retry_wait() -> None:
+    event = CompactionProbeFailed("rev", 4.0, (2.5, 5.0))
+    for work in (Idle(), Settled("rev", "published")):
+        state = PublicationState(work=work)
+        retry, command = publication_transition(state, event)
+        assert command.action is PublicationAction.ARM and command.deadline == 6.5
+        assert retry.work == RetryWait("rev", PublicationResult.TRANSIENT, 6.5, 1)
+
+
+def test_compaction_completion_checks_for_input_changed_during_work() -> None:
+    compacting, _ = publication_transition(PublicationState(), CompactionDue("rev", 8))
+    dirty, command = publication_transition(compacting, InputChanged())
+    assert isinstance(dirty.work, Compacting)
+    assert command.action is PublicationAction.NONE and dirty.needs_check
+
+    settled, command = publication_transition(dirty, CompactionFinished(1, 8, "rev", PublicationResult.SETTLED, 2.0))
+    assert command.action is PublicationAction.CHECK_INPUT
+    assert settled.mode is PublicationMode.AVAILABLE
+    assert settled.work == Settled("rev", PublicationResult.SETTLED)
+    assert settled.needs_check
+
+    compacting, _ = publication_transition(PublicationState(), CompactionDue("rev", 8))
+    dirty, _ = publication_transition(compacting, InputChanged())
+    waiting, command = publication_transition(
+        dirty, CompactionFinished(1, 8, "rev", PublicationResult.TRANSIENT, 2.0, (3.0,))
+    )
+    assert command.action is PublicationAction.ARM and command.deadline == 5.0
+    assert isinstance(waiting.work, RetryWait)
+    assert not waiting.needs_check
+
+    due, command = publication_transition(waiting, TimerFired(waiting.generation, 5.0, 5.0))
+    assert command.action is PublicationAction.CHECK_INPUT
+    assert due.needs_check
+
+
+def test_same_revision_wake_consumes_deferred_check_but_changed_revision_runs() -> None:
+    compacting, _ = publication_transition(PublicationState(), CompactionDue("rev", 8))
+    dirty, _ = publication_transition(compacting, InputChanged())
+    settled, command = publication_transition(dirty, CompactionFinished(1, 8, "rev", PublicationResult.SETTLED, 2.0))
+    assert command.action is PublicationAction.CHECK_INPUT and settled.needs_check
+
+    checked, command = publication_transition(settled, Wake("rev", 3.0))
+    assert command.action is PublicationAction.NONE
+    assert checked.work == settled.work
+    assert not checked.needs_check
+
+    changed, command = publication_transition(checked, Wake("new-rev", 4.0))
+    assert command.action is PublicationAction.RUN
+    assert isinstance(changed.work, Running)
+    assert changed.work.revision == "new-rev"
+
+
+def test_capture_quiesces_compaction_and_shutdown_cancellation_is_idempotent() -> None:
+    compacting, _ = publication_transition(PublicationState(), CompactionDue("rev", 8))
+    capturing, command = publication_transition(compacting, CaptureBegin())
+    assert capturing.mode is PublicationMode.CAPTURE
+    assert capturing.work == Quiescing(1, "rev", 0, 8)
+    assert command.action is PublicationAction.CANCEL_AND_JOIN
+
+    repeated, command = publication_transition(capturing, Shutdown())
+    assert repeated.mode is PublicationMode.CLOSED
+    assert repeated.work == capturing.work
+    assert command.action is PublicationAction.CANCEL_AND_JOIN
+    again, command = publication_transition(repeated, Shutdown())
+    assert again == repeated
+    assert command.action is PublicationAction.CANCEL_AND_JOIN
+
+    finished, command = publication_transition(
+        repeated, CompactionFinished(1, 8, "rev", PublicationResult.SETTLED, 2.0)
+    )
+    assert finished.mode is PublicationMode.CLOSED
+    assert finished.work is repeated.work
+    assert command.action is PublicationAction.NONE
+
+    quiesced, command = publication_transition(repeated, Quiesced())
+    assert quiesced.mode is PublicationMode.CLOSED and isinstance(quiesced.work, Idle)
+    assert command.action is PublicationAction.NONE
 
 
 def test_running_work_is_single_token_and_stale_completion_requests_one_input_check() -> None:

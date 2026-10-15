@@ -24,9 +24,7 @@ from omi_collector.storage_layout import StorageLayout, load_operator_config
 
 def _layout(tmp_path: Path) -> StorageLayout:
     config = tmp_path / "config.toml"
-    config.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 120\n', encoding="utf-8"
-    )
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
     return load_operator_config(config).storage
 
 

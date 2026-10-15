@@ -9,7 +9,7 @@ from pathlib import Path
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.storage_layout import load_operator_config
 
-_CONFIG = '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n'
+_CONFIG = 'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 3600.0\n'
 
 
 def test_product_namespace_is_importable() -> None:

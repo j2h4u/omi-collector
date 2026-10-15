@@ -56,7 +56,7 @@ def _capture_root(tmp_path: Path) -> Path:
 def _layout(tmp_path: Path) -> Path:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n',
+        'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
     layout = load_operator_config(path).storage
@@ -102,7 +102,7 @@ def test_mutating_cli_rejects_alternate_root_for_same_adapter_with_different_pen
     alternate = tmp_path / "alternate" / "config.toml"
     alternate.parent.mkdir()
     alternate.write_text(
-        '[pendant]\naddress = "11:22:33:44:55:66"\n[ready]\ntarget_audio_seconds = 3600.0\n',
+        'pendant_address = "11:22:33:44:55:66"\nbundle_min_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", installed)
@@ -346,7 +346,7 @@ def test_health_command_reports_ok() -> None:
 def test_staging_keeps_raw_drafts_inside_collector_state(tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     config_path.write_text(
-        '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 123.0\n',
+        'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 123.0\n',
         encoding="utf-8",
     )
     store = cli._staging(load_operator_config(config_path))

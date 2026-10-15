@@ -196,7 +196,10 @@ outcome and termination-class breakdowns, and the confirmed-loss event, record,
 and raw-byte totals (`confirmed_loss_events`, `confirmed_lost_records`, and
 `confirmed_lost_raw_bytes`). Use `device metrics` for the publication
 inventory alone and `journalctl -u omi-collector.service` when the summary
-needs more context.
+needs more context. `device status` and `device metrics` validate READY
+manifests, file types, and exact file sizes without opening audio payloads.
+Publication, reuse, and retirement verify payload hashes automatically at
+their custody boundaries.
 
 For subsequent updates, select the reviewed revision in the production
 checkout and run:

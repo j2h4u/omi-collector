@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from itertools import pairwise
 from multiprocessing import get_context
 from multiprocessing.connection import Connection
@@ -325,15 +326,9 @@ def test_ready_bundle_rejects_malformed_draft_hash_even_when_identity_matches(tm
         collect_spool_metrics(tmp_path)
 
 
-@pytest.mark.parametrize("mismatch", ["size", "hash"])
-def test_ready_bundle_rejects_each_records_manifest_mismatch(tmp_path: Path, mismatch: str) -> None:
+def test_ordinary_metrics_rejects_wrong_raw_size_without_opening_payload(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, "invalid", (_record(1),))
-    if mismatch == "size":
-        (bundle / "records.bin").write_bytes(b"short")
-        actual_hash = hashlib.sha256(b"short").hexdigest()
-        _rewrite_manifest(bundle, records_sha256=actual_hash)
-    else:
-        (bundle / "records.bin").write_bytes(_record(2))
+    (bundle / "records.bin").write_bytes(b"short")
 
     with pytest.raises(SpoolMetricsError, match=r"records\.bin does not match manifest"):
         collect_spool_metrics(tmp_path)
@@ -473,24 +468,26 @@ def test_conflicting_overlapping_ranges_fail_closed(tmp_path: Path) -> None:
         collect_spool_metrics(tmp_path)
 
 
-def test_bundle_validation_streams_records_instead_of_reading_all_bytes(
+def test_ordinary_metrics_does_not_open_any_ready_payload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    device = tmp_path
-    _bundle(device, "first", (_record(1), _record(2)))
-    original_read_bytes = Path.read_bytes
+    _bundle(tmp_path, "first", (_record(1), _record(2)))
+    _bundle(tmp_path, "second", (_record(3),), start=12)
+    original_open = Path.open
 
-    def guarded_read_bytes(path: Path) -> bytes:
+    def guarded_open(path: Path, *args: object, **kwargs: object) -> object:
         if path.name == "records.bin":
-            raise AssertionError("records.bin must be hashed as a bounded stream")
-        return original_read_bytes(path)
+            raise AssertionError("ordinary metrics must not open records.bin")
+        return cast(Callable[..., object], original_open)(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    monkeypatch.setattr(Path, "open", guarded_open)
 
     result = collect_spool_metrics(tmp_path)
 
-    assert result.current_window.downloaded_records == 2
+    assert result.current_window.bundle_count == 2
+    assert result.current_window.downloaded_records == 3
+    assert result.current_window.downloaded_raw_bytes == 3 * RECORD_SIZE
 
 
 def test_partial_and_symlink_artifacts_are_not_counted(tmp_path: Path) -> None:

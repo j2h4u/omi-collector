@@ -17,7 +17,6 @@ from omi_collector.capture.adapters.firmware_observations import (
 )
 from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, _validate_ready_ranges
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
-from omi_collector.config import DEFAULT_CONFIG
 
 _SHA256_HEX_LENGTH = 64
 
@@ -28,7 +27,7 @@ class SpoolMetricsError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class SpoolWindowMetrics:
-    """Metrics derived from one explicit set of authenticated bundles."""
+    """Metrics derived from one explicit set of validated visible bundles."""
 
     bundle_count: int
     downloaded_records: int
@@ -110,7 +109,7 @@ def collect_spool_metrics(
     *,
     state_db: StateDB | None = None,
 ) -> SpoolMetrics:
-    """Report only authenticated raw bundles visible in the capture root."""
+    """Report visible bundle metadata without reading raw audio payloads."""
     _require_directory(publication_root, "publication root")
     try:
         observations = read_firmware_observations(state_db) if state_db is not None else ()
@@ -165,9 +164,8 @@ def _read_bundle_artifact(path: Path) -> _BundleMeasurement:
 def _read_manifest_and_raw(path: Path) -> _ReadyManifest:
     manifest = _ready_manifest(path)
     raw_path = path / "records.bin"
-    _require_regular_file(raw_path, "records.bin")
-    raw_size, calculated_hash = _stream_size_and_hash(raw_path)
-    if raw_size != manifest.record_count * RECORD_SIZE or calculated_hash != manifest.records_sha256:
+    raw_size = _require_regular_file(raw_path, "records.bin")
+    if raw_size != manifest.record_count * RECORD_SIZE:
         raise SpoolMetricsError(f"records.bin does not match manifest: {path}")
     return manifest
 
@@ -228,19 +226,6 @@ def _sha256(value: object) -> bool:
         and len(value) == _SHA256_HEX_LENGTH
         and all(character in "0123456789abcdef" for character in value)
     )
-
-
-def _stream_size_and_hash(path: Path) -> tuple[int, str]:
-    digest = sha256()
-    size = 0
-    try:
-        with path.open("rb") as raw:
-            while chunk := raw.read(DEFAULT_CONFIG.durability.io_chunk_bytes):
-                size += len(chunk)
-                digest.update(chunk)
-    except OSError as error:
-        raise SpoolMetricsError(f"records.bin is unreadable: {path.parent}") from error
-    return size, digest.hexdigest()
 
 
 def _aggregate_window(measurements: tuple[_BundleMeasurement, ...]) -> SpoolWindowMetrics:
@@ -334,13 +319,14 @@ def _require_directory(path: Path, label: str) -> None:
         raise SpoolMetricsError(f"{label} must be a regular directory: {path}")
 
 
-def _require_regular_file(path: Path, label: str) -> None:
+def _require_regular_file(path: Path, label: str) -> int:
     try:
-        mode = path.lstat().st_mode
+        info = path.lstat()
     except OSError as error:
         raise SpoolMetricsError(f"{label} is missing or unreadable: {path}") from error
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise SpoolMetricsError(f"{label} must be a regular file: {path}")
+    return info.st_size
 
 
 def _regular_file(path: Path) -> bool:

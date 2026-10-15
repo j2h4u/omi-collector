@@ -433,6 +433,11 @@ and the retained recent quality-event window in the shared StateDB:
 sudo -n /usr/local/sbin/omi-collector-status
 ```
 
+Routine status and `device metrics` validate READY manifest structure, identity,
+file type, and exact payload size without reading `records.bin`; their counts
+describe visible metadata. Publication, reuse, and retirement automatically
+verify payload hashes at their custody boundaries.
+
 The operational snapshot stores low-rate `unknown`, `clear`, or `blocked`
 states for quality, publication, and clock health in the shared StateDB. It is
 scoped to the host boot ID and systemd invocation ID: a new identity degrades

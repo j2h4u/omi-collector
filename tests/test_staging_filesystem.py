@@ -87,18 +87,47 @@ def test_storage_preflight_rejects_existing_non_directory_root(tmp_path: Path) -
         store.preflight_storage()
 
 
-def test_storage_preflight_creates_and_durably_probes_missing_roots(tmp_path: Path) -> None:
+def test_storage_preflight_leaves_missing_private_roots_absent(tmp_path: Path) -> None:
     spool = tmp_path / "collector"
     capture_root = tmp_path / "pipeline" / "raw"
 
     StagingStore(spool, capture_root).preflight_storage()
 
     assert spool.is_dir()
-    assert (spool / "attempts").is_dir()
-    assert (spool / "quarantine").is_dir()
-    assert capture_root.is_dir()
+    assert not (spool / "attempts").exists()
+    assert not (spool / "quarantine").exists()
+    assert not capture_root.exists()
     assert not tuple(spool.glob(".storage-preflight-*.tmp"))
-    assert not tuple(capture_root.glob(".storage-preflight-*.tmp"))
+
+
+@pytest.mark.parametrize("root_name", ["attempts", "quarantine", "draft"])
+def test_storage_preflight_rejects_legacy_private_root_symlink(tmp_path: Path, root_name: str) -> None:
+    spool = tmp_path / "collector"
+    capture_root = tmp_path / "draft"
+    spool.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    root = capture_root if root_name == "draft" else spool / root_name
+    root.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(StagingError, match=r"must (?:be a real directory|not be a symlink)"):
+        StagingStore(spool, capture_root).preflight_storage()
+
+
+def test_storage_preflight_preserves_existing_legacy_private_files(tmp_path: Path) -> None:
+    spool = tmp_path / "collector"
+    capture_root = tmp_path / "draft"
+    spool.mkdir()
+    attempts = spool / "attempts"
+    attempts.mkdir()
+    source = attempts / "pending-source"
+    source.write_bytes(b"legacy attempt")
+
+    StagingStore(spool, capture_root).preflight_storage()
+
+    assert source.read_bytes() == b"legacy attempt"
+    assert not (spool / "quarantine").exists()
+    assert not capture_root.exists()
 
 
 def test_storage_preflight_rejects_unwritable_directory_and_preserves_cause(tmp_path: Path) -> None:

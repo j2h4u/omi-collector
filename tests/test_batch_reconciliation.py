@@ -184,7 +184,7 @@ async def test_cursor_ahead_with_metrics_disabled_has_no_metrics_error_event(tmp
         assert terminal_source.lifecycle == "sealed_waiting"
         assert terminal_source.committed_count == 1
         assert attempt_records(store, descriptor.attempt_id) == (_record(100),)
-        assert not tuple(store.capture_root.iterdir())
+        assert not store.capture_root.exists() or not tuple(store.capture_root.iterdir())
     finally:
         await _close_real_writers(runtime)
         await session.close()
@@ -246,7 +246,7 @@ def test_absence_publishes_authenticated_partial_and_closes_visit(tmp_path: Path
     assert reconciler.pending_descriptor is None
     assert reconciler.pending_durable_next is None
     assert reconciler.durable_progress() == 0
-    assert not tuple(store.capture_root.iterdir())
+    assert not store.capture_root.exists() or not tuple(store.capture_root.iterdir())
 
 
 @_async_test
@@ -278,7 +278,7 @@ async def test_empty_positive_admission_cancellation_creates_no_absence_closure(
         await reconciler.close_visit("absence")
         assert reconciler.durable_progress() == 0
         assert closure_payload(store) is None
-        assert not tuple(store.capture_root.iterdir())
+        assert not store.capture_root.exists() or not tuple(store.capture_root.iterdir())
         assert not runtime.proxies[0].thread.is_alive()
         with store.device_lock():
             pass
@@ -695,7 +695,7 @@ async def test_confirmed_loss_write_failure_preserves_unpublished_audio(
     assert store.pending_attempts() == (descriptor,)
     assert attempt_source(store, descriptor.attempt_id) == replace(source_before, lifecycle="interrupted")
     assert attempt_records(store, descriptor.attempt_id) == records_before
-    assert not tuple(store.capture_root.iterdir())
+    assert not store.capture_root.exists() or not tuple(store.capture_root.iterdir())
 
 
 class _LossMetrics:
@@ -775,7 +775,7 @@ async def test_collect_only_adopts_seal_completed_before_ack_timeout(tmp_path: P
         assert source.committed_count == adopted.record_count == 2
         assert source.committed_sha256 == adopted.raw_sha256
         assert attempt_records(store, adopted.source_id) == (_record(100), _record(101))
-        assert not tuple(store.capture_root.iterdir())
+        assert not store.capture_root.exists() or not tuple(store.capture_root.iterdir())
         assert not runtime_writer.thread.is_alive()
     finally:
         await _close_real_writers(runtime)
@@ -808,7 +808,7 @@ async def test_fresh_info_regression_keeps_sealed_batch_without_advance(tmp_path
         assert source.lifecycle == "sealed_waiting"
         assert source.committed_count == 2
         assert attempt_records(store, source_id) == (_record(100), _record(101))
-        assert not tuple(store.capture_root.iterdir())
+        assert not store.capture_root.exists() or not tuple(store.capture_root.iterdir())
     finally:
         await _close_real_writers(runtime)
         await session.close()

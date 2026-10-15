@@ -7,7 +7,10 @@ address = "AA:BB:CC:DD:EE:FF"
 arrival_stability_seconds = 30.0
 arrival_max_gap_seconds = 10.0
 
-# Minimum retained Opus audio after a confirmed complete drain. Smaller
-# downloads accumulate across visits; no age-based flush exists.
+# Publish a ready bundle after a complete pendant drain once captured Opus
+# audio reaches this cumulative minimum (3600 seconds = 1 hour). This is not
+# elapsed wait time or a maximum chunk size; smaller drains accumulate in
+# SQLite indefinitely. VAD processing happens downstream and does not set
+# this duration.
 [ready]
 target_audio_seconds = 3600.0

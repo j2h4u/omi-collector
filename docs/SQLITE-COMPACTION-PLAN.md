@@ -1,15 +1,29 @@
 # SQLite compaction plan
 
-**Status: implementation and five local gates passed at commit
-`2c5cbf1d3d915b600e8a50ab3c8384c580cf46ca`. Installation and automatic live
-compaction and the complete next pendant transfer passed on 2026-10-15.
-Physical slow-disk timing and remote PR, CI, and release gates remain pending.**
+**Status: the implementation candidate at `2c5cbf1d3d915b600e8a50ab3c8384c580cf46ca`
+passed live compaction and follow-on capture acceptance on 2026-10-15. The
+final flat-configuration source candidate at `1a8e72aef1701d47bd86477a955321b1a43748fc`
+passed all five local gates and was installed successfully at 15:12 UTC on
+2026-10-15. Remote PR, CI, and release gates remain pending.**
 The pre-compaction production snapshot measured 177.39 MiB, with 174.59 MiB on
 SQLite's freelist and 2.8 MiB used.
 
 The candidate Docker image is
 `sha256:e1b498cc3e21e63744abd94d6ed0056f94f40bcd89de83371aa3141be9ae56f7`.
 The retained local QA receipt is `/var/tmp/omi19-full-qa.y3MjI5gZ/ram-final-qa.log`.
+
+The final source candidate requires `pendant_address` and
+`bundle_min_audio_seconds` in the flat TOML config, preserves the optional flat
+presence pair and its defaults, and rejects derived audio-threshold overflow.
+`just verify` passed at `1a8e72aef1701d47bd86477a955321b1a43748fc`: `just check`,
+`just crap-check`, `just unit`, `just docker-build`, and `just runtime-smoke`.
+The CRAP and unit runs reported 2,463 passed and 5 skipped; CRAP passed for
+1,968 functions. Their durations were 288.03 and 77.68 seconds. The built
+image digest is
+`sha256:002c1ceec5fc7de96b1a15e58af1e8efc2b3c02e9b0ea8da03c912a6f40b2fa1`;
+the receipt is `/var/tmp/omi19-full-qa.y3MjI5gZ/flat-corrected-qa.log`. The
+live receipt below records the first compaction on `2c5cbf1`; the final
+flat-configuration candidate was installed and revalidated separately below.
 
 ## Live candidate receipt
 
@@ -34,6 +48,21 @@ completed the next pendant transfer: 1,429 records, 634,476 bytes, and
 8. Service status remained healthy and all clear. This confirms capture after
 completed VACUUM; it does not exercise capture arrival during VACUUM or
 establish physical slow-disk timing.
+
+## Final flat-configuration candidate receipt
+
+The final source candidate was installed at 2026-10-15 15:12 UTC. The service
+is active and running as PID 3734089 with zero restarts. The installed flat
+`/srv/pipelines/omi/config.toml` contains the required `pendant_address` and
+`bundle_min_audio_seconds = 3600` keys, with comments; the optional flat
+presence pair retains its defaults.
+
+Before/after state and the deployment log are captured in
+`/var/tmp/omic20-candidate.H8yCtLs1/{before.json,after.json,deploy.log}`. Strict
+snapshots matched all 8,146 `capture_record` timestamps and payload hashes, the
+single 200-byte `capture_tail`, and inode/size/mtime for all 130 ready files.
+The database is now 7,499,776 bytes; the increase from the first post-VACUUM
+size reflects new small captures since that compaction.
 
 ## Decision
 

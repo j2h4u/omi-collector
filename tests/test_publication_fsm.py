@@ -56,7 +56,7 @@ def test_transient_deadline_is_one_timer_and_no_immediate_retry(
     store.append_ready_closure(101, "drained")
     original_lock = store.device_lock
     attempts = 0
-    retry_seen = Event()
+    retry_finished = Event()
 
     @contextmanager
     def busy_once(*, operation: str = "unknown") -> Iterator[DeviceLock]:
@@ -64,9 +64,11 @@ def test_transient_deadline_is_one_timer_and_no_immediate_retry(
         attempts += 1
         if attempts == 1:
             raise DeviceAlreadyRunningError
-        retry_seen.set()
-        with original_lock(operation=operation) as lease:
-            yield lease
+        try:
+            with original_lock(operation=operation) as lease:
+                yield lease
+        finally:
+            retry_finished.set()
 
     monkeypatch.setattr(store, "device_lock", busy_once)
     first = store.recover_and_publish()
@@ -83,7 +85,7 @@ def test_transient_deadline_is_one_timer_and_no_immediate_retry(
     async def scenario() -> None:
         await maintenance.ensure_publication_ready()
         assert attempts == 1
-        assert await asyncio.to_thread(retry_seen.wait, 5)
+        assert await asyncio.to_thread(retry_finished.wait, 5)
         await maintenance.close()
         assert attempts == 2
         assert not tuple((tmp_path / "ready").iterdir())

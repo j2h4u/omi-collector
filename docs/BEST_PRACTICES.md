@@ -16,10 +16,18 @@ Use `uv` and keep `uv.lock` synchronized. The required gates are:
 - `just unit` — behavior tests;
 - `just docker-build` — Dockerfile, Compose, and image validation;
 - `just runtime-smoke` — a bounded installed-CLI container smoke;
-- `just verify` — the complete local contract.
+- `just verify` — the complete local contract when a local full run is needed.
 
 Do not weaken or locally suppress a gate. Use targeted checks while iterating,
-then run the full contract before release or handoff.
+then freeze and commit the candidate. A reviewed transactional candidate
+installer may deploy that exact branch commit for live feedback before GitHub
+merge or a release tag exists. It must retain the production stop, migration,
+rollback, and storage-integrity safeguards. Record it as a host candidate, not
+as a released version. The final protected-main candidate must pass all five
+required gates in CI before merge; the GitHub release follows live feedback
+and protected merge. Do not require a duplicate local `just verify` solely
+because the same candidate runs in CI. Use an extra local full run only for a
+specific local risk or when CI cannot provide the needed evidence.
 
 Runtime QA must run serially at low CPU and idle I/O priority. The canonical
 `just unit` command is bounded to 600 seconds; set

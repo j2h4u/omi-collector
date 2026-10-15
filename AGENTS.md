@@ -17,6 +17,16 @@ make a change pass.
 - `just runtime-smoke` must pass for Docker runtime changes.
 - `just docker-build` must pass because the service runs in Docker; it includes
   Dockerfile and Compose static validation before image build.
+- During development, run targeted local behavior and static checks. A frozen,
+  committed branch candidate may be installed and checked on the host before
+  GitHub merge through a reviewed transactional candidate entry point. It must
+  keep the production stop, migration, rollback, and storage-integrity checks;
+  a candidate is not a release tag.
+- All five gates above remain required on the final protected-main candidate,
+  normally through CI before merge. Do not duplicate the complete local suite
+  solely because CI runs it on the same candidate; run extra local full gates
+  when a distinct local risk or unavailable CI justifies them. Merge and the
+  GitHub release follow live candidate feedback.
 - Use `uv` only. Keep `uv.lock` current and use hardlink mode outside Docker.
 - Bound direct `uv run pytest` commands with `timeout --signal=TERM --kill-after=5s 600s`.
   If a tool returns a running session, poll it to completion or terminate it before moving on.

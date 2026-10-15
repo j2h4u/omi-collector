@@ -251,19 +251,7 @@ class PresenceScheduler:
         return await self._redeem(result.directive)
 
     async def _redeem(self, directive: machine.PresenceDirective) -> PresenceWake | PresenceEnd | None:
-        if isinstance(directive, machine.EndVisit):
-            try:
-                await self._stop_scan()
-            except asyncio.CancelledError:
-                await self._close_after_stop_failure()
-                raise
-            except Exception:
-                await self._close_after_stop_failure()
-                raise
-            if isinstance(self._state, machine.Closed):
-                raise RuntimeError("presence scheduler is closed")
-            return PresenceEnd(directive.reason)
-        if not isinstance(directive, machine.StopAndBeginAttempt):
+        if not isinstance(directive, machine.EndVisit | machine.StopAndBeginAttempt):
             return None
         try:
             await self._stop_scan()
@@ -275,6 +263,8 @@ class PresenceScheduler:
             raise
         if isinstance(self._state, machine.Closed):
             raise RuntimeError("presence scheduler is closed")
+        if isinstance(directive, machine.EndVisit):
+            return PresenceEnd(directive.reason)
         if not isinstance(self._state, machine.Attempting):
             raise RuntimeError("presence scheduler lost its outstanding attempt permit")
         return _wake(directive.trigger)

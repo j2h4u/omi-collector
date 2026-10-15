@@ -450,6 +450,86 @@ def test_stop_failure_closes_machine_without_releasing_permit() -> None:
     _run(scenario())
 
 
+def test_end_visit_stop_failure_closes_and_retries_cleanup() -> None:
+    async def scenario() -> None:
+        class FailOnceStop(FakeObserver):
+            stop_calls = 0
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                self.events.append("stop")
+                if self.stop_calls == 1:
+                    raise OSError("scanner stop failed")
+                self.active = False
+
+        observer = FailOnceStop()
+        scheduler = PresenceScheduler(observer, policy=_test_policy())
+        await scheduler._start_scan()
+
+        with pytest.raises(PresenceScanStopError):
+            await scheduler._redeem(presence_module.machine.EndVisit("absence"))
+
+        assert observer.events == ["start", "stop", "stop"]
+        assert not observer.active
+        with pytest.raises(RuntimeError, match="closed"):
+            await scheduler.wait_for_attempt()
+        await scheduler.close()
+
+    _run(scenario())
+
+
+def test_cancelling_end_visit_stop_closes_and_retries_cleanup() -> None:
+    async def scenario() -> None:
+        entered_stop = asyncio.Event()
+
+        class CancelledFirstStop(FakeObserver):
+            stop_calls = 0
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                self.events.append("stop")
+                if self.stop_calls == 1:
+                    entered_stop.set()
+                    await asyncio.Future()
+                self.active = False
+
+        observer = CancelledFirstStop()
+        scheduler = PresenceScheduler(observer, policy=_test_policy())
+        await scheduler._start_scan()
+        ending = asyncio.create_task(scheduler._redeem(presence_module.machine.EndVisit("absence")))
+        try:
+            await asyncio.wait_for(entered_stop.wait(), timeout=_READINESS_TIMEOUT_SECONDS)
+            ending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await ending
+
+            assert observer.events == ["start", "stop", "stop"]
+            assert not observer.active
+            with pytest.raises(RuntimeError, match="closed"):
+                await scheduler.wait_for_attempt()
+        finally:
+            await asyncio.gather(ending, return_exceptions=True)
+            await scheduler.close()
+
+    _run(scenario())
+
+
+def test_no_operation_does_not_stop_active_scanner() -> None:
+    async def scenario() -> None:
+        observer = FakeObserver()
+        scheduler = PresenceScheduler(observer, policy=_test_policy())
+        await scheduler._start_scan()
+
+        assert await scheduler._redeem(presence_module.machine.NoOperation()) is None
+        assert observer.events == ["start"]
+        assert observer.active
+
+        await scheduler.close()
+        assert observer.events == ["start", "stop"]
+
+    _run(scenario())
+
+
 def test_only_one_waiter_is_accepted() -> None:
     async def scenario() -> None:
         observer = FakeObserver()

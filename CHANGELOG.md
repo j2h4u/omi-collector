@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.13.2](https://github.com/j2h4u/omi-collector/compare/v0.13.1...v0.13.2) (2026-10-15)
+
+
+### Documentation
+
+* clarify compaction admission lifecycle ([cc3dcc5](https://github.com/j2h4u/omi-collector/commit/cc3dcc51126b44beee3239ad59952569e7936dbb))
+* explain cumulative READY audio threshold ([cc3dcc5](https://github.com/j2h4u/omi-collector/commit/cc3dcc51126b44beee3239ad59952569e7936dbb))
+* plan SQLite compaction lifecycle ([cc3dcc5](https://github.com/j2h4u/omi-collector/commit/cc3dcc51126b44beee3239ad59952569e7936dbb))
+
 ## [0.13.1](https://github.com/j2h4u/omi-collector/compare/v0.13.0...v0.13.1) (2026-10-15)
 
 

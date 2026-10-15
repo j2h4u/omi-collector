@@ -579,11 +579,9 @@ function provision_operator_data_access {
 
     # vars
     local directory
+    local legacy_directory
     local -a directories=(
         "${storage_root}/collector"
-        "${storage_root}/collector/attempts"
-        "${storage_root}/collector/quarantine"
-        "${storage_root}/draft"
         "${storage_root}/ready"
     )
 
@@ -591,6 +589,11 @@ function provision_operator_data_access {
     # assert: the state path's parent is an existing real pipeline storage root
     [[ -d "$storage_root" && ! -L "$storage_root" ]] || die 'Collector storage root is missing or unsafe'
     getent group "$operator_group" &> /dev/null || die "operator group is missing: ${operator_group}"
+    for legacy_directory in "${storage_root}/collector/attempts" "${storage_root}/collector/quarantine" "${storage_root}/draft"; do
+        if [[ -e "$legacy_directory" || -L "$legacy_directory" ]]; then
+            directories+=("$legacy_directory")
+        fi
+    done
     for directory in "${directories[@]}"; do
         # assert: never change a symlinked data root
         [[ ! -L "$directory" ]] || die "Collector data root must not be a symlink: ${directory}"

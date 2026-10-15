@@ -182,14 +182,15 @@ class StagingFilesystem:
         """Create and durably probe every directory needed before a device READ."""
         try:
             self._prepare_roots()
-            directories = (
-                (self.spool, "collector root"),
-                (self.attempts_root, "attempts root"),
-                (self.quarantine_root, "quarantine root"),
-                (self.capture_root, "publication raw root"),
-            )
+            directories = ((self.spool, "collector root"),)
             for path, label in directories:
                 self._ensure_real_directory(path, label)
+            for path, label in (
+                (self.attempts_root, "attempts root"),
+                (self.quarantine_root, "quarantine root"),
+                (self.capture_root, "legacy draft root"),
+            ):
+                self._validate_existing_real_directory(path, label)
             for path, label in directories:
                 self._probe_directory(path, label)
         except StagingError:
@@ -224,6 +225,16 @@ class StagingFilesystem:
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
             raise StagingError(f"{label} must be a real directory")
 
+    def _validate_existing_real_directory(self, path: Path, label: str) -> None:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise StagingError(f"{label} cannot be inspected") from error
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise StagingError(f"{label} must be a real directory")
+
     def _ensure_directory(self, path: Path) -> None:
         if path.exists():
             if not path.is_dir():
@@ -235,10 +246,11 @@ class StagingFilesystem:
 
     def _prepare_roots(self) -> None:
         spool_input = _absolute_root(self._spool_input, "spool")
-        capture_input = _absolute_root(self._capture_root_input, "capture")
+        capture_input = Path(self._capture_root_input).absolute()
+        self._validate_existing_real_directory(capture_input, "legacy draft root")
         try:
             spool = spool_input.resolve(strict=True)
-            capture = capture_input.resolve(strict=True)
+            capture = capture_input.resolve(strict=capture_input.exists())
         except OSError as error:
             raise StagingError("spool and capture root cannot be canonicalized") from error
         if spool == capture or spool.is_relative_to(capture) or capture.is_relative_to(spool):
@@ -249,7 +261,8 @@ class StagingFilesystem:
         self.quarantine_root = _contained_path(self.quarantine_root, self.spool, "quarantine root")
         self.lock_path = _contained_path(self.lock_path, self.spool, "collector lock")
         self.state_db_path = _contained_path(self.state_db_path, self.spool, "collector state database")
-        _require_same_filesystem(self.spool, self.capture_root)
+        if self.capture_root.exists():
+            _require_same_filesystem(self.spool, self.capture_root)
 
     @contextmanager
     def device_lock(self, *, operation: str = _UNKNOWN_OPERATION) -> Iterator[DeviceLock]:

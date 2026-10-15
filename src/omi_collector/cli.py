@@ -939,7 +939,7 @@ def device_metrics(
     *,
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Report metrics for the source bundles currently visible to the collector."""
+    """Report visible bundle metrics from metadata without reading audio payloads."""
     from omi_collector.capture.adapters.collector_state_db import StateDBError
     from omi_collector.capture.application.storage_fault import (
         FatalInternalAudioStorageError,

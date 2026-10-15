@@ -1681,15 +1681,12 @@ def test_deployer_migrates_stopped_state_before_service_restart(tmp_path: Path) 
     assert "collector.lock" in commands
     assert stat.S_IMODE(state_file.stat().st_mode) == 0o640
     assert stat.S_IMODE((state_file.parent / "collector.lock").stat().st_mode) == 0o600
-    data_roots = (
-        state_file.parent,
-        state_file.parent / "attempts",
-        state_file.parent / "quarantine",
-        state_file.parent.parent / "draft",
-        state_file.parent.parent / "ready",
-    )
+    data_roots = (state_file.parent, state_file.parent.parent / "ready")
     for root in data_roots:
         assert root.stat().st_mode & 0o7777 == 0o2750
+    assert not (state_file.parent / "attempts").exists()
+    assert not (state_file.parent / "quarantine").exists()
+    assert not (state_file.parent.parent / "draft").exists()
 
 
 def test_deployer_recovers_true_hot_journal_before_selector_and_full_migration(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
@@ -91,6 +92,48 @@ def _state_db(layout: StorageLayout) -> StateDB:
         database = StateDB(layout.collector.state_db)
         database.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return open_runtime_state(layout)
+
+
+def test_operator_status_reads_ready_metadata_without_opening_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    _state_db(layout)
+    raw = bytes(RECORD_SIZE)
+    digest = sha256(raw).hexdigest()
+    bundle_id = sha256(f"10:11:{digest}".encode()).hexdigest()
+    bundle = layout.publication.root / bundle_id
+    bundle.mkdir(parents=True)
+    (bundle / "records.bin").write_bytes(raw)
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "bundle_id": bundle_id,
+                "start_sequence": 10,
+                "next_sequence": 11,
+                "record_count": 1,
+                "record_size": RECORD_SIZE,
+                "records_sha256": digest,
+                "draft_raw_sha256": digest,
+                "time_ranges": [{"start_sequence": 10, "next_sequence": 11, "utc": None}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args: object, **kwargs: object) -> object:
+        if path.name == "records.bin":
+            raise AssertionError("operator status must not open audio payloads")
+        return cast(Callable[..., object], original_open)(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    publication = cast(dict[str, object], status["publication"])
+    assert publication["bundle_count"] == 1
+    assert publication["downloaded_raw_bytes"] == RECORD_SIZE
 
 
 def _put_quality_events(layout: StorageLayout, events: tuple[dict[str, object], ...] | list[dict[str, object]]) -> None:

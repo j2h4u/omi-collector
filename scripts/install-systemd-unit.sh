@@ -51,16 +51,19 @@ function provision_operator_data_access {
     local directory
     local -a directories=(
         "${storage_root}/collector"
-        "${storage_root}/collector/attempts"
-        "${storage_root}/collector/quarantine"
-        "${storage_root}/draft"
         "${storage_root}/ready"
     )
+    local legacy_directory
 
     # code
     # assert: only the fixed Collector data roots may receive operator read access
     [[ "$storage_root" == '/srv/pipelines/omi' ]] || die 'unexpected Collector storage root'
     getent group "$operator_group" &> /dev/null || die "operator group is missing: ${operator_group}"
+    for legacy_directory in "${storage_root}/collector/attempts" "${storage_root}/collector/quarantine" "${storage_root}/draft"; do
+        if [[ -e "$legacy_directory" || -L "$legacy_directory" ]]; then
+            directories+=("$legacy_directory")
+        fi
+    done
     for directory in "${directories[@]}"; do
         # assert: do not follow an existing data-root symlink
         [[ ! -L "$directory" ]] || die "Collector data root must not be a symlink: ${directory}"

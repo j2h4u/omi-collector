@@ -830,6 +830,25 @@ def test_device_metrics_failure_is_reported_on_stderr(monkeypatch: pytest.Monkey
     assert result.stderr.strip() == "manifest is malformed"
 
 
+def test_device_metrics_reads_publication_metadata(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+
+    class Metrics:
+        def as_dict(self) -> dict[str, object]:
+            return {"bundle_count": 1}
+
+    def collect(_root: Path, *, state_db: StateDB) -> Metrics:
+        assert state_db.read_only
+        return Metrics()
+
+    monkeypatch.setattr(cli, "collect_spool_metrics", collect)
+
+    result = CliRunner().invoke(app, ["device", "metrics", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {"bundle_count": 1}
+
+
 def test_device_status_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def failed(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise OperatorStatusError("status evidence is malformed")

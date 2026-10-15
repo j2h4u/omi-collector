@@ -439,6 +439,8 @@ def test_validate_policy_accepts_exact_fit_large_integer_capacity() -> None:
 def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         events: list[str] = []
+        published = asyncio.Event()
+        loop = asyncio.get_running_loop()
         spool = tmp_path / "spool"
         spool.mkdir()
         state_db = await asyncio.to_thread(StateDB, spool / "collector-state.sqlite3")
@@ -451,6 +453,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
         def publish() -> ReadyOutcome:
             assert ready_closures.load(store.state_db)[-1].reason == "drained"
             events.append("publish")
+            loop.call_soon_threadsafe(published.set)
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_eligible_drafts")
 
         monkeypatch.setattr(store, "_recover_and_publish_unlocked", publish)
@@ -504,10 +507,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
         monkeypatch.setattr(SessionLifecycle, "_attempt_visit", attempt)
         try:
             await SessionLifecycle(run).run_direct()
-            for _ in range(20):
-                if "publish" in events:
-                    break
-                await asyncio.sleep(0.001)
+            await asyncio.wait_for(published.wait(), timeout=5)
             assert events == ["attempt", "closure", "publish"]
         finally:
             await maintenance.close()

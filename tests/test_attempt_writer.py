@@ -217,7 +217,9 @@ class ProcessLifetimeTarget:
         return None
 
 
-def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Connection, flags: _ProcessFlags) -> None:
+def _run_writer_lifecycle_in_daemon_owner(
+    entered: _ProcessEvent, release: Connection, flags: _ProcessFlags, failure_writer: Connection
+) -> None:
     async def lifecycle() -> None:
         writer = AttemptWriter(ProcessLifetimeTarget(entered, release, flags), bytes(RECORD_SIZE))
         try:
@@ -235,7 +237,8 @@ def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Conne
     def owner() -> None:
         try:
             asyncio.run(lifecycle())
-        except Exception:  # noqa: BLE001 - the child reports owner-thread failures through shared state
+        except Exception as error:  # noqa: BLE001 - the child reports owner-thread failures to its parent
+            failure_writer.send(f"{type(error).__name__}: {error}")
             flags[3] = 1
 
     owner_thread = threading.Thread(target=owner, name="test-writer-owner", daemon=True)
@@ -335,8 +338,11 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
     context = multiprocessing.get_context("fork")
     entered = context.Event()
     release_reader, release_writer = context.Pipe(duplex=False)
+    failure_reader, failure_writer = context.Pipe(duplex=False)
     flags = context.Array("i", [0, 0, 0, 0])
-    process = context.Process(target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release_reader, flags))
+    process = context.Process(
+        target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release_reader, flags, failure_writer)
+    )
     started = False
     released = False
 
@@ -344,6 +350,7 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
         process.start()
         started = True
         release_reader.close()
+        failure_writer.close()
         assert entered.wait(5), "writer did not enter its blocked append"
         process.join(timeout=1)
         assert process.is_alive(), "process exited while writer-owned work was blocked"
@@ -358,7 +365,11 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
         assert process.exitcode == 0
         assert flags[1] == 1
         assert flags[2] == 1
-        assert flags[3] == 0
+        try:
+            failure = failure_reader.recv() if failure_reader.poll() else None
+        except EOFError:
+            failure = None
+        assert flags[3] == 0, f"child owner failed after target work completed: {failure}"
     finally:
         if not released:
             with suppress(BrokenPipeError, EOFError, OSError):
@@ -373,6 +384,8 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
             process.join(timeout=2)
         release_reader.close()
         release_writer.close()
+        failure_reader.close()
+        failure_writer.close()
         if started and not process.is_alive():
             process.close()
 

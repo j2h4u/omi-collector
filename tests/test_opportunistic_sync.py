@@ -4418,8 +4418,17 @@ async def test_background_quality_corruption_stops_active_read_after_preserving_
     )
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        for _ in range(3):
-            await asyncio.sleep(0)
+
+        async def wait_for_durable_record() -> None:
+            while True:
+                pending = store.pending_attempts()
+                if pending:
+                    source = _attempt_source(store, pending[0].attempt_id)
+                    if source is not None and source.committed_count == 1:
+                        return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_durable_record(), 5)
         journal._queue.put(("quality", {}, "fault"))
         with pytest.raises(FatalInternalAudioStorageError) as raised:
             await asyncio.wait_for(task, 5)

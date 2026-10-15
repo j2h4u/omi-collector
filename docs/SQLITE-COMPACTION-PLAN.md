@@ -6,19 +6,21 @@ MiB on SQLite's freelist and 2.8 MiB used. Production has not run `VACUUM`.
 
 ## Decision
 
-Run one full `VACUUM` after an actionable covered-record retirement cycle has
-exhausted its eligible records, at most once or twice per day. Determine
-exhaustion from the authoritative database predicate. `retirement_pending =
-false` alone is insufficient: it can mean the terminal source disappeared
+Run one full `VACUUM` after each actionable covered-record retirement cycle
+has exhausted its eligible records, typically once or twice per day, with no
+rate cap. Determine exhaustion from the authoritative database predicate.
+`retirement_pending = false` alone is insufficient: it can mean the terminal source disappeared
 while other sources remain. Do not require all sources to reach zero, wait for
-an ACK, or trigger on a database-size threshold. Do not gate or delay new
-capture on compaction readiness. A retained 200-byte tail and newly captured
-audio below the normal publication threshold remain valid and must be
-preserved.
+an ACK, or trigger on a database-size threshold. Record capture intent before
+readiness or joining maintenance; it makes VACUUM ineligible and interrupts an
+already-running VACUUM. Actual GATT capture waits for the worker to settle. A
+retained 200-byte tail and newly captured audio below the normal publication
+threshold remain valid and must be preserved.
 
-Do not enable `auto_vacuum=FULL` or `INCREMENTAL`, or add a scheduler, thread,
-settings, archives, manual CLI, or production priority changes. SQLite-managed
-temporary space and rollback journal may require up to about twice the original
+Do not enable `auto_vacuum=FULL` or `INCREMENTAL`, or add a dedicated
+scheduler thread, settings, archives, manual CLI, or production priority
+changes. Use the existing owned worker. SQLite-managed temporary space and
+rollback journal may require up to about twice the original
 database size in additional free space (roughly 355 MiB at the current size).
 
 ## State and ownership
@@ -40,23 +42,29 @@ debt, while success that wins a cancellation race may clear its own debt.
 
 ## Lifecycle and event expectations
 
-The implementation and tests must compare the full mode × phase × event
-transition table against an independently maintained expected matrix. Unknown
-events fail closed. Capture admission remains independent of compaction state.
+The existing owner mode axis is `AVAILABLE`, `CAPTURE`, or `CLOSED`. Compaction
+and quiescing belong on the work-phase axis; they are not owner modes. The
+cases below are illustrative, not the complete Cartesian transition table.
+Implementation and tests must compare that complete mode × phase × event
+table against an independently maintained expected matrix. Unknown events
+fail closed.
 
-| Mode | Phase | Arrival | Shutdown or repeated cancel | Worker completion | Storage event |
-| --- | --- | --- | --- | --- | --- |
-| Running | Idle / eligible | Admit capture; remember intent before readiness or maintenance join | Enter Quiescing; interrupt active worker | — | Authoritative retirement predicate may schedule work |
-| Running | Compacting | Record intent; interrupt and join VACUUM, then admit capture | Signal interrupt and join actual worker | Success clears matching debt; stale success cannot clear newer debt | BUSY/LOCKED/FULL retains debt and uses existing owner backoff |
-| Quiescing | Idle / eligible | Reject new work | Idempotent; join owned worker | — | No new VACUUM admission |
-| Quiescing | Compacting | Reject new work | Interrupt, wait for worker rollback/close, then finish shutdown | Success may clear matching debt if it actually wins | Preserve debt unless success is confirmed |
-| Closed | Any | Reject | Idempotent | Ignore stale notification; never reopen work | No storage operation |
+| Owner mode | Work phase | Capture arrival | Shutdown or repeated cancel | Worker completion / storage event |
+| --- | --- | --- | --- | --- |
+| AVAILABLE | Idle / eligible | Record intent before readiness/join; make VACUUM ineligible | Enter CLOSED | Authoritative predicate may admit compaction only without pending capture intent |
+| AVAILABLE | Compacting | Record intent, interrupt/join VACUUM, then begin GATT capture | Enter CLOSED; interrupt/join worker | Success clears matching debt; BUSY/LOCKED/FULL retains debt and uses existing backoff |
+| AVAILABLE | Quiescing | Keep intent; wait for settlement before GATT capture | Enter CLOSED; join owned worker | Rollback/close or confirmed success settles worker |
+| CAPTURE | Idle | Reject duplicate arrival | Enter CLOSED | Capture remains the active owner |
+| CAPTURE | Compacting | Existing VACUUM must be interrupted and joined before GATT begins | Enter CLOSED; interrupt/join worker | Success clears matching debt; stale completion cannot clear newer debt |
+| CAPTURE | Quiescing | Keep intent; wait for settlement before GATT capture | Idempotent; join owned worker | Rollback/close or confirmed success settles worker |
+| CLOSED | Any | Reject | Idempotent | Ignore stale notification; never reopen work |
 
 An arrival or shutdown request uses a `threading.Event`, SQLite progress
 handler, and a pre-execute cancellation check. Cancellation interrupts and
 joins the real worker; the worker rolls back if needed and closes its
-connection before capture is admitted. Repeated cancellation is safe. Full VACUUM cannot guarantee prompt
-preemption: final copy, fsync, or rollback can block. Do not impose an overall
+connection before GATT capture is admitted. Repeated cancellation is safe. Full
+VACUUM cannot guarantee prompt preemption: final copy, fsync, or rollback can
+block. Do not impose an overall
 short elapsed timeout or promise immediate ingest on this single-database
 service.
 
@@ -82,8 +90,9 @@ service.
   slow disk; BUSY/FULL/IOERR/corruption; ambiguous DELETE commit; pending-key
   clear failure; and SIGKILL/restart before and after VACUUM.
 - [ ] Run applicable project gates and runtime smoke on a frozen candidate.
-- [ ] Deploy only through the reviewed release path; confirm live health and
-  content preservation.
+- [ ] Install the committed branch candidate only after applicable local gates
+  pass; confirm live health and content preservation.
+- [ ] After live proof, open/update the PR and pass remote CI/release gates.
 
 ## Source and SQLite references
 

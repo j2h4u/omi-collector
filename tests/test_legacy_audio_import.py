@@ -115,6 +115,33 @@ def test_attempt_imports_257_rows_and_verifies_typed_source(tmp_path: Path) -> N
     assert raw == (attempt_path / "records.bin").read_bytes()
 
 
+def test_sql_authoritative_raw_only_attempt_imports_and_verifies(tmp_path: Path) -> None:
+    attempt_path, raw, row = _attempt(tmp_path)
+    (attempt_path / "attempt.json").unlink()
+    (attempt_path / "checkpoint.json").unlink()
+    assert {entry.name for entry in attempt_path.iterdir()} == {"records.bin"}
+    attempt = inspect_legacy_attempt(attempt_path, "a" * 32, row)
+    state_db = StateDB(tmp_path / "candidate.sqlite3")
+    with closing(state_db.open_connection()) as connection:
+        import_legacy_attempt(connection, attempt, authoritative_row=row)
+        verify_imported_attempt(connection, attempt)
+    assert (attempt_path / "records.bin").read_bytes() == raw
+
+
+def test_sql_authoritative_raw_only_attempt_rejects_changed_prefix_and_partial_json(tmp_path: Path) -> None:
+    attempt_path, raw, row = _attempt(tmp_path)
+    (attempt_path / "attempt.json").unlink()
+    (attempt_path / "checkpoint.json").unlink()
+    changed = bytes([raw[0] ^ 1]) + raw[1:]
+    (attempt_path / "records.bin").write_bytes(changed)
+    with pytest.raises(LegacyAudioImportError, match="raw prefix differs"):
+        inspect_legacy_attempt(attempt_path, "a" * 32, row)
+    (attempt_path / "records.bin").write_bytes(raw)
+    (attempt_path / "attempt.json").write_text(json.dumps(row["descriptor"]), encoding="utf-8")
+    with pytest.raises(LegacyAudioImportError, match="invalid"):
+        inspect_legacy_attempt(attempt_path, "a" * 32, row)
+
+
 def test_attempt_import_commits_no_more_than_one_record_page_per_transaction(tmp_path: Path) -> None:
     attempt_path, _, row = _attempt(tmp_path)
     attempt = inspect_legacy_attempt(attempt_path, "a" * 32, row)

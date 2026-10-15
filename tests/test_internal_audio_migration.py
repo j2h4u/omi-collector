@@ -903,7 +903,8 @@ def test_fresh_cutover_refuses_nonempty_v2_without_receipt(tmp_path: Path) -> No
         )
 
 
-def test_cutover_imports_v1_attempt_rows_and_complete_raw_tail(tmp_path: Path) -> None:
+@pytest.mark.parametrize("file_backed_metadata", [False, True])
+def test_cutover_imports_v1_attempt_rows_and_complete_raw_tail(tmp_path: Path, file_backed_metadata: bool) -> None:
     layout = _layout(tmp_path)
     release = _release(tmp_path)
     _v1(layout)
@@ -927,8 +928,9 @@ def test_cutover_imports_v1_attempt_rows_and_complete_raw_tail(tmp_path: Path) -
         "record_count": 2,
         "raw_sha256": hashlib.sha256(complete[:888]).hexdigest(),
     }
-    (attempt_path / "attempt.json").write_text(json.dumps(descriptor), encoding="utf-8")
-    (attempt_path / "checkpoint.json").write_text(json.dumps(checkpoint), encoding="utf-8")
+    if file_backed_metadata:
+        (attempt_path / "attempt.json").write_text(json.dumps(descriptor), encoding="utf-8")
+        (attempt_path / "checkpoint.json").write_text(json.dumps(checkpoint), encoding="utf-8")
     (attempt_path / "records.bin").write_bytes(raw)
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         connection.execute(
@@ -949,7 +951,7 @@ def test_cutover_imports_v1_attempt_rows_and_complete_raw_tail(tmp_path: Path) -
 
     result = migrate_internal_audio(layout, release_metadata=release)
 
-    assert result == {"imported_sources": 1, "removed_files": 3}
+    assert result == {"imported_sources": 1, "removed_files": 3 if file_backed_metadata else 1}
     assert not attempt_path.exists()
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         assert connection.execute("SELECT 1 FROM state WHERE kind='attempt'").fetchone() is None

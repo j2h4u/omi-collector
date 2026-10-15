@@ -13,6 +13,7 @@ from typing import cast
 
 from .bundle_contract import BundleManifest
 from .internal_audio_store import AUDIO_PAYLOAD_SIZE, AUDIO_RECORD_SIZE, DEFAULT_CHUNK_LIMIT, encode_uint64
+from .publication import PrefixPublicationEvidence, TerminalRetirementEvidence
 from .staging_contract import (
     AttemptDescriptor,
     AttemptStateError,
@@ -20,8 +21,9 @@ from .staging_contract import (
     _checkpoint_from_json,
     _descriptor_from_json,
     _validate_attempt_id,
+    _validate_descriptor,
 )
-from .staging_filesystem import legacy_attempt_row
+from .staging_filesystem import _hash_prefix, legacy_attempt_row
 
 
 class LegacyAudioImportError(RuntimeError):
@@ -71,7 +73,7 @@ def inspect_legacy_attempt(
         raise LegacyAudioImportError(f"attempt directory cannot be inspected: {path}") from error
     if not entries <= allowed:
         raise LegacyAudioImportError(f"attempt has unsupported entries: {path}")
-    row, descriptor, checkpoint, raw_size = _attempt_metadata(path, attempt_id, authoritative_row)
+    row, descriptor, checkpoint, raw_size = _attempt_metadata(path, attempt_id, authoritative_row, entries)
     _require_read_begin_for_private_bytes(descriptor, raw_size)
     return LegacyAttempt(
         path,
@@ -85,25 +87,54 @@ def inspect_legacy_attempt(
 
 
 def _attempt_metadata(
-    path: Path, attempt_id: str, authoritative_row: Mapping[str, object] | None
+    path: Path, attempt_id: str, authoritative_row: Mapping[str, object] | None, entries: set[str]
 ) -> tuple[dict[str, object], AttemptDescriptor, StreamingCheckpoint, int]:
     try:
-        row = legacy_attempt_row(path)
+        if entries == {"records.bin"} and authoritative_row is not None:
+            row = _sql_only_attempt_row(authoritative_row)
+        else:
+            row = legacy_attempt_row(path)
         descriptor_raw = cast(dict[str, object], row["descriptor"])
         checkpoint_raw = cast(dict[str, object], row["checkpoint"])
         descriptor = _descriptor_from_json(descriptor_raw)
+        _validate_descriptor(descriptor, attempt_id)
         checkpoint = _checkpoint_from_json(checkpoint_raw, attempt_id)
         if descriptor.attempt_id != attempt_id:
             raise LegacyAudioImportError("attempt descriptor identity differs from expected attempt")
-        raw_size = (path / "records.bin").stat(follow_symlinks=False).st_size
+        raw_path = path / "records.bin"
+        _regular_file(raw_path)
+        raw_size = raw_path.stat(follow_symlinks=False).st_size
+        checkpoint_bytes = checkpoint.record_count * AUDIO_RECORD_SIZE
+        if raw_size < checkpoint_bytes or _hash_prefix(raw_path, checkpoint_bytes) != checkpoint.raw_sha256:
+            raise LegacyAudioImportError("attempt raw prefix differs from checkpoint")
         if raw_size > descriptor.packet_count * AUDIO_RECORD_SIZE:
             raise LegacyAudioImportError("attempt raw data exceeds descriptor packet count")
         _check_authoritative_row(row, authoritative_row)
         return row, descriptor, checkpoint, raw_size
     except LegacyAudioImportError:
         raise
-    except (AttemptStateError, OSError, TypeError, ValueError) as error:
+    except (AttemptStateError, OSError, KeyError, TypeError, ValueError) as error:
         raise LegacyAudioImportError(f"attempt metadata is invalid: {path}") from error
+
+
+def _sql_only_attempt_row(authoritative_row: Mapping[str, object]) -> dict[str, object]:
+    row = dict(authoritative_row)
+    cleanup = row.pop("cleanup_intent", None)
+    if cleanup is not None and cleanup != {"version": 1, "state": "pending"}:
+        raise LegacyAudioImportError("attempt cleanup intent is invalid")
+    if set(row) != {"descriptor", "checkpoint", "prefix_publication", "terminal_retirement"}:
+        raise LegacyAudioImportError("attempt authoritative row has invalid fields")
+    if not isinstance(row["descriptor"], dict) or not isinstance(row["checkpoint"], dict):
+        raise LegacyAudioImportError("attempt authoritative metadata is malformed")
+    prefix = row["prefix_publication"]
+    terminal = row["terminal_retirement"]
+    if prefix is not None:
+        row["prefix_publication"] = PrefixPublicationEvidence.from_json(prefix).as_dict()
+    if terminal is not None:
+        if prefix is None:
+            raise LegacyAudioImportError("attempt terminal marker has no published prefix")
+        row["terminal_retirement"] = TerminalRetirementEvidence.from_json(terminal).as_dict()
+    return row
 
 
 def _check_authoritative_row(row: dict[str, object], authoritative_row: Mapping[str, object] | None) -> None:

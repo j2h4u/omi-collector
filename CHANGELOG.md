@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0](https://github.com/j2h4u/omi-collector/compare/v0.13.2...v0.14.0) (2026-10-15)
+
+
+### Features
+
+* compact retired audio and simplify operator configuration ([7508f61](https://github.com/j2h4u/omi-collector/commit/7508f6124d94eda0558c5a206f7dbc4acfe99922))
+
+
+### Fixes
+
+* reject unrepresentable bundle audio thresholds ([7508f61](https://github.com/j2h4u/omi-collector/commit/7508f6124d94eda0558c5a206f7dbc4acfe99922))
+
 ## [0.13.2](https://github.com/j2h4u/omi-collector/compare/v0.13.1...v0.13.2) (2026-10-15)
 
 

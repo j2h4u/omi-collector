@@ -408,6 +408,9 @@ class _WriterProxy:
     def publish(self, high_water: int, tail: bytes = b"") -> bool:
         return self.writer.publish(high_water, tail)
 
+    async def wait_failure(self) -> BaseException:
+        return await self.writer.wait_failure()
+
     def submit_read_begin(self, notice: ReadBeginNotification) -> object:
         future = cast(asyncio.Future[object], self.writer.submit_read_begin(notice))
         future.add_done_callback(lambda _done: self.read_begin_complete.set())

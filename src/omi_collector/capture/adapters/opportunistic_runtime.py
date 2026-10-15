@@ -108,6 +108,9 @@ class _BatchWriter:
     def failure(self) -> BaseException | None:
         return self._writer.failure
 
+    async def wait_failure(self) -> BaseException:
+        return await self._writer.wait_failure()
+
     @property
     def submitted_high_water(self) -> int:
         """Expose event-loop submitted bytes to the collector's typed counter seam."""

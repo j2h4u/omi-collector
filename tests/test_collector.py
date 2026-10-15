@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sqlite3
 import threading
 from collections.abc import AsyncIterator, Coroutine, Iterable
 from dataclasses import FrozenInstanceError, dataclass, field
@@ -10,7 +11,7 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters.attempt_writer import AttemptWriter
+from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError
 from omi_collector.capture.application import collector as collector_module
 from omi_collector.capture.application.collector import (
     AdvanceRejectedError,
@@ -31,6 +32,7 @@ from omi_collector.capture.application.ring_transport import (
     NotificationProtocolError,
     RingTransportDisconnectedError,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     STATUS_STORAGE_NOT_READY,
@@ -144,10 +146,15 @@ class FakeWriter:
     submitted_high_water: int = 0
     written_high_water: int = 0
     fail_barrier: bool = False
+    failure: BaseException | None = None
     target_threads: list[int] = field(default_factory=list)
     expected_start: int = 10
     expected_count: int = 2
     published_tails: list[bytes] = field(default_factory=list)
+
+    async def wait_failure(self) -> BaseException:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
     async def start(self) -> None:
         self.calls.append("start")
@@ -960,5 +967,144 @@ def test_writer_failure_is_reported_with_counters_after_terminal_done() -> None:
         assert caught.value.submitted_records == 2
         assert writer.calls[-1] == "barrier"
         assert session.writes == [encode_read_command(10, 2)]
+
+    asyncio.run(scenario())
+
+
+def test_real_attempt_writer_failure_stops_a_quiet_read_and_preserves_the_first_error() -> None:
+    async def scenario() -> None:
+        fatal = OSError("target disk failed")
+
+        class FailingTarget(BlockingWriterTarget):
+            def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+                del offset, chunk, tail
+                self.calls.append("append")
+                raise fatal
+
+        class QuietSession(BurstSession):
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    yield _data(_record(1))
+                    await asyncio.Event().wait()
+
+                return stream()
+
+            async def write_control(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                if payload == encode_stop_command():
+                    raise OSError("STOP failed")
+                if payload != encode_read_command(self.start, self.count):
+                    raise AssertionError(f"unexpected command: {payload!r}")
+
+        target = FailingTarget()
+        writer = AttemptWriter(target, bytearray(2 * RECORD_SIZE), config=WriterConfig(chunk_records=1))
+        session = QuietSession(())
+        try:
+            with pytest.raises(TransferInterruptedError) as caught:
+                await read_leg(
+                    session,
+                    TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                    writer,
+                    10,
+                    2,
+                    ReadLegOptions(1),
+                )
+            assert caught.value.__cause__ is fatal
+            assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        finally:
+            with pytest.raises(WriterFailedError) as close_error:
+                await writer.close()
+            assert close_error.value.args[1] is fatal
+
+    asyncio.run(scenario())
+
+
+def test_repeated_cancel_during_failed_read_stop_keeps_fatal_cause_and_settles_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+        sql_error = sqlite3.DatabaseError("file is not a database")
+        fatal.__cause__ = sql_error
+        failure_latched = threading.Event()
+        original_record_failure = AttemptWriter._record_failure
+
+        class FailingTarget(BlockingWriterTarget):
+            def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+                del offset, chunk, tail
+                raise fatal
+
+        def observe_failure(self: AttemptWriter, error: BaseException, *, close_failed: bool = False) -> BaseException:
+            latched = original_record_failure(self, error, close_failed=close_failed)
+            failure_latched.set()
+            return latched
+
+        class HeldStopSession(BurstSession):
+            def __init__(self) -> None:
+                super().__init__(())
+                self.stop_started = asyncio.Event()
+                self.stop_release = asyncio.Event()
+                self.stop_finished = asyncio.Event()
+                self.notification_cancelled = asyncio.Event()
+                self.stop_calls = 0
+
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    try:
+                        yield _begin(10, 2)
+                        yield _data(_record(1))
+                        await asyncio.Event().wait()
+                    finally:
+                        self.notification_cancelled.set()
+
+                return stream()
+
+            async def write_control(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                assert payload in (encode_read_command(self.start, self.count), encode_stop_command())
+                if payload == encode_read_command(self.start, self.count):
+                    return
+                self.stop_calls += 1
+                self.stop_started.set()
+                await self.stop_release.wait()
+                self.stop_finished.set()
+                raise OSError("STOP failed")
+
+        monkeypatch.setattr(AttemptWriter, "_record_failure", observe_failure)
+        target = FailingTarget()
+        writer = AttemptWriter(target, bytearray(2 * RECORD_SIZE), config=WriterConfig(chunk_records=1))
+        session = HeldStopSession()
+        task = asyncio.create_task(
+            read_leg(
+                session,
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                writer,
+                10,
+                2,
+                ReadLegOptions(1),
+            )
+        )
+        try:
+            await asyncio.to_thread(failure_latched.wait, 5)
+            await session.stop_started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            session.stop_release.set()
+            with pytest.raises(TransferInterruptedError) as caught:
+                await task
+            await session.stop_finished.wait()
+            await session.notification_cancelled.wait()
+            assert caught.value.__cause__ is fatal
+            assert fatal.sqlite_errorcode == 11
+            assert fatal.__cause__ is sql_error
+            assert session.stop_calls == 1
+        finally:
+            session.stop_release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            with pytest.raises(WriterFailedError):
+                await writer.close()
 
     asyncio.run(scenario())

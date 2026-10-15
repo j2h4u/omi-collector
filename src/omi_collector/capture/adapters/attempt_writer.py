@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from threading import Event, Lock, Thread
@@ -251,6 +252,7 @@ class AttemptWriter:
         self._commands: deque[_Pending] = deque()
         self._lock = Lock()
         self._wake = Event()
+        self._failure_event = asyncio.Event()
         self._published = 0
         self._published_tail = b""
         self._written = 0
@@ -325,6 +327,16 @@ class AttemptWriter:
         """Return the latched target exception, if any."""
         with self._lock:
             return failure_of(self._state)
+
+    async def wait_failure(self) -> BaseException:
+        """Wake the active READ owner when the target first fails."""
+        failure = self.failure
+        if failure is not None:
+            return failure
+        await self._failure_event.wait()
+        failure = self.failure
+        assert failure is not None
+        return failure
 
     def publish(self, high_water: int, tail: bytes = b"") -> bool:
         """Publish a monotonic source byte offset without waiting for disk I/O.
@@ -711,6 +723,10 @@ class AttemptWriter:
             pending = list(self._commands)
             self._commands.clear()
         if newly_latched:
+            loop = self._loop
+            if loop is not None:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._failure_event.set)
             debug_exception(
                 "attempt_writer_failed",
                 latched,

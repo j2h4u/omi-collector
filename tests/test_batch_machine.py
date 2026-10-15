@@ -6,11 +6,17 @@ from itertools import product
 import pytest
 
 from omi_collector.capture.application.batch_machine import (
+    _READ_TRANSITION_TABLE,
     Command,
     CursorAction,
     Event,
     Milestone,
+    ReadAction,
+    ReadEvent,
+    ReadPhase,
+    decide_read_event,
     derive_milestone,
+    read_transition,
     transition,
 )
 
@@ -133,3 +139,34 @@ def test_unknown_tags_are_rejected() -> None:
         transition("future-milestone", Event.SEAL)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unknown batch"):
         transition(Milestone.SEALED, "future-event")  # type: ignore[arg-type]
+
+
+def test_read_transition_is_total_and_typed() -> None:
+    assert len(tuple(ReadPhase)) == 5
+    assert len(tuple(ReadEvent)) == 10
+    assert len(tuple(ReadAction)) == 8
+    decisions = [read_transition(phase, event) for phase, event in product(ReadPhase, ReadEvent)]
+    assert set(_READ_TRANSITION_TABLE) == set(product(ReadPhase, ReadEvent))
+    assert len(decisions) == 50
+    assert all(isinstance(decision.next_phase, ReadPhase) for decision in decisions)
+    assert all(isinstance(decision.action, ReadAction) for decision in decisions)
+    assert all(decision.reason for decision in decisions)
+
+
+def test_read_transition_handles_begin_completion_and_failures() -> None:
+    assert read_transition(ReadPhase.AWAIT_BEGIN, ReadEvent.ACK).action is ReadAction.CONSUME
+    assert read_transition(ReadPhase.AWAIT_BEGIN, ReadEvent.BEGIN).next_phase is ReadPhase.RECEIVING
+    assert read_transition(ReadPhase.AWAIT_BEGIN, ReadEvent.DATA).action is ReadAction.REJECT
+    assert read_transition(ReadPhase.RECEIVING, ReadEvent.BEGIN).action is ReadAction.REJECT
+    assert read_transition(ReadPhase.RECEIVING, ReadEvent.DONE).action is ReadAction.BARRIER
+    assert read_transition(ReadPhase.DONE, ReadEvent.BARRIER_OK).action is ReadAction.COMPLETE
+    assert read_transition(ReadPhase.DONE, ReadEvent.BARRIER_FAILED).action is ReadAction.PROPAGATE
+    assert read_transition(ReadPhase.STOPPING, ReadEvent.STOP_SETTLED).next_phase is ReadPhase.EXITED
+
+
+def test_read_event_priority_preserves_latched_writer_failure() -> None:
+    events = (ReadEvent.DATA, ReadEvent.DONE, ReadEvent.CANCELLED)
+    assert decide_read_event(events, writer_failed=True) is ReadEvent.WRITER_FAILED
+    assert decide_read_event((*events, ReadEvent.WRITER_FAILED)) is ReadEvent.WRITER_FAILED
+    assert decide_read_event((ReadEvent.DATA, ReadEvent.DONE)) is ReadEvent.DATA
+    assert decide_read_event(()) is None

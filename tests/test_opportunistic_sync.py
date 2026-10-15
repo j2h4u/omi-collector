@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -3678,6 +3679,133 @@ async def test_fatal_writer_failure_after_data_survives_barrier_and_preserves_so
 
 
 @_async_test
+@pytest.mark.parametrize("next_data", [False, True], ids=["quiet-read", "next-data"])
+async def test_active_read_fatal_writer_failure_stops_without_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, next_data: bool
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    sql_error = sqlite3.DatabaseError("file is not a database")
+    fatal.__cause__ = sql_error
+    failure_latched = threading.Event()
+    original_append = StagingWriter.append_chunk
+    original_record_failure = AttemptWriter._record_failure
+
+    def fail_append(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        original_append(self, offset, chunk, tail)
+        raise fatal
+
+    def observe_failure(self: AttemptWriter, error: BaseException, *, close_failed: bool = False) -> BaseException:
+        latched = original_record_failure(self, error, close_failed=close_failed)
+        failure_latched.set()
+        return latched
+
+    monkeypatch.setattr(StagingWriter, "append_chunk", fail_append)
+    monkeypatch.setattr(AttemptWriter, "_record_failure", observe_failure)
+
+    class QuietReadSession(ScriptedRingSession):
+        def __init__(self) -> None:
+            super().__init__(
+                _status(),
+                (
+                    WriteStep(b"\x10", (_info(10, 12),)),
+                    WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_record(10)))),
+                    WriteStep(encode_stop_command(), error=OSError("STOP failed")),
+                ),
+            )
+            self._stream_calls = 0
+
+        def notifications(self) -> AsyncIterator[bytes]:
+            self._stream_calls += 1
+            if self._stream_calls == 1:
+                return super().notifications()
+
+            async def stream() -> AsyncIterator[bytes]:
+                yield _begin(10, 2)
+                yield _data(_record(10))
+                await asyncio.to_thread(failure_latched.wait, 5)
+                if next_data:
+                    yield _data(_record(11))
+                await asyncio.Event().wait()
+
+            return stream()
+
+    session = QuietReadSession()
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    task = asyncio.create_task(run_opportunistic_collector(Provider([session]), store, _options(batch_records=2)))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await asyncio.wait_for(task, 5)
+
+    assert raised.value is fatal
+    assert raised.value.sqlite_errorcode == 11
+    assert raised.value.__cause__ is sql_error
+    assert session.writes == [b"\x10", encode_read_command(10, 2), encode_stop_command()]
+    assert encode_advance_command(12) not in session.writes
+
+
+@_async_test
+async def test_latched_writer_failure_wins_when_done_arrives_same_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    failure_latched = threading.Event()
+    original_append = StagingWriter.append_chunk
+    original_record_failure = AttemptWriter._record_failure
+
+    def fail_append(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        original_append(self, offset, chunk, tail)
+        raise fatal
+
+    def observe_failure(self: AttemptWriter, error: BaseException, *, close_failed: bool = False) -> BaseException:
+        latched = original_record_failure(self, error, close_failed=close_failed)
+        failure_latched.set()
+        return latched
+
+    monkeypatch.setattr(StagingWriter, "append_chunk", fail_append)
+    monkeypatch.setattr(AttemptWriter, "_record_failure", observe_failure)
+
+    class DoneAfterFailureSession(ScriptedRingSession):
+        def __init__(self) -> None:
+            super().__init__(
+                _status(),
+                (
+                    WriteStep(b"\x10", (_info(10, 12),)),
+                    WriteStep(encode_read_command(10, 2)),
+                    WriteStep(encode_stop_command()),
+                ),
+            )
+            self._stream_calls = 0
+
+        def notifications(self) -> AsyncIterator[bytes]:
+            self._stream_calls += 1
+            if self._stream_calls == 1:
+                return super().notifications()
+
+            async def stream() -> AsyncIterator[bytes]:
+                yield _begin(10, 2)
+                yield _data(_record(10))
+                await asyncio.to_thread(failure_latched.wait, 5)
+                yield _done(12)
+
+            return stream()
+
+    session = DoneAfterFailureSession()
+    task = asyncio.create_task(
+        run_opportunistic_collector(
+            Provider([session]),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
+            _options(batch_records=2),
+        )
+    )
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await asyncio.wait_for(task, 5)
+
+    assert raised.value is fatal
+    assert raised.value.sqlite_errorcode == 11
+    assert session.writes == [b"\x10", encode_read_command(10, 2), encode_stop_command()]
+    assert encode_advance_command(12) not in session.writes
+
+
+@_async_test
 async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(tmp_path: Path) -> None:
     latched = OSError("latched disk failure")
     wrapped = WriterFailedError("writer boundary failed")
@@ -4182,9 +4310,21 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
     ("phase", "expected_count"),
     [("read", 1), ("advance", 2), ("confirm", 2)],
 )
-async def test_cancellation_reports_typed_source_custody(tmp_path: Path, phase: str, expected_count: int) -> None:
+async def test_cancellation_reports_typed_source_custody(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, expected_count: int
+) -> None:
     entered = asyncio.Event()
     release_advance = asyncio.Event()
+    committed = threading.Event()
+
+    if phase == "read":
+        append = StagingWriter.append_chunk
+
+        def note_commit(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+            append(self, offset, chunk, tail)
+            committed.set()
+
+        monkeypatch.setattr(StagingWriter, "append_chunk", note_commit)
 
     class GatedSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -4226,8 +4366,8 @@ async def test_cancellation_reports_typed_source_custody(tmp_path: Path, phase: 
     task = asyncio.create_task(run_opportunistic_collector(Provider([session]), store, _options()))
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        for _ in range(3):
-            await asyncio.sleep(0)
+        if phase == "read":
+            assert await asyncio.to_thread(committed.wait, 5)
         task.cancel()
 
         with pytest.raises(CollectionPreservedCancelledError) as raised:

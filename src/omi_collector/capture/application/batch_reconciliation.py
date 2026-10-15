@@ -617,11 +617,13 @@ async def _read_leg_with_progress(
     except collector.TransferInterruptedError as error:
         _note_quality_counters(quality, error.counters)
         if isinstance(batch.writer.failure, (FatalInternalAudioStorageError, TransientInternalAudioStorageError)):
-            raise batch.writer.failure from error
+            failure = batch.writer.failure
+            raise failure from failure.__cause__
         raise
-    except Exception as error:
+    except Exception:
         if isinstance(batch.writer.failure, (FatalInternalAudioStorageError, TransientInternalAudioStorageError)):
-            raise batch.writer.failure from error
+            failure = batch.writer.failure
+            raise failure from failure.__cause__
         raise
     else:
         _note_quality_counters(quality, result.counters)

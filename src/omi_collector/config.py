@@ -366,6 +366,8 @@ class ReadyConfig:
 
     def __post_init__(self) -> None:
         _require_positive_float(self.target_audio_seconds, "target_audio_seconds")
+        if not isfinite(self.target_audio_seconds * 50):
+            raise ValueError("target_audio_seconds is too large to represent as a packet threshold")
 
 
 @dataclass(frozen=True, slots=True)

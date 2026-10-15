@@ -57,7 +57,7 @@ def test_config_wires_bundle_minimum(tmp_path: Path) -> None:
     assert loaded.config.ready.target_audio_seconds == 1200.0
 
 
-@pytest.mark.parametrize("seconds", ["0.0", "nan", "inf"])
+@pytest.mark.parametrize("seconds", ["0.0", "nan", "inf", "1e308"])
 def test_config_rejects_invalid_bundle_minimum(tmp_path: Path, seconds: str) -> None:
     path = tmp_path / "config.toml"
     path.write_text(

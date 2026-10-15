@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.1](https://github.com/j2h4u/omi-collector/compare/v0.13.0...v0.13.1) (2026-10-15)
+
+
+### Fixes
+
+* **status:** keep inspection off READY audio and retire private roots ([cd29a26](https://github.com/j2h4u/omi-collector/commit/cd29a26d35f02048edbfefbe8e72dec6332b1651))
+
+
+### Tests
+
+* await deferred publication callback before asserting order ([cd29a26](https://github.com/j2h4u/omi-collector/commit/cd29a26d35f02048edbfefbe8e72dec6332b1651))
+
 ## [0.13.0](https://github.com/j2h4u/omi-collector/compare/v0.12.5...v0.13.0) (2026-10-15)
 
 

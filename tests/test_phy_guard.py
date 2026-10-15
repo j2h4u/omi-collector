@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from pathlib import Path
+from threading import Event, Thread
 from typing import cast
 
 import pytest
@@ -23,10 +25,30 @@ from omi_collector.capture.adapters.phy_guard import (
     parse_selected_phys,
     run_bluetoothctl,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.config import DEFAULT_CONFIG
 
 ORIGINAL = ("BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX")
 TEMPORARY = ORIGINAL[:-2]
+
+
+def storage_call[T](function: Callable[[], T]) -> T:
+    result: list[T] = []
+    error: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result.append(function())
+        except BaseException as exception:  # noqa: BLE001
+            error.append(exception)
+
+    thread = Thread(target=run)
+    thread.start()
+    thread.join()
+    if error:
+        raise error[0]
+    assert result
+    return result[0]
 
 
 def _async_test[**P](function: Callable[P, Awaitable[None]]) -> Callable[P, None]:
@@ -82,11 +104,11 @@ class FakeProcess:
 
 
 def _db(tmp_path: Path) -> StateDB:
-    return StateDB(tmp_path / "collector" / "collector-state.sqlite3")
+    return storage_call(lambda: StateDB(tmp_path / "collector" / "collector-state.sqlite3"))
 
 
 def _marker(db: StateDB) -> dict[str, object] | None:
-    return db.get(StateKind.PHY_RESTORATION, "hci0")
+    return storage_call(lambda: db.get(StateKind.PHY_RESTORATION, "hci0"))
 
 
 def test_phy_deadlines_project_from_runtime_config() -> None:
@@ -199,7 +221,11 @@ async def test_restore_failure_leaves_db_marker_for_next_run(tmp_path: Path) -> 
 @_async_test
 async def test_stale_marker_recovers_before_new_temporary_selection(tmp_path: Path) -> None:
     db, runner = _db(tmp_path), FakeRunner(selected=TEMPORARY)
-    db.put(StateKind.PHY_RESTORATION, "hci0", {"adapter": "hci0", "selected_phys": list(ORIGINAL), "version": 2})
+    storage_call(
+        lambda: db.put(
+            StateKind.PHY_RESTORATION, "hci0", {"adapter": "hci0", "selected_phys": list(ORIGINAL), "version": 2}
+        )
+    )
     with collector_guard(db.path.parent / "collector.lock"):
         async with ScopedPhyGuard("hci0", state_db=db, runner=runner):
             assert runner.selected == TEMPORARY
@@ -211,7 +237,7 @@ async def test_stale_marker_recovers_before_new_temporary_selection(tmp_path: Pa
 async def test_malformed_marker_fails_closed_before_controller_changes(tmp_path: Path) -> None:
     db, runner = _db(tmp_path), FakeRunner()
     bad_marker = {"adapter": "hci0", "selected_phys": [], "version": 2}
-    db.put(StateKind.PHY_RESTORATION, "hci0", bad_marker)
+    storage_call(lambda: db.put(StateKind.PHY_RESTORATION, "hci0", bad_marker))
     with collector_guard(db.path.parent / "collector.lock"):
         with pytest.raises(PhyStateError):
             await ScopedPhyGuard("hci0", state_db=db, runner=runner).recover()
@@ -225,10 +251,12 @@ async def test_marker_mutation_before_cleanup_is_detected(tmp_path: Path) -> Non
     with collector_guard(db.path.parent / "collector.lock"):
         with pytest.raises(PhyStateError, match="marker changed"):
             async with ScopedPhyGuard("hci0", state_db=db, runner=runner):
-                db.put(
-                    StateKind.PHY_RESTORATION,
-                    "hci0",
-                    {"adapter": "hci0", "selected_phys": list(TEMPORARY), "version": 2},
+                storage_call(
+                    lambda: db.put(
+                        StateKind.PHY_RESTORATION,
+                        "hci0",
+                        {"adapter": "hci0", "selected_phys": list(TEMPORARY), "version": 2},
+                    )
                 )
         assert _marker(db) is not None
 
@@ -269,3 +297,123 @@ def test_reap_returns_after_process_exited() -> None:
     process.returncode = 0
     asyncio.run(phy_guard._terminate_and_reap(cast(asyncio.subprocess.Process, process)))
     assert not process.terminated and not process.killed
+
+
+@pytest.mark.parametrize("method_name", ["_read_marker", "_write_marker", "_delete_marker"])
+@_async_test
+async def test_held_marker_storage_keeps_loop_responsive_and_guard_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method_name: str
+) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    entered, release = Event(), Event()
+    original = cast(Callable[..., object], getattr(guard, method_name))
+
+    def held(*args: object) -> object:
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(guard, method_name, held)
+    with collector_guard(db.path.parent / "collector.lock"):
+
+        async def visit() -> None:
+            async with guard:
+                assert runner.selected == TEMPORARY
+
+        task = asyncio.create_task(visit())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+            await asyncio.wait_for(asyncio.sleep(0.01), 0.1)
+            assert not task.done()
+        finally:
+            release.set()
+        await asyncio.wait_for(task, 5)
+    assert runner.selected == ORIGINAL
+    assert _marker(db) is None
+
+
+@_async_test
+async def test_repeated_cancel_after_marker_commit_joins_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    entered, release = Event(), Event()
+    original = guard._write_marker
+
+    def held(snapshot: tuple[str, ...]) -> None:
+        original(snapshot)
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(guard, "_write_marker", held)
+    with collector_guard(db.path.parent / "collector.lock"):
+        task = asyncio.create_task(guard.__aenter__())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+            task.cancel()
+            task.cancel()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert runner.selected == ORIGINAL
+    assert _marker(db) is None
+
+
+@_async_test
+async def test_repeated_cancel_during_marker_delete_waits_for_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    entered, release = Event(), Event()
+    original = guard._delete_marker
+
+    def held(snapshot: tuple[str, ...]) -> None:
+        entered.set()
+        assert release.wait(5)
+        original(snapshot)
+
+    monkeypatch.setattr(guard, "_delete_marker", held)
+
+    async def visit() -> None:
+        async with guard:
+            assert runner.selected == TEMPORARY
+
+    with collector_guard(db.path.parent / "collector.lock"):
+        task = asyncio.create_task(visit())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+            assert _marker(db) is not None
+            task.cancel()
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=0.02)
+            assert not done, "guard exit must remain owned while marker deletion is held"
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert runner.selected == ORIGINAL
+    assert _marker(db) is None
+
+
+@_async_test
+async def test_body_fatal_identity_survives_cleanup_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db, runner = _db(tmp_path), FakeRunner()
+    guard = ScopedPhyGuard("hci0", state_db=db, runner=runner)
+    fatal = FatalInternalAudioStorageError("primary storage failure")
+    original_sqlite_error = sqlite3.DatabaseError("original SQLite corruption")
+    fatal.__cause__ = original_sqlite_error
+
+    def failed_delete(_snapshot: tuple[str, ...]) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(guard, "_delete_marker", failed_delete)
+    with collector_guard(db.path.parent / "collector.lock"), pytest.raises(FatalInternalAudioStorageError) as caught:
+        async with guard:
+            raise fatal
+    assert caught.value is fatal
+    assert caught.value.__cause__ is original_sqlite_error
+    assert _marker(db) is not None

@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, closing
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
-from functools import partial, wraps
+from functools import wraps
 from hashlib import sha256
-from json import loads
 from pathlib import Path
 from shutil import rmtree
 from struct import pack
+from types import SimpleNamespace
 from typing import ParamSpec, TypeVar, cast
 
 import pytest
@@ -20,24 +21,31 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakDBusError, BleakError
 
 from fakes import DelayedNotification, ScriptedRingSession, WriteStep
-from omi_collector.capture.adapters import ready_closures
+from omi_collector.capture.adapters import internal_audio_store, opportunistic_runtime, ready_closures
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError, WriterProgress
+from omi_collector.capture.adapters.attempts import DurableSqliteSeal
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.collector_state_db import StateDB
+from omi_collector.capture.adapters.internal_audio_store import (
+    AUDIO_RECORD_SIZE,
+    CaptureSource,
+    InternalAudioStore,
+    read_capture_source,
+)
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics, read_quality_events
-from omi_collector.capture.adapters.quarantine_publish import QuarantineSalvageDeferredError
+from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import (
     AttemptDescriptor,
     DeviceAlreadyRunningError,
+    DiskSpaceError,
     DurablePrefix,
     LockContext,
     StagingError,
 )
 from omi_collector.capture.adapters.staging_filesystem import StagingIO
-from omi_collector.capture.adapters.staging_store import StagingStore
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application import batch_reconciliation, session_lifecycle
 from omi_collector.capture.application.batch_reconciliation import (
@@ -59,11 +67,6 @@ from omi_collector.capture.application.collector import (
 from omi_collector.capture.application.operational_telemetry import (
     BATTERY_UUID,
     TIME_READ_UUID,
-    OperationalEmitter,
-    TelemetryClock,
-)
-from omi_collector.capture.application.operational_telemetry import (
-    collect_operational_telemetry as _collect_operational_telemetry,
 )
 from omi_collector.capture.application.opportunistic_sync import CollectionPreservedCancelledError
 from omi_collector.capture.application.opportunistic_sync import (
@@ -71,7 +74,6 @@ from omi_collector.capture.application.opportunistic_sync import (
 )
 from omi_collector.capture.application.ports import (
     BatchWriterPort,
-    CaptureRuntimePort,
     StagingPort,
     StorageLeaseContext,
 )
@@ -100,6 +102,7 @@ from omi_collector.capture.application.session_lifecycle import (
     session_retry_outcome,
     validate_presence_policy,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     STATUS_STORAGE_NOT_READY,
@@ -112,7 +115,15 @@ from omi_collector.capture.domain.ring_protocol import (
     encode_stop_command,
 )
 from omi_collector.capture.domain.transfer_arena import TransferArena
-from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, ReadyConfig, RetryConfig, StagingRetentionConfig
+from omi_collector.config import (
+    DEFAULT_CONFIG,
+    CollectorConfig,
+    ReadyConfig,
+    RetryConfig,
+    StagingRetentionConfig,
+    TelemetryConfig,
+)
+from staging_test_factory import StagingStore, storage_call
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -138,18 +149,6 @@ async def run_opportunistic_collector(
 ) -> CollectionResult | NoDataResult:
     """Test helper that injects the concrete runtime at every call site."""
     return await _run_opportunistic_collector(provider, staging, options, runtime=_runtime())
-
-
-async def _finalize_with_short_transfer_timeout(
-    finalize: Callable[
-        [batch_reconciliation._Batch, OpportunisticOptions, CaptureRuntimePort],
-        Awaitable[tuple[BaseException | None, BaseException | None]],
-    ],
-    batch: batch_reconciliation._Batch,
-    options: OpportunisticOptions,
-    runtime: CaptureRuntimePort,
-) -> tuple[BaseException | None, BaseException | None]:
-    return await finalize(batch, replace(options, timeouts=TransferTimeouts(0.03, 0.03)), runtime)
 
 
 def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
@@ -193,7 +192,7 @@ def _staging_store(
     spool.mkdir(parents=True, exist_ok=True)
     state_db = _test_state_databases.get(spool)
     if state_db is None or not state_db.path.is_file():
-        state_db = StateDB(spool / "collector-state.sqlite3")
+        state_db = storage_call(lambda: StateDB(spool / "collector-state.sqlite3"))
         _test_state_databases[spool] = state_db
     return StagingStore(spool, capture_root, state_db=state_db, io=StagingIO(config=config))
 
@@ -203,15 +202,41 @@ def _quality_metrics(state_db: StateDB) -> SQLiteQualityMetrics:
 
 
 def _quality_events(journal: SQLiteQualityMetrics, state_db: StateDB) -> tuple[dict[str, object], ...]:
-    assert journal.close()
-    return read_quality_events(state_db, datetime.min.replace(tzinfo=UTC), datetime.max.replace(tzinfo=UTC))
+    def read() -> tuple[dict[str, object], ...]:
+        assert journal.close()
+        return read_quality_events(state_db, datetime.min.replace(tzinfo=UTC), datetime.max.replace(tzinfo=UTC))
+
+    return storage_call(read)
 
 
 def _ready_closure_rows(store: StagingStore) -> list[dict[str, object]]:
-    return [
-        {"next_sequence": closure.next_sequence, "reason": closure.reason}
-        for closure in ready_closures.load(store.state_db)
-    ]
+    return storage_call(
+        lambda: [
+            {"next_sequence": closure.next_sequence, "reason": closure.reason}
+            for closure in ready_closures.load(store.state_db)
+        ]
+    )
+
+
+def _attempt_source(store: StagingStore, source_id: str) -> CaptureSource | None:
+    return storage_call(lambda: read_capture_source(store.state_db, source_id))
+
+
+def _sealed_records(store: StagingStore, seal: DurableSqliteSeal) -> bytes:
+    return _source_records(store, seal.source_id)
+
+
+def _source_records(store: StagingStore, source_id: str) -> bytes:
+    def read() -> bytes:
+        with InternalAudioStore(store.state_db) as audio_store:
+            payloads: list[bytes] = []
+            after_ordinal = -1
+            while records := audio_store.read_record_page(source_id, after_ordinal):
+                payloads.extend(record.raw_bytes for record in records)
+                after_ordinal = records[-1].ordinal
+            return b"".join(payloads)
+
+    return storage_call(read)
 
 
 @pytest.fixture(autouse=True)
@@ -420,8 +445,11 @@ class _BlockingSealTarget:
     def read_begin(self, notice: object) -> None:
         del notice
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> None:
-        del offset, chunk
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        del offset, chunk, tail
+
+    def interrupt(self) -> None:
+        return None
 
     def checkpoint(self) -> DurablePrefix:
         return DurablePrefix(10, 11, 1, "a" * 64)
@@ -442,8 +470,13 @@ class _BlockingSealTarget:
 
 class _SealResultBatchWriter:
     def __init__(self, target: _BlockingSealTarget) -> None:
+        self._target = target
         self.writer = AttemptWriter(target, bytearray(RECORD_SIZE))
         self.close_requested = threading.Event()
+
+    @property
+    def attempt_id(self) -> str:
+        return self._target.attempt_id
 
     @property
     def thread(self) -> threading.Thread:
@@ -457,15 +490,19 @@ class _SealResultBatchWriter:
     def failure(self) -> BaseException | None:
         return self.writer.failure
 
+    @property
+    def interrupted_prefix(self) -> None:
+        return None
+
     async def checkpoint(self) -> DurablePrefix:
         return cast(DurablePrefix, await self.writer.checkpoint())
 
     async def await_seal_result(self) -> SealResult | None:
         return cast(SealResult | None, await self.writer.await_seal_result())
 
-    async def close(self, *, timeout: float) -> None:
+    async def close(self) -> None:
         self.close_requested.set()
-        await self.writer.close(timeout=timeout)
+        await self.writer.close()
 
 
 @asynccontextmanager
@@ -488,7 +525,7 @@ async def _real_batch_writer(
         yield writer
     finally:
         try:
-            await writer.close(timeout=DEFAULT_CONFIG.transfer.sync_timeout_seconds)
+            await writer.close()
         finally:
             await asyncio.to_thread(writer.thread.join, DEFAULT_CONFIG.transfer.sync_timeout_seconds)
             assert not writer.thread.is_alive()
@@ -518,14 +555,12 @@ async def test_real_runtime_writer_barrier_returns_persisted_durable_prefix(tmp_
         assert durable.start_sequence == 100
         assert durable.next_sequence == 101
         assert durable.record_count == 1
-        attempt_path = store.attempts_root / writer.attempt_id
-        assert (attempt_path / "records.bin").read_bytes() == record
-        attempt_state = store.state_db.get(StateKind.ATTEMPT, writer.attempt_id)
-        assert attempt_state is not None
-        checkpoint = cast(dict[str, object], attempt_state["checkpoint"])
-        assert checkpoint["record_count"] == 1
-        assert checkpoint["raw_sha256"] == sha256(record).hexdigest()
-        assert durable.raw_sha256 == checkpoint["raw_sha256"]
+        assert _source_records(store, writer.attempt_id) == record
+        source = _attempt_source(store, writer.attempt_id)
+        assert source is not None
+        assert source.committed_count == 1
+        assert source.committed_sha256 == sha256(record).hexdigest()
+        assert durable.raw_sha256 == source.committed_sha256
 
 
 @_async_test
@@ -534,16 +569,18 @@ async def test_real_runtime_writer_retains_seal_bundle_result(tmp_path: Path) ->
     records = _records(100, 2)
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(len(records))
-        sealed = await writer.seal(DoneNotification(0, 102))
+        sealed = cast(DurableSqliteSeal, await writer.seal(DoneNotification(0, 102)))
         retained = await writer.await_seal_result()
 
         assert retained == sealed
-        assert sealed.bundle_path.is_dir()
-        assert (sealed.bundle_path / "records.bin").read_bytes() == records
-        manifest = cast(dict[str, object], loads((sealed.bundle_path / "manifest.json").read_text(encoding="utf-8")))
-        assert manifest["start_sequence"] == 100
-        assert manifest["next_sequence"] == 102
-        assert manifest["record_count"] == 2
+        assert sealed.source_id == writer.attempt_id
+        assert sealed.start_sequence == 100
+        assert sealed.next_sequence == 102
+        assert sealed.record_count == 2
+        assert sealed.raw_sha256 == sha256(records).hexdigest()
+        source = _attempt_source(store, sealed.source_id)
+        assert source is not None
+        assert source.lifecycle == "sealed_waiting"
 
 
 @_async_test
@@ -810,15 +847,19 @@ def _patch_observation_writer(
 
 
 def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: int = 100) -> bytes:
-    store = _staging_store(root, _capture_root(root))
-    attempt = store.prepare_streaming_attempt(start, count)
-    attempt.record_read_begin(ReadBeginNotification(start, count))
-    records = _records(start, count)
-    if persisted:
-        attempt.accept_chunk(start, memoryview(records[: persisted * RECORD_SIZE]))
-    attempt.checkpoint()
-    attempt.close(durable=True)
-    return records
+    def seed() -> bytes:
+        store = _staging_store(root, _capture_root(root))
+        attempt = store.prepare_streaming_attempt(start, count)
+        attempt.prepare_leg(start, count)
+        attempt.record_read_begin(ReadBeginNotification(start, count))
+        records = _records(start, count)
+        if persisted:
+            attempt.accept_chunk(start, memoryview(records[: persisted * RECORD_SIZE]))
+        attempt.checkpoint()
+        attempt.close(durable=True)
+        return records
+
+    return storage_call(seed)
 
 
 def test_retry_policy_requires_explicit_drain_cooldown() -> None:
@@ -1102,11 +1143,9 @@ async def test_cancellation_during_observation_close_propagates(
 @pytest.mark.parametrize("kind", ["single", "multiple"])
 async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path: Path, kind: str) -> None:
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    if kind == "single":
-        store.prepare_streaming_attempt(100, 2)
-    else:
-        store.prepare_streaming_attempt(100, 2)
-        store.prepare_streaming_attempt(102, 2)
+    ranges = ((100, 2),) if kind == "single" else ((100, 2), (102, 2))
+    for start, count in ranges:
+        storage_call(lambda start=start, count=count: store.prepare_streaming_attempt(start, count).close())
     provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))])
     result = await run_opportunistic_collector(provider, store, _options())
 
@@ -1116,34 +1155,57 @@ async def test_partial_evidence_is_quarantined_before_provider_or_gatt(tmp_path:
 
 
 @_async_test
-@pytest.mark.parametrize("damage", ["checkpoint", "raw"])
-async def test_malformed_resume_evidence_is_quarantined_before_provider(tmp_path: Path, damage: str) -> None:
-    _seed_streaming_partial(tmp_path, count=2, persisted=1)
-    partial = next((tmp_path / "attempts").iterdir())
+async def test_corrupt_committed_record_is_held_before_provider_read(tmp_path: Path) -> None:
+    records = _seed_streaming_partial(tmp_path, count=2, persisted=1)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    attempt_state = store.state_db.get(StateKind.ATTEMPT, partial.name)
-    assert attempt_state is not None
-    evidence = partial / "records.bin"
-    if damage == "checkpoint":
-        attempt_state["checkpoint"] = {"version": "malformed"}
-        store.state_db.put(StateKind.ATTEMPT, partial.name, attempt_state)
-    else:
-        evidence.write_bytes(evidence.read_bytes() + b"torn")
-    cursor = 101 if damage == "raw" else 100
-    provider = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(cursor, cursor),)),))])
+    source_id = store.pending_attempts()[0].attempt_id
+    changed_payload = b"x" * (AUDIO_RECORD_SIZE - 4)
+    assert records[4:RECORD_SIZE] != changed_payload
+
+    def corrupt() -> int:
+        with closing(store.state_db.open_connection()) as connection:
+            updated = connection.execute(
+                "UPDATE capture_record SET payload = ? WHERE source_id = ? AND ordinal = 0",
+                (changed_payload, source_id),
+            )
+            connection.commit()
+            return updated.rowcount
+
+    assert storage_call(corrupt) == 1
+    session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))
+    provider = Provider([session])
     result = await run_opportunistic_collector(provider, _staging_store(tmp_path, _capture_root(tmp_path)), _options())
 
     assert isinstance(result, NoDataResult)
     assert provider.opened == 1
-    assert not partial.exists()
-    assert not evidence.exists()
-    retained_state = store.state_db.get(StateKind.ATTEMPT, partial.name)
-    if damage == "checkpoint":
-        assert retained_state is None
-    else:
-        assert retained_state is not None
-        assert cast(dict[str, object], retained_state["checkpoint"])["record_count"] == 1
-    assert list((tmp_path / "quarantine").iterdir())
+    assert not store.pending_attempts()
+    assert store.quarantined_attempts() == ()
+
+    def read_source() -> tuple[object, ...] | None:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                tuple[object, ...] | None,
+                connection.execute(
+                    "SELECT source_type, lifecycle, block_reason, quarantine_disposition, "
+                    "certified_prefix_count, coverage_digest, terminal_time, retention_deadline "
+                    "FROM capture_source WHERE source_id = ?",
+                    (source_id,),
+                ).fetchone(),
+            )
+
+    row = storage_call(read_source)
+    assert row is not None
+    assert tuple(row) == (
+        "quarantine",
+        "blocked",
+        "source_authentication_mismatch",
+        "unclassified",
+        None,
+        None,
+        None,
+        None,
+    )
+    assert encode_advance_command(102) not in session.writes
 
 
 @_async_test
@@ -1159,10 +1221,10 @@ async def test_resumed_complete_prefix_at_device_end_seals_without_read_or_advan
     )
 
     assert isinstance(result, CollectionResult)
-    assert isinstance(result.seal, SealResult)
+    assert isinstance(result.seal, DurableSqliteSeal)
     assert session.writes == [b"\x10", b"\x10"]
-    assert not result.seal.deduplicated
-    assert result.seal.bundle_path.joinpath("records.bin").read_bytes() == records
+    assert result.seal.source_id
+    assert _sealed_records(_staging_store(tmp_path, _capture_root(tmp_path)), result.seal) == records
 
 
 @_async_test
@@ -1211,7 +1273,7 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
     )
 
     assert isinstance(result, CollectionResult)
-    assert isinstance(result.seal, SealResult)
+    assert isinstance(result.seal, DurableSqliteSeal)
     assert session.writes == [
         b"\x10",
         encode_read_command(101, 1),
@@ -1219,7 +1281,7 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
         encode_advance_command(102),
         b"\x10",
     ]
-    assert result.seal.bundle_path.joinpath("records.bin").read_bytes() == records
+    assert _sealed_records(_staging_store(tmp_path, _capture_root(tmp_path)), result.seal) == records
 
 
 @_async_test
@@ -1250,20 +1312,31 @@ async def test_live_partial_ahead_of_fresh_cursor_resumes_at_durable_prefix(tmp_
     )
 
     assert isinstance(result, CollectionResult)
-    assert isinstance(result.seal, SealResult)
+    assert isinstance(result.seal, DurableSqliteSeal)
     assert session.writes[1] == encode_read_command(durable_next, end - durable_next)
-    assert result.seal.bundle_path.joinpath("records.bin").read_bytes() == records
+    assert _sealed_records(_staging_store(tmp_path, _capture_root(tmp_path)), result.seal) == records
 
 
 @_async_test
 async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    with store.device_lock() as lease:
-        sealed = store.resume_streaming_attempt(lease)
-        assert sealed is not None
-        sealed_result = sealed.seal(DoneNotification(0, 102))
-    assert sealed_result.bundle_path.exists()
+    attempt_id = store.pending_attempts()[0].attempt_id
+
+    def seal_resumed() -> DurableSqliteSeal:
+        with store.device_lock() as lease:
+            sealed = store.resume_streaming_attempt(lease)
+            assert sealed is not None
+            try:
+                result = sealed.seal(DoneNotification(0, 102))
+                assert isinstance(result, DurableSqliteSeal)
+                return result
+            finally:
+                sealed.close()
+
+    sealed_result = storage_call(seal_resumed)
+    assert sealed_result.source_id == attempt_id
+    assert _attempt_source(store, sealed_result.source_id) is not None
     session = ScriptedRingSession(
         _status(),
         (
@@ -1280,8 +1353,10 @@ async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path
     )
 
     assert isinstance(result, CollectionResult)
-    assert isinstance(result.seal, SealResult)
-    assert result.seal.deduplicated
+    assert isinstance(result.seal, DurableSqliteSeal)
+    assert result.seal.source_id != attempt_id
+    original = _attempt_source(store, attempt_id)
+    assert original is not None and original.lifecycle == "sealed_waiting"
     assert session.writes[1] == encode_read_command(100, 2)
     assert session.writes[3] == encode_advance_command(102)
 
@@ -1308,9 +1383,25 @@ async def test_post_seal_cursor_ahead_keeps_old_bundle_and_starts_at_fresh_curso
     assert isinstance(result, CollectionResult)
     assert result.next_sequence == 104
     assert encode_advance_command(102) not in session.writes
-    bundles = tuple(path.name for path in (_capture_root(tmp_path)).iterdir() if path.is_dir())
-    assert any(name.startswith("100-102-") for name in bundles)
-    assert any(name.startswith("103-104-") for name in bundles)
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+
+    def read_sources() -> list[tuple[str, bytes, bytes, int]]:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                list[tuple[str, bytes, bytes, int]],
+                connection.execute(
+                    "SELECT source_id, sequence_start, sequence_limit, committed_count "
+                    "FROM capture_source WHERE source_type = 'attempt' ORDER BY sequence_start"
+                ).fetchall(),
+            )
+
+    sources = storage_call(read_sources)
+    assert [(int.from_bytes(row[1], "big"), int.from_bytes(row[2], "big"), row[3]) for row in sources] == [
+        (100, 102, 2),
+        (103, 104, 1),
+    ]
+    assert _source_records(store, sources[0][0]) == _records(100, 2)
+    assert _source_records(store, sources[1][0]) == _record(103)
 
 
 @_async_test
@@ -1360,9 +1451,33 @@ async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor
 
 
 @_async_test
+async def test_capture_space_exhaustion_stops_before_read_or_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        internal_audio_store.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(f_bavail=0, f_frsize=4096),
+    )
+    session = ScriptedRingSession(
+        _status(),
+        (WriteStep(b"\x10", (_info(100, 101),)),),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+
+    with pytest.raises(DiskSpaceError, match="capture space"):
+        await run_opportunistic_collector(Provider([session]), store, _options(batch_records=1))
+
+    assert session.writes == [b"\x10"]
+    [pending] = store.pending_attempts()
+    assert (pending.start_sequence, pending.packet_count) == (100, 1)
+
+
+@_async_test
 async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_current_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
+    attempt_id = store.pending_attempts()[0].attempt_id
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
@@ -1382,19 +1497,15 @@ async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_curren
     assert isinstance(result, CollectionResult)
     assert encode_read_command(103, 1) in session.writes
     assert encode_advance_command(102) not in session.writes
-    prefix_bundles = tuple(path for path in (_capture_root(tmp_path)).iterdir() if path.name.startswith("100-101-"))
-    assert len(prefix_bundles) == 1
-    assert not (prefix_bundles[0] / "gap.json").exists()
-    assert not (prefix_bundles[0] / "receipt.json").exists()
-    retired = tuple((tmp_path / "attempts").iterdir())
-    assert len(retired) == 1
-    retired_state = store.state_db.get(StateKind.ATTEMPT, retired[0].name)
-    assert retired_state is not None
-    assert cast(dict[str, object], retired_state["terminal_retirement"])["state"] == "terminal-retired"
+    source = _attempt_source(store, attempt_id)
+    assert source is not None
+    assert source.lifecycle == "sealed_waiting"
+    assert (source.sequence_start, source.sequence_limit, source.committed_count) == (100, 102, 1)
+    assert _source_records(store, attempt_id) == _record(100)
 
 
 @_async_test
-async def test_startup_sweep_removes_only_aged_terminal_retired_partials(
+async def test_startup_sweep_retains_aged_sealed_source_until_publication_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -1408,24 +1519,32 @@ async def test_startup_sweep_removes_only_aged_terminal_retired_partials(
         _capture_root(tmp_path),
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(100))
-    attempt.checkpoint()
-    assert attempt.publish_prefix() is not None
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
+
+    def seed() -> str:
+        attempt = store.prepare_streaming_attempt(100, 1)
+        attempt.prepare_leg(100, 1)
+        attempt.record_read_begin(ReadBeginNotification(100, 1))
+        attempt.accept_chunk(100, _record(100))
+        attempt.checkpoint()
+        attempt.publish_prefix()
+        attempt.close(durable=True)
+        return attempt.attempt_id
+
+    attempt_id = storage_call(seed)
+    storage_call(lambda: store.terminalize_prefix_attempt(attempt_id))
     now += 1_000_000_000
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))
 
     result = await run_opportunistic_collector(Provider([session]), store, _options())
 
     assert isinstance(result, NoDataResult)
-    assert not attempt.path.exists()
+    source = _attempt_source(store, attempt_id)
+    assert source is not None and source.lifecycle == "sealed_waiting"
+    assert _source_records(store, attempt_id) == _record(100)
 
 
 @_async_test
-async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startup(
+async def test_maintenance_cadence_retains_sealed_source_until_publication_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -1449,13 +1568,19 @@ async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startu
             staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
         ),
     )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(100))
-    attempt.checkpoint()
-    assert attempt.publish_prefix() is not None
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
+
+    def seed() -> str:
+        attempt = store.prepare_streaming_attempt(100, 1)
+        attempt.prepare_leg(100, 1)
+        attempt.record_read_begin(ReadBeginNotification(100, 1))
+        attempt.accept_chunk(100, _record(100))
+        attempt.checkpoint()
+        attempt.publish_prefix()
+        attempt.close(durable=True)
+        return attempt.attempt_id
+
+    attempt_id = storage_call(seed)
+    storage_call(lambda: store.terminalize_prefix_attempt(attempt_id))
     drained = Provider([ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(101, 101),)),))])
 
     class RetryThenDrain:
@@ -1484,7 +1609,9 @@ async def test_maintenance_cadence_sweeps_terminal_retired_partials_after_startu
 
     assert isinstance(result, NoDataResult)
     assert provider.calls == 2
-    assert not attempt.path.exists()
+    source = _attempt_source(store, attempt_id)
+    assert source is not None and source.lifecycle == "sealed_waiting"
+    assert _source_records(store, attempt_id) == _record(100)
 
 
 @_async_test
@@ -1494,14 +1621,14 @@ async def test_terminal_retired_sweep_failure_is_structured_and_does_not_stop_co
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     events: list[tuple[str, BaseException, dict[str, object]]] = []
 
-    def fail_sweep(*, should_defer: Callable[[], bool]) -> tuple[Path, ...]:
+    def fail_sweep(*, should_defer: Callable[[], bool]) -> SweepResult:
         del should_defer
         raise OSError("simulated sweep failure")
 
     def record(event: str, error: BaseException, **fields: object) -> None:
         events.append((event, error, fields))
 
-    monkeypatch.setattr(store, "sweep_terminal_retired", fail_sweep)
+    monkeypatch.setattr(store, "sweep_terminal_quarantine", fail_sweep)
 
     def runtime_debug_exception(
         _runtime_instance: OpportunisticRuntime, event: str, error: BaseException, **fields: object
@@ -1516,7 +1643,7 @@ async def test_terminal_retired_sweep_failure_is_structured_and_does_not_stop_co
     assert isinstance(result, NoDataResult)
     assert len(events) == 1
     for event, error, fields in events:
-        assert event == "terminal_retired_sweep_failed"
+        assert event == "terminal_quarantine_sweep_failed"
         assert isinstance(error, OSError)
         assert fields == {}
 
@@ -1708,6 +1835,7 @@ async def test_coordinator_cancellation_joins_quarantine_maintenance(
 async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_and_drains(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
+    attempt_id = store.pending_attempts()[0].attempt_id
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
@@ -1724,9 +1852,11 @@ async def test_fresh_restart_cursor_ahead_at_write_watermark_publishes_prefix_an
     assert session.writes == [b"\x10", b"\x10"]
     assert encode_advance_command(102) not in session.writes
     assert result.advance_confirmed is False
-    prefix_bundles = tuple(path for path in (_capture_root(tmp_path)).iterdir() if path.name.startswith("100-101-"))
-    assert len(prefix_bundles) == 1
-    assert not (prefix_bundles[0] / "gap.json").exists()
+    source = _attempt_source(store, attempt_id)
+    assert source is not None
+    assert source.lifecycle == "sealed_waiting"
+    assert (source.sequence_start, source.sequence_limit, source.committed_count) == (100, 102, 1)
+    assert _source_records(store, attempt_id) == _record(100)
 
 
 @_async_test
@@ -1871,12 +2001,18 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt(100, 3)
-    attempt.record_read_begin(ReadBeginNotification(100, 3))
-    attempt.accept_chunk(100, _record(100))
-    attempt.checkpoint()
-    attempt.accept_chunk(101, _record(101))
-    attempt.close(durable=True)
+
+    def seed() -> str:
+        attempt = store.prepare_streaming_attempt(100, 3)
+        attempt.prepare_leg(100, 3)
+        attempt.record_read_begin(ReadBeginNotification(100, 3))
+        attempt.accept_chunk(100, _record(100))
+        attempt.checkpoint()
+        attempt.accept_chunk(101, _record(101))
+        attempt.close(durable=True)
+        return attempt.attempt_id
+
+    attempt_id = storage_call(seed)
 
     original_arena = batch_reconciliation.TransferArena
     checkpoint_counts_at_allocation: list[int] = []
@@ -1888,10 +2024,9 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
         max_bytes: int,
         record_size: int = RECORD_SIZE,
     ) -> TransferArena:
-        attempt_state = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
-        assert attempt_state is not None
-        checkpoint = cast(dict[str, object], attempt_state["checkpoint"])
-        checkpoint_counts_at_allocation.append(cast(int, checkpoint["record_count"]))
+        source = _attempt_source(store, attempt_id)
+        assert source is not None
+        checkpoint_counts_at_allocation.append(source.committed_count)
         return original_arena(start_sequence, total_records, max_bytes=max_bytes, record_size=record_size)
 
     monkeypatch.setattr(batch_reconciliation, "TransferArena", observe_arena)
@@ -1918,6 +2053,7 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
 async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_cursor(tmp_path: Path) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
+    attempt_id = store.pending_attempts()[0].attempt_id
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     session = ScriptedRingSession(
@@ -1937,13 +2073,19 @@ async def test_pending_cursor_ahead_publishes_prefix_and_reads_from_current_curs
     assert isinstance(result, CollectionResult)
     assert encode_read_command(103, 1) in session.writes
     assert not store.pending_attempts()
-    assert any(path.name.startswith("100-101-") for path in (_capture_root(tmp_path)).iterdir())
+    source = _attempt_source(store, attempt_id)
+    assert source is not None
+    assert source.lifecycle == "sealed_waiting"
+    assert _source_records(store, attempt_id) == _record(100)
 
 
 @_async_test
-async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audio(tmp_path: Path) -> None:
+async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _seed_streaming_partial(tmp_path, count=4, persisted=0)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
+    empty_source_id = store.pending_attempts()[0].attempt_id
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     activity: list[ActivityEvent] = []
@@ -1983,6 +2125,26 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
     assert isinstance(result, CollectionResult)
     assert encode_read_command(101, 3) in session.writes
     assert ActivityEvent("prefix_retired") in activity
+    empty_source = _attempt_source(store, empty_source_id)
+    assert empty_source is not None
+    assert (empty_source.source_type, empty_source.lifecycle, empty_source.committed_count) == (
+        "quarantine",
+        "blocked",
+        0,
+    )
+
+    def read_terminal() -> tuple[object, object] | None:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                tuple[object, object] | None,
+                connection.execute(
+                    "SELECT quarantine_disposition, retention_deadline FROM capture_source WHERE source_id = ?",
+                    (empty_source_id,),
+                ).fetchone(),
+            )
+
+    terminal = storage_call(read_terminal)
+    assert terminal is not None and terminal[0] == "unprocessable" and terminal[1] is not None
     assert any(event.get("event") == "loss_detected" for event in operational_events)
     metrics = _quality_events(journal, store.state_db)
     loss = next(item for item in metrics if item["event"] == "sequence_loss")
@@ -2002,6 +2164,11 @@ async def test_live_cursor_ahead_publishes_prefix_event_and_reads_remaining_audi
         "source_revision": "a" * 12,
         "firmware_version": None,
     }
+    deadline = int(cast(str, terminal[1]))
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: deadline)
+    sweep = storage_call(store.sweep_terminal_quarantine)
+    assert sweep.removed_source_ids == (empty_source_id,)
+    assert _attempt_source(store, empty_source_id) is None
 
 
 @_async_test
@@ -2100,6 +2267,7 @@ async def test_real_ring_cursor_ahead_publishes_hash_bound_prefix_and_continues(
     start, end, prefix_end, cursor, write = 1560520, 1564616, 1561108, 1561130, 1570627
     _seed_streaming_partial(tmp_path, count=end - start, persisted=prefix_end - start, start=start)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
+    attempt_id = store.pending_attempts()[0].attempt_id
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
     operational_events: list[dict[str, object]] = []
@@ -2118,10 +2286,15 @@ async def test_real_ring_cursor_ahead_publishes_hash_bound_prefix_and_continues(
 
     prefix_bytes = _records(start, prefix_end - start)
     prefix_hash = sha256(prefix_bytes).hexdigest()
-    prefix_bundle = _capture_root(tmp_path) / f"{start}-{prefix_end}-{prefix_hash[:16]}"
-    assert prefix_bundle.joinpath("records.bin").read_bytes() == prefix_bytes
-    assert not prefix_bundle.joinpath("gap.json").exists()
-    assert not prefix_bundle.joinpath("receipt.json").exists()
+    source = _attempt_source(store, attempt_id)
+    assert source is not None
+    assert source.lifecycle == "sealed_waiting"
+    assert (source.sequence_start, source.committed_count, source.committed_sha256) == (
+        start,
+        prefix_end - start,
+        prefix_hash,
+    )
+    assert _source_records(store, attempt_id) == prefix_bytes
     loss_events = [event for event in operational_events if event.get("event") == "loss_detected"]
     assert loss_events == [
         {
@@ -2400,10 +2573,10 @@ async def test_notification_overflow_checkpoints_and_reconnects_with_fresh_info(
 
     assert isinstance(result, CollectionResult)
     assert result.packet_count == 2
-    assert isinstance(result.seal, SealResult)
+    assert isinstance(result.seal, DurableSqliteSeal)
     assert result.advance_confirmed
     assert result.next_sequence == 12
-    assert result.seal.bundle_path.joinpath("records.bin").read_bytes() == _records(10, 2)
+    assert _sealed_records(_staging_store(tmp_path, _capture_root(tmp_path)), result.seal) == _records(10, 2)
     assert first.writes == [b"\x10", encode_read_command(10, 2), encode_stop_command()]
     assert first.closed
     assert second.closed
@@ -2705,14 +2878,12 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
     def observe(event: ActivityEvent) -> None:
         if event.state != "away":
             return
-        attempts = store.state_db.list(StateKind.ATTEMPT)
+        attempts = store.pending_attempts()
         assert len(attempts) == 1
-        checkpoint = cast(dict[str, object], attempts[0][1]["checkpoint"])
-        durable_after_visit.append(cast(int, checkpoint["record_count"]))
-        device_root = capture_root
-        published_after_visit.append(
-            sum(1 for path in device_root.iterdir() if path.is_dir()) if device_root.is_dir() else 0
-        )
+        source = _attempt_source(store, attempts[0].attempt_id)
+        assert source is not None
+        durable_after_visit.append(source.committed_count)
+        published_after_visit.append(int(source.lifecycle == "sealed_waiting"))
 
     provider = Provider([first, second, third])
     result = await run_opportunistic_collector(
@@ -2722,12 +2893,13 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
     )
 
     assert isinstance(result, CollectionResult)
-    assert isinstance(result.seal, SealResult)
+    assert isinstance(result.seal, DurableSqliteSeal)
     assert result.next_sequence == 16
     assert provider.opened == 3
     assert durable_after_visit == [2, 4]
     assert published_after_visit == [0, 0]
-    assert result.seal.bundle_path.name.startswith("10-16-")
+    assert result.seal.start_sequence == 10
+    assert result.seal.next_sequence == 16
 
 
 @_async_test
@@ -2763,48 +2935,21 @@ async def test_default_preflight_skips_cached_status_without_telemetry(tmp_path:
 
 
 @_async_test
-async def test_presence_preflight_budget_covers_status_and_optional_reads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storage_deadline(
+    tmp_path: Path,
 ) -> None:
-    config = CollectorConfig(retry=RetryConfig(presence_preflight_budget_seconds=0.05))
+    config = CollectorConfig(
+        retry=RetryConfig(presence_preflight_budget_seconds=0.001),
+        telemetry=TelemetryConfig(optional_operation_timeout_seconds=0.02),
+    )
     order: list[str] = []
     cancellation: list[str] = []
-    telemetry_awaitables: list[Awaitable[object]] = []
-    telemetry_timeouts: list[float] = []
-    timed_out_telemetry: list[Awaitable[object]] = []
-
-    def telemetry_factory(
-        session_arg: RingSession,
-        status: RingStatus | None,
-        info: RingInfo,
-        emit: OperationalEmitter | None,
-        *,
-        clock: TelemetryClock | None = None,
-    ) -> Awaitable[None]:
-        awaitable = _collect_operational_telemetry(session_arg, status, info, emit, clock=clock)
-        telemetry_awaitables.append(awaitable)
-        return awaitable
-
-    real_bounded = session_lifecycle.bounded
-
-    async def bounded_spy(awaitable: Awaitable[T], timeout: float) -> T:
-        if telemetry_awaitables and awaitable is telemetry_awaitables[0]:
-            telemetry_timeouts.append(timeout)
-            try:
-                return await real_bounded(awaitable, timeout)
-            except session_lifecycle.collector.CollectorTimeoutError:
-                timed_out_telemetry.append(awaitable)
-                raise
-        return await real_bounded(awaitable, timeout)
-
-    monkeypatch.setattr(session_lifecycle, "collect_operational_telemetry", telemetry_factory)
-    monkeypatch.setattr(session_lifecycle, "bounded", bounded_spy)
 
     class SlowPreflightSession(ScriptedRingSession):
         async def read_status(self) -> RingStatus:
             order.append("status")
             try:
-                await asyncio.sleep(config.retry.presence_preflight_budget_seconds * 0.75)
+                await asyncio.sleep(config.telemetry.optional_operation_timeout_seconds * 0.75)
                 return self._status
             finally:
                 cancellation.append("status")
@@ -2825,8 +2970,8 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(
 
     session = SlowPreflightSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
 
-    def emit(_event: Mapping[str, object]) -> None:
-        return None
+    async def emit(_event: Mapping[str, object]) -> None:
+        await asyncio.sleep(0.01)
 
     result = await asyncio.wait_for(
         run_opportunistic_collector(
@@ -2846,10 +2991,6 @@ async def test_presence_preflight_budget_covers_status_and_optional_reads(
     assert isinstance(result, NoDataResult)
     assert order[:3] == ["info", "optional", "status"]
     assert "optional" in order
-    assert len(telemetry_awaitables) == len(telemetry_timeouts) == 1
-    assert telemetry_timeouts[0] > 0
-    assert telemetry_timeouts[0] <= config.retry.presence_preflight_budget_seconds
-    assert timed_out_telemetry == telemetry_awaitables
     assert cancellation.count("status") == 1
     assert cancellation.count("optional") >= 1
 
@@ -2976,6 +3117,7 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
             events.append("retry")
         outcome = original_background()
         if outcome.state is ReadyOutcomeState.PUBLISHED:
+            events.append("publication_success")
             published.set()
         return outcome
 
@@ -3021,11 +3163,12 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
 
     assert isinstance(result, CollectionResult)
     assert session.clock_read
-    clock_state = ClockStateStore(store.state_db).state()
+    clock_state = storage_call(lambda: ClockStateStore(store.state_db).state())
     assert clock_state.intent is None
     assert clock_state.anchor is not None
     assert clock_state.anchor.sequence_frontier == 11
-    assert events == ["read", "closure", "publication_transient", "retry"]
+    assert events[:5] == ["read", "closure", "publication_transient", "retry", "publication_success"]
+    assert events[5:] in ([], ["retry"])
     assert len(tuple(ready.iterdir())) == 1
 
 
@@ -3196,8 +3339,8 @@ async def test_same_process_recovery_disconnect_rebinds_original_read_begin_for_
     assert isinstance(result, CollectionResult)
     assert recovery.writes[1] == encode_read_command(12, 1)
     assert gapped.writes == [b"\x10", b"\x10"]
-    assert isinstance(result.seal, SealResult)
-    assert not (result.seal.bundle_path / "gap.json").exists()
+    assert isinstance(result.seal, DurableSqliteSeal)
+    assert result.seal.source_id
 
 
 @_async_test
@@ -3304,7 +3447,7 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
         ordering.append("close")
         original_close(writer)
 
-    def quarantine_source(store: StagingStore, attempt_id: str) -> Path:
+    def quarantine_source(store: StagingStore, attempt_id: str) -> str:
         ordering.append("quarantine")
         return original_quarantine(store, attempt_id)
 
@@ -3347,20 +3490,39 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
     assert isinstance(result, (CollectionResult, NoDataResult))
     assert not _staging_store(tmp_path, _capture_root(tmp_path)).pending_attempts()
     assert second.writes[0] == b"\x10"
-    quarantine = tmp_path / "quarantine"
     if case == "gap":
-        assert quarantine.is_dir()
-        assert tuple(quarantine.iterdir()) == ()
-        assert "quarantine" not in ordering
+        assert second.writes == [b"\x10", b"\x10"]
+        quarantined = store.quarantined_attempts()
+        assert len(quarantined) == 1
+        source_id = quarantined[0]
+        source = _attempt_source(store, source_id)
+        assert source is not None
+        assert (source.source_type, source.lifecycle, source.committed_count) == ("quarantine", "blocked", 0)
+        assert source.committed_count == 0
+        assert _source_records(store, source_id) == b""
+
+        def read_terminal() -> tuple[object, object, object] | None:
+            with closing(store.state_db.open_connection(read_only=True)) as connection:
+                return cast(
+                    tuple[object, object, object] | None,
+                    connection.execute(
+                        "SELECT quarantine_disposition, terminal_reason, retention_deadline "
+                        "FROM capture_source WHERE source_id = ?",
+                        (source_id,),
+                    ).fetchone(),
+                )
+
+        terminal = storage_call(read_terminal)
+        assert terminal is not None
+        assert terminal[0] == "unprocessable" and isinstance(terminal[1], str) and terminal[1]
+        assert terminal[2] is not None
+        with store.device_lock():
+            pass
     else:
-        destinations = tuple(quarantine.iterdir())
-        assert len(destinations) == 1
-        destination = destinations[0]
-        assert destination.is_dir()
-        assert {path.name for path in destination.iterdir()} == {"records.bin"}
-        quarantine_rows = store.state_db.list(StateKind.QUARANTINE)
-        assert len(quarantine_rows) == 1
-        assert quarantine_rows[0][1]["move_committed"] is True
+        quarantined = store.quarantined_attempts()
+        assert len(quarantined) == 1
+        source = _attempt_source(store, quarantined[0])
+        assert source is not None and source.source_type == "quarantine"
         assert ordering.index("close") < ordering.index("quarantine")
 
 
@@ -3373,6 +3535,8 @@ async def test_startup_discontinuity_defers_quarantine_salvage_until_next_mainte
     tmp_path: Path, read: int, write: int, count: int
 ) -> None:
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    source_id = store.pending_attempts()[0].attempt_id
     end = read + count
     session = ScriptedRingSession(
         _status(),
@@ -3387,19 +3551,13 @@ async def test_startup_discontinuity_defers_quarantine_salvage_until_next_mainte
         ),
     )
 
-    result = await run_opportunistic_collector(
-        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options(batch_records=3)
-    )
+    result = await run_opportunistic_collector(Provider([session]), store, _options(batch_records=3))
 
     assert isinstance(result, CollectionResult)
-    quarantine = tmp_path / "quarantine"
-    destinations = tuple(quarantine.iterdir())
-    assert len(destinations) == 1
-    assert {path.name for path in destinations[0].iterdir()} == {"records.bin"}
-    state_db = _staging_store(tmp_path, _capture_root(tmp_path)).state_db
-    quarantine_rows = state_db.list(StateKind.QUARANTINE)
-    assert len(quarantine_rows) == 1
-    assert quarantine_rows[0][1]["move_committed"] is True
+    assert store.quarantined_attempts() == (source_id,)
+    source = _attempt_source(store, source_id)
+    assert source is not None and source.source_type == "quarantine"
+    assert _source_records(store, source_id) == _record(100)
 
 
 @_async_test
@@ -3409,13 +3567,15 @@ async def test_admission_prefix_mismatch_closes_writer_and_releases_lease(
     _seed_streaming_partial(tmp_path, count=2, persisted=1)
     original_threads = {thread for thread in threading.enumerate() if thread.name == "omi-attempt-writer"}
 
-    def mismatched_prepare_leg(self: object, _start: int, _count: int) -> DurablePrefix:
-        del self
+    original_prepare = opportunistic_runtime._StagingWriterAdapter.prepare
+
+    def mismatched_prepare(self: object) -> DurablePrefix:
+        original_prepare(cast(opportunistic_runtime._StagingWriterAdapter, self))
         return DurablePrefix(100, 100, 0, "mismatch")
 
     monkeypatch.setattr(
-        "omi_collector.capture.adapters.opportunistic_runtime._StagingWriterAdapter.prepare_leg",
-        mismatched_prepare_leg,
+        "omi_collector.capture.adapters.opportunistic_runtime._StagingWriterAdapter.prepare",
+        mismatched_prepare,
     )
     session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 102),)),))
 
@@ -3429,7 +3589,7 @@ async def test_admission_prefix_mismatch_closes_writer_and_releases_lease(
 
 
 @_async_test
-async def test_cursor_regression_after_advance_ack_rejects_drain_and_keeps_bundle(tmp_path: Path) -> None:
+async def test_cursor_regression_after_advance_ack_rejects_drain_and_keeps_sqlite_source(tmp_path: Path) -> None:
     session = ScriptedRingSession(
         _status(),
         (
@@ -3446,7 +3606,21 @@ async def test_cursor_regression_after_advance_ack_rejects_drain_and_keeps_bundl
         await run_opportunistic_collector(Provider([session]), store, _options(batch_records=3))
 
     assert session.writes.count(encode_advance_command(102)) == 1
-    assert tuple(store.capture_root.glob("100-102-*"))
+
+    def read_source_rows() -> list[tuple[str]]:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                list[tuple[str]],
+                connection.execute("SELECT source_id FROM capture_source WHERE source_type='attempt'").fetchall(),
+            )
+
+    source_rows = storage_call(read_source_rows)
+    assert len(source_rows) == 1
+    source_id = source_rows[0][0]
+    source = _attempt_source(store, source_id)
+    assert source is not None and source.lifecycle == "sealed_waiting"
+    assert source.committed_count == 2
+    assert _source_records(store, source_id) == _records(100, 2)
     assert not store.pending_attempts()
     assert _ready_closure_rows(store) == []
 
@@ -3465,12 +3639,170 @@ async def test_seal_failure_never_advances(tmp_path: Path, monkeypatch: pytest.M
         del self, _done_notice
         raise OSError("disk fault")
 
-    monkeypatch.setattr("omi_collector.capture.adapters.attempts.StagedAttempt.seal", fail_seal)
+    monkeypatch.setattr("omi_collector.capture.adapters.attempts.SqliteStagedAttempt.seal", fail_seal)
     with pytest.raises(OSError, match="disk fault"):
         await run_opportunistic_collector(
             Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options(batch_records=1)
         )
     assert encode_advance_command(11) not in session.writes
+
+
+@_async_test
+async def test_fatal_writer_failure_after_data_survives_barrier_and_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    append = StagingWriter.append_chunk
+
+    def fail_after_commit(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        append(self, offset, chunk, tail)
+        raise fatal
+
+    monkeypatch.setattr(StagingWriter, "append_chunk", fail_after_commit)
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(Provider([session]), store, _options(batch_records=1))
+    assert raised.value is fatal
+    assert encode_advance_command(11) not in session.writes
+    pending = store.pending_attempts()
+    assert len(pending) == 1
+    source = _attempt_source(store, pending[0].attempt_id)
+    assert source is not None and source.committed_count == 1
+    assert _source_records(store, source.source_id) == _record(10)
+
+
+@_async_test
+@pytest.mark.parametrize("next_data", [False, True], ids=["quiet-read", "next-data"])
+async def test_active_read_fatal_writer_failure_stops_without_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, next_data: bool
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    sql_error = sqlite3.DatabaseError("file is not a database")
+    fatal.__cause__ = sql_error
+    failure_latched = threading.Event()
+    original_append = StagingWriter.append_chunk
+    original_record_failure = AttemptWriter._record_failure
+
+    def fail_append(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        original_append(self, offset, chunk, tail)
+        raise fatal
+
+    def observe_failure(self: AttemptWriter, error: BaseException, *, close_failed: bool = False) -> BaseException:
+        latched = original_record_failure(self, error, close_failed=close_failed)
+        failure_latched.set()
+        return latched
+
+    monkeypatch.setattr(StagingWriter, "append_chunk", fail_append)
+    monkeypatch.setattr(AttemptWriter, "_record_failure", observe_failure)
+
+    class QuietReadSession(ScriptedRingSession):
+        def __init__(self) -> None:
+            super().__init__(
+                _status(),
+                (
+                    WriteStep(b"\x10", (_info(10, 12),)),
+                    WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_record(10)))),
+                    WriteStep(encode_stop_command(), error=OSError("STOP failed")),
+                ),
+            )
+            self._stream_calls = 0
+
+        def notifications(self) -> AsyncIterator[bytes]:
+            self._stream_calls += 1
+            if self._stream_calls == 1:
+                return super().notifications()
+
+            async def stream() -> AsyncIterator[bytes]:
+                yield _begin(10, 2)
+                yield _data(_record(10))
+                await asyncio.to_thread(failure_latched.wait, 5)
+                if next_data:
+                    yield _data(_record(11))
+                await asyncio.Event().wait()
+
+            return stream()
+
+    session = QuietReadSession()
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    task = asyncio.create_task(run_opportunistic_collector(Provider([session]), store, _options(batch_records=2)))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await asyncio.wait_for(task, 5)
+
+    assert raised.value is fatal
+    assert raised.value.sqlite_errorcode == 11
+    assert raised.value.__cause__ is sql_error
+    assert session.writes == [b"\x10", encode_read_command(10, 2), encode_stop_command()]
+    assert encode_advance_command(12) not in session.writes
+
+
+@_async_test
+async def test_latched_writer_failure_wins_when_done_arrives_same_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    failure_latched = threading.Event()
+    original_append = StagingWriter.append_chunk
+    original_record_failure = AttemptWriter._record_failure
+
+    def fail_append(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+        original_append(self, offset, chunk, tail)
+        raise fatal
+
+    def observe_failure(self: AttemptWriter, error: BaseException, *, close_failed: bool = False) -> BaseException:
+        latched = original_record_failure(self, error, close_failed=close_failed)
+        failure_latched.set()
+        return latched
+
+    monkeypatch.setattr(StagingWriter, "append_chunk", fail_append)
+    monkeypatch.setattr(AttemptWriter, "_record_failure", observe_failure)
+
+    class DoneAfterFailureSession(ScriptedRingSession):
+        def __init__(self) -> None:
+            super().__init__(
+                _status(),
+                (
+                    WriteStep(b"\x10", (_info(10, 12),)),
+                    WriteStep(encode_read_command(10, 2)),
+                    WriteStep(encode_stop_command()),
+                ),
+            )
+            self._stream_calls = 0
+
+        def notifications(self) -> AsyncIterator[bytes]:
+            self._stream_calls += 1
+            if self._stream_calls == 1:
+                return super().notifications()
+
+            async def stream() -> AsyncIterator[bytes]:
+                yield _begin(10, 2)
+                yield _data(_record(10))
+                await asyncio.to_thread(failure_latched.wait, 5)
+                yield _done(12)
+
+            return stream()
+
+    session = DoneAfterFailureSession()
+    task = asyncio.create_task(
+        run_opportunistic_collector(
+            Provider([session]),
+            _staging_store(tmp_path, _capture_root(tmp_path)),
+            _options(batch_records=2),
+        )
+    )
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await asyncio.wait_for(task, 5)
+
+    assert raised.value is fatal
+    assert raised.value.sqlite_errorcode == 11
+    assert session.writes == [b"\x10", encode_read_command(10, 2), encode_stop_command()]
+    assert encode_advance_command(12) not in session.writes
 
 
 @_async_test
@@ -3481,6 +3813,7 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
     class FailedWriter:
         progress = WriterProgress(RECORD_SIZE, 0)
         failure = latched
+        interrupted_prefix = None
 
         async def await_seal_result(self) -> object | None:
             return None
@@ -3569,10 +3902,10 @@ async def test_close_visit_absence_publishes_partial_prefix_before_terminal_clos
         assert reconciler._state.batch is None
         assert reconciler.durable_progress() == 0
         assert not writer.thread.is_alive()
-        attempt_state = store.state_db.get(StateKind.ATTEMPT, attempt_id)
-        assert attempt_state is not None
-        assert attempt_state["prefix_publication"] == {"version": 1, "state": "published"}
-        assert cast(dict[str, object], attempt_state["terminal_retirement"])["state"] == "terminal-retired"
+        source = _attempt_source(store, attempt_id)
+        assert source is not None
+        assert source.lifecycle == "sealed_waiting"
+        assert source.committed_count == 1
         assert _ready_closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
 
 
@@ -3581,7 +3914,7 @@ async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_cl
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(RECORD_SIZE * 2)
-        seal = await writer.seal(DoneNotification(0, 102))
+        seal = cast(DurableSqliteSeal, await writer.seal(DoneNotification(0, 102)))
         assert seal is not None
         batch = batch_reconciliation._Batch(
             RingInfo(100, 102, 10000, 0, RECORD_SIZE),
@@ -3600,7 +3933,8 @@ async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_cl
         await reconciler.close_visit("absence")
 
         assert not writer.thread.is_alive()
-        assert seal.bundle_path.is_dir()
+        assert seal.source_id == writer.attempt_id
+        assert _attempt_source(store, seal.source_id) is not None
         assert _ready_closure_rows(store) == [{"next_sequence": 102, "reason": "absence"}]
 
 
@@ -3633,7 +3967,7 @@ async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, mon
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 1) as writer:
         assert writer.publish(RECORD_SIZE)
-        seal = await writer.seal(DoneNotification(0, 101))
+        seal = cast(DurableSqliteSeal, await writer.seal(DoneNotification(0, 101)))
         assert seal is not None
         batch = batch_reconciliation._Batch(
             RingInfo(100, 101, 10000, 0, RECORD_SIZE),
@@ -3650,14 +3984,13 @@ async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, mon
         reconciler = BatchReconciler(store, _options(), _runtime(), quarantine)
         reconciler._state.batch = batch
 
-        async def fail_close(*, timeout: float) -> None:
-            del timeout
+        async def fail_close() -> None:
             raise TimeoutError("writer close did not complete")
 
         with monkeypatch.context() as patch:
             patch.setattr(writer, "close", fail_close)
             with pytest.raises(TimeoutError, match="writer close"):
-                await batch_reconciliation._complete_batch(reconciler._state, batch, _options())
+                await batch_reconciliation._complete_batch(reconciler._state, batch)
 
         assert reconciler._state.batch is batch
         assert reconciler._state.last_result is None
@@ -3665,7 +3998,7 @@ async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, mon
 
 
 @_async_test
-async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_path: Path) -> None:
+async def test_cancelled_owned_seal_is_adopted_before_uncertain_advance_retries(tmp_path: Path) -> None:
     target = _BlockingSealTarget(tmp_path / "sealed")
     writer = _SealResultBatchWriter(target)
     try:
@@ -3682,12 +4015,13 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
             durable,
         )
 
-        timed_out = asyncio.create_task(
-            batch_reconciliation._bounded(writer.writer.seal(DoneNotification(0, 11)), 0.01)
-        )
+        sealing = asyncio.create_task(writer.writer.seal(DoneNotification(0, 11)))
         assert await asyncio.to_thread(target.seal_started.wait, 1)
-        with pytest.raises(batch_reconciliation.collector.CollectorTimeoutError):
-            await timed_out
+        sealing.cancel()
+        sealing.cancel()
+        await asyncio.sleep(0)
+        assert not sealing.done()
+        assert writer.thread.is_alive()
 
         async def quarantine(_attempt_id: str) -> None:
             return None
@@ -3704,6 +4038,8 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
         assert not adoption.done()
         assert target.seal_calls == 1
         target.release_seal.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sealing
         await adoption
         assert batch.seal == SealResult(tmp_path / "sealed", False)
 
@@ -3738,11 +4074,11 @@ async def test_timed_out_seal_is_adopted_before_uncertain_advance_retries(tmp_pa
     finally:
         target.release_seal.set()
         if writer.thread.is_alive():
-            await writer.close(timeout=2)
+            await writer.close()
 
 
 @_async_test
-async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tmp_path: Path) -> None:
+async def test_finalization_joins_pending_seal_and_reports_bundle(tmp_path: Path) -> None:
     target = _BlockingSealTarget(tmp_path / "sealed")
     writer = _SealResultBatchWriter(target)
     try:
@@ -3758,12 +4094,13 @@ async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tm
             cast(BatchWriterPort, writer),
             durable,
         )
-        timed_out = asyncio.create_task(
-            batch_reconciliation._bounded(writer.writer.seal(DoneNotification(0, 11)), 0.01)
-        )
+        sealing = asyncio.create_task(writer.writer.seal(DoneNotification(0, 11)))
         assert await asyncio.to_thread(target.seal_started.wait, 1)
-        with pytest.raises(batch_reconciliation.collector.CollectorTimeoutError):
-            await timed_out
+        sealing.cancel()
+        sealing.cancel()
+        await asyncio.sleep(0)
+        assert not sealing.done()
+        assert writer.thread.is_alive()
 
         async def quarantine(_attempt_id: str) -> None:
             return None
@@ -3776,11 +4113,16 @@ async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tm
         )
         reconciler._state.batch = batch
         finalizing = asyncio.create_task(reconciler.finalize_active())
-        assert await asyncio.to_thread(writer.close_requested.wait, 1)
+        await asyncio.sleep(0)
+        assert not finalizing.done()
+        assert target.seal_calls == 1
         target.release_seal.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sealing
         result = await finalizing
         assert result.checkpoint_error is None
         assert result.close_error is None
+        assert writer.close_requested.is_set()
         assert result.preserved_path == tmp_path / "sealed"
         assert result.preserved_kind == "sealed bundle"
         await asyncio.to_thread(writer.thread.join, 1)
@@ -3789,7 +4131,7 @@ async def test_finalization_reports_a_seal_completed_during_close_as_a_bundle(tm
     finally:
         target.release_seal.set()
         if writer.thread.is_alive():
-            await writer.close(timeout=2)
+            await writer.close()
 
 
 @_async_test
@@ -3914,13 +4256,17 @@ async def test_writer_lease_blocks_second_coordinator_after_batch_admission(tmp_
 async def test_machine_closes_published_restart_prefix_before_waiting_without_device(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=2)
     store = _staging_store(tmp_path, _capture_root(tmp_path))
-    attempt = store.open_attempt(next((tmp_path / "attempts").iterdir()).name)
-    with store.device_lock() as lease:
-        attempt.activate_for_resume(lease)
-        publication = attempt.publish_prefix()
-        assert publication is not None
-        attempt.close(durable=True)
-    publication.bundle_path.rename(tmp_path / "previously-published-prefix")
+    attempt_id = store.pending_attempts()[0].attempt_id
+
+    def close_published() -> None:
+        with store.device_lock() as lease:
+            attempt = store.resume_streaming_attempt(lease)
+            assert attempt is not None
+            attempt.publish_prefix()
+            store.terminalize_prefix_attempt_held(attempt_id, lease)
+            attempt.close()
+
+    storage_call(close_published)
     scanning = asyncio.Event()
 
     class Observer:
@@ -3942,12 +4288,14 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
         scan_ready.result()
         assert not task.done()
         assert provider.opened == 0
-        attempt_state = store.state_db.get(StateKind.ATTEMPT, attempt.attempt_id)
-        assert attempt_state is not None
-        assert cast(dict[str, object], attempt_state["terminal_retirement"])["state"] == "terminal-retired"
-        assert store.pending_attempts() == ()
-        assert (attempt.path / "records.bin").read_bytes() == records
-        assert not store.inspect_recovery()[1], "durable closure must cover retained drafts"
+        pending, recovery = storage_call(lambda: (store.pending_attempts(), store.inspect_recovery()))
+        assert pending == ()
+        source = _attempt_source(store, attempt_id)
+        assert source is not None
+        assert source.lifecycle == "sealed_waiting"
+        assert source.committed_count == 2
+        assert source.committed_sha256 == sha256(records).hexdigest()
+        assert not recovery[1], "durable closure must cover retained drafts"
         checks_completed = True
     finally:
         await _finish_task(task, cancel=True)
@@ -3959,14 +4307,24 @@ async def test_machine_closes_published_restart_prefix_before_waiting_without_de
 
 @_async_test
 @pytest.mark.parametrize(
-    ("phase", "expected_kind"),
-    [("read", "partial collection"), ("advance", "sealed bundle"), ("confirm", "sealed bundle")],
+    ("phase", "expected_count"),
+    [("read", 1), ("advance", 2), ("confirm", 2)],
 )
-async def test_cancellation_reports_existing_partial_or_bundle_path(
-    tmp_path: Path, phase: str, expected_kind: str
+async def test_cancellation_reports_typed_source_custody(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, expected_count: int
 ) -> None:
     entered = asyncio.Event()
     release_advance = asyncio.Event()
+    committed = threading.Event()
+
+    if phase == "read":
+        append = StagingWriter.append_chunk
+
+        def note_commit(self: StagingWriter, offset: int, chunk: memoryview, tail: bytes = b"") -> None:
+            append(self, offset, chunk, tail)
+            committed.set()
+
+        monkeypatch.setattr(StagingWriter, "append_chunk", note_commit)
 
     class GatedSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -4004,23 +4362,22 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
             WriteStep(b"\x10", confirm_notifications),
         ),
     )
-    task = asyncio.create_task(
-        run_opportunistic_collector(Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options())
-    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    task = asyncio.create_task(run_opportunistic_collector(Provider([session]), store, _options()))
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        for _ in range(3):
-            await asyncio.sleep(0)
+        if phase == "read":
+            assert await asyncio.to_thread(committed.wait, 5)
         task.cancel()
 
         with pytest.raises(CollectionPreservedCancelledError) as raised:
             await task
-        assert raised.value.kind == expected_kind
-        assert raised.value.preserved_path.exists()
-        if phase == "read":
-            assert raised.value.preserved_path == tmp_path / "attempts"
-        else:
-            assert raised.value.preserved_path.parent == _capture_root(tmp_path)
+        assert raised.value.kind == "internal audio source"
+        assert raised.value.preserved_source_id is not None
+        source = _attempt_source(store, raised.value.preserved_source_id)
+        assert source is not None
+        assert source.committed_count == expected_count
+        assert _source_records(store, source.source_id) == _records(10, expected_count)
     finally:
         release_advance.set()
         task.cancel()
@@ -4028,58 +4385,196 @@ async def test_cancellation_reports_existing_partial_or_bundle_path(
 
 
 @_async_test
-async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(  # noqa: PLR0915
+async def test_background_quality_corruption_stops_active_read_after_preserving_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    checkpoint_started = threading.Event()
-    release_checkpoint = threading.Event()
-    close_attempted = threading.Event()
-    target_closed = threading.Event()
-    data_submitted = threading.Event()
-    closed_writers: list[AttemptWriter] = []
-    activity: list[ActivityEvent] = []
-    original_checkpoint = StagingWriter.checkpoint
-    original_target_close = StagingWriter.close
-    original_writer_close = AttemptWriter.close
+    entered = asyncio.Event()
+
+    class GatedSession(ScriptedRingSession):
+        async def write_control(self, payload: bytes) -> None:
+            await super().write_control(payload)
+            if payload == encode_read_command(10, 2):
+                entered.set()
+
+    session = GatedSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_record(10)))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    journal = _quality_metrics(store.state_db)
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+
+    def fail_quality(_item_id: str, _payload: dict[str, object]) -> None:
+        raise fatal
+
+    monkeypatch.setattr(journal, "_put_quality_event", fail_quality)
+    task = asyncio.create_task(
+        run_opportunistic_collector(
+            Provider([session]), store, replace(_options(), quality_metrics=journal, host_time=lambda: 1000.0)
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        journal._queue.put(("quality", {}, "fault"))
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await asyncio.wait_for(task, 5)
+        assert raised.value is fatal
+        pending = store.pending_attempts()
+        assert len(pending) == 1
+        source = _attempt_source(store, pending[0].attempt_id)
+        assert source is not None
+        assert source.committed_count == 1
+        assert _source_records(store, source.source_id) == _record(10)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@_async_test
+async def test_firmware_corruption_reported_during_writer_close_is_fatal_after_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    closed = threading.Event()
+
+    class FailingObservationWriter:
+        def __init__(self, on_error: Callable[[Exception], None]) -> None:
+            self.on_error = on_error
+
+        def observe(self, _info: RingInfo) -> None:
+            return None
+
+        def close(self) -> None:
+            self.on_error(fatal)
+            closed.set()
+
+    def make_writer(
+        _runtime: OpportunisticRuntime,
+        _staging: StagingStore,
+        _config: object,
+        on_error: Callable[[Exception], None],
+    ) -> FailingObservationWriter:
+        return FailingObservationWriter(on_error)
+
+    monkeypatch.setattr(OpportunisticRuntime, "make_observation_writer", make_writer)
+    session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(10, 10),)),))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(
+            Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
+        )
+    assert raised.value is fatal
+    assert closed.is_set()
+
+
+@_async_test
+async def test_corrupt_clock_state_read_stops_preflight_before_audio_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+
+    def fail_state(_store: ClockStateStore) -> object:
+        raise fatal
+
+    monkeypatch.setattr(ClockStateStore, "state", fail_state)
+
+    class ClockSession(ScriptedRingSession):
+        async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+            if uuid == TIME_READ_UUID:
+                return pack("<I", 1010)
+            return None
+
+    session = ClockSession(_status(), (WriteStep(b"\x10", (_info(10, 11),)),))
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(
+            Provider([session]),
+            store,
+            replace(_options(), host_time=lambda: 1000.0, host_clock_synchronized=lambda _timeout: True),
+        )
+    assert raised.value is fatal
+    assert session.writes == [b"\x10"]
+    assert store.pending_attempts() == ()
+
+
+class _StalledFinalCheckpointProbe:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, activity: list[ActivityEvent]) -> None:
+        self.checkpoint_started = threading.Event()
+        self.release_checkpoint = threading.Event()
+        self.close_attempted = threading.Event()
+        self.target_closed = threading.Event()
+        self.data_submitted = threading.Event()
+        self.closed_writers: list[AttemptWriter] = []
+        self.activity = activity
+        self.original_checkpoint = StagingWriter.checkpoint
+        self.original_target_close = StagingWriter.close
+        self.original_writer_close = AttemptWriter.close
+        self.original_publish = AttemptWriter.publish
+        self.read_begin_completed = _patch_read_begin_completion(monkeypatch)
+        self.entered = asyncio.Event()
+
+        def stalled_checkpoint(writer: StagingWriter) -> object:
+            self.checkpoint_started.set()
+            assert self.release_checkpoint.wait(2)
+            return self.original_checkpoint(writer)
+
+        async def failed_interrupt_admission(writer: AttemptWriter) -> object:
+            del writer
+            raise OSError("interrupt was not admitted")
+
+        def observed_target_close(writer: StagingWriter) -> object:
+            try:
+                return self.original_target_close(writer)
+            finally:
+                self.target_closed.set()
+
+        async def observed_writer_close(writer: AttemptWriter) -> object:
+            self.close_attempted.set()
+            self.closed_writers.append(writer)
+            return await self.original_writer_close(writer)
+
+        def observed_publish(writer: AttemptWriter, high_water: int, tail: bytes = b"") -> bool:
+            published = self.original_publish(writer, high_water, tail)
+            if published:
+                self.data_submitted.set()
+            return published
+
+        monkeypatch.setattr(StagingWriter, "checkpoint", stalled_checkpoint)
+        monkeypatch.setattr(StagingWriter, "close", observed_target_close)
+        monkeypatch.setattr(AttemptWriter, "interrupt", failed_interrupt_admission)
+        monkeypatch.setattr(AttemptWriter, "close", observed_writer_close)
+        monkeypatch.setattr(AttemptWriter, "publish", observed_publish)
+
+
+@_async_test
+async def test_repeated_cancel_during_interrupt_retains_custody_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = asyncio.Event()
+    interrupted = threading.Event()
+    release_interrupt = threading.Event()
+    submitted = threading.Event()
     read_begin_completed = _patch_read_begin_completion(monkeypatch)
+    original_interrupt = StagingWriter.interrupt
+    original_publish = AttemptWriter.publish
 
-    def stalled_checkpoint(self: StagingWriter) -> object:
-        checkpoint_started.set()
-        assert release_checkpoint.wait(2)
-        return original_checkpoint(self)
+    def held_interrupt(writer: StagingWriter) -> DurablePrefix:
+        interrupted.set()
+        assert release_interrupt.wait(2)
+        return original_interrupt(writer)
 
-    def observed_target_close(self: StagingWriter) -> object:
-        try:
-            return original_target_close(self)
-        finally:
-            target_closed.set()
-
-    async def observed_writer_close(self: AttemptWriter, *, timeout: float | None = None) -> object:
-        close_attempted.set()
-        closed_writers.append(self)
-        return await original_writer_close(self, timeout=timeout)
-
-    def observed_publish(
-        self: AttemptWriter,
-        high_water: int,
-        original_publish: Callable[[AttemptWriter, int], bool] = AttemptWriter.publish,
-    ) -> bool:
-        published = original_publish(self, high_water)
+    def observed_publish(writer: AttemptWriter, high_water: int, tail: bytes = b"") -> bool:
+        published = original_publish(writer, high_water, tail)
         if published:
-            data_submitted.set()
+            submitted.set()
         return published
 
-    monkeypatch.setattr("omi_collector.capture.adapters.staging_writer.StagingWriter.checkpoint", stalled_checkpoint)
-    monkeypatch.setattr("omi_collector.capture.adapters.staging_writer.StagingWriter.close", observed_target_close)
-    monkeypatch.setattr("omi_collector.capture.adapters.attempt_writer.AttemptWriter.close", observed_writer_close)
-    monkeypatch.setattr("omi_collector.capture.adapters.attempt_writer.AttemptWriter.publish", observed_publish)
-    monkeypatch.setattr(
-        batch_reconciliation,
-        "_finalize_batch",
-        partial(_finalize_with_short_transfer_timeout, batch_reconciliation._finalize_batch),
-    )
-
-    entered = asyncio.Event()
+    monkeypatch.setattr(StagingWriter, "interrupt", held_interrupt)
+    monkeypatch.setattr(AttemptWriter, "publish", observed_publish)
 
     class BlockingReadSession(ScriptedRingSession):
         async def write_control(self, payload: bytes) -> None:
@@ -4094,42 +4589,104 @@ async def test_stalled_final_checkpoint_still_attempts_close_and_releases_lease(
             WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)))),
         ),
     )
-    async with asyncio.TaskGroup() as tasks:
-        task = tasks.create_task(
-            run_opportunistic_collector(
-                Provider([session]),
-                _staging_store(tmp_path, _capture_root(tmp_path)),
-                _options(batch_records=1, activity=activity),
-            )
-        )
-        try:
-            await asyncio.wait_for(entered.wait(), 5)
-            assert await asyncio.to_thread(data_submitted.wait, 5)
-            assert await asyncio.to_thread(read_begin_completed.wait, 5)
-            task.cancel()
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    task = asyncio.create_task(run_opportunistic_collector(Provider([session]), store, _options(batch_records=1)))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert await asyncio.to_thread(submitted.wait, 5)
+        assert await asyncio.to_thread(read_begin_completed.wait, 5)
+        task.cancel()
+        assert await asyncio.to_thread(interrupted.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_interrupt.set()
+        with pytest.raises(CollectionPreservedCancelledError) as raised:
+            await task
+        source_id = raised.value.preserved_source_id
+        assert source_id is not None
+        source = _attempt_source(store, source_id)
+        assert source is not None and source.committed_count == 1
+        assert _source_records(store, source_id) == _record(10)
+        assert encode_advance_command(11) not in session.writes
+        with store.device_lock():
+            pass
+    finally:
+        release_interrupt.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
-            assert await asyncio.to_thread(checkpoint_started.wait, 5)
-            with pytest.raises(asyncio.CancelledError):
-                await task
 
-            assert close_attempted.is_set()
-            assert not target_closed.is_set()
-            errors = {event.state: event for event in activity}
-            assert errors["writer_checkpoint_error"].error_type == "CollectorTimeoutError"
-            assert errors["writer_close_error"].error_type == "CollectorTimeoutError"
-        finally:
-            task.cancel()
-            release_checkpoint.set()
-            await asyncio.gather(task, return_exceptions=True)
-            for writer in closed_writers:
-                await asyncio.to_thread(writer.thread.join, 5)
+@_async_test
+async def test_slow_final_checkpoint_joins_close_and_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    activity: list[ActivityEvent] = []
+    probe = _StalledFinalCheckpointProbe(monkeypatch, activity)
 
-    assert await asyncio.to_thread(target_closed.wait, 1)
-    assert len(closed_writers) == 1
-    assert await asyncio.to_thread(closed_writers[0].thread.join, 1) is None
-    assert not closed_writers[0].thread.is_alive()
+    class BlockingReadSession(ScriptedRingSession):
+        async def write_control(self, payload: bytes) -> None:
+            await super().write_control(payload)
+            if payload == encode_read_command(10, 1):
+                probe.entered.set()
+
+    session = BlockingReadSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    task = asyncio.create_task(
+        run_opportunistic_collector(Provider([session]), store, _options(batch_records=1, activity=activity))
+    )
+    try:
+        await asyncio.wait_for(probe.entered.wait(), 5)
+        assert await asyncio.to_thread(probe.data_submitted.wait, 5)
+        assert await asyncio.to_thread(probe.read_begin_completed.wait, 5)
+        task.cancel()
+
+        assert await asyncio.to_thread(probe.checkpoint_started.wait, 5)
+        await asyncio.sleep(0.05)
+        assert not task.done(), "admitted checkpoint must finish before cancellation returns"
+        assert not probe.target_closed.is_set()
+        probe.release_checkpoint.set()
+        with pytest.raises(OSError, match="interrupt was not admitted"):
+            await task
+
+        assert probe.close_attempted.is_set()
+        assert probe.target_closed.is_set()
+        assert not any(event.error_type == "CollectorTimeoutError" for event in activity)
+    finally:
+        task.cancel()
+        probe.release_checkpoint.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for writer in probe.closed_writers:
+            await asyncio.to_thread(writer.thread.join, 5)
+
+    assert await asyncio.to_thread(probe.target_closed.wait, 1)
+    assert len(probe.closed_writers) == 1
+    assert await asyncio.to_thread(probe.closed_writers[0].thread.join, 1) is None
+    assert not probe.closed_writers[0].thread.is_alive()
     with _staging_store(tmp_path, _capture_root(tmp_path)).device_lock():
         pass
+
+    def read_source_rows() -> list[tuple[str]]:
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            return cast(
+                list[tuple[str]],
+                connection.execute("SELECT source_id FROM capture_source WHERE source_type='attempt'").fetchall(),
+            )
+
+    source_rows = storage_call(read_source_rows)
+    assert len(source_rows) == 1
+    source_id = source_rows[0][0]
+    source = _attempt_source(store, source_id)
+    assert source is not None
+    assert source.lifecycle in {"receiving", "interrupted"}
+    assert source.committed_count == 1
+    assert _source_records(store, source_id) == _record(10)
 
 
 @_async_test

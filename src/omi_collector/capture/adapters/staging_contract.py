@@ -7,6 +7,7 @@ from json import JSONDecodeError, loads
 from pathlib import Path
 from typing import cast
 
+from ..application.storage_fault import FatalInternalAudioStorageError as FatalInternalAudioStorageError
 from ..domain.ring_protocol import RECORD_SIZE
 
 _DESCRIPTOR_NAME = "attempt.json"

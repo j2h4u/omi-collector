@@ -337,6 +337,8 @@ def _handle_preparing(state: Preparing, event: AttemptWriterMachineEvent) -> Tra
 def _handle_prepared(state: Prepared, event: AttemptWriterMachineEvent) -> TransitionResult:
     if isinstance(event, LegRequested | ReadBeginRequested | PublishRequested):
         return TransitionResult(state, Admit())
+    if isinstance(event, FinalizeRequested):
+        return TransitionResult(Finalizing(), Admit())
     if isinstance(event, ReadBeginSucceeded):
         return TransitionResult(Reading(), Ignore())
     if isinstance(event, LegSucceeded):

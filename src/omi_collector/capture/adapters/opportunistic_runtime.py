@@ -3,28 +3,31 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import Path
 from threading import Thread
 from typing import cast
 
 from ...config import FirmwareObservationConfig, WriterConfig
+from ..application.owned_work import join_owned, joined_to_thread
 from ..application.ports import (
     BatchWriterPort,
     CaptureRuntimePort,
     DurablePrefixShape,
+    DurableSealShape,
     ObservationWriterPort,
+    QuarantineAdmissionShape,
     QuarantineErrorKind,
     SealResultShape,
     StagingPort,
     StagingWriterTargetPort,
 )
+from ..application.storage_fault import FatalInternalAudioStorageError
 from ..domain.operational_status_machine import PublicationOutcome
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .attempt_writer import AttemptWriter, WriterError, WriterFailedError, WriterProgress
 from .clock_state_store import ClockStateStore
 from .debug_logging import debug_event, debug_exception
 from .firmware_observations import FirmwareObservationStore, FirmwareObservationWriter
-from .quarantine_publish import QuarantineOutputCollisionError, QuarantinePublishError, QuarantineSalvageDeferredError
+from .quarantine import QuarantineCustodyHoldError, QuarantinePublishError, QuarantineSalvageDeferredError
 from .staging_contract import DeviceAlreadyRunningError, StagingError
 from .staging_store import StagingStore
 
@@ -38,7 +41,8 @@ class _StagingWriterAdapter:
         self._source_start = source_start
 
     def prepare(self) -> object:
-        return self._writer.prepare()
+        self._writer.prepare()
+        return self._writer.durable_prefix
 
     @property
     def attempt_id(self) -> str:
@@ -53,20 +57,23 @@ class _StagingWriterAdapter:
             raise TypeError("notice must be a ReadBeginNotification")
         self._writer.read_begin(notice)
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
         if offset < self._leg_base:
             raise ValueError("arena chunk precedes prepared READ leg")
-        return self._writer.append_chunk(offset - self._leg_base, chunk)
+        return self._writer.append_chunk(offset - self._leg_base, chunk, tail)
 
     def checkpoint(self) -> DurablePrefixShape:
         return self._writer.checkpoint()
 
-    def seal(self, done_notice: object) -> SealResultShape:
+    def interrupt(self) -> DurablePrefixShape:
+        return self._writer.interrupt()
+
+    def seal(self, done_notice: object) -> SealResultShape | DurableSealShape:
         if not isinstance(done_notice, DoneNotification):
             raise TypeError("done_notice must be a DoneNotification")
         return self._writer.seal(done_notice)
 
-    def publish_prefix(self) -> SealResultShape | None:
+    def publish_prefix(self) -> SealResultShape | DurableSealShape | None:
         return self._writer.publish_prefix()
 
     def close(self) -> None:
@@ -79,10 +86,15 @@ class _BatchWriter:
     def __init__(self, writer: AttemptWriter, target: _StagingWriterAdapter) -> None:
         self._writer = writer
         self._target = target
+        self._attempt_id: str | None = None
+        self._initial_prefix: DurablePrefixShape | None = None
+        self._interrupted_prefix: DurablePrefixShape | None = None
 
     @property
     def attempt_id(self) -> str:
-        return self._target.attempt_id
+        if self._attempt_id is None:
+            raise RuntimeError("writer has not been started")
+        return self._attempt_id
 
     @property
     def thread(self) -> Thread:
@@ -96,6 +108,9 @@ class _BatchWriter:
     def failure(self) -> BaseException | None:
         return self._writer.failure
 
+    async def wait_failure(self) -> BaseException:
+        return await self._writer.wait_failure()
+
     @property
     def submitted_high_water(self) -> int:
         """Expose event-loop submitted bytes to the collector's typed counter seam."""
@@ -107,13 +122,38 @@ class _BatchWriter:
         return self._writer.written_high_water
 
     async def start(self) -> None:
-        await self._writer.start()
+        if self._initial_prefix is not None:
+            return
+
+        async def settle() -> None:
+            result = await self._writer.start()
+            if not isinstance(result, DurablePrefixShape):
+                raise TypeError("writer returned an invalid initial durable prefix")
+            self._attempt_id = self._target.attempt_id
+            self._initial_prefix = result
+
+        await join_owned(settle())
+
+    @property
+    def initial_prefix(self) -> DurablePrefixShape:
+        if self._initial_prefix is None:
+            raise RuntimeError("writer has not been started")
+        return self._initial_prefix
+
+    @property
+    def interrupted_prefix(self) -> DurablePrefixShape | None:
+        """Return the current-leg interruption acknowledgment, when committed."""
+        return self._interrupted_prefix
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefixShape:
-        result = await self._writer.prepare_leg(start_sequence, record_count)
-        if not isinstance(result, DurablePrefixShape):
-            raise TypeError("writer returned an invalid durable prefix")
-        return result
+        async def settle() -> DurablePrefixShape:
+            result = await self._writer.prepare_leg(start_sequence, record_count)
+            if not isinstance(result, DurablePrefixShape):
+                raise TypeError("writer returned an invalid durable prefix")
+            self._interrupted_prefix = None
+            return result
+
+        return await join_owned(settle())
 
     async def read_begin(self, notice: ReadBeginNotification) -> object:
         return await self._writer.read_begin(notice)
@@ -130,29 +170,39 @@ class _BatchWriter:
             raise TypeError("writer returned an invalid durable prefix")
         return result
 
-    async def seal(self, done_notice: DoneNotification) -> SealResultShape:
+    async def interrupt(self) -> DurablePrefixShape:
+        async def settle() -> DurablePrefixShape:
+            result = await self._writer.interrupt()
+            if not isinstance(result, DurablePrefixShape):
+                raise TypeError("writer returned an invalid interrupted prefix")
+            self._interrupted_prefix = result
+            return result
+
+        return await join_owned(settle())
+
+    async def seal(self, done_notice: DoneNotification) -> SealResultShape | DurableSealShape:
         result = await self._writer.seal(done_notice)
-        if not isinstance(result, SealResultShape):
+        if not isinstance(result, (SealResultShape, DurableSealShape)):
             raise TypeError("writer returned an invalid seal result")
         return result
 
-    async def await_seal_result(self) -> SealResultShape | None:
+    async def await_seal_result(self) -> SealResultShape | DurableSealShape | None:
         result = await self._writer.await_seal_result()
-        if result is not None and not isinstance(result, SealResultShape):
+        if result is not None and not isinstance(result, (SealResultShape, DurableSealShape)):
             raise TypeError("writer retained an invalid seal result")
         return result
 
-    async def publish_prefix(self) -> SealResultShape | None:
+    async def publish_prefix(self) -> SealResultShape | DurableSealShape | None:
         result = await self._writer.publish_prefix()
-        if result is not None and not isinstance(result, SealResultShape):
+        if result is not None and not isinstance(result, SealResultShape | DurableSealShape):
             raise TypeError("writer returned an invalid prefix publication")
         return result
 
-    async def close(self, *, timeout: float) -> None:
-        await self._writer.close(timeout=timeout)
+    async def close(self) -> None:
+        await self._writer.close()
 
-    def publish(self, high_water: int) -> bool:
-        return self._writer.publish(high_water)
+    def publish(self, high_water: int, tail: bytes = b"") -> bool:
+        return self._writer.publish(high_water, tail)
 
     def submit_read_begin(self, notice: ReadBeginNotification) -> object:
         return self._writer.submit_read_begin(notice)
@@ -193,17 +243,19 @@ class OpportunisticRuntime(CaptureRuntimePort):
     def make_clock_state_store(self, staging: StagingPort) -> ClockStateStore:
         return ClockStateStore(cast(StagingStore, staging).state_db)
 
-    def publish_quarantined_prefix(
+    def admit_quarantined_prefix(
         self,
-        source: Path,
+        source: str,
         staging: StagingPort,
         should_defer: Callable[[], bool],
-    ) -> SealResultShape:
-        return staging.publish_quarantined_prefix(source, should_defer=should_defer)
+    ) -> QuarantineAdmissionShape:
+        return staging.admit_quarantined_prefix(source, should_defer=should_defer)
 
     def classify_quarantine_error(self, error: BaseException) -> QuarantineErrorKind | None:
-        if isinstance(error, (QuarantinePublishError, QuarantineOutputCollisionError)):
-            return "unprocessable"
+        if isinstance(error, QuarantineCustodyHoldError):
+            return "deferred"
+        if isinstance(error, QuarantinePublishError):
+            return "deferred"
         if isinstance(error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError)):
             return "deferred"
         if isinstance(error, OSError):
@@ -238,3 +290,28 @@ class OpportunisticRuntime(CaptureRuntimePort):
 
     def debug_exception(self, event: str, error: BaseException, **fields: object) -> None:
         cast(Callable[..., None], debug_exception)(event, error, **fields)
+
+
+async def create_quality_metrics_owned[T](factory: Callable[..., T], *args: object, **kwargs: object) -> T:
+    """Own a quality factory result across cancellation and join any untransferred worker."""
+    settled: list[T] = []
+
+    def construct() -> T:
+        result = factory(*args, **kwargs)
+        settled.append(result)
+        return result
+
+    try:
+        return await joined_to_thread(construct)
+    except BaseException as primary:
+        if settled:
+            close = cast(Callable[[], object] | None, getattr(settled[0], "close", None))
+            if close is not None:
+                try:
+                    await joined_to_thread(close)
+                except FatalInternalAudioStorageError:
+                    raise
+                except BaseException:  # noqa: BLE001 - retain the primary factory outcome unless cleanup is fatal
+                    if isinstance(primary, FatalInternalAudioStorageError):
+                        raise primary from primary.__cause__
+        raise

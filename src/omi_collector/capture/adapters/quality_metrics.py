@@ -22,6 +22,7 @@ from ..application.quality_metrics import (
     SequenceLossMetric,
     TransferSessionMetric,
 )
+from ..application.storage_fault import FatalInternalAudioStorageError
 from ..domain.operational_status_machine import OperationalSignal
 from ..domain.ring_protocol import RECORD_SIZE
 from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction
@@ -122,18 +123,30 @@ class SQLiteQualityMetrics(QualityMetricsPort):
         self._state_lock = Lock()
         self._closed = False
         self._stop_enqueued = False
+        self._configured_pending = False
+        self._block_pending = False
         self._dropped_records = 0
         self._shutdown_timeout = config.shutdown_join_seconds
         self._logger = diagnostic_logger or logging.getLogger(__name__)
         self._operational_signal: Callable[[OperationalSignal], None] | None = None
+        self._fatal_callback: Callable[[FatalInternalAudioStorageError], None] | None = None
+        self._fatal_error: FatalInternalAudioStorageError | None = None
         self.release_version = _require_release_version(release_version)
         self.source_revision = normalize_source_revision(source_revision)
         self._thread = Thread(target=self._run, name="omi-quality-metrics", daemon=True)
         self._thread.start()
 
     def set_operational_signal(self, callback: Callable[[OperationalSignal], None]) -> None:
-        self._operational_signal = callback
-        self._signal(OperationalSignal.CONFIGURED)
+        with self._state_lock:
+            self._operational_signal = callback
+            self._configured_pending = True
+
+    def set_fatal_callback(self, callback: Callable[[FatalInternalAudioStorageError], None]) -> None:
+        with self._state_lock:
+            self._fatal_callback = callback
+            fatal = self._fatal_error
+        if fatal is not None:
+            callback(fatal)
 
     def record_transfer_session(self, metric: TransferSessionMetric) -> None:
         self._enqueue(metric.as_dict())
@@ -188,6 +201,7 @@ class SQLiteQualityMetrics(QualityMetricsPort):
                             self._queue.get_nowait()
                         except queue.Empty:
                             continue
+                        self._block_pending = True
                         drop_reason = "shutdown_queue_overflow"
         if drop_reason is not None:
             self._record_drop(drop_reason)
@@ -195,6 +209,8 @@ class SQLiteQualityMetrics(QualityMetricsPort):
         if self._thread.is_alive():
             self._diagnose("shutdown_timeout")
             self._thread.join()
+        if self._fatal_error is not None:
+            raise self._fatal_error
         return not self._thread.is_alive()
 
     @property
@@ -230,7 +246,9 @@ class SQLiteQualityMetrics(QualityMetricsPort):
 
     def _run(self) -> None:
         while True:
+            self._deliver_pending_signals()
             queued = self._queue.get()
+            self._deliver_pending_signals()
             if queued is None:
                 return
             try:
@@ -247,12 +265,22 @@ class SQLiteQualityMetrics(QualityMetricsPort):
                         cast(dict[str, object], event["fields"]),
                         cast(str, event["timestamp"]),
                     )
+            except FatalInternalAudioStorageError as error:
+                self._record_fatal(error)
+                return
             except Exception as error:  # noqa: BLE001 - auxiliary storage must not kill collection
                 if queued[0] == "quality":
                     self._signal(OperationalSignal.BLOCK)
                     self._diagnose("write_failed", error)
                 else:
                     self._diagnose("runtime_status_write_failed", error)
+
+    def _record_fatal(self, error: FatalInternalAudioStorageError) -> None:
+        with self._state_lock:
+            self._fatal_error = error
+            callback = self._fatal_callback
+        if callback is not None:
+            callback(error)
 
     def _record_drop(self, reason: str) -> None:
         with self._state_lock:
@@ -261,11 +289,33 @@ class SQLiteQualityMetrics(QualityMetricsPort):
         self._signal(OperationalSignal.BLOCK)
 
     def _signal(self, signal: OperationalSignal) -> None:
-        if self._operational_signal is not None:
+        if signal is OperationalSignal.BLOCK:
+            with self._state_lock:
+                self._block_pending = True
+            return
+        if signal is OperationalSignal.CLEAR and self._operational_signal is not None:
+            self._deliver_pending_signals()
             try:
                 self._operational_signal(signal)
             except Exception:  # noqa: BLE001 - status reporting must not affect collection
                 return
+
+    def _deliver_pending_signals(self) -> None:
+        with self._state_lock:
+            callback = self._operational_signal
+            configured, blocked = self._configured_pending, self._block_pending
+            self._configured_pending = self._block_pending = False
+        if callback is None:
+            return
+        for signal, pending in (
+            (OperationalSignal.CONFIGURED, configured),
+            (OperationalSignal.BLOCK, blocked),
+        ):
+            if pending:
+                try:
+                    callback(signal)
+                except Exception:  # noqa: BLE001 - status reporting must not affect collection
+                    continue
 
     def _diagnose(self, event: str, error: BaseException | None = None) -> None:
         try:

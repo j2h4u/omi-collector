@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Coroutine
-from contextlib import contextmanager
+import signal
+import sqlite3
+import subprocess
+import sys
+from collections.abc import Coroutine, Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
@@ -15,12 +19,14 @@ from typer.testing import CliRunner
 from omi_collector import cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
 from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.publication import SealResult
-from omi_collector.capture.adapters.staging_contract import StagingError
+from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError, StagingError
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
+from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockIntent
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.cli import app
@@ -53,7 +59,40 @@ def _layout(tmp_path: Path) -> Path:
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
+    layout = load_operator_config(path).storage
+    layout.collector.root.mkdir(parents=True, exist_ok=True)
+    layout.collector.root.chmod(0o2750)
+    if not layout.collector.state_db.exists():
+        db = StateDB(layout.collector.state_db)
+        db.put(StateKind.MIGRATION, "current", {"version": 1, "phase": "complete"})
+        db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return path
+
+
+def test_fatal_internal_audio_storage_exits_without_service_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    loaded = load_operator_config(_layout(tmp_path))
+    with pytest.raises(cli.typer.Exit) as state_exit, cli._command_state(loaded):
+        raise FatalInternalAudioStorageError("READY latch failed")
+    assert state_exit.value.exit_code == 78
+
+    class FatalCapture:
+        OperationInterruptedError = RuntimeError
+
+        @staticmethod
+        def run(operation: Coroutine[object, object, object]) -> object:
+            operation.close()
+            raise FatalInternalAudioStorageError("READY latch failed")
+
+    monkeypatch.setattr(cli, "_capture_cli", FatalCapture)
+
+    async def operation() -> object:
+        return None
+
+    with pytest.raises(cli.typer.Exit) as operation_exit:
+        cli._run_device_operation(operation())
+    assert operation_exit.value.exit_code == 78
 
 
 def test_mutating_cli_rejects_alternate_root_for_same_adapter_with_different_pendant(
@@ -76,7 +115,9 @@ def test_migrate_state_cli_requires_stopped_installed_service(monkeypatch: pytes
     config_path = _layout(tmp_path)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
     calls: list[object] = []
-    monkeypatch.setattr("omi_collector.state_migration.migrate_state", lambda *_args, **_kwargs: calls.append(True))
+    monkeypatch.setattr(
+        "omi_collector.internal_audio_migration.migrate_internal_audio", lambda *_args, **_kwargs: calls.append(True)
+    )
     monkeypatch.setattr(
         cli,
         "_systemd_service_status",
@@ -90,41 +131,186 @@ def test_migrate_state_cli_requires_stopped_installed_service(monkeypatch: pytes
     assert calls == []
 
 
-def test_migrate_state_cli_passes_operator_phy_home_after_stop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_migrate_state_cli_uses_the_only_cutover_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
     monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
     captured: list[tuple[object, object]] = []
 
-    def fake_migrate(layout: object, *, legacy_phy_state_homes: object) -> dict[str, int]:
-        captured.append((layout, legacy_phy_state_homes))
+    def fake_migrate(layout: object, *, release_metadata: Path) -> dict[str, int]:
+        captured.append((layout, release_metadata))
         return {"removed_files": 3}
 
-    monkeypatch.setattr("omi_collector.state_migration.migrate_state", fake_migrate)
-    old_home = tmp_path / "old-state"
+    monkeypatch.setattr("omi_collector.internal_audio_migration.migrate_internal_audio", fake_migrate)
 
-    result = CliRunner().invoke(
-        app,
-        ["migrate-state", "--config", str(config_path), "--legacy-phy-state-home", str(old_home)],
-    )
+    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
 
     assert result.exit_code == 0
     assert json.loads(result.output) == {"removed_files": 3}
-    assert captured[0][1] == (Path("/var/lib/omi-collector"), old_home)
+    assert captured[0][1] == Path(cli.sys.prefix) / "share/omi-collector/release.json"
 
 
-def test_cleanup_attempts_requires_stopped_installed_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_migrate_state_cli_uses_selected_release_metadata(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
-    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "active"})
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
+    captured: list[tuple[object, Path]] = []
 
-    result = CliRunner().invoke(app, ["cleanup-attempts", "--config", str(config_path)])
+    def fake_internal(layout: object, *, release_metadata: Path) -> dict[str, int]:
+        captured.append((layout, release_metadata))
+        return {"imported_sources": 2, "removed_files": 4}
+
+    monkeypatch.setattr("omi_collector.internal_audio_migration.migrate_internal_audio", fake_internal)
+    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"imported_sources": 2, "removed_files": 4}
+    assert captured[0][1] == Path(cli.sys.prefix) / "share/omi-collector/release.json"
+
+
+def test_mutating_cli_distinguishes_required_cutover_from_sqlite_busy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _layout(tmp_path)
+    layout = load_operator_config(config_path).storage
+    with closing(StateDB(layout.collector.state_db).open_connection()) as connection:
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
+    cutover = CliRunner().invoke(app, ["service", "--config", str(config_path)])
+    assert cutover.exit_code == 78
+    assert "requires stopped-service internal audio cutover" in cutover.output
+
+    def busy(_layout: object) -> StateDB:
+        raise StateDBError("database is locked")
+
+    monkeypatch.setattr("omi_collector.state_migration.open_runtime_state", busy)
+    locked = CliRunner().invoke(app, ["service", "--config", str(config_path)])
+    assert locked.exit_code == 1
+    assert "database is locked" in locked.output
+
+
+def test_mutating_cli_stops_restart_loop_for_inaccessible_hot_journal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            """
+import os
+import sqlite3
+import sys
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("UPDATE state SET payload='transient' WHERE kind='migration' AND id='current'")
+os._exit(0)
+""",
+            str(state_file),
+        ),
+        check=True,
+        timeout=10,
+    )
+    journal = state_file.parent / f"{state_file.name}-journal"
+    assert journal.is_file()
+    journal.chmod(0)
+    try:
+        result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
+        assert result.exit_code == 78
+        assert "journal access needs stopped-service repair" in result.output
+    finally:
+        journal.chmod(0o600)
+
+
+def test_mutating_cli_recovers_accessible_hot_journal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            """
+import os
+import sqlite3
+import sys
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("UPDATE state SET payload='transient' WHERE kind='migration' AND id='current'")
+os._exit(0)
+""",
+            str(state_file),
+        ),
+        check=True,
+        timeout=10,
+    )
+    journal = state_file.parent / f"{state_file.name}-journal"
+    assert journal.is_file()
+
+    result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert StateDB(state_file).get(StateKind.MIGRATION, "current") == {"version": 1, "phase": "complete"}
+
+
+@pytest.mark.parametrize("journal_kind", ["directory", "symlink"])
+def test_mutating_cli_stops_for_nonregular_journal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, journal_kind: str
+) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    journal = state_file.parent / f"{state_file.name}-journal"
+    if journal_kind == "directory":
+        journal.mkdir()
+    else:
+        journal.symlink_to(tmp_path / "absent")
+
+    result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
+
+    assert result.exit_code == 78, result.output
+    assert "journal is unsafe" in result.output
+
+
+@pytest.mark.parametrize("malformed_draft", [False, True])
+def test_migrate_state_reports_invalid_v1_inputs_without_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, malformed_draft: bool
+) -> None:
+    config_path = _layout(tmp_path)
+    layout = load_operator_config(config_path).storage
+    layout.collector.state_db.unlink()
+    if malformed_draft:
+        with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+            connection.execute(
+                "CREATE TABLE state(kind TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,"
+                "PRIMARY KEY(kind,id)) WITHOUT ROWID"
+            )
+            connection.execute("PRAGMA user_version=1")
+            connection.execute(
+                "INSERT INTO state VALUES ('migration','current','{\"phase\":\"complete\",\"version\":1}')"
+            )
+            connection.commit()
+        layout.draft.mkdir()
+        (layout.draft / "invalid-draft").write_bytes(b"unclassified")
+    else:
+        layout.collector.state_db.write_bytes(b"not a SQLite database")
+    monkeypatch.setattr("omi_collector.internal_audio_migration._release_revision", lambda _path: "a" * 40)
+
+    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
 
     assert result.exit_code == 1
-    assert "stop the Collector service" in result.output
+    assert "Traceback" not in result.output
+    if malformed_draft:
+        assert "draft" in result.output
+    else:
+        assert "database" in result.output.lower()
 
 
-def test_cleanup_attempts_runs_guarded_sweep(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_service_runs_under_one_guarded_state_scope(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     calls: list[str] = []
 
@@ -134,19 +320,13 @@ def test_cleanup_attempts_runs_guarded_sweep(monkeypatch: pytest.MonkeyPatch, tm
         yield object()
         calls.append("guard-exit")
 
-    class FakeStaging:
-        def sweep_terminal_retired(self) -> tuple[Path, ...]:
-            calls.append("sweep")
-            return (tmp_path / "retired",)
-
     monkeypatch.setattr(cli, "_command_state", fake_command_state)
-    monkeypatch.setattr(cli, "_staging", lambda *_args, **_kwargs: FakeStaging())
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: calls.append("service"))
 
-    result = CliRunner().invoke(app, ["cleanup-attempts", "--config", str(config_path)])
+    result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
 
     assert result.exit_code == 0
-    assert json.loads(result.output) == {"removed": 1}
-    assert calls == ["guard-enter", "sweep", "guard-exit"]
+    assert calls == ["guard-enter", "service", "guard-exit"]
 
 
 def test_version_flag_reports_package_version() -> None:
@@ -207,10 +387,32 @@ def test_service_announces_readiness_after_preflight(monkeypatch: pytest.MonkeyP
     assert sync_options[0]["log_level"] is cli.SyncLogLevel.INFO
     from omi_collector.capture.adapters.operational_status import OperationalStatusStore
 
-    status = cast(OperationalStatusStore, sync_options[0]["operational_status"])
+    context = cast(cli._SyncContext, sync_options[0]["context"])
+    assert context.stop_intent is not None
+    status = cast(OperationalStatusStore, context.operational_status)
     assert status.identity.boot_id == "00000000-0000-0000-0000-000000000001"
     assert isinstance(status.identity.invocation_id, str) and len(status.identity.invocation_id) == 32
     assert status._closed
+
+
+def test_service_term_during_synchronous_startup_suppresses_readiness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _layout(tmp_path)
+    previous = signal.getsignal(signal.SIGTERM)
+
+    @contextmanager
+    def interrupted_state(_loaded: object) -> Iterator[StateDB]:
+        signal.raise_signal(signal.SIGTERM)
+        yield cast(StateDB, object())
+
+    monkeypatch.setattr(cli, "_command_state", interrupted_state)
+    monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: pytest.fail("service ran after TERM"))
+
+    result = CliRunner().invoke(app, ["service", "--config", str(path)])
+    assert result.exit_code == 143
+    assert "deployment_ready" not in result.output
+    assert signal.getsignal(signal.SIGTERM) is previous
 
 
 def test_service_does_not_announce_readiness_for_invalid_config(tmp_path: Path) -> None:
@@ -638,6 +840,39 @@ def test_device_status_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyP
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.strip() == "status evidence is malformed"
+
+
+@pytest.mark.parametrize("command", ("metrics", "status"))
+@pytest.mark.parametrize(
+    ("failure", "exit_code"),
+    (
+        (FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11), 78),
+        (TransientInternalAudioStorageError("canonical audio database is busy", sqlite_errorcode=5), 1),
+    ),
+)
+def test_read_only_device_commands_refuse_classified_sqlite_faults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    failure: Exception,
+    exit_code: int,
+) -> None:
+    from omi_collector import state_migration
+
+    config_path = _layout(tmp_path)
+
+    def fail_open(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(state_migration, "open_runtime_state", fail_open)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": False})
+    result = CliRunner().invoke(app, ["device", command, "--config", str(config_path)])
+
+    assert result.exit_code == exit_code
+    assert isinstance(result.exception, SystemExit)
+    assert result.stdout == ""
+    assert result.stderr.strip() == str(failure)
+    assert "Traceback" not in result.output
 
 
 def _sync_progress(  # noqa: PLR0913

@@ -118,6 +118,9 @@ def test_request_admissions_and_rejections_are_exact() -> None:
     assert transition(Constructed(), StartRequested()).state == Preparing()
     assert isinstance(transition(Constructed(), StartRequested()).directive, Admit)
     assert transition(Prepared(), ReadBeginRequested()).directive == Admit()
+    assert transition(Prepared(), FinalizeRequested()) == type(transition(Prepared(), FinalizeRequested()))(
+        Finalizing(), Admit()
+    )
     assert transition(Reading(), CheckpointRequested()).directive == Admit()
     assert transition(Reading(), FinalizeRequested()) == type(transition(Reading(), FinalizeRequested()))(
         Finalizing(), Admit()

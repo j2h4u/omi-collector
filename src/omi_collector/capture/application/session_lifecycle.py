@@ -26,6 +26,7 @@ from .operational_telemetry import (
     collect_battery_observation,
     collect_operational_telemetry,
 )
+from .owned_work import invoke_owned, join_owned, joined_to_thread
 from .ports import CaptureRuntimePort, ClockStatePort, StorageLeaseFactory
 from .presence import PresenceEnd, PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
@@ -69,6 +70,8 @@ from .session_machine import (
 from .session_machine import (
     transition as transition_session,
 )
+from .stop_intent import StopIntent
+from .storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from .visit_machine import (
     AttemptGranted,
     CloseFailed,
@@ -172,8 +175,10 @@ class OpportunisticOptions:
     quality_metrics: QualityMetricsPort | None = None
     clock_state_store: ClockStatePort | None = None
     clock_lease: StorageLeaseFactory | None = None
+    session_guard: Callable[[], AbstractAsyncContextManager[object]] | None = None
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
+    stop_intent: StopIntent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,7 +212,7 @@ class SessionLifecycleCallbacks:
     load_recovery: Callable[[], Awaitable[VisitRecoveryDisposition]] | None = None
     invalidate_recovery: Callable[[], None] | None = None
     enter_capture_priority: Callable[[], Awaitable[None]] | None = None
-    exit_capture_priority: Callable[[], None] | None = None
+    exit_capture_priority: Callable[[], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if (self.enter_capture_priority is None) != (self.exit_capture_priority is None):
@@ -276,15 +281,17 @@ class SessionLifecycle:
                     capture_priority_active = True
                     enter_capture_priority = self.run.callbacks.enter_capture_priority
                     assert enter_capture_priority is not None
-                    await enter_capture_priority()
+                    await invoke_owned(enter_capture_priority)
                 event = await self._execute_visit_command(command, result.state, with_presence=with_presence)
                 result = transition(result.state, event, stop_after_drained=self.run.options.policy.stop_after_drained)
-                capture_priority_active = self._release_capture_priority_after(result.command, capture_priority_active)
+                capture_priority_active = await self._release_capture_priority_after(
+                    result.command, capture_priority_active
+                )
         except asyncio.CancelledError:
             transition(result.state, Shutdown())
             raise
         finally:
-            self._release_capture_priority_after(None, capture_priority_active)
+            await self._release_capture_priority_after(None, capture_priority_active)
             if presence is not None:
                 await presence.close()
 
@@ -295,10 +302,10 @@ class SessionLifecycle:
             and self.run.callbacks.enter_capture_priority is not None
         )
 
-    def _release_capture_priority_after(self, next_command: VisitCommand | None, active: bool) -> bool:
+    async def _release_capture_priority_after(self, next_command: VisitCommand | None, active: bool) -> bool:
         if active and not isinstance(next_command, (CommitClosure, InspectRecovery)):
             if self.run.callbacks.exit_capture_priority is not None:
-                self.run.callbacks.exit_capture_priority()
+                await invoke_owned(self.run.callbacks.exit_capture_priority)
             return False
         return active
 
@@ -403,13 +410,17 @@ class SessionLifecycle:
         return await presence.attempt_finished(outcome)
 
     async def _run_one_attempt(self, with_presence: bool) -> str:
+        if self.run.options.stop_intent is not None:
+            self.run.options.stop_intent.check()
         wake = self._take_wake() if with_presence else None
         candidate = wake.candidate if isinstance(wake, PresenceWake) else None
         advertisement = wake.advertisement_rssi_dbm if isinstance(wake, PresenceWake) else None
         if with_presence and (
             wake is None
             or not _wake_is_fresh(
-                wake, self.run.options.clock(), self.run.options.config.presence.arrival_max_gap_seconds
+                wake,
+                await joined_to_thread(self.run.options.clock),
+                self.run.options.config.presence.arrival_max_gap_seconds,
             )
         ):
             return "candidate_unavailable"
@@ -487,9 +498,13 @@ class SessionLifecycle:
         quality = SessionQuality(advertisement_rssi_dbm, self.run.options.phy_policy)
         phase = SessionPhaseState("connect", quality)
         self._storage_not_ready_responses = 0
-        self._record_advertisement_quality(quality)
+        await self._record_advertisement_quality(quality)
         try:
-            await self._run_session_effects(context, execution, phase)
+            guard = self.run.options.session_guard
+            if guard is None:
+                await self._run_session_effects(context, execution, phase)
+            else:
+                await self._run_guarded_session_effects(context, execution, phase, guard)
             require_session_command(execution.machine, SessionCommand.CHECKPOINT)
             await self.run.callbacks.post_session_checkpoint()
             execution.machine = transition_session(execution.machine, CheckpointResolved())
@@ -514,7 +529,40 @@ class SessionLifecycle:
                 execution.machine = transition_session(execution.machine, event)
             raise
         finally:
-            await self._record_session_quality(quality, execution.outcome, execution.teardown_error, terminal_error)
+            try:
+                await self._record_session_quality(quality, execution.outcome, execution.teardown_error, terminal_error)
+            except BaseException:
+                if isinstance(terminal_error, FatalInternalAudioStorageError):
+                    raise terminal_error from terminal_error.__cause__
+                raise
+
+    async def _run_guarded_session_effects(
+        self,
+        context: AbstractAsyncContextManager[RingSession],
+        execution: _SessionExecution,
+        phase: SessionPhaseState,
+        guard: Callable[[], AbstractAsyncContextManager[object]],
+    ) -> None:
+        """Report guard failures without reporting an already handled body error twice."""
+        guard_phase: SessionPhase = "connect"
+        body_error: BaseException | None = None
+        try:
+            async with guard():
+                guard_phase = "teardown"
+                try:
+                    await self._run_session_effects(context, execution, phase)
+                except BaseException as error:
+                    body_error = error
+                    raise
+        except Exception as error:
+            if error is not body_error:
+                try:
+                    await report_session_error(self.run.options.activity, guard_phase, error, self.run.runtime)
+                except BaseException:
+                    if isinstance(error, FatalInternalAudioStorageError):
+                        raise error from error.__cause__
+                    raise
+            raise
 
     async def _run_session_effects(
         self,
@@ -597,25 +645,31 @@ class SessionLifecycle:
             machine = transition_session(machine, ReadResolved(cast(Literal["drained", "collected"], outcome)))
             return outcome, machine
 
-    def _record_advertisement_quality(self, quality: SessionQuality) -> None:
+    async def _record_advertisement_quality(self, quality: SessionQuality) -> None:
         """Persist scanner evidence immediately without delaying connection setup."""
         metrics = self.run.options.quality_metrics
         if metrics is None or quality.advertisement_rssi_dbm is None:
             return
         try:
-            metrics.record_advertisement(
+            await joined_to_thread(
+                metrics.record_advertisement,
                 AdvertisementMetric(
-                    utc_timestamp(self.run.options.host_time()),
+                    utc_timestamp(await joined_to_thread(self.run.options.host_time)),
                     quality.session_id,
                     quality.advertisement_rssi_dbm,
                     metrics.release_version,
                     metrics.source_revision,
                     quality.phy_policy,
-                )
+                ),
             )
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as metrics_error:  # noqa: BLE001 - metrics cannot stop audio capture
-            self.run.runtime.debug_exception(
-                "quality_metrics_write_error", metrics_error, event_type="advertisement_observation"
+            await invoke_owned(
+                self.run.runtime.debug_exception,
+                "quality_metrics_write_error",
+                metrics_error,
+                event_type="advertisement_observation",
             )
 
     async def _record_session_quality(
@@ -632,7 +686,7 @@ class SessionLifecycle:
         termination_class, terminal_outcome = _quality_terminal(outcome, teardown_error, error, self.run.runtime)
         try:
             metric = TransferSessionMetric(
-                utc_timestamp(self.run.options.host_time()),
+                utc_timestamp(await joined_to_thread(self.run.options.host_time)),
                 quality.session_id,
                 terminal_outcome,
                 termination_class,
@@ -647,17 +701,30 @@ class SessionLifecycle:
                 quality.phy_policy,
                 quality.advertisement_rssi_dbm,
             )
-            metrics.record_transfer_session(metric)
+            await joined_to_thread(metrics.record_transfer_session, metric)
+        except FatalInternalAudioStorageError:
+            raise
         except Exception as metrics_error:  # noqa: BLE001 - metrics cannot stop audio capture
-            self.run.runtime.debug_exception(
-                "quality_metrics_write_error", metrics_error, event_type="transfer_session"
+            await invoke_owned(
+                self.run.runtime.debug_exception,
+                "quality_metrics_write_error",
+                metrics_error,
+                event_type="transfer_session",
             )
 
     async def _info(self, session: RingSession) -> RingInfo:
         while True:
             try:
+                if self.run.options.stop_intent is None:
+                    info_operation = collector.ring_info(session, timeout=self.run.options.timeouts.info)
+                else:
+                    info_operation = collector.ring_info(
+                        session,
+                        timeout=self.run.options.timeouts.info,
+                        stop_intent=self.run.options.stop_intent,
+                    )
                 info = await bounded(
-                    collector.ring_info(session, timeout=self.run.options.timeouts.info),
+                    info_operation,
                     self.run.options.timeouts.info,
                 )
                 if self.run.callbacks.observe_info is not None:
@@ -665,9 +732,14 @@ class SessionLifecycle:
                         result = self.run.callbacks.observe_info(info)
                         if inspect.isawaitable(result):
                             await result
+                    except FatalInternalAudioStorageError:
+                        raise
                     except Exception as error:  # noqa: BLE001 - observation is best effort
-                        self.run.runtime.debug_exception(
-                            "firmware_observation_writer_error", error, operation="observe"
+                        await invoke_owned(
+                            self.run.runtime.debug_exception,
+                            "firmware_observation_writer_error",
+                            error,
+                            operation="observe",
                         )
                 return info
             except collector.RingAcknowledgementError as error:
@@ -688,45 +760,44 @@ class SessionLifecycle:
         options = self.run.options
         if options.operational is None and options.clock_state_store is None:
             return "disabled"
-        deadline = asyncio.get_running_loop().time() + options.config.retry.presence_preflight_budget_seconds
+        if options.stop_intent is not None:
+            options.stop_intent.check()
         phase.value = "telemetry"
         emitter = _quality_aware_operational_emitter(
             options.operational or (lambda _event: None), phase.quality, options.quality_metrics, options.host_time
         )
         status: object | None = None
-        timeout = remaining_budget(deadline)
         try:
-            timeout = max(remaining_budget(deadline), 0.001)
-            # Reserve the latter half of this bounded preflight for status and
-            # metadata after the independent clock stage has completed.
-            operation_timeout = min(options.config.telemetry.optional_operation_timeout_seconds, timeout / 2)
+            operation_timeout = options.config.telemetry.optional_operation_timeout_seconds
+            if options.stop_intent is not None:
+                options.stop_intent.check()
 
             async def run_telemetry() -> None:
-                await bounded(
-                    collect_operational_telemetry(
-                        session,
-                        status if isinstance(status, RingStatus) else None,
-                        info,
-                        emitter,
-                        clock=TelemetryClock(
-                            now=options.host_time,
-                            synchronized=options.host_clock_synchronized,
-                            operation_timeout=operation_timeout,
-                            host_clock_probe_timeout=options.config.telemetry.host_clock_probe_timeout_seconds,
-                            info_reader=lambda: self._info(session),
-                            status_reader=session.read_status if options.operational is not None else None,
-                            state_store=options.clock_state_store,
-                            monotonic=options.clock,
-                            session_id=phase.quality.session_id if phase.quality is not None else "native",
-                            mutation_lease=options.clock_lease,
-                        ),
+                await collect_operational_telemetry(
+                    session,
+                    status if isinstance(status, RingStatus) else None,
+                    info,
+                    emitter,
+                    clock=TelemetryClock(
+                        now=options.host_time,
+                        synchronized=options.host_clock_synchronized,
+                        operation_timeout=operation_timeout,
+                        host_clock_probe_timeout=options.config.telemetry.host_clock_probe_timeout_seconds,
+                        info_reader=lambda: self._info(session),
+                        status_reader=session.read_status if options.operational is not None else None,
+                        state_store=options.clock_state_store,
+                        monotonic=options.clock,
+                        session_id=phase.quality.session_id if phase.quality is not None else "native",
+                        mutation_lease=options.clock_lease,
+                        stop_intent=options.stop_intent,
                     ),
-                    timeout,
                 )
 
             await run_telemetry()
             return "completed"
         except asyncio.CancelledError:
+            raise
+        except FatalInternalAudioStorageError:
             raise
         except Exception as error:  # noqa: BLE001 - optional telemetry
             await report_session_error(options.activity, "telemetry", error, self.run.runtime)
@@ -740,16 +811,21 @@ class SessionLifecycle:
             options.operational, phase.quality, options.quality_metrics, options.host_time
         )
         try:
-            await collect_battery_observation(
-                session,
-                info,
-                emitter,
-                operation_timeout=min(
-                    options.config.telemetry.optional_operation_timeout_seconds,
-                    options.config.retry.presence_preflight_budget_seconds,
-                ),
+            if options.stop_intent is not None:
+                options.stop_intent.check()
+            operation_timeout = min(
+                options.config.telemetry.optional_operation_timeout_seconds,
+                options.config.retry.presence_preflight_budget_seconds,
             )
+            if options.stop_intent is None:
+                await collect_battery_observation(session, info, emitter, operation_timeout=operation_timeout)
+            else:
+                await collect_battery_observation(
+                    session, info, emitter, operation_timeout=operation_timeout, stop_intent=options.stop_intent
+                )
         except asyncio.CancelledError:
+            raise
+        except FatalInternalAudioStorageError:
             raise
         except Exception as error:  # noqa: BLE001 - battery refresh is optional
             await report_session_error(options.activity, "telemetry", error, self.run.runtime)
@@ -811,6 +887,8 @@ def _record_clock_correction(
                 quality.firmware_version,
             )
         )
+    except FatalInternalAudioStorageError:
+        raise
     except Exception:  # noqa: BLE001 - metrics cannot stop audio capture
         return
 
@@ -844,7 +922,7 @@ async def recoverable_session_outcome(
     if outcome is None:
         await report_activity(options.activity, "fatal")
         raise error
-    if session is not None and phase == "read/reconcile":
+    if session is not None and phase == "read/reconcile" and not isinstance(error, collector.TransferInterruptedError):
         await stop_after_interruption(session, options.timeouts.info)
     return outcome
 
@@ -945,6 +1023,7 @@ def _retryable(
             NotificationOverflowError,
             RingTransportDisconnectedError,
             RingTransportUnavailableError,
+            TransientInternalAudioStorageError,
             TimeoutError,
         ),
     )
@@ -994,27 +1073,6 @@ async def exit_context(
             secondary.append(error)
 
 
-async def joined_to_thread[T](function: Callable[..., T], *args: object, **kwargs: object) -> T:
-    """Join a storage mutation before propagating cancellation to its caller."""
-    return await join_owned(asyncio.to_thread(function, *args, **kwargs))
-
-
-async def join_owned[T](awaitable: Awaitable[T]) -> T:
-    """Keep ownership through repeated cancellation until the task settles."""
-    task = asyncio.ensure_future(awaitable)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError as cancelled:
-        while not task.done():
-            with suppress(BaseException):
-                await asyncio.shield(task)
-        try:
-            task.result()
-        except BaseException as mutation_error:
-            raise cancelled from mutation_error
-        raise cancelled
-
-
 async def cancel_task[T](task: asyncio.Future[T]) -> None:
     task.cancel()
     await join_owned(asyncio.gather(task, return_exceptions=True))
@@ -1029,9 +1087,7 @@ async def report_activity(
 ) -> None:
     if callback is None:
         return
-    result = callback(event or ActivityEvent(state, retry_seconds))
-    if inspect.isawaitable(result):
-        await result
+    await invoke_owned(callback, event or ActivityEvent(state, retry_seconds))
 
 
 async def report_cooldown_started(
@@ -1055,7 +1111,7 @@ async def report_session_error(
     error: BaseException,
     runtime: CaptureRuntimePort,
 ) -> None:
-    runtime.debug_exception("session_error", error, phase=phase)
+    await invoke_owned(runtime.debug_exception, "session_error", error, phase=phase)
     cause = session_error_cause(error)
     lock_context = _lock_context(cause)
     await report_activity(
@@ -1078,7 +1134,9 @@ async def report_finalization_error(
     runtime: CaptureRuntimePort,
 ) -> None:
     """Report teardown failures without allowing observability to skip close."""
-    runtime.debug_exception(f"writer_{operation}_error", error, operation=operation, phase="teardown")
+    await invoke_owned(
+        runtime.debug_exception, f"writer_{operation}_error", error, operation=operation, phase="teardown"
+    )
     try:
         await report_activity(
             callback,

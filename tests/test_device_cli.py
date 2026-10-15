@@ -14,12 +14,15 @@ from struct import pack
 from typing import Protocol, cast
 
 import pytest
+import typer
 from bleak.backends.device import BLEDevice
 from typer.testing import CliRunner
 
 from fakes import ScriptedRingSession, WriteStep
 from omi_collector import cli as operator_cli
 from omi_collector.capture import cli as device_cli
+from omi_collector.capture.adapters.attempts import DurableSqliteSeal
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
@@ -48,6 +51,7 @@ from omi_collector.capture.domain.ring_protocol import (
 )
 from omi_collector.cli import app
 from omi_collector.config import BleConfig, CollectorConfig, PresenceConfig, RetryConfig, TransferConfig
+from omi_collector.storage_layout import load_operator_config
 from staging_test_factory import StagingStore
 
 
@@ -94,6 +98,11 @@ def _layout(tmp_path: Path) -> Path:
         '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n',
         encoding="utf-8",
     )
+    layout = load_operator_config(path).storage
+    if not layout.collector.state_db.exists():
+        db = StateDB(layout.collector.state_db)
+        db.put(StateKind.MIGRATION, "current", {"version": 1, "phase": "complete"})
+        db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return path
 
 
@@ -202,6 +211,75 @@ def test_production_factories_construct_monkeypatched_dependencies(
     assert (
         transport.kwargs["att_mtu_query_timeout_seconds"] == device_cli.DEFAULT_CONFIG.ble.att_mtu_query_timeout_seconds
     )
+
+
+def test_service_runtime_injects_one_state_db_into_capture_components(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from omi_collector.capture.adapters import (
+        operational_status,
+        opportunistic_runtime,
+        staging_store,
+    )
+    from omi_collector.capture.application import operational_telemetry, opportunistic_sync
+
+    config_path = _layout(tmp_path)
+    loaded = load_operator_config(config_path)
+    state_db = StateDB(loaded.storage.collector.state_db)
+    status = Mock(wraps=operational_status.OperationalStatusStore)
+    clock = Mock(wraps=opportunistic_runtime.ClockStateStore)
+    quality = Mock(wraps=device_cli.SQLiteQualityMetrics)
+    firmware = Mock(wraps=opportunistic_runtime.FirmwareObservationStore)
+    capture = Mock(wraps=staging_store.InternalAudioStore)
+    real_maintenance = opportunistic_sync.QuarantineMaintenance
+    maintenance = Mock(wraps=real_maintenance)
+    sync = AsyncMock(wraps=device_cli.sync)
+    monkeypatch.setattr(operational_status, "OperationalStatusStore", status)
+    monkeypatch.setattr(opportunistic_runtime, "ClockStateStore", clock)
+    monkeypatch.setattr(device_cli, "SQLiteQualityMetrics", quality)
+    monkeypatch.setattr(opportunistic_runtime, "FirmwareObservationStore", firmware)
+    monkeypatch.setattr(staging_store, "InternalAudioStore", capture)
+    monkeypatch.setattr(opportunistic_sync, "QuarantineMaintenance", maintenance)
+    monkeypatch.setattr(device_cli, "sync", sync)
+
+    startup_ready = asyncio.Event()
+    real_prepare = real_maintenance.prepare_pending_startup
+
+    async def prepare_startup(instance: opportunistic_sync.QuarantineMaintenance) -> object:
+        result = await real_prepare(instance)
+        startup_ready.set()
+        return result
+
+    monkeypatch.setattr(real_maintenance, "prepare_pending_startup", prepare_startup)
+    presence = device_cli.make_presence_scheduler("AA:BB:CC:DD:EE:FF", "hci0", config=loaded.config)
+
+    async def end_after_startup() -> None:
+        await startup_ready.wait()
+        raise RuntimeError("composition observed")
+
+    monkeypatch.setattr(presence, "wait_for_attempt", AsyncMock(side_effect=end_after_startup))
+    monkeypatch.setattr(presence, "close", AsyncMock())
+    monkeypatch.setattr(device_cli, "make_presence_scheduler", lambda *_a, **_k: presence)
+    monkeypatch.setattr(operational_telemetry, "system_host_boot_id", lambda: "00000000-0000-0000-0000-000000000001")
+    monkeypatch.setenv("INVOCATION_ID", "0" * 32)
+
+    with pytest.raises(typer.Exit) as stopped:
+        operator_cli._service_locked(loaded, state_db)
+    assert isinstance(stopped.value.__cause__, RuntimeError)
+    assert str(stopped.value.__cause__) == "composition observed"
+
+    component_dbs = {
+        "capture": cast(StateDB, capture.call_args.args[0]),
+        "staging": cast(StagingStore, sync.call_args.args[2]).state_db,
+        "status": cast(StateDB, status.call_args.args[0]),
+        "clock": cast(StateDB, clock.call_args.args[0]),
+        "quality": cast(StateDB, quality.call_args.args[0]),
+        "firmware": cast(StateDB, firmware.call_args.args[0]),
+        "maintenance": cast(StagingStore, maintenance.call_args.args[0]).state_db,
+    }
+    assert all(component_db is state_db for component_db in component_dbs.values())
 
 
 def test_make_transport_preserves_device_selector_and_nondefault_options(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -403,6 +481,8 @@ def test_sync_uses_one_guard_and_transport_and_forwards_end_to_end_progress(
             info=device_cli.DEFAULT_CONFIG.transfer.info_timeout_seconds,
             transfer=device_cli.DEFAULT_CONFIG.transfer.sync_timeout_seconds,
         )
+        assert options.session_guard is None
+        assert options.phy_policy == "auto"
         async with provider(None) as connected:
             assert connected is session
         progress = options.progress
@@ -446,6 +526,8 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
         runtime: object,
     ) -> object:
         del runtime
+        assert _options.session_guard is None
+        assert _options.phy_policy == "auto"
         async with provider(None) as connected:
             assert connected is session
         async with provider(BLEDevice("AA:BB", "omi", object())) as connected:
@@ -468,7 +550,9 @@ def test_sync_forwards_configured_att_mtu_timeout_to_all_transport_paths(
         runtime: object,
     ) -> object:
         del runtime
-        async with provider(None) as connected:
+        assert _options.session_guard is not None
+        assert _options.phy_policy == "force_1m"
+        async with _options.session_guard(), provider(None) as connected:
             assert connected is session
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
@@ -498,7 +582,8 @@ def test_sync_force_1m_enters_and_restores_phy_guard(
             info=device_cli.DEFAULT_CONFIG.transfer.info_timeout_seconds,
             transfer=device_cli.DEFAULT_CONFIG.transfer.sync_timeout_seconds,
         )
-        async with provider(None) as connected:
+        assert options.session_guard is not None
+        async with options.session_guard(), provider(None) as connected:
             assert connected is session
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
@@ -994,7 +1079,9 @@ def test_collect_cli_wires_bounded_policy_and_provider(
     ) -> object:
         del runtime
         captured.append((provider, options))
-        async with provider(None) as connected:
+        assert options.session_guard is not None
+        assert options.phy_policy == "force_1m"
+        async with options.session_guard(), provider(None) as connected:
             assert connected is session
         return device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
 
@@ -1161,33 +1248,19 @@ def test_run_uses_windows_asyncio_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert device_cli.run(operation()) == 17
 
 
-def test_posix_runner_converts_fake_sigterm_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeLoop:
-        def add_signal_handler(self, _signal: signal.Signals, callback: Callable[[], object]) -> None:
-            callback()
-
-        def remove_signal_handler(self, _signal: signal.Signals) -> bool:
-            return True
-
-    monkeypatch.setattr(device_cli.asyncio, "get_running_loop", lambda: FakeLoop())
+def test_posix_runner_converts_fake_sigterm_cancellation() -> None:
+    from omi_collector.capture.application.stop_intent import StopIntent
 
     async def operation() -> None:
-        return
+        await asyncio.Future()
 
+    intent = StopIntent()
+    intent.request(signal.SIGTERM)
     with pytest.raises(device_cli.OperationInterruptedError, match="after cleanup"):
-        asyncio.run(device_cli._run_posix_operation(operation()))
+        asyncio.run(device_cli._run_posix_operation(operation(), stop_intent=intent))
 
 
-def test_posix_runner_reraises_unrelated_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeLoop:
-        def add_signal_handler(self, _signal: signal.Signals, _callback: object) -> None:
-            return
-
-        def remove_signal_handler(self, _signal: signal.Signals) -> bool:
-            return True
-
-    monkeypatch.setattr(device_cli.asyncio, "get_running_loop", lambda: FakeLoop())
-
+def test_posix_runner_reraises_unrelated_cancellation() -> None:
     async def operation() -> None:
         raise asyncio.CancelledError
 
@@ -1217,6 +1290,33 @@ def test_sealed_collect_output_contains_only_bundle_metadata(tmp_path: Path) -> 
         "status": "sealed",
     }
     assert "records.bin" not in rendered
+
+
+def test_sql_custody_output_identifies_source_without_claiming_public_bundle() -> None:
+    result = CollectionResult(
+        RingInfo(10, 11, 100, 0, RECORD_SIZE),
+        1,
+        DurableSqliteSeal("a" * 32, 10, 11, 1, "b" * 64),
+        next_sequence=11,
+        advance_confirmed=True,
+    )
+    metrics = device_cli.DownloadMetrics(1.0, RECORD_SIZE, float(RECORD_SIZE), 1.0, 0, None)
+
+    collect = cast(dict[str, object], json.loads(device_cli.render_collect(result)))
+    sync = cast(dict[str, object], json.loads(device_cli.render_sync(result, metrics)))
+
+    assert collect == {
+        "source_id": "a" * 32,
+        "raw_sha256": "b" * 64,
+        "next_sequence": 11,
+        "record_count": 1,
+        "start_sequence": 10,
+        "status": "sealed",
+    }
+    assert sync["source_id"] == "a" * 32
+    assert sync["raw_sha256"] == "b" * 64
+    assert sync["advance_confirmed"] is True
+    assert "bundle_path" not in sync
 
 
 def test_help_has_no_manual_destructive_ring_commands() -> None:

@@ -4,13 +4,16 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, suppress
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, ClassVar, Never, Protocol, cast
 from uuid import uuid4
 
 import typer
@@ -23,6 +26,7 @@ if TYPE_CHECKING:
     from omi_collector.capture.adapters.collector_state_db import StateDB
     from omi_collector.capture.adapters.operational_status import OperationalStatusStore
     from omi_collector.capture.adapters.staging_store import StagingStore
+    from omi_collector.capture.application.stop_intent import StopIntent
     from omi_collector.capture.cli import DownloadProgress
     from omi_collector.capture.domain.operational_status_machine import OperationalSignal
     from omi_collector.storage_layout import OperatorConfig
@@ -37,7 +41,7 @@ class _CaptureCli(Protocol):
 
     def phy_state_context(self, state_db: object) -> AbstractContextManager[None]: ...
 
-    def run(self, operation: Coroutine[object, object, object]) -> object: ...
+    def run(self, operation: Coroutine[object, object, object], *, stop_intent: StopIntent | None = None) -> object: ...
 
     def phy_check(self, adapter: str) -> Coroutine[object, object, object]: ...
 
@@ -136,12 +140,25 @@ def _staging(operator_config: OperatorConfig, *, state_db: StateDB | None = None
     from omi_collector.capture.adapters.collector_state_db import StateDBError
     from omi_collector.capture.adapters.staging_filesystem import StagingIO, StagingPaths
     from omi_collector.capture.adapters.staging_store import StagingStore
-    from omi_collector.state_migration import StateMigrationError, open_runtime_state
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
+    from omi_collector.state_migration import InternalAudioCutoverRequiredError, StateMigrationError, open_runtime_state
 
     layout = operator_config.storage
     if state_db is None:
         try:
             state_db = open_runtime_state(layout)
+        except InternalAudioCutoverRequiredError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=78) from error
+        except FatalInternalAudioStorageError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=78) from error
+        except TransientInternalAudioStorageError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=1) from error
         except (StateMigrationError, StateDBError) as error:
             typer.echo(str(error), err=True)
             raise typer.Exit(code=1) from error
@@ -165,7 +182,9 @@ def _command_state(loaded: OperatorConfig) -> Iterator[StateDB]:
     """Hold the one Collector guard before any writable state or BLE work."""
     from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
     from omi_collector.capture.adapters.collector_state_db import StateDBError
-    from omi_collector.state_migration import StateMigrationError, open_runtime_state
+    from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
+    from omi_collector.state_migration import InternalAudioCutoverRequiredError, StateMigrationError, open_runtime_state
 
     try:
         _require_host_singleton(loaded)
@@ -173,6 +192,15 @@ def _command_state(loaded: OperatorConfig) -> Iterator[StateDB]:
             state_db = open_runtime_state(loaded.storage)
             with _capture_cli().phy_state_context(state_db):
                 yield state_db
+    except InternalAudioCutoverRequiredError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except TransientInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
     except (CollectorGuardError, StateMigrationError, StateDBError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
@@ -198,6 +226,12 @@ class SyncLogLevel(StrEnum):
 
     INFO = "INFO"
     DEBUG = "DEBUG"
+
+
+@dataclass(frozen=True, slots=True)
+class _SyncContext:
+    operational_status: OperationalStatusStore | None = None
+    stop_intent: StopIntent | None = None
 
 
 class SyncProgressReporter:
@@ -305,9 +339,12 @@ class SyncProgressReporter:
             signal = OperationalSignal.UNCHANGED
             if self._staging is not None:
                 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+                from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 
                 try:
                     pending = ClockStateStore(self._staging.state_db).state().intent
+                except FatalInternalAudioStorageError:
+                    raise
                 except Exception:  # noqa: BLE001 - unreadable evidence cannot prove recovery
                     pass
                 else:
@@ -414,13 +451,12 @@ def config_check(
 @app.command("migrate-state")
 def migrate_collector_state(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
-    legacy_phy_state_home: Annotated[
-        Path | None, typer.Option("--legacy-phy-state-home", help="Prior operator PHY state home.")
-    ] = None,
 ) -> None:
-    """Cut over stopped Collector control state to its single SQLite database."""
+    """Cut over stopped v1 Collector SQLite and private audio to v2."""
     from omi_collector.capture.adapters.collector_state_db import StateDBError
-    from omi_collector.state_migration import StateMigrationError, migrate_state
+    from omi_collector.capture.adapters.legacy_audio_import import LegacyAudioImportError
+    from omi_collector.internal_audio_migration import InternalAudioMigrationError, migrate_internal_audio
+    from omi_collector.state_migration import StateMigrationError
 
     loaded = _load_config(config_path)
     try:
@@ -430,31 +466,112 @@ def migrate_collector_state(
             not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}
         ):
             raise StateMigrationError("confirm the Collector service is stopped before state migration")
-        homes = None
-        if legacy_phy_state_home is not None:
-            homes = (Path("/var/lib/omi-collector"), legacy_phy_state_home)
-        result = migrate_state(loaded.storage, legacy_phy_state_homes=homes)
-    except (StateMigrationError, StateDBError, OSError, ValueError) as error:
+        result = migrate_internal_audio(
+            loaded.storage,
+            release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
+        )
+    except (
+        StateMigrationError,
+        InternalAudioMigrationError,
+        StateDBError,
+        LegacyAudioImportError,
+        sqlite3.DatabaseError,
+        OSError,
+        ValueError,
+    ) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
-@app.command("cleanup-attempts")
-def cleanup_attempts(
+@app.command("check-state-migration")
+def check_collector_state_migration(
+    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
+    stopped: Annotated[bool, typer.Option("--stopped", help="Require the installed service to be stopped.")] = False,
+) -> None:
+    """Read-only check that Collector state can be migrated by this release."""
+    from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
+    from omi_collector.internal_audio_migration import inspect_internal_audio_migration
+    from omi_collector.state_migration import StateMigrationError
+
+    loaded = _load_config(config_path)
+    exit_code = 1
+    try:
+        _require_host_singleton(loaded)
+        if stopped:
+            with collector_guard(loaded.storage.collector.lock):
+                service_state = _systemd_service_status()
+                if not service_state.get("available") or service_state.get("active_state") not in {
+                    "inactive",
+                    "failed",
+                }:
+                    raise StateMigrationError("confirm the Collector service is stopped before state inspection")
+                result = inspect_internal_audio_migration(
+                    loaded.storage,
+                    release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
+                )
+        else:
+            result = inspect_internal_audio_migration(
+                loaded.storage,
+                release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
+            )
+    except (FatalInternalAudioStorageError, TransientInternalAudioStorageError) as error:
+        result = {
+            "detail": str(error),
+            "fault": "fatal" if isinstance(error, FatalInternalAudioStorageError) else "transient",
+            "reason": "inspection_failed",
+            "status": "migration_refused",
+        }
+        if isinstance(error, FatalInternalAudioStorageError):
+            exit_code = 78
+    except (CollectorGuardError, StateMigrationError, OSError, ValueError) as error:
+        result = {"detail": str(error), "reason": "inspection_failed", "status": "migration_refused"}
+    typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    if result["status"] != "migration_compatible":
+        raise typer.Exit(code=exit_code)
+
+
+@app.command("recover-state-journal")
+def recover_collector_state_journal(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Sweep authenticated terminal raw while the service is stopped."""
+    """Recover only a verified hot SQLite journal under the stopped-service guard."""
+    from omi_collector.capture.adapters.collector_guard import CollectorGuardError
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
+    from omi_collector.internal_audio_migration import InternalAudioMigrationError, recover_canonical_journal
+    from omi_collector.state_migration import StateMigrationError
+
     loaded = _load_config(config_path)
-    service_state = _systemd_service_status()
-    if loaded.path == DEFAULT_CONFIG_PATH and (
-        not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}
-    ):
-        typer.echo("stop the Collector service before terminal attempt cleanup", err=True)
-        raise typer.Exit(code=1)
-    with _command_state(loaded) as state_db:
-        removed = _staging(loaded, state_db=state_db).sweep_terminal_retired()
-    typer.echo(json.dumps({"removed": len(removed)}, sort_keys=True, separators=(",", ":")))
+    try:
+        _require_host_singleton(loaded)
+        service_state = _systemd_service_status()
+        if not service_state.get("available") or service_state.get("active_state") not in {"inactive", "failed"}:
+            raise StateMigrationError("confirm the Collector service is stopped before journal recovery")
+        result = recover_canonical_journal(
+            loaded.storage,
+            release_metadata=Path(sys.prefix) / "share/omi-collector/release.json",
+        )
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except (
+        CollectorGuardError,
+        InternalAudioMigrationError,
+        StateMigrationError,
+        TransientInternalAudioStorageError,
+        sqlite3.DatabaseError,
+        OSError,
+    ) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
 @app.command()
@@ -462,12 +579,22 @@ def service(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Run the long-lived single-pendant collector."""
+    from omi_collector.capture.application.stop_intent import StopIntent, StopRequestedError
+
     loaded = _load_config(config_path)
-    with _command_state(loaded) as state_db:
-        _service_locked(loaded, state_db)
+    stop_intent = StopIntent()
+    with stop_intent.installed():
+        try:
+            with _command_state(loaded) as state_db:
+                stop_intent.check()
+                _service_locked(loaded, state_db, stop_intent=stop_intent)
+        except StopRequestedError as error:
+            raise typer.Exit(code=stop_intent.exit_code) from error
 
 
-def _service_locked(loaded: OperatorConfig, state_db: StateDB) -> None:
+def _service_locked(loaded: OperatorConfig, state_db: StateDB, *, stop_intent: StopIntent | None = None) -> None:
+    if stop_intent is not None:
+        stop_intent.check()
     staging = _staging(loaded, state_db=state_db)
     _preflight_storage(staging)
     from omi_collector.capture.adapters.operational_status import (
@@ -495,22 +622,24 @@ def _service_locked(loaded: OperatorConfig, state_db: StateDB) -> None:
             operational_status.close()
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
-    typer.echo(
-        json.dumps(
-            {"config": str(loaded.path), "status": "deployment_ready"},
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        err=True,
-    )
     try:
         assert operational_status is not None
+        if stop_intent is not None:
+            stop_intent.check()
+        typer.echo(
+            json.dumps(
+                {"config": str(loaded.path), "status": "deployment_ready"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            err=True,
+        )
         _sync(
             loaded,
             staging,
             force_1m=False,
             log_level=SyncLogLevel.INFO,
-            operational_status=operational_status,
+            context=_SyncContext(operational_status, stop_intent),
         )
     finally:
         operational_status.close()
@@ -660,9 +789,13 @@ def _sync(
     *,
     force_1m: bool,
     log_level: SyncLogLevel,
-    operational_status: OperationalStatusStore | None = None,
+    context: _SyncContext | None = None,
 ) -> None:
     """Run one foreground sync using validated configuration and storage."""
+    if context is None:
+        context = _SyncContext()
+    operational_status = context.operational_status
+    stop_intent = context.stop_intent
     started = time.monotonic()
     from omi_collector.capture.adapters.debug_logging import (
         close_debug_logging,
@@ -672,6 +805,8 @@ def _sync(
 
     debug_logger = configure_debug_logging(loaded.storage.collector.root)
     try:
+        if stop_intent is not None:
+            stop_intent.check()
         report_progress = SyncProgressReporter(
             log_level,
             debug_logger=debug_logger,
@@ -699,10 +834,11 @@ def _sync(
             record_publication=(
                 operational_status.record_publication_outcome if operational_status is not None else None
             ),
+            **({"stop_intent": stop_intent} if stop_intent is not None else {}),
         )
         if operational_status is not None:
             sync_operation = _supervise_operational_status(sync_operation, operational_status)
-        result = _run_device_operation(sync_operation)
+        result = _run_device_operation(sync_operation, stop_intent=stop_intent)
         metrics = _capture_cli().download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
         typer.echo(_capture_cli().render_sync(cast(object, result), metrics))
     except Exception as error:
@@ -731,8 +867,6 @@ def _quality_status_callback(
 async def _supervise_operational_status(
     operation: Coroutine[object, object, object], operational_status: OperationalStatusStore
 ) -> object:
-    from omi_collector.capture.adapters.operational_status import OperationalStatusError
-
     capture_task = asyncio.create_task(operation)
     failure_task = asyncio.create_task(operational_status.wait_failure())
     try:
@@ -745,8 +879,8 @@ async def _supervise_operational_status(
             except asyncio.CancelledError:
                 pass
             except Exception as cleanup_error:
-                raise OperationalStatusError("operational status persistence failed") from cleanup_error
-            raise OperationalStatusError("operational status persistence failed") from failure
+                raise _status_cleanup_error(failure, cleanup_error) from cleanup_error
+            _raise_status_failure(failure)
         return await capture_task
     except asyncio.CancelledError:
         if not capture_task.done():
@@ -756,13 +890,48 @@ async def _supervise_operational_status(
         except asyncio.CancelledError:
             pass
         except Exception as cleanup_error:
-            raise OperationalStatusError("capture cleanup failed during cancellation") from cleanup_error
+            raise _status_cleanup_error(
+                cleanup_error, cleanup_error, message="capture cleanup failed during cancellation"
+            ) from cleanup_error
         raise
     finally:
         if not failure_task.done():
             failure_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await failure_task
+
+
+def _raise_status_failure(
+    failure: BaseException,
+) -> Never:
+    from omi_collector.capture.adapters.operational_status import OperationalStatusError
+    from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
+
+    if isinstance(failure, (FatalInternalAudioStorageError, TransientInternalAudioStorageError)):
+        raise failure
+    raise OperationalStatusError("operational status persistence failed") from failure
+
+
+def _status_cleanup_error(
+    failure: BaseException,
+    cleanup_error: BaseException,
+    *,
+    message: str = "operational status persistence failed",
+) -> Exception:
+    from omi_collector.capture.adapters.operational_status import OperationalStatusError
+    from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
+
+    if isinstance(failure, FatalInternalAudioStorageError):
+        return failure
+    if isinstance(cleanup_error, FatalInternalAudioStorageError):
+        return cleanup_error
+    if isinstance(failure, TransientInternalAudioStorageError):
+        return failure
+    if isinstance(cleanup_error, TransientInternalAudioStorageError):
+        return cleanup_error
+    return OperationalStatusError(message)
 
 
 @device.command("metrics")
@@ -772,6 +941,10 @@ def device_metrics(
 ) -> None:
     """Report metrics for the source bundles currently visible to the collector."""
     from omi_collector.capture.adapters.collector_state_db import StateDBError
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
     from omi_collector.spool_metrics import SpoolMetricsError
     from omi_collector.state_migration import StateMigrationError, open_runtime_state
 
@@ -784,7 +957,10 @@ def device_metrics(
             loaded.storage.publication.root,
             state_db=open_runtime_state(loaded.storage, read_only=True),
         )
-    except (SpoolMetricsError, StateDBError, StateMigrationError) as error:
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except (SpoolMetricsError, StateDBError, StateMigrationError, TransientInternalAudioStorageError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(json.dumps(cast(_JsonResult, result).as_dict(), sort_keys=True, separators=(",", ":")))
@@ -799,6 +975,10 @@ def device_status(
     """Summarize current backlog, publication, transfers, and confirmed loss."""
     from omi_collector.capture.adapters.operational_status import OperationalIdentity
     from omi_collector.capture.application.operational_telemetry import system_host_boot_id
+    from omi_collector.capture.application.storage_fault import (
+        FatalInternalAudioStorageError,
+        TransientInternalAudioStorageError,
+    )
     from omi_collector.operator_status import OperatorStatusError
 
     try:
@@ -818,7 +998,10 @@ def device_status(
             hours=hours,
             identity=OperationalIdentity(system_host_boot_id(), invocation_id),
         )
-    except OperatorStatusError as error:
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
+    except (OperatorStatusError, TransientInternalAudioStorageError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     result["service"] = service_status
@@ -855,13 +1038,27 @@ def _initialize_confirmed_loss_ledger(staging: StagingStore) -> None:
         raise typer.Exit(code=1) from error
 
 
-def _run_device_operation(operation: Coroutine[object, object, object]) -> object:
+def _run_device_operation(
+    operation: Coroutine[object, object, object], *, stop_intent: StopIntent | None = None
+) -> object:
     capture_cli = _capture_cli()
+    from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
+    from omi_collector.capture.application.stop_intent import StopRequestedError
+
     try:
-        return capture_cli.run(operation)
+        if stop_intent is None:
+            return capture_cli.run(operation)
+        return capture_cli.run(operation, stop_intent=stop_intent)
+    except FatalInternalAudioStorageError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=78) from error
     except capture_cli.OperationInterruptedError as error:
         typer.echo(str(error), err=True)
-        raise typer.Exit(code=0) from error
+        raise typer.Exit(
+            code=stop_intent.exit_code if stop_intent is not None and stop_intent.requested else 0
+        ) from error
+    except StopRequestedError as error:
+        raise typer.Exit(code=stop_intent.exit_code if stop_intent is not None else 1) from error
     except Exception as error:  # User-facing boundary; BaseException remains unsuppressed.
         typer.echo(f"device operation failed: {type(error).__name__}", err=True)
         raise typer.Exit(code=1) from error

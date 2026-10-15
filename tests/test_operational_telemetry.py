@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import sqlite3
 import threading
 import time
 from collections.abc import Mapping
@@ -39,6 +40,7 @@ from omi_collector.capture.application.operational_telemetry import (
 )
 from omi_collector.capture.application.opportunistic_sync import run_opportunistic_collector
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockAnchor, ClockIntent, ClockRange, ClockState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo, RingStatus
 from omi_collector.config import DEFAULT_CONFIG
@@ -796,7 +798,7 @@ def test_verified_set_time_persists_intent_before_write_and_keeps_exact_boundary
 
     class InspectingSession(FakeOperationalSession):
         async def write_optional_characteristic(self, uuid: str, value: bytes) -> object:
-            observed_intents.append(store.state().intent)
+            observed_intents.append((await asyncio.to_thread(store.state)).intent)
             return await super().write_optional_characteristic(uuid, value)
 
     session = InspectingSession(session.values, readback=session.readback)
@@ -938,6 +940,152 @@ def test_failed_intent_commit_prevents_ble_set_time() -> None:
 
     assert session.writes == []
     assert _clock_event(events)["outcome"] == "intent_persist_failed"
+
+
+@pytest.mark.parametrize("failing_operation", ("state", "observe", "prepare"))
+def test_corrupt_clock_evidence_stops_preflight_before_audio_or_time_write(failing_operation: str) -> None:
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+
+    class CorruptClockStore(FakeClockStateStore):
+        def state(self) -> ClockState:
+            if failing_operation == "state":
+                raise fatal
+            return super().state()
+
+        def _fail_if(self, operation: str) -> None:
+            if operation == failing_operation:
+                raise fatal
+
+    session = FakeOperationalSession({TIME_READ_UUID: pack("<I", 1010)})
+    store = CorruptClockStore()
+    ticks = iter((1000.0,) * 8)
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        asyncio.run(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                _info(),
+                _event_emitter([]),
+                clock=TelemetryClock(lambda: next(ticks), lambda _timeout: True, 0.5, state_store=store),
+            )
+        )
+    assert raised.value is fatal
+    assert session.writes == []
+
+
+def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit(tmp_path: Path) -> None:
+    state_db = StateDB(tmp_path / "corrupt-state.sqlite3")
+    state_db.path.write_bytes(b"not a SQLite database")
+    observed_fatals: list[FatalInternalAudioStorageError] = []
+    original_causes: list[BaseException | None] = []
+    exit_started = threading.Event()
+    release_exit = threading.Event()
+    exit_completed = threading.Event()
+
+    class CorruptClockStore(ClockStateStore):
+        def state(self) -> ClockState:
+            try:
+                return super().state()
+            except FatalInternalAudioStorageError as error:
+                observed_fatals.append(error)
+                original_causes.append(error.__cause__)
+                raise
+
+    class HeldLease:
+        def __enter__(self) -> HeldLease:
+            return self
+
+        def require_active(self) -> None:
+            return None
+
+        def __exit__(self, _type: object, value: object, _traceback: object) -> None:
+            assert value is observed_fatals[0]
+            exit_started.set()
+            if not release_exit.wait(5):
+                raise TimeoutError("held clock lease exit was not released")
+            exit_completed.set()
+
+    session = FakeOperationalSession({TIME_READ_UUID: pack("<I", 1010)})
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            collect_operational_telemetry(
+                session,
+                _status(),
+                _info(),
+                _event_emitter([]),
+                clock=TelemetryClock(
+                    now=lambda: 1000.0,
+                    synchronized=lambda _timeout: True,
+                    state_store=CorruptClockStore(state_db),
+                    mutation_lease=HeldLease,
+                ),
+            )
+        )
+        try:
+            assert await asyncio.to_thread(exit_started.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert not exit_completed.is_set()
+            task.cancel()
+            await asyncio.sleep(0)
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            assert not done
+            assert not exit_completed.is_set()
+        finally:
+            release_exit.set()
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await task
+        assert raised.value is observed_fatals[0]
+        assert raised.value.__cause__ is original_causes[0]
+        assert isinstance(original_causes[0], sqlite3.DatabaseError)
+        assert raised.value.sqlite_errorcode == sqlite3.SQLITE_NOTADB
+        assert exit_completed.is_set()
+
+    asyncio.run(scenario())
+    assert session.writes == []
+
+
+def test_clock_target_becomes_stale_while_monotonic_preparation_waits() -> None:
+    monotonic_started = threading.Event()
+    release_monotonic = threading.Event()
+    wall_now = [1000.0]
+    event: dict[str, object] = {}
+    session = FakeOperationalSession({})
+
+    def held_monotonic() -> float:
+        monotonic_started.set()
+        if not release_monotonic.wait(5):
+            raise TimeoutError("held monotonic preparation was not released")
+        return 1.0
+
+    async def scenario() -> operational_telemetry._ClockReadback:
+        task = asyncio.create_task(
+            operational_telemetry._write_and_verify(
+                operational_telemetry._ClockWrite(
+                    session.read_optional_characteristic,
+                    session.write_optional_characteristic,
+                    1000,
+                    event,
+                    1.0,
+                    lambda: wall_now[0],
+                    held_monotonic,
+                    None,
+                )
+            )
+        )
+        try:
+            assert await asyncio.to_thread(monotonic_started.wait, 5)
+            wall_now[0] = 1003.0
+        finally:
+            release_monotonic.set()
+        return await task
+
+    readback = asyncio.run(scenario())
+    assert readback.epoch is None
+    assert event["outcome"] == "target_stale"
+    assert session.writes == []
 
 
 def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:

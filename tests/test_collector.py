@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sqlite3
 import threading
 from collections.abc import AsyncIterator, Coroutine, Iterable
 from dataclasses import FrozenInstanceError, dataclass, field
@@ -10,7 +11,7 @@ from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters.attempt_writer import AttemptWriter
+from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError
 from omi_collector.capture.application import collector as collector_module
 from omi_collector.capture.application.collector import (
     AdvanceRejectedError,
@@ -26,6 +27,12 @@ from omi_collector.capture.application.collector import (
     advance_leg,
     read_leg,
 )
+from omi_collector.capture.application.ring_transport import (
+    NotificationOverflowError,
+    NotificationProtocolError,
+    RingTransportDisconnectedError,
+)
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     STATUS_STORAGE_NOT_READY,
@@ -139,9 +146,15 @@ class FakeWriter:
     submitted_high_water: int = 0
     written_high_water: int = 0
     fail_barrier: bool = False
+    failure: BaseException | None = None
     target_threads: list[int] = field(default_factory=list)
     expected_start: int = 10
     expected_count: int = 2
+    published_tails: list[bytes] = field(default_factory=list)
+
+    async def wait_failure(self) -> BaseException:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
     async def start(self) -> None:
         self.calls.append("start")
@@ -157,9 +170,10 @@ class FakeWriter:
         future.set_result(None)
         return future
 
-    def publish(self, high_water: int) -> None:
+    def publish(self, high_water: int, tail: bytes = b"") -> None:
         self.calls.append(f"publish:{high_water}")
         self.submitted_high_water = high_water
+        self.published_tails.append(tail)
 
     async def barrier(self) -> str:
         self.calls.append("barrier")
@@ -168,25 +182,37 @@ class FakeWriter:
         await asyncio.to_thread(self._target_write)
         return "checkpointed"
 
+    async def interrupt(self) -> str:
+        self.calls.append("interrupt")
+        await asyncio.to_thread(self._target_write)
+        return "interrupted"
+
     def _target_write(self) -> None:
         self.target_threads.append(threading.get_ident())
         self.written_high_water = self.submitted_high_water
 
 
 class PendingReadBeginWriter(FakeWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_begin_future: asyncio.Future[object] | None = None
+
     def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
         del notice
         self.calls.append("read_begin")
-        return asyncio.get_running_loop().create_future()
+        self.read_begin_future = asyncio.get_running_loop().create_future()
+        return self.read_begin_future
 
 
 class PendingBarrierWriter(FakeWriter):
     def __init__(self) -> None:
         super().__init__()
         self.release_barrier = asyncio.Event()
+        self.barrier_started = asyncio.Event()
 
     async def barrier(self) -> str:
         self.calls.append("barrier")
+        self.barrier_started.set()
         await self.release_barrier.wait()
         return "checkpointed"
 
@@ -212,8 +238,8 @@ class BlockingWriterTarget:
         self.calls.append("read_begin")
         return None
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
-        del offset, chunk
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+        del offset, chunk, tail
         self.calls.append("append")
         self.append_threads.append(threading.get_ident())
         if len(self.append_threads) == 1:
@@ -224,6 +250,9 @@ class BlockingWriterTarget:
 
     def checkpoint(self) -> None:
         self.calls.append("checkpoint")
+
+    def interrupt(self) -> None:
+        self.calls.append("interrupt")
 
     def seal(self, done_notice: object) -> object:
         del done_notice
@@ -627,13 +656,46 @@ def test_read_leg_timeout_is_reset_by_continuous_notifications() -> None:
     async def scenario() -> None:
         record = _record(1)
         notifications = (_begin(10, 2), _data(record), _data(record), _done(12))
-        session = DelayedSession(notifications, (0.02, 0.02, 0.02, 0.02))
+        session = DelayedSession(notifications, (0.4, 0.4, 0.4, 0.4))
         writer = FakeWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        result = await read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.03))
+        result = await read_leg(session, arena, writer, 10, 2, ReadLegOptions(1))
 
         assert result.received_bytes == 2 * RECORD_SIZE
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_partial_read_flushes_tail_before_writer_interruption() -> None:
+    async def scenario() -> None:
+        record = _record(1)
+        partial_seen = asyncio.Event()
+
+        class PartialSession(BurstSession):
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    yield _data(record[:37])
+                    partial_seen.set()
+                    await asyncio.Event().wait()
+
+                return stream()
+
+        session = PartialSession(())
+        writer = FakeWriter()
+        task = asyncio.create_task(
+            read_leg(session, TransferArena(10, 2, max_bytes=2 * RECORD_SIZE), writer, 10, 2, ReadLegOptions(1))
+        )
+        await asyncio.wait_for(partial_seen.wait(), 1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert writer.published_tails == [record[:37]]
+        assert writer.calls[-1] == "interrupt"
+        assert session.writes[-1] == encode_stop_command()
 
     asyncio.run(scenario())
 
@@ -648,6 +710,173 @@ def test_read_leg_timeout_still_fails_after_idle_gap() -> None:
 
         with pytest.raises(TransferInterruptedError, match="timed out during READ"):
             await read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.03))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout", "protocol"])
+def test_cancel_during_read_failure_stop_propagates_after_owned_cleanup(failure_kind: str) -> None:
+    async def scenario() -> None:
+        class HeldStopSession(BurstSession):
+            def __init__(self) -> None:
+                super().__init__(())
+                self.stop_started = asyncio.Event()
+                self.stop_release = asyncio.Event()
+                self.stop_finished = asyncio.Event()
+
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    if failure_kind == "protocol":
+                        raise NotificationProtocolError("invalid transport notification")
+                    await asyncio.Event().wait()
+
+                return stream()
+
+            async def write_control(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                if payload == encode_stop_command():
+                    self.stop_started.set()
+                    await self.stop_release.wait()
+                    self.stop_finished.set()
+
+        session = HeldStopSession()
+        writer = FakeWriter()
+        task = asyncio.create_task(
+            read_leg(
+                session,
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                writer,
+                10,
+                2,
+                ReadLegOptions(0.03),
+            )
+        )
+        try:
+            await asyncio.wait_for(session.stop_started.wait(), 1)
+            task.cancel()
+            await asyncio.sleep(0)
+            session.stop_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert session.stop_finished.is_set()
+            assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+            assert writer.calls[-1] == "interrupt"
+        finally:
+            session.stop_release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("writer_fails", [False, True])
+def test_cancel_at_done_failure_waiter_handoff_settles_without_stop(writer_fails: bool) -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+        sql_error = sqlite3.DatabaseError("file is not a database")
+        fatal.__cause__ = sql_error
+
+        class HeldWaitWriter(FakeWriter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wait_cancelled = asyncio.Event()
+                self.wait_release = asyncio.Event()
+                self.barrier_started = asyncio.Event()
+                self.barrier_release = asyncio.Event()
+                self.barrier_done = asyncio.Event()
+
+            async def wait_failure(self) -> BaseException:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.wait_cancelled.set()
+                    await self.wait_release.wait()
+                    raise
+                raise AssertionError("unreachable")
+
+            async def barrier(self) -> str:
+                self.barrier_started.set()
+                await self.barrier_release.wait()
+                result = await super().barrier()
+                self.barrier_done.set()
+                return result
+
+        writer = HeldWaitWriter()
+        session = BurstSession((_begin(10, 2), _data(_record(1)), _data(_record(2)), _done(12)))
+        task = asyncio.create_task(
+            read_leg(
+                session,
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                writer,
+                10,
+                2,
+                ReadLegOptions(1),
+            )
+        )
+        try:
+            await asyncio.wait_for(writer.wait_cancelled.wait(), 1)
+            task.cancel()
+            if writer_fails:
+                writer.failure = fatal
+            writer.wait_release.set()
+            if writer_fails:
+                with pytest.raises(TransferInterruptedError) as caught:
+                    await task
+                assert caught.value.__cause__ is fatal
+                assert fatal.__cause__ is sql_error
+                assert "barrier" not in writer.calls
+            else:
+                await asyncio.wait_for(writer.barrier_started.wait(), 1)
+                assert not task.done()
+                writer.barrier_release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert writer.barrier_done.is_set()
+            assert session.writes == [encode_read_command(10, 2)]
+        finally:
+            writer.wait_release.set()
+            writer.barrier_release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        NotificationOverflowError("notification queue overflowed"),
+        RingTransportDisconnectedError("transport disconnected"),
+        NotificationProtocolError("invalid transport notification"),
+    ],
+    ids=["overflow", "disconnect", "protocol"],
+)
+def test_transport_failure_stops_and_interrupts_writer(transport_error: BaseException) -> None:
+    async def scenario() -> None:
+        record = _record(1)
+
+        class FailingSession(BurstSession):
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    yield _data(record)
+                    raise transport_error
+
+                return stream()
+
+        session = FailingSession(())
+        writer = FakeWriter()
+        arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+
+        with pytest.raises(TransferInterruptedError) as caught:
+            await read_leg(session, arena, writer, 10, 2, ReadLegOptions(1))
+
+        assert caught.value.__cause__ is transport_error
+        assert caught.value.received_records == 1
+        assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        assert writer.calls[-1] == "interrupt"
+        assert "barrier" not in writer.calls
 
     asyncio.run(scenario())
 
@@ -670,40 +899,44 @@ def test_read_control_write_timeout_stops_and_reports_counters() -> None:
     asyncio.run(scenario())
 
 
-def test_read_begin_wait_timeout_stops_and_reports_counters() -> None:
+def test_read_begin_storage_wait_outlives_ble_deadline() -> None:
     async def scenario() -> None:
         record = _record(1)
         session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
         writer = PendingReadBeginWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        with pytest.raises(TransferInterruptedError, match="timed out waiting for writer after READ") as caught:
-            await asyncio.wait_for(
-                read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)),
-                1,
-            )
-
-        assert caught.value.received_records == 2
-        assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)))
+        for _ in range(20):
+            if writer.read_begin_future is not None:
+                break
+            await asyncio.sleep(0)
+        assert writer.read_begin_future is not None
+        await asyncio.sleep(0.03)
+        assert not pending.done()
+        writer.read_begin_future.set_result(None)
+        result = await asyncio.wait_for(pending, 1)
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert session.writes == [encode_read_command(10, 2)]
 
     asyncio.run(scenario())
 
 
-def test_writer_barrier_timeout_stops_and_reports_counters() -> None:
+def test_writer_barrier_storage_wait_outlives_ble_deadline() -> None:
     async def scenario() -> None:
         record = _record(1)
         session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
         writer = PendingBarrierWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        with pytest.raises(TransferInterruptedError, match="timed out waiting for writer after READ") as caught:
-            await asyncio.wait_for(
-                read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)),
-                1,
-            )
-
-        assert caught.value.received_records == 2
-        assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)))
+        await asyncio.wait_for(writer.barrier_started.wait(), 1)
+        await asyncio.sleep(0.03)
+        assert not pending.done()
+        writer.release_barrier.set()
+        result = await asyncio.wait_for(pending, 1)
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert session.writes == [encode_read_command(10, 2)]
 
     asyncio.run(scenario())
 
@@ -863,5 +1096,144 @@ def test_writer_failure_is_reported_with_counters_after_terminal_done() -> None:
         assert caught.value.submitted_records == 2
         assert writer.calls[-1] == "barrier"
         assert session.writes == [encode_read_command(10, 2)]
+
+    asyncio.run(scenario())
+
+
+def test_real_attempt_writer_failure_stops_a_quiet_read_and_preserves_the_first_error() -> None:
+    async def scenario() -> None:
+        fatal = OSError("target disk failed")
+
+        class FailingTarget(BlockingWriterTarget):
+            def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+                del offset, chunk, tail
+                self.calls.append("append")
+                raise fatal
+
+        class QuietSession(BurstSession):
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    yield _data(_record(1))
+                    await asyncio.Event().wait()
+
+                return stream()
+
+            async def write_control(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                if payload == encode_stop_command():
+                    raise OSError("STOP failed")
+                if payload != encode_read_command(self.start, self.count):
+                    raise AssertionError(f"unexpected command: {payload!r}")
+
+        target = FailingTarget()
+        writer = AttemptWriter(target, bytearray(2 * RECORD_SIZE), config=WriterConfig(chunk_records=1))
+        session = QuietSession(())
+        try:
+            with pytest.raises(TransferInterruptedError) as caught:
+                await read_leg(
+                    session,
+                    TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                    writer,
+                    10,
+                    2,
+                    ReadLegOptions(1),
+                )
+            assert caught.value.__cause__ is fatal
+            assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+        finally:
+            with pytest.raises(WriterFailedError) as close_error:
+                await writer.close()
+            assert close_error.value.args[1] is fatal
+
+    asyncio.run(scenario())
+
+
+def test_repeated_cancel_during_failed_read_stop_keeps_fatal_cause_and_settles_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+        sql_error = sqlite3.DatabaseError("file is not a database")
+        fatal.__cause__ = sql_error
+        failure_latched = threading.Event()
+        original_record_failure = AttemptWriter._record_failure
+
+        class FailingTarget(BlockingWriterTarget):
+            def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+                del offset, chunk, tail
+                raise fatal
+
+        def observe_failure(self: AttemptWriter, error: BaseException, *, close_failed: bool = False) -> BaseException:
+            latched = original_record_failure(self, error, close_failed=close_failed)
+            failure_latched.set()
+            return latched
+
+        class HeldStopSession(BurstSession):
+            def __init__(self) -> None:
+                super().__init__(())
+                self.stop_started = asyncio.Event()
+                self.stop_release = asyncio.Event()
+                self.stop_finished = asyncio.Event()
+                self.notification_cancelled = asyncio.Event()
+                self.stop_calls = 0
+
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    try:
+                        yield _begin(10, 2)
+                        yield _data(_record(1))
+                        await asyncio.Event().wait()
+                    finally:
+                        self.notification_cancelled.set()
+
+                return stream()
+
+            async def write_control(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                assert payload in (encode_read_command(self.start, self.count), encode_stop_command())
+                if payload == encode_read_command(self.start, self.count):
+                    return
+                self.stop_calls += 1
+                self.stop_started.set()
+                await self.stop_release.wait()
+                self.stop_finished.set()
+                raise OSError("STOP failed")
+
+        monkeypatch.setattr(AttemptWriter, "_record_failure", observe_failure)
+        target = FailingTarget()
+        writer = AttemptWriter(target, bytearray(2 * RECORD_SIZE), config=WriterConfig(chunk_records=1))
+        session = HeldStopSession()
+        task = asyncio.create_task(
+            read_leg(
+                session,
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                writer,
+                10,
+                2,
+                ReadLegOptions(1),
+            )
+        )
+        try:
+            await asyncio.to_thread(failure_latched.wait, 5)
+            await session.stop_started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            session.stop_release.set()
+            with pytest.raises(TransferInterruptedError) as caught:
+                await task
+            await session.stop_finished.wait()
+            await session.notification_cancelled.wait()
+            assert caught.value.__cause__ is fatal
+            assert fatal.sqlite_errorcode == 11
+            assert fatal.__cause__ is sql_error
+            assert session.stop_calls == 1
+        finally:
+            session.stop_release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            with pytest.raises(WriterFailedError):
+                await writer.close()
 
     asyncio.run(scenario())

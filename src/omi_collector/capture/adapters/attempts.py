@@ -1,48 +1,22 @@
-"""Attempt descriptors and the durable attempt sequencing facade."""
+"""Typed SQL attempt sequencing and read-only startup inspection."""
 
 from __future__ import annotations
 
-import shutil
-from contextlib import suppress
-from dataclasses import asdict
-from hashlib import sha256
-from pathlib import Path
-from typing import BinaryIO, Protocol, cast
+from dataclasses import dataclass, replace
 
-from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from .bundle_contract import BundleManifest
-from .collector_state_db import StateKind
-from .publication import (
-    PrefixPublicationEvidence,
-    SealResult,
-    _bundle_matches,
-    _prefix_destination_for,
-    _prefix_destination_matches,
-    publish_full_directory,
-    publish_prefix_directory,
+from ..domain.ring_protocol import DoneNotification, ReadBeginNotification
+from .internal_audio_store import (
+    AUDIO_RECORD_SIZE,
+    CaptureRecord,
+    CaptureSource,
+    CaptureTail,
+    DrainCheckpoint,
+    InternalAudioStore,
+    InternalAudioStoreError,
 )
 from .recovery import Recovery
-from .staging_contract import (
-    _MANIFEST_NAME,
-    _RAW_NAME,
-    AttemptDescriptor,
-    AttemptStateError,
-    CollisionError,
-    DurablePrefix,
-    StreamingCheckpoint,
-    _checkpoint_from_json,
-    _validate_count,
-    _validate_int,
-)
-from .staging_filesystem import (
-    DeviceLock,
-    StagingFilesystem,
-    _file_size,
-    _fsync_path,
-    _hash_prefix,
-    _require_regular_file,
-    _sync_directory,
-)
+from .staging_contract import AttemptDescriptor, AttemptStateError, DurablePrefix
+from .staging_filesystem import DeviceLock
 
 
 class RecordAcceptanceError(AttemptStateError):
@@ -61,568 +35,284 @@ class RecordRegressionError(RecordAcceptanceError):
     """A recovery record precedes the original snapshot or requested range."""
 
 
-class _HashDigest(Protocol):
-    def update(self, data: bytes, /) -> None: ...
+@dataclass(frozen=True, slots=True)
+class AudioSourcePage:
+    """One bounded page paired with the source snapshot it belongs to."""
 
-    def hexdigest(self) -> str: ...
+    source: CaptureSource
+    after_ordinal: int
+    records: tuple[CaptureRecord, ...]
 
 
-class StagedAttempt:
-    """One on-disk attempt; instances never perform Bluetooth operations."""
+@dataclass(frozen=True, slots=True)
+class DurableSqliteSeal:
+    """Exact internal custody established before any device ADVANCE."""
+
+    source_id: str
+    start_sequence: int
+    next_sequence: int
+    record_count: int
+    raw_sha256: str
+
+
+class SqliteAttemptInspection:
+    """Read-only startup view that never creates a persistent SQL writer."""
+
+    def __init__(self, source: CaptureSource, descriptor: AttemptDescriptor) -> None:
+        self._source = source
+        self.descriptor = descriptor
+
+    @property
+    def attempt_id(self) -> str:
+        return self._source.source_id
+
+    @property
+    def durable_prefix(self) -> DurablePrefix:
+        source = self._source
+        return DurablePrefix(
+            source.sequence_start,
+            source.sequence_start + source.committed_count,
+            source.committed_count,
+            source.committed_sha256,
+        )
+
+    def recover(self) -> Recovery:
+        source = self._source
+        count = source.committed_count
+        return Recovery(source.source_id, count, count * AUDIO_RECORD_SIZE, True, None)
+
+    def close(self) -> None:
+        """A read-only snapshot owns no persistent resource."""
+
+
+class SqliteStagedAttempt:
+    """Runtime attempt target backed solely by :class:`InternalAudioStore`."""
 
     def __init__(
         self,
-        filesystem: StagingFilesystem,
-        path: Path,
+        audio_store: InternalAudioStore,
+        source: CaptureSource,
         descriptor: AttemptDescriptor,
         *,
-        live: bool = True,
+        close_store: bool = False,
     ) -> None:
-        self._filesystem = filesystem
-        self.path = path
+        self._audio_store = audio_store
+        self._source = source
         self.descriptor = descriptor
-        self._stream_raw: BinaryIO | None = None
-        self._stream_hash: _HashDigest = sha256()
-        self._stream_durable_hash = self._stream_hash.hexdigest()
-        self._stream_next_index = 0
-        self._stream_durable_next_index = 0
-        self._stream_written_bytes = 0
-        self._stream_failed = False
-        self._live_recovery = live
+        self._close_store = close_store
+        self._closed = False
         self._resume_lease: DeviceLock | None = None
-        self._stream_requires_recovery = False
-        self._recovery_start: int | None = None
-        self._recovery_count: int | None = None
-        self._hydrate_streaming_prefix()
-        self._stream_raw = cast(BinaryIO, (path / _RAW_NAME).open("ab", buffering=0)) if live else None
 
     @property
     def attempt_id(self) -> str:
         return self.descriptor.attempt_id
 
-    def record_read_begin(self, notice: ReadBeginNotification) -> None:
-        """Durably bind this attempt to the device's matching READ_BEGIN."""
-        self._require_resume_lease()
-        if self.descriptor.read_begin_start is not None:
-            if (notice.transfer_start_sequence, notice.packet_count) == (
-                self.descriptor.read_begin_start,
-                self.descriptor.read_begin_count,
-            ):
-                return
-            if (notice.transfer_start_sequence, notice.packet_count) == (
-                self._recovery_start,
-                self._recovery_count,
-            ):
-                return
-            raise AttemptStateError("READ_BEGIN is already persisted")
-        if (notice.transfer_start_sequence, notice.packet_count) != self._requested_range():
-            raise AttemptStateError("READ_BEGIN does not match the prepared READ range")
-        descriptor = AttemptDescriptor(
-            self.descriptor.attempt_id,
-            2,
-            self.descriptor.start_sequence,
-            self.descriptor.packet_count,
-            read_begin_start=notice.transfer_start_sequence,
-            read_begin_count=notice.packet_count,
-        )
-        self._filesystem._write_attempt_field(self.attempt_id, "descriptor", asdict(descriptor))
-        self.descriptor = descriptor
+    @property
+    def source(self) -> CaptureSource:
+        """Return the latest immutable SQL source snapshot."""
+        try:
+            source = self._audio_store.get_source(self.attempt_id)
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        if source is None:
+            raise AttemptStateError("typed audio source no longer exists")
+        self._source = source
+        return source
 
-    def prepare_leg(self, start: int, count: int) -> DurablePrefix:
-        """Persist only the current live recovery intent before a READ."""
-        if self.descriptor.read_begin_start is None:
-            if (start, count) != self._requested_range():
-                raise AttemptStateError("initial READ does not match the prepared range")
-            self._admit_remaining_capture()
-            return self.checkpoint()
-        return self.begin_recovery(start, count)
+    @property
+    def path(self) -> None:
+        """Typed attempts intentionally have no filesystem path."""
+        return None
 
     @property
     def durable_prefix(self) -> DurablePrefix:
-        """Return the verified streaming prefix without changing on-disk bytes."""
-        if not self._live_recovery:
-            raise AttemptStateError("reopened streaming attempts have no trusted live durable prefix")
+        source = self.source
         return DurablePrefix(
-            self.descriptor.start_sequence,
-            self.descriptor.start_sequence + self._stream_durable_next_index,
-            self._stream_durable_next_index,
-            self._stream_durable_hash,
+            source.sequence_start,
+            source.sequence_start + source.committed_count,
+            source.committed_count,
+            source.committed_sha256,
         )
 
-    def begin_recovery(self, start_sequence: int, packet_count: int) -> DurablePrefix:
-        """Durably record a continuation range before accepting any DATA bytes."""
-        self._require_resume_lease()
-        if not self._live_recovery:
-            raise AttemptStateError("reopened partial attempts are not recoverable")
-        _validate_int(start_sequence, "recovery start_sequence")
-        _validate_count(packet_count)
-        if self.descriptor.read_begin_start is None or self.descriptor.read_begin_count is None:
-            raise AttemptStateError("READ_BEGIN must be persisted before recovery")
-        original_end = self.descriptor.start_sequence + self.descriptor.packet_count
-        if start_sequence < self.descriptor.start_sequence or start_sequence + packet_count > original_end:
-            raise RecordRegressionError("recovery leg is outside the original snapshot range")
-        prefix = self.durable_prefix
-        if start_sequence > prefix.next_sequence:
-            raise RecordGapError("recovery leg starts after the next durable sequence")
-        self._admit_remaining_capture()
-        # Recovery intent is ephemeral. The checkpoint is the sole durable
-        # recovery frontier; after a restart the next READ begins at it again.
-        self._recovery_start = start_sequence
-        self._recovery_count = packet_count
-        return prefix
-
-    def accept_chunk(self, start_sequence: int, records: bytes | bytearray | memoryview) -> None:
-        """Replay or append one contiguous block of complete ring records.
-
-        The raw stream is a synchronous disk target; callers own transport
-        buffering and must hand us an immutable snapshot of the block.  A
-        replay prefix is compared before one write appends its new suffix.
-        """
-        self._require_resume_lease()
-        _validate_int(start_sequence, "start_sequence")
+    def source_page(self, after_ordinal: int = -1, limit: int = 128) -> AudioSourcePage:
+        """Read one bounded, short-lived page for the publication adapter."""
+        source = self.source
         try:
-            payload = bytes(records)
-        except (TypeError, ValueError) as error:
-            raise AttemptStateError("ring chunk must be bytes-like") from error
-        if not payload or len(payload) % RECORD_SIZE:
-            raise AttemptStateError(f"ring chunk must be a positive multiple of {RECORD_SIZE} bytes")
-        record_count = len(payload) // RECORD_SIZE
-        self._accept_streaming_chunk(start_sequence, payload, record_count)
+            records = self._audio_store.read_record_page(self.attempt_id, after_ordinal, limit)
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        return AudioSourcePage(source, after_ordinal, records)
 
-    def _accept_streaming_chunk(self, start_sequence: int, payload: bytes, record_count: int) -> None:
-
-        if self._recovery_start is None or self._recovery_count is None:
-            expected = self.descriptor.start_sequence + self._stream_next_index
-            if start_sequence != expected:
-                raise AttemptStateError("initial record is not the next expected sequence")
-            self._append_streaming_chunk(self._stream_next_index, payload)
-            return
-        self._accept_recovery_chunk(start_sequence, payload, record_count)
-
-    def _accept_recovery_chunk(self, start_sequence: int, payload: bytes, record_count: int) -> None:
-        end_sequence = start_sequence + record_count
-        recovery_start = self._recovery_start
-        recovery_count = self._recovery_count
-        assert recovery_start is not None and recovery_count is not None
-        if start_sequence < recovery_start:
-            raise RecordRegressionError("recovery sequence regresses before the recovery leg")
-        if end_sequence > recovery_start + recovery_count:
-            raise RecordGapError("recovery sequence exceeds the requested range")
-
-        next_sequence = self.descriptor.start_sequence + self._stream_next_index
-        if start_sequence > next_sequence:
-            raise RecordGapError("recovery sequence leaves a gap after the durable prefix")
-        replay_count = max(0, min(end_sequence, next_sequence) - start_sequence)
-        if replay_count:
-            offset = (start_sequence - self.descriptor.start_sequence) * RECORD_SIZE
-            replay_bytes = replay_count * RECORD_SIZE
-            with (self.path / _RAW_NAME).open("rb") as raw:
-                raw.seek(offset)
-                existing = raw.read(replay_bytes)
-            if existing != payload[:replay_bytes]:
-                raise RecordMismatchError("replayed record bytes do not match the durable prefix")
-        appended_count = record_count - replay_count
-        if appended_count:
-            self._append_streaming_chunk(self._stream_next_index, payload[replay_count * RECORD_SIZE :])
-
-    def recover(self) -> Recovery:
-        """Return the checkpoint-authenticated prefix and raw evidence status."""
-        return self._recover_streaming()
-
-    def seal(self, done: DoneNotification) -> SealResult:
-        """Publish a fully validated attempt using an fsync-and-rename boundary."""
-        self._require_resume_lease()
-        raw_path = self.path / _RAW_NAME
-        self._require_streaming_sealable(done)
-        self._flush_stream_raw(durable=True)
-        if _file_size(raw_path) != self._stream_written_bytes:
-            raise AttemptStateError("streaming raw file changed during transfer")
-        # ``_stream_hash`` is updated from every byte accepted by the single
-        # writer thread.  The lease and the size check above establish that no
-        # other writer can have changed the file, so reuse this digest instead
-        # of reading the completed raw stream a second time just to hash it.
-        raw_hash = self._stream_hash.hexdigest()
-        self.close()
-        bundle_path = self._bundle_path(raw_hash)
-        manifest = self._manifest(raw_hash)
-        if bundle_path.exists():
-            if _bundle_matches(
-                bundle_path,
-                raw_path,
-                manifest,
-                io_chunk_bytes=self._filesystem._durability.io_chunk_bytes,
-            ):
-                self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
-                return SealResult(bundle_path, True)
-            raise CollisionError(f"bundle collision preserved at {self.path}; destination is {bundle_path}")
-        self._filesystem._write_json_atomic(self.path / _MANIFEST_NAME, manifest)
-        publish_full_directory(self._filesystem, self.path, bundle_path)
-        shutil.rmtree(self.path)
-        _sync_directory(self._filesystem.attempts_root, self._filesystem._fsync)
-        with self._filesystem.state_db.transaction() as transaction:
-            transaction.delete(StateKind.ATTEMPT, self.attempt_id)
-        return SealResult(bundle_path, False)
-
-    def publish_prefix(self) -> SealResult | None:
-        """Publish only the checkpoint-authenticated prefix as an ordinary bundle.
-
-        The source partial remains in place so uncheckpointed or torn raw bytes
-        remain available for inspection. A zero-length prefix has no audio
-        artifact; its source reaches terminal-retired only after the writer's
-        successful close.
-        """
-        self._require_resume_lease()
-        prefix = self.durable_prefix
-        if self._stream_raw is not None:
-            self._flush_stream_raw(durable=True)
-        prefix_size = prefix.record_count * RECORD_SIZE
-        if (
-            _hash_prefix(
-                self.path / _RAW_NAME,
-                prefix_size,
-                chunk_size=self._filesystem._durability.io_chunk_bytes,
+    def record_read_begin(self, notice: ReadBeginNotification) -> None:
+        self._require_open()
+        try:
+            self._audio_store.record_read_begin(
+                self.attempt_id,
+                notice.transfer_start_sequence,
+                notice.packet_count,
             )
-            != prefix.raw_sha256
-        ):
-            raise AttemptStateError("streaming prefix hash does not match raw bytes")
-        if not prefix.record_count:
-            self._filesystem._write_attempt_field(
-                self.attempt_id, "prefix_publication", PrefixPublicationEvidence().as_dict()
-            )
-            return None
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        self._refresh_descriptor()
 
-        destination = _prefix_destination_for(self._filesystem.capture_root, prefix)
-        manifest = self._manifest_for_prefix(prefix)
-        if destination.exists():
-            if _prefix_destination_matches(
-                destination,
-                self.path / _RAW_NAME,
-                prefix_size,
-                manifest,
-                io_chunk_bytes=self._filesystem._durability.io_chunk_bytes,
-            ):
-                self._filesystem._write_attempt_field(
-                    self.attempt_id, "prefix_publication", PrefixPublicationEvidence().as_dict()
-                )
-                return SealResult(destination, True)
-            raise CollisionError(f"prefix collision preserved at {self.path}; destination is {destination}")
-        publish_prefix_directory(
-            self._filesystem,
-            destination=destination,
-            raw_source=self.path / _RAW_NAME,
-            prefix_size=prefix_size,
-            manifest=manifest,
-        )
-        self._filesystem._write_attempt_field(
-            self.attempt_id, "prefix_publication", PrefixPublicationEvidence().as_dict()
-        )
-        return SealResult(destination, False)
-
-    def close(self, *, durable: bool = False) -> None:
-        """Close a streaming handle while retaining partial evidence.
-
-        ``durable`` is opt-in for callers that are about to lose the process.
-        """
-        stream = self._stream_raw
-        if stream is None:
-            return
-        self._stream_raw = None
+    def prepare_leg(self, start: int, count: int) -> DurablePrefix:
+        self._require_open()
         try:
-            stream.flush()
-            if durable:
-                self._filesystem._fsync(stream.fileno())
-                self._stream_durable_next_index = self._stream_next_index
-                self._stream_durable_hash = self._stream_hash.hexdigest()
-        finally:
-            stream.close()
-
-    def activate_for_resume(self, lease: DeviceLock) -> None:
-        """Bind a startup-hydrated inspection to its consuming device lease."""
-        lease.require_active()
-        if self._live_recovery or self._stream_raw is not None:
-            raise AttemptStateError("streaming attempt is already active")
-        self._resume_lease = lease
-        try:
-            raw_count = self._stream_written_bytes // RECORD_SIZE
-            if raw_count > self._stream_durable_next_index:
-                # Hydration already authenticated the checkpoint prefix and
-                # computed the complete raw digest in one streaming pass.
-                # Only this lease-bound consuming seam may advance the
-                # durable frontier over the complete aligned tail.
-                raw_path = self.path / _RAW_NAME
-                _fsync_path(raw_path, self._filesystem._fsync)
-                self._stream_durable_next_index = raw_count
-                self._stream_durable_hash = self._stream_hash.hexdigest()
-                self._filesystem._write_checkpoint(
-                    self.path,
-                    StreamingCheckpoint(1, self.attempt_id, raw_count, self._stream_durable_hash),
-                )
-            self._stream_next_index = raw_count
-            self._live_recovery = True
-            self._stream_requires_recovery = False
-            self._stream_raw = cast(BinaryIO, (self.path / _RAW_NAME).open("ab", buffering=0))
-        except BaseException:
-            self._resume_lease = None
-            raise
-
-    def checkpoint(self) -> DurablePrefix:
-        """Fsync raw bytes, then atomically publish their checkpoint proof."""
-        self._require_resume_lease()
-        # The upstream DATA path flushes full chunks during transfer:
-        # https://github.com/BasedHardware/omi/blob/6f7c57ac1545c1931c806a01605646405d398198/app/lib/services/wals/ring_storage_sync.dart#L504-L523
-        _require_regular_file(self.path / _RAW_NAME, "streaming raw file")
-        self._checkpoint_stream_prefix(self._stream_next_index, self._stream_hash.hexdigest())
+            self._audio_store.prepare_leg(self.attempt_id, start, count)
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        self._refresh_descriptor()
         return self.durable_prefix
 
-    def __del__(self) -> None:
-        with suppress(Exception):
-            self.close()
+    def begin_recovery(self, start_sequence: int, packet_count: int) -> DurablePrefix:
+        return self.prepare_leg(start_sequence, packet_count)
 
-    def _require_resume_lease(self) -> None:
-        if self._resume_lease is not None:
-            self._resume_lease.require_active()
-
-    def _requested_range(self) -> tuple[int, int]:
-        return self.descriptor.start_sequence, self.descriptor.packet_count
-
-    def _admit_remaining_capture(self) -> None:
-        """Recheck capacity before every consuming READ leg."""
-        self._filesystem._preflight(
-            self.descriptor.packet_count,
-            staged_bytes=self._stream_written_bytes,
-        )
-
-    def _hydrate_streaming_prefix(self) -> None:
-        """Authenticate the checkpoint prefix while hashing raw evidence once."""
-        raw_path = self.path / _RAW_NAME
-        _require_regular_file(raw_path, "streaming raw file")
-        row = self._filesystem._read_attempt_row(self.attempt_id)
-        raw_checkpoint = row["checkpoint"]
-        if not isinstance(raw_checkpoint, dict):
-            raise AttemptStateError("streaming checkpoint is malformed")
+    def accept_chunk(
+        self,
+        start_sequence: int,
+        records: bytes | bytearray | memoryview,
+        tail: bytes | bytearray | memoryview = b"",
+    ) -> None:
+        """Commit exact complete records and their bounded following tail."""
+        self._require_open()
         try:
-            checkpoint = _checkpoint_from_json(raw_checkpoint, self.attempt_id)
+            payload = bytes(records)
+            partial = bytes(tail)
         except (TypeError, ValueError) as error:
-            raise AttemptStateError("streaming checkpoint is malformed") from error
-        raw_size = raw_path.stat().st_size
-        if raw_size % RECORD_SIZE:
-            raise AttemptStateError("streaming raw file is not record aligned")
-        raw_count = raw_size // RECORD_SIZE
-        limit = self.descriptor.packet_count
-        if self.descriptor.read_begin_count is not None:
-            limit = min(limit, self.descriptor.read_begin_count)
-        if raw_count > limit:
-            raise AttemptStateError("streaming raw file exceeds the prepared range")
-        if checkpoint.record_count > limit:
-            raise AttemptStateError("streaming checkpoint exceeds the prepared range")
-        if raw_count < checkpoint.record_count:
-            raise AttemptStateError("streaming raw file is shorter than its checkpoint")
-        checkpoint_bytes = checkpoint.record_count * RECORD_SIZE
-        bytes_seen, digest, prefix_hash = self._hash_raw_stream(raw_path, checkpoint_bytes)
-        if bytes_seen != raw_size:
-            raise AttemptStateError("streaming raw file changed during hydration")
-        if prefix_hash != checkpoint.raw_sha256:
-            raise AttemptStateError("streaming checkpoint hash does not match raw bytes")
-        # Keep the complete digest state from the streaming pass.  Hashlib's
-        # state cannot be reconstructed from a digest, so replaying the chunks
-        # would violate the one-pass hydration contract.
-        self._stream_hash = digest
-        self._stream_durable_hash = checkpoint.raw_sha256
-        self._stream_durable_next_index = checkpoint.record_count
-        self._stream_written_bytes = raw_size
-        # Keep the uncheckpointed tail in memory only as a digest state. It is
-        # not consumable until activate_for_resume binds an active device lease.
-        self._stream_next_index = checkpoint.record_count
-        self._stream_requires_recovery = not self._live_recovery
-
-    def _hash_raw_stream(self, path: Path, checkpoint_bytes: int) -> tuple[int, _HashDigest, str | None]:
-        """Hash raw evidence once and return byte count, full hash, and prefix hash."""
-        digest = sha256()
-        prefix_remaining = checkpoint_bytes
-        prefix_hash = sha256(b"").hexdigest() if not prefix_remaining else None
-        bytes_seen = 0
-        with path.open("rb") as raw:
-            while chunk := raw.read(self._filesystem._durability.io_chunk_bytes):
-                prefix_remaining, prefix_hash = self._hash_raw_chunk(
-                    digest,
-                    chunk,
-                    prefix_remaining,
-                    prefix_hash,
+            raise AttemptStateError("ring drain must be bytes-like") from error
+        if len(payload) % AUDIO_RECORD_SIZE:
+            raise AttemptStateError(f"ring chunk must be a multiple of {AUDIO_RECORD_SIZE} bytes")
+        if len(partial) >= AUDIO_RECORD_SIZE:
+            raise AttemptStateError(f"ring tail must be shorter than {AUDIO_RECORD_SIZE} bytes")
+        if not payload and not partial:
+            raise AttemptStateError("ring drain must contain records or a partial tail")
+        offset = start_sequence - self.descriptor.start_sequence
+        if offset < 0:
+            raise RecordRegressionError("record precedes the source range")
+        positions = range(0, len(payload), self._audio_store.chunk_limit * AUDIO_RECORD_SIZE)
+        for position in positions:
+            chunk = payload[position : position + self._audio_store.chunk_limit * AUDIO_RECORD_SIZE]
+            expected = offset + position // AUDIO_RECORD_SIZE
+            chunk_end = position + len(chunk)
+            following = partial if chunk_end == len(payload) else b""
+            try:
+                source = self.source
+                record_count = len(chunk) // AUDIO_RECORD_SIZE
+                checkpoint_tail = (
+                    CaptureTail(
+                        source.current_leg_generation,
+                        expected + record_count,
+                        (expected + record_count) * AUDIO_RECORD_SIZE + len(following),
+                        (expected + record_count) * AUDIO_RECORD_SIZE,
+                        following,
+                    )
+                    if following
+                    else None
                 )
-                bytes_seen += len(chunk)
-        return bytes_seen, digest, prefix_hash
+                self._audio_store.commit_drain(
+                    self.attempt_id,
+                    expected,
+                    (chunk[index : index + AUDIO_RECORD_SIZE] for index in range(0, len(chunk), AUDIO_RECORD_SIZE)),
+                    DrainCheckpoint(source.current_leg_generation, checkpoint_tail),
+                )
+            except InternalAudioStoreError as error:
+                raise RecordAcceptanceError(str(error)) from error
+        if not payload:
+            try:
+                source = self.source
+                checkpoint_tail = CaptureTail(
+                    source.current_leg_generation,
+                    offset,
+                    offset * AUDIO_RECORD_SIZE + len(partial),
+                    offset * AUDIO_RECORD_SIZE,
+                    partial,
+                )
+                self._audio_store.commit_tail(
+                    self.attempt_id,
+                    offset,
+                    DrainCheckpoint(source.current_leg_generation, checkpoint_tail),
+                )
+            except InternalAudioStoreError as error:
+                raise RecordAcceptanceError(str(error)) from error
+        self._refresh_descriptor()
 
-    @staticmethod
-    def _hash_raw_chunk(
-        digest: _HashDigest,
-        chunk: bytes,
-        prefix_remaining: int,
-        prefix_hash: str | None,
-    ) -> tuple[int, str | None]:
-        """Update one raw chunk while capturing the checkpoint boundary digest."""
-        if prefix_remaining:
-            prefix_bytes = min(len(chunk), prefix_remaining)
-            digest.update(chunk[:prefix_bytes])
-            prefix_remaining -= prefix_bytes
-            if not prefix_remaining:
-                prefix_hash = digest.hexdigest()
-            digest.update(chunk[prefix_bytes:])
-        else:
-            digest.update(chunk)
-        return prefix_remaining, prefix_hash
+    def checkpoint(self) -> DurablePrefix:
+        self._require_open()
+        return self.durable_prefix
 
-    def _append_streaming_chunk(self, index: int, payload: bytes) -> None:
-        """Write one contiguous suffix and advance its in-memory proofs."""
-        _validate_int(index, "index")
-        if not payload or len(payload) % RECORD_SIZE:
-            raise AttemptStateError(f"ring chunk must be a positive multiple of {RECORD_SIZE} bytes")
-        record_count = len(payload) // RECORD_SIZE
-        self._validate_streaming_chunk_append(index, record_count)
-        self._write_streaming_chunk(payload)
-        old_index = self._stream_next_index
-        self._stream_next_index += record_count
-        self._stream_written_bytes += len(payload)
-        checkpoint_hashes = self._hash_streaming_chunk(old_index, payload, record_count)
-        self._checkpoint_streaming_boundaries(checkpoint_hashes)
+    def recover(self) -> Recovery:
+        source = self.source
+        count = source.committed_count
+        return Recovery(self.attempt_id, count, count * AUDIO_RECORD_SIZE, True, None)
 
-    def _validate_streaming_chunk_append(self, index: int, record_count: int) -> None:
-        if self._stream_failed:
-            raise AttemptStateError("streaming attempt has preserved partial evidence")
-        if self._stream_requires_recovery:
-            raise AttemptStateError("attempt has preserved partial evidence; restart is blocked")
-        if self._stream_raw is None:
-            raise AttemptStateError("streaming attempt is closed")
-        if self.descriptor.read_begin_start is None or self.descriptor.read_begin_count is None:
-            raise AttemptStateError("READ_BEGIN must be persisted before records")
-        if index != self._stream_next_index:
-            raise AttemptStateError("record index is not the next expected value")
-        if index + record_count > self.descriptor.read_begin_count:
-            raise AttemptStateError("record count exceeds READ_BEGIN")
+    def activate_for_resume(self, lease: DeviceLock) -> None:
+        lease.require_active()
+        self._resume_lease = lease
 
-    def _write_streaming_chunk(self, payload: bytes) -> None:
-        stream = self._stream_raw
-        if stream is None:
-            raise AttemptStateError("streaming attempt is closed")
+    def interrupt(self) -> None:
+        self._require_open()
         try:
-            written = stream.write(payload)
-        except OSError:
-            self._stream_failed = True
-            raise
-        if written != len(payload):
-            self._stream_failed = True
-            raise OSError("streaming raw write was short")
+            self._audio_store.interrupt(self.attempt_id)
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        self._refresh_descriptor()
 
-    def _hash_streaming_chunk(self, old_index: int, payload: bytes, record_count: int) -> list[tuple[int, str]]:
-        checkpoint_hashes: list[tuple[int, str]] = []
-        checkpoint_records = self._filesystem._durability.checkpoint_records
-        offset = 0
-        hash_index = old_index
-        while offset < len(payload):
-            next_boundary = ((hash_index // checkpoint_records) + 1) * checkpoint_records
-            segment_records = min(next_boundary - hash_index, record_count - offset // RECORD_SIZE)
-            segment_bytes = segment_records * RECORD_SIZE
-            self._stream_hash.update(payload[offset : offset + segment_bytes])
-            offset += segment_bytes
-            hash_index += segment_records
-            if hash_index % checkpoint_records == 0:
-                checkpoint_hashes.append((hash_index, self._stream_hash.hexdigest()))
-        return checkpoint_hashes
-
-    def _checkpoint_streaming_boundaries(self, checkpoint_hashes: list[tuple[int, str]]) -> None:
+    def seal(self, done: DoneNotification) -> DurableSqliteSeal:
+        """Validate a complete source before the publication adapter takes it."""
+        self._require_open()
+        source = self.source
+        if not done.is_ok:
+            raise AttemptStateError("DONE status does not permit sealing")
+        if source.committed_count != self.descriptor.packet_count:
+            raise AttemptStateError("typed source is incomplete")
+        if done.next_sequence != self.descriptor.start_sequence + self.descriptor.packet_count:
+            raise AttemptStateError("DONE count does not match the typed source")
         try:
-            for checkpoint_count, checkpoint_hash in checkpoint_hashes:
-                self._checkpoint_stream_prefix(checkpoint_count, checkpoint_hash)
-        except OSError:
-            self._stream_failed = True
-            raise
-
-    def _checkpoint_stream_prefix(self, record_count: int, raw_hash: str) -> None:
-        """Persist a checkpoint boundary without changing the raw stream."""
-        self._flush_stream_raw(durable=True)
-        self._stream_durable_next_index = record_count
-        self._stream_durable_hash = raw_hash
-        self._filesystem._write_checkpoint(
-            self.path,
-            StreamingCheckpoint(1, self.attempt_id, record_count, raw_hash),
+            sealed = self._audio_store.seal_source(
+                self.attempt_id,
+                leg_generation=source.current_leg_generation,
+                expected_count=source.committed_count,
+                expected_sha256=source.committed_sha256,
+            )
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        self._refresh_descriptor()
+        return DurableSqliteSeal(
+            sealed.source_id,
+            sealed.sequence_start,
+            sealed.sequence_start + sealed.committed_count,
+            sealed.committed_count,
+            sealed.committed_sha256,
         )
 
-    def _recover_streaming(self) -> Recovery:
-        if self._stream_failed:
-            return Recovery(
-                self.attempt_id,
-                0,
-                max(_file_size(self.path / _RAW_NAME), self._stream_written_bytes),
-                False,
-                "streaming attempt has preserved partial evidence",
-            )
-        # Construction already authenticated the checkpoint-backed prefix.
-        # Reuse that in-memory result here instead of hashing the same prefix
-        # a second time during startup validation.
-        raw_size = self._stream_written_bytes
-        if self.descriptor.read_begin_start is None or self.descriptor.read_begin_count is None:
-            return Recovery(
-                self.attempt_id,
-                self._stream_durable_next_index,
-                raw_size,
-                raw_size == 0,
-                None if raw_size == 0 else "READ_BEGIN is not persisted",
-            )
-        raw_count, remainder = divmod(raw_size, RECORD_SIZE)
-        limit = min(self.descriptor.packet_count, self.descriptor.read_begin_count)
-        issue: str | None = None
-        if remainder:
-            issue = "streaming raw file is not record aligned"
-        elif raw_count > limit:
-            issue = "streaming raw file exceeds the prepared range"
-        elif self._stream_durable_next_index > limit:
-            issue = "streaming checkpoint exceeds the prepared range"
-        elif raw_count < self._stream_durable_next_index:
-            issue = "streaming raw file is shorter than its checkpoint"
-        elif raw_count != self.descriptor.read_begin_count:
-            issue = "streaming attempt is incomplete"
-        return Recovery(self.attempt_id, self._stream_durable_next_index, raw_size, issue is None, issue)
+    def publish_prefix(self) -> DurableSqliteSeal:
+        """Typed sources are published from SQL rows by the publication worker."""
+        self._require_open()
+        source = self.source
+        return DurableSqliteSeal(
+            source.source_id,
+            source.sequence_start,
+            source.sequence_start + source.committed_count,
+            source.committed_count,
+            source.committed_sha256,
+        )
 
-    def _require_streaming_sealable(self, done: DoneNotification) -> None:
-        if not done.is_ok:
-            raise AttemptStateError("DONE did not report success")
-        if self._stream_failed:
-            raise AttemptStateError("streaming attempt has preserved partial evidence")
-        if self.descriptor.read_begin_start is None or self.descriptor.read_begin_count is None:
-            raise AttemptStateError("READ_BEGIN is missing")
-        if done.next_sequence != self.descriptor.read_begin_start + self.descriptor.read_begin_count:
-            raise AttemptStateError("DONE next sequence does not match READ_BEGIN")
-        if self._stream_next_index != self.descriptor.read_begin_count:
-            raise AttemptStateError("attempt does not contain a complete record count")
-        if self._stream_written_bytes != self.descriptor.read_begin_count * RECORD_SIZE:
-            raise AttemptStateError("streaming raw file size does not match record count")
+    def close(self, *, durable: bool = False) -> None:
+        del durable
+        if self._closed:
+            return
+        self._closed = True
+        if self._close_store:
+            self._audio_store.close()
 
-    def _flush_stream_raw(self, *, durable: bool) -> None:
-        if self._stream_raw is None:
-            raise AttemptStateError("streaming attempt is closed")
-        self._stream_raw.flush()
-        if durable:
-            self._filesystem._fsync(self._stream_raw.fileno())
+    def _refresh_descriptor(self) -> None:
+        source = self.source
+        self.descriptor = replace(
+            self.descriptor,
+            read_begin_start=source.read_begin_start,
+            read_begin_count=source.read_begin_count,
+        )
 
-    def _bundle_path(self, raw_hash: str) -> Path:
-        start = self.descriptor.read_begin_start
-        count = self.descriptor.read_begin_count
-        if start is None or count is None:
-            raise AttemptStateError("READ_BEGIN is missing")
-        return self._filesystem.capture_root / f"{start}-{start + count}-{raw_hash[:16]}"
-
-    def _manifest(self, raw_hash: str) -> dict[str, object]:
-        start = self.descriptor.read_begin_start
-        count = self.descriptor.read_begin_count
-        if start is None or count is None:
-            raise AttemptStateError("READ_BEGIN is missing")
-        return BundleManifest(2, start, start + count, count, RECORD_SIZE, raw_hash).as_dict()
-
-    def _manifest_for_prefix(self, prefix: DurablePrefix) -> dict[str, object]:
-        return BundleManifest(
-            2,
-            prefix.start_sequence,
-            prefix.next_sequence,
-            prefix.record_count,
-            RECORD_SIZE,
-            prefix.raw_sha256,
-        ).as_dict()
+    def _require_open(self) -> None:
+        if self._closed:
+            raise AttemptStateError("typed attempt is closed")

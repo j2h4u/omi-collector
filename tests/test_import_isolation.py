@@ -6,6 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.storage_layout import load_operator_config
+
 _CONFIG = '[pendant]\naddress = "AA:BB:CC:DD:EE:FF"\n[ready]\ntarget_audio_seconds = 3600.0\n'
 
 
@@ -37,6 +40,9 @@ def test_root_cli_does_not_import_unselected_capture() -> None:
 def test_device_sync_executes_without_importing_downstream_code(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text(_CONFIG, encoding="utf-8")
+    storage = load_operator_config(config).storage
+    state_db = StateDB(storage.collector.state_db)
+    state_db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     fake_sync_source = """
 async def fake_sync(*args: object, **kwargs: object) -> object:
     del args, kwargs

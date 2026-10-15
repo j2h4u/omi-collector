@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import os
-import shutil
 import stat
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from hashlib import sha256
-from json import JSONDecodeError, dumps, loads
+from json import JSONDecodeError, loads
 from os import O_DIRECTORY, O_RDONLY, close, fsync, statvfs
 from os import open as os_open
 from pathlib import Path
@@ -20,7 +19,7 @@ from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, DurabilityConfig, ReadyConfig
 from ..domain.ring_protocol import RECORD_SIZE
-from .collector_state_db import StateDB, StateDBError, StateKind
+from .collector_state_db import StateDB
 from .debug_logging import debug_event
 from .staging_contract import (
     _CHECKPOINT_NAME,
@@ -30,10 +29,8 @@ from .staging_contract import (
     _TERMINAL_RETIRED_NAME,
     AttemptStateError,
     DeviceAlreadyRunningError,
-    DiskSpaceError,
     MaintenanceDeferredError,
     StagingError,
-    StreamingCheckpoint,
     _checkpoint_from_json,
     _descriptor_from_json,
     _validate_descriptor,
@@ -47,9 +44,6 @@ Statvfs = Callable[[str | Path], object]
 # entry and mask; world access remains disabled.
 _SHARED_BUNDLE_DIRECTORY_MODE: Final = 0o770
 _UNKNOWN_OPERATION: Final = "unknown"
-_ATTEMPT_ROW_FIELDS: Final = frozenset({"descriptor", "checkpoint", "prefix_publication", "terminal_retirement"})
-_ATTEMPT_CLEANUP_FIELD: Final = "cleanup_intent"
-_ATTEMPT_CLEANUP_INTENT: Final = {"version": 1, "state": "pending"}
 
 
 def legacy_attempt_row(path: Path) -> dict[str, object]:
@@ -239,99 +233,6 @@ class StagingFilesystem:
         _sync_directory(path.parent, self._fsync)
         _sync_directory(path, self._fsync)
 
-    def _read_descriptor(self, attempt_path: Path):
-        _require_regular_directory(attempt_path)
-        row = self._read_attempt_row(attempt_path.name)
-        try:
-            raw = row["descriptor"]
-            if not isinstance(raw, dict):
-                raise TypeError("descriptor")
-            descriptor = _descriptor_from_json(raw)
-        except (TypeError, ValueError) as error:
-            raise AttemptStateError("attempt descriptor is malformed") from error
-        if attempt_path.parent == self.attempts_root and descriptor.attempt_id != attempt_path.name:
-            raise AttemptStateError("attempt descriptor identity does not match its directory")
-        _validate_descriptor(descriptor, descriptor.attempt_id)
-        return descriptor
-
-    def _read_attempt_row(self, attempt_id: str) -> dict[str, object]:
-        row = self._read_attempt_row_if_valid_schema(attempt_id)
-        if row is None:
-            raise AttemptStateError("attempt state is missing or malformed")
-        return row
-
-    def _read_attempt_row_if_valid_schema(self, attempt_id: str) -> dict[str, object] | None:
-        """Return structurally valid attempt state, leaving corrupt rows for quarantine."""
-        try:
-            row = self.state_db.get(StateKind.ATTEMPT, attempt_id)
-        except (OSError, ValueError, StateDBError) as error:
-            raise AttemptStateError("attempt state is unreadable") from error
-        if row is None or set(row) not in (_ATTEMPT_ROW_FIELDS, _ATTEMPT_ROW_FIELDS | {_ATTEMPT_CLEANUP_FIELD}):
-            return None
-        if _ATTEMPT_CLEANUP_FIELD in row and row[_ATTEMPT_CLEANUP_FIELD] != _ATTEMPT_CLEANUP_INTENT:
-            return None
-        return row
-
-    def _write_attempt_field(self, attempt_id: str, field: str, value: object) -> None:
-        if field not in _ATTEMPT_ROW_FIELDS | {_ATTEMPT_CLEANUP_FIELD}:
-            raise AttemptStateError("attempt state field is invalid")
-        row = self._read_attempt_row(attempt_id)
-        self._validate_attempt_row(attempt_id, row)
-        row[field] = value
-        self._validate_attempt_row(attempt_id, row)
-        try:
-            with self.state_db.transaction() as transaction:
-                transaction.put(StateKind.ATTEMPT, attempt_id, row)
-        except (OSError, ValueError, StateDBError) as error:
-            raise AttemptStateError("attempt state could not be written") from error
-
-    def _create_attempt_row(self, attempt_id: str, descriptor: object, checkpoint: object) -> None:
-        row = {
-            "descriptor": descriptor,
-            "checkpoint": checkpoint,
-            "prefix_publication": None,
-            "terminal_retirement": None,
-        }
-        self._validate_attempt_row(attempt_id, row)
-        try:
-            with self.state_db.transaction() as transaction:
-                if transaction.get(StateKind.ATTEMPT, attempt_id) is not None:
-                    raise AttemptStateError("attempt state already exists")
-                transaction.put(StateKind.ATTEMPT, attempt_id, row)
-        except (OSError, ValueError, StateDBError) as error:
-            raise AttemptStateError("attempt state could not be created") from error
-
-    def _validate_attempt_row(self, attempt_id: str, row: dict[str, object]) -> None:
-        if set(row) not in (_ATTEMPT_ROW_FIELDS, _ATTEMPT_ROW_FIELDS | {_ATTEMPT_CLEANUP_FIELD}):
-            raise AttemptStateError("attempt state schema is invalid")
-        if _ATTEMPT_CLEANUP_FIELD in row and row[_ATTEMPT_CLEANUP_FIELD] != _ATTEMPT_CLEANUP_INTENT:
-            raise AttemptStateError("attempt cleanup intent is invalid")
-        descriptor = row["descriptor"]
-        checkpoint = row["checkpoint"]
-        if not isinstance(descriptor, dict) or not isinstance(checkpoint, dict):
-            raise AttemptStateError("attempt state is malformed")
-        try:
-            parsed_descriptor = _descriptor_from_json(descriptor)
-            _validate_descriptor(parsed_descriptor, parsed_descriptor.attempt_id)
-            _checkpoint_from_json(checkpoint, attempt_id)
-        except (TypeError, ValueError) as error:
-            raise AttemptStateError("attempt state is malformed") from error
-
-    def _write_json_atomic(self, path: Path, value: object) -> None:
-        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-        _write_synced(temporary, _json_bytes(value), self._fsync)
-        temporary.replace(path)
-        _sync_directory(path.parent, self._fsync)
-
-    def _write_checkpoint(
-        self, attempt_path: Path, checkpoint: StreamingCheckpoint, *, allow_missing: bool = False
-    ) -> None:
-        if attempt_path.name != checkpoint.attempt_id:
-            raise AttemptStateError("checkpoint identity does not match its attempt path")
-        if not allow_missing:
-            self._read_attempt_row(checkpoint.attempt_id)
-        self._write_attempt_field(checkpoint.attempt_id, "checkpoint", asdict(checkpoint))
-
     def _prepare_roots(self) -> None:
         spool_input = _absolute_root(self._spool_input, "spool")
         capture_input = _absolute_root(self._capture_root_input, "capture")
@@ -349,27 +250,6 @@ class StagingFilesystem:
         self.lock_path = _contained_path(self.lock_path, self.spool, "collector lock")
         self.state_db_path = _contained_path(self.state_db_path, self.spool, "collector state database")
         _require_same_filesystem(self.spool, self.capture_root)
-
-    def _preflight(self, packet_count: int, *, staged_bytes: int = 0) -> None:
-        captured_bytes = packet_count * RECORD_SIZE
-        if staged_bytes < 0 or staged_bytes > captured_bytes:
-            raise AttemptStateError("staged raw bytes exceed the prepared range")
-        reserve_bytes = max(
-            self._durability.staging_headroom_bytes,
-            int(captured_bytes * self._durability.staging_overhead_fraction),
-        )
-        # Full publication copies records.bin into a capture-local temporary
-        # directory before atomically renaming it.  The source attempt remains
-        # recoverable until that switch succeeds. Existing raw bytes are already
-        # allocated, so later READ legs reserve only the missing source suffix,
-        # then the full capture copy and configured metadata/durability reserve.
-        required = (captured_bytes - staged_bytes) + captured_bytes + reserve_bytes
-        self._prepare_roots()
-        self._ensure_real_directory(self.capture_root, "capture root")
-        result = self._statvfs(self.spool)
-        available = result.f_bavail * result.f_frsize  # type: ignore[attr-defined]
-        if available < required:
-            raise DiskSpaceError(f"need {required} bytes of free space; only {available} bytes available")
 
     @contextmanager
     def device_lock(self, *, operation: str = _UNKNOWN_OPERATION) -> Iterator[DeviceLock]:
@@ -407,18 +287,6 @@ class StagingFilesystem:
         if self._active_lease is not lease or not lease._matches(self):
             raise AttemptStateError("consuming ring operations require the active spool lock")
 
-    def validate_capture_destination(self, destination: Path) -> int:
-        self._prepare_roots()
-        self._ensure_real_directory(self.capture_root, "capture root")
-        if destination.parent != self.capture_root:
-            raise StagingError("bundle destination escaped capture root")
-        if os.path.lexists(destination) and destination.is_symlink():
-            raise StagingError("bundle destination must not be a symlink")
-        try:
-            return os.open(self.capture_root, os.O_RDONLY | O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
-        except OSError as error:
-            raise StagingError("capture publication destination cannot be inspected") from error
-
 
 class DeviceLock:
     """Opaque active lease proving one coordinator owns a device spool lock."""
@@ -446,11 +314,6 @@ class DeviceLock:
         self._active = True
 
 
-def _json_bytes(value: object, *, newline: bool = False) -> bytes:
-    suffix = "\n" if newline else ""
-    return (dumps(value, sort_keys=True, separators=(",", ":")) + suffix).encode()
-
-
 def _read_json(path: Path) -> dict[str, object]:
     try:
         value = cast(object, loads(path.read_text(encoding="utf-8")))
@@ -468,26 +331,6 @@ def _write_synced(path: Path, payload: bytes, sync: Fsync) -> None:
         sync(file.fileno())
 
 
-def _copy_synced(source: Path, destination: Path, sync: Fsync) -> None:
-    """Copy one regular source file and fsync the destination inode."""
-    with source.open("rb") as input_file, destination.open("xb") as output_file:
-        shutil.copyfileobj(input_file, output_file)
-        output_file.flush()
-        sync(output_file.fileno())
-
-
-def _create_empty_synced(path: Path, sync: Fsync) -> None:
-    """Create a regular empty raw file and make its inode durable."""
-    with path.open("xb") as file:
-        file.flush()
-        sync(file.fileno())
-
-
-def _fsync_path(path: Path, sync: Fsync) -> None:
-    with path.open("rb") as file:
-        sync(file.fileno())
-
-
 def _sync_directory(path: Path, sync: Fsync) -> None:
     descriptor = os_open(path, O_RDONLY | O_DIRECTORY)
     try:
@@ -498,76 +341,6 @@ def _sync_directory(path: Path, sync: Fsync) -> None:
 
 def _file_size(path: Path) -> int:
     return path.stat().st_size if path.exists() else 0
-
-
-def _file_hash(
-    path: Path,
-    *,
-    chunk_size: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
-) -> str:
-    digest = sha256()
-    with path.open("rb") as file:
-        while chunk := file.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _files_equal(
-    first: Path,
-    second: Path,
-    *,
-    chunk_size: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
-) -> bool:
-    if _file_size(first) != _file_size(second):
-        return False
-    with first.open("rb") as left, second.open("rb") as right:
-        while left_chunk := left.read(chunk_size):
-            if left_chunk != right.read(len(left_chunk)):
-                return False
-    return True
-
-
-def _files_equal_prefix(
-    first: Path,
-    second: Path,
-    size: int,
-    *,
-    chunk_size: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
-) -> bool:
-    """Compare one bounded prefix without materializing it in memory."""
-    if size < 0 or _file_size(first) != size or _file_size(second) < size:
-        return False
-    with first.open("rb") as left, second.open("rb") as right:
-        remaining = size
-        while remaining:
-            chunk = left.read(min(chunk_size, remaining))
-            if not chunk or chunk != right.read(len(chunk)):
-                return False
-            remaining -= len(chunk)
-    return True
-
-
-def _copy_prefix_synced(
-    source: Path,
-    destination: Path,
-    size: int,
-    sync: Fsync,
-    *,
-    chunk_size: int = DEFAULT_CONFIG.durability.io_chunk_bytes,
-) -> None:
-    """Copy one bounded prefix using fixed-size buffers and fsync the result."""
-    if size < 0:
-        raise AttemptStateError("prefix size must be non-negative")
-    with source.open("rb") as input_file, destination.open("xb") as output_file:
-        remaining = size
-        while remaining:
-            chunk = input_file.read(min(chunk_size, remaining))
-            if not chunk:
-                raise AttemptStateError("streaming raw file ended before prefix")
-            output_file.write(chunk)
-            remaining -= len(chunk)
-        output_file.flush()
-        sync(output_file.fileno())
 
 
 def _hash_prefix(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +18,7 @@ from omi_collector.capture.adapters.debug_logging import (
     write_runtime_status_event,
 )
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
+from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.quality_metrics import (
     QualityMetricsError,
@@ -28,6 +31,10 @@ from omi_collector.capture.application.quality_metrics import (
     ClockCorrectionMetric,
     SequenceLossMetric,
     TransferSessionMetric,
+)
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
 )
 from omi_collector.capture.domain.operational_status_machine import OperationalDimension, OperationalSignal
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
@@ -80,6 +87,9 @@ def _spool() -> SpoolMetrics:
 
 
 def _state_db(layout: StorageLayout) -> StateDB:
+    if not layout.collector.state_db.exists():
+        database = StateDB(layout.collector.state_db)
+        database.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return open_runtime_state(layout)
 
 
@@ -223,6 +233,60 @@ def test_durable_loss_remains_visible_without_degrading_clear_status(
     assert quality["confirmed_loss_events"] == 1
     assert quality["confirmed_lost_records"] == 10
     assert quality["confirmed_lost_raw_bytes"] == 10 * RECORD_SIZE
+
+
+def test_status_counts_persistent_custody_holds_without_changing_health(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    db = _state_db(layout)
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    now = datetime(2026, 9, 8, 10, tzinfo=UTC)
+    assert collect_operator_status(layout, hours=24, now=now)["custody_holds"] == 0
+
+    with InternalAudioStore(db) as store:
+        store.create_source("a" * 32, "attempt", 100, 101)
+        store.create_source("b" * 32, "attempt", 101, 102)
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "UPDATE capture_source SET source_type='quarantine', lifecycle='blocked', "
+            "block_reason='ready_overlap_conflict' WHERE source_id=?",
+            ("a" * 32,),
+        )
+        connection.execute(
+            "UPDATE capture_source SET source_type='quarantine', lifecycle='blocked', "
+            "block_reason='source_authentication_mismatch' WHERE source_id=?",
+            ("b" * 32,),
+        )
+
+    result = collect_operator_status(layout, hours=24, now=now)
+    assert result["custody_holds"] == 2
+    assert result["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("sqlite_errorcode", "error_type"),
+    (
+        (sqlite3.SQLITE_CORRUPT, FatalInternalAudioStorageError),
+        (sqlite3.SQLITE_NOTADB, FatalInternalAudioStorageError),
+        (sqlite3.SQLITE_BUSY, TransientInternalAudioStorageError),
+    ),
+)
+def test_custody_hold_inventory_classifies_raw_sqlite_fault(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sqlite_errorcode: int, error_type: type[Exception]
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    failure = sqlite3.DatabaseError("private SQLite detail")
+    failure.sqlite_errorcode = sqlite_errorcode
+
+    def fail_open(_self: StateDB, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(StateDB, "open_connection", fail_open)
+    with pytest.raises(error_type) as raised:
+        status_module._custody_hold_count(db)
+    assert raised.value.sqlite_errorcode == sqlite_errorcode  # type: ignore[attr-defined]
+    assert "private SQLite detail" not in str(raised.value)
 
 
 def test_confirmed_loss_with_blocked_publication_remains_attention(

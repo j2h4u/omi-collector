@@ -38,7 +38,6 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.retry.presence_preflight_budget_seconds == 10.0
     assert DEFAULT_CONFIG.transfer.collect_timeout_seconds == 600.0
     assert DEFAULT_CONFIG.memory.arena_max_bytes == 512 * 1024 * 1024
-    assert DEFAULT_CONFIG.durability.checkpoint_records == 1024
     assert DEFAULT_CONFIG.ble.preflight_settle_seconds == 0.5
     assert DEFAULT_CONFIG.ble.observer_max_connection_parameter_requests == 8
     assert DEFAULT_CONFIG.ble.observer_max_connection_parameter_updates == 8
@@ -47,11 +46,8 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert DEFAULT_CONFIG.writer.chunk_records == 128
     assert DEFAULT_CONFIG.writer.max_control_commands == 32
     assert DEFAULT_CONFIG.writer.state_poll_seconds == 0.001
-    assert DEFAULT_CONFIG.writer.close_timeout_seconds == 5.0
-    assert DEFAULT_CONFIG.writer.join_poll_seconds == 0.005
     assert isinstance(DEFAULT_CONFIG.firmware_observations, FirmwareObservationConfig)
     assert DEFAULT_CONFIG.firmware_observations.retry_backoff_seconds == (0.05, 0.25, 1.0, 5.0)
-    assert DEFAULT_CONFIG.firmware_observations.close_timeout_seconds == 0.5
     assert DEFAULT_CONFIG.telemetry.clock_drift_threshold_seconds == 5.0
     assert isinstance(DEFAULT_CONFIG.observability, ObservabilityConfig)
     assert DEFAULT_CONFIG.observability.max_error_chain_entries == 8
@@ -82,6 +78,12 @@ def test_staging_retention_default_is_terminal_lifecycle_window() -> None:
     assert DEFAULT_CONFIG.staging_retention.terminal_retention_seconds == 72.0 * 60.0 * 60.0
 
 
+@pytest.mark.parametrize("factory", [WriterConfig, FirmwareObservationConfig])
+def test_retired_close_timeout_config_key_fails_fast(factory: type[object]) -> None:
+    with pytest.raises(TypeError, match="close_timeout_seconds"):
+        factory(close_timeout_seconds=1.0)  # type: ignore[call-arg]
+
+
 @pytest.mark.parametrize(
     ("factory", "field", "value"),
     [
@@ -89,12 +91,10 @@ def test_staging_retention_default_is_terminal_lifecycle_window() -> None:
         (RetryConfig, "max_storage_not_ready_responses", 0),
         (TransferConfig, "info_timeout_seconds", 0.0),
         (MemoryConfig, "arena_max_bytes", 0),
-        (DurabilityConfig, "checkpoint_records", 0),
         (StagingRetentionConfig, "terminal_retention_seconds", 0.0),
         (BleConfig, "preflight_settle_seconds", 0.0),
         (BleConfig, "att_mtu_query_timeout_seconds", 0.0),
         (WriterConfig, "chunk_records", 0),
-        (FirmwareObservationConfig, "close_timeout_seconds", 0.0),
         (ObservabilityConfig, "max_error_chain_entries", 0),
         (ObservabilityConfig, "max_error_entry_chars", 0),
         (DebugLogConfig, "max_bytes", 0),
@@ -122,6 +122,8 @@ def test_runtime_ranges_are_coherent() -> None:
         ServiceConfig(max_records=1, default_collect_records=2)
     with pytest.raises(ValueError, match="scan cancellation"):
         PresenceConfig(scan_cancel_grace_min_seconds=0.2, scan_cancel_grace_max_seconds=0.1)
+    with pytest.raises(ValueError, match="must not exceed 128"):
+        WriterConfig(chunk_records=129)
 
 
 def test_runtime_ranges_allow_equal_limits() -> None:

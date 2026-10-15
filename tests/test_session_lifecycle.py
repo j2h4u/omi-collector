@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from struct import pack
+from threading import Event
 from typing import Literal, Never, cast
 
 import pytest
 
+from omi_collector import cli as operator_cli
 from omi_collector.capture.adapters import ready_closures
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
-from omi_collector.capture.adapters.collector_state_db import StateDB
+from omi_collector.capture.adapters.collector_guard import collector_guard
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.phy_guard import CommandResult, ScopedPhyGuard
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -67,8 +72,13 @@ from omi_collector.capture.application.session_lifecycle import (
     presence_attempt_outcome,
     recoverable_session_outcome,
     report_session_error,
+    session_retry_outcome,
     storage_not_ready_delay,
     validate_policy,
+)
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
 )
 from omi_collector.capture.application.visit_machine import DrainConfirmed, RecoveryDisposition
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
@@ -77,6 +87,73 @@ from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, TelemetryConfi
 
 def _run(coroutine: Coroutine[object, object, object]) -> object:
     return asyncio.run(coroutine)
+
+
+class _PhyTestRunner:
+    def __init__(self) -> None:
+        self.selected = ["BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX"]
+
+    async def __call__(self, argv: tuple[str, ...]) -> CommandResult:
+        if len(argv) == 6:
+            return CommandResult(0, f"selected PHYs: {' '.join(self.selected)}\n")
+        self.selected[:] = argv[6:]
+        return CommandResult(0, "")
+
+
+class _PhyTestContext:
+    def __init__(self, events: list[str], *, hang: bool = False, cancelled: Event | None = None) -> None:
+        self.events = events
+        self.hang = hang
+        self.cancelled = cancelled
+
+    async def __aenter__(self) -> RingSession:
+        if self.hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                assert self.cancelled is not None
+                self.cancelled.set()
+                raise
+        self.events.append("transport-enter")
+        return cast(RingSession, object())
+
+    async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.events.append("transport-exit")
+
+
+async def _phy_test_connected(
+    _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+) -> tuple[str, RingInfo | None]:
+    return "drained", current
+
+
+async def _phy_test_info(_session: RingSession, *, timeout: float) -> RingInfo:
+    del timeout
+    return RingInfo(10, 10, 100, 0, 512)
+
+
+def _phy_test_lifecycle(guard: ScopedPhyGuard) -> SessionLifecycle:
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_phy_test_connected,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    options = OpportunisticOptions(
+        TransferTimeouts(0.005, 1),
+        RetryPolicy(backoff=(0.01,), stop_after_drained=True),
+        session_guard=lambda: guard,
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
+        options=options,
+        runtime=OpportunisticRuntime(),
+        callbacks=callbacks,
+    )
+    return SessionLifecycle(run)
 
 
 class _ScriptedPresence:
@@ -231,6 +308,9 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
     async def enter() -> None:
         events.append("enter")
 
+    async def exit_priority() -> None:
+        events.append("exit")
+
     async def close(_reason: str, _drain_cursor: int | None) -> None:
         events.append("close")
         raise OSError("closure failed")
@@ -249,7 +329,7 @@ def test_capture_priority_covers_closure_and_releases_after_failure(monkeypatch:
         drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
         close_visit=close,
         enter_capture_priority=enter,
-        exit_capture_priority=lambda: events.append("exit"),
+        exit_capture_priority=exit_priority,
     )
     with pytest.raises(FrozenInstanceError):
         callbacks.exit_capture_priority = None  # type: ignore[reportAttributeAccessIssue]
@@ -361,7 +441,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
         events: list[str] = []
         spool = tmp_path / "spool"
         spool.mkdir()
-        state_db = StateDB(spool / "collector-state.sqlite3")
+        state_db = await asyncio.to_thread(StateDB, spool / "collector-state.sqlite3")
         bootstrap = StagingStore(spool, tmp_path / "captures", state_db=state_db)
         ready = tmp_path / "ready"
         ready.mkdir(mode=0o2750)
@@ -393,7 +473,7 @@ def test_deferred_retry_waits_until_visit_closure(tmp_path: Path, monkeypatch: p
 
         async def close(_reason: str, _drain_cursor: int | None) -> None:
             await asyncio.sleep(0)
-            store.append_ready_closure(10, "drained")
+            await asyncio.to_thread(store.append_ready_closure, 10, "drained")
             events.append("closure")
             assert "publish" not in events
 
@@ -449,6 +529,9 @@ def test_restart_closure_keeps_priority_through_followup_inspection() -> None:
     async def enter() -> None:
         events.append("enter")
 
+    async def exit_priority() -> None:
+        events.append("exit")
+
     async def stop() -> None:
         raise RuntimeError("stop after restart inspection")
 
@@ -467,7 +550,7 @@ def test_restart_closure_keeps_priority_through_followup_inspection() -> None:
         close_visit=close,
         load_recovery=load_recovery,
         enter_capture_priority=enter,
-        exit_capture_priority=lambda: events.append("exit"),
+        exit_capture_priority=exit_priority,
     )
     run = SessionLifecycleRun(
         provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
@@ -540,6 +623,195 @@ def test_teardown_precedes_post_session_checkpoint(monkeypatch: pytest.MonkeyPat
 
     _run(scenario())
     assert events == ["connected", "teardown", "checkpoint"]
+
+
+def test_phy_guard_wait_is_outside_info_timeout_but_transport_entry_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_db = StateDB(tmp_path / "collector-state.sqlite3")
+    events: list[str] = []
+    marker_held = Event()
+    release_marker = Event()
+    runner = _PhyTestRunner()
+    guard = ScopedPhyGuard("hci0", state_db=state_db, runner=runner)
+    write_marker = guard._write_marker
+
+    def held_write_marker(snapshot: tuple[str, ...]) -> None:
+        write_marker(snapshot)
+        marker_held.set()
+        if not release_marker.wait(5):
+            raise TimeoutError("test did not release held PHY marker write")
+
+    monkeypatch.setattr(guard, "_write_marker", held_write_marker)
+
+    lifecycle = _phy_test_lifecycle(guard)
+
+    async def held_marker_scenario() -> str:
+        monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", _phy_test_info)
+        with collector_guard(state_db.path.parent / "collector.lock"):
+            task = asyncio.create_task(lifecycle.run_session(_PhyTestContext(events)))
+            assert await asyncio.to_thread(marker_held.wait, 5), "PHY marker write did not reach held state"
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            assert not done, "session timed out while waiting to enter the PHY guard"
+            assert events == []
+            release_marker.set()
+            return await task
+
+    assert _run(held_marker_scenario()) == "drained"
+    assert events == ["transport-enter", "transport-exit"]
+    assert runner.selected == ["BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX"]
+    assert state_db.get(StateKind.PHY_RESTORATION, "hci0") is None
+
+    timed_out = Event()
+
+    # A fresh guard has no marker delay; its transport entry still obeys INFO's deadline.
+    monkeypatch.setattr(guard, "_write_marker", write_marker)
+
+    async def transport_timeout_scenario() -> str:
+        with collector_guard(state_db.path.parent / "collector.lock"):
+            return await lifecycle.run_session(_PhyTestContext(events, hang=True, cancelled=timed_out))
+
+    assert _run(transport_timeout_scenario()) == "retry"
+    assert timed_out.is_set()
+    assert runner.selected == ["BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX"]
+    assert state_db.get(StateKind.PHY_RESTORATION, "hci0") is None
+
+
+@pytest.mark.parametrize("site", ("enter", "exit", "body"))
+def test_session_guard_reports_only_its_own_failures(monkeypatch: pytest.MonkeyPatch, site: str) -> None:
+    fault = RuntimeError(f"{site} failed")
+    activity: list[ActivityEvent] = []
+    debug: list[tuple[str, BaseException, object]] = []
+    transport_events: list[str] = []
+    runtime = OpportunisticRuntime()
+    monkeypatch.setattr(
+        runtime,
+        "debug_exception",
+        lambda event, error, **fields: debug.append((event, error, fields.get("phase"))),
+    )
+
+    class Guard:
+        async def __aenter__(self) -> object:
+            if site == "enter":
+                raise fault
+            return object()
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            if site == "exit":
+                raise fault
+
+    async def connected_step(
+        _session: RingSession, current: RingInfo | None, _read_info: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str, RingInfo | None]:
+        if site == "body":
+            raise fault
+        return "drained", current
+
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: _PhyTestContext(transport_events),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), activity=activity.append, session_guard=Guard),
+        runtime=runtime,
+        callbacks=callbacks,
+    )
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", _phy_test_info)
+
+    with pytest.raises(RuntimeError) as raised:
+        _run(SessionLifecycle(run).run_session(_PhyTestContext(transport_events)))
+    assert raised.value is fault
+    reports = [event for event in activity if event.state == "session_error"]
+    assert len(reports) == 1
+    assert len(debug) == 1
+    assert debug[0][0:2] == ("session_error", fault)
+    if site in {"enter", "exit"}:
+        expected_phase = "connect" if site == "enter" else "teardown"
+        assert reports[0].phase == expected_phase
+        assert debug[0][2] == expected_phase
+
+
+def test_session_guard_keeps_first_fatal_if_reporting_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    fatal = FatalInternalAudioStorageError("guard failed")
+    original_sqlite_error = sqlite3.DatabaseError("original SQLite corruption")
+    fatal.__cause__ = original_sqlite_error
+    reporting_failure = FatalInternalAudioStorageError("reporter failed")
+
+    class Guard:
+        async def __aenter__(self) -> Never:
+            raise fatal
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    runtime = OpportunisticRuntime()
+
+    def fail_report(_event: str, _error: BaseException, **_fields: object) -> Never:
+        raise reporting_failure
+
+    monkeypatch.setattr(runtime, "debug_exception", fail_report)
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_phy_test_connected,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: _PhyTestContext([]),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), session_guard=Guard),
+        runtime=runtime,
+        callbacks=callbacks,
+    )
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        _run(SessionLifecycle(run).run_session(_PhyTestContext([])))
+    assert raised.value is fatal
+    assert raised.value.__cause__ is original_sqlite_error
+    assert raised.value.__context__ is reporting_failure
+
+
+def test_session_guard_cancellation_does_not_report_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    activity: list[ActivityEvent] = []
+    debug: list[str] = []
+    cancelled = asyncio.CancelledError("guard cancelled")
+
+    class Guard:
+        async def __aenter__(self) -> Never:
+            raise cancelled
+
+        async def __aexit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    runtime = OpportunisticRuntime()
+    monkeypatch.setattr(runtime, "debug_exception", lambda event, _error, **_fields: debug.append(event))
+    info = RingInfo(10, 10, 100, 0, 512)
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_phy_test_connected,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        provider=lambda _candidate: _PhyTestContext([]),
+        options=OpportunisticOptions(TransferTimeouts(1, 1), activity=activity.append, session_guard=Guard),
+        runtime=runtime,
+        callbacks=callbacks,
+    )
+    with pytest.raises(asyncio.CancelledError) as raised:
+        _run(SessionLifecycle(run).run_session(_PhyTestContext([])))
+    assert raised.value is cancelled
+    assert not [event for event in activity if event.state == "session_error"]
+    assert debug == []
 
 
 def test_missing_preflight_acknowledgement_blocks_read_and_still_tears_down(
@@ -1230,6 +1502,15 @@ def test_validate_policy_accepts_exact_fit_batch_capacity() -> None:
     validate_policy(RetryPolicy(batch_records=2, arena_max_bytes=2 * RECORD_SIZE))
 
 
+def test_sqlite_busy_retries_session_but_corruption_stops_it() -> None:
+    busy = TransientInternalAudioStorageError("database busy", sqlite_errorcode=sqlite3.SQLITE_BUSY)
+    fatal = FatalInternalAudioStorageError("database corrupt", sqlite_errorcode=sqlite3.SQLITE_CORRUPT)
+
+    assert session_retry_outcome(busy, connected=False) == "retry"
+    assert session_retry_outcome(busy, connected=True) == "connected_interrupted"
+    assert session_retry_outcome(fatal, connected=True) is None
+
+
 def test_recoverable_session_outcome_keeps_contended_device_lease_retryable(tmp_path: Path) -> None:
     spool = tmp_path / "spool"
     spool.mkdir()
@@ -1512,6 +1793,108 @@ def test_run_session_records_one_terminal_transfer_metric_without_masking_sessio
         "fatal_with_teardown": ("failed", "fatal_error"),
     }[terminal_case]
     assert (metric.outcome, metric.termination_class) == expected
+
+
+async def _cancel_during_held_terminal_metric(
+    task: asyncio.Task[object], metric_started: Event, release_metric: Event, metric_completed: Event
+) -> None:
+    try:
+        assert await asyncio.to_thread(metric_started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not metric_completed.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        done, _pending = await asyncio.wait({task}, timeout=0.05)
+        assert not done
+        assert not metric_completed.is_set()
+    finally:
+        release_metric.set()
+    await task
+
+
+def test_fatal_read_survives_repeated_cancellation_during_terminal_metric_and_exits_78(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_db = StateDB(tmp_path / "corrupt-state.sqlite3")
+    state_db.path.write_bytes(b"not a SQLite database")
+    clock_store = ClockStateStore(state_db)
+    observed_fatals: list[FatalInternalAudioStorageError] = []
+    original_causes: list[BaseException | None] = []
+    metric_started = Event()
+    release_metric = Event()
+    metric_completed = Event()
+    info = RingInfo(10, 10, 100, 1, 512)
+
+    class HeldMetrics(_RecordingLifecycleMetrics):
+        def record_transfer_session(self, metric: TransferSessionMetric) -> None:
+            metric_started.set()
+            if not release_metric.wait(5):
+                raise TimeoutError("held terminal metric was not released")
+            super().record_transfer_session(metric)
+            metric_completed.set()
+
+    metrics = HeldMetrics()
+    session = _TerminalMetricSession()
+    context = _TerminalMetricContext("fatal", session, RuntimeError("unexpected teardown"))
+
+    async def connected_step(
+        _session: RingSession,
+        _current: RingInfo | None,
+        _read_info: InfoReader,
+        phase: SessionPhaseState,
+    ) -> tuple[str, RingInfo | None]:
+        assert phase.quality is not None
+        phase.quality.note_read(0.25, 3)
+        try:
+            await asyncio.to_thread(clock_store.state)
+        except FatalInternalAudioStorageError as error:
+            observed_fatals.append(error)
+            original_causes.append(error.__cause__)
+            raise
+        raise AssertionError("corrupt clock state read unexpectedly succeeded")
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=connected_step,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(info),
+    )
+    run = SessionLifecycleRun(
+        lambda _candidate: context,
+        OpportunisticOptions(
+            TransferTimeouts(1, 1),
+            quality_metrics=metrics,  # type: ignore[arg-type]
+        ),
+        OpportunisticRuntime(),
+        callbacks,
+    )
+
+    async def info_reader(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return info
+
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(SessionLifecycle(run).run_session(context))
+        await _cancel_during_held_terminal_metric(task, metric_started, release_metric, metric_completed)
+
+    with pytest.raises(operator_cli.typer.Exit) as raised:
+        operator_cli._run_device_operation(scenario())
+    assert raised.value.exit_code == 78
+    assert len(observed_fatals) == 1
+    assert raised.value.__cause__ is observed_fatals[0]
+    assert observed_fatals[0].sqlite_errorcode == sqlite3.SQLITE_NOTADB
+    assert observed_fatals[0].__cause__ is original_causes[0]
+    assert isinstance(original_causes[0], sqlite3.DatabaseError)
+    assert metric_completed.is_set()
+    assert len(metrics.transfers) == 1
+    assert metrics.transfers[0].termination_class == "fatal_error"
 
 
 @pytest.mark.parametrize("progress_kind", ("unchanged", "completed_batch", "durable_frontier"))

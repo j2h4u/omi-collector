@@ -17,12 +17,14 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from threading import Event, Lock, Thread
 from typing import Protocol, runtime_checkable
 
 from ...config import DEFAULT_CONFIG, WriterConfig
+from ..application.owned_work import join_owned
 from ..domain.ring_protocol import RECORD_SIZE
 from .attempt_writer_machine import (
     Admit,
@@ -72,11 +74,14 @@ class WriterTarget(Protocol):
     def read_begin(self, notice: object) -> object:
         """Persist the beginning of the read represented by ``notice``."""
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
         """Append one contiguous slice beginning at ``offset``."""
 
     def checkpoint(self) -> object:
         """Durably checkpoint all bytes written so far."""
+
+    def interrupt(self) -> object:
+        """Persist an interrupted source after its exact frontier."""
 
     def seal(self, done_notice: object) -> object:
         """Seal and publish the target for a completed device read."""
@@ -140,10 +145,6 @@ class WriterQueueFullError(WriterError):
     """The bounded control-command queue is full."""
 
 
-class WriterShutdownTimeoutError(WriterError):
-    """The target did not finish orderly close within the requested bound."""
-
-
 @dataclass(frozen=True, slots=True)
 class PrepareCommand:
     """Prepare the target attempt."""
@@ -169,6 +170,15 @@ class CheckpointCommand:
     """Flush bytes through this high-water mark, then checkpoint."""
 
     high_water: int
+    tail: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptCommand:
+    """Flush the exact receive frontier, then persist interruption."""
+
+    high_water: int
+    tail: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +187,7 @@ class SealCommand:
 
     high_water: int
     done_notice: object
+    tail: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +195,7 @@ class PublishPrefixCommand:
     """Flush published bytes, then publish the durable prefix."""
 
     high_water: int
+    tail: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +203,7 @@ class CloseCommand:
     """Flush bytes through this high-water mark, then close."""
 
     high_water: int
+    tail: bytes = b""
 
 
 type WriterCommand = (
@@ -198,6 +211,7 @@ type WriterCommand = (
     | PrepareLegCommand
     | ReadBeginCommand
     | CheckpointCommand
+    | InterruptCommand
     | SealCommand
     | PublishPrefixCommand
     | CloseCommand
@@ -238,8 +252,11 @@ class AttemptWriter:
         self._commands: deque[_Pending] = deque()
         self._lock = Lock()
         self._wake = Event()
+        self._failure_event = asyncio.Event()
         self._published = 0
+        self._published_tail = b""
         self._written = 0
+        self._written_tail = b""
         self._durable_next_sequence: int | None = None
         self._durable_record_count: int | None = None
         self._state: AttemptWriterMachineState = Constructed()
@@ -311,7 +328,18 @@ class AttemptWriter:
         with self._lock:
             return failure_of(self._state)
 
-    def publish(self, high_water: int) -> bool:
+    async def wait_failure(self) -> BaseException:
+        """Wake the active READ owner when the target first fails."""
+        self._loop_for_completion()
+        failure = self.failure
+        if failure is not None:
+            return failure
+        await self._failure_event.wait()
+        failure = self.failure
+        assert failure is not None
+        return failure
+
+    def publish(self, high_water: int, tail: bytes = b"") -> bool:
         """Publish a monotonic source byte offset without waiting for disk I/O.
 
         The return value is ``True`` only when the offset advances the current
@@ -321,38 +349,51 @@ class AttemptWriter:
             raise ValueError(f"high_water must be between 0 and {len(self._arena)}")
         if high_water % RECORD_SIZE:
             raise ValueError(f"high_water must be record-aligned ({RECORD_SIZE} bytes)")
+        if not isinstance(tail, bytes) or len(tail) >= RECORD_SIZE:
+            raise ValueError(f"tail must be bytes shorter than {RECORD_SIZE} bytes")
+        if high_water + len(tail) > len(self._arena):
+            raise ValueError("tail exceeds the source arena")
+        if self._arena[high_water : high_water + len(tail)].tobytes() != tail:
+            raise ValueError("tail does not match the source arena")
         with self._lock:
             result = transition(self._state, PublishRequested())
             self._raise_rejection_locked(result.directive, publish=True)
-            if high_water <= self._published:
+            if high_water < self._published:
                 return False
+            if high_water == self._published:
+                if self._published_tail[: len(tail)] != tail[: len(self._published_tail)]:
+                    raise ValueError("tail conflicts with the published frontier")
+                if len(tail) <= len(self._published_tail):
+                    return False
             self._published = high_water
+            self._published_tail = tail
             self._wake.set()
             return True
 
-    async def start(self) -> None:
+    async def start(self) -> object:
         """Prepare the target attempt on the dedicated thread."""
-        future = self._admit(StartRequested(), lambda _high_water: PrepareCommand())
+        future = self._admit(StartRequested(), lambda _high_water, _tail: PrepareCommand())
         if future is not None:
-            await future
+            return await join_owned(future)
+        return None
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> object:
         """Prepare one target leg on the dedicated thread."""
         if start_sequence < 0 or record_count < 0:
             raise ValueError("leg sequence and record count must be non-negative")
-        future = self._admit(LegRequested(), lambda _high_water: PrepareLegCommand(start_sequence, record_count))
+        future = self._admit(LegRequested(), lambda _high_water, _tail: PrepareLegCommand(start_sequence, record_count))
         if future is None:
             return None
-        return await future
+        return await join_owned(future)
 
     async def read_begin(self, notice: object) -> object:
         """Record READ_BEGIN through the target thread."""
-        return await self.submit_read_begin(notice)
+        return await join_owned(self.submit_read_begin(notice))
 
     def submit_read_begin(self, notice: object) -> asyncio.Future[object]:
         """Queue READ_BEGIN without waiting for target or disk progress."""
         try:
-            future = self._admit(ReadBeginRequested(), lambda _high_water: ReadBeginCommand(notice))
+            future = self._admit(ReadBeginRequested(), lambda _high_water, _tail: ReadBeginCommand(notice))
         except WriterFailedError as error:
             with self._lock:
                 future = self._new_future_locked()
@@ -369,22 +410,29 @@ class AttemptWriter:
         future = self._admit(CheckpointRequested(), CheckpointCommand)
         if future is None:
             return None
-        return await future
+        return await join_owned(future)
 
     async def barrier(self) -> object:
         """Alias for :meth:`checkpoint`, emphasizing ordering semantics."""
         return await self.checkpoint()
 
+    async def interrupt(self) -> object:
+        """Flush the exact receive frontier, then persist interruption in order."""
+        future = self._admit(CheckpointRequested(), InterruptCommand)
+        if future is None:
+            return None
+        return await join_owned(future)
+
     async def seal(self, done_notice: object = None) -> object:
         """Flush published bytes and seal, unless the target has failed."""
         future = self._admit(
             FinalizeRequested(),
-            lambda high_water: SealCommand(high_water, done_notice),
+            lambda high_water, tail: SealCommand(high_water, done_notice, tail),
             finalization_message="writer seal is already pending",
         )
         if future is None:
             return None
-        return await asyncio.shield(future)
+        return await join_owned(future)
 
     async def await_seal_result(self) -> object | None:
         """Return the retained seal result, waiting if a seal command is still running."""
@@ -394,7 +442,7 @@ class AttemptWriter:
             pending = self._seal_pending
         if pending is None:
             return None
-        return await asyncio.shield(pending)
+        return await join_owned(pending)
 
     async def publish_prefix(self) -> object:
         """Flush published bytes and publish the durable prefix on the writer thread."""
@@ -405,62 +453,26 @@ class AttemptWriter:
         )
         if future is None:
             return None
-        return await future
+        return await join_owned(future)
 
-    async def close(self, *, timeout: float | None = None) -> object:
-        """Orderly-close the target, with idempotent bounded waiting.
-
-        If the caller is cancelled, the close command remains owned by the
-        writer thread and is given the same bounded opportunity to finish;
-        cancellation is then re-raised.  A target that remains blocked yields
-        :class:`WriterShutdownTimeoutError` rather than being silently abandoned.
-        """
-        if timeout is None:
-            timeout = self._config.close_timeout_seconds
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+    async def close(self) -> object:
+        """Drain and join the target worker, preserving its settled outcome."""
         future = self._admit(CloseRequested(), CloseCommand)
         assert future is not None
-        try:
-            await asyncio.wait_for(asyncio.shield(future), timeout)
-        except asyncio.CancelledError:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise WriterShutdownTimeoutError("writer close timed out after cancellation") from None
-            try:
-                result = await asyncio.wait_for(asyncio.shield(future), remaining)
-            except TimeoutError as exc:
-                raise WriterShutdownTimeoutError("writer close timed out after cancellation") from exc
-            except WriterFailedError:
-                await self._join_until(deadline)
-                raise
-            await self._join_until(deadline)
-            del result
-            raise
-        except TimeoutError as exc:
-            raise WriterShutdownTimeoutError(f"writer close timed out after {timeout:.3f}s") from exc
-        except WriterFailedError:
-            await self._join_until(deadline)
-            raise
-        return await self._join_until(deadline, result=future)
 
-    async def _join_until(
-        self,
-        deadline: float,
-        *,
-        result: asyncio.Future[object] | None = None,
-    ) -> object:
-        """Join without blocking the event loop, preserving the close deadline."""
-        while self._thread.is_alive():
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise WriterShutdownTimeoutError("writer thread did not exit before close deadline")
-            await asyncio.sleep(min(self._config.join_poll_seconds, remaining))
-        if result is None:
-            return None
-        return result.result()
+        async def finish() -> object:
+            result: object | None = None
+            failure: BaseException | None = None
+            try:
+                result = await asyncio.shield(future)
+            except BaseException as error:  # noqa: BLE001 - join before propagating any settled result
+                failure = error
+            await asyncio.to_thread(self._thread.join)
+            if failure is not None:
+                raise failure
+            return result
+
+        return await join_owned(finish())
 
     def _loop_for_completion(self) -> asyncio.AbstractEventLoop:
         if self._loop is not None:
@@ -474,7 +486,7 @@ class AttemptWriter:
     def _admit(
         self,
         event: AttemptWriterMachineEvent,
-        command_factory: Callable[[int], WriterCommand],
+        command_factory: Callable[[int, bytes], WriterCommand],
         *,
         finalization_message: str | None = None,
     ) -> asyncio.Future[object] | None:
@@ -490,7 +502,7 @@ class AttemptWriter:
             assert isinstance(result.directive, Admit)
             if not isinstance(event, CloseRequested) and len(self._commands) >= self._config.max_control_commands:
                 raise WriterQueueFullError("writer control queue is full")
-            command = command_factory(self._published)
+            command = command_factory(self._published, self._published_tail)
             future = self._new_future_locked()
             self._commands.append(_Pending(command, future))
             self._state = result.state
@@ -597,7 +609,7 @@ class AttemptWriter:
                 self._seal_result = result
                 self._seal_completed = True
             failure = failure_of(self._state)
-        if failure is None and isinstance(command, CheckpointCommand):
+        if failure is None and isinstance(command, CheckpointCommand | InterruptCommand):
             self._remember_durable_result(result)
         if failure is not None:
             self._complete(pending.future, None, WriterFailedError("writer target failed", failure))
@@ -632,38 +644,54 @@ class AttemptWriter:
         elif isinstance(command, ReadBeginCommand):
             result = self._target.read_begin(command.notice)
         elif isinstance(command, CheckpointCommand):
-            self._drain_data(command.high_water, exact=True)
+            self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.checkpoint()
+        elif isinstance(command, InterruptCommand):
+            self._drain_data(command.high_water, command.tail, exact=True)
+            result = self._target.interrupt()
         elif isinstance(command, SealCommand):
-            self._drain_data(command.high_water, exact=True)
+            self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.seal(command.done_notice)
         elif isinstance(command, PublishPrefixCommand):
-            self._drain_data(command.high_water, exact=True)
+            self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.publish_prefix()
         else:
             with self._lock:
                 state = self._state
             if isinstance(state, Closing) and state.failure is None and state.drain:
-                self._drain_data(command.high_water, exact=True)
+                self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.close()
         return result
 
-    def _drain_data(self, limit: int | None, *, exact: bool = False) -> bool:
+    def _drain_data(self, limit: int | None, tail: bytes | None = None, *, exact: bool = False) -> bool:
         with self._lock:
             target = self._published if limit is None else min(limit, self._published)
+            frontier_tail = self._published_tail if tail is None else tail
             start = self._written
+            written_tail = self._written_tail
         wrote = False
         while start < target:
             end = target
             end = min(end, start + self._config.chunk_records * RECORD_SIZE)
             chunk = self._arena[start:end].toreadonly()
-            self._target.append_chunk(start, chunk)
+            following = frontier_tail if end == target else b""
+            if following:
+                self._target.append_chunk(start, chunk, following)
+            else:
+                self._target.append_chunk(start, chunk)
             with self._lock:
                 self._written = end
+                self._written_tail = following
             wrote = True
             start = end
+            written_tail = following
             if not exact:
                 break
+        if start == target and frontier_tail != written_tail:
+            self._target.append_chunk(start, self._arena[start:start].toreadonly(), frontier_tail)
+            with self._lock:
+                self._written_tail = frontier_tail
+            wrote = True
         return wrote
 
     def _success_event(self, command: WriterCommand) -> AttemptWriterMachineEvent:
@@ -673,7 +701,7 @@ class AttemptWriter:
             return LegSucceeded()
         if isinstance(command, ReadBeginCommand):
             return ReadBeginSucceeded()
-        if isinstance(command, CheckpointCommand):
+        if isinstance(command, CheckpointCommand | InterruptCommand):
             return CheckpointSucceeded()
         if isinstance(command, SealCommand | PublishPrefixCommand):
             return FinalizeSucceeded()
@@ -696,6 +724,10 @@ class AttemptWriter:
             pending = list(self._commands)
             self._commands.clear()
         if newly_latched:
+            loop = self._loop
+            if loop is not None:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._failure_event.set)
             debug_exception(
                 "attempt_writer_failed",
                 latched,
@@ -747,7 +779,6 @@ __all__ = [
     "WriterProgress",
     "WriterQueueFullError",
     "WriterResult",
-    "WriterShutdownTimeoutError",
     "WriterSnapshot",
     "WriterState",
     "WriterTarget",

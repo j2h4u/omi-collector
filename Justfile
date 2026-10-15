@@ -168,16 +168,17 @@ docker-check:
 
 # Build the collector package image.
 docker-build: docker-check
-    docker build -t omi-collector:local .
+    docker build --build-arg "SOURCE_REVISION=$(git rev-parse --verify 'HEAD^{commit}')" -t omi-collector:local .
 
 # Recreate the local Docker service.
 docker-up:
-    docker compose up -d --force-recreate --remove-orphans --wait --wait-timeout 90
+    OMI_COLLECTOR_SOURCE_REVISION="$(git rev-parse --verify 'HEAD^{commit}')" docker compose up -d --force-recreate --remove-orphans --wait --wait-timeout 90
 
 # CI-safe runtime smoke: build, start, wait for health, exercise the installed CLI, and clean up.
 runtime-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
+    export OMI_COLLECTOR_SOURCE_REVISION="$(git rev-parse --verify 'HEAD^{commit}')"
     project="omi-collector-qa-$$-$RANDOM"
     cleanup() {
         status="$1"
@@ -198,7 +199,10 @@ runtime-smoke:
     trap 'exit 130' INT
     trap 'exit 143' TERM
     timeout --signal=TERM --kill-after=5s 600s docker compose -p "$project" up -d --build --force-recreate --remove-orphans --wait --wait-timeout 90
-    timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" exec -T omi-collector-qa omi-collector health
+    timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" exec -T --user 1000:1000 omi-collector-qa omi-collector health
+    timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" exec -T --user 1000:1000 \
+        -e "OMI_COLLECTOR_SOURCE_REVISION=$OMI_COLLECTOR_SOURCE_REVISION" \
+        omi-collector-qa python - < scripts/check_docker_qa_state.py
     container_id="$(timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" ps --quiet omi-collector-qa)"
     state="$(timeout --signal=TERM --kill-after=5s 30s docker inspect --format='{{"{{.State.Running}} {{.State.Health.Status}}"}}' "$container_id")"
     if [[ "$state" != 'true healthy' ]]; then

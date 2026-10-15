@@ -23,10 +23,8 @@ from omi_collector.capture.adapters.attempt_writer import (
     WriterClosedError,
     WriterFailedError,
     WriterQueueFullError,
-    WriterShutdownTimeoutError,
     WriterState,
 )
-from omi_collector.capture.application.session_lifecycle import bounded
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG, WriterConfig
 
@@ -73,6 +71,7 @@ class FakeTarget:
     prepare_leg_result: object = "prepared"
     append_readonly: list[bool] = field(default_factory=list)
     append_offsets: list[int] = field(default_factory=list)
+    append_tails: list[bytes] = field(default_factory=list)
     second_append_started: threading.Event = field(default_factory=threading.Event)
 
     def _record(self, name: str, value: bytes | object = None) -> None:
@@ -101,11 +100,12 @@ class FakeTarget:
             raise OSError("read begin failed after close")
         return notice
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
         self.thread_ids.add(threading.get_ident())
         self.calls.append(("append", offset, bytes(chunk)))
         self.append_readonly.append(chunk.readonly)
         self.append_offsets.append(offset)
+        self.append_tails.append(tail)
         if len(self.append_offsets) == 2:
             self.second_append_started.set()
         self.append_started.set()
@@ -119,6 +119,10 @@ class FakeTarget:
 
     def checkpoint(self) -> object:
         self._record("checkpoint")
+        return self.checkpoint_result
+
+    def interrupt(self) -> object:
+        self._record("interrupt")
         return self.checkpoint_result
 
     def seal(self, done_notice: object) -> object:
@@ -185,8 +189,8 @@ class ProcessLifetimeTarget:
         self.flags[0] = 1
         return None
 
-    def append_chunk(self, offset: int, chunk: memoryview) -> object:
-        del offset, chunk
+    def append_chunk(self, offset: int, chunk: memoryview, tail: bytes = b"") -> object:
+        del offset, chunk, tail
         self.entered.set()
         if not self.release.poll(15):
             raise TimeoutError("parent did not release the writer target")
@@ -194,6 +198,10 @@ class ProcessLifetimeTarget:
         return None
 
     def checkpoint(self) -> object:
+        self.flags[1] = 1
+        return None
+
+    def interrupt(self) -> object:
         self.flags[1] = 1
         return None
 
@@ -219,10 +227,10 @@ def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Conne
             await writer.read_begin("begin")
             writer.publish(RECORD_SIZE)
             await writer.checkpoint()
-            await writer.close(timeout=5)
+            await writer.close()
         finally:
             if writer.state is not WriterState.CLOSED:
-                await writer.close(timeout=5)
+                await writer.close()
 
     def owner() -> None:
         try:
@@ -258,7 +266,7 @@ async def _owned_writer(
         ):
             barrier.set()
         try:
-            await writer.close(timeout=1)
+            await writer.close()
         except WriterFailedError:
             if not expect_failure or writer.failure is None:
                 raise
@@ -314,12 +322,11 @@ def test_writer_progress_and_commands_reject_field_reassignment(value: object, f
 
 
 def test_writer_config_controls_writer_settings() -> None:
-    config = WriterConfig(chunk_records=2, max_control_commands=3, join_poll_seconds=0.123)
+    config = WriterConfig(chunk_records=2, max_control_commands=3)
 
     async def exercise() -> None:
         async with _owned_writer(FakeTarget(), bytearray(RECORD_SIZE * 5), config=config) as writer:
             assert writer._config is config
-            assert writer._config.join_poll_seconds == 0.123
 
     asyncio.run(exercise())
 
@@ -388,19 +395,19 @@ def test_writer_config_controls_control_capacity() -> None:
     asyncio.run(exercise())
 
 
-def test_writer_config_controls_default_close_timeout() -> None:
+def test_close_waits_for_slow_target_until_durable_result_and_join() -> None:
     async def exercise() -> None:
         target = FakeTarget(block_close=True)
-        config = WriterConfig(close_timeout_seconds=0.01, join_poll_seconds=0.001)
-        async with _owned_writer(target, bytearray(), config=config) as writer:
+        async with _owned_writer(target, bytearray()) as writer:
             await writer.start()
             await writer.read_begin("begin")
-
-            with pytest.raises(WriterShutdownTimeoutError):
-                await writer.close()
+            closing = asyncio.create_task(writer.close())
+            assert await asyncio.to_thread(target.close_started.wait, 1)
+            assert not closing.done()
             assert target.close_calls == 1
             target.release_close.set()
-            assert await writer.close(timeout=1) == "closed"
+            assert await closing == "closed"
+            assert not writer.thread.is_alive()
 
     asyncio.run(exercise())
 
@@ -423,6 +430,31 @@ async def _test_arena_is_shared_and_data_waits_for_read_begin() -> None:
         assert writer.progress.submitted == RECORD_SIZE
         assert writer.progress.written == RECORD_SIZE
         await writer.close()
+
+
+def test_partial_tail_is_drained_before_interruption() -> None:
+    async def exercise() -> None:
+        target = FakeTarget()
+        arena = bytearray(RECORD_SIZE * 2)
+        first = b"x" * RECORD_SIZE
+        tail = b"partial"
+        arena[: RECORD_SIZE + len(tail)] = first + tail
+        async with _owned_writer(target, arena, config=WriterConfig(chunk_records=1)) as writer:
+            await writer.start()
+            await writer.prepare_leg(10, 2)
+            await writer.read_begin("begin")
+            assert writer.publish(RECORD_SIZE, tail)
+
+            assert await writer.interrupt() == "checkpointed"
+
+            assert target.calls[-2:] == [
+                ("append", 0, first),
+                ("interrupt", 0, None),
+            ]
+            assert target.append_tails[-1] == tail
+            assert writer.written_high_water == RECORD_SIZE
+
+    asyncio.run(exercise())
 
 
 def test_submit_read_begin_is_nonblocking_and_orders_data() -> None:
@@ -642,7 +674,7 @@ async def _test_drain_integrity_finalizers_flush_the_submitted_high_water(operat
                 finalizer = asyncio.create_task(writer.publish_prefix())
                 expected_state = WriterState.SEALING
             else:
-                finalizer = asyncio.create_task(writer.close(timeout=1))
+                finalizer = asyncio.create_task(writer.close())
                 expected_state = WriterState.CLOSING
 
             # Yield once so the public operation admits its command while append is
@@ -661,7 +693,7 @@ async def _test_drain_integrity_finalizers_flush_the_submitted_high_water(operat
             if finalizer is not None and not finalizer.done():
                 await finalizer
             if writer.thread.is_alive():
-                await writer.close(timeout=1)
+                await writer.close()
 
 
 def test_drain_integrity_idle_writer_continues_after_first_chunk() -> None:
@@ -676,7 +708,7 @@ async def _test_drain_integrity_idle_writer_continues_after_first_chunk() -> Non
             assert await asyncio.to_thread(target.second_append_started.wait, 3)
             assert target.append_offsets[:2] == [0, RECORD_SIZE]
         finally:
-            await writer.close(timeout=1)
+            await writer.close()
 
 
 def test_idle_writer_consumes_negligible_thread_cpu() -> None:
@@ -739,23 +771,6 @@ def test_prepare_leg_rejects_negative_values_before_target_call(start_sequence: 
                 await writer.prepare_leg(start_sequence, record_count)
 
             assert tuple(target.calls) == calls_before
-            await writer.close()
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize("timeout", [0, -0.5])
-def test_invalid_close_timeout_leaves_writer_usable(timeout: float) -> None:
-    async def exercise() -> None:
-        target = FakeTarget()
-        async with _started(target, bytearray(RECORD_SIZE)) as writer:
-            with pytest.raises(ValueError, match="timeout must be positive"):
-                await writer.close(timeout=timeout)
-
-            assert target.close_calls == 0
-            assert writer.publish(RECORD_SIZE)
-            assert await writer.barrier() == "checkpointed"
-            assert writer.written_bytes == RECORD_SIZE
             await writer.close()
 
     asyncio.run(exercise())
@@ -905,203 +920,22 @@ async def _test_close_is_idempotent_and_target_calls_stay_on_one_thread() -> Non
         assert not writer.thread.is_alive()
 
 
-def test_close_timeout_is_reported_until_blocking_target_is_released() -> None:
-    asyncio.run(_test_close_timeout_is_reported_until_blocking_target_is_released())
-
-
-async def _test_close_timeout_is_reported_until_blocking_target_is_released() -> None:
-    target = FakeTarget(block_close=True)
-    async with _started(target, bytearray()) as writer:
-        with pytest.raises(WriterShutdownTimeoutError):
-            await writer.close(timeout=0.01)
-        assert target.close_calls == 1
-        assert writer.state is WriterState.CLOSING
-        assert writer.thread.is_alive()
-        target.release_close.set()
-        assert await writer.close(timeout=1) == "closed"
-        assert writer.state is WriterState.CLOSED
-        assert not writer.thread.is_alive()
-
-
-def test_close_deadline_includes_writer_thread_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_close_survives_repeated_cancellation_until_target_result() -> None:
     async def exercise() -> None:
-        target = FakeTarget()
-        async with _started(target, bytearray()) as writer:
-            worker_paused = threading.Event()
-            release_worker = threading.Event()
-            complete = writer._complete
-
-            def pause_after_completion(
-                future: asyncio.Future[object],
-                result: object | None,
-                error: BaseException | None,
-            ) -> None:
-                complete(future, result, error)
-                worker_paused.set()
-                release_worker.wait(5)
-
-            monkeypatch.setattr(writer, "_complete", pause_after_completion)
-            closing = asyncio.create_task(writer.close(timeout=0.5))
-            try:
-                assert await asyncio.to_thread(worker_paused.wait, 1)
-                assert not closing.done()
-                with pytest.raises(WriterShutdownTimeoutError):
-                    await asyncio.wait_for(asyncio.shield(closing), timeout=1)
-            finally:
-                release_worker.set()
-                monkeypatch.setattr(writer, "_complete", complete)
-                await writer.close(timeout=1)
-            if not closing.done():
-                await closing
-
-    asyncio.run(exercise())
-
-
-def test_bounded_close_survives_repeated_cancellation_until_target_release() -> None:
-    async def exercise() -> None:
-        target = FakeTarget(block_close=True)
-        async with _started(target, bytearray()) as writer:
-            owner = asyncio.create_task(bounded(writer.close(timeout=3), 3))
-            for _ in range(100):
-                if target.close_calls == 1:
-                    break
-                await asyncio.sleep(0.001)
-            assert target.close_calls == 1
-
-            owner.cancel()
+        target = FakeTarget(block_close=True, fail_close=True)
+        async with _owned_writer(target, bytearray(), expect_failure=True) as writer:
+            await writer.start()
+            closing = asyncio.create_task(writer.close())
+            assert await asyncio.to_thread(target.close_started.wait, 1)
+            closing.cancel()
             await asyncio.sleep(0)
-            owner.cancel()
+            closing.cancel()
             await asyncio.sleep(0)
-            assert not owner.done()
-            assert writer.thread.is_alive()
-
+            assert not closing.done()
             target.release_close.set()
-            with pytest.raises(asyncio.CancelledError):
-                await owner
+            with pytest.raises(WriterFailedError, match="target failed"):
+                await closing
             assert not writer.thread.is_alive()
-            assert writer.state is WriterState.CLOSED
-
-    asyncio.run(exercise())
-
-
-def test_cancelled_close_keeps_positive_remaining_shutdown_budget() -> None:
-    async def exercise() -> None:
-        target = FakeTarget(block_close=True)
-        async with _started(target, bytearray()) as writer:
-            closing = asyncio.create_task(writer.close(timeout=0.9))
-            try:
-                assert await asyncio.to_thread(target.close_started.wait, 1)
-                closing.cancel()
-                target.release_close.set()
-                with pytest.raises(asyncio.CancelledError):
-                    await asyncio.wait_for(closing, timeout=1)
-                assert target.close_calls == 1
-                assert not writer.thread.is_alive()
-                assert writer.state is WriterState.CLOSED
-            finally:
-                target.release_close.set()
-                if not closing.done():
-                    closing.cancel()
-                await asyncio.gather(closing, return_exceptions=True)
-                await asyncio.to_thread(writer.thread.join, 1)
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize("after_deadline", [0.0, 0.25])
-def test_cancelled_close_reports_expired_remaining_budget(
-    after_deadline: float, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def exercise() -> None:
-        target = FakeTarget(block_close=True)
-        async with _started(target, bytearray()) as writer:
-            loop = asyncio.get_running_loop()
-            base_time = loop.time()
-            fake_time = [base_time]
-            closing: asyncio.Task[object] | None = None
-            try:
-                with monkeypatch.context() as patch:
-                    patch.setattr(loop, "time", lambda: fake_time[0])
-                    closing = asyncio.create_task(writer.close(timeout=0.5))
-                    assert await asyncio.to_thread(target.close_started.wait, 1)
-                    target.release_close.set()
-                    writer.thread.join(1)
-                    assert not writer.thread.is_alive()
-                    fake_time[0] = base_time + 0.5 + after_deadline
-                    closing.cancel()
-                    with pytest.raises(WriterShutdownTimeoutError):
-                        await closing
-            finally:
-                target.release_close.set()
-                if closing is not None and not closing.done():
-                    closing.cancel()
-                if closing is not None:
-                    await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), timeout=1)
-                await asyncio.to_thread(writer.thread.join, 1)
-                assert target.close_calls == 1
-
-    asyncio.run(exercise())
-
-
-def test_close_deadline_rejects_extra_join_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def exercise() -> None:
-        target = FakeTarget()
-        async with _started(target, bytearray()) as writer:
-            loop = asyncio.get_running_loop()
-            base_time = loop.time()
-            fake_time = [base_time]
-            release_worker = threading.Event()
-            worker_paused = threading.Event()
-            complete = writer._complete
-            join_until = writer._join_until
-            closing: asyncio.Task[object] | None = None
-
-            def pause_after_completion(
-                future: asyncio.Future[object],
-                result: object | None,
-                error: BaseException | None,
-            ) -> None:
-                complete(future, result, error)
-                worker_paused.set()
-                release_worker.wait(5)
-
-            def release_and_join_worker() -> None:
-                release_worker.set()
-                writer.thread.join(1)
-
-            async def join_at_deadline(
-                deadline: float,
-                *,
-                result: asyncio.Future[object] | None = None,
-            ) -> object:
-                async def reject_poll_after_deadline(delay: float) -> None:
-                    del delay
-                    assert loop.time() < deadline, "writer must not poll after its close deadline"
-
-                with monkeypatch.context() as clock_patch:
-                    clock_patch.setattr(loop, "time", lambda: deadline)
-                    clock_patch.setattr(attempt_writer.asyncio, "sleep", reject_poll_after_deadline)
-                    loop.call_soon(release_and_join_worker)
-                    return await join_until(deadline, result=result)
-
-            try:
-                with monkeypatch.context() as patch:
-                    patch.setattr(loop, "time", lambda: fake_time[0])
-                    patch.setattr(writer, "_complete", pause_after_completion)
-                    patch.setattr(writer, "_join_until", join_at_deadline)
-                    closing = asyncio.create_task(writer.close(timeout=0.5))
-                    assert await asyncio.to_thread(worker_paused.wait, 1)
-                    with pytest.raises(WriterShutdownTimeoutError):
-                        await closing
-            finally:
-                release_worker.set()
-                if closing is not None and not closing.done():
-                    closing.cancel()
-                if closing is not None:
-                    await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), timeout=1)
-                await asyncio.to_thread(writer.thread.join, 1)
-                assert not writer.thread.is_alive()
-                await writer.close(timeout=1)
 
     asyncio.run(exercise())
 
@@ -1113,12 +947,15 @@ def test_cancelled_seal_remains_admitted_and_converges_to_one_target_call() -> N
             sealing = asyncio.create_task(writer.seal("done"))
             assert await asyncio.to_thread(target.seal_started.wait, 1)
             sealing.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await sealing
+            await asyncio.sleep(0)
+            assert not sealing.done()
             assert writer.state is WriterState.SEALING
             with pytest.raises(WriterClosedError, match="seal is already pending"):
                 await writer.seal("again")
             target.release_seal.set()
+            with pytest.raises(asyncio.CancelledError):
+                await sealing
+            assert writer.state is WriterState.SEALED
             assert await writer.await_seal_result() == "sealed"
             assert await writer.await_seal_result() == "sealed"
             await writer.close()
@@ -1134,10 +971,11 @@ def test_cancelled_start_remains_admitted_and_second_start_is_idempotent() -> No
             starting = asyncio.create_task(writer.start())
             assert await asyncio.to_thread(target.prepare_started.wait, 1)
             starting.cancel()
+            await asyncio.sleep(0)
+            assert not starting.done()
+            target.release_prepare.set()
             with pytest.raises(asyncio.CancelledError):
                 await starting
-            await writer.start()
-            target.release_prepare.set()
             for _ in range(20):
                 if writer.state is WriterState.STARTED:
                     break
@@ -1371,7 +1209,7 @@ def test_failure_lifecycle_idle_append_error_keeps_close_owned_and_failed_state_
 
             async def close_after_barrier() -> object:
                 await allow_close.wait()
-                return await writer.close(timeout=1)
+                return await writer.close()
 
             closing = asyncio.create_task(close_after_barrier())
             close_outcome: object | None = None

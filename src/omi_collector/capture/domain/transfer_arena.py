@@ -249,6 +249,11 @@ class TransferArena:
         """Return the submitted source prefix without changing any cursor."""
         return memoryview(self._buffer)[: self._submitted_bytes].toreadonly()
 
+    def partial_tail(self) -> bytes:
+        """Return the exact received bytes after the last complete record."""
+        aligned = self.complete_records * self.record_size
+        return bytes(self._buffer[aligned : self._received_bytes])
+
     def readonly_source(self) -> memoryview:
         """Return a live read-only view over the full preallocated source."""
         return memoryview(self._buffer).toreadonly()

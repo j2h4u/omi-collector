@@ -2,1111 +2,985 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from errno import EXDEV
+import sqlite3
+from contextlib import closing
 from hashlib import sha256
-from json import dumps
-from os import PathLike, fsync
 from pathlib import Path
-from shutil import rmtree
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters import attempt_cleanup, staging_filesystem
 from omi_collector.capture.adapters import quarantine as quarantine_module
+from omi_collector.capture.adapters.attempts import RecordAcceptanceError
+from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateKind
-from omi_collector.capture.adapters.staging_contract import (
-    AttemptStateError,
-    DeviceAlreadyRunningError,
-    PendingAttemptError,
-    StagingError,
+from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore, InternalAudioStoreError
+from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.quarantine import QuarantineCustodyHoldError, QuarantinePublishError
+from omi_collector.capture.adapters.ready_bundles import (
+    ReadyOutcomeState,
+    SqlitePublicationSource,
+    finalize_typed_sources,
 )
-from omi_collector.capture.adapters.staging_filesystem import DeviceLock
+from omi_collector.capture.adapters.staging_contract import StagingError
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
+)
 from omi_collector.capture.domain.quarantine_machine import QuarantineState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from omi_collector.config import CollectorConfig, DurabilityConfig, StagingRetentionConfig
-from staging_test_factory import StagingStore, attempt_payload
-
-_CAPTURE_ROOTS: set[Path] = set()
-
-
-def _capture_root(tmp_path: Path) -> Path:
-    root = tmp_path.parent / f"{tmp_path.name}-captures"
-    if tmp_path not in _CAPTURE_ROOTS:
-        rmtree(root, ignore_errors=True)
-        _CAPTURE_ROOTS.add(tmp_path)
-    return root
-
-
-@pytest.fixture(autouse=True)
-def _isolate_capture_root(tmp_path: Path) -> None:
-    rmtree(_capture_root(tmp_path), ignore_errors=True)
+from omi_collector.config import CollectorConfig, ReadyConfig, StagingRetentionConfig, WriterConfig
+from staging_test_factory import StagingStore, attempt_source
 
 
 def _record(marker: int) -> bytes:
     return marker.to_bytes(4, "big") + bytes((marker,)) * (RECORD_SIZE - 4)
 
 
-def _started_attempt(tmp_path: Path, *, count: int = 2):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path)).prepare_streaming_attempt(100, count)
-    attempt.record_read_begin(ReadBeginNotification(100, count))
+def _opus_record(timestamp: int, marker: int) -> bytes:
+    return timestamp.to_bytes(4, "big") + bytes((2, 8, marker)) + bytes(RECORD_SIZE - 7)
+
+
+def _capture_root(tmp_path: Path) -> Path:
+    return tmp_path.parent / f"{tmp_path.name}-captures"
+
+
+def _store(tmp_path: Path, **options: object) -> StagingStore:
+    return StagingStore(tmp_path, _capture_root(tmp_path), **options)
+
+
+def _attempt(store: StagingStore, start: int = 100, count: int = 2):
+    attempt = store.prepare_streaming_attempt(start, count)
+    attempt.prepare_leg(start, count)
+    attempt.record_read_begin(ReadBeginNotification(start, count))
     return attempt
 
 
-def _started_streaming_attempt(tmp_path: Path, *, count: int = 2, fsync_fn: Callable[[int], None] = fsync):
-    attempt = StagingStore(tmp_path, _capture_root(tmp_path), fsync_fn=fsync_fn).prepare_streaming_attempt(100, count)
-    attempt.record_read_begin(ReadBeginNotification(100, count))
-    return attempt
-
-
-def _quarantine_state(store: StagingStore, entry: Path) -> dict[str, object]:
-    row = store.state_db.get(StateKind.QUARANTINE, entry.name)
-    assert row is not None
-    return row
-
-
-def _rewrite_quarantine_state(store: StagingStore, entry: Path, field: str, value: object) -> None:
-    row = _quarantine_state(store, entry)
-    row[field] = value
-    store.state_db.put(StateKind.QUARANTINE, entry.name, row)
-
-
-def _record_retired_ready_ack(store: StagingStore, start_sequence: int, next_sequence: int, raw_sha256: str) -> str:
-    bundle_id = sha256(f"{start_sequence}:{next_sequence}:{raw_sha256}".encode()).hexdigest()
-    store.state_db.put(
-        StateKind.READY_PUBLICATION,
-        bundle_id,
-        {
-            "records_sha256": raw_sha256,
-            "state": "retired",
-            "start_sequence": start_sequence,
-            "next_sequence": next_sequence,
-            "draft_raw_sha256": raw_sha256,
-        },
-    )
-    return bundle_id
-
-
-def _replace_with_symlink(path: Path, target: Path, payload: bytes | str) -> None:
-    path.unlink()
-    path.symlink_to(target)
-    if isinstance(payload, bytes):
-        target.write_bytes(payload)
-    else:
-        target.write_text(payload, encoding="utf-8")
-
-
-def _guard_rename_to_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_rename = staging_filesystem.os.rename
-
-    def guarded_rename(
-        source: str | bytes | PathLike[str] | PathLike[bytes],
-        destination: str | bytes | PathLike[str] | PathLike[bytes],
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-    ) -> None:
-        if src_dir_fd is None or dst_dir_fd is None or src_dir_fd != dst_dir_fd:
-            raise OSError(EXDEV, "simulated cross-mount rename")
-        real_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
-
-    monkeypatch.setattr(staging_filesystem.os, "rename", guarded_rename)
-
-
-class _RecordingStream:
-    def __init__(self, wrapped: object) -> None:
-        self.wrapped = wrapped
-        self.writes: list[bytes] = []
-
-    def write(self, payload: bytes) -> int:
-        self.writes.append(payload)
-        return cast(int, self.wrapped.write(payload))  # type: ignore[attr-defined]
-
-    def flush(self) -> None:
-        self.wrapped.flush()  # type: ignore[attr-defined]
-
-    def fileno(self) -> int:
-        return cast(int, self.wrapped.fileno())  # type: ignore[attr-defined]
-
-    def close(self) -> None:
-        self.wrapped.close()  # type: ignore[attr-defined]
-
-
-def test_device_lock_quarantines_hard_crash_publication_leftover(tmp_path: Path) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    capture_root.mkdir(parents=True)
-    leftover = capture_root / ".100-101-deadbeef.tmp"
-    leftover.mkdir()
-    payload = _record(1)
-    (leftover / "records.bin").write_bytes(payload)
-
-    store = StagingStore(spool, capture_root)
-    with store.device_lock():
-        pass
-
-    assert not leftover.exists()
-    quarantined = tuple(path for path in (spool / "quarantine").glob("capture-temporary-*") if path.is_dir())
-    assert len(quarantined) == 1
-    assert (quarantined[0] / "records.bin").read_bytes() == payload
-    assert _quarantine_state(store, quarantined[0])["terminal_state"] == "unprocessable"
-
-
-def test_device_lock_finalizes_complete_capture_local_publication_temporary(tmp_path: Path) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    attempt = StagingStore(spool, capture_root).prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(1))
-    result = attempt.seal(DoneNotification(0, 101))
-    temporary = result.bundle_path.with_name(f".{result.bundle_path.name}.{'a' * 32}.tmp")
-    result.bundle_path.replace(temporary)
-
-    with StagingStore(spool, capture_root).device_lock():
-        pass
-
-    assert result.bundle_path.is_dir()
-    assert not temporary.exists()
-    assert (result.bundle_path / "records.bin").read_bytes() == _record(1)
-
-
-def test_terminal_quarantine_expires_at_exact_retention_and_preserves_live_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    config = CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0))
-    store = StagingStore(tmp_path, _capture_root(tmp_path), config=config)
-    root = tmp_path / "quarantine"
-    published_attempt = store.prepare_streaming_attempt(100, 1)
-    published_attempt.record_read_begin(ReadBeginNotification(100, 1))
-    published_attempt.accept_chunk(100, _record(1))
-    published_attempt.checkpoint()
-    published_attempt.close(durable=True)
-    published = store.quarantine_attempt_source(published_attempt.attempt_id)
-    store.mark_quarantine_published(published)
-    unprocessable_attempt = store.prepare_streaming_attempt(200, 1)
-    unprocessable_attempt.record_read_begin(ReadBeginNotification(200, 1))
-    unprocessable_attempt.accept_chunk(200, _record(2))
-    unprocessable_attempt.checkpoint()
-    unprocessable_attempt.close(durable=True)
-    unprocessable = store.quarantine_attempt_source(unprocessable_attempt.attempt_id)
-    store.mark_quarantine_unprocessable(unprocessable, "strict proof failed")
-    live_attempt = store.prepare_streaming_attempt(300, 1)
-    live_attempt.record_read_begin(ReadBeginNotification(300, 1))
-    live_attempt.accept_chunk(300, _record(3))
-    live_attempt.checkpoint()
-    live_attempt.close(durable=True)
-    live = store.quarantine_attempt_source(live_attempt.attempt_id)
-    malformed = root / "malformed-source"
-    malformed.mkdir()
-    (malformed / "records.bin").write_bytes(b"untracked evidence")
-
-    def contents() -> dict[Path, bytes]:
-        return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
-
-    original_contents = contents()
-    now += 72_000_000_000 - 1
-    assert store.sweep_terminal_quarantine() == ()
-    assert contents() == original_contents
-
-    now += 1
-
-    assert set(store.sweep_terminal_quarantine()) == {published, unprocessable}
-    assert not published.exists()
-    assert not unprocessable.exists()
-    assert contents() == {
-        path: payload for path, payload in original_contents.items() if path.parts[0] in {live.name, "malformed-source"}
-    }
-
-
-@pytest.mark.parametrize(
-    ("field", "invalid_value"),
-    [
-        ("terminal_state", True),
-        ("terminal_state", "published"),
-        ("terminal_at_unix_ns", True),
-        ("terminal_at_unix_ns", "1000000000"),
-        ("terminal_at_unix_ns", -1),
-        ("terminal_reason", ""),
-        ("terminal_reason", None),
-        ("original_name", ""),
-        ("original_name", 7),
-    ],
-)
-def test_terminal_quarantine_rejects_malformed_marker_fields_without_mutation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, invalid_value: object
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
-    )
-    attempt = store.prepare_streaming_attempt(100, 2)
-    try:
-        attempt.record_read_begin(ReadBeginNotification(100, 2))
-        attempt.accept_chunk(100, _record(1))
-        attempt.checkpoint()
-    finally:
-        attempt.close(durable=True)
-    entry = store.quarantine_attempt_source(attempt.attempt_id)
-    store.mark_quarantine_unprocessable(entry, "authenticated fixture")
-    _rewrite_quarantine_state(store, entry, field, invalid_value)
-    malformed_row = _quarantine_state(store, entry)
-    entry_contents = {path.relative_to(entry): path.read_bytes() for path in entry.rglob("*") if path.is_file()}
-    now += 72_000_000_000
-
-    with pytest.raises(StagingError, match="quarantine move state is malformed"):
-        store.sweep_terminal_quarantine()
-    assert entry.exists()
-    assert _quarantine_state(store, entry) == malformed_row
-    assert {path.relative_to(entry): path.read_bytes() for path in entry.rglob("*") if path.is_file()} == entry_contents
-
-
-def test_legacy_quarantine_sidecar_requires_exact_or_uuid_suffixed_identity(tmp_path: Path) -> None:
-    from omi_collector.capture.adapters.quarantine import legacy_quarantine_row
-
-    root = tmp_path / "legacy-quarantine"
-    root.mkdir()
-
-    def entry(name: str, original_name: object) -> Path:
-        path = root / name
-        path.mkdir()
-        (path / "records.bin").write_bytes(b"legacy evidence")
-        marker = {
-            "version": 1,
-            "state": "unprocessable",
-            "classified_at_unix_ns": 1,
-            "reason": "legacy classification",
-            "original_name": original_name,
-        }
-        path.with_name(f"{path.name}.json").write_text(dumps(marker), encoding="utf-8")
-        return path
-
-    exact = entry("exact", "exact")
-    suffixed = entry(f"visit-{'a' * 32}", "visit")
-    assert legacy_quarantine_row(exact)["terminal_state"] == "unprocessable"
-    assert legacy_quarantine_row(suffixed)["terminal_state"] == "unprocessable"
-
-    malformed = (
-        entry(f"short-{'a' * 31}", "short"),
-        entry(f"nonhex-{'g' * 32}", "nonhex"),
-        entry("wrong-prefix", "different"),
-        entry("empty-original", ""),
-        entry("nonstring-original", 7),
-    )
-    missing_original = root / "missing-original"
-    missing_original.mkdir()
-    (missing_original / "records.bin").write_bytes(b"legacy evidence")
-    (missing_original.with_name(f"{missing_original.name}.json")).write_text(
-        dumps({"version": 1, "state": "unprocessable", "classified_at_unix_ns": 1, "reason": "legacy"}),
-        encoding="utf-8",
-    )
-    for path in (*malformed, missing_original):
-        with pytest.raises(AttemptStateError, match="legacy quarantine"):
-            legacy_quarantine_row(path)
-
-
-def test_legacy_contradictory_quarantine_markers_are_rejected(tmp_path: Path) -> None:
-    from omi_collector.capture.adapters.quarantine import legacy_quarantine_row
-
-    root = tmp_path / "legacy-quarantine"
-    entry = root / "contradictory"
-    entry.mkdir(parents=True)
-    (entry / "records.bin").write_bytes(b"contradictory evidence")
-    (entry / "published.json").write_text(
-        dumps({"version": 1, "state": "published", "published_at_unix_ns": 1}), encoding="utf-8"
-    )
-    (entry / "unprocessable.json").write_text(
-        dumps({"version": 1, "state": "unprocessable", "classified_at_unix_ns": 1, "reason": "conflict"}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(AttemptStateError, match="contradictory"):
-        legacy_quarantine_row(entry)
-
-
-def test_device_lock_rejects_symlink_publishing_root(tmp_path: Path) -> None:
-    spool = tmp_path / "spool"
-    capture_root = _capture_root(tmp_path)
-    outside = tmp_path / "outside-publishing"
-    outside.mkdir()
-    capture_root.symlink_to(outside, target_is_directory=True)
-
-    with (
-        pytest.raises(StagingError, match="capture root"),
-        StagingStore(spool, capture_root).device_lock(),
-    ):
-        pass
-
-
-def test_terminal_retired_marker_ignores_missing_destination_then_expires_only_its_partial(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-
-    def wall_clock_ns() -> int:
-        return now
-
-    config = CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0))
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", wall_clock_ns)
-    store = StagingStore(tmp_path, _capture_root(tmp_path), config=config)
-    attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    result = attempt.publish_prefix()
-    assert result is not None
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
-
-    attempt_state = attempt_payload(store, attempt.attempt_id)
-    assert attempt_state is not None
-    marker = cast(dict[str, object], attempt_state["terminal_retirement"])
-    assert marker == {
-        "version": 1,
-        "state": "terminal-retired",
-        "terminalized_at_unix_ns": now,
-    }
-    rmtree(result.bundle_path)
-    checkpoint = cast(dict[str, object], attempt_state["checkpoint"])
-    _record_retired_ready_ack(
-        store,
-        attempt.descriptor.start_sequence,
-        attempt.descriptor.start_sequence + cast(int, checkpoint["record_count"]),
-        cast(str, checkpoint["raw_sha256"]),
-    )
-    active = store.prepare_streaming_attempt(200, 1)
-    quarantine = tmp_path / "quarantine"
-    quarantine.mkdir(parents=True)
-    preserved = quarantine / "preserved"
-    preserved.write_text("evidence", encoding="utf-8")
-
-    assert store.pending_attempts() == (active.descriptor,)
-    assert store.sweep_terminal_retired() == (attempt.path,)
-    assert not attempt.path.exists()
-    assert active.path.exists()
-    assert preserved.read_text(encoding="utf-8") == "evidence"
-
-
-@pytest.mark.parametrize("acknowledgement", ["absent", "mismatched"])
-def test_terminal_retired_missing_destination_without_exact_ack_is_retained(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, acknowledgement: str
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
-    attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    result = attempt.publish_prefix()
-    assert result is not None
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
-    rmtree(result.bundle_path)
-    if acknowledgement == "mismatched":
-        state = attempt_payload(store, attempt.attempt_id)
-        assert state is not None
-        checkpoint = cast(dict[str, object], state["checkpoint"])
-        _record_retired_ready_ack(
-            store,
-            attempt.descriptor.start_sequence,
-            attempt.descriptor.start_sequence + cast(int, checkpoint["record_count"]) + 1,
-            cast(str, checkpoint["raw_sha256"]),
+def _source_row(store: StagingStore, source_id: str) -> tuple[object, ...] | None:
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        row = cast(
+            sqlite3.Row | None,
+            connection.execute(
+                "SELECT source_type, lifecycle, block_reason, quarantine_disposition, "
+                "quarantine_opaque, terminal_reason, retention_deadline, committed_count, committed_sha256 "
+                "FROM capture_source WHERE source_id = ?",
+                (source_id,),
+            ).fetchone(),
         )
-    now += 1_000_000_000
-
-    assert store.sweep_terminal_retired() == ()
-    assert attempt.path.exists()
+    return tuple(row) if row is not None else None
 
 
-def test_terminal_retired_sweep_revalidates_checkpointed_records_before_delete(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(
-            durability=DurabilityConfig(io_chunk_bytes=1024),
-            staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
-        ),
-    )
-    attempt = store.prepare_streaming_attempt(100, 5)
-    attempt.record_read_begin(ReadBeginNotification(100, 5))
-    attempt.accept_chunk(100, memoryview(b"x" * (5 * RECORD_SIZE)))
-    attempt.checkpoint()
-    assert attempt.publish_prefix() is not None
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
-    now += 1_000_000_000
-    original_published_prefix = attempt_cleanup._published_prefix
-    reads: list[int] = []
-
-    def count_prefix_validation(*args: object, **kwargs: object) -> object:
-        reads.append(1)
-        return original_published_prefix(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(attempt_cleanup, "_published_prefix", count_prefix_validation)
-    assert store.sweep_terminal_retired() == (attempt.path,)
-    assert reads
-    assert not attempt.path.exists()
-
-
-def test_terminal_retired_sweep_keeps_attempt_with_checkpoint_digest_mismatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
+def test_typed_quarantine_changes_source_state_without_creating_private_entry(tmp_path: Path) -> None:
+    store = _store(tmp_path)
     attempt = store.prepare_streaming_attempt(100, 1)
+    attempt.prepare_leg(100, 1)
     attempt.record_read_begin(ReadBeginNotification(100, 1))
     attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    assert attempt.publish_prefix() is not None
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
 
-    state = attempt_payload(store, attempt.attempt_id)
-    assert state is not None
-    checkpoint = cast(dict[str, object], state["checkpoint"])
-    checkpoint["raw_sha256"] = "0" * 64
-    store.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, state)
-    now += 1_000_000_000
+    logical = store.quarantine_attempt_source(attempt.attempt_id)
 
-    assert store.sweep_terminal_retired() == ()
-    assert attempt.path.exists()
-
-
-def test_quarantine_attempt_source_preserves_only_existing_attempt_files(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt_id = attempt.attempt_id
-    expected_files = {path.name for path in attempt.path.iterdir()}
-    attempt.close(durable=True)
-
-    destination = store.quarantine_attempt_source(attempt_id)
-
-    assert not attempt.path.exists()
-    assert destination.name.startswith(f"{attempt_id}-")
-    assert {path.name for path in destination.iterdir()} == expected_files
-    assert tuple(destination.parent.iterdir()) == (destination,)
-    assert not store.pending_attempts()
-
-
-def test_streaming_partial_close_is_preserved_and_blocks_pending(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=2)
-    attempt.accept_chunk(100, _record(1))
+    assert logical == attempt.attempt_id
+    assert not (tmp_path / "quarantine" / attempt.attempt_id).exists()
+    row = _source_row(store, attempt.attempt_id)
+    assert row is not None and row[:3] == (
+        "quarantine",
+        "blocked",
+        "attempt source preserved",
+    )
     attempt.close()
 
-    reopened = StagingStore(tmp_path, _capture_root(tmp_path)).open_attempt(attempt.attempt_id)
-    recovery = reopened.recover()
-    assert not recovery.clean
-    assert recovery.raw_bytes == RECORD_SIZE
-    with pytest.raises(AttemptStateError, match="preserved partial evidence"):
-        reopened.accept_chunk(100, _record(2))
-    with pytest.raises(PendingAttemptError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
-    assert attempt.path.exists()
+
+def test_quarantine_pending_only_blocks_active_attempt_sources(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    active = _attempt(store)
+    active.accept_chunk(100, _record(1))
+
+    sealed = _attempt(store, 200, 1)
+    sealed.accept_chunk(200, _record(2))
+    sealed.seal(DoneNotification(0, 201))
+    sealed.close()
+    covered = _attempt(store, 300, 1)
+    retiring = _attempt(store, 400, 1)
+    with closing(store.state_db.open_connection()) as connection:
+        connection.execute("UPDATE capture_source SET lifecycle = 'covered' WHERE source_id = ?", (covered.attempt_id,))
+        connection.execute(
+            "UPDATE capture_source SET lifecycle = 'retiring' WHERE source_id = ?", (retiring.attempt_id,)
+        )
+        connection.commit()
+
+    assert store.quarantine_pending("preserve active source") == (active.attempt_id,)
+    active_row = _source_row(store, active.attempt_id)
+    sealed_row = _source_row(store, sealed.attempt_id)
+    covered_row = _source_row(store, covered.attempt_id)
+    retiring_row = _source_row(store, retiring.attempt_id)
+    assert active_row is not None and active_row[:3] == ("quarantine", "blocked", "preserve active source")
+    assert sealed_row is not None and sealed_row[:2] == ("attempt", "sealed_waiting")
+    assert covered_row is not None and covered_row[:2] == ("attempt", "covered")
+    assert retiring_row is not None and retiring_row[:2] == ("attempt", "retiring")
+    for attempt in active, covered, retiring:
+        attempt.close()
 
 
-def test_pending_attempts_fail_closed_on_unattributed_malformed_evidence(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt(100, 2)
+def test_quarantine_preserves_exact_records_tail_and_conflict_evidence(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
+    try:
+        accepted = _record(1)
+        tail = b"partial-audio-tail"
+        attempt.accept_chunk(100, accepted, tail)
+        with pytest.raises(RecordAcceptanceError, match="conflict"):
+            attempt.accept_chunk(100, _record(9))
+        source_id = attempt.attempt_id
 
-    assert store.pending_attempts() == (matching.descriptor,)
-    with pytest.raises(PendingAttemptError, match="blocks another READ"):
-        store.assert_no_pending()
+        store.quarantine_attempt_source(source_id)
 
-    malformed = tmp_path / "attempts" / "unattributed-entry"
-    malformed.mkdir()
-    (malformed / "records.bin").write_bytes(b"unattributed raw evidence")
-    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts()
-    moved = store.quarantine_pending("unattributed malformed evidence")
-    assert len(moved) == 2
-    assert not matching.path.exists()
-    assert not malformed.exists()
-    moved_rows = {_quarantine_state(store, entry)["source_name"]: _quarantine_state(store, entry) for entry in moved}
-    assert moved_rows[malformed.name]["attempt_id"] is None
-
-
-def test_pending_attempts_fail_closed_on_invalid_malformed_attribution(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    malformed = tmp_path / "attempts" / ("f" * 32)
-    malformed.mkdir(parents=True)
-    (malformed / "records.bin").write_bytes(b"preserve malformed typed state")
-    state = {
-        "descriptor": {"attempt_id": malformed.name, "schema_version": 2},
-        "checkpoint": None,
-        "prefix_publication": None,
-        "terminal_retirement": None,
-    }
-    store.state_db.put(StateKind.ATTEMPT, malformed.name, state)
-
-    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts()
-    moved = store.quarantine_pending("invalid descriptor attribution")
-    assert len(moved) == 1
-    assert not malformed.exists()
-    quarantine_row = _quarantine_state(store, moved[0])
-    assert quarantine_row["opaque"] is True
-    assert quarantine_row["terminal_state"] == "unprocessable"
-    assert quarantine_row["attempt_id"] == malformed.name
-    assert attempt_payload(store, malformed.name) is None
-    assert (moved[0] / "records.bin").read_bytes() == b"preserve malformed typed state"
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            record = cast(
+                tuple[object, object] | None,
+                connection.execute(
+                    "SELECT device_timestamp, payload FROM capture_record WHERE source_id = ? AND ordinal = 0",
+                    (source_id,),
+                ).fetchone(),
+            )
+            saved_tail = cast(
+                tuple[object] | None,
+                connection.execute("SELECT bytes FROM capture_tail WHERE source_id = ?", (source_id,)).fetchone(),
+            )
+            conflicts = connection.execute(
+                "SELECT bytes, reason FROM capture_conflict WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        assert record is not None and saved_tail is not None
+        assert tuple(record) == (1, accepted[4:])
+        assert saved_tail[0] == tail
+        assert [(row[0], row[1]) for row in cast(list[tuple[object, object]], conflicts)] == [
+            (_record(9), "replay_mismatch")
+        ]
+        source = attempt_source(store, source_id)
+        assert source is not None and source.committed_sha256 == sha256(accepted).hexdigest()
+    finally:
+        attempt.close()
 
 
-def test_attributable_malformed_evidence_is_quarantined_without_read_authorization(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    malformed = tmp_path / "attempts" / ("f" * 32)
-    malformed.mkdir(parents=True)
-    (malformed / "records.bin").write_bytes(b"unverified bytes")
-    before = {path.name: path.read_bytes() for path in malformed.iterdir()}
+def test_terminal_reason_is_distinct_from_original_quarantine_reason(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
+    attempt.accept_chunk(100, _record(1))
+    source_id = store.quarantine_attempt_source(attempt.attempt_id)
 
-    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts()
-    moved = store.quarantine_pending("malformed descriptor")
+    store.mark_quarantine_unprocessable(source_id, "terminal proof failed")
 
-    assert len(moved) == 1
-    assert not malformed.exists()
-    assert {path.name: path.read_bytes() for path in moved[0].iterdir()} == before
-    quarantine_row = _quarantine_state(store, moved[0])
-    assert quarantine_row["opaque"] is True
-    assert quarantine_row["terminal_state"] == "unprocessable"
-    assert quarantine_row["attempt_id"] == malformed.name
-    store.assert_no_pending()
+    row = _source_row(store, source_id)
+    assert row is not None and row[2] == "attempt source preserved"
+    assert row is not None and row[3] == "unprocessable"
+    assert row is not None and row[5] == "terminal proof failed"
+    assert row is not None and row[6] is not None
+    attempt.close()
 
 
-def test_quarantine_pending_moves_all_blockers_and_preserves_retired(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt(100, 2)
-    unrelated = store.prepare_streaming_attempt(200, 2)
-    published = store.prepare_streaming_attempt(300, 1)
-    assert published.publish_prefix() is None
-    published.close(durable=True)
-    store.terminalize_prefix_attempt(published.attempt_id)
-    malformed = tmp_path / "attempts" / ("f" * 32)
-    malformed.mkdir()
-    (malformed / "records.bin").write_bytes(b"unattributed malformed evidence")
-
-    moved = store.quarantine_pending("manual recovery")
-
-    assert len(moved) == 3
-    assert not matching.path.exists()
-    assert not malformed.exists()
-    assert not unrelated.path.exists()
-    assert published.path.exists()
-    published_state = attempt_payload(store, published.attempt_id)
-    assert published_state is not None and published_state["terminal_retirement"] is not None
-    assert store.pending_attempts() == ()
-
-
-def test_direct_quarantine_function_uses_concrete_filesystem(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt(100, 1)
-
-    moved = quarantine_module.quarantine_pending(store._filesystem, "direct call")
-
-    assert len(moved) == 1
-    assert moved[0].parent == tmp_path / "quarantine"
-    assert not matching.path.exists()
-
-
-def test_quarantine_a_does_not_move_unattributed_entry_during_b_lease(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    matching = store.prepare_streaming_attempt(100, 2)
-    malformed = tmp_path / "attempts" / ("f" * 32)
-    malformed.mkdir()
-    before = malformed / "evidence"
-    before.write_bytes(b"unattributed")
-
-    with store.device_lock(), pytest.raises(DeviceAlreadyRunningError):
-        store.quarantine_pending("race recovery")
-
-    assert matching.path.exists()
-    assert malformed.is_dir()
-    assert before.read_bytes() == b"unattributed"
-
-
-def test_quarantine_pending_moves_symlink_without_following_it(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    (tmp_path / "attempts").mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    target = outside / "evidence"
-    target.write_bytes(b"evidence")
-    link = tmp_path / "attempts" / "link"
-    link.symlink_to(target)
-
-    moved = store.quarantine_pending("symlink recovery")
-
-    assert len(moved) == 1
-    assert moved[0].is_symlink()
-    assert moved[0].readlink() == target
-    assert not link.is_symlink()
-    assert target.read_bytes() == b"evidence"
-
-
-def test_opaque_quarantine_entries_expire_after_terminal_retention(
+def test_ready_custody_conflict_cannot_be_salvaged_or_terminally_deleted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
         tmp_path,
-        _capture_root(tmp_path),
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    attempt = _attempt(store, count=1)
+    try:
+        raw = _record(1)
+        attempt.accept_chunk(100, raw)
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET block_reason='ready_overlap_conflict', "
+                "terminal_time=NULL, retention_deadline=NULL, "
+                "certified_prefix_count=NULL, coverage_digest=NULL WHERE source_id=?",
+                (source_id,),
+            )
+            connection.commit()
+        before = _source_row(store, source_id)
+        generation = store.state_db.get_generation()
+
+        assert source_id not in store.quarantined_attempts()
+        with pytest.raises(QuarantineCustodyHoldError, match="unresolved custody") as admission_error:
+            store.admit_quarantined_prefix(source_id)
+        assert OpportunisticRuntime().classify_quarantine_error(admission_error.value) == "deferred"
+        with pytest.raises(QuarantineCustodyHoldError, match="unresolved custody"):
+            store.mark_quarantine_unprocessable(source_id, "could not authenticate")
+        now += 2_000_000_000
+        assert store.sweep_terminal_quarantine().progressed is False
+        assert _source_row(store, source_id) == before
+        assert store.state_db.get_generation() == generation
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            kept = cast(
+                tuple[object, object] | None,
+                connection.execute(
+                    "SELECT device_timestamp, payload FROM capture_record WHERE source_id=? AND ordinal=0", (source_id,)
+                ).fetchone(),
+            )
+        assert kept is not None and tuple(kept) == (1, raw[4:])
+    finally:
+        attempt.close()
+
+
+def test_opaque_quarantine_sources_are_not_salvaged_and_expire_after_terminal_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    attempt = _attempt(store)
+    try:
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute("UPDATE capture_source SET quarantine_opaque = 1 WHERE source_id = ?", (source_id,))
+            connection.commit()
+
+        assert source_id not in store.quarantined_attempts()
+        with pytest.raises(QuarantinePublishError, match="cannot be admitted"):
+            store.admit_quarantined_prefix(source_id)
+        store.mark_quarantine_unprocessable(source_id, "opaque evidence cannot be authenticated")
+        now += 999_999_999
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
+        now += 1
+        assert store.sweep_terminal_quarantine().removed_source_ids == (source_id,)
+        assert attempt_source(store, source_id) is None
+    finally:
+        attempt.close()
+
+
+def test_salvaged_prefix_remains_in_sql_until_below_threshold_packaging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    attempt = _attempt(store, count=2)
+    try:
+        raw = _record(1)
+        residual_tail = b"residual-tail"
+        attempt.accept_chunk(100, raw, residual_tail)
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        evidence_id = "e" * 64
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "INSERT INTO capture_evidence("
+                "evidence_id, source_id, entry_kind, original_relative_path, device, inode, mode, size, "
+                "sha256, disposition, reason) VALUES (?, ?, 'regular', ?, 1, 2, 384, 1, ?, 'unclassified', ?)",
+                (evidence_id, source_id, "attempt/residual.bin", sha256(b"x").hexdigest(), "retained residual"),
+            )
+            connection.commit()
+
+        admitted_at = now
+        receipt = store.admit_quarantined_prefix(source_id)
+        now += 1
+        assert store.admit_quarantined_prefix(source_id) == receipt
+        assert (receipt.source_id, receipt.start_sequence, receipt.next_sequence, receipt.record_count) == (
+            source_id,
+            100,
+            101,
+            1,
+        )
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            source = cast(
+                tuple[object, ...] | None,
+                connection.execute(
+                    "SELECT lifecycle, quarantine_disposition, certified_prefix_count, closure_frontier, "
+                    "coverage_digest, retirement_cursor, terminal_time, retention_deadline "
+                    "FROM capture_source WHERE source_id = ?",
+                    (source_id,),
+                ).fetchone(),
+            )
+            record = cast(
+                tuple[object, object] | None,
+                connection.execute(
+                    "SELECT device_timestamp, payload FROM capture_record WHERE source_id = ? AND ordinal = 0",
+                    (source_id,),
+                ).fetchone(),
+            )
+            tail = cast(
+                tuple[object] | None,
+                connection.execute("SELECT bytes FROM capture_tail WHERE source_id = ?", (source_id,)).fetchone(),
+            )
+            evidence = cast(
+                tuple[object, object] | None,
+                connection.execute(
+                    "SELECT disposition, retention_deadline FROM capture_evidence WHERE evidence_id = ?",
+                    (evidence_id,),
+                ).fetchone(),
+            )
+        publication_rows = store.state_db.list(StateKind.READY_PUBLICATION)
+        assert source is not None and tuple(source) == (
+            "blocked",
+            "published_prefix",
+            1,
+            None,
+            sha256(raw).hexdigest(),
+            None,
+            str(admitted_at),
+            str(admitted_at + 1_000_000_000),
+        )
+        assert record is not None and tuple(record) == (1, raw[4:])
+        assert tail is not None and tuple(tail) == (residual_tail,)
+        assert evidence is not None and tuple(evidence) == ("unclassified", None)
+        assert publication_rows == ()
+
+        now += 1_000_000_000
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
+        assert attempt_source(store, source_id) is not None
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            tail = cast(
+                tuple[object] | None,
+                connection.execute("SELECT bytes FROM capture_tail WHERE source_id = ?", (source_id,)).fetchone(),
+            )
+            evidence = cast(
+                sqlite3.Row | None,
+                connection.execute("SELECT 1 FROM capture_evidence WHERE evidence_id = ?", (evidence_id,)).fetchone(),
+            )
+        assert tail is None
+        assert evidence is None
+        for _ in range(3):
+            assert store.sweep_terminal_quarantine().removed_source_ids == ()
+        assert attempt_source(store, source_id) is not None
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM capture_record WHERE source_id = ? AND ordinal = 0", (source_id,)
+                ).fetchone()
+                is not None
+            )
+    finally:
+        attempt.close()
+
+
+def test_replay_conflict_requires_quarantine_admission_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    attempt = _attempt(store)
+    source_id = attempt.attempt_id
+    raw = _opus_record(1, 1)
+    attempt.accept_chunk(100, raw)
+    with pytest.raises(RecordAcceptanceError, match="conflict"):
+        attempt.accept_chunk(100, _record(9))
+    attempt.close()
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+
+    with InternalAudioStore(store.state_db) as audio_store:
+        reader = SqlitePublicationSource(audio_store, source_id)
+        waiting = finalize_typed_sources(
+            audio_store,
+            (reader,),
+            ready,
+            config=ReadyConfig(target_audio_seconds=0.02),
+            clock_segments=ClockSegmentMap(()),
+            frontier=101,
+            drained=True,
+        )
+    assert waiting.state is ReadyOutcomeState.WAITING
+    assert not tuple(ready.iterdir())
+    before = _source_row(store, source_id)
+    assert before is not None and before[3] == "unclassified"
+    assert before[6] is None
+    now += 1_000_000_000
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
+    retained = _source_row(store, source_id)
+    assert retained is not None and retained[3] == "unclassified"
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        assert (
+            connection.execute("SELECT 1 FROM capture_conflict WHERE source_id = ?", (source_id,)).fetchone()
+            is not None
+        )
+
+    admission = store.admit_quarantined_prefix(source_id)
+    assert (admission.record_count, admission.raw_sha256) == (1, sha256(raw).hexdigest())
+    with InternalAudioStore(store.state_db) as audio_store:
+        published = finalize_typed_sources(
+            audio_store,
+            (SqlitePublicationSource(audio_store, source_id),),
+            ready,
+            config=ReadyConfig(target_audio_seconds=0.02),
+            clock_segments=ClockSegmentMap(()),
+            frontier=101,
+            drained=True,
+        )
+    assert published.state is ReadyOutcomeState.PUBLISHED
+
+    admitted = _source_row(store, source_id)
+    assert admitted is not None and isinstance(admitted[6], str)
+    assert admitted[6] == str(now + 1_000_000_000)
+    assert admitted[3] == "published_prefix"
+
+
+def test_standalone_evidence_owns_its_terminal_retention(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    evidence_id = "f" * 64
+    with closing(store.state_db.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO capture_evidence("
+            "evidence_id, source_id, entry_kind, original_relative_path, device, inode, mode, size, "
+            "sha256, disposition, reason) VALUES (?, NULL, 'regular', ?, 1, 2, 384, 1, ?, 'unclassified', ?)",
+            (evidence_id, "quarantine/orphan.bin", sha256(b"x").hexdigest(), "orphaned evidence"),
+        )
+        connection.commit()
+
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        evidence = cast(
+            tuple[object, object, object, object] | None,
+            connection.execute(
+                "SELECT disposition, terminal_reason, terminal_time, retention_deadline "
+                "FROM capture_evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone(),
+        )
+    assert evidence is not None and tuple(evidence) == (
+        "unprocessable",
+        "standalone typed quarantine evidence",
+        str(now),
+        str(now + 1_000_000_000),
+    )
+
+    now += 1_000_000_000
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        assert (
+            connection.execute("SELECT 1 FROM capture_evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+            is None
+        )
+
+
+def test_corrupt_source_digest_becomes_indefinite_custody_hold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    raw = _record(1)
+    try:
+        attempt.accept_chunk(100, raw)
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET committed_sha256 = ? WHERE source_id = ?", ("0" * 64, source_id)
+            )
+            connection.commit()
+
+        with pytest.raises(QuarantineCustodyHoldError):
+            store.admit_quarantined_prefix(source_id)
+
+        source = attempt_source(store, source_id)
+        assert source is not None and source.committed_count == 1
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            certified = cast(
+                tuple[object, ...] | None,
+                connection.execute(
+                    "SELECT source_type, lifecycle, block_reason, quarantine_disposition, "
+                    "certified_prefix_count, coverage_digest, committed_sha256, terminal_time, retention_deadline "
+                    "FROM capture_source WHERE source_id = ?",
+                    (source_id,),
+                ).fetchone(),
+            )
+            record = cast(
+                tuple[object] | None,
+                connection.execute(
+                    "SELECT payload FROM capture_record WHERE source_id = ? AND ordinal = 0", (source_id,)
+                ).fetchone(),
+            )
+        assert certified is not None and tuple(certified) == (
+            "quarantine",
+            "blocked",
+            "source_authentication_mismatch",
+            "unclassified",
+            None,
+            None,
+            "0" * 64,
+            None,
+            None,
+        )
+        assert record is not None and record[0] == raw[4:]
+        assert source_id not in store.quarantined_attempts()
+        with pytest.raises(QuarantineCustodyHoldError):
+            store.mark_quarantine_unprocessable(source_id, "bad source")
+        monkeypatch.setattr(
+            "omi_collector.capture.adapters.quarantine.authenticate_capture_source",
+            lambda *_args, **_kwargs: pytest.fail("held source was rehashed"),
+        )
+        with pytest.raises(QuarantineCustodyHoldError):
+            store.admit_quarantined_prefix(source_id)
+        now += 73 * 3600 * 1_000_000_000
+        assert not store.sweep_terminal_quarantine().progressed
+        assert _source_row(store, source_id) is not None
+    finally:
+        attempt.close()
+
+
+@pytest.mark.parametrize("durable_state", ["committed", "rolled_back", "partial"])
+def test_authentication_hold_reconciles_complete_durable_row(tmp_path: Path, durable_state: str) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    raw = _record(1)
+    try:
+        attempt.accept_chunk(100, raw)
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET quarantine_disposition='published_prefix', "
+                "certified_prefix_count=1, coverage_digest=?, terminal_time='1000', retention_deadline='2000' "
+                "WHERE source_id=?",
+                (sha256(raw).hexdigest(), source_id),
+            )
+            connection.commit()
+            current = quarantine_module._source_row(connection, source_id)
+            assert current is not None
+            columns, before_row = current
+            assert type(before_row) is tuple
+            before = tuple(before_row)
+            changes: dict[str, object] = {
+                "source_type": "quarantine",
+                "lifecycle": "blocked",
+                "block_reason": "source_authentication_mismatch",
+                "quarantine_disposition": "unclassified",
+                "quarantine_opaque": 0,
+                "terminal_reason": None,
+                "terminal_time": None,
+                "retention_deadline": None,
+                "certified_prefix_count": None,
+                "coverage_digest": None,
+                "retirement_cursor": None,
+            }
+            proposed = tuple(changes.get(column, value) for column, value in zip(columns, before, strict=True))
+            if durable_state == "committed":
+                connection.execute(
+                    "UPDATE capture_source SET block_reason='source_authentication_mismatch', "
+                    "quarantine_disposition='unclassified', terminal_time=NULL, retention_deadline=NULL, "
+                    "certified_prefix_count=NULL, coverage_digest=NULL, retirement_cursor=NULL "
+                    "WHERE source_id=?",
+                    (source_id,),
+                )
+            elif durable_state == "partial":
+                connection.execute(
+                    "UPDATE capture_source SET block_reason='source_authentication_mismatch' WHERE source_id=?",
+                    (source_id,),
+                )
+            connection.commit()
+            actual = quarantine_module._source_row(connection, source_id)
+            assert actual is not None
+            durable = tuple(actual[1])
+
+        failure = sqlite3.OperationalError("injected ambiguous commit")
+        if durable_state == "committed":
+            quarantine_module._reconcile_source_authentication_hold(
+                store._filesystem, source_id, before, proposed, failure
+            )
+            assert durable == proposed
+            assert store.quarantined_attempts() == ()
+        else:
+            with pytest.raises(
+                StagingError if durable_state == "rolled_back" else FatalInternalAudioStorageError,
+                match="rolled back" if durable_state == "rolled_back" else "ambiguous third state",
+            ) as raised:
+                quarantine_module._reconcile_source_authentication_hold(
+                    store._filesystem, source_id, before, proposed, failure
+                )
+            assert raised.value.__cause__ is failure
+            assert durable != proposed
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            after = quarantine_module._source_row(connection, source_id)
+            retained = cast(
+                sqlite3.Row | None,
+                connection.execute(
+                    "SELECT payload FROM capture_record WHERE source_id=? AND ordinal=0", (source_id,)
+                ).fetchone(),
+            )
+        assert after is not None and tuple(after[1]) == durable
+        assert retained is not None and retained[0] == raw[4:]
+        if durable_state == "rolled_back":
+            assert durable == before
+        elif durable_state == "partial":
+            assert durable[columns.index("terminal_time")] == "1000"
+            assert durable[columns.index("certified_prefix_count")] == 1
+        else:
+            assert durable[columns.index("terminal_time")] is None
+            assert durable[columns.index("certified_prefix_count")] is None
+    finally:
+        attempt.close()
+
+
+def test_authentication_hold_unreadable_commit_outcome_stops_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    try:
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            row = quarantine_module._source_row(connection, source_id)
+        assert row is not None
+        before = row[1]
+        proposed = ("changed", *before[1:])
+        busy = TransientInternalAudioStorageError("database busy", sqlite_errorcode=sqlite3.SQLITE_BUSY)
+
+        def unreadable(*_args: object) -> None:
+            raise busy
+
+        with monkeypatch.context() as patch:
+            patch.setattr(quarantine_module, "_source_row", unreadable)
+            with pytest.raises(FatalInternalAudioStorageError, match="unreadable") as raised:
+                quarantine_module._reconcile_source_authentication_hold(
+                    store._filesystem, source_id, before, proposed, busy
+                )
+        assert raised.value.__cause__ is busy
+    finally:
+        attempt.close()
+
+
+def test_authentication_read_failure_defers_without_terminal_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    try:
+        attempt.accept_chunk(100, _record(1))
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        before = _source_row(store, source_id)
+        generation = store.state_db.get_generation()
+
+        def fail_read(*_args: object, **_kwargs: object) -> None:
+            raise InternalAudioStoreError("transient canonical read failure")
+
+        monkeypatch.setattr("omi_collector.capture.adapters.quarantine.authenticate_capture_source", fail_read)
+        with pytest.raises(StagingError, match="authentication is unavailable") as error:
+            store.admit_quarantined_prefix(source_id)
+        assert OpportunisticRuntime().classify_quarantine_error(error.value) == "deferred"
+        assert _source_row(store, source_id) == before
+        assert store.state_db.get_generation() == generation
+    finally:
+        attempt.close()
+
+
+def test_zero_checkpoint_with_real_record_enters_hold_at_quarantine_open(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    try:
+        attempt.accept_chunk(100, _record(1))
+        source_id = attempt.attempt_id
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET committed_count=0, committed_sha256=? WHERE source_id=?",
+                (sha256(b"").hexdigest(), source_id),
+            )
+            connection.commit()
+        store.quarantine_attempt_source(source_id)
+        row = _source_row(store, source_id)
+        assert row is not None and row[:4] == (
+            "quarantine",
+            "blocked",
+            "source_authentication_mismatch",
+            "unclassified",
+        )
+        assert row[6] is None
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM capture_record WHERE source_id=?", (source_id,)).fetchone()[0]
+                == 1
+            )
+    finally:
+        attempt.close()
+
+
+def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    config = CollectorConfig(
+        ready=ReadyConfig(target_audio_seconds=0.02),
+        staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+    )
+    bootstrap = StagingStore(tmp_path / "spool", tmp_path / "capture", config=config)
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    store = StagingStore.from_paths(bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config)
+    zero = _attempt(store, start=100, count=1)
+    sealed = _attempt(store, start=101, count=1)
+    try:
+        zero.accept_chunk(100, b"", b"partial-tail")
+        zero.interrupt()
+        zero_id = zero.attempt_id
+        zero.close(durable=True)
+        store.terminalize_prefix_attempt(zero_id)
+
+        raw = _opus_record(2, 2)
+        sealed.accept_chunk(101, raw)
+        sealed.seal(DoneNotification(0, 102))
+        sealed_id = sealed.attempt_id
+        sealed.close(durable=True)
+        store.terminalize_prefix_attempt(sealed_id)
+        store.append_ready_closure(102, "drained")
+
+        zero_row = _source_row(store, zero_id)
+        assert zero_row is not None and zero_row[:4] == (
+            "quarantine",
+            "blocked",
+            "terminal prefix residual",
+            "unprocessable",
+        )
+        assert zero_row[6] is not None
+        now += 1_000_000_000
+        assert store.sweep_terminal_quarantine().removed_source_ids == (zero_id,)
+        published = store.recover_and_publish()
+        assert published.state is ReadyOutcomeState.PUBLISHED
+        assert published.published[0].path.joinpath("records.bin").read_bytes() == raw
+
+        restarted = StagingStore.from_paths(
+            bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config
+        )
+        assert restarted.sweep_terminal_quarantine().removed_source_ids == ()
+        assert attempt_source(restarted, zero_id) is None
+        assert attempt_source(restarted, sealed_id) is not None
+    finally:
+        zero.close()
+        sealed.close()
+
+
+def test_unclassified_evidence_cannot_expire_or_starve_later_terminal_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
+        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    )
+    unresolved = _attempt(store, start=100, count=2)
+    terminal = _attempt(store, start=200, count=1)
+    try:
+        unresolved.accept_chunk(100, _record(1), b"uncertain tail")
+        unresolved_id = store.quarantine_attempt_source(unresolved.attempt_id)
+        terminal.accept_chunk(200, _record(2))
+        terminal_id = store.quarantine_attempt_source(terminal.attempt_id)
+        store.mark_quarantine_unprocessable(terminal_id, "explicit terminal disposition")
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET terminal_time='1', retention_deadline='1' WHERE source_id=?",
+                (unresolved_id,),
+            )
+            connection.commit()
+        before = _source_row(store, unresolved_id)
+        now += 1_000_000_000
+        assert store.sweep_terminal_quarantine().removed_source_ids == (terminal_id,)
+        assert _source_row(store, unresolved_id) == before
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM capture_record WHERE source_id=?", (unresolved_id,)
+                ).fetchone()[0]
+                == 1
+            )
+            assert (
+                connection.execute("SELECT bytes FROM capture_tail WHERE source_id=?", (unresolved_id,)).fetchone()[0]
+                == b"uncertain tail"
+            )
+    finally:
+        unresolved.close()
+        terminal.close()
+
+
+def test_terminal_quarantine_obeys_retention_deadline_and_keeps_unterminalized_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_000_000_000
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    store = _store(
+        tmp_path,
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
     )
-    opaque_dir = tmp_path / "attempts" / "opaque-dir"
-    opaque_dir.mkdir(parents=True)
-    target = tmp_path / "outside"
-    target.write_bytes(b"preserve")
-    opaque_link = tmp_path / "attempts" / "opaque-link"
-    opaque_link.symlink_to(target)
+    aged = _attempt(store, 100, 2)
+    live = _attempt(store, 200, 1)
+    try:
+        residual = _record(3)
+        aged.accept_chunk(100, residual, b"retained tail")
+        aged_id = store.quarantine_attempt_source(aged.attempt_id)
+        store.mark_quarantine_unprocessable(aged_id, "cannot authenticate")
+        live.accept_chunk(200, _record(4))
+        live_id = store.quarantine_attempt_source(live.attempt_id)
+        now += 72_000_000_000 - 1
 
-    moved = store.quarantine_pending("opaque evidence")
-    now += 72_000_000_000
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
+        assert attempt_source(store, aged_id) is not None
+        with closing(store.state_db.open_connection(read_only=True)) as connection:
+            row = cast(
+                tuple[object] | None,
+                connection.execute(
+                    "SELECT payload FROM capture_record WHERE source_id = ? AND ordinal = 0", (aged_id,)
+                ).fetchone(),
+            )
+        assert row is not None and row[0] == residual[4:]
+        now += 1
 
-    assert set(store.sweep_terminal_quarantine()) == set(moved)
-    assert not opaque_dir.exists()
-    assert not opaque_link.is_symlink()
-    assert target.read_bytes() == b"preserve"
-
-
-def test_quarantine_pending_rejects_active_lease(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-
-    with store.device_lock(), pytest.raises(DeviceAlreadyRunningError):
-        store.quarantine_pending("manual recovery")
-
-
-def test_pending_checks_empty_and_rejects_malformed_roots(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    store.assert_no_pending()
-
-    partial = tmp_path / "attempts"
-    partial.write_text("not a directory", encoding="utf-8")
-    with pytest.raises(PendingAttemptError, match="not a directory"):
-        store.pending_attempts()
-    partial.unlink()
-    target = tmp_path / "partial-target"
-    target.mkdir()
-    partial.symlink_to(target, target_is_directory=True)
-    with pytest.raises(PendingAttemptError, match="not a directory"):
-        store.pending_attempts()
+        assert store.sweep_terminal_quarantine().removed_source_ids == (aged_id,)
+        assert attempt_source(store, aged_id) is None
+        assert attempt_source(store, live_id) is not None
+    finally:
+        aged.close()
+        live.close()
 
 
-@pytest.mark.parametrize("root_kind", ["file", "symlink"])
-def test_quarantine_pending_moves_unsafe_partial_root_and_recreates_it(tmp_path: Path, root_kind: str) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    partial = tmp_path / "attempts"
-    target = tmp_path / "outside"
-    if root_kind == "file":
-        partial.write_bytes(b"unsafe root")
-    else:
-        target.mkdir()
-        (target / "evidence").write_bytes(b"keep me")
-        partial.symlink_to(target, target_is_directory=True)
-
-    if root_kind == "symlink":
-        with pytest.raises(StagingError, match="attempts root must not be a symlink"):
-            store.quarantine_pending("root recovery")
-        return
-
-    moved = store.quarantine_pending("root recovery")
-
-    assert len(moved) == 1
-    assert moved[0].name.startswith("attempts-")
-    assert moved[0].is_symlink() is (root_kind == "symlink")
-    if root_kind == "file":
-        assert moved[0].read_bytes() == b"unsafe root"
-    else:
-        assert moved[0].readlink() == target
-        assert (target / "evidence").read_bytes() == b"keep me"
-    assert partial.is_dir()
-    assert not partial.is_symlink()
-    assert tuple(partial.iterdir()) == ()
-    assert store.pending_attempts() == ()
+def _quarantine_child_count(store: StagingStore, source_id: str) -> int:
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        return sum(
+            cast(
+                int, connection.execute(f"SELECT COUNT(*) FROM {table} WHERE source_id = ?", (source_id,)).fetchone()[0]
+            )
+            for table in ("capture_record", "capture_tail", "capture_conflict", "capture_evidence")
+        ) + cast(
+            int,
+            connection.execute(
+                "SELECT COUNT(*) FROM capture_evidence_chunk c "
+                "JOIN capture_evidence e ON e.evidence_id = c.evidence_id WHERE e.source_id = ?",
+                (source_id,),
+            ).fetchone()[0],
+        )
 
 
-def test_pending_sealed_looking_partial_requires_the_real_destination_bundle(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=1)
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    raw_hash = sha256(_record(1)).hexdigest()
-    (attempt.path / "manifest.json").write_text(dumps(attempt._manifest(raw_hash)), encoding="utf-8")
-
-    with pytest.raises(PendingAttemptError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
-
-
-def test_pending_partial_with_a_corrupt_destination_bundle_remains_blocking(tmp_path: Path) -> None:
-    attempt = _started_streaming_attempt(tmp_path, count=1)
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    raw_hash = sha256(_record(1)).hexdigest()
-    destination = attempt._bundle_path(raw_hash)
-    destination.mkdir(parents=True)
-    (destination / "records.bin").write_bytes(_record(9))
-    (destination / "manifest.json").write_text(dumps(attempt._manifest(raw_hash)), encoding="utf-8")
-    (attempt.path / "manifest.json").write_text(dumps(attempt._manifest(raw_hash)), encoding="utf-8")
-
-    with pytest.raises(PendingAttemptError):
-        StagingStore(tmp_path, _capture_root(tmp_path)).assert_no_pending()
-
-
-def test_device_lock_is_exclusive_and_released_after_an_error(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    with store.device_lock(), pytest.raises(DeviceAlreadyRunningError), store.device_lock():
-        pass
-    with store.device_lock():
-        pass
-
-
-def test_device_lock_rejects_forged_cross_store_expired_and_reused_leases(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    other = StagingStore(tmp_path / "other", tmp_path / "other-captures")
-    forged = DeviceLock(store._filesystem)
-    cross_store = DeviceLock(other._filesystem)
-
-    with pytest.raises(AttemptStateError, match="active spool lock"):
-        forged.require_active()
-    with store.device_lock() as active:
-        active.require_active()
-        with pytest.raises(AttemptStateError, match="active spool lock"):
-            forged.require_active()
-        with pytest.raises(AttemptStateError, match="active spool lock"):
-            cross_store.require_active()
-    with pytest.raises(AttemptStateError, match="active spool lock"):
-        active.require_active()
-
-
-def test_pending_ignores_non_directory_entries_and_reports_iterdir_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    partial = tmp_path / "attempts"
-    partial.mkdir()
-    (partial / "evidence.txt").write_text("preserve", encoding="utf-8")
-    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts()
-
-    entry = partial / "linked-evidence"
-    entry_target = tmp_path / "entry-target"
-    entry_target.mkdir()
-    entry.symlink_to(entry_target, target_is_directory=True)
-    with pytest.raises(PendingAttemptError, match="malformed partial attempt evidence"):
-        store.pending_attempts()
-    moved = store.quarantine_pending("opaque local evidence")
-    assert len(moved) == 2
-    assert all(path.parent == tmp_path / "quarantine" for path in moved)
-    assert all(not path.is_symlink() for path in partial.iterdir())
-    assert entry_target.is_dir()
-
-    original_iterdir = Path.iterdir
-
-    def fail_iterdir(path: Path):
-        if path == partial:
-            raise OSError("simulated directory listing failure")
-        return original_iterdir(path)
-
-    monkeypatch.setattr(Path, "iterdir", fail_iterdir)
-    with pytest.raises(PendingAttemptError, match="cannot be inspected"):
-        store.pending_attempts()
-
-
-def test_quarantine_pending_rejects_whitespace_reason_before_moving_closed_partial(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt.close(durable=True)
-    before = {path.name: path.read_bytes() for path in attempt.path.iterdir() if path.is_file()}
-
-    with pytest.raises(AttemptStateError):
-        store.quarantine_pending(" \t ")
-
-    assert {path.name: path.read_bytes() for path in attempt.path.iterdir() if path.is_file()} == before
-    assert not (tmp_path / "quarantine").exists()
-    moved = store.quarantine_pending("operator requested recovery")
-    assert len(moved) == 1
-    assert not attempt.path.exists()
-
-
-def test_terminal_retired_sweep_keeps_opaque_attempt_file_and_removes_only_expired_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 10_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
-    opaque = tmp_path / "attempts" / "opaque-evidence"
-    opaque.parent.mkdir(parents=True)
-    opaque.write_bytes(b"opaque file evidence")
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    assert attempt.publish_prefix() is not None
-    attempt.close(durable=True)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
-    now += 1_000_000_000
-
-    assert store.sweep_terminal_retired() == (attempt.path,)
-    assert opaque.read_bytes() == b"opaque file evidence"
-    assert not attempt.path.exists()
-
-
-def test_terminal_quarantine_sweep_defers_without_touching_aged_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 10_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt.close(durable=True)
-    entry = store.quarantine_attempt_source(attempt.attempt_id)
-    store.mark_quarantine_unprocessable(entry, "not publishable")
-    now += 1_000_000_000
-    before = {path.relative_to(entry): path.read_bytes() for path in entry.rglob("*") if path.is_file()}
-
-    assert tuple(store.sweep_terminal_quarantine(should_defer=lambda: True)) == ()
-
-    assert entry.is_dir()
-    assert {path.relative_to(entry): path.read_bytes() for path in entry.rglob("*") if path.is_file()} == before
-
-
-def test_quarantine_state_reports_missing_owned_path_as_invalid_evidence(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-
-    assert (
-        store.quarantine_state(tmp_path / "quarantine" / "missing-owned-evidence") is QuarantineState.INVALID_EVIDENCE
-    )
-
-
-def test_terminal_retired_sweep_rechecks_attempts_root_after_validation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    outside = tmp_path / "outside-attempts"
-    outside.mkdir()
-    attempts_root = store._filesystem.attempts_root
-    prepare_roots = store._filesystem._prepare_roots
-
-    def swap_after_validation() -> None:
-        prepare_roots()
-        attempts_root.symlink_to(outside, target_is_directory=True)
-
-    monkeypatch.setattr(store._filesystem, "_prepare_roots", swap_after_validation)
-
-    with pytest.raises(StagingError, match="terminal attempt root is not a directory"):
-        store.sweep_terminal_retired()
-
-    assert attempts_root.is_symlink()
-    assert outside.is_dir()
-
-
-def test_quarantine_state_classifies_non_directory_as_invalid_evidence(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    quarantine_root = store._filesystem.quarantine_root
-    quarantine_root.mkdir()
-    opaque = quarantine_root / "opaque-evidence"
-    opaque.write_text("preserved evidence", encoding="utf-8")
-
-    assert store.quarantine_state(opaque) is QuarantineState.INVALID_EVIDENCE
-    assert opaque.read_text(encoding="utf-8") == "preserved evidence"
-
-
-def test_published_quarantine_marker_with_extra_field_is_retained_for_reauthentication(
+def test_terminal_quarantine_sweep_k1_bounds_children_and_converges(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    config = CollectorConfig(
+        staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+        writer=WriterConfig(chunk_records=1),
     )
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    raw = _record(1)
-    attempt.accept_chunk(100, raw)
-    attempt.checkpoint()
-    attempt.close(durable=True)
-    entry = store.quarantine_attempt_source(attempt.attempt_id)
-    store.mark_quarantine_published(entry)
-    _rewrite_quarantine_state(store, entry, "unexpected", True)
-    original = store.state_db.get(StateKind.QUARANTINE, entry.name)
-    now += 1_000_000_000
+    store = _store(tmp_path, config=config)
+    attempt = _attempt(store, count=4)
+    try:
+        for ordinal in range(3):
+            attempt.accept_chunk(100 + ordinal, _record(ordinal + 1), b"tail" if ordinal == 2 else b"")
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        store.mark_quarantine_unprocessable(source_id, "authentication failed")
+        evidence_id = "e" * 64
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "INSERT INTO capture_evidence(evidence_id, source_id, entry_kind, original_relative_path, "
+                "device, inode, mode, size, sha256, disposition, reason) "
+                "VALUES (?, ?, 'regular', 'quarantine/remnant.bin', 1, 2, 384, 2, ?, 'unclassified', 'residual')",
+                (evidence_id, source_id, sha256(b"xy").hexdigest()),
+            )
+            connection.executemany(
+                "INSERT INTO capture_evidence_chunk(evidence_id, chunk_ordinal, bytes) VALUES (?, ?, ?)",
+                ((evidence_id, 0, b"x"), (evidence_id, 1, b"y")),
+            )
+            connection.execute(
+                "INSERT INTO capture_conflict(source_id, chunk_ordinal, leg_generation, absolute_byte_offset, reason, bytes) "
+                "VALUES (?, 0, 1, 0, 'replay_mismatch', X'01')",
+                (source_id,),
+            )
+            connection.commit()
+        now += 1_000_000_000
+        initial = _quarantine_child_count(store, source_id)
+        assert initial == 8
+        removed: list[str] = []
+        for _ in range(initial):
+            before = _quarantine_child_count(store, source_id)
+            result = store.sweep_terminal_quarantine()
+            assert result.progressed
+            removed.extend(result.removed_source_ids)
+            after = _quarantine_child_count(store, source_id)
+            assert before - after == 1
+            if after:
+                assert store.quarantine_state(source_id) is QuarantineState.UNPROCESSABLE
+        assert removed == [source_id]
+        assert attempt_source(store, source_id) is None
+        assert store.sweep_terminal_quarantine().progressed is False
+    finally:
+        attempt.close()
 
-    with pytest.raises(StagingError, match="quarantine move state is malformed"):
-        store.sweep_terminal_quarantine()
-    assert entry.exists()
-    assert store.state_db.get(StateKind.QUARANTINE, entry.name) == original
-    assert (entry / "records.bin").read_bytes() == raw
 
-
-def test_zero_timestamp_opaque_quarantine_expires_but_fresh_evidence_remains(
+def test_terminal_quarantine_sweep_preserves_referenced_canonical_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    now = 0
-    monkeypatch.setattr(quarantine_module, "_wall_clock_ns", lambda: now)
-    store = StagingStore(
-        tmp_path,
-        _capture_root(tmp_path),
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
-    attempts = tmp_path / "attempts"
-    attempts.mkdir()
-    aged_source = attempts / "aged-opaque"
-    aged_source.write_bytes(b"aged")
-    aged = store.quarantine_pending("aged opaque evidence")[0]
     now = 1_000_000_000
-    fresh_source = attempts / "fresh-opaque"
-    fresh_source.write_bytes(b"fresh")
-    fresh = store.quarantine_pending("fresh opaque evidence")[0]
-
-    assert set(store.sweep_terminal_quarantine()) == {aged}
-    assert not aged.exists()
-    assert store.state_db.get(StateKind.QUARANTINE, aged.name) is None
-    assert fresh.exists()
-    assert store.state_db.get(StateKind.QUARANTINE, fresh.name) is not None
-
-
-def test_invalid_prefix_publication_marker_stays_pending_and_blocks_read(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempt = store.prepare_streaming_attempt(100, 1)
-    attempt.record_read_begin(ReadBeginNotification(100, 1))
-    attempt.accept_chunk(100, _record(1))
-    attempt.checkpoint()
-    attempt.close(durable=True)
-    state = attempt_payload(store, attempt.attempt_id)
-    assert state is not None
-    state["prefix_publication"] = {"version": 99}
-    store.state_db.put(StateKind.ATTEMPT, attempt.attempt_id, state)
-    original = attempt_payload(store, attempt.attempt_id)
-
-    assert store.pending_attempts() == (attempt.descriptor,)
-    with pytest.raises(PendingAttemptError):
-        store.assert_no_pending()
-
-    assert attempt_payload(store, attempt.attempt_id) == original
-
-
-def test_quarantine_name_allocation_skips_existing_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    attempts = tmp_path / "attempts"
-    attempts.mkdir()
-    entry = attempts / "opaque-entry"
-    entry.write_bytes(b"opaque source")
-    quarantine_root = tmp_path / "quarantine"
-    quarantine_root.mkdir()
-    first_name = f"opaque-entry-{'a' * 32}"
-    collision_path = quarantine_root / first_name
-    collision_path.write_bytes(b"pre-existing collision evidence")
-    choices = iter(("a" * 32, "b" * 32))
-    monkeypatch.setattr(quarantine_module, "uuid4", lambda: SimpleNamespace(hex=next(choices)))
-
-    moved = store.quarantine_pending("opaque collision fixture")
-
-    expected = quarantine_root / f"opaque-entry-{'b' * 32}"
-    assert moved == (expected,)
-    assert collision_path.read_bytes() == b"pre-existing collision evidence"
-    marker = _quarantine_state(store, expected)
-    assert marker["original_name"] == "opaque-entry"
-    assert marker["physical_name"] == expected.name
+    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
+    config = CollectorConfig(
+        staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0),
+        writer=WriterConfig(chunk_records=1),
+    )
+    store = _store(tmp_path, config=config)
+    attempt = _attempt(store, count=2)
+    try:
+        raw = _record(1)
+        attempt.accept_chunk(100, raw, b"tail")
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        store.mark_quarantine_unprocessable(source_id, "authentication failed")
+        cohort_id = "c" * 64
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute(
+                "INSERT INTO publication_cohort(cohort_id, lifecycle) VALUES (?, 'accepted')", (cohort_id,)
+            )
+            connection.execute(
+                "INSERT INTO publication_cohort_member(cohort_id, member_ordinal, source_id, slice_start, "
+                "slice_count, admitted_lifecycle, admitted_count, admitted_sha256) "
+                "VALUES (?, 0, ?, 0, 1, 'blocked', 1, ?)",
+                (cohort_id, source_id, sha256(raw).hexdigest()),
+            )
+            connection.commit()
+        now += 1_000_000_000
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
+        assert _quarantine_child_count(store, source_id) == 1
+        assert attempt_source(store, source_id) is not None
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute("DELETE FROM publication_cohort_member WHERE cohort_id = ?", (cohort_id,))
+            connection.execute("DELETE FROM publication_cohort WHERE cohort_id = ?", (cohort_id,))
+            connection.commit()
+        assert store.sweep_terminal_quarantine().removed_source_ids == (source_id,)
+        assert attempt_source(store, source_id) is None
+    finally:
+        attempt.close()
 
 
-def test_quarantine_pending_reuses_existing_root_and_rejects_non_directory_root(tmp_path: Path) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    first = store.prepare_streaming_attempt(100, 1)
-    first.record_read_begin(ReadBeginNotification(100, 1))
-    first.close(durable=True)
-    first_moved = store.quarantine_pending("first attempt")[0]
-    first_bytes = {path.name: path.read_bytes() for path in first_moved.iterdir() if path.is_file()}
-    second = store.prepare_streaming_attempt(101, 1)
-    second.record_read_begin(ReadBeginNotification(101, 1))
-    second.close(durable=True)
+def test_corrupt_quarantine_state_is_retained_without_mutation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
+    source_id = store.quarantine_attempt_source(attempt.attempt_id)
+    store.mark_quarantine_unprocessable(source_id, "terminal proof failed")
+    with closing(store.state_db.open_connection()) as connection:
+        connection.execute(
+            "UPDATE capture_source SET retention_deadline = 'not-a-time' WHERE source_id = ?", (source_id,)
+        )
+        connection.commit()
+    before = _source_row(store, source_id)
 
-    second_moved = store.quarantine_pending("second attempt")[0]
-
-    assert first_moved.is_dir()
-    assert {path.name: path.read_bytes() for path in first_moved.iterdir() if path.is_file()} == first_bytes
-    assert second_moved.is_dir()
-    assert first_moved != second_moved
-
-    blocked_root = tmp_path / "blocked"
-    blocked_capture = _capture_root(blocked_root)
-    blocked = StagingStore(blocked_root, blocked_capture)
-    source = blocked.prepare_streaming_attempt(200, 1)
-    source.record_read_begin(ReadBeginNotification(200, 1))
-    source.close(durable=True)
-    before = {path.name: path.read_bytes() for path in source.path.iterdir() if path.is_file()}
-    quarantine_root = blocked_root / "quarantine"
-    quarantine_root.write_bytes(b"not a directory")
-
-    with pytest.raises(StagingError):
-        blocked.quarantine_pending("blocked destination")
-
-    assert quarantine_root.read_bytes() == b"not a directory"
-    assert {path.name: path.read_bytes() for path in source.path.iterdir() if path.is_file()} == before
+    assert store.sweep_terminal_quarantine().removed_source_ids == ()
+    assert _source_row(store, source_id) == before
+    attempt.close()
 
 
-@pytest.mark.parametrize("entry_kind", ["symlink", "file"])
-def test_device_lock_quarantines_unsafe_capture_temporary_in_typed_state(tmp_path: Path, entry_kind: str) -> None:
-    store = StagingStore(tmp_path, _capture_root(tmp_path))
-    capture_root = _capture_root(tmp_path)
-    capture_root.mkdir(parents=True)
-    temporary = capture_root / f".unsafe.{('a' * 32)}.tmp"
-    outside = tmp_path / "external-temporary"
-    if entry_kind == "symlink":
-        outside.mkdir()
-        target = outside / "evidence"
-        target.write_bytes(b"external target remains untouched")
-        temporary.symlink_to(outside, target_is_directory=True)
-    else:
-        temporary.write_bytes(b"opaque temporary bytes")
+def test_quarantine_read_helper_closes_materialized_cursor() -> None:
+    connection = sqlite3.connect(":memory:")
+    cursor = connection.execute("SELECT 1")
 
-    with store.device_lock():
-        pass
-
-    evidence = next((tmp_path / "quarantine").glob("capture-temporary-*.tmp*"))
-    marker = _quarantine_state(store, evidence)
-    assert not temporary.exists() and not temporary.is_symlink()
-    assert marker["original_name"] == temporary.name
-    assert marker["opaque"] is True
-    assert marker["terminal_state"] == "unprocessable"
-    if entry_kind == "symlink":
-        assert evidence.is_symlink()
-        assert evidence.readlink() == outside
-        assert (outside / "evidence").read_bytes() == b"external target remains untouched"
-    else:
-        assert evidence.read_bytes() == b"opaque temporary bytes"
+    assert quarantine_module._db_one(cursor) == (1,)
+    with pytest.raises(sqlite3.ProgrammingError):
+        cursor.fetchone()
+    connection.close()

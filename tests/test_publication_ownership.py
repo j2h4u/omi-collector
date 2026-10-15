@@ -16,7 +16,7 @@ from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
-from staging_test_factory import StagingStore, attempt_payload, closure_payload
+from staging_test_factory import StagingStore, attempt_source, closure_payload
 
 
 def _store(tmp_path: Path) -> StagingStore:
@@ -37,13 +37,13 @@ def _record(value: int) -> bytes:
     return pack(">I", value) + bytes((2, 8, value % 256)) + bytes(RECORD_SIZE - 7)
 
 
-def _seal_writer(store: StagingStore) -> StagingWriter:
-    writer = StagingWriter(store, 100, 1)
+def _seal_writer(store: StagingStore, start: int = 100) -> StagingWriter:
+    writer = StagingWriter(store, start, 1)
     writer.prepare()
-    writer.prepare_leg(100, 1)
-    writer.read_begin(ReadBeginNotification(100, 1))
-    writer.append_chunk(0, memoryview(_record(100)))
-    writer.seal(DoneNotification(0, 101))
+    writer.prepare_leg(start, 1)
+    writer.read_begin(ReadBeginNotification(start, 1))
+    writer.append_chunk(0, memoryview(_record(start)))
+    writer.seal(DoneNotification(0, start + 1))
     return writer
 
 
@@ -68,20 +68,39 @@ def test_sealed_writer_publishes_with_its_held_lease(tmp_path: Path) -> None:
     writer.close()
 
 
-def test_restart_closes_and_persists_the_frontier_of_an_orphaned_sealed_draft(tmp_path: Path) -> None:
+def test_restart_closes_and_persists_the_frontier_of_a_sealed_sql_attempt(tmp_path: Path) -> None:
     store = _store(tmp_path)
     writer = _seal_writer(store)
+    attempt_id = writer.attempt_id
     writer.close()
 
     expected = ReadyClosure(101, "restart_interrupted")
-    assert store.close_orphaned_drafts("restart_interrupted") == expected
+    assert store.close_pending_prefix("restart_interrupted") == expected
     assert closure_payload(store) == {
         "version": 1,
         "closures": [{"next_sequence": expected.next_sequence, "reason": expected.reason}],
     }
-    drafts = tuple(store.capture_root.iterdir())
-    assert len(drafts) == 1
-    assert (drafts[0] / "records.bin").read_bytes() == _record(100)
+    source = attempt_source(store, attempt_id)
+    assert source is not None
+    assert source.lifecycle == "sealed_waiting"
+    assert source.committed_count == 1
+
+
+def test_recovery_closes_each_new_sealed_frontier_once(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first = _seal_writer(store)
+    first.close()
+
+    assert store.inspect_recovery() == (True, False)
+    assert store.close_pending_prefix("restart_interrupted") == ReadyClosure(101, "restart_interrupted")
+    assert store.inspect_recovery() == (False, False)
+
+    second = _seal_writer(store, 101)
+    second.close()
+
+    assert store.inspect_recovery() == (True, False)
+    assert store.close_pending_prefix("restart_interrupted") == ReadyClosure(102, "restart_interrupted")
+    assert store.inspect_recovery() == (False, False)
 
 
 def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
@@ -96,37 +115,36 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     writer.checkpoint()
     attempt_id = writer.attempt_id
 
-    retired: list[bool] = []
+    terminalized: list[bool] = []
     original = store.terminalize_prefix_attempt_held
 
     def observe_terminalization(attempt_id: str, lease: DeviceLock) -> None:
         lease.require_active()
-        attempt_state = attempt_payload(store, attempt_id)
-        assert attempt_state is not None
-        retired.append(attempt_state["prefix_publication"] is not None)
+        source = attempt_source(store, attempt_id)
+        assert source is not None
+        terminalized.append(source.lifecycle == "receiving")
         original(attempt_id, lease)
 
     monkeypatch.setattr(store, "terminalize_prefix_attempt_held", observe_terminalization)
-    assert writer.publish_prefix() is not None
-    assert tuple(store.capture_root.iterdir())
+    writer.publish_prefix()
+    source = attempt_source(store, attempt_id)
+    assert source is not None and source.lifecycle == "receiving"
 
     writer.close()
 
-    assert retired == [True]
-    attempt_state = attempt_payload(store, attempt_id)
-    assert attempt_state is not None
-    terminal = attempt_state["terminal_retirement"]
-    assert isinstance(terminal, dict)
-    assert terminal["version"] == 1
-    assert terminal["state"] == "terminal-retired"
-    terminalized_at = terminal["terminalized_at_unix_ns"]
-    assert isinstance(terminalized_at, int) and not isinstance(terminalized_at, bool)
+    source = attempt_source(store, attempt_id)
+    assert source is not None and source.lifecycle == "sealed_waiting"
+    assert terminalized == [True]
+    assert attempt_source(store, attempt_id) is not None
     writer.close()
     store.append_ready_closure(101, "drained")
-    assert store.publish_ready() is not None
-    assert not tuple(store.capture_root.iterdir())
-    assert store.sweep_terminal_retired() == (store.paths.attempts / attempt_id,)
-    assert attempt_payload(store, attempt_id) is None
+    published = store.publish_ready()
+    source = attempt_source(store, attempt_id)
+    assert published.state is ReadyOutcomeState.PUBLISHED
+    assert published.retirement_pending
+    assert source is not None and source.lifecycle == "retiring"
+    assert store.publish_ready().retirement_pending
+    assert attempt_source(store, attempt_id) is None
 
 
 def test_child_task_publishes_after_writer_releases(tmp_path: Path) -> None:
@@ -137,7 +155,7 @@ def test_child_task_publishes_after_writer_releases(tmp_path: Path) -> None:
 
     async def publish_from_child_task() -> object | None:
         async def publish() -> object | None:
-            return store.publish_ready()
+            return await asyncio.to_thread(store.publish_ready)
 
         return await asyncio.create_task(publish())
 
@@ -149,7 +167,7 @@ def test_clock_mutation_lease_reuses_active_writer_storage_lease(tmp_path: Path)
     store = _store(tmp_path)
 
     with (
-        store.device_lock(recover_capture_temporaries=False) as writer_lease,
+        store.device_lock() as writer_lease,
         store.clock_mutation_lease() as clock_lease,
     ):
         assert clock_lease is writer_lease
@@ -165,12 +183,8 @@ def test_clock_mutation_lease_reuses_current_publication_lease_and_falls_back_af
     original_device_lock = store.device_lock
 
     @contextmanager
-    def tracked_device_lock(
-        *, recover_capture_temporaries: bool = True, operation: str = "unknown"
-    ) -> Iterator[DeviceLock]:
-        with original_device_lock(
-            recover_capture_temporaries=recover_capture_temporaries, operation=operation
-        ) as lease:
+    def tracked_device_lock(*, operation: str = "unknown") -> Iterator[DeviceLock]:
+        with original_device_lock(operation=operation) as lease:
             acquired.append(lease)
             yield lease
 
@@ -203,14 +217,20 @@ def test_failed_sealed_publication_retains_capture_for_retry(tmp_path: Path, mon
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", fail_publication)
     assert writer.publish_ready().state is ReadyOutcomeState.TRANSIENT
 
-    assert tuple(store.capture_root.iterdir())
+    assert attempt_source(store, writer.attempt_id) is not None
     assert not tuple((tmp_path / "ready").glob("*/manifest.json"))
     monkeypatch.setattr(store, "_recover_and_publish_unlocked", original)
 
     assert writer._lease is not None
     store._append_ready_closure_unlocked(writer._lease, 101, "drained")
-    assert writer.publish_ready().state is ReadyOutcomeState.PUBLISHED
+    published = writer.publish_ready()
+    source = attempt_source(store, writer.attempt_id)
+    assert published.state is ReadyOutcomeState.PUBLISHED
+    assert published.retirement_pending
+    assert source is not None and source.lifecycle == "retiring"
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
+    assert writer.publish_ready().retirement_pending
+    assert attempt_source(store, writer.attempt_id) is None
     writer.close()
 
 
@@ -224,11 +244,19 @@ def test_writer_seal_keeps_draft_until_closed_visit(tmp_path: Path) -> None:
 
     writer.seal(DoneNotification(0, 101))
 
-    assert tuple(store.capture_root.iterdir())
+    attempt_id = writer.attempt_id
+    source = attempt_source(store, attempt_id)
+    assert source is not None and source.lifecycle == "sealed_waiting"
     assert not tuple((tmp_path / "ready").iterdir())
     writer.close()
     store.append_ready_closure(101, "drained")
-    assert store.publish_ready().state is ReadyOutcomeState.PUBLISHED
+    published = store.publish_ready()
+    source = attempt_source(store, attempt_id)
+    assert published.state is ReadyOutcomeState.PUBLISHED
+    assert published.retirement_pending
+    assert source is not None and source.lifecycle == "retiring"
+    assert store.publish_ready().retirement_pending
+    assert attempt_source(store, attempt_id) is None
 
 
 def test_writer_seal_does_not_report_false_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

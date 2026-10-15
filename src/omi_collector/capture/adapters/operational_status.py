@@ -12,6 +12,7 @@ from pathlib import Path
 from threading import Lock
 from typing import cast
 
+from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from ..domain.operational_status_machine import (
     OperationalDimension,
     OperationalSignal,
@@ -37,6 +38,9 @@ class OperationalStatusError(RuntimeError):
     """The service could not safely read or persist operational status."""
 
 
+type _StatusFailure = OperationalStatusError | FatalInternalAudioStorageError | TransientInternalAudioStorageError
+
+
 @dataclass(frozen=True, slots=True)
 class OperationalIdentity:
     boot_id: str
@@ -56,18 +60,20 @@ class OperationalStatusStore:
         self.db = db
         self.identity = identity
         self._lock = Lock()
+        self._proposal_lock = Lock()
         self._closed = False
         self._states: dict[OperationalDimension, OperationalState] = dict.fromkeys(
             _DIMENSIONS, OperationalState.UNKNOWN
         )
-        self._failure: OperationalStatusError | None = None
-        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[OperationalStatusError]]] = []
+        self._failure: _StatusFailure | None = None
+        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[_StatusFailure]]] = []
 
     def initialize(self) -> None:
         """Load only a safe prior snapshot, then publish this invocation's state."""
-        with self._lock:
-            if self._closed:
-                raise OperationalStatusError("operational status writer is closed")
+        with self._proposal_lock:
+            with self._lock:
+                if self._closed:
+                    raise OperationalStatusError("operational status writer is closed")
             try:
                 previous = _read_snapshot(self.db)
             except StateDBError as error:
@@ -75,27 +81,39 @@ class OperationalStatusStore:
             if previous is not None:
                 prior_identity, prior_states = previous
                 if prior_identity == self.identity:
-                    self._states = prior_states
+                    with self._lock:
+                        self._states = prior_states
                     return
-                self._states = {
+                proposed = {
                     name: state if state is OperationalState.BLOCKED else OperationalState.UNKNOWN
                     for name, state in prior_states.items()
                 }
-            self._persist()
+            else:
+                proposed = dict.fromkeys(_DIMENSIONS, OperationalState.UNKNOWN)
+            self._persist(proposed)
+            with self._lock:
+                self._states = proposed
 
     def update(self, dimension: OperationalDimension, signal: OperationalSignal) -> None:
-        with self._lock:
-            if self._closed or self._failure is not None:
-                return
-            previous = self._states[dimension]
-            try:
-                state = transition(self._states[dimension], signal)
-                if state is self._states[dimension]:
+        with self._proposal_lock:
+            with self._lock:
+                if self._closed or self._failure is not None:
                     return
-                self._states[dimension] = state
-                self._persist()
-            except OperationalStatusError as error:
-                self._states[dimension] = previous
+                proposed = self._states.copy()
+            previous = proposed[dimension]
+            try:
+                state = transition(previous, signal)
+                if state is previous:
+                    return
+                proposed[dimension] = state
+                self._persist(proposed)
+                with self._lock:
+                    self._states = proposed
+            except (
+                OperationalStatusError,
+                FatalInternalAudioStorageError,
+                TransientInternalAudioStorageError,
+            ) as error:
                 self._latch_failure(error)
                 return
 
@@ -124,13 +142,13 @@ class OperationalStatusStore:
         self.close()
 
     @property
-    def failure(self) -> OperationalStatusError | None:
+    def failure(self) -> _StatusFailure | None:
         with self._lock:
             return self._failure
 
-    async def wait_failure(self) -> OperationalStatusError:
+    async def wait_failure(self) -> _StatusFailure:
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[OperationalStatusError] = loop.create_future()
+        future: asyncio.Future[_StatusFailure] = loop.create_future()
         with self._lock:
             if self._failure is not None:
                 future.set_result(self._failure)
@@ -148,18 +166,21 @@ class OperationalStatusStore:
         with self._lock:
             return {name.value: state.value for name, state in self._states.items()}
 
-    def _latch_failure(self, error: OperationalStatusError) -> None:
-        self._failure = error
-        waiters, self._waiters = self._waiters, []
+    def _latch_failure(self, error: _StatusFailure) -> None:
+        with self._lock:
+            if self._failure is not None:
+                return
+            self._failure = error
+            waiters, self._waiters = self._waiters, []
         for loop, future in waiters:
             loop.call_soon_threadsafe(_set_failure, future, error)
 
-    def _persist(self) -> None:
+    def _persist(self, states: dict[OperationalDimension, OperationalState]) -> None:
         document = {
             "boot_id": self.identity.boot_id,
             "invocation_id": self.identity.invocation_id,
             "schema_version": 1,
-            "states": {name.value: state.value for name, state in self._states.items()},
+            "states": {name.value: state.value for name, state in states.items()},
         }
         if len(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()) > _MAX_SNAPSHOT_BYTES:
             raise OperationalStatusError("operational status snapshot is oversized")
@@ -287,6 +308,9 @@ def _decode_snapshot_identity(document: dict[str, object]) -> OperationalIdentit
     return OperationalIdentity(boot_id, invocation_id)
 
 
-def _set_failure(future: asyncio.Future[OperationalStatusError], error: OperationalStatusError) -> None:
+def _set_failure(
+    future: asyncio.Future[_StatusFailure],
+    error: _StatusFailure,
+) -> None:
     if not future.done():
         future.set_result(error)

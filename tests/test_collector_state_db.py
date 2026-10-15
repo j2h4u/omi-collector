@@ -1,14 +1,58 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NoReturn, cast
 
 import pytest
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
+from omi_collector.capture.adapters import collector_state_db
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind, _Operations
+from omi_collector.capture.adapters.sqlite_admission import admit_exclusive
+from omi_collector.capture.application.storage_fault import (
+    FatalInternalAudioStorageError,
+    TransientInternalAudioStorageError,
+)
+
+
+@pytest.mark.parametrize(
+    ("sqlite_errorcode", "expected"),
+    [
+        (None, StateDBError),
+        (sqlite3.SQLITE_BUSY, TransientInternalAudioStorageError),
+        (sqlite3.SQLITE_CORRUPT, FatalInternalAudioStorageError),
+        (sqlite3.SQLITE_NOTADB, FatalInternalAudioStorageError),
+    ],
+)
+@pytest.mark.parametrize("operation", ["get", "list", "put", "delete"])
+def test_state_operation_classifies_sqlite_errorcode(
+    operation: str, sqlite_errorcode: int | None, expected: type[Exception]
+) -> None:
+    failure = sqlite3.OperationalError("injected database failure")
+    if sqlite_errorcode is not None:
+        failure.sqlite_errorcode = sqlite_errorcode
+
+    class FailingConnection:
+        def execute(self, *_args: object, **_kwargs: object) -> NoReturn:
+            raise failure
+
+    operations = _Operations(cast(sqlite3.Connection, FailingConnection()))
+    with pytest.raises(expected) as raised:
+        if operation == "get":
+            operations.get(StateKind.FIRMWARE, "current")
+        elif operation == "list":
+            operations.list(StateKind.FIRMWARE)
+        elif operation == "put":
+            operations.put(StateKind.FIRMWARE, "current", {"value": 1})
+        else:
+            operations.delete(StateKind.FIRMWARE, "current")
+    assert getattr(raised.value, "sqlite_errorcode", None) == sqlite_errorcode
+    assert raised.value.__cause__ is failure
 
 
 def test_state_db_round_trip_is_canonical_and_reopens_in_a_fresh_process(tmp_path: Path) -> None:
@@ -87,6 +131,93 @@ def test_concurrent_transactional_updates_do_not_lose_writes(tmp_path: Path) -> 
         tuple(workers.map(increment, range(8)))
 
     assert db.get(StateKind.CLOCK, "current") == {"count": 80}
+
+
+def test_write_owner_rejects_a_new_or_preexisting_second_connection(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    first = db.open_connection()
+    second = db.open_connection()
+    pending_cursor = second.execute("SELECT 1")
+    try:
+        with db.access(first):
+            db.begin_exclusive(first)
+            first.execute("INSERT INTO state(kind,id,payload) VALUES ('firmware','owner','{}')").close()
+            with pytest.raises(StateDBError, match="another state connection owns"):
+                second.execute("SELECT 1")
+            with pytest.raises(StateDBError, match="another state connection owns"):
+                pending_cursor.fetchone()
+            with pytest.raises(StateDBError, match="another state connection owns"), db.access(second):
+                second.execute("SELECT 1")
+            with pytest.raises(StateDBError, match="another state connection owns"):
+                db.open_connection()
+            with pytest.raises(StateDBError, match="another state connection owns"):
+                db.get(StateKind.FIRMWARE, "owner")
+            assert first.execute("SELECT payload FROM state WHERE id='owner'").fetchone()[0] == "{}"
+            first.rollback()
+            db.end_write(first)
+        with db.access(second):
+            assert second.execute("SELECT count(*) FROM state WHERE id='owner'").fetchone()[0] == 0
+    finally:
+        pending_cursor.close()
+        first.close()
+        second.close()
+
+
+def test_external_shared_reader_delays_admission_before_any_write(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    db = StateDB(path)
+    external = sqlite3.connect(path, isolation_level=None)
+    external.execute("BEGIN")
+    external.execute("SELECT count(*) FROM state").fetchone()
+    started = threading.Event()
+    finished = threading.Event()
+
+    def write() -> None:
+        started.set()
+        db.put(StateKind.FIRMWARE, "after-reader", {"value": 1})
+        finished.set()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(write)
+        assert started.wait(2)
+        assert not finished.wait(0.05)
+        assert external.execute("SELECT count(*) FROM state WHERE id='after-reader'").fetchone()[0] == 0
+        external.rollback()
+        future.result(timeout=10)
+    external.close()
+    assert db.get(StateKind.FIRMWARE, "after-reader") == {"value": 1}
+
+
+def test_loop_thread_state_access_fails_before_sql(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+
+    async def access_on_loop() -> None:
+        with pytest.raises(StateDBError, match="event-loop thread"):
+            db.get(StateKind.FIRMWARE, "missing")
+        with pytest.raises(StateDBError, match="event-loop thread"):
+            db.open_connection()
+
+    asyncio.run(access_on_loop())
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_BUSY | (1 << 8), sqlite3.SQLITE_LOCKED])
+def test_exclusive_admission_retries_only_exact_primary_busy(code: int) -> None:
+    error = sqlite3.OperationalError("injected")
+    error.sqlite_errorcode = code
+
+    class FailingConnection:
+        in_transaction = False
+        calls = 0
+
+        def execute(self, _query: str) -> NoReturn:
+            self.calls += 1
+            raise error
+
+    connection = FailingConnection()
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        admit_exclusive(cast(sqlite3.Connection, connection))
+    assert raised.value is error
+    assert connection.calls == 1
 
 
 def test_rows_are_sorted_and_kind_and_identity_are_closed_and_validated(tmp_path: Path) -> None:
@@ -191,34 +322,45 @@ def test_transaction_database_errors_are_normalized_and_rollback_cannot_mask_the
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
 ) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
-    original_connect = db._connect
     rollback_called = False
 
-    class FailingConnection:
-        def __init__(self) -> None:
-            self.connection = original_connect()
-
-        def execute(self, statement: str) -> sqlite3.Cursor:
-            if failure_point == "begin" and statement == "BEGIN IMMEDIATE":
+    class FailingConnection(collector_state_db._GuardedConnection):
+        def execute(self, statement: str, parameters: object = (), /) -> sqlite3.Cursor:
+            if failure_point == "begin" and statement == "BEGIN EXCLUSIVE":
                 raise sqlite3.OperationalError("synthetic begin failure")
-            return self.connection.execute(statement)
+            return super().execute(statement, parameters)
 
         def commit(self) -> None:
             if failure_point == "commit":
                 raise sqlite3.OperationalError("synthetic commit failure")
-            self.connection.commit()
+            super().commit()
 
         def rollback(self) -> None:
             nonlocal rollback_called
             rollback_called = True
-            self.connection.close()
+            super().rollback()
             raise sqlite3.OperationalError("synthetic rollback failure")
 
-        def close(self) -> None:
-            self.connection.close()
-
-    monkeypatch.setattr(db, "_connect", FailingConnection)
+    monkeypatch.setattr(collector_state_db, "_GuardedConnection", FailingConnection)
     with pytest.raises(StateDBError, match="transaction failed") as error, db.transaction():
         pass
     assert isinstance(error.value.__cause__, sqlite3.OperationalError)
     assert rollback_called
+
+
+def test_unsettled_rollback_keeps_prior_fatal_and_closes_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    fatal = FatalInternalAudioStorageError("original corruption")
+
+    class FailingRollbackConnection(collector_state_db._GuardedConnection):
+        def rollback(self) -> None:
+            raise sqlite3.OperationalError("rollback did not settle")
+
+    monkeypatch.setattr(collector_state_db, "_GuardedConnection", FailingRollbackConnection)
+    with pytest.raises(FatalInternalAudioStorageError) as raised, db.transaction() as transaction:
+        transaction.put(StateKind.FIRMWARE, "current", {"value": 1})
+        raise fatal
+    assert raised.value is fatal
+    assert db.get(StateKind.FIRMWARE, "current") is None

@@ -5,14 +5,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import stat
 from collections.abc import Iterable
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
+from omi_collector.capture.adapters.collector_state_db import (
+    StateDB,
+    StateDBError,
+    StateKind,
+    raise_if_sqlite_storage_fault,
+)
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, ConfirmedLossFact, read_confirmed_losses
 from omi_collector.capture.adapters.debug_logging import read_runtime_status
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservation, read_firmware_observations
@@ -27,6 +34,7 @@ from omi_collector.capture.adapters.quality_metrics import (
     validate_quality_event,
 )
 from omi_collector.capture.application.operational_telemetry import system_host_boot_id
+from omi_collector.capture.domain.internal_audio_machine import QUARANTINE_CUSTODY_HOLD_REASONS
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
 from omi_collector.spool_metrics import collect_spool_metrics
@@ -259,6 +267,7 @@ def collect_operator_status(
         current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
         operational_status = read_operational_status(db, current_identity)
         runtime = _runtime_status(db, end.astimezone(UTC), operational_status)
+        custody_holds = _custody_hold_count(db)
     except (
         ConfirmedLossError,
         QualityMetricsError,
@@ -277,11 +286,36 @@ def collect_operator_status(
         "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
         "publication": spool.current_window.as_dict(),
         "quality_window": quality.as_dict(),
+        "custody_holds": custody_holds,
         "runtime": runtime,
         "schema_version": 2,
         "status": window_status,
         "window_hours": hours,
     }
+
+
+def _custody_hold_count(db: StateDB) -> int:
+    """Count SQL audio held indefinitely after unresolved custody conflicts."""
+    try:
+        with (
+            closing(db.open_connection(read_only=True)) as connection,
+            db.access(connection),
+            closing(
+                connection.execute(
+                    "SELECT COUNT(*) FROM capture_source WHERE source_type='quarantine' "
+                    "AND lifecycle='blocked' AND block_reason IN (?, ?)",
+                    tuple(sorted(QUARANTINE_CUSTODY_HOLD_REASONS)),
+                )
+            ) as cursor,
+        ):
+            row = cast(sqlite3.Row | None, cursor.fetchone())
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise OperatorStatusError("custody hold inventory is unreadable") from error
+    count = None if row is None else cast(object, row[0])
+    if type(count) is not int:
+        raise OperatorStatusError("custody hold inventory is invalid")
+    return cast(int, count)
 
 
 def _runtime_status(db: StateDB, now: datetime, operational_status: dict[str, str]) -> dict[str, object]:

@@ -4,8 +4,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SOURCE_REVISION: ${OMI_COLLECTOR_SOURCE_REVISION:-}
     image: omi-collector:local
-    init: true
+    user: "0:0"
+    entrypoint: ["python", "/app/scripts/docker_qa_entrypoint.py"]
+    command: ["omi-collector", "service", "--config", "/data/omi/config.toml"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_qa_entrypoint.py", "--healthcheck"]
     mem_limit: 1g
     environment:
       PYTHONUNBUFFERED: "1"

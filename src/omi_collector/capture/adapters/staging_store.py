@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import errno
 import os
+import sqlite3
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
-from hashlib import sha256
+from contextlib import closing, contextmanager
 from logging import getLogger
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from uuid import uuid4
 
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
+from ..application.storage_fault import TransientInternalAudioStorageError
 from ..domain.quarantine_machine import QuarantineState
 from ..domain.ready_machine import (
     CaptureBegin,
@@ -38,34 +38,42 @@ from ..domain.ready_machine import (
     publication_transition,
     recovered_closure,
 )
-from ..domain.ring_protocol import RECORD_SIZE
-from . import publication, quarantine, ready_closures
-from .attempts import StagedAttempt
+from . import quarantine, ready_closures
+from .attempts import SqliteAttemptInspection, SqliteStagedAttempt
 from .clock_segments import ClockSegmentError, ClockSegmentMap
-from .collector_state_db import StateDB, StateKind
+from .collector_state_db import StateDB, StateDBError, StateKind, raise_if_sqlite_storage_fault
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
-from .debug_logging import debug_event
+from .debug_logging import debug_event, debug_exception
+from .internal_audio_store import (
+    AUDIO_RECORD_SIZE,
+    CaptureSource,
+    InternalAudioStore,
+    InternalAudioStoreError,
+    authenticate_capture_source,
+    capture_space_requirement,
+    read_capture_source,
+    refresh_utc_projection,
+)
 from .ready_bundles import (
     ReadyBundleError,
-    ReadyInventory,
+    ReadyCustodyCache,
     ReadyOutcome,
     ReadyOutcomeState,
+    SqlitePublicationSource,
     acknowledged_ready,
-    authenticated_inventory,
-    draft_frontier,
-    finalize_drafts,
-    legacy_ready_retirement_ranges,
+    finalize_typed_sources,
     resume_retired,
     retire_acknowledged,
     source_revision,
 )
 from .staging_contract import (
-    _RAW_NAME,
     AttemptDescriptor,
     AttemptStateError,
     DeviceAlreadyRunningError,
+    DiskSpaceError,
+    FatalInternalAudioStorageError,
     PendingAttemptError,
-    StreamingCheckpoint,
+    StagingError,
     _validate_attempt_id,
     _validate_count,
     _validate_int,
@@ -76,14 +84,8 @@ from .staging_filesystem import (
     StagingFilesystem,
     StagingIO,
     StagingPaths,
-    _create_empty_synced,
     _never_defer,
-    _require_regular_directory,
-    _sync_directory,
 )
-
-if TYPE_CHECKING:
-    from .quarantine_publish import QuarantinePublication
 
 _LOGGER = getLogger(__name__)
 _UNKNOWN_REVISION = object()
@@ -111,16 +113,26 @@ def _debug_publication_failure(
     )
 
 
-def _publication_io_reason(error: OSError) -> str:
+def _publication_io_reason(error: OSError | TransientInternalAudioStorageError) -> str:
+    if isinstance(error, TransientInternalAudioStorageError):
+        return "publication_sqlite_busy"
     if error.errno in {errno.EACCES, errno.EPERM}:
         return "publication_access_denied"
     return "publication_io_error"
 
 
-@dataclass(frozen=True, slots=True)
-class _FailedReadyInspection:
-    revision: tuple[tuple[str, int, int, int, int, int], ...]
-    error: ReadyBundleError
+def _db_one(cursor: sqlite3.Cursor) -> sqlite3.Row | tuple[object, ...] | None:
+    try:
+        return cast(sqlite3.Row | tuple[object, ...] | None, cursor.fetchone())
+    finally:
+        cursor.close()
+
+
+def _db_all(cursor: sqlite3.Cursor) -> list[sqlite3.Row] | list[tuple[object, ...]]:
+    try:
+        return cursor.fetchall()
+    finally:
+        cursor.close()
 
 
 class StagingStore:
@@ -142,11 +154,10 @@ class StagingStore:
             state_db=state_db,
             io=io,
         )
-        self._validated_attempts: dict[str, StagedAttempt] = {}
         self._publication_root: Path | None = None
         self._publication_lock = Lock()
         self._publication_state = PublicationState()
-        self._ready_inspection: ReadyInventory | _FailedReadyInspection | None = None
+        self._ready_custody_cache: ReadyCustodyCache | None = None
 
     @classmethod
     def from_paths(
@@ -162,11 +173,10 @@ class StagingStore:
         store._config = io.config
         store._state_db = state_db
         store._filesystem = StagingFilesystem.from_paths(paths, state_db=state_db, io=io)
-        store._validated_attempts = {}
         store._publication_root = publication_root
         store._publication_lock = Lock()
         store._publication_state = PublicationState()
-        store._ready_inspection = None
+        store._ready_custody_cache = None
         return store
 
     def publish_ready(self, held_lease: DeviceLock | None = None) -> ReadyOutcome:
@@ -205,10 +215,10 @@ class StagingStore:
 
     def _execute_publication_command(self, command: PublicationCommand, held_lease: DeviceLock | None) -> ReadyOutcome:
         while command.action is PublicationAction.CHECK_INPUT:
-            probe_error: OSError | None = None
+            probe_error: OSError | TransientInternalAudioStorageError | None = None
             try:
                 revision: object = self._publication_revision()
-            except OSError as error:
+            except (OSError, TransientInternalAudioStorageError) as error:
                 _debug_publication_failure(error, phase="input_revision")
                 revision = _UNKNOWN_REVISION
                 probe_error = error
@@ -238,7 +248,7 @@ class StagingStore:
         phase = "publication_effect"
         try:
             if held_lease is None:
-                with self.device_lock(recover_capture_temporaries=False, operation="ready_publication"):
+                with self.device_lock(operation="ready_publication"):
                     outcome = self._recover_and_publish_unlocked()
                     phase = "post_effect_revision"
                     revision = self._publication_revision()
@@ -248,18 +258,25 @@ class StagingStore:
                 phase = "post_effect_revision"
                 revision = self._publication_revision()
             return outcome, revision
+        except FatalInternalAudioStorageError:
+            raise
         except DeviceAlreadyRunningError as error:
             _debug_publication_failure(error, phase="device_lock", path=self._filesystem.lock_path)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="publication_lock_busy"), running.revision
-        except OSError as error:
+        except (OSError, TransientInternalAudioStorageError) as error:
             _debug_publication_failure(error, phase=phase)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), running.revision
         except Exception as error:
             if not isinstance(error, ReadyBundleError):
-                _LOGGER.exception("ready publication failed unexpectedly")
+                debug_exception(
+                    "ready_publication_failure",
+                    error,
+                    phase=phase,
+                )
+                _LOGGER.exception("ready publication failed unexpectedly", exc_info=Exception("details redacted"))
             try:
                 revision = self._publication_revision()
-            except OSError as revision_error:
+            except (OSError, TransientInternalAudioStorageError) as revision_error:
                 if isinstance(error, ReadyBundleError):
                     _debug_publication_failure(error, phase="publication_effect")
                 _debug_publication_failure(revision_error, phase="post_effect_revision")
@@ -285,6 +302,8 @@ class StagingStore:
             Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff)
         )
         if next_command.action is PublicationAction.CHECK_INPUT:
+            if outcome.retirement_pending:
+                return outcome
             checked = self._execute_publication_command(next_command, held_lease)
             if outcome.state is ReadyOutcomeState.PUBLISHED and checked.state is ReadyOutcomeState.WAITING:
                 return outcome
@@ -299,7 +318,7 @@ class StagingStore:
         checkpoint_path = self._publication_root.parent / "work" / "omi-ready-checkpoint.json"
         return (
             self._state_db.get_generation(),
-            source_revision(self.capture_root, self._publication_root, extras=(checkpoint_path,)),
+            source_revision(self._publication_root, extras=(checkpoint_path,)),
         )
 
     def publication_retry_schedule(self) -> tuple[int, float] | None:
@@ -312,13 +331,15 @@ class StagingStore:
 
     def publication_followup_due(self) -> bool:
         """Report a reducer-issued input check that has not been consumed."""
+        if self._publication_root is None:
+            return False
         with self._publication_lock:
             state = self._publication_state
             return state.mode is PublicationMode.AVAILABLE and state.needs_check
 
     def publication_wake_admitted(self) -> bool:
         with self._publication_lock:
-            return self._publication_state.mode is PublicationMode.AVAILABLE
+            return self._publication_root is not None and self._publication_state.mode is PublicationMode.AVAILABLE
 
     def publication_timer_fired(self, generation: int, deadline: float) -> bool:
         command = self._publication_event(TimerFired(generation, deadline, monotonic()))
@@ -348,33 +369,22 @@ class StagingStore:
         return self.publish_ready()
 
     def inspect_recovery(self) -> tuple[bool, bool]:
-        """Report prefix-marker and orphan-draft evidence under the device lease."""
-        with self.device_lock(recover_capture_temporaries=False, operation="inspect_recovery"):
-            recoverable_prefix = False
-            if self.attempts_root.exists():
-                _require_regular_directory(self.attempts_root)
-                for path in self.attempts_root.iterdir():
-                    if path.is_symlink() or not path.is_dir():
-                        raise AttemptStateError("partial staging root contains a non-directory entry")
-                    row = self._filesystem._read_attempt_row_if_valid_schema(path.name)
-                    if row is None:
-                        # Let pending-attempt inspection classify attributable
-                        # corruption so startup can move it to quarantine while
-                        # retaining the raw evidence.
-                        continue
-                    if row["terminal_retirement"] is not None:
-                        continue
-                    if row["prefix_publication"] is not None:
-                        recoverable_prefix = True
-                        break
-            frontier = self._cached_draft_frontier()
+        """Report sealed SQL prefixes and orphan-draft evidence under the lease."""
+        with self.device_lock(operation="inspect_recovery"):
             closures = ready_closures.coalesce(self._state_db)
+            closed_frontier = closures[-1].next_sequence if closures else None
+            recoverable_prefix = any(
+                source.lifecycle == "sealed_waiting"
+                and (closed_frontier is None or source.sequence_start + source.committed_count > closed_frontier)
+                for source in self._typed_attempt_sources(include_sealed=True)
+            )
+            frontier = self._cached_draft_frontier()
             unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
             return recoverable_prefix, unclosed_drafts
 
     def append_ready_closure(self, next_sequence: int, reason: str) -> ready_closures.ReadyClosure:
         """Durably close one physical visit before allowing ready publication."""
-        with self.device_lock(recover_capture_temporaries=False, operation="ready_closure") as lease:
+        with self.device_lock(operation="ready_closure") as lease:
             return self._append_ready_closure_unlocked(lease, next_sequence, reason)
 
     def begin_ready_visit(self) -> ready_closures.ReadyClosure | None:
@@ -387,68 +397,65 @@ class StagingStore:
         if active is not None:
             self._filesystem.require_device_lock(active)
             return ready_closures.begin_visit(self._state_db)
-        with self.device_lock(recover_capture_temporaries=False, operation="ready_visit_begin"):
+        with self.device_lock(operation="ready_visit_begin"):
             return ready_closures.begin_visit(self._state_db)
 
     def close_orphaned_drafts(
         self, reason: str, *, drain_cursor: int | None = None
     ) -> ready_closures.ReadyClosure | None:
         """Create a restart closure for authenticated drafts without a pending attempt."""
-        with self.device_lock(recover_capture_temporaries=False, operation="close_orphaned_drafts") as lease:
+        with self.device_lock(operation="close_orphaned_drafts") as lease:
             frontier = self._cached_draft_frontier()
             return self._merge_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
 
     def _cached_draft_frontier(self) -> int | None:
-        publication_root = self._publication_root
-        if publication_root is None or not publication_root.is_dir():
-            return draft_frontier(self.capture_root)
-        inventory = self._authenticated_ready_inventory(publication_root)
-        return max((draft.manifest.next_sequence for draft in inventory.drafts), default=None)
-
-    def _authenticated_ready_inventory(self, publication_root: Path) -> ReadyInventory:
-        """Reuse an authenticated view or the unchanged source-validation failure."""
-        revision = source_revision(self.capture_root, publication_root)
-        previous = self._ready_inspection
-        if isinstance(previous, _FailedReadyInspection) and previous.revision == revision:
-            raise previous.error.with_traceback(None)
-        prior_inventory = previous if isinstance(previous, ReadyInventory) else None
         try:
-            inventory = authenticated_inventory(self.capture_root, publication_root, prior_inventory)
-        except ReadyBundleError as error:
-            self._ready_inspection = _FailedReadyInspection(revision, error)
-            raise
-        self._ready_inspection = inventory
-        return inventory
+            with (
+                closing(self._state_db.open_connection(read_only=True)) as connection,
+                self._state_db.access(connection),
+            ):
+                rows = cast(
+                    list[tuple[object, object]],
+                    _db_all(
+                        connection.execute(
+                            "SELECT sequence_start, committed_count FROM capture_source "
+                            "WHERE source_type = 'draft' AND committed_count > 0"
+                        )
+                    ),
+                )
+        except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
+            raise StagingError("typed draft frontier is unreadable") from error
+        return max((int.from_bytes(cast(bytes, row[0]), "big") + cast(int, row[1]) for row in rows), default=None)
 
     def close_pending_prefix(
         self, reason: str, *, include_unpublished: bool = True, drain_cursor: int | None = None
     ) -> ready_closures.ReadyClosure | None:
-        """Replay and close every published or resumable prefix under one lease."""
-        with self.device_lock(recover_capture_temporaries=False, operation="close_pending_prefix") as lease:
+        """Seal the durable SQL prefix and append its recovered closure."""
+        with self.device_lock(operation="close_pending_prefix") as lease:
             self._validate_recovery_cursor_unlocked(lease, reason, drain_cursor)
-            candidates = self._pending_prefix_candidates(include_unpublished)
-            drained_plan: tuple[tuple[int, str] | None, ready_closures.ReadyClosure | None] | None = None
-            orphan_frontier = self._cached_draft_frontier() if reason == "drained" else None
-            preflight_all = reason == "drained" and (len(candidates) > 1 or orphan_frontier is not None)
-            if preflight_all:
-                frontiers = [self._preflight_prefix_frontier(item[2]) for item in candidates]
-                if orphan_frontier is not None:
-                    frontiers.append(orphan_frontier)
-                frontier = max(frontiers) if frontiers else None
-                drained_plan = self._decide_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
-            if not candidates:
+            sources = tuple(
+                source
+                for source in self._typed_attempt_sources(include_sealed=True)
+                if include_unpublished or source.lifecycle == "sealed_waiting"
+            )
+            if not sources:
                 return None
-            last_closure: ready_closures.ReadyClosure | None = None
-            for _start_sequence, _path, descriptor in sorted(candidates, key=lambda item: item[0]):
-                last_closure = self._close_prefix_candidate(
-                    lease, descriptor, reason, drain_cursor, defer_drain_commit=preflight_all
-                )
-            if drained_plan is not None:
-                decision, existing = drained_plan
-                if decision is None:
-                    return existing
-                return self._append_ready_closure_unlocked(lease, *decision)
-            return last_closure
+            orphan_frontier = self._cached_draft_frontier() if reason == "drained" else None
+            frontiers = [source.sequence_start + source.committed_count for source in sources]
+            if orphan_frontier is not None:
+                frontiers.append(orphan_frontier)
+            frontier = max(frontiers) if frontiers else None
+            assert frontier is not None
+            decision, existing = self._decide_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
+            for source in sources:
+                if source.lifecycle != "sealed_waiting":
+                    self.terminalize_prefix_attempt_held(source.source_id, lease)
+            if sources:
+                self.publication_input_changed()
+            if decision is None:
+                return existing
+            return self._append_ready_closure_unlocked(lease, *decision)
 
     def _validate_recovery_cursor_unlocked(self, lease: DeviceLock, reason: str, drain_cursor: int | None) -> None:
         self._filesystem.require_device_lock(lease)
@@ -463,65 +470,6 @@ class StagingStore:
             )
         except ValueError as error:
             raise ready_closures.ReadyClosureError(str(error)) from error
-
-    def _pending_prefix_candidates(self, include_unpublished: bool) -> list[tuple[int, Path, AttemptDescriptor]]:
-        if not self.attempts_root.exists():
-            return []
-        _require_regular_directory(self.attempts_root)
-        pending_ids = (
-            {descriptor.attempt_id for descriptor in self.pending_attempts()} if include_unpublished else set()
-        )
-        candidates: list[tuple[int, Path, AttemptDescriptor]] = []
-        for path in tuple(self.attempts_root.iterdir()):
-            if path.is_symlink() or not path.is_dir():
-                raise AttemptStateError("partial staging root contains a non-directory entry")
-            row = self._filesystem._read_attempt_row(path.name)
-            if row["terminal_retirement"] is not None:
-                continue
-            marker_present = row["prefix_publication"] is not None
-            if not marker_present and path.name not in pending_ids:
-                continue
-            descriptor = self._filesystem._read_descriptor(path)
-            candidates.append((descriptor.start_sequence, path, descriptor))
-        return candidates
-
-    def _close_prefix_candidate(
-        self,
-        lease: DeviceLock,
-        descriptor: AttemptDescriptor,
-        reason: str,
-        drain_cursor: int | None,
-        *,
-        defer_drain_commit: bool,
-    ) -> ready_closures.ReadyClosure | None:
-        attempt = self.open_attempt(descriptor.attempt_id)
-        try:
-            attempt.activate_for_resume(lease)
-            prefix = attempt.durable_prefix
-            decision, existing = (None, None)
-            if reason != "drained" or not defer_drain_commit:
-                decision, existing = self._decide_recovered_closure_unlocked(
-                    lease, prefix.next_sequence, reason, drain_cursor
-                )
-            attempt.publish_prefix()
-            attempt.close(durable=True)
-            self.terminalize_prefix_attempt_held(attempt.attempt_id, lease)
-            if reason == "drained" and defer_drain_commit:
-                return None
-            if decision is None:
-                return existing
-            return self._append_ready_closure_unlocked(lease, *decision)
-        finally:
-            attempt.close(durable=True)
-
-    def _preflight_prefix_frontier(self, descriptor: AttemptDescriptor) -> int:
-        attempt = self.open_attempt(descriptor.attempt_id)
-        try:
-            recovery = attempt.recover()
-            recovered_records = max(recovery.valid_records, recovery.raw_bytes // RECORD_SIZE)
-            return descriptor.start_sequence + recovered_records
-        finally:
-            attempt.close()
 
     def _decide_recovered_closure_unlocked(
         self, lease: DeviceLock, frontier: int | None, reason: str, drain_cursor: int | None
@@ -559,15 +507,27 @@ class StagingStore:
         self._publication_event(InputChanged())
         return closure
 
-    def _guard_legacy_ready_retirement(self, publication_root: Path, acknowledged: tuple[tuple[str, str], ...]) -> None:
-        legacy_ranges = legacy_ready_retirement_ranges(publication_root, self._state_db, acknowledged)
-        if not legacy_ranges:
-            return
-        from .attempt_cleanup import terminal_attempts_overlap
-
-        self.sweep_terminal_retired()
-        if terminal_attempts_overlap(self._filesystem, legacy_ranges):
-            raise ReadyBundleError("legacy ready retirement still has terminal raw without durable lineage")
+    def _typed_publication_source_ids(self) -> tuple[str, ...]:
+        """List SQL sources that the canonical publisher can admit or resume."""
+        try:
+            with (
+                closing(self._state_db.open_connection(read_only=True)) as connection,
+                self._state_db.access(connection),
+            ):
+                rows = cast(
+                    list[tuple[object]],
+                    _db_all(
+                        connection.execute(
+                            "SELECT source_id FROM capture_source "
+                            "WHERE lifecycle IN ('sealed_waiting','blocked') "
+                            "ORDER BY sequence_start, source_id"
+                        )
+                    ),
+                )
+        except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
+            raise ReadyBundleError("typed publication source inventory is unreadable") from error
+        return tuple(str(row[0]) for row in rows)
 
     def _recover_and_publish_unlocked(self) -> ReadyOutcome:
         publication_root = self._publication_root
@@ -582,37 +542,37 @@ class StagingStore:
         except (ClockSegmentError, ValueError) as error:
             _LOGGER.warning("clock metadata unavailable; publishing ready audio without UTC normalization: %s", error)
             segments = ClockSegmentMap(())
-        self._guard_legacy_ready_retirement(publication_root, acknowledged)
         resume_retired(publication_root, self._state_db)
         closures = ready_closures.coalesce(self._state_db)
-        outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="no_closed_frontier")
-        if not closures:
-            self._authenticated_ready_inventory(publication_root)
-        else:
-            closure = closures[-1]
-            try:
-                inventory = self._authenticated_ready_inventory(publication_root)
-                outcome = finalize_drafts(
-                    self.capture_root,
-                    publication_root,
-                    self._state_db,
-                    segments,
-                    config=self._filesystem._ready,
-                    frontier=closure.next_sequence,
-                    drained=closure.reason == "drained",
-                    inventory=inventory,
+        closure = closures[-1] if closures else None
+        frontier = None if closure is None else closure.next_sequence
+        drained = closure is not None and closure.reason == "drained"
+        try:
+            with InternalAudioStore(
+                self._state_db,
+                chunk_limit=self._config.writer.chunk_records,
+            ) as audio_store:
+                sources = tuple(
+                    SqlitePublicationSource(audio_store, source_id)
+                    for source_id in self._typed_publication_source_ids()
                 )
-                self._ready_inspection = outcome.inventory
-            except ReadyBundleError as error:
-                outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
-            if not outcome.remaining_at_frontier:
-                inventory = self._authenticated_ready_inventory(publication_root)
-                pending = any(draft.manifest.next_sequence <= closure.next_sequence for draft in inventory.drafts)
-                if pending:
-                    outcome = replace(outcome, remaining_at_frontier=True, inventory=inventory)
-                else:
-                    ready_closures.remove(self._state_db, closure)
-        self._guard_legacy_ready_retirement(publication_root, acknowledged)
+                outcome = finalize_typed_sources(
+                    audio_store,
+                    sources,
+                    publication_root,
+                    config=self._filesystem._ready,
+                    clock_segments=segments,
+                    frontier=frontier,
+                    drained=drained,
+                    page_limit=self._config.writer.chunk_records,
+                    custody_cache=self._ready_custody_cache,
+                )
+                if outcome.custody_cache is not None:
+                    self._ready_custody_cache = outcome.custody_cache
+        except ReadyBundleError as error:
+            outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
+        if closure is not None and not outcome.remaining_at_frontier:
+            ready_closures.remove(self._state_db, closure)
         retired = retire_acknowledged(publication_root, self._state_db, checkpoint_path, acknowledged=acknowledged)
         if retired and outcome.state is ReadyOutcomeState.WAITING:
             outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="ack_retired")
@@ -643,6 +603,22 @@ class StagingStore:
         elif self._state_db.get(StateKind.OPERATIONAL_STATUS, "current") is not None:
             raise ConfirmedLossError("confirmed-loss ledger is missing after status initialization")
 
+    def require_capture_space(self, record_count: int) -> None:
+        """Refresh the bounded SQLite growth and journal reserve before READ."""
+        required, available = capture_space_requirement(
+            self._state_db,
+            record_count,
+            self._config.writer.chunk_records,
+        )
+        raw_bytes = record_count * AUDIO_RECORD_SIZE
+        safety = max(
+            self._config.durability.staging_headroom_bytes,
+            int(raw_bytes * self._config.durability.staging_overhead_fraction),
+        )
+        required += safety
+        if available < required:
+            raise DiskSpaceError(f"need {required} bytes of capture space; only {available} bytes available")
+
     def initialize_confirmed_loss_ledger(self) -> None:
         """Initialize only before the first operational snapshot exists."""
         with self.clock_mutation_lease():
@@ -666,18 +642,10 @@ class StagingStore:
                 occurred_at,
             )
 
-    def quarantine_pending(self, reason: str) -> tuple[Path, ...]:
-        moved = quarantine.quarantine_pending(self._filesystem, reason)
-        for attempt_id, attempt in tuple(self._validated_attempts.items()):
-            if not attempt.path.exists():
-                self._validated_attempts.pop(attempt_id, None)
-                attempt.close()
-        return moved
+    def quarantine_pending(self, reason: str) -> tuple[str, ...]:
+        return quarantine.quarantine_pending(self._filesystem, reason)
 
-    def quarantine_attempt_source(self, attempt_id: str) -> Path:
-        cached = self._validated_attempts.pop(attempt_id, None)
-        if cached is not None:
-            cached.close()
+    def quarantine_attempt_source(self, attempt_id: str) -> str:
         return quarantine.quarantine_attempt_source(
             self._filesystem,
             attempt_id,
@@ -693,83 +661,130 @@ class StagingStore:
         """Terminalize a prefix under the writer's already-held device lease."""
         quarantine.terminalize_prefix_attempt_held(self._filesystem, attempt_id, lease)
 
-    def sweep_terminal_retired(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
-        return quarantine.sweep_terminal_retired(
-            self._filesystem,
-            ready_root=self._publication_root,
-            should_defer=should_defer or _never_defer,
-        )
-
-    def quarantined_attempts(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
+    def quarantined_attempts(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[str, ...]:
         return quarantine.quarantined_attempts(
             self._filesystem,
             should_defer=should_defer or _never_defer,
         )
 
-    def quarantine_state(self, source: Path) -> QuarantineState:
+    def quarantine_state(self, source: str) -> QuarantineState:
         return quarantine._quarantine_state(self._filesystem, source)
 
-    def mark_quarantine_published(self, source: Path) -> None:
-        quarantine.mark_quarantine_published(
-            self._filesystem,
-            source,
-        )
-
-    def mark_quarantine_unprocessable(self, source: Path, reason: str) -> None:
+    def mark_quarantine_unprocessable(self, source: str, reason: str) -> None:
         quarantine.mark_quarantine_unprocessable(
             self._filesystem,
             source,
             reason,
         )
 
-    def publish_quarantined_prefix(
-        self, source: Path, *, should_defer: Callable[[], bool] = _never_defer
-    ) -> QuarantinePublication:
-        """Salvage one quarantined prefix through this store's explicit paths capability."""
-        from .quarantine_publish import publish_quarantined_prefix
-
+    def admit_quarantined_prefix(
+        self, source: str, *, should_defer: Callable[[], bool] = _never_defer
+    ) -> quarantine.QuarantinePrefixAdmission:
+        """Admit a certified SQL prefix to the normal publication scheduler."""
         active_lease = self._filesystem._active_lease
         if active_lease is None:
-            with self.device_lock(recover_capture_temporaries=False, operation="publish_quarantined_prefix") as lease:
-                published = publish_quarantined_prefix(source, self._filesystem, lease, should_defer=should_defer)
+            with self.device_lock(operation="admit_quarantined_prefix"):
+                admitted = quarantine.admit_quarantined_prefix(
+                    self._filesystem,
+                    source,
+                    should_defer=should_defer,
+                    page_limit=self._config.writer.chunk_records,
+                )
         else:
-            published = publish_quarantined_prefix(source, self._filesystem, active_lease, should_defer=should_defer)
+            self._filesystem.require_device_lock(active_lease)
+            admitted = quarantine.admit_quarantined_prefix(
+                self._filesystem,
+                source,
+                should_defer=should_defer,
+                page_limit=self._config.writer.chunk_records,
+            )
         self.publication_input_changed()
-        return published
+        return admitted
 
-    def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool] | None = None) -> tuple[Path, ...]:
-        return quarantine.sweep_terminal_quarantine(
+    def sweep_terminal_quarantine(self, *, should_defer: Callable[[], bool] | None = None) -> quarantine.SweepResult:
+        generation = self._state_db.get_generation()
+        result = quarantine.sweep_terminal_quarantine(
             self._filesystem,
             should_defer=should_defer or _never_defer,
+            chunk_limit=self._config.writer.chunk_records,
         )
+        if self._state_db.get_generation() != generation:
+            self.publication_input_changed()
+        return result
+
+    def refresh_utc_projection(self) -> int:
+        """Refresh one bounded chunk of queryable UTC metadata during idle maintenance."""
+
+        return refresh_utc_projection(self._state_db, chunk_limit=self._config.writer.chunk_records)
 
     def assert_no_pending(self) -> None:
         quarantine.assert_no_pending(self._filesystem)
 
-    def prepare_streaming_attempt(self, start_sequence: int, packet_count: int) -> StagedAttempt:
-        """Prepare a restart-safe streaming attempt and its empty checkpoint."""
+    def _typed_attempt_sources(self, *, include_sealed: bool = False) -> tuple[CaptureSource, ...]:
+        """Read typed attempt snapshots without creating a persistent writer."""
+        lifecycles = "('prepared','leg_prepared','receiving','interrupted'"
+        if include_sealed:
+            lifecycles += ",'sealed_waiting'"
+        lifecycles += ")"
+        try:
+            with (
+                closing(self._state_db.open_connection(read_only=True)) as connection,
+                self._state_db.access(connection),
+            ):
+                rows = cast(
+                    list[tuple[object]],
+                    _db_all(
+                        connection.execute(
+                            "SELECT source_id FROM capture_source "
+                            f"WHERE source_type = 'attempt' AND lifecycle IN {lifecycles} ORDER BY source_id"
+                        )
+                    ),
+                )
+        except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+            raise_if_sqlite_storage_fault(error)
+            raise AttemptStateError("typed attempt inventory is unreadable") from error
+        sources: list[CaptureSource] = []
+        try:
+            for row in rows:
+                source = read_capture_source(self._state_db, str(row[0]))
+                if source is not None:
+                    sources.append(source)
+        except InternalAudioStoreError as error:
+            raise AttemptStateError("typed attempt inventory is unreadable") from error
+        return tuple(sources)
+
+    @staticmethod
+    def _typed_descriptor(source: CaptureSource) -> AttemptDescriptor:
+        return AttemptDescriptor(
+            source.source_id,
+            2,
+            source.sequence_start,
+            source.sequence_limit - source.sequence_start,
+            read_begin_start=source.read_begin_start,
+            read_begin_count=source.read_begin_count,
+        )
+
+    def prepare_streaming_attempt(self, start_sequence: int, packet_count: int) -> SqliteStagedAttempt:
+        """Prepare a restart-safe typed source before issuing READ."""
         # Mirrors the app's buffered/full-read transfer model:
         # https://github.com/BasedHardware/omi/blob/6f7c57ac1545c1931c806a01605646405d398198/app/lib/services/wals/ring_storage_sync.dart#L545-L608
         _validate_int(start_sequence, "start_sequence")
         _validate_count(packet_count)
-        self._filesystem._preflight(packet_count)
-        self._filesystem._ensure_directory(self.attempts_root)
-        descriptor = AttemptDescriptor(
-            uuid4().hex,
-            2,
-            start_sequence,
-            packet_count,
-        )
-        attempt_path = self.attempts_root / descriptor.attempt_id
-        self._filesystem._ensure_directory(attempt_path)
-        _create_empty_synced(attempt_path / _RAW_NAME, self._filesystem._fsync)
-        _sync_directory(attempt_path, self._filesystem._fsync)
-        self._filesystem._create_attempt_row(
-            descriptor.attempt_id,
-            asdict(descriptor),
-            asdict(StreamingCheckpoint(1, descriptor.attempt_id, 0, sha256(b"").hexdigest())),
-        )
-        return StagedAttempt(self._filesystem, attempt_path, descriptor)
+        source_id = uuid4().hex
+        try:
+            audio_store = InternalAudioStore(
+                self._state_db,
+                chunk_limit=self._config.writer.chunk_records,
+                terminal_retention_seconds=self._config.staging_retention.terminal_retention_seconds,
+            )
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        try:
+            source = audio_store.create_source(source_id, "attempt", start_sequence, start_sequence + packet_count)
+        except InternalAudioStoreError as error:
+            audio_store.close()
+            raise AttemptStateError(str(error)) from error
+        return SqliteStagedAttempt(audio_store, source, self._typed_descriptor(source), close_store=True)
 
     def make_staging_writer(self, start: int, count: int) -> StagingWriterTargetPort:
         """Construct the sole writer target without exposing this concrete store to runtime composition."""
@@ -777,24 +792,22 @@ class StagingStore:
 
         return StagingWriter(self, start, count)
 
-    def open_attempt(self, attempt_id: str) -> StagedAttempt:
-        """Open a valid persisted attempt without changing it."""
+    def open_attempt(self, attempt_id: str) -> SqliteAttemptInspection:
+        """Open one immutable SQL snapshot without creating a persistent writer."""
         _validate_attempt_id(attempt_id)
-        attempt_path = self.attempts_root / attempt_id
-        descriptor = self._filesystem._read_descriptor(attempt_path)
-        _require_regular_directory(attempt_path)
-        return StagedAttempt(self._filesystem, attempt_path, descriptor, live=False)
+        try:
+            typed = authenticate_capture_source(
+                self._state_db,
+                attempt_id,
+                page_limit=self._config.writer.chunk_records,
+            )
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        if typed is not None and typed.source_type == "attempt":
+            return SqliteAttemptInspection(typed, self._typed_descriptor(typed))
+        raise AttemptStateError("typed audio source does not exist")
 
-    def retain_validated_attempt(self, attempt_id: str, attempt: object) -> None:
-        """Transfer ownership of a startup-hydrated attempt to the next lease."""
-        if not isinstance(attempt, StagedAttempt):
-            raise TypeError("validated attempt must be a StagedAttempt")
-        previous = self._validated_attempts.pop(attempt_id, None)
-        if previous is not None and previous is not attempt:
-            previous.close()
-        self._validated_attempts[attempt_id] = attempt
-
-    def resume_streaming_attempt(self, lease: StorageLeasePort) -> StagedAttempt | None:
+    def resume_streaming_attempt(self, lease: StorageLeasePort) -> SqliteStagedAttempt | None:
         """Validate and reopen the unique streaming partial under an active lease.
 
         ``open_attempt`` is deliberately inspection-only.  This consuming seam
@@ -806,41 +819,53 @@ class StagingStore:
         lease.require_active()
         if lease.filesystem is not self._filesystem:
             raise AttemptStateError("resume requires the active spool lock")
-        candidates = self.pending_attempts()
-        if len(candidates) > 1:
-            raise PendingAttemptError("multiple partial attempts block resume")
-        if not candidates:
-            return None
-        descriptor = candidates[0]
-        path = self.attempts_root / descriptor.attempt_id
-        _require_regular_directory(path)
-        attempt = self._validated_attempts.pop(descriptor.attempt_id, None)
-        if attempt is None:
-            attempt = StagedAttempt(self._filesystem, path, descriptor, live=False)
-        attempt.activate_for_resume(lease)
-        return attempt
+        typed_candidates = self._typed_attempt_sources()
+        if len(typed_candidates) > 1:
+            raise PendingAttemptError("multiple partial typed attempts block resume")
+        if typed_candidates:
+            source = typed_candidates[0]
+            try:
+                audio_store = InternalAudioStore(
+                    self._state_db,
+                    chunk_limit=self._config.writer.chunk_records,
+                    terminal_retention_seconds=self._config.staging_retention.terminal_retention_seconds,
+                )
+            except InternalAudioStoreError as error:
+                raise AttemptStateError(str(error)) from error
+            try:
+                if source.lifecycle == "receiving":
+                    source = audio_store.interrupt(source.source_id)
+            except InternalAudioStoreError as error:
+                audio_store.close()
+                raise AttemptStateError(str(error)) from error
+            attempt = SqliteStagedAttempt(
+                audio_store,
+                source,
+                self._typed_descriptor(source),
+                close_store=True,
+            )
+            try:
+                attempt.activate_for_resume(lease)
+            except BaseException:
+                attempt.close()
+                raise
+            return attempt
+        return None
 
     def pending_attempts(self) -> tuple[AttemptDescriptor, ...]:
+        typed = self._typed_attempt_sources()
+        if typed:
+            return tuple(self._typed_descriptor(source) for source in typed)
         return quarantine.pending_attempts(self._filesystem)
 
     @contextmanager
     def device_lock(
         self,
         *,
-        recover_capture_temporaries: bool = True,
         operation: str = "unknown",
     ) -> Iterator[DeviceLock]:
-        """Acquire the filesystem lease, then sequence publication recovery and quarantine."""
+        """Acquire the filesystem lease for one typed storage mutation."""
         with self._filesystem.device_lock(operation=operation) as lease:
-            if recover_capture_temporaries:
-                unsafe = publication.recover_capture_temporaries(self._filesystem)
-                for temporary, capture_root, reason in unsafe:
-                    quarantine.quarantine_capture_temporary(
-                        self._filesystem,
-                        temporary,
-                        capture_root,
-                        reason,
-                    )
             yield lease
 
     @contextmanager
@@ -851,7 +876,7 @@ class StagingStore:
             self._filesystem.require_device_lock(active)
             yield active
             return
-        with self.device_lock(recover_capture_temporaries=False, operation="clock_mutation") as lease:
+        with self.device_lock(operation="clock_mutation") as lease:
             yield lease
 
     def require_device_lock(self, lease: DeviceLock) -> None:

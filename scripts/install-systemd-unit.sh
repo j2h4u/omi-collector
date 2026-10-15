@@ -379,5 +379,5 @@ if (( restart_requested )); then
     systemctl restart "$service_name" || die "could not restart ${service_name}"
     printf 'Restarted %s.\n' "$service_name"
 else
-    printf 'Service was not started; deploy a release before starting it.\n'
+    printf 'Systemd configuration installed; application deployment starts the service.\n'
 fi

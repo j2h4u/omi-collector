@@ -330,6 +330,7 @@ class AttemptWriter:
 
     async def wait_failure(self) -> BaseException:
         """Wake the active READ owner when the target first fails."""
+        self._loop_for_completion()
         failure = self.failure
         if failure is not None:
             return failure

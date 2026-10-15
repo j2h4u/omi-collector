@@ -354,7 +354,8 @@ async def read_leg(
         state.failure_message = "timed out during READ"
         state.failure_cause = error
         state.progress_mailbox.finish()
-        raise await _interrupt(session, state, arena, writer, options) from error
+        interrupted = await _interrupt(session, state, arena, writer, options)
+        raise interrupted from interrupted.__cause__
     except _WriterIngestError as error:
         state.progress_mailbox.finish()
         state.failure_cause = error.failure
@@ -367,7 +368,8 @@ async def read_leg(
         state.failure_message = str(error)
         state.failure_cause = error
         state.progress_mailbox.finish()
-        raise await _interrupt(session, state, arena, writer, options) from error
+        interrupted = await _interrupt(session, state, arena, writer, options)
+        raise interrupted from interrupted.__cause__
 
     if state.phase is not batch_machine.ReadPhase.DONE:  # defensive; only validated DONE exits the loop
         raise RingTransferError("READ ended without terminal DONE")
@@ -449,8 +451,7 @@ async def _cancel_and_join[T](task: asyncio.Future[T]) -> None:
             task.result()
         return
     task.cancel()
-    with suppress(asyncio.CancelledError):
-        await join_owned(asyncio.gather(task, return_exceptions=True))
+    await join_owned(asyncio.gather(task, return_exceptions=True))
 
 
 def _parse_read_leg_call(
@@ -590,15 +591,18 @@ async def _interrupt(
             return await _interrupt_failed_writer(session, state, arena, writer, options)
         assert selected is batch_machine.ReadEvent.READ_FAILED
         _move_read(state, selected, batch_machine.ReadAction.STOP)
+    cancellation: asyncio.CancelledError | None = None
     try:
         await join_owned(_stop_best_effort(session, options.cleanup_timeout))
-    except asyncio.CancelledError:
-        _move_read(state, batch_machine.ReadEvent.CANCELLED, batch_machine.ReadAction.IGNORE)
+    except asyncio.CancelledError as error:
+        cancellation = error
+        _move_read(state, batch_machine.ReadEvent.CANCELLED, batch_machine.ReadAction.LATCH_CANCELLATION)
     if writer.failure is None:
         try:
             await join_owned(_persist_interrupted_writer(state, writer))
-        except asyncio.CancelledError:
-            _move_read(state, batch_machine.ReadEvent.CANCELLED, batch_machine.ReadAction.IGNORE)
+        except asyncio.CancelledError as error:
+            cancellation = error
+            _move_read(state, batch_machine.ReadEvent.CANCELLED, batch_machine.ReadAction.LATCH_CANCELLATION)
         except BaseException:
             if writer.failure is None:
                 raise
@@ -606,6 +610,8 @@ async def _interrupt(
         _move_read(state, batch_machine.ReadEvent.WRITER_FAILED, batch_machine.ReadAction.LATCH_FAILURE)
         state.failure_cause = writer.failure
     _move_read(state, batch_machine.ReadEvent.STOP_SETTLED, batch_machine.ReadAction.PROPAGATE)
+    if cancellation is not None and writer.failure is None:
+        raise cancellation
     return TransferInterruptedError(
         state.failure_message, _leg_counters(arena, writer, state.baselines), cause=state.failure_cause
     )
@@ -625,12 +631,17 @@ async def _handle_read_cancelled(
         failure = writer.failure
         assert failure is not None
         state.failure_cause = failure
-        raise await _interrupt_failed_writer(session, state, arena, writer, options) from failure.__cause__
+        raise await _interrupt_failed_writer(session, state, arena, writer, options) from failure
     assert selected is batch_machine.ReadEvent.CANCELLED
+    if state.phase is batch_machine.ReadPhase.DONE:
+        # DONE admitted the writer barrier. Settle it without issuing STOP; the
+        # caller still propagates cancellation and cannot seal or ADVANCE.
+        await join_owned(_finish_read(state, arena, writer, cancelled=True))
+        return
     _move_read(state, selected, batch_machine.ReadAction.STOP)
     interrupted = await _interrupt(session, state, arena, writer, options)
     if writer.failure is not None:
-        raise interrupted from writer.failure.__cause__
+        raise interrupted from writer.failure
 
 
 async def _interrupt_failed_writer(
@@ -646,7 +657,7 @@ async def _interrupt_failed_writer(
         try:
             await join_owned(_stop_best_effort(session, options.cleanup_timeout))
         except asyncio.CancelledError:
-            _move_read(state, batch_machine.ReadEvent.CANCELLED, batch_machine.ReadAction.IGNORE)
+            _move_read(state, batch_machine.ReadEvent.CANCELLED, batch_machine.ReadAction.LATCH_CANCELLATION)
     elif decision.action is not batch_machine.ReadAction.PROPAGATE:
         raise RuntimeError("writer failure has no READ exit decision")
     # A failed writer cannot admit INTERRUPT. Its existing durable frontier is
@@ -719,6 +730,8 @@ async def _finish_read(
     state: _IngestState,
     arena: TransferArena,
     writer: IngestWriter,
+    *,
+    cancelled: bool = False,
 ) -> object:
     try:
         await _await_read_begin(state.read_begin_future)
@@ -749,7 +762,10 @@ async def _finish_read(
         raise TransferInterruptedError(
             "writer failed after READ terminal", _leg_counters(arena, writer, state.baselines), cause=writer.failure
         ) from writer.failure
-    _move_read(state, batch_machine.ReadEvent.BARRIER_OK, batch_machine.ReadAction.COMPLETE)
+    if cancelled:
+        _move_read(state, batch_machine.ReadEvent.CANCELLED, batch_machine.ReadAction.PROPAGATE)
+    else:
+        _move_read(state, batch_machine.ReadEvent.BARRIER_OK, batch_machine.ReadAction.COMPLETE)
     return result
 
 

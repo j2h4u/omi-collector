@@ -656,11 +656,11 @@ def test_read_leg_timeout_is_reset_by_continuous_notifications() -> None:
     async def scenario() -> None:
         record = _record(1)
         notifications = (_begin(10, 2), _data(record), _data(record), _done(12))
-        session = DelayedSession(notifications, (0.02, 0.02, 0.02, 0.02))
+        session = DelayedSession(notifications, (0.4, 0.4, 0.4, 0.4))
         writer = FakeWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        result = await read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.03))
+        result = await read_leg(session, arena, writer, 10, 2, ReadLegOptions(1))
 
         assert result.received_bytes == 2 * RECORD_SIZE
 
@@ -710,6 +710,135 @@ def test_read_leg_timeout_still_fails_after_idle_gap() -> None:
 
         with pytest.raises(TransferInterruptedError, match="timed out during READ"):
             await read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.03))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout", "protocol"])
+def test_cancel_during_read_failure_stop_propagates_after_owned_cleanup(failure_kind: str) -> None:
+    async def scenario() -> None:
+        class HeldStopSession(BurstSession):
+            def __init__(self) -> None:
+                super().__init__(())
+                self.stop_started = asyncio.Event()
+                self.stop_release = asyncio.Event()
+                self.stop_finished = asyncio.Event()
+
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    if failure_kind == "protocol":
+                        raise NotificationProtocolError("invalid transport notification")
+                    await asyncio.Event().wait()
+
+                return stream()
+
+            async def write_control(self, payload: bytes) -> None:
+                self.writes.append(payload)
+                if payload == encode_stop_command():
+                    self.stop_started.set()
+                    await self.stop_release.wait()
+                    self.stop_finished.set()
+
+        session = HeldStopSession()
+        writer = FakeWriter()
+        task = asyncio.create_task(
+            read_leg(
+                session,
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                writer,
+                10,
+                2,
+                ReadLegOptions(0.03),
+            )
+        )
+        try:
+            await asyncio.wait_for(session.stop_started.wait(), 1)
+            task.cancel()
+            await asyncio.sleep(0)
+            session.stop_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert session.stop_finished.is_set()
+            assert session.writes == [encode_read_command(10, 2), encode_stop_command()]
+            assert writer.calls[-1] == "interrupt"
+        finally:
+            session.stop_release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("writer_fails", [False, True])
+def test_cancel_at_done_failure_waiter_handoff_settles_without_stop(writer_fails: bool) -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+        sql_error = sqlite3.DatabaseError("file is not a database")
+        fatal.__cause__ = sql_error
+
+        class HeldWaitWriter(FakeWriter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wait_cancelled = asyncio.Event()
+                self.wait_release = asyncio.Event()
+                self.barrier_started = asyncio.Event()
+                self.barrier_release = asyncio.Event()
+                self.barrier_done = asyncio.Event()
+
+            async def wait_failure(self) -> BaseException:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.wait_cancelled.set()
+                    await self.wait_release.wait()
+                    raise
+                raise AssertionError("unreachable")
+
+            async def barrier(self) -> str:
+                self.barrier_started.set()
+                await self.barrier_release.wait()
+                result = await super().barrier()
+                self.barrier_done.set()
+                return result
+
+        writer = HeldWaitWriter()
+        session = BurstSession((_begin(10, 2), _data(_record(1)), _data(_record(2)), _done(12)))
+        task = asyncio.create_task(
+            read_leg(
+                session,
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                writer,
+                10,
+                2,
+                ReadLegOptions(1),
+            )
+        )
+        try:
+            await asyncio.wait_for(writer.wait_cancelled.wait(), 1)
+            task.cancel()
+            if writer_fails:
+                writer.failure = fatal
+            writer.wait_release.set()
+            if writer_fails:
+                with pytest.raises(TransferInterruptedError) as caught:
+                    await task
+                assert caught.value.__cause__ is fatal
+                assert fatal.__cause__ is sql_error
+                assert "barrier" not in writer.calls
+            else:
+                await asyncio.wait_for(writer.barrier_started.wait(), 1)
+                assert not task.done()
+                writer.barrier_release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert writer.barrier_done.is_set()
+            assert session.writes == [encode_read_command(10, 2)]
+        finally:
+            writer.wait_release.set()
+            writer.barrier_release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
 

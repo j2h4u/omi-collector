@@ -144,7 +144,7 @@ def test_unknown_tags_are_rejected() -> None:
 def test_read_transition_is_total_and_typed() -> None:
     assert len(tuple(ReadPhase)) == 5
     assert len(tuple(ReadEvent)) == 10
-    assert len(tuple(ReadAction)) == 8
+    assert len(tuple(ReadAction)) == 9
     decisions = [read_transition(phase, event) for phase, event in product(ReadPhase, ReadEvent)]
     assert set(_READ_TRANSITION_TABLE) == set(product(ReadPhase, ReadEvent))
     assert len(decisions) == 50
@@ -161,6 +161,7 @@ def test_read_transition_handles_begin_completion_and_failures() -> None:
     assert read_transition(ReadPhase.RECEIVING, ReadEvent.DONE).action is ReadAction.BARRIER
     assert read_transition(ReadPhase.DONE, ReadEvent.BARRIER_OK).action is ReadAction.COMPLETE
     assert read_transition(ReadPhase.DONE, ReadEvent.BARRIER_FAILED).action is ReadAction.PROPAGATE
+    assert read_transition(ReadPhase.STOPPING, ReadEvent.CANCELLED).action is ReadAction.LATCH_CANCELLATION
     assert read_transition(ReadPhase.STOPPING, ReadEvent.STOP_SETTLED).next_phase is ReadPhase.EXITED
 
 

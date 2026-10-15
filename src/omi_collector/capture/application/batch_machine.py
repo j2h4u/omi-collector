@@ -67,6 +67,7 @@ class ReadAction(StrEnum):
     BARRIER = "barrier"
     STOP = "stop"
     LATCH_FAILURE = "latch_failure"
+    LATCH_CANCELLATION = "latch_cancellation"
     PROPAGATE = "propagate"
     COMPLETE = "complete"
     REJECT = "reject"
@@ -186,7 +187,7 @@ _READ_TRANSITION_TABLE = {
         ReadPhase.STOPPING, ReadAction.IGNORE, "read failure already latched"
     ),
     (ReadPhase.STOPPING, ReadEvent.CANCELLED): _read_decision(
-        ReadPhase.STOPPING, ReadAction.IGNORE, "cancellation already latched"
+        ReadPhase.STOPPING, ReadAction.LATCH_CANCELLATION, "retain cancellation while stop settles"
     ),
     (ReadPhase.STOPPING, ReadEvent.STOP_SETTLED): _read_decision(
         ReadPhase.EXITED, ReadAction.PROPAGATE, "stop settled after failure"

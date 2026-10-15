@@ -531,6 +531,9 @@ function check_candidate_state_migration {
         printf -v "$output_name" '%s' 'recovery_required'
         return
     fi
+    if [[ -n "$output" ]]; then
+        printf 'Collector state migration preflight response (exit %s): %s\n' "$command_status" "$output" >&2
+    fi
     die 'candidate refused the Collector state migration preflight'
 }
 
@@ -735,10 +738,11 @@ declare state_file
 declare migration_preflight_state
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
+declare initial_service_state
 declare readiness_snapshot readiness_state readiness_pid readiness_restarts readiness_invocation
 declare -i readiness_seen=0 selection_published=0 deployment_committed=0
 declare -i readiness_observation_failed=0
-declare -i service_quiesced=0 release_created=0 deployment_lock_fd=-1
+declare -i service_quiesced=0 initial_service_active=0 release_created=0 deployment_lock_fd=-1
 declare -ri readiness_poll_interval_seconds=1 stability_interval_seconds=6
 
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve script directory'
@@ -836,7 +840,7 @@ function finalize {
     elif (( selector_readable )) && [[ "$selected_target" == "$previous_target" ]]; then
         if canonical_is_previous_runtime_state; then
             selection_published=0
-            if (( service_quiesced )) && [[ -n "$previous_target" ]]; then
+            if (( service_quiesced && initial_service_active )) && [[ -n "$previous_target" ]]; then
                 if systemctl start "$service_name"; then
                     service_quiesced=0
                 else
@@ -936,6 +940,13 @@ screen_cutover_backup_space "$state_file" "$sealer_python"
 validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
 provision_operator_data_access "${state_file%/collector/collector-state.sqlite3}" "$account_user" "$operator_group"
 check_candidate_state_migration "$staged_environment" "$config_file" 'false' migration_preflight_state
+initial_service_state=$(systemctl show "$service_name" --property=ActiveState) \
+    || die "could not inspect initial ${service_name} state before stop"
+case "$initial_service_state" in
+    ActiveState=active) initial_service_active=1 ;;
+    ActiveState=inactive|ActiveState=failed) ;;
+    *) die "ambiguous initial ${service_name} state before stop: ${initial_service_state}" ;;
+esac
 service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"
 [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"

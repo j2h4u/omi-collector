@@ -217,7 +217,14 @@ class ProcessLifetimeTarget:
         return None
 
 
-def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Connection, flags: _ProcessFlags) -> None:
+def _run_writer_lifecycle_in_daemon_owner(
+    entered: _ProcessEvent,
+    release: Connection,
+    flags: _ProcessFlags,
+    failure_writer: Connection,
+    *,
+    join_owner: bool = False,
+) -> None:
     async def lifecycle() -> None:
         writer = AttemptWriter(ProcessLifetimeTarget(entered, release, flags), bytes(RECORD_SIZE))
         try:
@@ -228,6 +235,8 @@ def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Conne
             writer.publish(RECORD_SIZE)
             await writer.checkpoint()
             await writer.close()
+            assert not writer.thread.is_alive()
+            flags[4] = 1
         finally:
             if writer.state is not WriterState.CLOSED:
                 await writer.close()
@@ -235,13 +244,17 @@ def _run_writer_lifecycle_in_daemon_owner(entered: _ProcessEvent, release: Conne
     def owner() -> None:
         try:
             asyncio.run(lifecycle())
-        except Exception:  # noqa: BLE001 - the child reports owner-thread failures through shared state
+        except Exception as error:  # noqa: BLE001 - the child reports owner-thread failures to its parent
+            failure_writer.send(f"{type(error).__name__}: {error}")
             flags[3] = 1
 
     owner_thread = threading.Thread(target=owner, name="test-writer-owner", daemon=True)
     owner_thread.start()
     if not entered.wait(10):
         flags[3] = 1
+    if join_owner:
+        owner_thread.join(timeout=4)
+        flags[5] = int(not owner_thread.is_alive())
 
 
 @asynccontextmanager
@@ -335,8 +348,11 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
     context = multiprocessing.get_context("fork")
     entered = context.Event()
     release_reader, release_writer = context.Pipe(duplex=False)
-    flags = context.Array("i", [0, 0, 0, 0])
-    process = context.Process(target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release_reader, flags))
+    failure_reader, failure_writer = context.Pipe(duplex=False)
+    flags = context.Array("i", [0, 0, 0, 0, 0, 0])
+    process = context.Process(
+        target=_run_writer_lifecycle_in_daemon_owner, args=(entered, release_reader, flags, failure_writer)
+    )
     started = False
     released = False
 
@@ -344,6 +360,7 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
         process.start()
         started = True
         release_reader.close()
+        failure_writer.close()
         assert entered.wait(5), "writer did not enter its blocked append"
         process.join(timeout=1)
         assert process.is_alive(), "process exited while writer-owned work was blocked"
@@ -356,9 +373,14 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
         process.join(timeout=5)
         assert not process.is_alive(), "writer workflow did not finish after target release"
         assert process.exitcode == 0
-        assert flags[1] == 1
-        assert flags[2] == 1
-        assert flags[3] == 0
+        try:
+            failure = failure_reader.recv() if failure_reader.poll() else None
+        except EOFError:
+            failure = None
+        # A daemon owner can be interrupted after the non-daemon target exits.
+        # Its clean close is asserted in the controlled-lifecycle test below.
+        assert flags[1] == 1, f"checkpoint did not finish: {failure}"
+        assert flags[2] == 1, f"target close did not finish: {failure}"
     finally:
         if not released:
             with suppress(BrokenPipeError, EOFError, OSError):
@@ -373,6 +395,63 @@ def test_non_daemon_writer_keeps_process_alive_until_admitted_work_finishes() ->
             process.join(timeout=2)
         release_reader.close()
         release_writer.close()
+        failure_reader.close()
+        failure_writer.close()
+        if started and not process.is_alive():
+            process.close()
+
+
+def test_writer_owner_close_joins_target_before_process_exit() -> None:
+    context = multiprocessing.get_context("fork")
+    entered = context.Event()
+    release_reader, release_writer = context.Pipe(duplex=False)
+    failure_reader, failure_writer = context.Pipe(duplex=False)
+    flags = context.Array("i", [0, 0, 0, 0, 0, 0])
+    process = context.Process(
+        target=_run_writer_lifecycle_in_daemon_owner,
+        args=(entered, release_reader, flags, failure_writer),
+        kwargs={"join_owner": True},
+    )
+    started = False
+    released = False
+
+    try:
+        process.start()
+        started = True
+        release_reader.close()
+        failure_writer.close()
+        assert entered.wait(5), "writer did not enter its blocked append"
+        release_writer.send(None)
+        released = True
+        process.join(timeout=5)
+        assert not process.is_alive(), "writer owner did not finish after target release"
+        assert process.exitcode == 0
+        try:
+            failure = failure_reader.recv() if failure_reader.poll() else None
+        except EOFError:
+            failure = None
+        assert flags[3] == 0, f"child owner failed: {failure}"
+        assert flags[0] == 1
+        assert flags[1] == 1
+        assert flags[2] == 1
+        assert flags[4] == 1, "owner returned before its writer thread was joined"
+        assert flags[5] == 1, "owner thread remained alive"
+    finally:
+        if not released:
+            with suppress(BrokenPipeError, EOFError, OSError):
+                release_writer.send(None)
+        if started and process.is_alive():
+            process.join(timeout=2)
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+        release_reader.close()
+        release_writer.close()
+        failure_reader.close()
+        failure_writer.close()
         if started and not process.is_alive():
             process.close()
 

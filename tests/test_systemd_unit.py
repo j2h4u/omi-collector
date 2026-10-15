@@ -35,6 +35,7 @@ _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 
 @dataclass(frozen=True, slots=True)
 class _DeploymentScenario:
+    initial_service_active: bool = True
     readiness_config: str | None = None
     config_check_failure: bool = False
     crash_loop: bool = False
@@ -677,6 +678,10 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
         'case "$1" in\n'
         "stop|start|restart) exit 0 ;;\n"
         "show)\n"
+        'if [[ "$#" == 3 && "$3" == "--property=ActiveState" ]]; then\n'
+        f"    printf 'ActiveState=%s\\n' '{'active' if scenario.initial_service_active else 'inactive'}'\n"
+        "    exit 0\n"
+        "fi\n"
         f"count_file={shlex.quote(str(fake_bin / 'show-count'))}\n"
         'count=0; [[ -f "$count_file" ]] && read -r count < "$count_file"\n'
         '(( count++ )); printf "%s\\n" "$count" > "$count_file"\n'
@@ -1001,6 +1006,10 @@ def test_deployer_preflight_refusal_keeps_previous_service_and_selector_untouche
 
     assert result.returncode != 0
     assert "candidate refused the Collector state migration preflight" in result.stderr
+    assert (
+        "Collector state migration preflight response (exit 1): "
+        '{"detail":"injected refusal","reason":"state_validation_failed","status":"migration_refused"}'
+    ) in result.stderr
     assert harness.current_link.resolve(strict=True) == previous
     commands = harness.log.read_text(encoding="utf-8")
     assert commands.count("preflight args=") == 1
@@ -1272,8 +1281,11 @@ def test_deployer_keeps_previous_release_running_when_space_screen_fails(tmp_pat
     assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
 
 
-def test_deployer_restores_previous_service_when_selector_publish_fails_before_rename(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
+@pytest.mark.parametrize("initial_service_active", [True, False])
+def test_deployer_restores_previous_service_when_selector_publish_fails_before_rename(
+    tmp_path: Path, initial_service_active: bool
+) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(initial_service_active=initial_service_active))
     previous = _previous_release(harness)
     _canonical_state(harness, version=1, phase="complete")
     script = harness.deployer.read_text(encoding="utf-8")
@@ -1290,7 +1302,7 @@ def test_deployer_restores_previous_service_when_selector_publish_fails_before_r
     assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
     commands = harness.log.read_text(encoding="utf-8")
     assert commands.count("systemctl args=stop omi-collector.service") == 1
-    assert commands.count("systemctl args=start omi-collector.service") == 1
+    assert commands.count("systemctl args=start omi-collector.service") == int(initial_service_active)
 
 
 @pytest.mark.parametrize(

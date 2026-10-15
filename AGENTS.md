@@ -17,6 +17,17 @@ make a change pass.
 - `just runtime-smoke` must pass for Docker runtime changes.
 - `just docker-build` must pass because the service runs in Docker; it includes
   Dockerfile and Compose static validation before image build.
+- Iterate with targeted local checks. Before a local candidate install, all
+  applicable local tests and linters must pass, including the gates above.
+  Reuse prior results only for byte-identical relevant inputs with targeted
+  checks covering any isolated change. A frozen, committed branch candidate
+  may be installed for live feedback through a reviewed transactional entry
+  point preserving stop, migration, rollback, and storage-integrity checks.
+  Remote CI, PR, security, merge, and release gates do not block this local
+  candidate install; the candidate is not a release tag.
+- After live feedback, push the accepted change and pass the existing remote
+  gates before protected-main merge. The GitHub release follows in the
+  background. See [edge.md](edge.md) for the workflow sequence.
 - Use `uv` only. Keep `uv.lock` current and use hardlink mode outside Docker.
 - Bound direct `uv run pytest` commands with `timeout --signal=TERM --kill-after=5s 600s`.
   If a tool returns a running session, poll it to completion or terminate it before moving on.

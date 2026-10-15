@@ -422,7 +422,7 @@ def _backup_and_convert(
                 target.execute("DELETE FROM state WHERE kind='quarantine' AND id=?", (item.item_id,))
             if _legacy_mutable_rows(target):
                 raise InternalAudioMigrationError("v1 attempt/quarantine row conversion is not complete")
-            _assert_inventory_exact(inventory, _inventory_from_paths(inventory, candidate.parent.parent))
+            _assert_inventory_exact(inventory, _inventory_from_paths(inventory, candidate.parent.parent, source))
             for draft in inventory.drafts:
                 verify_imported_draft(target, draft)
             for attempt in inventory.attempts:
@@ -934,7 +934,7 @@ def _walk_private(root: Path, path: Path, entries: list[_FileIdentity]) -> None:
         raise InternalAudioMigrationError(f"unsupported private entry type: {relative}")
 
 
-def _inventory_from_paths(inventory: _Inventory, root: Path) -> _Inventory:
+def _inventory_from_paths(inventory: _Inventory, root: Path, source: sqlite3.Connection) -> _Inventory:
     if not inventory.entries:
         return inventory
     # Candidate import can verify physical draft identities without finding a
@@ -946,7 +946,8 @@ def _inventory_from_paths(inventory: _Inventory, root: Path) -> _Inventory:
         drafts.append(inspect_legacy_draft(draft.path))
         _walk_private(root, draft.path, entries)
     for attempt in inventory.attempts:
-        attempts.append(inspect_legacy_attempt(attempt.path, attempt.attempt_id))
+        authoritative = _v1_payload(source, "attempt", attempt.attempt_id)
+        attempts.append(inspect_legacy_attempt(attempt.path, attempt.attempt_id, authoritative))
         _walk_private(root, attempt.path, entries)
     quarantines: list[_Quarantine] = []
     for item in inventory.quarantines:

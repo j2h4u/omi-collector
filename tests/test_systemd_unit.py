@@ -678,7 +678,7 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
         'case "$1" in\n'
         "stop|start|restart) exit 0 ;;\n"
         "show)\n"
-        'if [[ "$3" == "--property=ActiveState" ]]; then\n'
+        'if [[ "$#" == 3 && "$3" == "--property=ActiveState" ]]; then\n'
         f"    printf 'ActiveState=%s\\n' '{'active' if scenario.initial_service_active else 'inactive'}'\n"
         "    exit 0\n"
         "fi\n"

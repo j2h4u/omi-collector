@@ -887,10 +887,14 @@ def test_retirement_step_reconciles_only_exact_cursor_states(
             assert calls == 1
             expected_cursor = 0 if fault == "third_state" else 2
             assert _source_state(database, source.source_id) == ("retiring", None, expected_cursor, 0)
-            expected_marker = None if fault == "marker_missing" else {
-                "generation": 2,
-                "pending": False if fault == "marker_cleared" else True,
-            }
+            expected_marker = (
+                None
+                if fault == "marker_missing"
+                else {
+                    "generation": 2,
+                    "pending": fault != "marker_cleared",
+                }
+            )
             assert database.get(StateKind.COMPACTION, "current") == expected_marker
             return
 

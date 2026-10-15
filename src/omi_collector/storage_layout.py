@@ -122,8 +122,7 @@ def _parse_settings(document: dict[str, object]) -> tuple[str, CollectorConfig]:
     if set(document) & presence_keys:
         if not presence_keys <= set(document):
             raise StorageLayoutError(
-                "presence tuning requires both presence_arrival_stability_seconds and "
-                "presence_arrival_max_gap_seconds"
+                "presence tuning requires both presence_arrival_stability_seconds and presence_arrival_max_gap_seconds"
             )
         presence = _number_fields(document, presence_keys)
         try:

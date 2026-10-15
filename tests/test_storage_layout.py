@@ -61,8 +61,7 @@ def test_config_wires_bundle_minimum(tmp_path: Path) -> None:
 def test_config_rejects_invalid_bundle_minimum(tmp_path: Path, seconds: str) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        'pendant_address = "AA:BB:CC:DD:EE:FF"\n'
-        f"bundle_min_audio_seconds = {seconds}\n",
+        f'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = {seconds}\n',
         encoding="utf-8",
     )
 

@@ -134,9 +134,7 @@ def _run_real_complete_migration(root: Path, service_uid: int, operator_gid: int
 
 def _layout(tmp_path: Path) -> StorageLayout:
     config = tmp_path / "config.toml"
-    config.write_text(
-        'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8"
-    )
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
     layout = load_operator_config(config).storage
     layout.collector.root.mkdir()
     layout.collector.root.chmod(0o2750)

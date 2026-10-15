@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.13.0](https://github.com/j2h4u/omi-collector/compare/v0.12.5...v0.13.0) (2026-10-15)
+
+
+### Features
+
+* move internal audio custody into Collector SQLite ([afe3078](https://github.com/j2h4u/omi-collector/commit/afe30789cd02ae6cb2ceea26eeca7ac17bc0db41))
+
+
+### Fixes
+
+* bound terminal retention and recover migration state safely ([afe3078](https://github.com/j2h4u/omi-collector/commit/afe30789cd02ae6cb2ceea26eeca7ac17bc0db41))
+* import SQL-backed v1 attempts with raw-only directories ([e1b94b1](https://github.com/j2h4u/omi-collector/commit/e1b94b10573cb6294ce0c49d5505efb3aeb60ab5))
+* preserve captured audio across crashes and SQLite storage faults ([afe3078](https://github.com/j2h4u/omi-collector/commit/afe30789cd02ae6cb2ceea26eeca7ac17bc0db41))
+* preserve stopped service state during failed deploy ([e1b94b1](https://github.com/j2h4u/omi-collector/commit/e1b94b10573cb6294ce0c49d5505efb3aeb60ab5))
+* surface migration preflight refusal details ([e1b94b1](https://github.com/j2h4u/omi-collector/commit/e1b94b10573cb6294ce0c49d5505efb3aeb60ab5))
+
+
+### Maintenance
+
+* **deps:** bump python from `cad9a2c` to `a2b82f3` in the docker-images group ([#241](https://github.com/j2h4u/omi-collector/issues/241)) ([fa1660f](https://github.com/j2h4u/omi-collector/commit/fa1660fa0987f3859546aa5866a20c04d28b4fa8))
+* **deps:** bump the github-actions group with 4 updates ([#243](https://github.com/j2h4u/omi-collector/issues/243)) ([41774d7](https://github.com/j2h4u/omi-collector/commit/41774d701d2595f1bba237c26c01d721e5d52428))
+
+
+### Documentation
+
+* require local gates and record live OMIC-16 capture ([e1b94b1](https://github.com/j2h4u/omi-collector/commit/e1b94b10573cb6294ce0c49d5505efb3aeb60ab5))
+
+
+### Tests
+
+* synchronize quality fault and writer process scenarios ([e1b94b1](https://github.com/j2h4u/omi-collector/commit/e1b94b10573cb6294ce0c49d5505efb3aeb60ab5))
+
 ## [0.12.5](https://github.com/j2h4u/omi-collector/compare/v0.12.4...v0.12.5) (2026-10-13)
 
 

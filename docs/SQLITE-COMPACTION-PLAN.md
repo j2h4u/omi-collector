@@ -1,8 +1,39 @@
 # SQLite compaction plan
 
-**Status: design reviewed; implementation and deployment have not begun.** The
-production database is healthy. The current file is 177.39 MiB, with 174.59
-MiB on SQLite's freelist and 2.8 MiB used. Production has not run `VACUUM`.
+**Status: implementation and five local gates passed at commit
+`2c5cbf1d3d915b600e8a50ab3c8384c580cf46ca`. Installation and automatic live
+compaction and the complete next pendant transfer passed on 2026-10-15.
+Physical slow-disk timing and remote PR, CI, and release gates remain pending.**
+The pre-compaction production snapshot measured 177.39 MiB, with 174.59 MiB on
+SQLite's freelist and 2.8 MiB used.
+
+The candidate Docker image is
+`sha256:e1b498cc3e21e63744abd94d6ed0056f94f40bcd89de83371aa3141be9ae56f7`.
+The retained local QA receipt is `/var/tmp/omi19-full-qa.y3MjI5gZ/ram-final-qa.log`.
+
+## Live candidate receipt
+
+The committed candidate was installed at 2026-10-15 14:51:58 UTC. The service
+was running as PID 3603844 with zero restarts. Automatic state-machine
+compaction completed within 52 seconds. The database changed from
+186,011,648 bytes to 5,148,672 bytes (about 177.39 MiB to 4.91 MiB).
+`PRAGMA quick_check` returned `ok`; the previously absent compaction marker
+bootstrapped to generation 0 with `pending=false`.
+
+All 4,812 `capture_record` payloads and device timestamps matched exactly
+before and after; the single `capture_tail` also matched exactly. Inode, size,
+and mtime remained unchanged for the 130 observed ready files. The existing
+2.5 GiB ready payload was not read or hashed, so its content was not
+independently compared. The captured receipts are
+`/var/tmp/omic19-candidate.3Q32lFX7/before.json`, `after.json`, `deploy.log`,
+and `verification.log`.
+
+At 2026-10-15 14:53:22.673 UTC, the same process (PID 3603844, zero restarts)
+completed the next pendant transfer: 1,429 records, 634,476 bytes, and
+`unread=0`; sequence read/write was 1546/1429 and completed transfers reached
+8. Service status remained healthy and all clear. This confirms capture after
+completed VACUUM; it does not exercise capture arrival during VACUUM or
+establish physical slow-disk timing.
 
 ## Decision
 
@@ -80,19 +111,39 @@ service.
 
 ## Implementation and acceptance milestones
 
-- [ ] Add the durable pending key and atomic retirement commit integration.
-- [ ] Add explicit states, owner lifecycle, admission rules, cancellation,
+- [x] Add the durable pending key and atomic retirement commit integration.
+- [x] Add explicit states, owner lifecycle, admission rules, cancellation,
   worker join, and restart/bootstrap behavior.
-- [ ] Add independent complete transition matrix and guards for unknown events.
-- [ ] Test real SQLite file-size reduction and preservation of live content,
+- [x] Add independent complete transition matrix and guards for unknown events.
+- [x] Test real SQLite file-size reduction and preservation of live content,
   including retained tail and below-threshold new audio.
-- [ ] Cover repeated cancellation; admission, arrival, and success races;
-  slow disk; BUSY/FULL/IOERR/corruption; ambiguous DELETE commit; pending-key
-  clear failure; and SIGKILL/restart before and after VACUUM.
-- [ ] Run applicable project gates and runtime smoke on a frozen candidate.
-- [ ] Install the committed branch candidate only after applicable local gates
-  pass; confirm live health and content preservation.
+- [x] Cover cancellation and admission/success races; BUSY/FULL/IOERR/corruption;
+  pending-key clear failure; and SIGKILL/restart before and after VACUUM.
+  `tests/test_publication_ownership.py::test_capture_interrupts_and_joins_compaction_before_visit`
+  blocks the worker and verifies repeated cancellation and no GATT visit before
+  join.
+- [x] Exercise ambiguous retirement-DELETE commit reconciliation with
+  failure injection. `tests/test_ready_sql_fault_recovery.py` covers exact
+  cursor states (rolled back, committed, and third state) and final-source
+  deletion followed by a commit error; the current cases assert marker
+  generation 2 remains pending.
+- [x] Reject an absent or `pending=false` marker after the proposed retirement
+  cursor committed. The `marker_missing` and `marker_cleared` cases in
+  `tests/test_ready_sql_fault_recovery.py` assert a fatal third state and a
+  failed store without advancing publication.
+- [x] Run the five local gates on the frozen candidate commit above:
+  `just check`, `just crap-check`, `just unit`, `just docker-build`, and
+  `just runtime-smoke`. The two pytest runs each reported 2,459 passed and 5
+  skipped; CRAP checked 1,968 functions. Docker build and runtime smoke passed.
+- [x] Install the committed branch candidate after local gates; verify service
+  health, automatic compaction, database integrity, preserved capture data,
+  and the complete subsequent pendant transfer.
 - [ ] After live proof, open/update the PR and pass remote CI/release gates.
+
+Physical slow-disk timing remains an optional follow-up, not a release gate.
+The tested logical guard interrupts and joins the owner before GATT visitation;
+the live follow-on transfer verifies normal capture after VACUUM, not arrival
+while VACUUM is active.
 
 ## Source and SQLite references
 

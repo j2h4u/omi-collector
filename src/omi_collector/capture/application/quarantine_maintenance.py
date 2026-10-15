@@ -159,11 +159,14 @@ class QuarantineMaintenance:
             await joined_to_thread(
                 self._runtime.debug_event, "ready_publication_transient", reason=getattr(outcome, "reason", None)
             )
-            self._arm_publication_timer()
         else:
             await joined_to_thread(
                 self._runtime.debug_event, "ready_publication_waiting", reason=getattr(outcome, "reason", None)
             )
+        # A successful publication can be followed by deferred compaction.
+        # The reducer owns that retry even when the publication result is published.
+        if self._staging.publication_retry_schedule() is not None:
+            self._arm_publication_timer()
 
     async def ensure_publication_ready(self) -> None:
         """Run one bounded local recovery attempt without blocking BLE forever."""
@@ -377,7 +380,7 @@ class QuarantineMaintenance:
                     self._raise_publication_fatal()
                     if presence_task in done:
                         wake = presence_task.result()
-                        await self.ensure_publication_ready()
+                        await self._prepare_presence_wake(wake)
                         permit_returned = True
                         defer_requested.set()
                         return wake
@@ -392,7 +395,7 @@ class QuarantineMaintenance:
                     wake = presence_task.result()
                     # A scanner wake is not permission to open BLE while local
                     # clock publication is still retrying.
-                    await self.ensure_publication_ready()
+                    await self._prepare_presence_wake(wake)
                     permit_returned = True
                     defer_requested.set()
                     await join_owned(maintenance_task)
@@ -420,6 +423,11 @@ class QuarantineMaintenance:
             # other result too. This keeps task identity scoped to this call.
             if primary is None and maintenance_task is not None:
                 await asyncio.gather(presence_task, maintenance_task, return_exceptions=True)
+
+    async def _prepare_presence_wake(self, wake: PresenceWake | PresenceEnd) -> None:
+        if isinstance(wake, PresenceWake):
+            self._staging.publication_capture_intent()
+        await self.ensure_publication_ready()
 
     async def _join_presence_tasks(
         self,

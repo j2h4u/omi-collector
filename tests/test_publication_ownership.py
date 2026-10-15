@@ -9,17 +9,19 @@ from threading import Event, Thread
 
 import pytest
 
-from omi_collector.capture.adapters.opportunistic_runtime import _StagingWriterAdapter
+from omi_collector.capture.adapters.collector_state_db import StateKind
+from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime, _StagingWriterAdapter
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.ready_closures import ReadyClosure
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_writer import StagingWriter
+from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
-from omi_collector.config import CollectorConfig, ReadyConfig
+from omi_collector.config import CollectorConfig, ReadyConfig, RetryConfig
 from staging_test_factory import StagingStore, attempt_source, closure_payload
 
 
-def _store(tmp_path: Path) -> StagingStore:
+def _store(tmp_path: Path, *, retry_backoff: float | None = None) -> StagingStore:
     capture_root = tmp_path / "draft"
     capture_root.mkdir()
     bootstrap = StagingStore(tmp_path / "spool", capture_root)
@@ -29,7 +31,10 @@ def _store(tmp_path: Path) -> StagingStore:
     return StagingStore.from_paths(
         bootstrap.paths,
         publication_root=ready,
-        config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02)),
+        config=CollectorConfig(
+            ready=ReadyConfig(target_audio_seconds=0.02),
+            retry=RetryConfig(rapid_backoff=(retry_backoff,)) if retry_backoff is not None else RetryConfig(),
+        ),
     )
 
 
@@ -306,3 +311,156 @@ def test_publication_owner_rejects_concurrent_projection(tmp_path: Path, monkeyp
 
     assert not thread.is_alive()
     assert errors == []
+
+
+def test_compaction_reuses_publication_lease(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    seen: list[DeviceLock | None] = []
+
+    def vacuum(_state_db: object, _generation: int, _interrupt: Event) -> str:
+        seen.append(store._filesystem._active_lease)
+        return "done"
+
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.vacuum_pending", vacuum)
+    with store.device_lock(operation="test_compaction") as lease:
+        assert store.publish_ready(lease).state is ReadyOutcomeState.WAITING
+        assert seen == [lease]
+
+
+def test_capture_interrupts_and_joins_compaction_before_visit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    entered = Event()
+    release = Event()
+    settled = Event()
+    visit_started = Event()
+    original_visit = store.begin_ready_visit
+
+    def vacuum(_state_db: object, _generation: int, interrupt: Event) -> str:
+        entered.set()
+        assert interrupt.wait(5)
+        assert release.wait(5)
+        settled.set()
+        return "interrupted"
+
+    def begin_visit() -> object:
+        visit_started.set()
+        return original_visit()
+
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.vacuum_pending", vacuum)
+    monkeypatch.setattr(store, "begin_ready_visit", begin_visit)
+
+    async def scenario() -> None:
+        maintenance.schedule_publication_retry()
+        assert await asyncio.to_thread(entered.wait, 5)
+        capture = asyncio.create_task(maintenance.enter_capture_priority())
+        try:
+            assert await asyncio.to_thread(store._compaction_interrupt.wait, 5)
+            await asyncio.sleep(0)
+            assert not capture.done()
+            assert not visit_started.is_set()
+            capture.cancel()
+            capture.cancel()
+            await asyncio.sleep(0)
+            assert not capture.done()
+            assert not visit_started.is_set()
+            release.set()
+            await asyncio.gather(capture, return_exceptions=True)
+            assert settled.is_set()
+            assert not visit_started.is_set()
+        finally:
+            release.set()
+            await maintenance.close()
+
+    asyncio.run(scenario())
+
+
+def test_deferred_compaction_retries_without_new_publication_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path, retry_backoff=0.05)
+    store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    first = Event()
+    retried = Event()
+    calls = 0
+
+    def vacuum(_state_db: object, generation: int, _interrupt: Event) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first.set()
+            return "deferred"
+        assert generation == 1
+        store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": False})
+        retried.set()
+        return "done"
+
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.vacuum_pending", vacuum)
+
+    async def scenario() -> None:
+        try:
+            await maintenance.ensure_publication_ready()
+            assert first.is_set()
+            assert store.publication_retry_schedule() is not None
+            assert await asyncio.to_thread(retried.wait, 5)
+            assert calls == 2
+            assert store.publication_retry_schedule() is None
+        finally:
+            await maintenance.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("followup_state", (ReadyOutcomeState.WAITING, ReadyOutcomeState.BLOCKED))
+def test_input_change_during_compaction_runs_followup_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, followup_state: ReadyOutcomeState
+) -> None:
+    store = _store(tmp_path)
+    store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    entered = Event()
+    release = Event()
+    publications = 0
+    errors: list[BaseException] = []
+    results: list[ReadyOutcome] = []
+    revision = ["r1"]
+
+    def publication() -> ReadyOutcome:
+        nonlocal publications
+        publications += 1
+        state = ReadyOutcomeState.WAITING if publications == 1 else followup_state
+        return ReadyOutcome(state, reason="followup" if publications > 1 else "idle")
+
+    def vacuum(_state_db: object, _generation: int, _interrupt: Event) -> str:
+        entered.set()
+        assert release.wait(5)
+        store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": False})
+        return "done"
+
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", publication)
+    monkeypatch.setattr(store, "_publication_revision", lambda: revision[0])
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.vacuum_pending", vacuum)
+
+    def publish() -> None:
+        try:
+            results.append(store.publish_ready())
+        except BaseException as error:  # noqa: BLE001 - propagate worker failure to the main assertion
+            errors.append(error)
+
+    thread = Thread(target=publish)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        assert store.publication_input_changed() is False
+        revision[0] = "r2"
+        release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert errors == []
+        assert publications == 2
+        assert len(results) == 1 and results[0].state is followup_state
+    finally:
+        release.set()
+        thread.join(timeout=5)

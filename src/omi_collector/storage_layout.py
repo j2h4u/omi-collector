@@ -74,13 +74,7 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
         document = cast(dict[str, object], tomllib.loads(config_path.read_text(encoding="utf-8")))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise StorageLayoutError("config TOML is unreadable or malformed") from error
-    allowed = {"pendant", "presence", "ready"}
-    if not isinstance(document, dict) or not {"pendant", "ready"} <= set(document) or not set(document) <= allowed:
-        raise StorageLayoutError("config must contain [pendant] and [ready], with optional [presence]")
-    pendant = _section(document["pendant"], {"address"}, "pendant")
-    address = pendant["address"]
-    if _ADDRESS.fullmatch(address) is None:
-        raise StorageLayoutError("pendant.address must be an uppercase Bluetooth address")
+    address, runtime_config = _parse_settings(document)
     root = config_path.absolute().parent
     if os.path.lexists(root) and root.is_symlink():
         raise StorageLayoutError("config parent must not be a symlink")
@@ -99,48 +93,66 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
         draft=root / "draft",
         publication=PublicationLayout(root=publication_root),
     )
+    return OperatorConfig(config_path.absolute(), PendantConfig(address), layout, runtime_config)
+
+
+def _parse_settings(document: dict[str, object]) -> tuple[str, CollectorConfig]:
+    allowed = {
+        "pendant_address",
+        "bundle_min_audio_seconds",
+        "presence_arrival_stability_seconds",
+        "presence_arrival_max_gap_seconds",
+    }
+    required = {"pendant_address", "bundle_min_audio_seconds"}
+    if not isinstance(document, dict):
+        raise StorageLayoutError("config must be a TOML table")
+    missing = required - set(document)
+    if missing:
+        raise StorageLayoutError(f"config is missing required keys: {', '.join(sorted(missing))}")
+    unknown = set(document) - allowed
+    if unknown:
+        raise StorageLayoutError(f"config contains unsupported keys: {', '.join(sorted(unknown))}")
+    address = document["pendant_address"]
+    if not isinstance(address, str) or not address or address != address.strip():
+        raise StorageLayoutError("pendant_address must be a non-empty string")
+    if _ADDRESS.fullmatch(address) is None:
+        raise StorageLayoutError("pendant_address must be an uppercase Bluetooth address")
     runtime_config = CollectorConfig()
-    if "presence" in document:
-        presence = _number_section(
-            document["presence"], {"arrival_max_gap_seconds", "arrival_stability_seconds"}, "presence"
-        )
+    presence_keys = {"presence_arrival_stability_seconds", "presence_arrival_max_gap_seconds"}
+    if set(document) & presence_keys:
+        if not presence_keys <= set(document):
+            raise StorageLayoutError(
+                "presence tuning requires both presence_arrival_stability_seconds and "
+                "presence_arrival_max_gap_seconds"
+            )
+        presence = _number_fields(document, presence_keys)
         try:
             runtime_config = replace(
                 runtime_config,
                 presence=PresenceConfig(
-                    arrival_stability_seconds=presence["arrival_stability_seconds"],
-                    arrival_max_gap_seconds=presence["arrival_max_gap_seconds"],
+                    arrival_stability_seconds=presence["presence_arrival_stability_seconds"],
+                    arrival_max_gap_seconds=presence["presence_arrival_max_gap_seconds"],
                 ),
             )
         except ValueError as error:
             raise StorageLayoutError(f"presence settings are invalid: {error}") from error
-    if "ready" in document:
-        ready = _number_section(document["ready"], {"target_audio_seconds"}, "ready")
-        try:
-            runtime_config = replace(runtime_config, ready=ReadyConfig(**ready))
-        except ValueError as error:
-            raise StorageLayoutError(f"ready settings are invalid: {error}") from error
-    return OperatorConfig(config_path.absolute(), PendantConfig(address), layout, runtime_config)
+    ready = _number_fields(document, {"bundle_min_audio_seconds"})
+    try:
+        runtime_config = replace(
+            runtime_config,
+            ready=ReadyConfig(target_audio_seconds=ready["bundle_min_audio_seconds"]),
+        )
+    except ValueError as error:
+        raise StorageLayoutError(f"bundle settings are invalid: {error}") from error
+    return address, runtime_config
 
 
-def _section(value: object, keys: set[str], name: str) -> dict[str, str]:
-    if not isinstance(value, dict) or set(value) != keys:
-        raise StorageLayoutError(f"[{name}] must contain exactly {', '.join(sorted(keys))}")
-    result: dict[str, str] = {}
-    for key, item in value.items():
-        if not isinstance(item, str) or not item or item != item.strip():
-            raise StorageLayoutError(f"{name}.{key} must be a non-empty string")
-        result[key] = item
-    return result
-
-
-def _number_section(value: object, keys: set[str], name: str) -> dict[str, float]:
-    if not isinstance(value, dict) or set(value) != keys:
-        raise StorageLayoutError(f"[{name}] must contain exactly {', '.join(sorted(keys))}")
+def _number_fields(document: dict[str, object], keys: set[str]) -> dict[str, float]:
     result: dict[str, float] = {}
-    for key, item in value.items():
+    for key in keys:
+        item = document[key]
         if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise StorageLayoutError(f"{name}.{key} must be a number")
+            raise StorageLayoutError(f"{key} must be a number")
         result[key] = float(item)
     return result
 

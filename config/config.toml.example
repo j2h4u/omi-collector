@@ -1,16 +1,8 @@
-[pendant]
-address = "AA:BB:CC:DD:EE:FF"
-
-# Automatic service and `device sync` require one exact-address scanner
-# candidate to remain visible for this span before opening GATT.
-[presence]
-arrival_stability_seconds = 30.0
-arrival_max_gap_seconds = 10.0
+pendant_address = "AA:BB:CC:DD:EE:FF" # Bluetooth address printed by `bluetoothctl devices`
 
 # Publish a ready bundle after a complete pendant drain once captured Opus
 # audio reaches this cumulative minimum (3600 seconds = 1 hour). This is not
 # elapsed wait time or a maximum chunk size; smaller drains accumulate in
 # SQLite indefinitely. VAD processing happens downstream and does not set
 # this duration.
-[ready]
-target_audio_seconds = 3600.0
+bundle_min_audio_seconds = 3600.0

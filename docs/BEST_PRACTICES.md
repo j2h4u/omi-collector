@@ -36,6 +36,14 @@ Runtime QA must run serially at low CPU and idle I/O priority. The canonical
 `PYTEST_XDIST_AUTO_NUM_WORKERS=1` so its pytest-xdist invocation uses one
 worker. Keep the tests and assertions intact.
 
+For full QA on a slow disk, put only temporary test scratch in a short,
+task-owned `TMPDIR` on tmpfs; keep logs and receipts on persistent storage.
+pytest-xdist's Unix socket path, including its generated suffix, must fit the
+Linux 108-byte `AF_UNIX` path limit. A prior 117-byte path caused the harness
+to time out at 600 seconds; using a shorter `TMPDIR` let the unchanged gates
+pass. After the run, remove only its owned scratch directory and retain the
+logs.
+
 Git tracks only whether a source file is executable (`100644` or `100755`),
 not its full worktree permission bits. Tests of source-file executability must
 read the Git index mode instead of comparing `stat()` with exact `0755` or

@@ -58,6 +58,7 @@ from .internal_audio_store import (
     decode_uint64,
     encode_uint64,
 )
+from .sqlite_compaction import mark_retirement_compaction_pending
 from .staging_contract import FatalInternalAudioStorageError
 
 
@@ -4101,6 +4102,7 @@ def _retire_typed_source_once(audio_store: InternalAudioStore, step: _Retirement
             if ordinals != tuple(range(step.old_cursor, step.old_cursor + len(ordinals))):
                 raise ReadyBundleError("typed retirement rows are not contiguous")
             proposed = step.old_cursor + len(ordinals)
+            mark_retirement_compaction_pending(state)
             connection.executemany(
                 "DELETE FROM capture_record WHERE source_id=? AND ordinal=?",
                 ((step.source_id, ordinal) for ordinal in ordinals),
@@ -4158,7 +4160,13 @@ def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
                     (step.source_id,),
                 )
             )
-    except (OSError, StateDBError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
+            marker = _sql_one(
+                connection.execute(
+                    "SELECT payload FROM state WHERE kind=? AND id=?", (StateKind.COMPACTION.value, "current")
+                )
+            )
+            marker_payload = json.loads(cast(str, marker[0])) if marker is not None else None
+    except (OSError, ValueError, StateDBError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
         raise_if_sqlite_corrupt(error)
         _typed_fail_stop(audio_store, f"ambiguous typed retirement could not be inspected: {error}")
     if proposed is None and row is None:
@@ -4170,7 +4178,7 @@ def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
         step.coverage_digest,
     ):
         if row[4] == proposed:
-            return "proposed"
+            return "proposed" if isinstance(marker_payload, dict) and marker_payload.get("pending") is True else "third"
         if row[4] == step.old_cursor:
             return "old"
     return "third"

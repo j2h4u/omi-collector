@@ -1,6 +1,6 @@
 # OMIC-16: internal capture in the existing Collector SQLite
 
-Status: implementation plan for adversarial review. No OMIC-16 code or production migration has begun. This plan does not authorize changing the public ready format or the external ACK protocol.
+Status: accepted design, implemented and deployed as recorded in the [OMIC-16 acceptance receipt](qa/2026-10-13-omic-16-implementation.md). This frozen plan does not authorize changing the public ready format or the external ACK protocol.
 
 ## Goal and observable boundary
 

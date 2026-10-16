@@ -1,4 +1,4 @@
-"""Validate the state left by the Docker QA migration bootstrap."""
+"""Validate the state left by the Docker QA initialization bootstrap."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ _REVISION = re.compile(r"[0-9a-f]{40,64}\Z")
 _APP_UID = 1000
 _OPERATOR_GID = 1001
 _DATABASE_MODE = 0o640
+_SCHEMA_VERSION = 2
 _LOCK_MODE = 0o600
 _READY_MODE = 0o2750
 
@@ -63,22 +64,14 @@ def _check_database() -> None:
     _require(stat.S_IMODE(database_stat.st_mode) == _DATABASE_MODE, "database mode is not 0640")
     with sqlite3.connect(f"file:{_DATABASE}?mode=ro", uri=True) as connection:
         version = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
-        _require(version == (2,), f"SQLite user_version is {version}, expected 2")
-        row = cast(
-            tuple[str] | None,
-            connection.execute(
-                "SELECT payload FROM state WHERE kind = 'migration' AND id = 'internal_audio_cutover'"
-            ).fetchone(),
+        _require(
+            version is not None and version[0] == _SCHEMA_VERSION,
+            f"SQLite user_version is {version}, expected {_SCHEMA_VERSION}",
         )
-    if row is None:
-        raise RuntimeError("internal audio cutover receipt is missing")
-    if not isinstance(row[0], str):
-        raise RuntimeError("internal audio cutover payload is not text")
-    payload = cast(object, json.loads(row[0]))
-    _require(
-        payload == {"format": 1, "phase": "COMPLETE", "fresh": True},
-        "internal audio cutover receipt is not the expected complete fresh payload",
-    )
+        _require(
+            connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone() is None,
+            "legacy capture rows remain",
+        )
 
 
 def main() -> int:

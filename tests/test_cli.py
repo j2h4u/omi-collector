@@ -63,9 +63,7 @@ def _layout(tmp_path: Path) -> Path:
     layout.collector.root.mkdir(parents=True, exist_ok=True)
     layout.collector.root.chmod(0o2750)
     if not layout.collector.state_db.exists():
-        db = StateDB(layout.collector.state_db)
-        db.put(StateKind.MIGRATION, "current", {"version": 1, "phase": "complete"})
-        db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
+        StateDB(layout.collector.state_db).put(StateKind.RUNTIME_STATUS, "current", {"last_error": "original"})
     return path
 
 
@@ -111,64 +109,141 @@ def test_mutating_cli_rejects_alternate_root_for_same_adapter_with_different_pen
         cli._require_host_singleton(load_operator_config(alternate))
 
 
-def test_migrate_state_cli_requires_stopped_installed_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_init_state_cli_initializes_empty_v2_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    state_file.unlink()
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
-    calls: list[object] = []
-    monkeypatch.setattr(
-        "omi_collector.internal_audio_migration.migrate_internal_audio", lambda *_args, **_kwargs: calls.append(True)
-    )
     monkeypatch.setattr(
         cli,
         "_systemd_service_status",
-        lambda: {"available": True, "active_state": "active"},
+        lambda: {"available": True, "active_state": "inactive"},
     )
 
-    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
+    result = CliRunner().invoke(app, ["init-state", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"schema_version": 2}
+    assert state_file.is_file()
+    with closing(sqlite3.connect(state_file)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+
+
+def test_init_state_preserves_existing_receiptless_v2_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    before = state_file.read_bytes()
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
+
+    result = CliRunner().invoke(app, ["init-state", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"schema_version": 2}
+    assert state_file.read_bytes() == before
+    assert StateDB(state_file).get(StateKind.RUNTIME_STATUS, "current") == {"last_error": "original"}
+
+
+def test_init_state_refuses_v1_database_without_changing_it(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    with closing(sqlite3.connect(state_file)) as connection:
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+    before = state_file.read_bytes()
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
+
+    result = CliRunner().invoke(app, ["init-state", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert state_file.read_bytes() == before
+
+
+def test_init_state_rejects_active_installed_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "active"})
+
+    result = CliRunner().invoke(app, ["init-state", "--config", str(config_path)])
 
     assert result.exit_code == 1
     assert "confirm the Collector service is stopped" in result.output
-    assert calls == []
 
 
-def test_migrate_state_cli_uses_the_only_cutover_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_recover_state_journal_requires_stopped_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
-    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
-    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
-    captured: list[tuple[object, object]] = []
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "active"})
 
-    def fake_migrate(layout: object, *, release_metadata: Path) -> dict[str, int]:
-        captured.append((layout, release_metadata))
-        return {"removed_files": 3}
+    result = CliRunner().invoke(app, ["recover-state-journal", "--config", str(config_path)])
 
-    monkeypatch.setattr("omi_collector.internal_audio_migration.migrate_internal_audio", fake_migrate)
-
-    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
-
-    assert result.exit_code == 0
-    assert json.loads(result.output) == {"removed_files": 3}
-    assert captured[0][1] == Path(cli.sys.prefix) / "share/omi-collector/release.json"
+    assert result.exit_code == 1
+    assert "confirm the Collector service is stopped before journal recovery" in result.output
 
 
-def test_migrate_state_cli_uses_selected_release_metadata(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_check_state_classifies_v1_as_refused_without_mutating_it(tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
-    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    with closing(sqlite3.connect(state_file)) as connection:
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+    before = state_file.read_bytes()
+
+    result = CliRunner().invoke(app, ["check-state", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "detail": "Collector v1 state is unsupported by this release",
+        "reason": "state_validation_failed",
+        "status": "state_refused",
+    }
+    assert state_file.read_bytes() == before
+
+
+def test_recover_state_journal_recovers_real_v2_journal_only_when_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _layout(tmp_path)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    with closing(StateDB(state_file).open_connection()) as connection:
+        connection.executemany(
+            "INSERT INTO state(kind,id,payload) VALUES('padding',?,?)",
+            ((str(index), '"' + "x" * 1000 + '"') for index in range(1000)),
+        )
+    subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            (
+                "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1],isolation_level=None); "
+                "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); "
+                "c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)"
+            ),
+            str(state_file),
+        ),
+        check=True,
+        timeout=10,
+    )
+    journal = state_file.with_name(f"{state_file.name}-journal")
+    assert journal.is_file()
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "active"})
+
+    active = CliRunner().invoke(app, ["recover-state-journal", "--config", str(config_path)])
+
+    assert active.exit_code == 1
+    assert journal.is_file()
     monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "inactive"})
-    captured: list[tuple[object, Path]] = []
 
-    def fake_internal(layout: object, *, release_metadata: Path) -> dict[str, int]:
-        captured.append((layout, release_metadata))
-        return {"imported_sources": 2, "removed_files": 4}
+    stopped = CliRunner().invoke(app, ["recover-state-journal", "--config", str(config_path)])
 
-    monkeypatch.setattr("omi_collector.internal_audio_migration.migrate_internal_audio", fake_internal)
-    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
-
-    assert result.exit_code == 0
-    assert json.loads(result.output) == {"imported_sources": 2, "removed_files": 4}
-    assert captured[0][1] == Path(cli.sys.prefix) / "share/omi-collector/release.json"
+    assert stopped.exit_code == 0, stopped.output
+    assert json.loads(stopped.output) == {"schema_version": 2, "status": "state_compatible"}
+    assert not journal.exists()
+    assert StateDB(state_file).get(StateKind.RUNTIME_STATUS, "current") == {"last_error": "original"}
 
 
-def test_mutating_cli_distinguishes_required_cutover_from_sqlite_busy(
+def test_mutating_cli_refuses_v1_without_changing_it_and_classifies_sqlite_busy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config_path = _layout(tmp_path)
@@ -176,11 +251,13 @@ def test_mutating_cli_distinguishes_required_cutover_from_sqlite_busy(
     with closing(StateDB(layout.collector.state_db).open_connection()) as connection:
         connection.execute("PRAGMA user_version=1")
         connection.commit()
+    before = layout.collector.state_db.read_bytes()
 
     monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: None)
-    cutover = CliRunner().invoke(app, ["service", "--config", str(config_path)])
-    assert cutover.exit_code == 78
-    assert "requires stopped-service internal audio cutover" in cutover.output
+    refused = CliRunner().invoke(app, ["service", "--config", str(config_path)])
+    assert refused.exit_code == 78
+    assert "Collector v1 state is unsupported" in refused.output
+    assert layout.collector.state_db.read_bytes() == before
 
     def busy(_layout: object) -> StateDB:
         raise StateDBError("database is locked")
@@ -207,7 +284,7 @@ import sqlite3
 import sys
 connection = sqlite3.connect(sys.argv[1], isolation_level=None)
 connection.execute("BEGIN IMMEDIATE")
-connection.execute("UPDATE state SET payload='transient' WHERE kind='migration' AND id='current'")
+connection.execute("UPDATE state SET payload='transient' WHERE kind='runtime_status' AND id='current'")
 os._exit(0)
 """,
             str(state_file),
@@ -240,7 +317,7 @@ import sqlite3
 import sys
 connection = sqlite3.connect(sys.argv[1], isolation_level=None)
 connection.execute("BEGIN IMMEDIATE")
-connection.execute("UPDATE state SET payload='transient' WHERE kind='migration' AND id='current'")
+connection.execute("UPDATE state SET payload='transient' WHERE kind='runtime_status' AND id='current'")
 os._exit(0)
 """,
             str(state_file),
@@ -254,7 +331,7 @@ os._exit(0)
     result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
 
     assert result.exit_code == 0, result.output
-    assert StateDB(state_file).get(StateKind.MIGRATION, "current") == {"version": 1, "phase": "complete"}
+    assert StateDB(state_file).get(StateKind.RUNTIME_STATUS, "current") == {"last_error": "original"}
 
 
 @pytest.mark.parametrize("journal_kind", ["directory", "symlink"])
@@ -276,38 +353,17 @@ def test_mutating_cli_stops_for_nonregular_journal(
     assert "journal is unsafe" in result.output
 
 
-@pytest.mark.parametrize("malformed_draft", [False, True])
-def test_migrate_state_reports_invalid_v1_inputs_without_traceback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, malformed_draft: bool
-) -> None:
+def test_init_state_reports_invalid_database_without_traceback(tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     layout = load_operator_config(config_path).storage
     layout.collector.state_db.unlink()
-    if malformed_draft:
-        with closing(sqlite3.connect(layout.collector.state_db)) as connection:
-            connection.execute(
-                "CREATE TABLE state(kind TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,"
-                "PRIMARY KEY(kind,id)) WITHOUT ROWID"
-            )
-            connection.execute("PRAGMA user_version=1")
-            connection.execute(
-                "INSERT INTO state VALUES ('migration','current','{\"phase\":\"complete\",\"version\":1}')"
-            )
-            connection.commit()
-        layout.draft.mkdir()
-        (layout.draft / "invalid-draft").write_bytes(b"unclassified")
-    else:
-        layout.collector.state_db.write_bytes(b"not a SQLite database")
-    monkeypatch.setattr("omi_collector.internal_audio_migration._release_revision", lambda _path: "a" * 40)
+    layout.collector.state_db.write_bytes(b"not a SQLite database")
 
-    result = CliRunner().invoke(app, ["migrate-state", "--config", str(config_path)])
+    result = CliRunner().invoke(app, ["init-state", "--config", str(config_path)])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 78
     assert "Traceback" not in result.output
-    if malformed_draft:
-        assert "draft" in result.output
-    else:
-        assert "database" in result.output.lower()
+    assert "canonical audio database is corrupt" in result.output
 
 
 def test_service_runs_under_one_guarded_state_scope(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -262,20 +262,16 @@ This gives the local operator password-free read and inventory access without
 allowing edits to Collector state. Existing nested files from older releases
 need a one-time ownership/mode repair before the operator can read them.
 
-The canonical systemd deployment persists the sealed release and checks backup
-space before stopping the service. It then selects the new release, runs that
-release's `migrate-state` command, and starts the service. The
-command converts supported v1 SQLite state and private capture files into
-typed records, verifies parity, and removes only inventoried old private
-copies. An attributable v1 quarantine or terminal-retired attempt needs manual
-custody resolution before a cutover receipt is written. If conversion or
-cleanup is interrupted, keep the service stopped and rerun the selected new
-release's migrator; runtime refuses an incomplete cutover. The deployer keeps
-the new release selected after the cutover boundary. See
-[Best practices](docs/BEST_PRACTICES.md#state-ownership-and-offline-migration)
-for recovery details and the [implementation receipt](docs/qa/2026-10-13-omic-16-implementation.md)
-for the current release status.
-
+The canonical systemd deployment persists the sealed release, checks Collector
+state before stopping the service, and rechecks it under the stable lock before
+selecting the release. A verified SQLite hot rollback journal is recovered by
+SQLite after stop, then checked again. The selected release runs `init-state`:
+it creates a v2 database only when the database and Collector data roots are
+empty, and validates an existing v2 database without rewriting it. Existing v1
+state and unknown private artifacts fail closed and remain untouched. Runtime
+never creates or upgrades state. See [Best practices](docs/BEST_PRACTICES.md#state-ownership-and-state-initialization)
+for the deploy sequence and the [OMIC-16 acceptance receipt](docs/qa/2026-10-13-omic-16-implementation.md)
+for production and release evidence.
 Published bundles are a shared boundary. If another local account consumes
 them, configure either a shared Unix group or a default ACL on the ready root.
 For a named downstream account, the ACL shape is:

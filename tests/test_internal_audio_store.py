@@ -1225,18 +1225,30 @@ def test_stream_validation_is_bounded_to_count_and_digest() -> None:
     assert validate_source_stream(records, expected_count=3, expected_sha256=digest) == (3, digest)
 
 
-def test_offline_installer_converts_v1_backup_only_when_explicit(tmp_path: Path) -> None:
-    path = tmp_path / "backup.sqlite3"
-    connection = sqlite3.connect(path)
-    connection.execute(
-        "CREATE TABLE state (kind TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(kind, id)) WITHOUT ROWID"
-    )
-    connection.execute("PRAGMA user_version = 1")
-    connection.commit()
-    install_audio_schema(connection)
-    connection.commit()
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-    connection.close()
+def test_offline_installer_refuses_v1_database_without_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "v1.sqlite3"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "CREATE TABLE state (kind TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(kind, id)) WITHOUT ROWID"
+        )
+        connection.execute("INSERT INTO state VALUES ('migration', 'legacy', '{\"value\":1}')")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    before = path.read_bytes()
+
+    with closing(sqlite3.connect(path)) as connection, pytest.raises(StateDBError, match="unsupported"):
+        install_audio_schema(connection)
+
+    assert path.read_bytes() == before
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("SELECT kind, id, payload FROM state").fetchone() == (
+            "migration",
+            "legacy",
+            '{"value":1}',
+        )
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name = 'capture_source'").fetchone() is None
 
 
 def test_publication_ledger_and_typed_cursor_share_one_atomic_transaction(tmp_path: Path) -> None:

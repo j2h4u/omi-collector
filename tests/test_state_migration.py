@@ -1,4 +1,4 @@
-"""Runtime accepts only a completed typed Collector database."""
+"""Runtime accepts only a safe typed Collector database."""
 
 from __future__ import annotations
 
@@ -46,14 +46,11 @@ def test_known_v1_requires_stopped_cutover(tmp_path: Path) -> None:
         open_runtime_state(layout)
 
 
-def test_v2_receipt_must_be_complete_and_private_audio_gone(tmp_path: Path) -> None:
+def test_v2_receipt_is_inert_and_private_audio_must_be_gone(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
-    with pytest.raises(InternalAudioCutoverRequiredError, match="missing"):
-        open_runtime_state(layout)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "CLEANUP_PENDING"})
-    with pytest.raises(InternalAudioCutoverRequiredError, match="incomplete"):
-        open_runtime_state(layout)
+    assert open_runtime_state(layout, read_only=True).path == db.path
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     assert open_runtime_state(layout, read_only=True).get(StateKind.MIGRATION, "internal_audio_cutover") is not None
     layout.draft.mkdir()
@@ -67,11 +64,11 @@ def test_v2_rejects_legacy_mutable_rows(tmp_path: Path) -> None:
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     db.put(StateKind.ATTEMPT, "a" * 32, {"descriptor": {"attempt_id": "a" * 32}})
-    with pytest.raises(InternalAudioCutoverRequiredError, match="v1 capture rows"):
+    with pytest.raises(InternalAudioCutoverRequiredError, match="legacy capture rows"):
         open_runtime_state(layout)
 
 
-def test_runtime_receipt_validation_never_scans_retained_audio(tmp_path: Path) -> None:
+def test_runtime_schema_validation_does_not_scan_retained_audio(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
@@ -81,7 +78,9 @@ def test_runtime_receipt_validation_never_scans_retained_audio(tmp_path: Path) -
         _validate_v2(connection)
     assert statements
     assert all("quick_check" not in statement.lower() for statement in statements)
-    assert all("capture_record" not in statement.lower() for statement in statements)
+    assert all(
+        "capture_record" not in statement.lower() or "sqlite_master" in statement.lower() for statement in statements
+    )
 
 
 def test_v2_runtime_accepts_only_sql_owned_partial_ready_stage(tmp_path: Path) -> None:
@@ -128,7 +127,7 @@ def test_v2_runtime_rejects_unowned_stage_lookalike(tmp_path: Path) -> None:
         open_runtime_state(layout)
 
 
-def test_v2_rejects_complete_label_with_unverified_inventory(tmp_path: Path) -> None:
+def test_historical_migration_payload_is_inert(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(
@@ -141,8 +140,7 @@ def test_v2_rejects_complete_label_with_unverified_inventory(tmp_path: Path) -> 
             "files": ["old-raw-path"],
         },
     )
-    with pytest.raises(InternalAudioCutoverRequiredError, match="incomplete"):
-        open_runtime_state(layout)
+    assert open_runtime_state(layout, read_only=True).path == db.path
 
 
 def test_identified_canonical_access_denial_requires_stopped_repair(tmp_path: Path) -> None:

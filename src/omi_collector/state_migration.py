@@ -1,9 +1,8 @@
-"""Runtime gate for the completed, one-way internal-audio cutover."""
+"""Runtime gate for current Collector SQLite state."""
 
 from __future__ import annotations
 
 import errno
-import json
 import os
 import re
 import sqlite3
@@ -14,7 +13,13 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import quote
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, raise_if_sqlite_storage_fault
+from omi_collector.capture.adapters.collector_state_db import (
+    StateDB,
+    StateDBError,
+    _validate_audio_schema,
+    _validate_schema,
+    raise_if_sqlite_storage_fault,
+)
 from omi_collector.storage_layout import StorageLayout
 
 
@@ -23,7 +28,7 @@ class StateMigrationError(RuntimeError):
 
 
 class InternalAudioCutoverRequiredError(StateMigrationError):
-    """A known v1 or interrupted v2 state needs the stopped-service migrator."""
+    """A known v1 or unsafe stopped-service state needs operator repair."""
 
 
 def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
@@ -41,7 +46,7 @@ def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
             _validate_v2(connection)
             _assert_private_audio_gone(layout, connection)
     except FileNotFoundError as error:
-        raise StateMigrationError("Collector SQLite database is missing; run stopped-service migrate-state") from error
+        raise StateMigrationError("Collector SQLite database is missing; run stopped-service init-state") from error
     except PermissionError as error:
         raise InternalAudioCutoverRequiredError(
             "Collector SQLite or journal access needs stopped-service repair"
@@ -55,45 +60,21 @@ _TYPED_SCHEMA = 2
 
 
 def _validate_v2(connection: sqlite3.Connection) -> None:
+    connection.row_factory = sqlite3.Row
     version_row = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
     if version_row is None:
         raise StateMigrationError("Collector SQLite schema version is unavailable")
     if version_row[0] == 1:
-        raise InternalAudioCutoverRequiredError("Collector v1 state requires stopped-service internal audio cutover")
+        raise InternalAudioCutoverRequiredError("Collector v1 state is unsupported by this release")
     if version_row[0] != _TYPED_SCHEMA:
         raise StateMigrationError("Collector SQLite schema version is unsupported")
-    row = cast(
-        tuple[str] | None,
-        connection.execute(
-            "SELECT payload FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
-        ).fetchone(),
-    )
-    if row is None:
-        raise InternalAudioCutoverRequiredError("Collector internal audio cutover receipt is missing")
-    receipt = cast(object, json.loads(row[0]))
-    if not _complete_receipt(receipt):
-        raise InternalAudioCutoverRequiredError("Collector internal audio cutover is incomplete")
+    try:
+        _validate_schema(connection)
+        _validate_audio_schema(connection)
+    except StateDBError as error:
+        raise StateMigrationError("Collector SQLite typed schema is invalid") from error
     if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
-        raise InternalAudioCutoverRequiredError("Collector v1 capture rows remain after cutover")
-
-
-def _complete_receipt(value: object) -> bool:
-    if not isinstance(value, dict) or value.get("format") != 1 or value.get("phase") != "COMPLETE":
-        return False
-    if value == {"format": 1, "phase": "COMPLETE", "fresh": True}:
-        return True
-    if set(value) != {"format", "phase", "source_revision", "source_sha256", "imported_sources"}:
-        return False
-    revision = value["source_revision"]
-    digest = value["source_sha256"]
-    return (
-        isinstance(revision, str)
-        and re.fullmatch(r"[0-9a-f]{40,64}", revision) is not None
-        and isinstance(digest, str)
-        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
-        and type(value["imported_sources"]) is int
-        and value["imported_sources"] >= 0
-    )
+        raise InternalAudioCutoverRequiredError("legacy capture rows remain in v2 state")
 
 
 def open_runtime_state(layout: StorageLayout, *, read_only: bool = False) -> StateDB:
@@ -148,7 +129,7 @@ def _assert_private_audio_gone(layout: StorageLayout, connection: sqlite3.Connec
         if not stat.S_ISDIR(mode):
             raise StateMigrationError(f"private audio root is unsafe: {root}")
         if any(root.iterdir()):
-            raise InternalAudioCutoverRequiredError(f"v1 private audio remains after cutover: {root}")
+            raise InternalAudioCutoverRequiredError(f"private audio remains outside typed SQLite state: {root}")
     ready = layout.publication.root
     if not ready.exists() and not ready.is_symlink():
         return
@@ -185,7 +166,7 @@ def _owned_typed_ready_stage(entry: Path, connection: sqlite3.Connection) -> boo
         tuple[str, int] | None,
         connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (parts[1],)).fetchone(),
     )
-    if cohort is None or cohort != ("staging", int(parts[2])) or str(cohort[1]) != parts[2]:
+    if cohort is None or (cohort[0], cohort[1]) != ("staging", int(parts[2])) or str(cohort[1]) != parts[2]:
         return False
     return all(
         child.name in {"records.bin", "manifest.json"} and stat.S_ISREG(child.lstat().st_mode)

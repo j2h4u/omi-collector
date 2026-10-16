@@ -4,10 +4,11 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, closing
 from pathlib import Path
 from shutil import rmtree
 from struct import pack
@@ -22,7 +23,7 @@ from fakes import ScriptedRingSession, WriteStep
 from omi_collector import cli as operator_cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.attempts import DurableSqliteSeal
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.collector_state_db import StateDB
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
@@ -100,9 +101,7 @@ def _layout(tmp_path: Path) -> Path:
     )
     layout = load_operator_config(path).storage
     if not layout.collector.state_db.exists():
-        db = StateDB(layout.collector.state_db)
-        db.put(StateKind.MIGRATION, "current", {"version": 1, "phase": "complete"})
-        db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
+        StateDB(layout.collector.state_db)
     return path
 
 
@@ -372,6 +371,20 @@ def test_confirmation_gates_do_not_construct_host_operations(monkeypatch: pytest
     assert "--confirm-host-change" in info_result.output
     assert collect_result.exit_code == 2
     assert "--confirm-read" in collect_result.output
+
+
+def test_device_status_refuses_v1_state_before_opening_host_operations(tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    state_file = load_operator_config(config_path).storage.collector.state_db
+    with closing(sqlite3.connect(state_file)) as connection:
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+
+    result = CliRunner().invoke(app, ["device", "status", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "Collector v1 state is unsupported" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_unexpected_transport_error_is_redacted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

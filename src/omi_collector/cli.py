@@ -1060,5 +1060,7 @@ def _run_device_operation(
     except StopRequestedError as error:
         raise typer.Exit(code=stop_intent.exit_code if stop_intent is not None else 1) from error
     except Exception as error:  # User-facing boundary; BaseException remains unsuppressed.
-        typer.echo(f"device operation failed: {type(error).__name__}", err=True)
+        from omi_collector.capture.adapters.debug_logging import safe_exception_summary
+
+        typer.echo(f"device operation failed: {safe_exception_summary(error)}", err=True)
         raise typer.Exit(code=1) from error

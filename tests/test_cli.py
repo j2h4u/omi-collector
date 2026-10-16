@@ -659,7 +659,8 @@ def test_device_operation_failure_is_reported_on_stderr(monkeypatch: pytest.Monk
 
     assert result.exit_code == 1
     assert result.stdout == ""
-    assert result.stderr.strip() == "device operation failed: RuntimeError"
+    assert result.stderr.strip().startswith("device operation failed: RuntimeError at ")
+    assert "private detail" not in result.stderr
 
 
 def test_device_host_change_and_read_routes_refuse_without_confirmation(

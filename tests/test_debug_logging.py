@@ -3,11 +3,13 @@ from __future__ import annotations
 import gc
 import logging
 import weakref
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters import debug_logging
 from omi_collector.capture.adapters.collector_state_db import StateDB
 from omi_collector.capture.adapters.debug_logging import (
     _validate_runtime_event,
@@ -19,11 +21,124 @@ from omi_collector.capture.adapters.debug_logging import (
     legacy_runtime_projection,
     merge_runtime_status,
     read_runtime_status,
+    safe_exception_summary,
     set_runtime_status_sink,
     write_runtime_status_event,
 )
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.config import DebugLogConfig
+
+
+def test_safe_exception_summary_keeps_tail_frames_and_omits_exception_data() -> None:
+    package_file = Path(__file__).parents[1] / "src/omi_collector/capture/adapters/debug_logging.py"
+    namespace: dict[str, object] = {}
+    exec(
+        compile(
+            "def descend(depth):\n"
+            "    secret_local = 'private-local-value'\n"
+            "    if depth:\n"
+            "        return descend(depth - 1)\n"
+            "    raise RecursionError('private-exception-value')\n",
+            str(package_file),
+            "exec",
+        ),
+        namespace,
+    )
+
+    try:
+        cast(Callable[[int], None], namespace["descend"])(24)
+    except RecursionError as error:
+        summary = safe_exception_summary(error)
+    else:
+        pytest.fail("synthetic recursive failure was not raised")
+
+    assert summary.startswith("RecursionError at ")
+    assert "capture/adapters/debug_logging.py:" in summary
+    assert summary.count("capture/adapters/debug_logging.py:") == 16
+    assert "<external>" not in summary
+    assert "private-exception-value" not in summary
+    assert "private-local-value" not in summary
+
+
+def test_safe_exception_summary_marks_external_and_missing_frames() -> None:
+    try:
+        raise RuntimeError("private message")
+    except RuntimeError as error:
+        external = safe_exception_summary(error)
+
+    assert "<external>:" in external
+    assert "private message" not in external
+    assert safe_exception_summary(ValueError("secret")) == "ValueError at <no stack>"
+
+
+def test_safe_exception_summary_resolves_current_symlink_frame_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_root = tmp_path / "release" / "omi_collector"
+    package_root.mkdir(parents=True)
+    current = tmp_path / "current"
+    current.symlink_to(package_root, target_is_directory=True)
+    monkeypatch.setattr(debug_logging, "__file__", str(current / "capture/adapters/debug_logging.py"))
+    namespace: dict[str, object] = {}
+    exec(
+        compile(
+            "def inner():\n"
+            "    secret_local = 'private-local-value'\n"
+            "    raise RuntimeError('private-exception-value')\n",
+            str(package_root / "cli.py"),
+            "exec",
+        ),
+        namespace,
+    )
+    exec(
+        compile(
+            "def outer():\n    secret_source = 'private-source-value'\n    return inner()\n",
+            str(current / "cli.py"),
+            "exec",
+        ),
+        namespace,
+    )
+
+    try:
+        cast(Callable[[], None], namespace["outer"])()
+    except RuntimeError as error:
+        summary = safe_exception_summary(error)
+    else:
+        pytest.fail("synthetic symlink-path failure was not raised")
+
+    assert summary.startswith("RuntimeError at ")
+    assert summary.count("cli.py:") == 2
+    assert "<external>:" in summary
+    assert str(tmp_path) not in summary
+    assert "private-exception-value" not in summary
+    assert "private-local-value" not in summary
+    assert "private-source-value" not in summary
+
+
+def test_safe_exception_summary_survives_traceback_path_resolution_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_root = tmp_path / "release" / "omi_collector"
+    package_root.mkdir(parents=True)
+    monkeypatch.setattr(debug_logging, "__file__", str(package_root / "capture/adapters/debug_logging.py"))
+    loop = tmp_path / "loop.py"
+    loop.symlink_to(loop)
+    namespace: dict[str, object] = {}
+    exec(
+        compile("def fail():\n    raise LookupError('private-message')\n", str(loop), "exec"),
+        namespace,
+    )
+
+    try:
+        cast(Callable[[], None], namespace["fail"])()
+    except LookupError as error:
+        summary = safe_exception_summary(error)
+    else:
+        pytest.fail("synthetic path-resolution failure was not raised")
+
+    assert summary.startswith("LookupError at <external>:")
+    assert "private-message" not in summary
+    assert str(tmp_path) not in summary
 
 
 def test_debug_events_are_redacted_before_they_reach_root_logging(

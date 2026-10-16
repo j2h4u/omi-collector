@@ -383,7 +383,8 @@ def test_unexpected_transport_error_is_redacted(monkeypatch: pytest.MonkeyPatch,
     result = CliRunner().invoke(app, ["device", "probe", "--config", str(_layout(tmp_path)), "--confirm-host-change"])
 
     assert result.exit_code == 1
-    assert result.output.strip() == "device operation failed: Exception"
+    assert result.output.strip().startswith("device operation failed: Exception at ")
+    assert "raw transport detail" not in result.output
 
 
 def test_probe_uses_injected_fakes_and_renders_safe_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1181,7 +1182,7 @@ def test_collect_command_redacts_operational_errors(monkeypatch: pytest.MonkeyPa
     )
 
     assert result.exit_code == 1
-    assert result.output.strip() == "device operation failed: OSError"
+    assert result.output.strip().startswith("device operation failed: OSError at ")
     assert "raw ring detail" not in result.output
 
 

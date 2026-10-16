@@ -615,13 +615,18 @@ def _exception_summary(exc_info: LoggedExceptionInfo) -> _SafeTraceback:
     package_root = Path(__file__).resolve().parents[2]
     frames: list[str] = []
     if traceback_ is not None:
-        for frame in traceback.extract_tb(traceback_, limit=16):
+        for frame in traceback.extract_tb(traceback_, limit=-16):
             try:
-                source = Path(frame.filename).relative_to(package_root).as_posix()
-            except ValueError:
+                source = Path(frame.filename).resolve().relative_to(package_root).as_posix()
+            except OSError, RuntimeError, ValueError:
                 source = "<external>"
             frames.append(f"{source}:{frame.lineno}")
     return _SafeTraceback(f"{name} at {' <- '.join(frames) if frames else '<no stack>'}")
+
+
+def safe_exception_summary(error: BaseException) -> str:
+    """Return an exception type and redacted, package-relative stack summary."""
+    return _exception_summary(_exception_info(error)).text
 
 
 def _journal_code(value: object) -> str:

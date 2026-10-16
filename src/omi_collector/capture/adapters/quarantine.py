@@ -128,7 +128,7 @@ def _typed_transaction(filesystem: StagingFilesystem) -> Iterator[sqlite3.Connec
     with state_db.access():
         connection = state_db.open_connection()
         try:
-            state_db.begin_exclusive(connection)
+            state_db.begin_write(connection)
             yield connection
             connection.commit()
         except BaseException as error:

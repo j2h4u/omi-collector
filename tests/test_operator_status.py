@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
@@ -134,6 +135,39 @@ def test_operator_status_reads_ready_metadata_without_opening_audio(
     publication = cast(dict[str, object], status["publication"])
     assert publication["bundle_count"] == 1
     assert publication["downloaded_raw_bytes"] == RECORD_SIZE
+
+
+def test_operator_status_reads_committed_state_during_runtime_write(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    layout.publication.root.mkdir(parents=True)
+    db = _state_db(layout)
+    _operational_status(layout, {})
+    db.put(StateKind.CLOCK, "current", {"status": "old"})
+    writer_ready = threading.Event()
+    finish_write = threading.Event()
+
+    def write_uncommitted_state() -> None:
+        with db.transaction() as transaction:
+            transaction.put(StateKind.CLOCK, "current", {"status": "new"})
+            writer_ready.set()
+            if not finish_write.wait(5):
+                raise TimeoutError("test writer was not released")
+
+    thread = threading.Thread(target=write_uncommitted_state)
+    thread.start()
+    try:
+        assert writer_ready.wait(5)
+        status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+        assert isinstance(status, dict)
+        with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+            assert connection.execute("SELECT payload FROM state WHERE kind='clock' AND id='current'").fetchone() == (
+                '{"status":"old"}',
+            )
+    finally:
+        finish_write.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert db.get(StateKind.CLOCK, "current") == {"status": "new"}
 
 
 def _put_quality_events(layout: StorageLayout, events: tuple[dict[str, object], ...] | list[dict[str, object]]) -> None:

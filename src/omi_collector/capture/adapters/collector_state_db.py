@@ -17,7 +17,7 @@ from typing import cast, overload
 from urllib.parse import quote
 
 from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
-from .sqlite_admission import admit_exclusive
+from .sqlite_admission import admit_exclusive, admit_immediate, commit_with_busy_retry
 
 _SCHEMA_VERSION = 2
 _LEGACY_SCHEMA_VERSION = 1
@@ -275,7 +275,7 @@ class _GuardedConnection(sqlite3.Connection):
 
     def commit(self) -> None:
         self._check()
-        super().commit()
+        commit_with_busy_retry(self, super().commit)
 
     def rollback(self) -> None:
         self._check()
@@ -344,16 +344,24 @@ class StateDB(_Operations):
                             raise StateDBError("state write transaction escaped its access guard")
                         self._active.write_connection = None
 
-    def begin_exclusive(self, connection: sqlite3.Connection) -> None:
-        """Admit this guarded connection as this thread's sole write owner."""
-
+    def _begin_write(self, connection: sqlite3.Connection, admit: Callable[[sqlite3.Connection], None]) -> None:
         if getattr(self._active, "access_depth", 0) == 0:
             raise StateDBError("write admission requires the state access guard")
         owner = getattr(self._active, "write_connection", None)
         if owner is not None and owner is not connection:
             raise StateDBError("another state connection owns the write transaction")
-        admit_exclusive(connection)
+        admit(connection)
         self._active.write_connection = connection
+
+    def begin_exclusive(self, connection: sqlite3.Connection) -> None:
+        """Admit a schema or recovery transaction as this thread's sole writer."""
+
+        self._begin_write(connection, admit_exclusive)
+
+    def begin_write(self, connection: sqlite3.Connection) -> None:
+        """Admit a runtime writer without blocking readers of committed data."""
+
+        self._begin_write(connection, admit_immediate)
 
     def end_write(self, connection: sqlite3.Connection) -> None:
         """Release ownership only after the transaction has actually ended."""
@@ -529,7 +537,7 @@ class StateDB(_Operations):
             connection = self._connect_unlocked()
             try:
                 if write:
-                    self.begin_exclusive(connection)
+                    self.begin_write(connection)
                 yield connection
                 if write:
                     connection.commit()
@@ -575,7 +583,7 @@ class StateDB(_Operations):
         with self.access():
             connection = self._connect_unlocked()
             try:
-                self.begin_exclusive(connection)
+                self.begin_write(connection)
                 self._active.in_transaction = True
                 transaction = StateTransaction(connection)
                 yield transaction

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.3](https://github.com/j2h4u/omi-collector/compare/v0.14.2...v0.14.3) (2026-10-16)
+
+
+### Fixes
+
+* retain redacted stack context for fatal device errors ([#262](https://github.com/j2h4u/omi-collector/issues/262)) ([3d90abd](https://github.com/j2h4u/omi-collector/commit/3d90abd6fa1efebaca8d6815b7fd5769c54d006a))
+
 ## [0.14.2](https://github.com/j2h4u/omi-collector/compare/v0.14.1...v0.14.2) (2026-10-16)
 
 

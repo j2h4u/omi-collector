@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/j2h4u/omi-collector/compare/v0.14.1...v0.14.2) (2026-10-16)
+
+
+### Fixes
+
+* allow device status during audio capture ([#260](https://github.com/j2h4u/omi-collector/issues/260)) ([18cd936](https://github.com/j2h4u/omi-collector/commit/18cd936bcd2862c8b107d42a0eabec942d163e84))
+
 ## [0.14.1](https://github.com/j2h4u/omi-collector/compare/v0.14.0...v0.14.1) (2026-10-16)
 
 

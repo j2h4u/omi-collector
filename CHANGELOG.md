@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.4](https://github.com/j2h4u/omi-collector/compare/v0.14.3...v0.14.4) (2026-10-16)
+
+
+### Refactoring
+
+* remove completed v1 audio cutover ([#264](https://github.com/j2h4u/omi-collector/issues/264)) ([eb5b478](https://github.com/j2h4u/omi-collector/commit/eb5b47803b91e99622b3ad23771b3dd9b7599a0c))
+
 ## [0.14.3](https://github.com/j2h4u/omi-collector/compare/v0.14.2...v0.14.3) (2026-10-16)
 
 

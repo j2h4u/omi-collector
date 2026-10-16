@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import stat
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from pathlib import Path
 from typing import cast
 
 from ..domain.ring_protocol import RECORD_SIZE
@@ -155,28 +152,6 @@ def read_confirmed_losses(db: StateDB, *, allow_missing: bool = False) -> tuple[
         return ConfirmedLossLedger(db).read()
     except StateDBError as error:
         raise ConfirmedLossError("confirmed-loss database read failed") from error
-
-
-def parse_legacy_confirmed_loss(path: Path) -> tuple[ConfirmedLossFact, ...]:
-    """Strictly decode the old bounded ledger for the offline state importer."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_LEDGER_BYTES:
-                raise ValueError("legacy loss ledger is unsafe or oversized")
-            with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                payload = stream.read(_MAX_LEDGER_BYTES + 1)
-        finally:
-            os.close(descriptor)
-        if len(payload) > _MAX_LEDGER_BYTES:
-            raise ValueError("legacy loss ledger is oversized")
-        document = cast(object, json.loads(payload))
-        if not isinstance(document, dict):
-            raise ValueError("legacy ledger must be an object")
-        return ConfirmedLossLedger._decode_ledger(cast(dict[str, object], document))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-        raise ConfirmedLossError("legacy confirmed-loss ledger is malformed or unsafe") from error
 
 
 def _decode_fact(value: object) -> ConfirmedLossFact:

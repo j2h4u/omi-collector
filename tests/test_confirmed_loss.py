@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
@@ -11,7 +10,6 @@ from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.confirmed_loss import (
     ConfirmedLossError,
     ConfirmedLossLedger,
-    parse_legacy_confirmed_loss,
     read_confirmed_losses,
 )
 from omi_collector.capture.adapters.staging_store import StagingStore
@@ -176,15 +174,3 @@ def test_preflight_rejects_missing_initialized_ledger_without_recreating_it(tmp_
         staging.preflight_storage()
 
     assert db.get(StateKind.CONFIRMED_LOSS, "ledger") is None
-
-
-def test_legacy_parser_remains_separate_from_runtime_db_reader(tmp_path: Path) -> None:
-    legacy = tmp_path / "confirmed-loss.json"
-    db = _db(tmp_path)
-    ledger = ConfirmedLossLedger(db)
-    ledger.initialize(allow_create=True)
-    ledger.record(ATTEMPT, 100, 110, OCCURRED_AT)
-    document = db.get(StateKind.CONFIRMED_LOSS, "ledger")
-    assert document is not None
-    legacy.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-    assert parse_legacy_confirmed_loss(legacy)[0].start_sequence == 100

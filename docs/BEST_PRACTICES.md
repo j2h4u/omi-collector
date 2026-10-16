@@ -41,8 +41,10 @@ task-owned `TMPDIR` on tmpfs; keep logs and receipts on persistent storage.
 pytest-xdist's Unix socket path, including its generated suffix, must fit the
 Linux 108-byte `AF_UNIX` path limit. A prior 117-byte path caused the harness
 to time out at 600 seconds; using a shorter `TMPDIR` let the unchanged gates
-pass. After the run, remove only its owned scratch directory and retain the
-logs.
+pass. Remove the run's owned scratch directory after completion. Keep diagnostic
+logs only while investigating failures or recording acceptance, then delete
+them once the useful result is recorded in WorkGraph. Preserve reusable mutation
+campaign results; they are not disposable test scratch.
 
 Git tracks only whether a source file is executable (`100644` or `100755`),
 not its full worktree permission bits. Tests of source-file executability must

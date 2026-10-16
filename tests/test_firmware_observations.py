@@ -12,7 +12,6 @@ from omi_collector.capture.adapters.firmware_observations import (
     FirmwareObservationError,
     FirmwareObservationStore,
     FirmwareObservationWriter,
-    parse_legacy_firmware,
     read_firmware_observations,
 )
 from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
@@ -220,15 +219,3 @@ def test_writer_replaces_stalled_mailbox_with_latest_observation(tmp_path: Path)
     (observation,) = read_firmware_observations(db)
     assert observation.dropped_packets == 3
     assert observation.observation_count == 2
-
-
-def test_legacy_parser_is_separate_from_runtime_database_reader(tmp_path: Path) -> None:
-    legacy = tmp_path / "device.json"
-    legacy.write_text(
-        '{"latest":{"capacity_packets":100,"dropped_packets":3,"packet_size":444,'
-        '"read_sequence":10,"write_sequence":20},"metrics":{"initial":3,'
-        '"observation_count":1,"observed_increase":0,"regression_count":0},"schema_version":3}',
-        encoding="utf-8",
-    )
-    (observation,) = parse_legacy_firmware(legacy)
-    assert observation.dropped_packets == 3

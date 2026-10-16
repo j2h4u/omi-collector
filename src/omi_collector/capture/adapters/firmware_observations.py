@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import json
-import os
-import stat
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Final, cast
+from typing import Final
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, FirmwareObservationConfig
 from ..application.storage_fault import FatalInternalAudioStorageError
@@ -17,7 +13,6 @@ from ..domain.ring_protocol import RingInfo
 from .collector_state_db import StateDB, StateDBError, StateKind
 
 _SCHEMA_VERSION: Final = 3
-_MAX_LEGACY_STATE_BYTES: Final = 65_536
 _U16_MAX: Final = (1 << 16) - 1
 _U32_MAX: Final = (1 << 32) - 1
 _U64_MAX: Final = (1 << 64) - 1
@@ -25,7 +20,7 @@ _ErrorCallback = Callable[[Exception], None]
 
 
 class FirmwareObservationError(ValueError):
-    """The declared device observation file is malformed or unsafe."""
+    """A firmware observation could not be decoded or persisted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,30 +123,6 @@ def read_firmware_observations(db: StateDB) -> tuple[FirmwareObservation, ...]:
     if document is None:
         return ()
     return (_decode(document),)
-
-
-def parse_legacy_firmware(path: Path) -> tuple[FirmwareObservation, ...]:
-    """Strictly decode the old device snapshot for the offline state importer."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_LEGACY_STATE_BYTES:
-                raise ValueError("legacy firmware state is not a regular file")
-            with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                raw = stream.read(_MAX_LEGACY_STATE_BYTES + 1)
-        finally:
-            os.close(descriptor)
-        if len(raw) > _MAX_LEGACY_STATE_BYTES or raw != json.dumps(
-            cast(object, json.loads(raw)), ensure_ascii=True, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8"):
-            raise ValueError("legacy firmware JSON is not canonical or is oversized")
-        document = cast(object, json.loads(raw))
-        if not isinstance(document, dict):
-            raise ValueError("legacy firmware state must be an object")
-        return (_decode(cast(dict[str, object], document)),)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
-        raise FirmwareObservationError("legacy firmware state is malformed or unsafe") from error
 
 
 class FirmwareObservationStore:

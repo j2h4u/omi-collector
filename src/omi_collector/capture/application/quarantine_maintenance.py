@@ -189,6 +189,20 @@ class QuarantineMaintenance:
             deadline, self._publication_timer_fired, generation, deadline
         )
 
+    def _cancel_publication_timer(self) -> None:
+        if self._publication_retry_handle is not None:
+            self._publication_retry_handle.cancel()
+            self._publication_retry_handle = None
+
+    async def _cancel_and_join_publication_tasks(self, task: asyncio.Task[None] | None) -> None:
+        if task is not None and not task.done():
+            task.cancel()
+        active = tuple(self._publication_effect_tasks)
+        for effect in active:
+            effect.cancel()
+        if task is not None or active:
+            await join_owned(asyncio.gather(*(active + ((task,) if task is not None else ())), return_exceptions=True))
+
     def _publication_timer_fired(self, generation: int, deadline: float) -> None:
         self._publication_retry_handle = None
         if self._publication_fatal is not None:
@@ -227,19 +241,8 @@ class QuarantineMaintenance:
         self._raise_publication_fatal()
         self._staging.publication_capture_begin()
         try:
-            if self._publication_retry_handle is not None:
-                self._publication_retry_handle.cancel()
-                self._publication_retry_handle = None
-            task = self._publication_retry_task
-            if task is not None and not task.done():
-                task.cancel()
-            active = tuple(self._publication_effect_tasks)
-            for effect in active:
-                effect.cancel()
-            if task is not None or active:
-                await join_owned(
-                    asyncio.gather(*(active + ((task,) if task is not None else ())), return_exceptions=True)
-                )
+            self._cancel_publication_timer()
+            await self._cancel_and_join_publication_tasks(self._publication_retry_task)
             self._raise_publication_fatal()
             self._staging.publication_quiesced()
             await joined_to_thread(self._staging.begin_ready_visit)
@@ -255,18 +258,10 @@ class QuarantineMaintenance:
     async def close(self) -> None:
         """Cancel and join local publication retry work before loop shutdown."""
         self._staging.publication_shutdown()
-        if self._publication_retry_handle is not None:
-            self._publication_retry_handle.cancel()
-            self._publication_retry_handle = None
+        self._cancel_publication_timer()
         task = self._publication_retry_task
         self._publication_retry_task = None
-        if task is not None and not task.done():
-            task.cancel()
-        active = tuple(self._publication_effect_tasks)
-        for effect in active:
-            effect.cancel()
-        if task is not None or active:
-            await join_owned(asyncio.gather(*(active + ((task,) if task is not None else ())), return_exceptions=True))
+        await self._cancel_and_join_publication_tasks(task)
 
     async def run_once(self, should_defer: Callable[[], bool]) -> None:
         """Run one cooperative terminal sweep and quarantine salvage pass."""

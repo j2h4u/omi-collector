@@ -377,71 +377,6 @@ finally:
 PY
 }
 
-function screen_cutover_backup_space {
-    # args
-    local -r state_file="$1" trusted_python="$2"
-
-    # code
-    # assert: a live v1 snapshot has room for its copy, typed private audio, journal, and reserve before service stop
-    "$trusted_python" -I -B -S - "$state_file" <<'PY' \
-        || die 'Collector SQLite backup space screening failed before service stop'
-import os
-from pathlib import Path
-import stat
-import sys
-
-path = Path(sys.argv[1])
-try:
-    metadata = path.lstat()
-except FileNotFoundError:
-    raise SystemExit(0)
-if not stat.S_ISREG(metadata.st_mode):
-    raise SystemExit("Collector state database is not a regular file")
-if metadata.st_size == 0:
-    raise SystemExit(0)
-with path.open("rb") as source:
-    header = source.read(100)
-if len(header) != 100 or not header.startswith(b"SQLite format 3\0"):
-    raise SystemExit("Collector state database has an invalid SQLite header")
-if int.from_bytes(header[60:64], "big") == 1:
-    page_size = int.from_bytes(header[16:18], "big")
-    page_size = 65536 if page_size == 1 else page_size
-    page_count = int.from_bytes(header[28:32], "big")
-    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
-        raise SystemExit("v1 SQLite page size is invalid")
-    candidate_base = max(metadata.st_size, page_count * page_size)
-    private_bytes = 0
-    private_entries = 0
-    for root in (path.parent / "attempts", path.parent / "quarantine", path.parent.parent / "draft"):
-        if root.is_symlink():
-            raise SystemExit(f"private Collector root is a symlink: {root}")
-        if not root.exists():
-            continue
-        for directory, children, files in os.walk(root, followlinks=False):
-            private_entries += len(children) + len(files)
-            children[:] = [name for name in children if not (Path(directory) / name).is_symlink()]
-            for name in files:
-                item = (Path(directory) / name).lstat()
-                if stat.S_ISREG(item.st_mode):
-                    private_bytes += item.st_size
-    # Every private byte is conservatively treated as candidate record data; metadata is counted again.
-    record_pages = 2 * ((private_bytes + 443) // 444)
-    typed_growth = (64 + record_pages + 4 * private_entries) * page_size
-    journal_bound = max(candidate_base + 16 * page_size, (2 * 128 + 64) * page_size)
-    headroom = 64 * 1024 * 1024
-    required = candidate_base + typed_growth + journal_bound + headroom
-    filesystem = os.statvfs(path.parent)
-    available = filesystem.f_bavail * filesystem.f_frsize
-    if available < required:
-        raise SystemExit(
-            f"v1 cutover space is insufficient: page_count={page_count} "
-            f"candidate_base={candidate_base} typed_growth={typed_growth} "
-            f"journal_bound={journal_bound} headroom={headroom} "
-            f"required={required} available={available}"
-        )
-PY
-}
-
 function verify_installed_package {
     # args
     local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" environment="$5" source_package="$6"
@@ -500,7 +435,7 @@ function validate_candidate_config {
     [[ "$output" == "$expected" ]] || die 'candidate returned an unexpected configuration validation record'
 }
 
-function check_candidate_state_migration {
+function check_candidate_collector_state {
     # args
     local -r environment="$1" config_file="$2" stopped="$3" output_name="$4"
 
@@ -512,29 +447,29 @@ function check_candidate_state_migration {
     if [[ "$stopped" == 'true' ]]; then
         stopped_args+=( '--stopped' )
     fi
-    if output=$("${environment}/bin/omi-collector" check-state-migration --config "$config_file" "${stopped_args[@]}"); then
+    if output=$("${environment}/bin/omi-collector" check-state --config "$config_file" "${stopped_args[@]}"); then
         command_status=0
     else
         command_status=$?
     fi
     if (( command_status == 0 )); then
         case "$output" in
-            '{"schema_version":null,"status":"migration_compatible"}'|\
-            '{"schema_version":1,"status":"migration_compatible"}'|\
-            '{"schema_version":2,"status":"migration_compatible"}')
+            '{"schema_version":null,"status":"state_compatible"}'|\
+            '{"schema_version":0,"status":"state_compatible"}'|\
+            '{"schema_version":2,"status":"state_compatible"}')
                 printf -v "$output_name" '%s' 'compatible'
                 return ;;
-            *) die 'candidate returned an unexpected Collector state migration preflight record' ;;
+            *) die 'candidate returned an unexpected Collector state check record' ;;
         esac
     fi
-    if (( command_status == 1 )) && [[ "$output" == '{"reason":"canonical_hot_journal","status":"migration_recovery_required"}' ]]; then
+    if (( command_status == 1 )) && [[ "$output" == '{"reason":"canonical_hot_journal","status":"recovery_required"}' ]]; then
         printf -v "$output_name" '%s' 'recovery_required'
         return
     fi
     if [[ -n "$output" ]]; then
-        printf 'Collector state migration preflight response (exit %s): %s\n' "$command_status" "$output" >&2
+        printf 'Collector state check response (exit %s): %s\n' "$command_status" "$output" >&2
     fi
-    die 'candidate refused the Collector state migration preflight'
+    die 'candidate refused the Collector state check'
 }
 
 function recover_stopped_canonical_journal {
@@ -544,7 +479,7 @@ function recover_stopped_canonical_journal {
         || die 'candidate refused guarded Collector SQLite journal recovery'
 }
 
-function migrate_stopped_collector_state {
+function initialize_stopped_collector_state {
     # args
     local -r environment="$1" config_file="$2" state_file="$3"
     local -r runuser_bin="$4" account_user="$5" account_group="$6" operator_group="$7"
@@ -552,25 +487,29 @@ function migrate_stopped_collector_state {
 
     # code
     [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
-    "$environment/bin/omi-collector" migrate-state --config "$config_file" \
-        || die 'offline Collector state migration failed; service remains stopped'
+    "$environment/bin/omi-collector" init-state --config "$config_file" \
+        || die 'stopped-service Collector state initialization failed; service remains stopped'
     [[ ! -e "$lock_file" && ! -L "$lock_file" ]] \
         || [[ -f "$lock_file" && ! -L "$lock_file" ]] \
         || die "Collector singleton lock is not a regular file: ${lock_file}"
     [[ -f "$state_file" && ! -L "$state_file" ]] \
-        || die "offline migration did not install a regular Collector state database: ${state_file}"
+        || die "stopped-service initialization did not install a regular Collector state database: ${state_file}"
     [[ -f "$lock_file" && ! -L "$lock_file" ]] \
         || die "Collector singleton lock is not a regular file: ${lock_file}"
-    # The migrator verifies this handoff before its COMPLETE receipt.  The
-    # wrapper checks it again but must not perform the handoff afterward.
+    # Verify service and operator ownership after initialization.
     [[ $(stat -c '%U:%G:%a' -- "$state_file") == "${account_user}:${operator_group}:640" ]] \
-        || die 'Collector state database ownership or mode is unexpected after migration'
+        || die 'Collector state database ownership or mode is unexpected after initialization'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -r "$state_file" \
         || die 'service account cannot read Collector state database'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "$state_file" \
         || die 'service account cannot write Collector state database'
     "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "${state_file%/*}" \
         || die 'service account cannot write Collector state journal directory'
+    "$runuser_bin" --user "$operator_group" --group "$operator_group" -- test -r "$state_file" \
+        || die 'operator account cannot read Collector state database'
+    if "$runuser_bin" --user "$operator_group" --group "$operator_group" -- test -w "$state_file"; then
+        die 'operator account can write Collector state database'
+    fi
 }
 
 function provision_operator_data_access {
@@ -645,38 +584,6 @@ function read_current_target {
     printf -v "$output_name" '%s' "$target"
 }
 
-function canonical_is_previous_runtime_state {
-    # Restart the previous release only while its v1 state is still intact.
-    "$sealer_python" - "$state_file" <<'PY'
-import json
-import sqlite3
-import stat
-import sys
-from contextlib import closing
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    if not stat.S_ISREG(path.lstat().st_mode):
-        raise ValueError("unsafe canonical inode")
-    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)) as connection:
-        version = connection.execute("PRAGMA user_version").fetchone()
-        row = connection.execute(
-            "SELECT payload FROM state WHERE kind='migration' AND id='current'"
-        ).fetchone()
-        cutover = connection.execute(
-            "SELECT 1 FROM state WHERE kind='migration' AND id='internal_audio_cutover'"
-        ).fetchone()
-        receipt = json.loads(row[0]) if row is not None else None
-    if version != (1,) or cutover is not None:
-        raise ValueError("canonical state is not accepted v1")
-    if receipt != {"version": 1, "phase": "complete"}:
-        raise ValueError("canonical v1 receipt is incomplete")
-except (OSError, sqlite3.Error, ValueError, TypeError):
-    raise SystemExit(1)
-PY
-}
-
 function publish_current_target {
     # args
     local -r current_link="$1" target="$2" temporary_link="$3"
@@ -738,7 +645,7 @@ declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user
 declare build_state_dir uv_cache_dir python_install_dir
 declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
 declare state_file
-declare migration_preflight_state
+declare state_preflight
 declare source_revision release_name release_path staged_environment previous_target deployment_epoch
 declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
 declare initial_service_state
@@ -841,23 +748,14 @@ function finalize {
         printf 'ERROR: selected new release requires forward Collector recovery; service is stopped and recovery state retained\n' >&2
         recovery_failed=1
     elif (( selector_readable )) && [[ "$selected_target" == "$previous_target" ]]; then
-        if canonical_is_previous_runtime_state; then
-            selection_published=0
-            if (( service_quiesced && initial_service_active )) && [[ -n "$previous_target" ]]; then
-                if systemctl start "$service_name"; then
-                    service_quiesced=0
-                else
-                    recovery_failed=1
-                    printf 'ERROR: could not restart the previous deployment; recovery artifacts were retained\n' >&2
-                fi
-            fi
-        else
-            selection_published=1
-            if ! systemctl stop "$service_name"; then
+        selection_published=0
+        if (( service_quiesced && initial_service_active )) && [[ -n "$previous_target" ]]; then
+            if systemctl start "$service_name"; then
+                service_quiesced=0
+            else
                 recovery_failed=1
+                printf 'ERROR: could not restart the previous deployment; recovery artifacts were retained\n' >&2
             fi
-            printf 'ERROR: canonical state is not accepted v1; previous runtime remains stopped for forward recovery\n' >&2
-            recovery_failed=1
         fi
     else
         selection_published=1
@@ -939,10 +837,9 @@ seal_deployment_environment "$staged_environment" "$deployments_dir" "$sealer_py
 write_release_metadata "$staged_environment" "$deployments_dir" "$source_revision"
 persist_sealed_tree "$python_install_dir" "$deployment_root" "$sealer_python"
 persist_sealed_tree "$staged_environment" "$deployments_dir" "$sealer_python"
-screen_cutover_backup_space "$state_file" "$sealer_python"
 validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
 provision_operator_data_access "${state_file%/collector/collector-state.sqlite3}" "$account_user" "$operator_group"
-check_candidate_state_migration "$staged_environment" "$config_file" 'false' migration_preflight_state
+check_candidate_collector_state "$staged_environment" "$config_file" 'false' state_preflight
 initial_service_state=$(systemctl show "$service_name" --property=ActiveState) \
     || die "could not inspect initial ${service_name} state before stop"
 case "$initial_service_state" in
@@ -954,17 +851,17 @@ service_quiesced=1
 systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"
 [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
 prepare_service_singleton_lock "${state_file%/*}/collector.lock" "$runuser_bin" "$account_user" "$account_group" \
-    || die 'could not prepare the stable Collector singleton lock for migration'
-check_candidate_state_migration "$staged_environment" "$config_file" 'true' migration_preflight_state
-if [[ "$migration_preflight_state" == 'recovery_required' ]]; then
+    || die 'could not prepare the stable Collector singleton lock for state initialization'
+check_candidate_collector_state "$staged_environment" "$config_file" 'true' state_preflight
+if [[ "$state_preflight" == 'recovery_required' ]]; then
     recover_stopped_canonical_journal "$staged_environment" "$config_file"
-    check_candidate_state_migration "$staged_environment" "$config_file" 'true' migration_preflight_state
-    [[ "$migration_preflight_state" == 'compatible' ]] \
+    check_candidate_collector_state "$staged_environment" "$config_file" 'true' state_preflight
+    [[ "$state_preflight" == 'compatible' ]] \
         || die 'Collector state still needs recovery after guarded SQLite rollback'
 fi
 selection_published=1
 publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"
-migrate_stopped_collector_state "$current_link" "$config_file" "$state_file" \
+initialize_stopped_collector_state "$current_link" "$config_file" "$state_file" \
     "$runuser_bin" "$account_user" "$account_group" "$operator_group"
 systemctl restart "$service_name" || die "could not restart ${service_name}"
 initial_snapshot=$(read_service_snapshot "$service_name") \

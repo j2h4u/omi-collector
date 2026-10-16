@@ -3,29 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from json import JSONDecodeError, loads
-from pathlib import Path
-from typing import cast
 
 from ..application.storage_fault import FatalInternalAudioStorageError as FatalInternalAudioStorageError
 from ..domain.ring_protocol import RECORD_SIZE
 
-_DESCRIPTOR_NAME = "attempt.json"
-_RAW_NAME = "records.bin"
-_MANIFEST_NAME = "manifest.json"
-_CHECKPOINT_NAME = "checkpoint.json"
-_PREFIX_PUBLICATION_NAME = "prefix-publication.json"
-_TERMINAL_RETIRED_NAME = "terminal-retired.json"
-_TERMINAL_RETIRED_STATE = "terminal-retired"
-_TERMINAL_RETIREMENT_VERSION = 1
-_PUBLISHED_QUARANTINE_NAME = "published.json"
-_UNPROCESSABLE_QUARANTINE_NAME = "unprocessable.json"
-_PUBLISHED_QUARANTINE_STATE = "published"
-_UNPROCESSABLE_QUARANTINE_STATE = "unprocessable"
 _ATTEMPT_ID_LENGTH = 32
-_UUID_HEX_LENGTH = 32
-_SHA256_LENGTH = 64
-_ATTEMPT_SCHEMA_VERSION = 2
 _MAX_READ_PACKET_COUNT = (1 << 32) - 1
 
 
@@ -81,26 +63,12 @@ class DeviceAlreadyRunningError(StagingError):
         self.lock_context = lock_context
 
 
-class MaintenanceDeferredError(Exception):
-    """Cooperative stop between bounded maintenance I/O quanta."""
-
-
 @dataclass(frozen=True, slots=True)
 class DurablePrefix:
     """The byte-verified prefix retained in a streaming attempt."""
 
     start_sequence: int
     next_sequence: int
-    record_count: int
-    raw_sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class StreamingCheckpoint:
-    """The only durable proof of a streaming attempt's local byte prefix."""
-
-    version: int
-    attempt_id: str
     record_count: int
     raw_sha256: str
 
@@ -134,103 +102,3 @@ def _validate_count(value: int) -> None:
         raise AttemptStateError("packet_count must be positive")
     if value > _MAX_READ_PACKET_COUNT:
         raise AttemptStateError("packet_count exceeds the protocol uint32 limit")
-
-
-def _validate_terminalized_at(value: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise AttemptStateError("terminalized_at_unix_ns must be a positive integer")
-
-
-def _is_sha256(value: str) -> bool:
-    return len(value) == _SHA256_LENGTH and all(char in "0123456789abcdef" for char in value)
-
-
-def _validate_descriptor(descriptor: AttemptDescriptor, path_id: str) -> None:
-    _validate_attempt_id(descriptor.attempt_id)
-    if descriptor.schema_version != _ATTEMPT_SCHEMA_VERSION:
-        raise AttemptStateError("attempt descriptor schema version is invalid")
-    _validate_int(descriptor.start_sequence, "start_sequence")
-    _validate_count(descriptor.packet_count)
-    if descriptor.attempt_id != path_id or descriptor.record_size != RECORD_SIZE:
-        raise AttemptStateError("attempt descriptor identity or record size is invalid")
-    if (descriptor.read_begin_start is None) != (descriptor.read_begin_count is None):
-        raise AttemptStateError("attempt descriptor has incomplete READ_BEGIN")
-    if descriptor.read_begin_start is not None and descriptor.read_begin_count is not None:
-        _validate_int(descriptor.read_begin_start, "read_begin_start")
-        _validate_count(descriptor.read_begin_count)
-        if (descriptor.read_begin_start, descriptor.read_begin_count) != (
-            descriptor.start_sequence,
-            descriptor.packet_count,
-        ):
-            raise AttemptStateError("attempt descriptor READ_BEGIN does not match requested range")
-
-
-def _required_str(raw: dict[str, object], key: str) -> str:
-    value = raw.get(key)
-    if not isinstance(value, str):
-        raise ValueError(key)
-    return value
-
-
-def _required_int(raw: dict[str, object], key: str) -> int:
-    value = raw.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(key)
-    return value
-
-
-def _optional_int(raw: dict[str, object], key: str) -> int | None:
-    value = raw.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(key)
-    return value
-
-
-def _descriptor_from_json(raw: dict[str, object]) -> AttemptDescriptor:
-    if set(raw) != {
-        "attempt_id",
-        "schema_version",
-        "start_sequence",
-        "packet_count",
-        "record_size",
-        "read_begin_start",
-        "read_begin_count",
-    }:
-        raise ValueError("attempt descriptor schema")
-    return AttemptDescriptor(
-        attempt_id=_required_str(raw, "attempt_id"),
-        schema_version=_required_int(raw, "schema_version"),
-        start_sequence=_required_int(raw, "start_sequence"),
-        packet_count=_required_int(raw, "packet_count"),
-        record_size=_required_int(raw, "record_size"),
-        read_begin_start=_optional_int(raw, "read_begin_start"),
-        read_begin_count=_optional_int(raw, "read_begin_count"),
-    )
-
-
-def _checkpoint_from_json(raw: dict[str, object], attempt_id: str) -> StreamingCheckpoint:
-    if set(raw) != {"version", "attempt_id", "record_count", "raw_sha256"}:
-        raise ValueError("checkpoint schema")
-    checkpoint = StreamingCheckpoint(
-        _required_int(raw, "version"),
-        _required_str(raw, "attempt_id"),
-        _required_int(raw, "record_count"),
-        _required_str(raw, "raw_sha256"),
-    )
-    if checkpoint.version != 1 or checkpoint.attempt_id != attempt_id:
-        raise ValueError("checkpoint identity or version")
-    if checkpoint.record_count < 0 or not _is_sha256(checkpoint.raw_sha256):
-        raise ValueError("checkpoint range or hash")
-    return checkpoint
-
-
-def _read_checkpoint(path: Path, attempt_id: str) -> StreamingCheckpoint:
-    try:
-        raw = cast(object, loads(path.read_text(encoding="utf-8")))
-        if not isinstance(raw, dict):
-            raise ValueError("checkpoint object")
-        return _checkpoint_from_json(cast(dict[str, object], raw), attempt_id)
-    except (OSError, JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as error:
-        raise AttemptStateError("streaming checkpoint is malformed") from error

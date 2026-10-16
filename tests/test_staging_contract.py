@@ -10,12 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from omi_collector.capture.adapters.publication import TerminalRetirementEvidence
-from omi_collector.capture.adapters.staging_contract import (
-    AttemptStateError,
-    DurablePrefix,
-    StreamingCheckpoint,
-)
+from omi_collector.capture.adapters.staging_contract import AttemptStateError, DurablePrefix
 from staging_test_factory import StagingStore, attempt_source
 
 
@@ -36,26 +31,9 @@ else:
     subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
 
 
-@pytest.mark.parametrize("timestamp", [0, -1], ids=["zero", "negative"])
-def test_terminal_retirement_json_rejects_nonpositive_timestamp(timestamp: int) -> None:
-    value = TerminalRetirementEvidence(1).as_dict()
-    value["terminalized_at_unix_ns"] = timestamp
-
-    with pytest.raises(AttemptStateError, match="terminalized_at_unix_ns must be a positive integer"):
-        TerminalRetirementEvidence.from_json(value)
-
-
-@pytest.mark.parametrize(
-    ("value", "field", "replacement"),
-    [
-        (DurablePrefix(10, 12, 2, "a" * 64), "record_count", 3),
-        (StreamingCheckpoint(1, "a" * 32, 2, "a" * 64), "record_count", 3),
-    ],
-    ids=["durable-prefix", "streaming-checkpoint"],
-)
-def test_durable_staging_values_are_immutable(
-    value: DurablePrefix | StreamingCheckpoint, field: str, replacement: int
-) -> None:
+@pytest.mark.parametrize(("field", "replacement"), [("record_count", 3)])
+def test_durable_staging_value_is_immutable(field: str, replacement: int) -> None:
+    value = DurablePrefix(10, 12, 2, "a" * 64)
     original = value.record_count
 
     with pytest.raises(FrozenInstanceError):

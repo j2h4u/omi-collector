@@ -20,7 +20,6 @@ from ..application.storage_fault import FatalInternalAudioStorageError, Transien
 from .sqlite_admission import admit_exclusive, admit_immediate, commit_with_busy_retry
 
 _SCHEMA_VERSION = 2
-_LEGACY_SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5_000
 _STATE_DB_MODE = 0o640
 
@@ -482,7 +481,7 @@ class StateDB(_Operations):
                     "kind TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, "
                     "PRIMARY KEY(kind, id)) WITHOUT ROWID"
                 )
-                connection.execute(f"PRAGMA user_version = {_LEGACY_SCHEMA_VERSION}")
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 install_audio_schema(connection)
             elif version != _SCHEMA_VERSION or "state" not in tables:
                 raise StateDBError("state database schema is unsupported")
@@ -911,12 +910,12 @@ _AUDIO_INDEXES = {
 
 
 def install_audio_schema(connection: sqlite3.Connection) -> None:
-    """Install typed audio tables on an offline v1 backup, or validate v2."""
+    """Install or validate the current typed audio schema."""
 
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     version = _user_version(connection)
-    if version not in {_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION}:
+    if version != _SCHEMA_VERSION:
         raise StateDBError("state database schema is unsupported")
     tables = {
         _row_text(row, 0)

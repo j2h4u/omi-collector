@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+
 _ROOT = Path(__file__).parents[1]
 _UNIT = _ROOT / "systemd" / "omi-collector.service"
 _INSTALLER = _ROOT / "scripts" / "install-systemd-unit.sh"
@@ -50,9 +52,9 @@ class _DeploymentScenario:
     service_work_traversable: bool = True
     service_checkpoint_readable: bool = True
     preflight_failure_at: int | None = None
-    preflight_drift: bool = False
-    migration_activates: bool = False
-    migration_failure: bool = False
+    init_creates_database: bool = False
+    init_failure: bool = False
+    operator_can_write_state: bool = False
     recovery_required: bool = False
     real_state_cli: bool = False
 
@@ -73,6 +75,7 @@ class _FakeCommandContext:
     deployments_dir: Path
     account_user: str
     account_group: str
+    operator_group: str
     build_user: str
     build_group: str
 
@@ -216,11 +219,6 @@ def test_deployer_persists_the_selected_tree_before_stopping_service() -> None:
     )
     assert deployer.index('persist_sealed_tree "$staged_environment"') < deployer.rindex(
         'systemctl stop "$service_name"'
-    )
-    assert (
-        deployer.index('persist_sealed_tree "$staged_environment"')
-        < deployer.index('screen_cutover_backup_space "$state_file"')
-        < deployer.rindex('systemctl stop "$service_name"')
     )
 
 
@@ -483,6 +481,7 @@ def _write_build_fakes(
     quoted_user = shlex.quote(context.build_user)
     quoted_service_user = shlex.quote(context.account_user)
     quoted_service_group = shlex.quote(context.account_group)
+    quoted_operator_group = shlex.quote(context.operator_group)
     alias_directory = "cpython-3.14-linux-x86_64-gnu"
     versioned_directory = "cpython-3.14.6-linux-x86_64-gnu"
     managed_python_directory = alias_directory if scenario.versioned_python_alias else "cpython-3.14"
@@ -519,32 +518,31 @@ def _write_build_fakes(
         'entrypoint="$UV_PROJECT_ENVIRONMENT/bin/omi-collector"\n'
         "printf '%s\\n' '#!/usr/bin/env bash' > \"$entrypoint\"\n"
         'printf \'%s\\n\' \'printf "candidate args=%s\\n" "$*" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'if [[ "${DEPLOY_REAL_STATE_CLI:-0}" == 1 && ( "$1" == check-state-migration || "$1" == recover-state-journal || "$1" == migrate-state ) ]]; then\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'if [[ "${DEPLOY_REAL_STATE_CLI:-0}" == 1 && ( "$1" == check-state || "$1" == recover-state-journal || "$1" == init-state ) ]]; then\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    [[ "$1" != recover-state-journal ]] || printf "recovery selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    [[ "$1" != migrate-state ]] || printf "migration selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    [[ "$1" != init-state ]] || printf "initialization selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    export DEPLOY_CANDIDATE_PREFIX="$(dirname -- "$(dirname -- "$0")")"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    PYTHONPATH="$DEPLOY_SOURCE_PACKAGE_PARENT" python3 -c "import os,sys; from pathlib import Path; sys.prefix=os.environ[\\"DEPLOY_CANDIDATE_PREFIX\\"]; from omi_collector import cli; cli.DEFAULT_CONFIG_PATH=Path(os.environ[\\"DEPLOY_CONFIG_FILE\\"]); cli._require_host_singleton=lambda _loaded: None; import omi_collector.internal_audio_migration as migration; migration._verify_handoff_access=lambda _path: None; from omi_collector.cli import app; app()" "$@" 2>> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    PYTHONPATH="$DEPLOY_SOURCE_PACKAGE_PARENT" python3 -c "import os,sys; from pathlib import Path; sys.prefix=os.environ[\\"DEPLOY_CANDIDATE_PREFIX\\"]; from omi_collector import cli; cli.DEFAULT_CONFIG_PATH=Path(os.environ[\\"DEPLOY_CONFIG_FILE\\"]); cli._require_host_singleton=lambda _loaded: None; from omi_collector.cli import app; app()" "$@" 2>> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
         "printf '%s\\n' '    exit $?' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
-        "printf '%s\\n' 'if [[ \"$1\" == check-state-migration ]]; then' >> \"$entrypoint\"\n"
+        "printf '%s\\n' 'if [[ \"$1\" == check-state ]]; then' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    printf "preflight args=%s\\n" "$*" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
         "printf '%s\\n' '    call_file=\"${DEPLOY_PREFLIGHT_CALL_FILE}\"' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    calls=0; [[ ! -f "$call_file" ]] || calls=$(<"$call_file")\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    calls=$((calls + 1)); printf "%s\\n" "$calls" > "$call_file"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_DRIFT:-0}" == 1 && "$calls" == 1 ]]; then printf "foreign drift\\n" > "${DEPLOY_STATE_FILE%/*}/.collector-state.sqlite3.migrating.foreign"; fi\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_FAIL_AT:-0}" == "$calls" ]]; then printf "{\\"detail\\":\\"injected refusal\\",\\"reason\\":\\"state_validation_failed\\",\\"status\\":\\"migration_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ "${DEPLOY_RECOVERY_REQUIRED:-0}" == 1 && "$calls" == 2 ]]; then printf "{\\"reason\\":\\"canonical_hot_journal\\",\\"status\\":\\"migration_recovery_required\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":null,\\"status\\":\\"migration_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_FAIL_AT:-0}" == "$calls" ]]; then printf "{\\"detail\\":\\"injected refusal\\",\\"reason\\":\\"state_validation_failed\\",\\"status\\":\\"state_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    if [[ "${DEPLOY_RECOVERY_REQUIRED:-0}" == 1 && "$calls" == 2 ]]; then printf "{\\"reason\\":\\"canonical_hot_journal\\",\\"status\\":\\"recovery_required\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":null,\\"status\\":\\"state_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"$1\" == recover-state-journal ]]; then' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\\"PRAGMA integrity_check\\").fetchone(); c.close()" "$DEPLOY_STATE_FILE"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":1,\\"status\\":\\"migration_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":2,\\"status\\":\\"state_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
-        "printf '%s\\n' 'if [[ \"$1\" == migrate-state ]]; then' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    printf "migration selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ "${DEPLOY_MIGRATION_ACTIVATES:-0}" == 1 || "${DEPLOY_MIGRATION_FAIL:-0}" != 1 ]]; then mkdir -p -- "${DEPLOY_STATE_FILE%/*}"; : > "$DEPLOY_STATE_FILE"; chmod 0640 "$DEPLOY_STATE_FILE"; fi\' >> "$entrypoint"\n'
-        "printf '%s\\n' '    if [[ \"${DEPLOY_MIGRATION_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    printf "{\\"removed_files\\":0}\\n"; exit 0\' >> "$entrypoint"\n'
+        "printf '%s\\n' 'if [[ \"$1\" == init-state ]]; then' >> \"$entrypoint\"\n"
+        'printf \'%s\\n\' \'    printf "initialization selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    if [[ "${DEPLOY_INIT_CREATES_DATABASE:-0}" == 1 || "${DEPLOY_INIT_FAIL:-0}" != 1 ]]; then mkdir -p -- "${DEPLOY_STATE_FILE%/*}"; : > "$DEPLOY_STATE_FILE"; chmod 0640 "$DEPLOY_STATE_FILE"; fi\' >> "$entrypoint"\n'
+        "printf '%s\\n' '    if [[ \"${DEPLOY_INIT_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
+        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":2}\\n"; exit 0\' >> "$entrypoint"\n'
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"${DEPLOY_CONFIG_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
         f'printf \'%s\\n\' \'printf \'"\'"\'{{"config":"{config_file}","status":"config_valid"}}\\n\'"\'"\'\' >> "$entrypoint"\n'
@@ -585,6 +583,14 @@ def _write_build_fakes(
         "    fi\n"
         '    if [[ "$1" == test && "$2" == -w ]]; then exit 0; fi\n'
         "    exit 2\n"
+        "fi\n"
+        f'if [[ "$1" == --user && "$2" == {quoted_operator_group} && "$3" == --group && "$4" == {quoted_operator_group} && "$5" == -- ]]; then\n'
+        "    shift 5\n"
+        f'    printf "runuser operator args=%s\\n" "$*" >> {quoted_log}\n'
+        '    [[ "$1" == test && ( "$2" == -r || "$2" == -w ) && "$3" == "$DEPLOY_STATE_FILE" ]] || exit 2\n'
+        '    [[ -f "$3" && "$(/usr/bin/stat -c %a -- "$3")" == 640 ]] || exit 1\n'
+        '    if [[ "$2" == -w ]]; then [[ "${DEPLOY_OPERATOR_CAN_WRITE_STATE:-0}" == 1 ]] && exit 0 || exit 1; fi\n'
+        "    exit 0\n"
         "fi\n"
         f'[[ "$1" == --user && "$2" == {quoted_user} && "$3" == --group && "$4" == {shlex.quote(context.build_group)} && "$5" == -- ]] || exit 2\n'
         "shift 5\n"
@@ -647,6 +653,8 @@ def _write_filesystem_fakes(context: _FakeCommandContext, scenario: _DeploymentS
     (fake_bin / "stat").write_text(
         "#!/usr/bin/env bash\n"
         'path="${@: -1}"\n'
+        f'if [[ "$path" == "$DEPLOY_STATE_FILE" && -f "$path" ]]; then printf \'%s:%s:%s\\n\' {shlex.quote(context.account_user)} {shlex.quote(context.operator_group)} "$(/usr/bin/stat -c %a -- "$path")"; exit 0; fi\n'
+        f'if [[ ( "$path" == "${{DEPLOY_STATE_FILE%/*}}" || "$path" == "${{DEPLOY_STATE_FILE%/collector/collector-state.sqlite3}}/ready" ) && -d "$path" ]]; then printf \'%s:%s:%s\\n\' {shlex.quote(context.account_user)} {shlex.quote(context.operator_group)} "$(/usr/bin/stat -c %a -- "$path")"; exit 0; fi\n'
         f"if [[ \"$path\" == {quoted_config} ]]; then printf '%s\\n' 'root:root:644'; exit 0; fi\n"
         f"if [[ \"$path\" == {quoted_build_state} ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
         f"if [[ \"$path\" == {quoted_uv_cache} ]]; then printf '%s\\n' "
@@ -676,7 +684,8 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
         "#!/usr/bin/env bash\n"
         f'printf "systemctl args=%s\\n" "$*" >> {quoted_log}\n'
         'case "$1" in\n'
-        "stop|start|restart) exit 0 ;;\n"
+        'stop) rm -f -- "$DEPLOY_SERVICE_STARTED_FILE"; exit 0 ;;\n'
+        'start|restart) : > "$DEPLOY_SERVICE_STARTED_FILE"; exit 0 ;;\n'
         "show)\n"
         'if [[ "$#" == 3 && "$3" == "--property=ActiveState" ]]; then\n'
         f"    printf 'ActiveState=%s\\n' '{'active' if scenario.initial_service_active else 'inactive'}'\n"
@@ -688,7 +697,7 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
         f"pid=4242; restarts=0; invocation={initial_invocation}\n"
         f"{crash_clause}"
         f"active_state={'inactive' if scenario.real_state_cli else 'active'}\n"
-        'if [[ "${DEPLOY_REAL_STATE_CLI:-0}" == 1 && "$count" -gt 4 ]]; then active_state=active; fi\n'
+        'if [[ "${DEPLOY_REAL_STATE_CLI:-0}" == 1 && -f "$DEPLOY_SERVICE_STARTED_FILE" ]]; then active_state=active; fi\n'
         'printf "ActiveState=%s\\nMainPID=%s\\nNRestarts=%s\\nInvocationID=%s\\n" '
         '"$active_state" '
         '"$pid" "$restarts" "$invocation"\n'
@@ -726,6 +735,7 @@ def _write_identity_fakes(context: _FakeCommandContext, scenario: _DeploymentSce
     quoted_build_user = shlex.quote(context.build_user)
     quoted_build_group = shlex.quote(context.build_group)
     quoted_service_user = shlex.quote(context.account_user)
+    quoted_operator_group = shlex.quote(context.operator_group)
     build_uid = "1000" if scenario.same_uid else "1001"
     build_gid = "2000" if scenario.same_primary_gid else "2001"
     build_groups = f"{build_gid} 2000" if scenario.service_group_membership else build_gid
@@ -733,6 +743,7 @@ def _write_identity_fakes(context: _FakeCommandContext, scenario: _DeploymentSce
 
     (fake_bin / "getent").write_text(
         "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == group && "$2" == {quoted_operator_group} ]]; then printf \'%s:x:2002:\\n\' {quoted_operator_group}; exit 0; fi\n'
         f'if [[ "$1" == group && "$2" == {quoted_build_group} ]]; then exit 0; fi\n'
         f'if [[ "$1" == passwd && "$2" == {quoted_build_user} ]]; then exit 0; fi\n'
         'exec /usr/bin/getent "$@"\n',
@@ -789,6 +800,7 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
     config_file.chmod(0o644)
     account_user = getpass.getuser()
     account_group = grp.getgrgid(pwd.getpwnam(account_user).pw_gid).gr_name
+    operator_group = "omi-operator-test"
     build_user = "omi-collector-build-test"
     build_group = "omi-collector-build-test"
     return _FakeCommandContext(
@@ -803,6 +815,7 @@ def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandC
         deployments_dir,
         account_user,
         account_group,
+        operator_group,
         build_user,
         build_group,
     )
@@ -846,7 +859,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         ("/var/lib/omi-collector-build", str(context.build_state)),
         ("account_user='omi-collector'", f"account_user={shlex.quote(context.account_user)}"),
         ("account_group='omi-collector'", f"account_group={shlex.quote(context.account_group)}"),
-        ("operator_group='j2h4u'", f"operator_group={shlex.quote(context.account_group)}"),
+        ("operator_group='j2h4u'", f"operator_group={shlex.quote(context.operator_group)}"),
         ("build_user='omi-collector-build'", f"build_user={shlex.quote(context.build_user)}"),
         ("build_group='omi-collector-build'", f"build_group={shlex.quote(context.build_group)}"),
         ("sealer_owner='0:0'", f"sealer_owner='{os.getuid()}:{os.getgid()}'"),
@@ -864,10 +877,10 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "PATH": f"{context.fake_bin}{os.pathsep}{os.environ['PATH']}",
         "DEPLOY_BUILD_FAIL": "0",
         "DEPLOY_CONFIG_FAIL": "1" if scenario.config_check_failure else "0",
-        "DEPLOY_MIGRATION_ACTIVATES": "1" if scenario.migration_activates else "0",
-        "DEPLOY_MIGRATION_FAIL": "1" if scenario.migration_failure else "0",
+        "DEPLOY_INIT_CREATES_DATABASE": "1" if scenario.init_creates_database else "0",
+        "DEPLOY_INIT_FAIL": "1" if scenario.init_failure else "0",
+        "DEPLOY_OPERATOR_CAN_WRITE_STATE": "1" if scenario.operator_can_write_state else "0",
         "DEPLOY_PREFLIGHT_FAIL_AT": str(scenario.preflight_failure_at or 0),
-        "DEPLOY_PREFLIGHT_DRIFT": "1" if scenario.preflight_drift else "0",
         "DEPLOY_RECOVERY_REQUIRED": "1" if scenario.recovery_required else "0",
         "DEPLOY_REAL_STATE_CLI": "1" if scenario.real_state_cli else "0",
         "DEPLOY_SOURCE_PACKAGE_PARENT": str(context.source_package.parent),
@@ -876,6 +889,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "DEPLOY_PREFLIGHT_CALL_FILE": str(tmp_path / "preflight.calls"),
         "DEPLOY_STATE_FILE": str(state_file),
         "DEPLOY_CURRENT_LINK": str(current_link),
+        "DEPLOY_SERVICE_STARTED_FILE": str(tmp_path / "service-started"),
         "DEPLOY_LOG": str(context.log),
         "DEPLOY_METADATA_SYMLINK": "1" if scenario.metadata_symlink else "0",
         "DEPLOY_SERVICE_WORK_TRAVERSABLE": "1" if scenario.service_work_traversable else "0",
@@ -900,29 +914,25 @@ def _previous_release(harness: _DeploymentHarness) -> Path:
     return release
 
 
-def _canonical_state(harness: _DeploymentHarness, *, version: int, phase: str, cutover: bool = False) -> None:
+def _canonical_state(harness: _DeploymentHarness, *, version: int) -> None:
     path = Path(harness.environment["DEPLOY_STATE_FILE"])
     path.parent.mkdir(parents=True, exist_ok=True)
+    if version == 2:
+        StateDB(path).put(StateKind.RUNTIME_STATUS, "current", {"last_error": "original"})
+        return
     with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             "CREATE TABLE state(kind TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(kind,id))"
         )
         connection.execute(f"PRAGMA user_version={version}")
-        connection.execute(
-            "INSERT INTO state VALUES ('migration','current',?)",
-            (json.dumps({"version": 1, "phase": phase}),),
-        )
-        if cutover:
-            connection.execute(
-                "INSERT INTO state VALUES ('migration','internal_audio_cutover',?)",
-                (json.dumps({"format": 1, "phase": "BUILDING"}),),
-            )
         connection.commit()
 
 
 def _make_true_hot_journal(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
-        connection.execute("INSERT INTO state VALUES ('runtime_status','current',?)", ('{"last_error":"original"}',))
+        connection.execute(
+            "INSERT OR REPLACE INTO state VALUES ('runtime_status','current',?)", ('{"last_error":"original"}',)
+        )
         connection.executemany(
             "INSERT INTO state VALUES ('padding',?,?)",
             ((str(index), "x" * 1000) for index in range(1000)),
@@ -989,12 +999,12 @@ def test_deployer_builds_validates_selects_and_seals_one_release(tmp_path: Path)
     assert "systemctl args=restart omi-collector.service" in commands
     preflights = [line for line in commands.splitlines() if line.startswith("preflight args=")]
     assert preflights == [
-        f"preflight args=check-state-migration --config {harness.config_file}",
-        f"preflight args=check-state-migration --config {harness.config_file} --stopped",
+        f"preflight args=check-state --config {harness.config_file}",
+        f"preflight args=check-state --config {harness.config_file} --stopped",
     ]
     assert commands.index(preflights[0]) < commands.index("systemctl args=stop omi-collector.service")
     assert commands.index("systemctl args=stop omi-collector.service") < commands.index(preflights[1])
-    assert commands.index(preflights[1]) < commands.index("candidate args=migrate-state")
+    assert commands.index(preflights[1]) < commands.index("candidate args=init-state")
     assert f"config={harness.config_file}" in result.stdout
 
 
@@ -1005,10 +1015,10 @@ def test_deployer_preflight_refusal_keeps_previous_service_and_selector_untouche
     result = _run_deployer(harness)
 
     assert result.returncode != 0
-    assert "candidate refused the Collector state migration preflight" in result.stderr
+    assert "candidate refused the Collector state check" in result.stderr
     assert (
-        "Collector state migration preflight response (exit 1): "
-        '{"detail":"injected refusal","reason":"state_validation_failed","status":"migration_refused"}'
+        "Collector state check response (exit 1): "
+        '{"detail":"injected refusal","reason":"state_validation_failed","status":"state_refused"}'
     ) in result.stderr
     assert harness.current_link.resolve(strict=True) == previous
     commands = harness.log.read_text(encoding="utf-8")
@@ -1018,31 +1028,49 @@ def test_deployer_preflight_refusal_keeps_previous_service_and_selector_untouche
     assert "systemctl args=restart omi-collector.service" not in commands
 
 
-def test_deployer_stopped_preflight_catches_drift_before_selector_and_restarts_old_release(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=2, preflight_drift=True))
+def test_deployer_stopped_preflight_refusal_keeps_old_release_and_state(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=2))
     previous = _previous_release(harness)
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    _canonical_state(harness, version=1, phase="complete")
+    _canonical_state(harness, version=2)
     before = state_file.read_bytes()
 
     result = _run_deployer(harness)
 
     assert result.returncode != 0
-    assert "candidate refused the Collector state migration preflight" in result.stderr
+    assert "candidate refused the Collector state check" in result.stderr
     assert harness.current_link.resolve(strict=True) == previous
     assert state_file.read_bytes() == before
-    drift = state_file.parent / ".collector-state.sqlite3.migrating.foreign"
-    assert drift.read_bytes() == b"foreign drift\n"
     commands = harness.log.read_text(encoding="utf-8")
     preflights = [line for line in commands.splitlines() if line.startswith("preflight args=")]
     assert preflights == [
-        f"preflight args=check-state-migration --config {harness.config_file}",
-        f"preflight args=check-state-migration --config {harness.config_file} --stopped",
+        f"preflight args=check-state --config {harness.config_file}",
+        f"preflight args=check-state --config {harness.config_file} --stopped",
     ]
     assert commands.count("systemctl args=stop omi-collector.service") == 1
     assert commands.count("systemctl args=start omi-collector.service") == 1
     assert "systemctl args=restart omi-collector.service" not in commands
-    assert "candidate args=migrate-state" not in commands
+    assert "candidate args=init-state" not in commands
+
+
+def test_deployer_refuses_v1_state_before_stopping_or_changing_it(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
+    previous = _previous_release(harness)
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    _canonical_state(harness, version=1)
+    before = state_file.read_bytes()
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "candidate refused the Collector state check" in result.stderr
+    assert "Collector v1 state is unsupported" in result.stderr
+    assert harness.current_link.resolve(strict=True) == previous
+    assert state_file.read_bytes() == before
+    commands = harness.log.read_text(encoding="utf-8")
+    assert commands.count("candidate args=check-state") == 1
+    assert "systemctl args=stop omi-collector.service" not in commands
+    assert "candidate args=init-state" not in commands
 
 
 def test_deployer_checks_existing_publication_checkpoint_as_service_before_stop(tmp_path: Path) -> None:
@@ -1262,32 +1290,13 @@ def test_deployer_keeps_previous_release_running_when_persistence_barrier_fails(
     assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
 
 
-def test_deployer_keeps_previous_release_running_when_space_screen_fails(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    previous = _previous_release(harness)
-    script = harness.deployer.read_text(encoding="utf-8")
-    assert "path = Path(sys.argv[1])" in script
-    harness.deployer.write_text(
-        script.replace("path = Path(sys.argv[1])", 'raise SystemExit("injected space failure")'),
-        encoding="utf-8",
-    )
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "Collector SQLite backup space screening failed before service stop" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
-    assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
-
-
 @pytest.mark.parametrize("initial_service_active", [True, False])
 def test_deployer_restores_previous_service_when_selector_publish_fails_before_rename(
     tmp_path: Path, initial_service_active: bool
 ) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(initial_service_active=initial_service_active))
     previous = _previous_release(harness)
-    _canonical_state(harness, version=1, phase="complete")
+    _canonical_state(harness, version=2)
     script = harness.deployer.read_text(encoding="utf-8")
     publish = 'mv -T -- "$temporary_link" "$current_link" || die \'could not publish current deployment selector\''
     assert publish in script
@@ -1303,30 +1312,6 @@ def test_deployer_restores_previous_service_when_selector_publish_fails_before_r
     commands = harness.log.read_text(encoding="utf-8")
     assert commands.count("systemctl args=stop omi-collector.service") == 1
     assert commands.count("systemctl args=start omi-collector.service") == int(initial_service_active)
-
-
-@pytest.mark.parametrize(
-    "version,phase,cutover", [(2, "complete", False), (1, "complete", True), (1, "building", False)]
-)
-def test_deployer_keeps_previous_selector_stopped_if_canonical_cannot_run_previous_runtime(
-    tmp_path: Path, version: int, phase: str, cutover: bool
-) -> None:
-    harness = _deployment_harness(tmp_path)
-    previous = _previous_release(harness)
-    _canonical_state(harness, version=version, phase=phase, cutover=cutover)
-    script = harness.deployer.read_text(encoding="utf-8")
-    publish = 'mv -T -- "$temporary_link" "$current_link" || die \'could not publish current deployment selector\''
-    assert publish in script
-    harness.deployer.write_text(script.replace(publish, "die 'injected pre-rename failure'"), encoding="utf-8")
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "canonical state is not accepted v1" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=stop omi-collector.service") == 2
-    assert "systemctl args=start omi-collector.service" not in commands
 
 
 def test_deployer_retains_new_selector_when_parent_fsync_fails_after_rename(tmp_path: Path) -> None:
@@ -1661,8 +1646,8 @@ def test_deployer_keeps_selected_release_stopped_when_readiness_fails(tmp_path: 
     assert "systemctl args=start omi-collector.service" not in commands
 
 
-def test_deployer_migrates_stopped_state_before_service_restart(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(migration_activates=True))
+def test_deployer_initializes_stopped_state_before_service_restart(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(init_creates_database=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
     state_file.parent.mkdir(parents=True)
 
@@ -1670,14 +1655,14 @@ def test_deployer_migrates_stopped_state_before_service_restart(tmp_path: Path) 
 
     assert result.returncode == 0, result.stderr
     commands = harness.log.read_text(encoding="utf-8")
-    assert commands.index("systemctl args=stop omi-collector.service") < commands.index("candidate args=migrate-state")
-    assert commands.index("candidate args=migrate-state") < commands.index(
-        "systemctl args=restart omi-collector.service"
-    )
-    assert "candidate args=migrate-state --config " in commands
+    assert commands.index("systemctl args=stop omi-collector.service") < commands.index("candidate args=init-state")
+    assert commands.index("candidate args=init-state") < commands.index("systemctl args=restart omi-collector.service")
+    assert "candidate args=init-state --config " in commands
     selected_target = harness.current_link.readlink()
-    assert f"migration selector={selected_target}" in commands
+    assert f"initialization selector={selected_target}" in commands
     assert "runuser service args=test -w" in commands
+    assert f"runuser operator args=test -r {state_file}" in commands
+    assert f"runuser operator args=test -w {state_file}" in commands
     assert "collector.lock" in commands
     assert stat.S_IMODE(state_file.stat().st_mode) == 0o640
     assert stat.S_IMODE((state_file.parent / "collector.lock").stat().st_mode) == 0o600
@@ -1689,11 +1674,11 @@ def test_deployer_migrates_stopped_state_before_service_restart(tmp_path: Path) 
     assert not (state_file.parent.parent / "draft").exists()
 
 
-def test_deployer_recovers_true_hot_journal_before_selector_and_full_migration(tmp_path: Path) -> None:
+def test_deployer_recovers_true_hot_journal_before_selector_and_v2_initialization(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(recovery_required=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
     state_file.parent.mkdir(parents=True)
-    _canonical_state(harness, version=1, phase="complete")
+    _canonical_state(harness, version=2)
     _make_true_hot_journal(state_file)
 
     result = _run_deployer(harness)
@@ -1701,19 +1686,19 @@ def test_deployer_recovers_true_hot_journal_before_selector_and_full_migration(t
     assert result.returncode == 0, result.stderr
     commands = harness.log.read_text(encoding="utf-8")
     recovery = "candidate args=recover-state-journal"
-    selector = "migration selector="
+    selector = "initialization selector="
     assert recovery in commands
     assert commands.index("systemctl args=stop omi-collector.service") < commands.index(recovery)
     assert commands.index(recovery) < commands.index(selector)
     assert not state_file.with_name(state_file.name + "-journal").exists()
 
 
-def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_migration(tmp_path: Path) -> None:
+def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_v2_preservation(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
     state_file.parent.mkdir(parents=True)
     state_file.parent.chmod(0o2750)
-    _canonical_state(harness, version=1, phase="complete")
+    _canonical_state(harness, version=2)
     _make_true_hot_journal(state_file)
     previous = _previous_release(harness)
 
@@ -1722,16 +1707,16 @@ def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_migration(tmp
 
     assert result.returncode == 0, result.stderr + "\n" + commands
     recovery = "recovery selector="
-    migration = "migration selector="
-    preflights = [line for line in commands.splitlines() if line.startswith("candidate args=check-state-migration")]
+    initialization = "initialization selector="
+    preflights = [line for line in commands.splitlines() if line.startswith("candidate args=check-state")]
     assert len(preflights) == 3
     assert recovery in commands
-    assert migration in commands
+    assert initialization in commands
     recovery_selector = f"recovery selector=releases/{previous.name}"
     selected_target = harness.current_link.readlink()
-    migration_selector = f"migration selector={selected_target}"
+    initialization_selector = f"initialization selector={selected_target}"
     assert recovery_selector in commands
-    assert migration_selector in commands
+    assert initialization_selector in commands
     second_preflight_at = commands.index(preflights[1])
     third_preflight_at = commands.index(preflights[2], second_preflight_at + 1)
     assert commands.index("systemctl args=stop omi-collector.service") < commands.index(recovery_selector)
@@ -1739,7 +1724,7 @@ def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_migration(tmp
         second_preflight_at
         < commands.index(recovery_selector)
         < third_preflight_at
-        < commands.index(migration_selector)
+        < commands.index(initialization_selector)
     )
     assert harness.current_link.resolve(strict=True) != previous
     assert not state_file.with_name(state_file.name + "-journal").exists()
@@ -1750,11 +1735,27 @@ def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_migration(tmp
         )
 
 
-def test_deployer_does_not_recover_on_arbitrary_preflight_refusal(tmp_path: Path) -> None:
+def test_deployer_initializes_fresh_v2_state_through_real_cli(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+
+    result = _run_deployer(harness)
+
+    commands = harness.log.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stderr + "\n" + commands
+    assert "candidate args=init-state" in commands
+    assert f"initialization selector={harness.current_link.readlink()}" in commands
+    assert state_file.is_file()
+    with closing(sqlite3.connect(state_file)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_deployer_does_not_recover_on_arbitrary_state_check_refusal(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=1, recovery_required=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
     state_file.parent.mkdir(parents=True)
-    _canonical_state(harness, version=1, phase="complete")
+    _canonical_state(harness, version=2)
     _make_true_hot_journal(state_file)
 
     result = _run_deployer(harness)
@@ -1780,8 +1781,8 @@ def test_deployer_prepares_lock_for_empty_existing_collector_root(tmp_path: Path
     assert f"runuser service args=test -w {lock}" in commands
 
 
-def test_deployer_keeps_new_release_if_migration_fails_before_activation(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(migration_failure=True))
+def test_deployer_keeps_new_release_if_state_initialization_fails_before_activation(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(init_failure=True))
     previous = _previous_release(harness)
 
     result = _run_deployer(harness)
@@ -1794,8 +1795,8 @@ def test_deployer_keeps_new_release_if_migration_fails_before_activation(tmp_pat
     assert "systemctl args=restart omi-collector.service" not in commands
 
 
-def test_deployer_keeps_new_release_when_migration_activated_then_fails(tmp_path: Path) -> None:
-    scenario = _DeploymentScenario(migration_activates=True, migration_failure=True)
+def test_deployer_keeps_new_release_when_state_initialization_activates_then_fails(tmp_path: Path) -> None:
+    scenario = _DeploymentScenario(init_creates_database=True, init_failure=True)
     harness = _deployment_harness(tmp_path, scenario)
     previous = _previous_release(harness)
 
@@ -1807,6 +1808,17 @@ def test_deployer_keeps_new_release_when_migration_activated_then_fails(tmp_path
     commands = harness.log.read_text(encoding="utf-8")
     assert "systemctl args=restart omi-collector.service" not in commands
     assert "systemctl args=start omi-collector.service" not in commands
+
+
+def test_deployer_rejects_operator_write_access_to_state_database(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(operator_can_write_state=True))
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "operator account can write Collector state database" in result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    assert "systemctl args=restart omi-collector.service" not in commands
 
 
 def test_deployer_never_rolls_back_old_release_with_existing_database(tmp_path: Path) -> None:
@@ -1825,20 +1837,6 @@ def test_deployer_never_rolls_back_old_release_with_existing_database(tmp_path: 
     commands = harness.log.read_text(encoding="utf-8")
     assert "systemctl args=start omi-collector.service" not in commands
     assert commands.count("systemctl args=restart omi-collector.service") == 1
-
-
-def test_deployer_leaves_unfinished_candidate_for_offline_migrator(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    candidate = Path(harness.environment["DEPLOY_STATE_FILE"]).parent / ".collector-state.sqlite3.migrating"
-    candidate.parent.mkdir(parents=True)
-    candidate.touch()
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    assert candidate.exists()
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.index("systemctl args=stop omi-collector.service") < commands.index("candidate args=migrate-state")
 
 
 def test_failed_first_deployment_keeps_selected_release_for_recovery(tmp_path: Path) -> None:

@@ -153,4 +153,4 @@ def test_unverified_release_can_be_checked_read_only_afterward(tmp_path: Path) -
     assert '{"config":"' + str(harness.config_file) + '","status":"deployment_ready"}' in journal.stdout
     after = harness.log.read_text(encoding="utf-8")
     assert "systemctl args=restart omi-collector.service" not in after[len(before) :]
-    assert "candidate args=migrate-state" not in after[len(before) :]
+    assert "candidate args=init-state" not in after[len(before) :]

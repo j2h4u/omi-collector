@@ -27,7 +27,7 @@ def _run(command: Sequence[str], *, healthcheck: bool) -> int:
         command = ("omi-collector", "service", "--config", _CONFIG_PATH)
     if not healthcheck:
         subprocess.run(
-            ("omi-collector", "migrate-state", "--config", _CONFIG_PATH),
+            ("omi-collector", "init-state", "--config", _CONFIG_PATH),
             check=True,
         )
     _drop_privileges()

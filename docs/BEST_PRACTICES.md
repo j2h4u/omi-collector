@@ -286,7 +286,7 @@ Its fixed parent `/srv/pipelines/omi` is the storage root; `collector`,
 service write access to that root. Use filesystem ownership or ACLs on the
 derived directories when a downstream account also needs access.
 
-### State ownership and offline migration
+### State ownership and state initialization
 
 All mutable structured Collector state lives in
 `collector/collector-state.sqlite3`, using SQLite's DELETE rollback journal,
@@ -295,41 +295,21 @@ quarantine audio and its recovery evidence live in typed tables in that same
 database. Public ready bundles remain immutable filesystem artifacts containing
 only `records.bin` and `manifest.json`. Keep the separate, zero-content
 `collector/collector.lock` stable: the service holds its flock for the full
-invocation, and every state-mutating manual command and migration takes that
-same guard before opening writable state or performing BLE work. Read-only
-`device status` and `device metrics` may read the database while the service
-is active.
+invocation, and every state-mutating manual command and stopped-service
+initialization takes that same guard before opening writable state. Read-only
+`device status` and `device metrics` may read the database while the service is
+active.
 
-The canonical systemd deployer fsyncs the sealed release and managed Python
-tree and screens backup space. It runs the new release's read-only
-`check-state-migration` inventory before stopping the service, then repeats it
-with `--stopped` under the stable guard before durably selecting the new
-release. A verified hot canonical rollback journal is the sole recoverable
-preflight result: after stopping the service, `recover-state-journal` performs
-SQLite rollback under the stable guard and a full read-only preflight must then
-accept the state. Other drift or foreign scratch blocks selection. The deployer then invokes
-the selected release's `omi-collector migrate-state --config PATH` before
-restart. Migration takes the stable guard,
-inventories the deployed v1 SQLite database and private files, reserves space
-for a full candidate backup, typed growth, rollback journal, and filesystem
-headroom, then records a source receipt bound to the real setgid Collector
-directory, its inherited candidate group, and the migrator's effective identity.
-It builds and verifies a v2 candidate
-on the same filesystem, activates it, deletes only inventoried old private
-files, verifies service and operator access, and marks the receipt complete
-last. The command does not archive old raw audio or alter public ready bundles.
-An attributable or spool-rooted v1 quarantine, terminal-retired attempt,
-attempt with private bytes but no recorded READ_BEGIN, or unknown private
-artifact fails before the receipt; resolve custody manually instead of
-discarding it. Any later source change fails before activation. A validation
-or parity failure leaves the service
-stopped. To recover an interrupted cutover, keep the service stopped and rerun
-the selected new release's command; v1 resumes candidate preparation and v2
-resumes forward cleanup only. Runtime refuses known v1 state and incomplete v2
-receipts before BLE, with exit status 78 preventing a restart loop. Missing or
-unknown database state fails separately; runtime never creates a replacement.
-Never remove or replace `collector.lock` during migration, and never restart
-the old release after the new selector is durable.
+The deployer checks state before stopping the service and repeats the check
+under the stable guard after stop. A verified hot rollback journal is recovered
+by SQLite under that guard, then a read-only check must accept the recovered
+state. The selected release's `omi-collector init-state --config PATH` creates
+v2 only for an empty installation and validates existing v2 without rewriting
+it. Missing databases alongside READY, private audio, control data, or unknown
+scratch fail closed. Existing v1 databases are refused unchanged; this command
+never imports or deletes old data. Runtime also refuses v1 and never creates a
+replacement database. Keep the service stopped while repairing an incompatible
+state, and preserve the stable lock inode through deploy and recovery.
 
 A mismatched canonical record or checkpoint stays in blocked, unclassified
 quarantine custody without an expiry deadline. Ordinary salvage and terminal

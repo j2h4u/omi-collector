@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/j2h4u/omi-collector/compare/v0.14.0...v0.14.1) (2026-10-16)
+
+
+### Refactoring
+
+* share collector shutdown paths and remove unused legacy readers ([0d9d1b1](https://github.com/j2h4u/omi-collector/commit/0d9d1b1457d900702f748f22a4a20c8aeac8b865))
+
 ## [0.14.0](https://github.com/j2h4u/omi-collector/compare/v0.13.2...v0.14.0) (2026-10-15)
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
@@ -10,10 +11,11 @@ from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters import collector_state_db
 from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.attempts import RecordAcceptanceError
 from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
-from omi_collector.capture.adapters.collector_state_db import StateKind
+from omi_collector.capture.adapters.collector_state_db import StateDBError, StateKind
 from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore, InternalAudioStoreError
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine import QuarantineCustodyHoldError, QuarantinePublishError
@@ -68,6 +70,60 @@ def _source_row(store: StagingStore, source_id: str) -> tuple[object, ...] | Non
             ).fetchone(),
         )
     return tuple(row) if row is not None else None
+
+
+def test_typed_quarantine_writer_keeps_committed_rows_readable_until_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    store.state_db.put(StateKind.CLOCK, "current", {"value": "old"})
+    commit_called = threading.Event()
+    dml_done = threading.Event()
+    armed = False
+    base_connection = collector_state_db._GuardedConnection
+
+    class SignalingConnection(base_connection):
+        def commit(self) -> None:
+            if armed:
+                commit_called.set()
+            super().commit()
+
+    monkeypatch.setattr(collector_state_db, "_GuardedConnection", SignalingConnection)
+    reader = sqlite3.connect(store.state_db.path, isolation_level=None, timeout=0)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM state").fetchone()
+    errors: list[Exception] = []
+
+    def write() -> None:
+        nonlocal armed
+        try:
+            with quarantine_module._typed_transaction(store._filesystem) as connection:
+                connection.execute(
+                    "UPDATE state SET payload = '{\"value\":\"new\"}' WHERE kind='clock' AND id='current'"
+                )
+                armed = True
+                dml_done.set()
+        except (sqlite3.DatabaseError, StateDBError, TimeoutError) as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    try:
+        assert dml_done.wait(5)
+        assert commit_called.wait(5)
+        assert reader.execute("SELECT payload FROM state WHERE kind='clock' AND id='current'").fetchone() == (
+            '{"value":"old"}',
+        )
+        reader.rollback()
+        thread.join(5)
+    finally:
+        reader.rollback()
+        reader.close()
+        if thread.is_alive():
+            thread.join(5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert store.state_db.get(StateKind.CLOCK, "current") == {"value": "new"}
 
 
 def test_typed_quarantine_changes_source_state_without_creating_private_entry(tmp_path: Path) -> None:

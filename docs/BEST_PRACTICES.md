@@ -160,6 +160,11 @@ mutation result. Each job retains its snapshot and evidence for later review.
 
 ## Capture safety
 
+Keep runtime SQLite writers on `BEGIN IMMEDIATE` so status and other readers can
+see committed data during audio transfers; reserve `BEGIN EXCLUSIVE` for schema
+initialization and recovery. Retry only a direct `SQLITE_BUSY` at admission or
+commit, and never replay DML after a commit error.
+
 Keep physical-download policy in the pure `visit_machine`: it alone authorizes
 drained, interrupted, restart, or operator-limit closure. Session, presence, and
 storage code supply facts or execute its commands; they do not choose a second

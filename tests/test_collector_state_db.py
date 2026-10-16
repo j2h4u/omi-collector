@@ -13,7 +13,7 @@ import pytest
 
 from omi_collector.capture.adapters import collector_state_db
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind, _Operations
-from omi_collector.capture.adapters.sqlite_admission import admit_exclusive
+from omi_collector.capture.adapters.sqlite_admission import admit_exclusive, commit_with_busy_retry
 from omi_collector.capture.application.storage_fault import (
     FatalInternalAudioStorageError,
     TransientInternalAudioStorageError,
@@ -140,7 +140,7 @@ def test_write_owner_rejects_a_new_or_preexisting_second_connection(tmp_path: Pa
     pending_cursor = second.execute("SELECT 1")
     try:
         with db.access(first):
-            db.begin_exclusive(first)
+            db.begin_write(first)
             first.execute("INSERT INTO state(kind,id,payload) VALUES ('firmware','owner','{}')").close()
             with pytest.raises(StateDBError, match="another state connection owns"):
                 second.execute("SELECT 1")
@@ -163,7 +163,7 @@ def test_write_owner_rejects_a_new_or_preexisting_second_connection(tmp_path: Pa
         second.close()
 
 
-def test_external_shared_reader_delays_admission_before_any_write(tmp_path: Path) -> None:
+def test_external_shared_reader_allows_admission_but_delays_commit(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     db = StateDB(path)
     external = sqlite3.connect(path, isolation_level=None)
@@ -186,6 +186,58 @@ def test_external_shared_reader_delays_admission_before_any_write(tmp_path: Path
         future.result(timeout=10)
     external.close()
     assert db.get(StateKind.FIRMWARE, "after-reader") == {"value": 1}
+
+
+def test_immediate_writer_keeps_committed_rows_readable_until_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    db = StateDB(path)
+    db.put(StateKind.CLOCK, "current", {"value": "old"})
+    commit_called = threading.Event()
+    dml_done = threading.Event()
+    armed = False
+    base_connection = collector_state_db._GuardedConnection
+
+    class SignalingConnection(base_connection):
+        def commit(self) -> None:
+            if armed:
+                commit_called.set()
+            super().commit()
+
+    monkeypatch.setattr(collector_state_db, "_GuardedConnection", SignalingConnection)
+    reader = sqlite3.connect(path, isolation_level=None, timeout=0)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM state").fetchone()
+    errors: list[Exception] = []
+
+    def write() -> None:
+        nonlocal armed
+        try:
+            with db.transaction() as transaction:
+                transaction.put(StateKind.CLOCK, "current", {"value": "new"})
+                armed = True
+                dml_done.set()
+        except (sqlite3.DatabaseError, StateDBError, TimeoutError) as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    try:
+        assert dml_done.wait(5)
+        assert commit_called.wait(5)
+        assert reader.execute("SELECT payload FROM state WHERE id='current'").fetchone() == ('{"value":"old"}',)
+        reader.rollback()
+        thread.join(5)
+    finally:
+        reader.rollback()
+        reader.close()
+        if thread.is_alive():
+            thread.join(5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert db.get(StateKind.CLOCK, "current") == {"value": "new"}
+    assert db.get_generation() == 2
 
 
 def test_loop_thread_state_access_fails_before_sql(tmp_path: Path) -> None:
@@ -217,6 +269,66 @@ def test_exclusive_admission_retries_only_exact_primary_busy(code: int) -> None:
     with pytest.raises(sqlite3.OperationalError) as raised:
         admit_exclusive(cast(sqlite3.Connection, connection))
     assert raised.value is error
+    assert connection.calls == 1
+
+
+def test_commit_retries_direct_busy_once_without_replaying_sql() -> None:
+    class Connection:
+        in_transaction = True
+        calls = 0
+
+    connection = Connection()
+
+    def commit() -> None:
+        connection.calls += 1
+        if connection.calls == 1:
+            failure = sqlite3.OperationalError("busy")
+            failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise failure
+        connection.in_transaction = False
+
+    commit_with_busy_retry(cast(sqlite3.Connection, connection), commit)
+    assert connection.calls == 2
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_BUSY | (1 << 8), sqlite3.SQLITE_LOCKED])
+def test_commit_propagates_extended_busy_and_locked(code: int) -> None:
+    failure = sqlite3.OperationalError("injected")
+    failure.sqlite_errorcode = code
+
+    class Connection:
+        in_transaction = True
+        calls = 0
+
+    connection = Connection()
+
+    def commit() -> NoReturn:
+        connection.calls += 1
+        raise failure
+
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        commit_with_busy_retry(cast(sqlite3.Connection, connection), commit)
+    assert raised.value is failure
+    assert connection.calls == 1
+
+
+def test_commit_does_not_retry_busy_after_transaction_ended() -> None:
+    failure = sqlite3.OperationalError("injected")
+    failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    class Connection:
+        in_transaction = False
+        calls = 0
+
+    connection = Connection()
+
+    def commit() -> NoReturn:
+        connection.calls += 1
+        raise failure
+
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        commit_with_busy_retry(cast(sqlite3.Connection, connection), commit)
+    assert raised.value is failure
     assert connection.calls == 1
 
 
@@ -326,7 +438,7 @@ def test_transaction_database_errors_are_normalized_and_rollback_cannot_mask_the
 
     class FailingConnection(collector_state_db._GuardedConnection):
         def execute(self, statement: str, parameters: object = (), /) -> sqlite3.Cursor:
-            if failure_point == "begin" and statement == "BEGIN EXCLUSIVE":
+            if failure_point == "begin" and statement in {"BEGIN EXCLUSIVE", "BEGIN IMMEDIATE"}:
                 raise sqlite3.OperationalError("synthetic begin failure")
             return super().execute(statement, parameters)
 

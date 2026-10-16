@@ -286,7 +286,7 @@ def refresh_utc_projection(state_db: StateDB, *, chunk_limit: int = DEFAULT_CHUN
         with state_db.access():
             connection = state_db.open_connection()
             try:
-                state_db.begin_exclusive(connection)
+                state_db.begin_write(connection)
                 if _clock_payload_text(connection) != payload:
                     connection.commit()
                     return 0
@@ -1477,7 +1477,7 @@ class InternalAudioStore:
         scope = self.state_db.access(connection)
         scope.__enter__()
         try:
-            self.state_db.begin_exclusive(connection)
+            self.state_db.begin_write(connection)
         except BaseException:
             scope.__exit__(None, None, None)
             raise

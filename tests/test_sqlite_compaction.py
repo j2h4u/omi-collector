@@ -99,7 +99,7 @@ def _create_freelist(state_db: StateDB) -> None:
     with state_db.access():
         connection = state_db.open_connection()
         try:
-            state_db.begin_exclusive(connection)
+            state_db.begin_write(connection)
             connection.executemany(
                 "INSERT INTO state(kind,id,payload) VALUES(?,?,?)",
                 (
@@ -109,7 +109,7 @@ def _create_freelist(state_db: StateDB) -> None:
             )
             connection.commit()
             state_db.end_write(connection)
-            state_db.begin_exclusive(connection)
+            state_db.begin_write(connection)
             connection.execute("DELETE FROM state WHERE kind=?", (StateKind.QUALITY_EVENT.value,))
             connection.commit()
             state_db.end_write(connection)

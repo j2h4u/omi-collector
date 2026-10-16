@@ -185,6 +185,63 @@ def test_exact_drain_checkpoint_tail_and_page_bounds(tmp_path: Path) -> None:
     connection.close()
 
 
+def test_bounded_audio_append_waits_for_shared_reader_then_commits_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    commit_called = Event()
+    append_started = Event()
+    start_append = Event()
+    armed = False
+    base_connection = collector_state_db._GuardedConnection
+
+    class SignalingConnection(base_connection):
+        def commit(self) -> None:
+            if armed:
+                commit_called.set()
+            super().commit()
+
+    monkeypatch.setattr(collector_state_db, "_GuardedConnection", SignalingConnection)
+    records = tuple(_record(index, index % 251) for index in range(128))
+    result: list[int] = []
+    errors: list[Exception] = []
+
+    def append_batch() -> None:
+        try:
+            with InternalAudioStore(db, chunk_limit=128) as store:
+                source_id = _source(store, limit=128)
+                append_started.set()
+                if not start_append.wait(5):
+                    raise TimeoutError("test append was not released")
+                result.append(store.commit_drain(source_id, 0, records, DrainCheckpoint(1)))
+        except (sqlite3.DatabaseError, StateDBError, InternalAudioStoreError, TimeoutError) as error:
+            errors.append(error)
+
+    thread = Thread(target=append_batch)
+    thread.start()
+    reader = sqlite3.connect(db.path, isolation_level=None, timeout=0)
+    try:
+        assert append_started.wait(5)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM capture_record").fetchone()
+        armed = True
+        start_append.set()
+        assert commit_called.wait(5)
+        reader.rollback()
+        thread.join(5)
+    finally:
+        start_append.set()
+        reader.rollback()
+        reader.close()
+        if thread.is_alive():
+            thread.join(5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert result == [128]
+    with closing(sqlite3.connect(db.path)) as connection:
+        assert connection.execute("SELECT count(*) FROM capture_record").fetchone() == (128,)
+
+
 def test_create_ambiguity_reconciles_commit_and_rollback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     with InternalAudioStore(db) as store:

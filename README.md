@@ -176,6 +176,12 @@ transfer-quality events are projected into the shared state database for
 `device status`; detailed diagnostic events are available through the system
 journal when DEBUG logging is enabled.
 
+Bundle formation and recording-date history is kept in the existing SQLite
+publication ledger, including after a processed bundle is removed. It is
+separate from the bounded quality-event journal. See
+[bundle date history](docs/QUALITY_METRICS.md#bundle-date-history) for the
+meaning of the dates and how to retrieve them.
+
 For one machine-readable operational snapshot of systemd health, current
 transfer progress, last observed battery and firmware, device backlog,
 publication, and recent transfer/loss evidence,

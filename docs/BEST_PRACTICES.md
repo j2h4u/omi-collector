@@ -311,6 +311,12 @@ never imports or deletes old data. Runtime also refuses v1 and never creates a
 replacement database. Keep the service stopped while repairing an incompatible
 state, and preserve the stable lock inode through deploy and recovery.
 
+Before restarting the previous release after an interrupted deployment, its
+own interpreter must validate the current publication ledger read-only. Older
+readers reject the bundle-date fields introduced after they were built. If
+compatibility cannot be established, leave the service stopped for forward
+recovery; never strip dates or restore an older state database.
+
 A mismatched canonical record or checkpoint stays in blocked, unclassified
 quarantine custody without an expiry deadline. Ordinary salvage and terminal
 classification must leave it untouched until an explicit custody resolution;

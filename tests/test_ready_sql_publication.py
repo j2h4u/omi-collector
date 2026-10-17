@@ -1439,12 +1439,25 @@ def test_sql_publication_reconciles_ambiguous_transaction_boundaries(
     assert result.records_sha256 == sha256(raw).hexdigest()
     assert result.path.joinpath("records.bin").read_bytes() == raw
     assert len(tuple(ready.iterdir())) == 1
+    publication_entry = database.get(StateKind.READY_PUBLICATION, result.bundle_id)
+    assert publication_entry is not None
+    publication_dates = tuple(
+        publication_entry[field] for field in ("formed_on_utc", "recorded_on_utc_min", "recorded_on_utc_max")
+    )
+    assert ready_bundles._valid_publication_dates(publication_entry)
+    assert publication_dates[1:] == (None, None)
     ledger = database.list(StateKind.READY_PUBLICATION)
     assert len(ledger) == 2
     assert len({item_id for item_id, _payload in ledger}) == 2
     assert _publication_database_state(database, source._source_id) == (None, "retiring", (1, 0), 0, 0)
     retry = _publish(store, (), ready)
     assert retry.state is ReadyOutcomeState.WAITING
+    retried_entry = database.get(StateKind.READY_PUBLICATION, result.bundle_id)
+    assert retried_entry is not None
+    assert (
+        tuple(retried_entry[field] for field in ("formed_on_utc", "recorded_on_utc_min", "recorded_on_utc_max"))
+        == publication_dates
+    )
     assert len(tuple(ready.iterdir())) == 1
     with closing(database.open_connection(read_only=True)) as connection:
         assert (

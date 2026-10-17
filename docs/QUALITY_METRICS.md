@@ -40,6 +40,37 @@ write must begin within that inclusive interval. Downstream may treat a reset
 as authorized only when the raw boundary falls in such an interval; a bundle
 or terminal-source boundary alone is not clock-correction evidence.
 
+## Bundle date history
+
+The `ready_publication` rows in the same SQLite database retain each bundle's
+identity, sequence range and three calendar dates, including after downstream
+acknowledgement removes the bundle files. This durable publication metadata
+does not use the best-effort quality-event queue or its byte budget.
+
+`formed_on_utc` is the UTC date sampled for the final publication commit
+proposal. Retries and reuse preserve that value; it describes publication,
+not when the audio was recorded or an exact transaction commit instant.
+`recorded_on_utc_min` and `recorded_on_utc_max` are inclusive estimated bounds
+on the UTC recording dates. They cover every converted record and expand
+outward for clock uncertainty. Both are null if any record has no UTC mapping
+or the dates cannot be represented safely. A date envelope does not claim
+continuous recording between its endpoints. Sequence ranges remain the basis
+for ordering; overlapping ranges do not establish a strict archive order.
+
+Old entries without these fields have unknown dates. Do not fill them from file
+modification dates, the latest clock correction, or the number of records.
+Reading this history does not require opening audio files. For example, use
+the following query through a read-only SQLite connection:
+
+```sql
+SELECT id AS bundle_id,
+       json_extract(payload, '$.formed_on_utc') AS formed_on_utc,
+       json_extract(payload, '$.recorded_on_utc_min') AS recorded_on_utc_min,
+       json_extract(payload, '$.recorded_on_utc_max') AS recorded_on_utc_max
+FROM state
+WHERE kind = 'ready_publication' AND id != 'frontier';
+```
+
 ## Operator summary
 
 The read-only status command combines the current firmware observation,

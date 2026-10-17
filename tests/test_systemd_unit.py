@@ -26,6 +26,7 @@ _INSTALLER = _ROOT / "scripts" / "install-systemd-unit.sh"
 _BLUETOOTH_READY = _ROOT / "scripts" / "omi-collector-bluetooth-ready"
 _DEPLOYER = _ROOT / "scripts" / "deploy-systemd-service.sh"
 _SEALER = _ROOT / "scripts" / "seal_deployment_tree.py"
+_FALLBACK_LEDGER_CHECK = _ROOT / "scripts" / "check_fallback_ledger_compatibility.py"
 _DEV_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
 _STATUS_COMMAND = _ROOT / "scripts" / "omi-collector-status"
 _STATUS_SUDOERS = _ROOT / "scripts" / "omi-collector-status.sudoers"
@@ -57,6 +58,7 @@ class _DeploymentScenario:
     operator_can_write_state: bool = False
     recovery_required: bool = False
     real_state_cli: bool = False
+    fallback_ledger_compatible: bool = True
 
 
 _DEFAULT_SCENARIO = _DeploymentScenario()
@@ -775,6 +777,7 @@ def _stage_harness_repository(tmp_path: Path) -> tuple[Path, Path, Path]:
     source_root.mkdir()
     shutil.copytree(_SOURCE_PACKAGE, source_package)
     shutil.copy2(_SEALER, scripts_dir / _SEALER.name)
+    shutil.copy2(_FALLBACK_LEDGER_CHECK, scripts_dir / _FALLBACK_LEDGER_CHECK.name)
     shutil.copy2(_UNIT, systemd_dir / _UNIT.name)
     installed_unit = tmp_path / "installed" / "omi-collector.service"
     installed_unit.parent.mkdir()
@@ -883,6 +886,7 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "DEPLOY_PREFLIGHT_FAIL_AT": str(scenario.preflight_failure_at or 0),
         "DEPLOY_RECOVERY_REQUIRED": "1" if scenario.recovery_required else "0",
         "DEPLOY_REAL_STATE_CLI": "1" if scenario.real_state_cli else "0",
+        "DEPLOY_FALLBACK_COMPATIBLE": "1" if scenario.fallback_ledger_compatible else "0",
         "DEPLOY_SOURCE_PACKAGE_PARENT": str(context.source_package.parent),
         "DEPLOY_CANDIDATE_PREFIX": str(context.deployment_root / "candidate-prefix"),
         "DEPLOY_CONFIG_FILE": str(context.config_file),
@@ -910,6 +914,15 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
 def _previous_release(harness: _DeploymentHarness) -> Path:
     release = harness.deployment_root / "releases" / ("release-" + "1" * 40 + "-1-1")
     release.mkdir(parents=True)
+    fake_python = release / "bin" / "python"
+    fake_python.parent.mkdir()
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'fallback compatibility args=%s\\n' \"$*\" >> {shlex.quote(str(harness.log))}\n"
+        '[[ "${DEPLOY_FALLBACK_COMPATIBLE:-1}" == 1 ]]\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
     harness.current_link.symlink_to(f"releases/{release.name}")
     return release
 
@@ -1290,11 +1303,20 @@ def test_deployer_keeps_previous_release_running_when_persistence_barrier_fails(
     assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("initial_service_active", [True, False])
+@pytest.mark.parametrize(
+    ("initial_service_active", "fallback_ledger_compatible"),
+    [(True, True), (False, True), (True, False)],
+)
 def test_deployer_restores_previous_service_when_selector_publish_fails_before_rename(
-    tmp_path: Path, initial_service_active: bool
+    tmp_path: Path, initial_service_active: bool, fallback_ledger_compatible: bool
 ) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(initial_service_active=initial_service_active))
+    harness = _deployment_harness(
+        tmp_path,
+        _DeploymentScenario(
+            initial_service_active=initial_service_active,
+            fallback_ledger_compatible=fallback_ledger_compatible,
+        ),
+    )
     previous = _previous_release(harness)
     _canonical_state(harness, version=2)
     script = harness.deployer.read_text(encoding="utf-8")
@@ -1308,10 +1330,18 @@ def test_deployer_restores_previous_service_when_selector_publish_fails_before_r
     assert "injected pre-rename failure" in result.stderr
     assert "requires forward Collector recovery" not in result.stderr
     assert harness.current_link.resolve(strict=True) == previous
-    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
+    releases = tuple((harness.deployment_root / "releases").glob("release-*"))
+    assert len(releases) == 1 + int(initial_service_active and not fallback_ledger_compatible)
+    assert previous in releases
     commands = harness.log.read_text(encoding="utf-8")
     assert commands.count("systemctl args=stop omi-collector.service") == 1
-    assert commands.count("systemctl args=start omi-collector.service") == int(initial_service_active)
+    assert commands.count("systemctl args=start omi-collector.service") == int(
+        initial_service_active and fallback_ledger_compatible
+    )
+    if initial_service_active:
+        assert commands.count("fallback compatibility args=") == 1
+    if initial_service_active and not fallback_ledger_compatible:
+        assert "cannot safely read Collector state" in result.stderr
 
 
 def test_deployer_retains_new_selector_when_parent_fsync_fails_after_rename(tmp_path: Path) -> None:

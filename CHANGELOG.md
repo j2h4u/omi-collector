@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/j2h4u/omi-collector/compare/v0.14.4...v0.15.0) (2026-10-17)
+
+
+### Features
+
+* retain bundle formation and recording dates in SQLite ([#266](https://github.com/j2h4u/omi-collector/issues/266)) ([16d39b8](https://github.com/j2h4u/omi-collector/commit/16d39b81ac51821f4b0d9c69ead7ae9d974d6ed8))
+
 ## [0.14.4](https://github.com/j2h4u/omi-collector/compare/v0.14.3...v0.14.4) (2026-10-16)
 
 

@@ -222,7 +222,6 @@ def _require_host_singleton(loaded: OperatorConfig) -> None:
         raise StateMigrationError("this Bluetooth adapter is bound to the installed Collector state root")
 
 
-
 class SyncLogLevel(StrEnum):
     """The small, command-local verbosity surface for long-lived sync."""
 

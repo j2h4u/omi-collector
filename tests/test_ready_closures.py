@@ -112,9 +112,7 @@ def test_staging_emits_only_verified_armed_drain_and_keeps_repeat_identity(tmp_p
 
 
 @pytest.mark.parametrize("loss", [None, ("wrong-source", 11, 13), ("same", 11, 12), ("same", 11, 14)])
-def test_ahead_drain_needs_one_exact_confirmed_loss(
-    tmp_path: Path, loss: tuple[str, int, int] | None
-) -> None:
+def test_ahead_drain_needs_one_exact_confirmed_loss(tmp_path: Path, loss: tuple[str, int, int] | None) -> None:
     store = StagingStore(tmp_path / "spool", tmp_path / "capture")
     store.initialize_confirmed_loss_ledger()
     writer = store.make_staging_writer(10, 1)

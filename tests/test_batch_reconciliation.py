@@ -209,7 +209,8 @@ async def test_cursor_ahead_with_zero_durable_prefix_does_not_arm_public_drain(t
     arm_calls: list[tuple[str, int]] = []
     original_arm = store.public_drain.arm_pending
     store.public_drain.arm_pending = lambda source_id, frontier: (
-        arm_calls.append((source_id, frontier)), original_arm(source_id, frontier)
+        arm_calls.append((source_id, frontier)),
+        original_arm(source_id, frontier),
     )
     reconciler = BatchReconciler(
         store,

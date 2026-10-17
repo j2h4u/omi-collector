@@ -40,6 +40,40 @@ def test_fresh_initialization_creates_v2_without_migration_receipt(tmp_path: Pat
     )
 
 
+def test_fresh_initialization_accepts_empty_public_directory(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    public_root = layout.collector.root / "public"
+    public_root.mkdir(parents=True)
+
+    assert inspect_collector_state(layout) == {"schema_version": None, "status": "state_compatible"}
+    assert initialize_collector_state(layout) == {"schema_version": 2}
+    assert layout.collector.state_db.is_file()
+
+
+@pytest.mark.parametrize("public_entry", ["payload", "legacy.json"])
+def test_missing_database_with_nonempty_public_directory_refuses(tmp_path: Path, public_entry: str) -> None:
+    layout = _layout(tmp_path)
+    public_root = layout.collector.root / "public"
+    public_root.mkdir(parents=True)
+    (public_root / public_entry).write_text("retained", encoding="utf-8")
+
+    with pytest.raises(InternalAudioMigrationError, match="data exists"):
+        initialize_collector_state(layout)
+    assert not layout.collector.state_db.exists()
+
+
+def test_missing_database_with_symlinked_public_directory_refuses(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    layout.collector.root.mkdir()
+    outside = tmp_path / "outside-public"
+    outside.mkdir()
+    (layout.collector.root / "public").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(InternalAudioMigrationError, match="data exists"):
+        initialize_collector_state(layout)
+    assert not layout.collector.state_db.exists()
+
+
 def test_existing_v2_without_receipt_is_accepted_without_rewrite(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)

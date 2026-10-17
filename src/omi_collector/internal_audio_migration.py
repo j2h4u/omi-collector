@@ -110,7 +110,14 @@ def _assert_canonical(path: Path) -> None:
 
 
 def _validate_empty_install(layout: StorageLayout) -> None:
-    for root in (layout.collector.attempts, layout.collector.quarantine, layout.draft, layout.publication.root):
+    public_root = layout.collector.root / "public"
+    for root in (
+        layout.collector.attempts,
+        layout.collector.quarantine,
+        layout.draft,
+        layout.publication.root,
+        public_root,
+    ):
         try:
             mode = root.lstat().st_mode
         except FileNotFoundError:
@@ -126,7 +133,11 @@ def _validate_empty_install(layout: StorageLayout) -> None:
                 entry_mode = entry.lstat().st_mode
             except OSError as error:
                 raise InternalAudioMigrationError("Collector control data is unavailable") from error
-            if entry.name not in {"attempts", "quarantine"} or not stat.S_ISDIR(entry_mode) or any(entry.iterdir()):
+            if (
+                entry.name not in {"attempts", "quarantine", "public"}
+                or not stat.S_ISDIR(entry_mode)
+                or any(entry.iterdir())
+            ):
                 raise InternalAudioMigrationError("canonical DB is missing while Collector control data exists")
 
 

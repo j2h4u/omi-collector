@@ -164,15 +164,17 @@ class PublicDrainProjection:
         pending_frontier = row["pending_frontier"]
         accepted_binding = None if accepted_custody is None else (accepted_custody.source_id, accepted_custody.frontier)
         pending_binding = (row["pending_source_id"], pending_frontier)
+        cursor_is_covered = info.read_sequence == closure_frontier or (
+            accepted_custody is not None
+            and info.read_sequence > closure_frontier
+            and info.read_sequence == accepted_custody.confirmed_loss_end
+        )
         if (
             pending is not None
             and accepted_custody is not None
             and accepted_binding == pending_binding
             and closure_frontier == pending_frontier
-            and (
-                info.read_sequence == closure_frontier
-                or (info.read_sequence > closure_frontier and info.read_sequence == accepted_custody.confirmed_loss_end)
-            )
+            and cursor_is_covered
         ):
             row["last_drain"] = {"event_id": pending, "completed_at": completed_at}
             row["pending_event_id"] = None

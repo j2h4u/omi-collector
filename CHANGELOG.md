@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.16.0](https://github.com/j2h4u/omi-collector/compare/v0.15.0...v0.16.0) (2026-10-17)
+
+
+### Features
+
+* publish a durable pendant drain snapshot ([5e77d3a](https://github.com/j2h4u/omi-collector/commit/5e77d3a02a1cf1b4f27180d9729623774f97f239))
+
+
+### Fixes
+
+* allow the provisioned public directory on first install ([5e77d3a](https://github.com/j2h4u/omi-collector/commit/5e77d3a02a1cf1b4f27180d9729623774f97f239))
+
 ## [0.15.0](https://github.com/j2h4u/omi-collector/compare/v0.14.4...v0.15.0) (2026-10-17)
 
 

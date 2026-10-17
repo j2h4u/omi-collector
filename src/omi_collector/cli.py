@@ -209,15 +209,17 @@ def _require_host_singleton(loaded: OperatorConfig) -> None:
     """Do not let another state root control the installed Bluetooth adapter."""
     if loaded.path == DEFAULT_CONFIG_PATH:
         return
-    from omi_collector.storage_layout import StorageLayoutError, load_operator_config
-
-    try:
-        load_operator_config(DEFAULT_CONFIG_PATH)
-    except StorageLayoutError:
-        return
     from omi_collector.state_migration import StateMigrationError
 
-    raise StateMigrationError("this Bluetooth adapter is bound to the installed Collector state root")
+    installed_root = DEFAULT_CONFIG_PATH.absolute().parent / "collector"
+    for path in (DEFAULT_CONFIG_PATH, installed_root):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise StateMigrationError("cannot verify the installed Collector state root") from error
+        raise StateMigrationError("this Bluetooth adapter is bound to the installed Collector state root")
 
 
 class SyncLogLevel(StrEnum):

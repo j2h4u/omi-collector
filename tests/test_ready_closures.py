@@ -111,6 +111,63 @@ def test_staging_emits_only_verified_armed_drain_and_keeps_repeat_identity(tmp_p
     assert repeated is not None and repeated["last_drain"] == first
 
 
+@pytest.mark.parametrize("loss", [None, ("wrong-source", 11, 13), ("same", 11, 12), ("same", 11, 14)])
+def test_ahead_drain_needs_one_exact_confirmed_loss(tmp_path: Path, loss: tuple[str, int, int] | None) -> None:
+    store = StagingStore(tmp_path / "spool", tmp_path / "capture")
+    store.initialize_confirmed_loss_ledger()
+    writer = store.make_staging_writer(10, 1)
+    writer.prepare()
+    writer.prepare_leg(10, 1)
+    writer.read_begin(ReadBeginNotification(10, 1))
+    writer.append_chunk(0, memoryview(_record(10)))
+    writer.seal(DoneNotification(0, 11))
+    source_id = writer.attempt_id
+    writer.close()
+    store.public_drain.arm_pending(source_id, 11)
+    if loss is not None:
+        fact_source = source_id if loss[0] == "same" else "0" * 32
+        store.record_confirmed_loss(fact_source, loss[1], loss[2], "2026-10-17T12:00:00+00:00")
+
+    store.append_ready_closure(
+        11,
+        "drained",
+        verified_drain=(RingInfo(13, 13, 100, 0, RECORD_SIZE), "2026-10-17T12:01:00+00:00"),
+        completed_at="2026-10-17T12:02:00+00:00",
+    )
+
+    state = store.state_db.get(StateKind.PENDANT_DRAIN, "current")
+    assert state is not None
+    assert state["last_drain"] is None
+    assert state["pending_event_id"] is not None
+
+
+def test_recovered_existing_drain_closure_completes_with_exact_loss(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path / "spool", tmp_path / "capture")
+    store.initialize_confirmed_loss_ledger()
+    writer = store.make_staging_writer(10, 1)
+    writer.prepare()
+    writer.prepare_leg(10, 1)
+    writer.read_begin(ReadBeginNotification(10, 1))
+    writer.append_chunk(0, memoryview(_record(10)))
+    writer.seal(DoneNotification(0, 11))
+    source_id = writer.attempt_id
+    writer.close()
+    store.public_drain.arm_pending(source_id, 11)
+    store.record_confirmed_loss(source_id, 11, 13, "2026-10-17T12:00:00+00:00")
+    store.append_ready_closure(11, "drained")
+
+    store.close_pending_prefix(
+        "drained",
+        drain_cursor=13,
+        verified_drain=(RingInfo(13, 13, 100, 0, RECORD_SIZE), "2026-10-17T12:01:00+00:00"),
+        completed_at="2026-10-17T12:02:00+00:00",
+    )
+
+    state = store.state_db.get(StateKind.PENDANT_DRAIN, "current")
+    assert state is not None and state["last_drain"] is not None
+    assert state["pending_event_id"] is None
+
+
 def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: Path) -> None:
     base = StagingStore(tmp_path / "spool", tmp_path / "draft")
     ready = tmp_path / "ready"

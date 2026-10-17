@@ -26,6 +26,7 @@ from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterF
 from omi_collector.capture.adapters.attempts import DurableSqliteSeal
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.confirmed_loss import read_confirmed_losses
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
     CaptureSource,
@@ -1503,6 +1504,9 @@ async def test_restart_cursor_after_prefix_publishes_gap_and_continues_at_cursor
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
+    public_dir = store.state_db.path.parent / "public"
+    public_dir.mkdir(mode=0o2750)
+    public_dir.chmod(0o2750)
     session = ScriptedRingSession(
         _status(),
         (
@@ -1574,6 +1578,71 @@ async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_curren
     assert source.lifecycle == "sealed_waiting"
     assert (source.sequence_start, source.sequence_limit, source.committed_count) == (100, 102, 1)
     assert _source_records(store, attempt_id) == _record(100)
+
+
+@_async_test
+async def test_recovered_confirmed_loss_completes_public_drain_token(tmp_path: Path) -> None:
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
+    first = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(100, 102),)),
+            WriteStep(
+                encode_read_command(100, 2),
+                (_begin(100, 2), _data(_record(100)), RingTransportDisconnectedError("gone")),
+            ),
+            WriteStep(encode_stop_command()),
+        ),
+    )
+    recovered = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(103, 103),)),
+            WriteStep(b"\x10", (_info(103, 103),)),
+            WriteStep(b"\x10", (_info(103, 103),)),
+        ),
+    )
+
+    class StopAfterAwayError(Exception):
+        pass
+
+    def stop_after_away(event: ActivityEvent) -> None:
+        if event.state == "away":
+            raise StopAfterAwayError
+
+    with pytest.raises(StopAfterAwayError):
+        await asyncio.wait_for(
+            run_opportunistic_collector(
+                Provider([first]),
+                store,
+                replace(_options(), activity=stop_after_away, public_drain=store.public_drain),
+            ),
+            20,
+        )
+
+    reopened = _staging_store(tmp_path, _capture_root(tmp_path))
+    result = await run_opportunistic_collector(
+        Provider([recovered]),
+        reopened,
+        replace(_options(), public_drain=reopened.public_drain),
+    )
+
+    assert isinstance(result, CollectionResult)
+    assert result.next_sequence == 101
+    assert _ready_closure_rows(store) == [{"next_sequence": 101, "reason": "drained"}]
+    [loss] = storage_call(lambda: read_confirmed_losses(reopened.state_db))
+    assert (loss.start_sequence, loss.end_sequence) == (101, 103)
+    assert _source_records(reopened, loss.attempt_id) == _record(100)
+    assert recovered.writes == [b"\x10"] * 3
+    drain = storage_call(lambda: reopened.state_db.get(StateKind.PENDANT_DRAIN, "current"))
+    assert drain is not None and drain["last_drain"] is not None
+    assert drain["pending_event_id"] is None
+
+    restarted_again = _staging_store(tmp_path, _capture_root(tmp_path))
+    reopened_drain = storage_call(lambda: restarted_again.state_db.get(StateKind.PENDANT_DRAIN, "current"))
+    assert reopened_drain is not None and reopened_drain["last_drain"] == drain["last_drain"]
 
 
 @_async_test

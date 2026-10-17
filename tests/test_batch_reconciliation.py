@@ -17,6 +17,7 @@ import pytest
 from fakes import DelayedNotification, ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.attempt_writer import WriterError, WriterFailedError
 from omi_collector.capture.adapters.attempts import DurableSqliteSeal
+from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, read_confirmed_losses
 from omi_collector.capture.adapters.internal_audio_store import CaptureSource
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
@@ -186,6 +187,56 @@ async def test_cursor_ahead_with_metrics_disabled_has_no_metrics_error_event(tmp
         assert attempt_records(store, descriptor.attempt_id) == (_record(100),)
         assert not store.capture_root.exists() or not tuple(store.capture_root.iterdir())
     finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_cursor_ahead_with_zero_durable_prefix_does_not_arm_public_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def seed_empty() -> StagingStore:
+        store = StagingStore(tmp_path / "spool", tmp_path / "captures")
+        attempt = store.prepare_streaming_attempt(100, 2)
+        attempt.prepare_leg(100, 2)
+        attempt.record_read_begin(ReadBeginNotification(100, 2))
+        attempt.checkpoint()
+        attempt.close(durable=True)
+        return store
+
+    store = storage_call(seed_empty)
+    store.preflight_storage()
+    store.initialize_confirmed_loss_ledger()
+    descriptor = store.pending_attempts()[0]
+    runtime = _Runtime()
+    arm_calls: list[tuple[str, int]] = []
+    original_arm = store.public_drain.arm_pending
+
+    def record_arm(source_id: str, frontier: int) -> None:
+        arm_calls.append((source_id, frontier))
+        original_arm(source_id, frontier)
+
+    monkeypatch.setattr(store.public_drain, "arm_pending", record_arm)
+    reconciler = BatchReconciler(
+        store,
+        replace(_options(), public_drain=store.public_drain),
+        runtime,
+        _ignore_quarantine,
+    )
+    reconciler.set_startup_state(descriptor, descriptor.start_sequence)
+    current = RingInfo(102, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1))
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
+        assert arm_calls == []
+        state = storage_call(lambda: store.state_db.get(StateKind.PENDANT_DRAIN, "current"))
+        assert state is None or state["pending_event_id"] is None
+    finally:
+        await reconciler.close_visit("drained", drain_cursor=102)
         await _close_real_writers(runtime)
         await session.close()
 
@@ -535,6 +586,7 @@ def _install_confirmed_loss_retry_observers(
     original_record = store.record_confirmed_loss
     original_read_begin = StagingWriter.read_begin
     original_publish_prefix = StagingWriter.publish_prefix
+    original_arm_pending = store.public_drain.arm_pending
     fail_after_recording = True
 
     def record_loss(attempt_id: str, start: int, end: int, occurred_at: str) -> str:
@@ -555,9 +607,14 @@ def _install_confirmed_loss_retry_observers(
         events.append("publish")
         return original_publish_prefix(writer)
 
+    def arm_pending(source_id: str, frontier: int) -> None:
+        events.append("arm")
+        original_arm_pending(source_id, frontier)
+
     monkeypatch.setattr(store, "record_confirmed_loss", record_loss)
     monkeypatch.setattr(StagingWriter, "read_begin", read_begin)
     monkeypatch.setattr(StagingWriter, "publish_prefix", publish_prefix)
+    monkeypatch.setattr(store.public_drain, "arm_pending", arm_pending)
 
 
 def _assert_confirmed_loss(store: StagingStore, loss_id: str) -> None:
@@ -576,7 +633,12 @@ def _make_cursor_ahead_loss_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     durable_next = store.open_attempt(descriptor.attempt_id).recover().valid_records + descriptor.start_sequence
     runtime = _Runtime()
     metrics = _LossMetrics()
-    options = replace(_options(), quality_metrics=cast(QualityMetricsPort, metrics), host_time=lambda: 1_700_000_000.0)
+    options = replace(
+        _options(),
+        quality_metrics=cast(QualityMetricsPort, metrics),
+        host_time=lambda: 1_700_000_000.0,
+        public_drain=store.public_drain,
+    )
     reconciler = BatchReconciler(store, options, runtime, _ignore_quarantine)
     reconciler.set_startup_state(descriptor, durable_next)
     scenario = _CursorAheadLossRetry(
@@ -599,7 +661,7 @@ async def _assert_confirmed_loss_retry_completion(
     seen: RingInfo | None,
 ) -> None:
     assert seen is scenario.current
-    assert scenario.events == ["loss", "publish"]
+    assert scenario.events == ["loss", "arm", "publish"]
     assert len(scenario.loss_ids) == 2 and scenario.loss_ids[0] == scenario.loss_ids[1]
     _assert_confirmed_loss(scenario.store, scenario.loss_ids[0])
     [metric] = scenario.metrics.losses

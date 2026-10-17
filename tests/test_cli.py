@@ -9,6 +9,7 @@ import subprocess
 import sys
 from collections.abc import Coroutine, Iterator
 from contextlib import closing, contextmanager
+from os import stat_result
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
@@ -42,7 +43,7 @@ _CAPTURE_ROOTS: set[Path] = set()
 
 @pytest.fixture(autouse=True)
 def _isolate_installed_host_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "absent-installed-config.toml")
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "installed" / "config.toml")
 
 
 def _capture_root(tmp_path: Path) -> Path:
@@ -107,6 +108,103 @@ def test_mutating_cli_rejects_alternate_root_for_same_adapter_with_different_pen
 
     with pytest.raises(StateMigrationError, match="Bluetooth adapter is bound"):
         cli._require_host_singleton(load_operator_config(alternate))
+
+
+def test_installed_default_config_remains_allowed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    installed = _layout(tmp_path)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", installed)
+
+    cli._require_host_singleton(load_operator_config(installed))
+
+
+def test_alternate_root_rejected_when_installed_config_is_malformed_and_guard_is_held(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omi_collector.capture.adapters.collector_guard import collector_guard
+
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", installed / "config.toml")
+    cli.DEFAULT_CONFIG_PATH.write_text("not = [valid TOML", encoding="utf-8")
+    canonical_lock = installed / "collector" / "collector.lock"
+    canonical_lock.parent.mkdir()
+    alternate_root = tmp_path / "alternate"
+    alternate_root.mkdir()
+    alternate = _layout(alternate_root)
+    alternate_lock = load_operator_config(alternate).storage.collector.lock
+
+    with collector_guard(canonical_lock), pytest.raises(StateMigrationError, match="Bluetooth adapter is bound"):
+        cli._require_host_singleton(load_operator_config(alternate))
+
+    assert not alternate_lock.exists()
+
+
+def test_alternate_root_rejected_when_config_is_missing_but_installed_state_remains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omi_collector.capture.adapters.collector_guard import collector_guard
+
+    installed = tmp_path / "installed"
+    canonical_lock = installed / "collector" / "collector.lock"
+    state_db = canonical_lock.parent / "collector-state.sqlite3"
+    canonical_lock.parent.mkdir(parents=True)
+    StateDB(state_db).put(StateKind.RUNTIME_STATUS, "current", {"last_error": "retained"})
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", installed / "config.toml")
+    alternate_root = tmp_path / "alternate"
+    alternate_root.mkdir()
+    alternate = _layout(alternate_root)
+    alternate_lock = load_operator_config(alternate).storage.collector.lock
+
+    with collector_guard(canonical_lock), pytest.raises(StateMigrationError, match="Bluetooth adapter is bound"):
+        cli._require_host_singleton(load_operator_config(alternate))
+
+    assert not alternate_lock.exists()
+
+
+def test_dangling_installed_config_symlink_is_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    config_path = installed / "config.toml"
+    config_path.symlink_to(installed / "missing.toml")
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+    alternate_root = tmp_path / "alternate"
+    alternate_root.mkdir()
+    alternate = _layout(alternate_root)
+
+    with pytest.raises(StateMigrationError, match="Bluetooth adapter is bound"):
+        cli._require_host_singleton(load_operator_config(alternate))
+
+
+def test_alternate_root_rejected_when_installed_authority_cannot_be_inspected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    installed_config = tmp_path / "installed" / "config.toml"
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", installed_config)
+    alternate_root = tmp_path / "alternate"
+    alternate_root.mkdir()
+    alternate = _layout(alternate_root)
+    original_lstat = Path.lstat
+
+    def deny_installed_inspection(path: Path) -> stat_result:
+        if path == installed_config:
+            raise PermissionError("cannot inspect installed config")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", deny_installed_inspection)
+
+    with pytest.raises(StateMigrationError, match="cannot verify the installed Collector state root"):
+        cli._require_host_singleton(load_operator_config(alternate))
+
+
+def test_alternate_root_allowed_without_installed_config_or_collector_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    standalone_root = tmp_path / "standalone"
+    standalone_root.mkdir()
+    alternate = _layout(standalone_root)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "installed" / "config.toml")
+
+    cli._require_host_singleton(load_operator_config(alternate))
 
 
 def test_init_state_cli_initializes_empty_v2_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

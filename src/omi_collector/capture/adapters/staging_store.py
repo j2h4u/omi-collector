@@ -60,7 +60,7 @@ from .internal_audio_store import (
     read_capture_source,
     refresh_utc_projection,
 )
-from .public_drain import PublicDrainProjection
+from .public_drain import AcceptedDrainCustody, PublicDrainProjection
 from .ready_bundles import (
     ReadyBundleError,
     ReadyCustodyCache,
@@ -669,7 +669,7 @@ class StagingStore:
                 verified_drain=verified_drain,
                 completed_at=completed_at,
                 closure_frontier=next_sequence,
-                accepted_custody=self._accepted_drain_binding(next_sequence),
+                accepted_custody=self._accepted_public_custody(verified_drain, next_sequence),
             )
         closure = ready_closures.append(self._state_db, next_sequence, reason, on_commit=callback)
         self._public_drain.wake()
@@ -684,7 +684,7 @@ class StagingStore:
     ) -> None:
         if closure.reason != "drained" or verified_drain is None or completed_at is None:
             return
-        accepted_custody = self._accepted_drain_binding(closure.next_sequence)
+        accepted_custody = self._accepted_public_custody(verified_drain, closure.next_sequence)
         with self._state_db.transaction() as transaction:
             self._public_drain.complete_in_transaction(
                 transaction,
@@ -694,6 +694,31 @@ class StagingStore:
                 accepted_custody=accepted_custody,
             )
         self._public_drain.wake()
+
+    def _accepted_public_custody(
+        self,
+        verified_drain: tuple[RingInfo, str],
+        closure_frontier: int,
+    ) -> AcceptedDrainCustody | None:
+        accepted_custody = self._accepted_drain_binding(closure_frontier)
+        info, _observed_at = verified_drain
+        if (
+            accepted_custody is None
+            or accepted_custody != self._public_drain.pending_binding()
+            or accepted_custody[1] != closure_frontier
+            or info.read_sequence != info.write_sequence
+            or info.read_sequence <= closure_frontier
+        ):
+            return None if accepted_custody is None else AcceptedDrainCustody(*accepted_custody)
+        matches = tuple(
+            fact
+            for fact in ConfirmedLossLedger(self._state_db).read()
+            if fact.attempt_id == accepted_custody[0]
+            and fact.start_sequence == closure_frontier
+            and fact.end_sequence == info.read_sequence
+        )
+        confirmed_loss_end = info.read_sequence if len(matches) == 1 else None
+        return AcceptedDrainCustody(*accepted_custody, confirmed_loss_end=confirmed_loss_end)
 
     def _accepted_drain_binding(self, closure_frontier: int) -> tuple[str, int] | None:
         binding = self._public_drain.pending_binding()

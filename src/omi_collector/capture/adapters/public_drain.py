@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import re
+import stat
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -22,6 +26,18 @@ _ROW_FIELDS = frozenset(
 _PUBLIC_FIELDS = frozenset({"version", "ring", "last_drain", "battery"})
 _OBSERVATION_FIELDS = 2
 _MAX_BATTERY_PERCENT = 100
+_PRIVATE_TEMP_MODES = frozenset({0o600, 0o640})
+_PUBLIC_MODE = 0o640
+_TEMPORARY_SUFFIX = re.compile(r"[a-z0-9_]{8}\Z")
+
+
+@dataclass(frozen=True)
+class AcceptedDrainCustody:
+    """Bind accepted source custody to its frontier and optional confirmed loss endpoint."""
+
+    source_id: str
+    frontier: int
+    confirmed_loss_end: int | None = None
 
 
 class PublicDrainProjection:
@@ -31,6 +47,8 @@ class PublicDrainProjection:
         self._state_db = state_db
         self.path = Path(path)
         self._wake_callback: Callable[[], None] | None = None
+        self._stale_files_scanned = False
+        self._needs_sync = False
 
     def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
         """Register the coordinator event used to coalesce committed changes."""
@@ -47,14 +65,26 @@ class PublicDrainProjection:
             raise OSError("public pendant drain path must not contain symlinks")
         if not self.path.parent.is_dir():
             raise OSError("public pendant drain directory is unavailable")
+        parent_stat = self.path.parent.stat()
+        if not self._stale_files_scanned:
+            for candidate in _stale_files(self.path, parent_stat.st_gid):
+                self._needs_sync = True
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    continue
+            self._stale_files_scanned = True
         row = self._state_db.get(StateKind.PENDANT_DRAIN, _ROW_ID)
         public = _public_row(row)
         encoded = (json.dumps(public, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        if not self._needs_sync and _matches_public_file(self.path, encoded, parent_stat.st_gid):
+            return
+        self._needs_sync = True
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as stream:
-                os.fchmod(stream.fileno(), 0o640)
+                os.fchmod(stream.fileno(), _PUBLIC_MODE)
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -66,6 +96,7 @@ class PublicDrainProjection:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            self._needs_sync = False
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -112,7 +143,7 @@ class PublicDrainProjection:
         verified_drain: tuple[RingInfo, str],
         completed_at: str,
         closure_frontier: int,
-        accepted_custody: tuple[str, int] | None,
+        accepted_custody: AcceptedDrainCustody | None,
     ) -> None:
         """Complete an armed token in the same SQLite transaction as its closure."""
         info, observed_at = verified_drain
@@ -120,7 +151,7 @@ class PublicDrainProjection:
         _validate_timestamp(completed_at)
         _validate_frontier(closure_frontier)
         if accepted_custody is not None:
-            _validate_binding(accepted_custody)
+            _validate_accepted_custody(accepted_custody)
         if not isinstance(info, RingInfo):
             raise ValueError("verified drain INFO must report zero unread packets")
         if any(type(sequence) is not int or sequence < 0 for sequence in (info.read_sequence, info.write_sequence)):
@@ -131,13 +162,19 @@ class PublicDrainProjection:
         row["ring"] = {"unread_packets": 0, "observed_at": observed_at}
         pending = row["pending_event_id"]
         pending_frontier = row["pending_frontier"]
-        accepted_binding = accepted_custody
+        accepted_binding = None if accepted_custody is None else (accepted_custody.source_id, accepted_custody.frontier)
         pending_binding = (row["pending_source_id"], pending_frontier)
+        cursor_is_covered = info.read_sequence == closure_frontier or (
+            accepted_custody is not None
+            and info.read_sequence > closure_frontier
+            and info.read_sequence == accepted_custody.confirmed_loss_end
+        )
         if (
             pending is not None
+            and accepted_custody is not None
             and accepted_binding == pending_binding
             and closure_frontier == pending_frontier
-            and info.read_sequence == closure_frontier
+            and cursor_is_covered
         ):
             row["last_drain"] = {"event_id": pending, "completed_at": completed_at}
             row["pending_event_id"] = None
@@ -239,11 +276,64 @@ def _validate_frontier(value: int) -> None:
         raise ValueError("closure frontier is invalid")
 
 
-def _validate_binding(value: tuple[str, int]) -> None:
-    if not isinstance(value, tuple) or len(value) != _OBSERVATION_FIELDS:
+def _validate_accepted_custody(value: AcceptedDrainCustody) -> None:
+    if not isinstance(value, AcceptedDrainCustody):
         raise ValueError("accepted pendant custody binding is invalid")
-    if not isinstance(value[0], str) or not value[0].strip() or type(value[1]) is not int or value[1] < 0:
+    if not isinstance(value.source_id, str) or not value.source_id.strip():
         raise ValueError("accepted pendant custody binding is invalid")
+    if type(value.frontier) is not int or value.frontier < 0:
+        raise ValueError("accepted pendant custody binding is invalid")
+    if value.confirmed_loss_end is not None and (
+        type(value.confirmed_loss_end) is not int or value.confirmed_loss_end < 0
+    ):
+        raise ValueError("accepted pendant custody binding is invalid")
+
+
+def _safe_stale_file(candidate: os.stat_result, parent_gid: int) -> bool:
+    return (
+        stat.S_ISREG(candidate.st_mode)
+        and candidate.st_uid == os.geteuid()
+        and candidate.st_gid == parent_gid
+        and candidate.st_nlink == 1
+        and stat.S_IMODE(candidate.st_mode) in _PRIVATE_TEMP_MODES
+    )
+
+
+def _stale_files(path: Path, parent_gid: int) -> list[Path]:
+    stale_files = []
+    prefix = f".{path.name}."
+    for candidate in path.parent.iterdir():
+        if not candidate.name.startswith(prefix) or not _TEMPORARY_SUFFIX.fullmatch(candidate.name[len(prefix) :]):
+            continue
+        try:
+            candidate_stat = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if _safe_stale_file(candidate_stat, parent_gid):
+            stale_files.append(candidate)
+    return stale_files
+
+
+def _matches_public_file(path: Path, encoded: bytes, parent_gid: int) -> bool:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return False
+        raise
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and metadata.st_gid == parent_gid
+            and metadata.st_nlink == 1
+            and stat.S_IMODE(metadata.st_mode) == _PUBLIC_MODE
+            and metadata.st_size == len(encoded)
+            and stream.read() == encoded
+        )
 
 
 def _validate_timestamp(value: str) -> None:

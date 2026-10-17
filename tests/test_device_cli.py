@@ -58,7 +58,7 @@ from staging_test_factory import StagingStore
 
 @pytest.fixture(autouse=True)
 def _isolate_installed_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(operator_cli, "DEFAULT_CONFIG_PATH", tmp_path / "absent-installed-config.toml")
+    monkeypatch.setattr(operator_cli, "DEFAULT_CONFIG_PATH", tmp_path / "installed" / "config.toml")
 
 
 class FakeGuard:

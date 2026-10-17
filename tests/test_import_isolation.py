@@ -55,7 +55,7 @@ async def fake_sync(*args: object, **kwargs: object) -> object:
         "from typer.testing import CliRunner; "
         "from pathlib import Path; "
         "from omi_collector import cli; "
-        f"cli.DEFAULT_CONFIG_PATH = Path({str(tmp_path / 'absent-installed-config.toml')!r}); "
+        f"cli.DEFAULT_CONFIG_PATH = Path({str(tmp_path / 'installed' / 'config.toml')!r}); "
         "from omi_collector.capture import cli as capture_cli; "
         f"exec({fake_sync_source!r}); "
         "capture_cli.sync = fake_sync; "

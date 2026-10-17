@@ -729,6 +729,9 @@ async def _publish_cursor_ahead(
         cursor,
         occurred_at,
     )
+    public_drain = options.public_drain
+    if batch.durable is not None and batch.durable.record_count > 0 and public_drain is not None:
+        await joined_to_thread(public_drain.arm_pending, batch.writer.attempt_id, durable_next)
     published = await batch.writer.publish_prefix()
     await _report_loss_detected(
         options,

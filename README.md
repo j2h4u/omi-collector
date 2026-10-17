@@ -231,6 +231,10 @@ republication. It remains the last completed event when later audio arrives,
 while `ring` reports the newer backlog. Deduplicate notifications by event ID
 and assess freshness using the actual observation time. Files use mode `0640`
 inside a setgid `2750` directory owned by the service and operator read group.
+An unchanged snapshot is checked without rewriting it. After a restart, the
+writer removes its own abandoned staging files before publishing. A recovered
+download with a durably recorded firmware gap can still complete the event;
+the gap remains visible in audio-quality statistics.
 
 For subsequent updates, select the reviewed revision in the production
 checkout and run:

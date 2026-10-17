@@ -27,7 +27,7 @@ from .operational_telemetry import (
     collect_operational_telemetry,
 )
 from .owned_work import invoke_owned, join_owned, joined_to_thread
-from .ports import CaptureRuntimePort, ClockStatePort, StorageLeaseFactory
+from .ports import CaptureRuntimePort, ClockStatePort, PublicDrainPort, StorageLeaseFactory
 from .presence import PresenceEnd, PresencePolicy, PresenceWake
 from .presence_machine import AttemptOutcome, CandidateUnavailable, CleanDrain, ConnectedInterruption, NotConnected
 from .quality_metrics import (
@@ -179,6 +179,7 @@ class OpportunisticOptions:
     phy_policy: str = "auto"
     config: CollectorConfig = DEFAULT_CONFIG
     stop_intent: StopIntent | None = None
+    public_drain: PublicDrainPort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +214,9 @@ class SessionLifecycleCallbacks:
     invalidate_recovery: Callable[[], None] | None = None
     enter_capture_priority: Callable[[], Awaitable[None]] | None = None
     exit_capture_priority: Callable[[], Awaitable[None]] | None = None
+    observe_public_info: Callable[[RingInfo, str], object] | None = None
+    observe_public_battery: Callable[[int, str], object] | None = None
+    close_verified_drain: Callable[[RingInfo, str], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if (self.enter_capture_priority is None) != (self.exit_capture_priority is None):
@@ -252,6 +256,9 @@ class SessionLifecycle:
         self._direct_retry = 0
         self._pending_presence_outcome: CleanDrain | None = None
         self._pending_drain_cursor: int | None = None
+        self._verified_drain_info: RingInfo | None = None
+        self._verified_drain_observed_at: str | None = None
+        self._last_info_observed_at: str | None = None
 
     async def run_direct(self) -> collector.CollectResult:
         return await self._run_visit_machine(with_presence=False)
@@ -327,7 +334,13 @@ class SessionLifecycle:
         if isinstance(command, RunAttempt):
             return SessionFinished(await self._attempt_visit(with_presence=with_presence))
         if isinstance(command, CommitClosure):
-            await self._close_visit(command.reason, command.drain_cursor)
+            callback = self.run.callbacks.close_verified_drain
+            if command.reason == "drained" and callback is not None:
+                assert self._verified_drain_info is not None
+                assert self._verified_drain_observed_at is not None
+                await callback(self._verified_drain_info, self._verified_drain_observed_at)
+            else:
+                await self._close_visit(command.reason, command.drain_cursor)
             invalidate = self.run.callbacks.invalidate_recovery
             if command.reason == "restart_interrupted" and invalidate is not None:
                 invalidate()
@@ -639,7 +652,16 @@ class SessionLifecycle:
             if outcome == "drained":
                 if current is None or current.read_sequence != current.write_sequence:
                     raise RuntimeError("drained session lacks a fresh empty-ring cursor")
+                if self.run.callbacks.close_verified_drain is not None:
+                    final_info = await self._info(session)
+                    if final_info.read_sequence != final_info.write_sequence:
+                        current = final_info
+                        continue
+                    current = final_info
                 self._pending_drain_cursor = current.read_sequence
+                if self.run.callbacks.close_verified_drain is not None:
+                    self._verified_drain_info = current
+                    self._verified_drain_observed_at = self._last_info_observed_at
             if current is not None:
                 await self._refresh_battery(session, current, phase)
             machine = transition_session(machine, ReadResolved(cast(Literal["drained", "collected"], outcome)))
@@ -727,6 +749,7 @@ class SessionLifecycle:
                     info_operation,
                     self.run.options.timeouts.info,
                 )
+                self._observe_public_info(info)
                 if self.run.callbacks.observe_info is not None:
                     try:
                         result = self.run.callbacks.observe_info(info)
@@ -754,11 +777,24 @@ class SessionLifecycle:
                 await report_activity(self.run.options.activity, "storage_wait", delay)
                 await sleep(self.run.options.sleep, delay)
 
+    def _observe_public_info(self, info: RingInfo) -> None:
+        callback = self.run.callbacks.observe_public_info
+        if callback is not None or self.run.callbacks.close_verified_drain is not None:
+            observed_at = utc_timestamp(self.run.options.host_time())
+            self._last_info_observed_at = observed_at
+            if callback is None:
+                return
+            callback(info, observed_at)
+
     async def _collect_telemetry(
         self, session: RingSession, info: RingInfo, phase: SessionPhaseState
     ) -> Literal["disabled", "completed", "degraded"]:
         options = self.run.options
-        if options.operational is None and options.clock_state_store is None:
+        if (
+            options.operational is None
+            and options.clock_state_store is None
+            and self.run.callbacks.observe_public_battery is None
+        ):
             return "disabled"
         if options.stop_intent is not None:
             options.stop_intent.check()
@@ -773,6 +809,16 @@ class SessionLifecycle:
                 options.stop_intent.check()
 
             async def run_telemetry() -> None:
+                if options.operational is None and options.clock_state_store is None:
+                    await collect_battery_observation(
+                        session,
+                        info,
+                        emitter,
+                        operation_timeout=operation_timeout,
+                        stop_intent=options.stop_intent,
+                        observe_battery=self._observe_public_battery,
+                    )
+                    return
                 await collect_operational_telemetry(
                     session,
                     status if isinstance(status, RingStatus) else None,
@@ -790,6 +836,7 @@ class SessionLifecycle:
                         session_id=phase.quality.session_id if phase.quality is not None else "native",
                         mutation_lease=options.clock_lease,
                         stop_intent=options.stop_intent,
+                        battery_observer=self._observe_public_battery,
                     ),
                 )
 
@@ -805,10 +852,10 @@ class SessionLifecycle:
 
     async def _refresh_battery(self, session: RingSession, info: RingInfo, phase: SessionPhaseState) -> None:
         options = self.run.options
-        if options.operational is None:
+        if options.operational is None and self.run.callbacks.observe_public_battery is None:
             return
         emitter = _quality_aware_operational_emitter(
-            options.operational, phase.quality, options.quality_metrics, options.host_time
+            options.operational or (lambda _event: None), phase.quality, options.quality_metrics, options.host_time
         )
         try:
             if options.stop_intent is not None:
@@ -818,10 +865,21 @@ class SessionLifecycle:
                 options.config.retry.presence_preflight_budget_seconds,
             )
             if options.stop_intent is None:
-                await collect_battery_observation(session, info, emitter, operation_timeout=operation_timeout)
+                await collect_battery_observation(
+                    session,
+                    info,
+                    emitter,
+                    operation_timeout=operation_timeout,
+                    observe_battery=self._observe_public_battery,
+                )
             else:
                 await collect_battery_observation(
-                    session, info, emitter, operation_timeout=operation_timeout, stop_intent=options.stop_intent
+                    session,
+                    info,
+                    emitter,
+                    operation_timeout=operation_timeout,
+                    stop_intent=options.stop_intent,
+                    observe_battery=self._observe_public_battery,
                 )
         except asyncio.CancelledError:
             raise
@@ -829,6 +887,11 @@ class SessionLifecycle:
             raise
         except Exception as error:  # noqa: BLE001 - battery refresh is optional
             await report_session_error(options.activity, "telemetry", error, self.run.runtime)
+
+    def _observe_public_battery(self, percent: int) -> None:
+        callback = self.run.callbacks.observe_public_battery
+        if callback is not None:
+            callback(percent, utc_timestamp(self.run.options.host_time()))
 
 
 def _quality_aware_operational_emitter(

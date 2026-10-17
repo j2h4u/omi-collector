@@ -25,7 +25,7 @@ from omi_collector.capture.adapters import internal_audio_store, opportunistic_r
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError, WriterProgress
 from omi_collector.capture.adapters.attempts import DurableSqliteSeal
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
-from omi_collector.capture.adapters.collector_state_db import StateDB
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
     CaptureSource,
@@ -68,12 +68,16 @@ from omi_collector.capture.application.operational_telemetry import (
     BATTERY_UUID,
     TIME_READ_UUID,
 )
-from omi_collector.capture.application.opportunistic_sync import CollectionPreservedCancelledError
+from omi_collector.capture.application.opportunistic_sync import (
+    CollectionPreservedCancelledError,
+    _PublicDrainCoordinator,
+)
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
 )
 from omi_collector.capture.application.ports import (
     BatchWriterPort,
+    CaptureRuntimePort,
     StagingPort,
     StorageLeaseContext,
 )
@@ -424,6 +428,58 @@ def _options(
         clock=local_clock,
         sleep=local_clock.sleep,
     )
+
+
+@_async_test
+async def test_public_drain_coordinator_flushes_latest_samples_when_closed() -> None:
+    class PublicDrain:
+        def __init__(self) -> None:
+            self.snapshot: dict[str, object] = {
+                "ring": None,
+                "battery": None,
+                "last_drain": {"event_id": "stable", "completed_at": "earlier"},
+            }
+            self.wake_callback: Callable[[], None] | None = None
+
+        def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
+            self.wake_callback = callback
+
+        def update_observations(
+            self,
+            *,
+            ring: tuple[int, str] | None = None,
+            battery: tuple[int, str] | None = None,
+        ) -> None:
+            if ring is not None:
+                self.snapshot["ring"] = ring
+            if battery is not None:
+                self.snapshot["battery"] = battery
+
+        def publish_snapshot(self) -> None:
+            if self.wake_callback is not None:
+                self.wake_callback()
+
+        def arm_pending(self, source_id: str, durable_next_sequence: int) -> None:
+            del source_id, durable_next_sequence
+            raise AssertionError("shutdown test does not arm a drain")
+
+    public_drain = PublicDrain()
+    coordinator = _PublicDrainCoordinator(
+        public_drain,
+        cast(CaptureRuntimePort, SimpleNamespace(debug_exception=lambda *_args, **_kwargs: None)),
+    )
+    coordinator.start()
+    coordinator.observe_info(RingInfo(8, 11, 10000, 0, RECORD_SIZE), "ring-now")
+    coordinator.observe_battery(63, "battery-now")
+
+    await coordinator.close()
+
+    assert public_drain.snapshot == {
+        "ring": (3, "ring-now"),
+        "battery": (63, "battery-now"),
+        "last_drain": {"event_id": "stable", "completed_at": "earlier"},
+    }
+    assert public_drain.wake_callback is None
 
 
 class _BlockingSealTarget:
@@ -952,9 +1008,16 @@ async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
         emit: Callable[[Mapping[str, object]], object],
         *,
         operation_timeout: float,
+        observe_battery: Callable[[int], object] | None = None,
     ) -> None:
         operation_timeouts.append(operation_timeout)
-        await collect_battery_observation(battery_session, info, emit, operation_timeout=operation_timeout)
+        await collect_battery_observation(
+            battery_session,
+            info,
+            emit,
+            operation_timeout=operation_timeout,
+            observe_battery=observe_battery,
+        )
 
     monkeypatch.setattr(session_lifecycle, "collect_battery_observation", record_battery_timeout)
     session = BatterySession()
@@ -1252,6 +1315,7 @@ async def test_collect_mode_seals_without_advance_or_second_info(tmp_path: Path)
 @_async_test
 async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_path: Path) -> None:
     records = _seed_streaming_partial(tmp_path, count=2, persisted=1)
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     session = ScriptedRingSession(
         _status(),
         (
@@ -1263,13 +1327,14 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
             WriteStep(b"\x10", (_info(100, 102),)),
             WriteStep(encode_advance_command(102), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(102, 102),)),
+            WriteStep(b"\x10", (_info(102, 102),)),
         ),
     )
 
     result = await run_opportunistic_collector(
         Provider([session]),
-        _staging_store(tmp_path, _capture_root(tmp_path)),
-        _options(),
+        store,
+        replace(_options(), public_drain=store.public_drain),
     )
 
     assert isinstance(result, CollectionResult)
@@ -1280,8 +1345,11 @@ async def test_restart_hydrates_checkpoint_and_resumes_at_durable_prefix(tmp_pat
         b"\x10",
         encode_advance_command(102),
         b"\x10",
+        b"\x10",
     ]
     assert _sealed_records(_staging_store(tmp_path, _capture_root(tmp_path)), result.seal) == records
+    drain_state = storage_call(lambda: store.state_db.get(StateKind.PENDANT_DRAIN, "current"))
+    assert drain_state is not None and drain_state["last_drain"] is not None
 
 
 @_async_test
@@ -1337,6 +1405,7 @@ async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path
     sealed_result = storage_call(seal_resumed)
     assert sealed_result.source_id == attempt_id
     assert _attempt_source(store, sealed_result.source_id) is not None
+    assert storage_call(lambda: store.state_db.get(StateKind.PENDANT_DRAIN, "current")) is None
     session = ScriptedRingSession(
         _status(),
         (
@@ -1345,11 +1414,12 @@ async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path
             WriteStep(b"\x10", (_info(100, 102),)),
             WriteStep(encode_advance_command(102), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(102, 102),)),
+            WriteStep(b"\x10", (_info(102, 102),)),
         ),
     )
 
     result = await run_opportunistic_collector(
-        Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([session]), store, replace(_options(), public_drain=store.public_drain)
     )
 
     assert isinstance(result, CollectionResult)
@@ -1359,6 +1429,8 @@ async def test_restart_after_seal_reads_fresh_cursor_before_any_advance(tmp_path
     assert original is not None and original.lifecycle == "sealed_waiting"
     assert session.writes[1] == encode_read_command(100, 2)
     assert session.writes[3] == encode_advance_command(102)
+    drain_state = storage_call(lambda: store.state_db.get(StateKind.PENDANT_DRAIN, "current"))
+    assert drain_state is not None and drain_state["last_drain"] is not None
 
 
 @_async_test

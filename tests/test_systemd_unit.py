@@ -257,6 +257,21 @@ def test_installer_provisions_only_execute_access_to_existing_publication_work()
     assert 'chown -- "$work_dir"' not in installer
 
 
+def test_installer_and_deployer_provision_the_narrow_public_data_root() -> None:
+    installer = _INSTALLER.read_text(encoding="utf-8")
+    deployer = _DEPLOYER.read_text(encoding="utf-8")
+
+    for script in (installer, deployer):
+        assert '"${storage_root}/collector/public"' in script
+        assert 'install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory"' in script
+        assert '[[ ! -L "$directory" ]] || die "Collector data root must not be a symlink:' in script
+        assert script.index('[[ ! -L "$directory" ]] || die "Collector data root') < script.index(
+            'install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory"'
+        )
+    assert "local -a directories=(" in installer
+    assert "local -a directories=(" in deployer
+
+
 def test_deployer_validates_publication_checkpoint_access_before_stopping_service() -> None:
     deployer = _DEPLOYER.read_text(encoding="utf-8")
 
@@ -656,7 +671,7 @@ def _write_filesystem_fakes(context: _FakeCommandContext, scenario: _DeploymentS
         "#!/usr/bin/env bash\n"
         'path="${@: -1}"\n'
         f'if [[ "$path" == "$DEPLOY_STATE_FILE" && -f "$path" ]]; then printf \'%s:%s:%s\\n\' {shlex.quote(context.account_user)} {shlex.quote(context.operator_group)} "$(/usr/bin/stat -c %a -- "$path")"; exit 0; fi\n'
-        f'if [[ ( "$path" == "${{DEPLOY_STATE_FILE%/*}}" || "$path" == "${{DEPLOY_STATE_FILE%/collector/collector-state.sqlite3}}/ready" ) && -d "$path" ]]; then printf \'%s:%s:%s\\n\' {shlex.quote(context.account_user)} {shlex.quote(context.operator_group)} "$(/usr/bin/stat -c %a -- "$path")"; exit 0; fi\n'
+        f'if [[ ( "$path" == "${{DEPLOY_STATE_FILE%/*}}" || "$path" == "${{DEPLOY_STATE_FILE%/*}}/public" || "$path" == "${{DEPLOY_STATE_FILE%/collector/collector-state.sqlite3}}/ready" ) && -d "$path" ]]; then printf \'%s:%s:%s\\n\' {shlex.quote(context.account_user)} {shlex.quote(context.operator_group)} "$(/usr/bin/stat -c %a -- "$path")"; exit 0; fi\n'
         f"if [[ \"$path\" == {quoted_config} ]]; then printf '%s\\n' 'root:root:644'; exit 0; fi\n"
         f"if [[ \"$path\" == {quoted_build_state} ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
         f"if [[ \"$path\" == {quoted_uv_cache} ]]; then printf '%s\\n' "
@@ -1696,12 +1711,27 @@ def test_deployer_initializes_stopped_state_before_service_restart(tmp_path: Pat
     assert "collector.lock" in commands
     assert stat.S_IMODE(state_file.stat().st_mode) == 0o640
     assert stat.S_IMODE((state_file.parent / "collector.lock").stat().st_mode) == 0o600
-    data_roots = (state_file.parent, state_file.parent.parent / "ready")
+    data_roots = (state_file.parent, state_file.parent / "public", state_file.parent.parent / "ready")
     for root in data_roots:
         assert root.stat().st_mode & 0o7777 == 0o2750
     assert not (state_file.parent / "attempts").exists()
     assert not (state_file.parent / "quarantine").exists()
     assert not (state_file.parent.parent / "draft").exists()
+
+
+def test_deployer_rejects_public_data_root_symlink_before_mutating_roots(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario())
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    state_file.parent.mkdir(parents=True)
+    public_dir = state_file.parent / "public"
+    public_dir.symlink_to(tmp_path / "outside", target_is_directory=True)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "Collector data root must not be a symlink" in result.stderr
+    assert not state_file.parent.parent.joinpath("ready").exists()
+    assert "systemctl args=stop omi-collector.service" not in harness.log.read_text(encoding="utf-8")
 
 
 def test_deployer_recovers_true_hot_journal_before_selector_and_v2_initialization(tmp_path: Path) -> None:

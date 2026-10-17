@@ -11,14 +11,16 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 
 from ..domain.ring_protocol import RingInfo
 from . import collector
 from .batch_reconciliation import BatchReconciler
 from .owned_work import invoke_owned, join_owned, joined_to_thread
-from .ports import CaptureRuntimePort, ObservationWriterPort, StagingPort
+from .ports import CaptureRuntimePort, ObservationWriterPort, PublicDrainPort, StagingPort
 from .presence import PresenceEnd, PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
 from .session_lifecycle import (
@@ -59,6 +61,7 @@ class _Run:
     runtime: CaptureRuntimePort
     maintenance: QuarantineMaintenance
     observation_error_relay: _ObservationErrorRelay
+    public_drain: _PublicDrainCoordinator | None = None
 
 
 @dataclass(slots=True)
@@ -84,6 +87,106 @@ class _BackgroundFatalOwner:
         self.notified = True
         if not self.cleanup_started:
             self.task.cancel()
+
+
+class _PublicDrainCoordinator:
+    """Coalesce public observations and serialize replayable file exports."""
+
+    def __init__(self, port: PublicDrainPort, runtime: CaptureRuntimePort) -> None:
+        self.port = port
+        self.runtime = runtime
+        self.wake = asyncio.Event()
+        self._db_lock = asyncio.Lock()
+        self._ring: tuple[int, str] | None = None
+        self._battery: tuple[int, str] | None = None
+        self._stopping = False
+        self._task: asyncio.Task[None] | None = None
+        self._loop = asyncio.get_running_loop()
+        self.port.set_wake_callback(self._wake_on_loop)
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run())
+        self.wake.set()
+
+    def _wake_on_loop(self) -> None:
+        self._loop.call_soon_threadsafe(self.wake.set)
+
+    def observe_info(self, info: RingInfo, observed_at: str) -> None:
+        self._ring = (info.unread_packets, observed_at)
+        self.wake.set()
+
+    def observe_battery(self, percent: int, observed_at: str) -> None:
+        self._battery = (percent, observed_at)
+        self.wake.set()
+
+    async def before_closure(self) -> None:
+        async with self._db_lock:
+            ring, battery = None, self._battery
+            self._ring = None
+            if ring is None and battery is None:
+                return
+            try:
+                await joined_to_thread(self.port.update_observations, ring=ring, battery=battery)
+            except Exception as error:  # noqa: BLE001 - public observations are best effort
+                self._ring = None
+                self._log(error, "observation")
+            else:
+                if self._ring == ring:
+                    self._ring = None
+                if self._battery == battery:
+                    self._battery = None
+
+    async def publish_after_closure(self) -> None:
+        self._ring = None
+        self.wake.set()
+
+    async def close(self) -> None:
+        self._stopping = True
+        self.wake.set()
+        try:
+            if self._task is not None:
+                await join_owned(self._task)
+        finally:
+            self.port.set_wake_callback(None)
+
+    async def _run(self) -> None:
+        while True:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.wake.wait(), timeout=30.0)
+            self.wake.clear()
+            if self._stopping:
+                await self._flush_observations()
+                try:
+                    await joined_to_thread(self.port.publish_snapshot)
+                except Exception as error:  # noqa: BLE001 - final export remains repairable
+                    self._log(error, "publish")
+                return
+            await self._flush_observations()
+            try:
+                await joined_to_thread(self.port.publish_snapshot)
+            except Exception as error:  # noqa: BLE001 - JSON is a repairable projection
+                self._log(error, "publish")
+
+    async def _flush_observations(self) -> None:
+        async with self._db_lock:
+            ring, battery = self._ring, self._battery
+            if ring is None and battery is None:
+                return
+            try:
+                await joined_to_thread(self.port.update_observations, ring=ring, battery=battery)
+            except Exception as error:  # noqa: BLE001 - public observations are best effort
+                self._log(error, "observation")
+                return
+            if self._ring == ring:
+                self._ring = None
+            if self._battery == battery:
+                self._battery = None
+
+    def _log(self, error: Exception, operation: str) -> None:
+        try:
+            self.runtime.debug_exception("public_drain_projection_error", error, operation=operation)
+        except Exception:  # noqa: BLE001 - diagnostics cannot affect capture
+            return
 
 
 async def run_opportunistic_collector(
@@ -120,12 +223,16 @@ async def run_opportunistic_collector(
         options.config.firmware_observations,
         _observation_error_reporter(options, runtime, loop, fatal_owner, relay),
     )
-    run = _Run(provider, staging, options, observation_writer, runtime, maintenance, relay)
+    public_drain = options.public_drain
+    public_coordinator = _PublicDrainCoordinator(public_drain, runtime) if public_drain is not None else None
+    run = _Run(provider, staging, options, observation_writer, runtime, maintenance, relay, public_coordinator)
     reconciler = BatchReconciler(staging, options, runtime, maintenance.quarantine_attempt_source)
     lifecycle = _make_session_lifecycle(run, reconciler)
     cancelled = False
     unwinding = False
     primary_error: BaseException | None = None
+    if public_coordinator is not None:
+        public_coordinator.start()
     try:
         if options.presence is not None:
             return await lifecycle.run_with_presence()
@@ -139,7 +246,11 @@ async def run_opportunistic_collector(
         raise
     finally:
         fatal_owner.cleanup_started = True
-        await _finalize_run(run, reconciler, cancelled=cancelled, unwinding=unwinding, primary_error=primary_error)
+        try:
+            await _finalize_run(run, reconciler, cancelled=cancelled, unwinding=unwinding, primary_error=primary_error)
+        finally:
+            if public_coordinator is not None:
+                await public_coordinator.close()
 
 
 async def _finalize_run(
@@ -304,6 +415,9 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         durable_progress_query=reconciler.durable_progress,
         drained_result=reconciler.drained_result,
         observe_info=observe_info,
+        observe_public_info=run.public_drain.observe_info if run.public_drain is not None else None,
+        observe_public_battery=run.public_drain.observe_battery if run.public_drain is not None else None,
+        close_verified_drain=partial(_close_verified_drain, run, reconciler) if run.public_drain is not None else None,
         close_visit=close_visit,
         load_recovery=load_recovery,
         invalidate_recovery=invalidate_recovery,
@@ -311,6 +425,19 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         exit_capture_priority=run.maintenance.exit_capture_priority,
     )
     return SessionLifecycle(SessionLifecycleRun(run.provider, run.options, run.runtime, callbacks))
+
+
+async def _close_verified_drain(
+    run: _Run,
+    reconciler: BatchReconciler,
+    info: RingInfo,
+    observed_at: str,
+) -> None:
+    assert run.public_drain is not None
+    await run.public_drain.before_closure()
+    await reconciler.close_visit("drained", info.read_sequence, verified_drain=(info, observed_at))
+    run.maintenance.schedule_publication_retry()
+    await run.public_drain.publish_after_closure()
 
 
 def _bind_startup_state(reconciler: BatchReconciler, state: PendingStartupState) -> None:

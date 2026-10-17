@@ -281,6 +281,7 @@ async def collect(
         phy_policy="force_1m",
         session_guard=lambda: make_guard(adapter),
         stop_intent=stop_intent,
+        public_drain=getattr(staging, "public_drain", None),
     )
     return await run_opportunistic_collector(provider, staging, options, runtime=OpportunisticRuntime())
 
@@ -360,6 +361,7 @@ async def sync(  # noqa: PLR0913
         session_guard=(lambda: make_guard(adapter)) if force_1m else None,
         config=config,
         stop_intent=stop_intent,
+        public_drain=getattr(staging, "public_drain", None),
     )
     return await run_opportunistic_collector(
         provider, staging, options, runtime=OpportunisticRuntime(record_publication)

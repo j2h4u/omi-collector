@@ -254,6 +254,19 @@ to `omi-collector:j2h4u` mode `0640`; the singleton lock remains private
 service control and deployment use their separate bounded commands. Older
 nested data and retained root-owned recovery packages require a one-time,
 audited group-read repair; do not recursively chown unrelated pipeline state.
+The notification boundary is the single atomic
+`collector/public/pendant-drain.json` projection. Provision `collector/public`
+with the same service owner, operator read group and mode `2750`; its JSON
+file is `0640`. A downstream container mounts only this directory read-only,
+without the private database or other Collector roots. On this host the public
+directory owner/group are numeric `996:1000`; application code derives paths
+and inherits the provisioned group rather than hardcoding these identities.
+The completion receipt lives in SQLite and is exported again after restart.
+Its ID denotes a verified empty ring after accepted durable custody, including
+the existing quality-loss classification. Repeated empty observations do not
+create new completions; later unread data retains the previous receipt.
+Notification delivery, consumer deduplication and mounting belong to the
+downstream service.
 The installed sudo policy permits `j2h4u` to start, stop, or restart only
 `omi-collector.service`, alongside the existing fixed status and release
 wrappers.

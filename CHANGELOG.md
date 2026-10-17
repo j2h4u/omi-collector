@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.16.1](https://github.com/j2h4u/omi-collector/compare/v0.16.0...v0.16.1) (2026-10-17)
+
+
+### Fixes
+
+* complete recovered downloads with exact certified firmware gaps ([af5204e](https://github.com/j2h4u/omi-collector/commit/af5204e9d0c4f2105ab3cbb2a531470e4ef01bc6))
+* reject alternate collector roots when installed authority remains ([af5204e](https://github.com/j2h4u/omi-collector/commit/af5204e9d0c4f2105ab3cbb2a531470e4ef01bc6))
+* remove abandoned public snapshot staging files after restart ([af5204e](https://github.com/j2h4u/omi-collector/commit/af5204e9d0c4f2105ab3cbb2a531470e4ef01bc6))
+
+
+### Performance
+
+* avoid rewriting unchanged public snapshots while preserving durable retries ([af5204e](https://github.com/j2h4u/omi-collector/commit/af5204e9d0c4f2105ab3cbb2a531470e4ef01bc6))
+
 ## [0.16.0](https://github.com/j2h4u/omi-collector/compare/v0.15.0...v0.16.0) (2026-10-17)
 
 

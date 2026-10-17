@@ -254,6 +254,23 @@ class ObservationWriterPort(Protocol):
     def close(self) -> None: ...
 
 
+class PublicDrainPort(Protocol):
+    """Durable public drain projection; all methods run off the event loop."""
+
+    def publish_snapshot(self) -> None: ...
+
+    def set_wake_callback(self, callback: Callable[[], None] | None) -> None: ...
+
+    def update_observations(
+        self,
+        *,
+        ring: tuple[int, str] | None = None,
+        battery: tuple[int, str] | None = None,
+    ) -> None: ...
+
+    def arm_pending(self, source_id: str, durable_next_sequence: int) -> None: ...
+
+
 @runtime_checkable
 class StagingPort(Protocol):
     """Synchronous local staging operations used by the coordinator."""
@@ -285,7 +302,14 @@ class StagingPort(Protocol):
 
     def inspect_recovery(self) -> tuple[bool, bool]: ...
 
-    def append_ready_closure(self, next_sequence: int, reason: str) -> object: ...
+    def append_ready_closure(
+        self,
+        next_sequence: int,
+        reason: str,
+        *,
+        verified_drain: tuple[RingInfo, str] | None = None,
+        completed_at: str | None = None,
+    ) -> object: ...
 
     def begin_ready_visit(self) -> object | None: ...
 
@@ -295,10 +319,23 @@ class StagingPort(Protocol):
         self, attempt_id: str, start_sequence: int, end_sequence: int, occurred_at: str
     ) -> str: ...
 
-    def close_orphaned_drafts(self, reason: str, *, drain_cursor: int | None = None) -> object | None: ...
+    def close_orphaned_drafts(
+        self,
+        reason: str,
+        *,
+        drain_cursor: int | None = None,
+        verified_drain: tuple[RingInfo, str] | None = None,
+        completed_at: str | None = None,
+    ) -> object | None: ...
 
     def close_pending_prefix(
-        self, reason: str, *, include_unpublished: bool = True, drain_cursor: int | None = None
+        self,
+        reason: str,
+        *,
+        include_unpublished: bool = True,
+        drain_cursor: int | None = None,
+        verified_drain: tuple[RingInfo, str] | None = None,
+        completed_at: str | None = None,
     ) -> object | None: ...
 
     def pending_attempts(self) -> tuple[AttemptDescriptorShape, ...]: ...

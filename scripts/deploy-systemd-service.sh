@@ -521,6 +521,7 @@ function provision_operator_data_access {
     local legacy_directory
     local -a directories=(
         "${storage_root}/collector"
+        "${storage_root}/collector/public"
         "${storage_root}/ready"
     )
 
@@ -534,8 +535,10 @@ function provision_operator_data_access {
         fi
     done
     for directory in "${directories[@]}"; do
-        # assert: never change a symlinked data root
+        # assert: reject every unsafe root before changing any of them
         [[ ! -L "$directory" ]] || die "Collector data root must not be a symlink: ${directory}"
+    done
+    for directory in "${directories[@]}"; do
         install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory" \
             || die "could not provision Collector data root: ${directory}"
         [[ $(stat -c '%U:%G:%a' -- "$directory") == "${account_user}:${operator_group}:2750" ]] \

@@ -7,6 +7,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
+from functools import partial
 from logging import getLogger
 from pathlib import Path
 from threading import Event, Lock
@@ -42,10 +43,11 @@ from ..domain.ready_machine import (
     publication_transition,
     recovered_closure,
 )
+from ..domain.ring_protocol import RingInfo
 from . import quarantine, ready_closures
 from .attempts import SqliteAttemptInspection, SqliteStagedAttempt
 from .clock_segments import ClockSegmentError, ClockSegmentMap
-from .collector_state_db import StateDB, StateDBError, StateKind, raise_if_sqlite_storage_fault
+from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction, raise_if_sqlite_storage_fault
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
 from .debug_logging import debug_event, debug_exception
 from .internal_audio_store import (
@@ -58,12 +60,14 @@ from .internal_audio_store import (
     read_capture_source,
     refresh_utc_projection,
 )
+from .public_drain import PublicDrainProjection
 from .ready_bundles import (
     ReadyBundleError,
     ReadyCustodyCache,
     ReadyOutcome,
     ReadyOutcomeState,
     SqlitePublicationSource,
+    _typed_source_admissions,
     acknowledged_ready,
     finalize_typed_sources,
     resume_retired,
@@ -153,6 +157,7 @@ class StagingStore:
     ) -> None:
         self._config = io.config
         self._state_db = state_db
+        self._public_drain = PublicDrainProjection(state_db, state_db.path.parent / "public" / "pendant-drain.json")
         self._filesystem = StagingFilesystem(
             spool,
             capture_root,
@@ -178,6 +183,7 @@ class StagingStore:
         store = cls.__new__(cls)
         store._config = io.config
         store._state_db = state_db
+        store._public_drain = PublicDrainProjection(state_db, state_db.path.parent / "public" / "pendant-drain.json")
         store._filesystem = StagingFilesystem.from_paths(paths, state_db=state_db, io=io)
         store._publication_root = publication_root
         store._publication_lock = Lock()
@@ -185,6 +191,11 @@ class StagingStore:
         store._ready_custody_cache = None
         store._compaction_interrupt = Event()
         return store
+
+    @property
+    def public_drain(self) -> PublicDrainProjection:
+        """Expose the private drain recorder to the coordinator composition."""
+        return self._public_drain
 
     def publish_ready(self, held_lease: DeviceLock | None = None) -> ReadyOutcome:
         """Publish a complete normalized view when this store has an external boundary."""
@@ -482,10 +493,19 @@ class StagingStore:
             unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
             return recoverable_prefix, unclosed_drafts
 
-    def append_ready_closure(self, next_sequence: int, reason: str) -> ready_closures.ReadyClosure:
+    def append_ready_closure(
+        self,
+        next_sequence: int,
+        reason: str,
+        *,
+        verified_drain: tuple[RingInfo, str] | None = None,
+        completed_at: str | None = None,
+    ) -> ready_closures.ReadyClosure:
         """Durably close one physical visit before allowing ready publication."""
         with self.device_lock(operation="ready_closure") as lease:
-            return self._append_ready_closure_unlocked(lease, next_sequence, reason)
+            return self._append_ready_closure_unlocked(
+                lease, next_sequence, reason, verified_drain=verified_drain, completed_at=completed_at
+            )
 
     def begin_ready_visit(self) -> ready_closures.ReadyClosure | None:
         """Fence an older drain permit before a new physical visit can run."""
@@ -501,12 +521,20 @@ class StagingStore:
             return ready_closures.begin_visit(self._state_db)
 
     def close_orphaned_drafts(
-        self, reason: str, *, drain_cursor: int | None = None
+        self,
+        reason: str,
+        *,
+        drain_cursor: int | None = None,
+        verified_drain: tuple[RingInfo, str] | None = None,
+        completed_at: str | None = None,
     ) -> ready_closures.ReadyClosure | None:
         """Create a restart closure for authenticated drafts without a pending attempt."""
         with self.device_lock(operation="close_orphaned_drafts") as lease:
             frontier = self._cached_draft_frontier()
-            return self._merge_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
+            drain_completion = (
+                (verified_drain, completed_at) if verified_drain is not None and completed_at is not None else None
+            )
+            return self._merge_recovered_closure_unlocked(lease, frontier, reason, drain_cursor, drain_completion)
 
     def _cached_draft_frontier(self) -> int | None:
         try:
@@ -529,7 +557,13 @@ class StagingStore:
         return max((int.from_bytes(cast(bytes, row[0]), "big") + cast(int, row[1]) for row in rows), default=None)
 
     def close_pending_prefix(
-        self, reason: str, *, include_unpublished: bool = True, drain_cursor: int | None = None
+        self,
+        reason: str,
+        *,
+        include_unpublished: bool = True,
+        drain_cursor: int | None = None,
+        verified_drain: tuple[RingInfo, str] | None = None,
+        completed_at: str | None = None,
     ) -> ready_closures.ReadyClosure | None:
         """Seal the durable SQL prefix and append its recovered closure."""
         with self.device_lock(operation="close_pending_prefix") as lease:
@@ -554,8 +588,12 @@ class StagingStore:
             if sources:
                 self.publication_input_changed()
             if decision is None:
+                if existing is not None:
+                    self._complete_recovered_drain_unlocked(existing, verified_drain, completed_at)
                 return existing
-            return self._append_ready_closure_unlocked(lease, *decision)
+            return self._append_ready_closure_unlocked(
+                lease, *decision, verified_drain=verified_drain, completed_at=completed_at
+            )
 
     def _validate_recovery_cursor_unlocked(self, lease: DeviceLock, reason: str, drain_cursor: int | None) -> None:
         self._filesystem.require_device_lock(lease)
@@ -591,21 +629,93 @@ class StagingStore:
         return decision, existing
 
     def _merge_recovered_closure_unlocked(
-        self, lease: DeviceLock, frontier: int | None, reason: str, drain_cursor: int | None
+        self,
+        lease: DeviceLock,
+        frontier: int | None,
+        reason: str,
+        drain_cursor: int | None,
+        drain_completion: tuple[tuple[RingInfo, str], str] | None,
     ) -> ready_closures.ReadyClosure | None:
+        verified_drain = None if drain_completion is None else drain_completion[0]
+        completed_at = None if drain_completion is None else drain_completion[1]
         decision, existing = self._decide_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
         if decision is None:
+            if existing is not None:
+                self._complete_recovered_drain_unlocked(existing, verified_drain, completed_at)
             return existing if frontier is not None else None
         next_sequence, closure_reason = decision
-        return self._append_ready_closure_unlocked(lease, next_sequence, closure_reason)
+        return self._append_ready_closure_unlocked(
+            lease,
+            next_sequence,
+            closure_reason,
+            verified_drain=verified_drain,
+            completed_at=completed_at,
+        )
 
     def _append_ready_closure_unlocked(
-        self, lease: DeviceLock, next_sequence: int, reason: str
+        self,
+        lease: DeviceLock,
+        next_sequence: int,
+        reason: str,
+        *,
+        verified_drain: tuple[RingInfo, str] | None = None,
+        completed_at: str | None = None,
     ) -> ready_closures.ReadyClosure:
         self._filesystem.require_device_lock(lease)
-        closure = ready_closures.append(self._state_db, next_sequence, reason)
+        callback: Callable[[StateTransaction], None] | None = None
+        if reason == "drained" and verified_drain is not None and completed_at is not None:
+            callback = partial(
+                self._public_drain.complete_in_transaction,
+                verified_drain=verified_drain,
+                completed_at=completed_at,
+                closure_frontier=next_sequence,
+                accepted_custody=self._accepted_drain_binding(next_sequence),
+            )
+        closure = ready_closures.append(self._state_db, next_sequence, reason, on_commit=callback)
+        self._public_drain.wake()
         self._publication_event(InputChanged())
         return closure
+
+    def _complete_recovered_drain_unlocked(
+        self,
+        closure: ready_closures.ReadyClosure,
+        verified_drain: tuple[RingInfo, str] | None,
+        completed_at: str | None,
+    ) -> None:
+        if closure.reason != "drained" or verified_drain is None or completed_at is None:
+            return
+        accepted_custody = self._accepted_drain_binding(closure.next_sequence)
+        with self._state_db.transaction() as transaction:
+            self._public_drain.complete_in_transaction(
+                transaction,
+                verified_drain=verified_drain,
+                completed_at=completed_at,
+                closure_frontier=closure.next_sequence,
+                accepted_custody=accepted_custody,
+            )
+        self._public_drain.wake()
+
+    def _accepted_drain_binding(self, closure_frontier: int) -> tuple[str, int] | None:
+        binding = self._public_drain.pending_binding()
+        if binding is None:
+            return None
+        source_id, durable_frontier = binding
+        try:
+            with InternalAudioStore(
+                self._state_db,
+                chunk_limit=self._config.writer.chunk_records,
+            ) as audio_store:
+                reader = SqlitePublicationSource(audio_store, source_id)
+                admissions = _typed_source_admissions(audio_store, (reader,), closure_frontier)
+        except InternalAudioStoreError, ReadyBundleError, StateDBError:
+            return None
+        if len(admissions) != 1:
+            return None
+        admitted = admissions[0]
+        admitted_frontier = admitted.snapshot.sequence_start + admitted.admitted_count
+        if admitted.snapshot.source_id != source_id or admitted_frontier != durable_frontier:
+            return None
+        return source_id, admitted_frontier
 
     def _typed_publication_source_ids(self) -> tuple[str, ...]:
         """List SQL sources that the canonical publisher can admit or resume."""

@@ -503,6 +503,25 @@ def test_battery_observation_reports_exact_percent_without_clock_access(payload:
     assert session.writes == []
 
 
+def test_battery_callback_receives_only_validated_sample() -> None:
+    samples: list[int] = []
+
+    async def read(payload: bytes) -> None:
+        session = FakeOperationalSession({BATTERY_UUID: payload})
+        await collect_battery_observation(
+            session,
+            _info(),
+            _event_emitter([]),
+            operation_timeout=0.1,
+            observe_battery=samples.append,
+        )
+
+    asyncio.run(read(b"\x2a"))
+    asyncio.run(read(b"\x65"))
+
+    assert samples == [42]
+
+
 @pytest.mark.parametrize("payload", [b"\x65", b"", b"\x01\x02"])
 def test_battery_observation_classifies_invalid_payload_without_value(payload: bytes) -> None:
     session = FakeOperationalSession({BATTERY_UUID: payload})

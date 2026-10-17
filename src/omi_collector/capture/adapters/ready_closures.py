@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import pairwise
 from json import JSONDecodeError, loads
 from pathlib import Path
 from typing import cast
 
-from .collector_state_db import StateDB, StateDBError, StateKind
+from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction
 
 
 class ReadyClosureError(ValueError):
@@ -73,6 +74,14 @@ def load(db: StateDB) -> tuple[ReadyClosure, ...]:
         value = db.get(StateKind.READY_CLOSURE, "current")
     except (OSError, ValueError, StateDBError) as error:
         raise ReadyClosureError("ready closure queue is unreadable") from error
+    return _parse_document(value)
+
+
+def _load(transaction: StateTransaction) -> tuple[ReadyClosure, ...]:
+    return _parse_document(transaction.get(StateKind.READY_CLOSURE, "current"))
+
+
+def _parse_document(value: dict[str, object] | None) -> tuple[ReadyClosure, ...]:
     if value is None:
         return ()
     if not isinstance(value, dict) or set(value) != _FIELDS or value.get("version") != _VERSION:
@@ -86,19 +95,32 @@ def load(db: StateDB) -> tuple[ReadyClosure, ...]:
     return closures
 
 
-def append(db: StateDB, next_sequence: int, reason: str) -> ReadyClosure:
+def append(
+    db: StateDB,
+    next_sequence: int,
+    reason: str,
+    *,
+    on_commit: Callable[[StateTransaction], None] | None = None,
+) -> ReadyClosure:
     """Keep only the newest durable watermark, upgrading an equal drain."""
     closure = _make_closure(next_sequence, reason)
-    closures = load(db)
-    if closures and next_sequence < closures[-1].next_sequence:
-        raise ReadyClosureError("ready closure frontier regressed")
-    if closures and closures[-1].next_sequence == next_sequence:
-        previous = closures[-1]
-        if previous.reason == "drained" or reason != "drained":
-            closure = previous
-        if closures == (closure,):
-            return closure
-    _write(db, (closure,))
+    try:
+        with db.transaction() as transaction:
+            closures = _load(transaction)
+            if closures and next_sequence < closures[-1].next_sequence:
+                raise ReadyClosureError("ready closure frontier regressed")
+            if closures and closures[-1].next_sequence == next_sequence:
+                previous = closures[-1]
+                if previous.reason == "drained" or reason != "drained":
+                    closure = previous
+            if closures != (closure,):
+                _put(transaction, (closure,))
+            if on_commit is not None:
+                on_commit(transaction)
+    except (OSError, ValueError, StateDBError) as error:
+        if isinstance(error, ReadyClosureError):
+            raise
+        raise ReadyClosureError("ready closure queue could not be written") from error
     return closure
 
 
@@ -147,12 +169,19 @@ def _make_closure(next_sequence: object, reason: object) -> ReadyClosure:
 
 
 def _write(db: StateDB, closures: tuple[ReadyClosure, ...]) -> None:
-    value = {
-        "closures": [{"next_sequence": item.next_sequence, "reason": item.reason} for item in closures],
-        "version": _VERSION,
-    }
     try:
         with db.transaction() as transaction:
-            transaction.put(StateKind.READY_CLOSURE, "current", value)
+            _put(transaction, closures)
     except (OSError, ValueError, StateDBError) as error:
         raise ReadyClosureError("ready closure queue could not be written") from error
+
+
+def _put(transaction: StateTransaction, closures: tuple[ReadyClosure, ...]) -> None:
+    transaction.put(
+        StateKind.READY_CLOSURE,
+        "current",
+        {
+            "closures": [{"next_sequence": item.next_sequence, "reason": item.reason} for item in closures],
+            "version": _VERSION,
+        },
+    )

@@ -78,6 +78,7 @@ class TelemetryClock:
     session_id: str = "native"
     mutation_lease: ClockMutationLease | None = None
     stop_intent: StopIntent | None = None
+    battery_observer: Callable[[int], object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +179,7 @@ async def collect_operational_telemetry(
         telemetry_clock.operation_timeout,
         sample=sample,
         stop_intent=telemetry_clock.stop_intent,
+        observe_battery=telemetry_clock.battery_observer,
     )
     # The journal is a projection, not the clock-recovery authority.  Keep a
     # slow or failed emitter from suppressing the durable clock decision.
@@ -193,19 +195,20 @@ def _validate_telemetry_clock(clock: TelemetryClock) -> None:
         raise ValueError("host clock probe timeout must be positive")
 
 
-async def collect_battery_observation(
+async def collect_battery_observation(  # noqa: PLR0913 - inputs preserve the optional GATT seam
     session: object,
     info: RingInfo,
     emit: OperationalEmitter,
     *,
     operation_timeout: float,
     stop_intent: StopIntent | None = None,
+    observe_battery: Callable[[int], object] | None = None,
 ) -> None:
     """Emit one bounded battery refresh without repeating connection telemetry."""
     if operation_timeout <= 0:
         raise ValueError("optional operation timeout must be positive")
     reader, _ = _optional_accessors(session)
-    battery, outcome = await _read_battery(reader, operation_timeout, stop_intent)
+    battery, outcome = await _read_battery(reader, operation_timeout, stop_intent, observe_battery=observe_battery)
     observation: dict[str, object] = {
         "event": "pendant_observation",
         "read_sequence": info.read_sequence,
@@ -230,6 +233,7 @@ async def _build_observation(  # noqa: PLR0913, PLR0917 - operation inputs mirro
     *,
     sample: _TimeSample | None = None,
     stop_intent: StopIntent | None = None,
+    observe_battery: Callable[[int], object] | None = None,
 ) -> tuple[dict[str, object], _TimeSample]:
     observation: dict[str, object] = {"event": "pendant_observation"}
     if status is not None:
@@ -247,7 +251,9 @@ async def _build_observation(  # noqa: PLR0913, PLR0917 - operation inputs mirro
         packet_size=info.packet_size,
     )
     outcomes: dict[str, str] = {}
-    battery, outcomes["battery"] = await _read_battery(reader, operation_timeout, stop_intent)
+    battery, outcomes["battery"] = await _read_battery(
+        reader, operation_timeout, stop_intent, observe_battery=observe_battery
+    )
     if battery is not None:
         observation["battery_percent"] = battery
     for name, uuid in (
@@ -635,7 +641,11 @@ def _optional_accessors(session: object) -> tuple[OptionalReader | None, Optiona
 
 
 async def _read_battery(
-    reader: OptionalReader | None, operation_timeout: float, stop_intent: StopIntent | None = None
+    reader: OptionalReader | None,
+    operation_timeout: float,
+    stop_intent: StopIntent | None = None,
+    *,
+    observe_battery: Callable[[int], object] | None = None,
 ) -> tuple[int | None, str]:
     if reader is None:
         return None, "unsupported"
@@ -651,6 +661,8 @@ async def _read_battery(
         return None, "missing"
     if len(raw) != 1 or not 0 <= raw[0] <= BATTERY_MAX_PERCENT:
         return None, "malformed"
+    if observe_battery is not None:
+        observe_battery(raw[0])
     return raw[0], "ok"
 
 

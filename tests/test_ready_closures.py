@@ -10,7 +10,7 @@ from struct import pack
 import pytest
 
 from omi_collector.capture.adapters.attempts import SqliteStagedAttempt
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind, StateTransaction
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_closures import (
     ReadyClosure,
@@ -23,7 +23,7 @@ from omi_collector.capture.adapters.ready_closures import (
     remove,
 )
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification, RingInfo
 from omi_collector.config import CollectorConfig, ReadyConfig
 from staging_test_factory import StagingStore, attempt_source, closure_rows
 
@@ -62,6 +62,53 @@ def test_closures_coalesce_to_latest_watermark_and_keep_equal_drain(tmp_path: Pa
     remove(path, drained)
     assert load(path) == ()
     assert path.get(StateKind.READY_CLOSURE, "current") == {"version": 1, "closures": []}
+
+
+def test_equal_closure_callback_commits_in_same_transaction(tmp_path: Path) -> None:
+    db = _state_db(tmp_path / "ready-closures.json")
+    closure = append(db, 10, "drained")
+    callback_transactions: list[StateTransaction] = []
+
+    def record(transaction: StateTransaction) -> None:
+        callback_transactions.append(transaction)
+        transaction.put(StateKind.PENDANT_DRAIN, "current", {"marker": "closure"})
+
+    assert append(db, 10, "drained", on_commit=record) == closure
+    assert len(callback_transactions) == 1
+    assert db.get(StateKind.PENDANT_DRAIN, "current") == {"marker": "closure"}
+
+
+def test_staging_emits_only_verified_armed_drain_and_keeps_repeat_identity(tmp_path: Path) -> None:
+    store = StagingStore(tmp_path / "spool", tmp_path / "capture")
+    store.append_ready_closure(10, "drained")
+    assert store.state_db.get(StateKind.PENDANT_DRAIN, "current") is None
+
+    writer = store.make_staging_writer(10, 1)
+    writer.prepare()
+    writer.prepare_leg(10, 1)
+    writer.read_begin(ReadBeginNotification(10, 1))
+    writer.append_chunk(0, memoryview(_record(10)))
+    writer.seal(DoneNotification(0, 11))
+    source_id = writer.attempt_id
+    writer.close()
+    store.public_drain.arm_pending(source_id, 11)
+    info = RingInfo(11, 11, 100, 0, RECORD_SIZE)
+    store.append_ready_closure(
+        11, "drained", verified_drain=(info, "2026-10-17T12:00:00+00:00"), completed_at="2026-10-17T12:01:00+00:00"
+    )
+    state = store.state_db.get(StateKind.PENDANT_DRAIN, "current")
+    assert state is not None
+    first = state["last_drain"]
+    assert state["pending_event_id"] is None
+    assert isinstance(first, dict)
+    first_event = first["event_id"]
+    assert first == {"event_id": first_event, "completed_at": "2026-10-17T12:01:00+00:00"}
+
+    store.append_ready_closure(
+        11, "drained", verified_drain=(info, "2026-10-17T12:02:00+00:00"), completed_at="2026-10-17T12:03:00+00:00"
+    )
+    repeated = store.state_db.get(StateKind.PENDANT_DRAIN, "current")
+    assert repeated is not None and repeated["last_drain"] == first
 
 
 def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: Path) -> None:

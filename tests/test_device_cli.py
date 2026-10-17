@@ -90,7 +90,9 @@ def _capture_root(tmp_path: Path) -> Path:
 
 
 def _store(tmp_path: Path) -> StagingStore:
-    return StagingStore(tmp_path, _capture_root(tmp_path))
+    store = StagingStore(tmp_path, _capture_root(tmp_path))
+    store.public_drain.path.parent.mkdir(parents=True, exist_ok=True)
+    return store
 
 
 def _layout(tmp_path: Path) -> Path:
@@ -102,6 +104,7 @@ def _layout(tmp_path: Path) -> Path:
     layout = load_operator_config(path).storage
     if not layout.collector.state_db.exists():
         StateDB(layout.collector.state_db)
+    (layout.collector.root / "public").mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -650,6 +653,7 @@ def test_sync_reconnects_with_overlap_and_enters_one_outer_guard(
             WriteStep(b"\x10", (_info_notification(11, 12),)),
             WriteStep(encode_advance_command(12), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info_notification(12, 12),)),
+            WriteStep(b"\x10", (_info_notification(12, 12),)),
         ),
     )
     sessions = [first, second]
@@ -884,7 +888,10 @@ def test_sync_retries_pendant_absence_with_a_fresh_transport(monkeypatch: pytest
 
     recovered = ScriptedRingSession(
         RingStatus(0, 0, 0, 1),
-        (WriteStep(b"\x10", (_info_notification(10, 10),)),),
+        (
+            WriteStep(b"\x10", (_info_notification(10, 10),)),
+            WriteStep(b"\x10", (_info_notification(10, 10),)),
+        ),
     )
     transports: list[TransportContext] = [UnavailableTransport(), FakeTransport("AA:BB", recovered, [])]
     calls: list[str] = []
@@ -1071,7 +1078,13 @@ def test_collect_no_data_result_is_safe_json(monkeypatch: pytest.MonkeyPatch, tm
         "unread_packets": 0,
         "write_sequence": 10,
     }
-    assert session.writes == [b"\x10"]
+    assert session.writes == [b"\x10", b"\x10"]
+    projection = cast(
+        dict[str, object],
+        json.loads((tmp_path / "collector/public/pendant-drain.json").read_text(encoding="utf-8")),
+    )
+    assert set(projection) == {"version", "ring", "last_drain", "battery"}
+    assert projection["last_drain"] is None
 
 
 def test_collect_cli_wires_bounded_policy_and_provider(

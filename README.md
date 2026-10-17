@@ -209,6 +209,29 @@ manifests, file types, and exact file sizes without opening audio payloads.
 Publication, reuse, and retirement verify payload hashes automatically at
 their custody boundaries.
 
+For a notification consumer, Collector publishes the small atomic snapshot
+`collector/public/pendant-drain.json` beside the private state database. Mount
+only `collector/public` read-only; the consumer does not need SQLite, READY,
+or service-control access. The version-1 document has exactly four fields:
+
+```json
+{
+  "version": 1,
+  "ring": {"observed_at": "2026-10-17T12:00:00+00:00", "unread_packets": 0},
+  "last_drain": {"event_id": "example-stable-id", "completed_at": "2026-10-17T12:00:00+00:00"},
+  "battery": {"percent": 85, "observed_at": "2026-10-17T11:59:59+00:00"}
+}
+```
+
+`ring`, `last_drain`, and `battery` may each be `null` when unknown.
+Observation timestamps are when
+the device was read, not when the JSON was generated. `last_drain` records a
+confirmed empty ring after durable host storage; its ID survives restarts and
+republication. It remains the last completed event when later audio arrives,
+while `ring` reports the newer backlog. Deduplicate notifications by event ID
+and assess freshness using the actual observation time. Files use mode `0640`
+inside a setgid `2750` directory owned by the service and operator read group.
+
 For subsequent updates, select the reviewed revision in the production
 checkout and run:
 
@@ -220,8 +243,10 @@ The deployment command validates the operator configuration, builds a
 versioned root-owned environment under `/var/lib/omi-collector-deployments`,
 writes its source revision into the release, atomically selects it, and
 starts the service. It
-requires both application readiness and a stable process. If either check
-fails, it restores the previous selected environment and service. Known
+requires both application readiness and a stable process. Before selecting a
+new release, recovery may restart a compatible previous release. After a new
+release is selected, failed verification stops the service for forward
+recovery. Known
 obsolete release directories are pruned only after a successful deployment.
 
 ### Maintainer Dev Script

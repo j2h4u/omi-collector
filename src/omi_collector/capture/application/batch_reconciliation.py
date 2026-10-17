@@ -167,7 +167,13 @@ class BatchReconciler:
         if pending is not None and durable_next is not None and durable_next > pending.start_sequence:
             self._state.visit_frontier = max(self._state.visit_frontier or durable_next, durable_next)
 
-    async def close_visit(self, reason: str, drain_cursor: int | None = None) -> None:
+    async def close_visit(
+        self,
+        reason: str,
+        drain_cursor: int | None = None,
+        *,
+        verified_drain: tuple[RingInfo, str] | None = None,
+    ) -> None:
         """Close the physical visit and enqueue its durable publication frontier."""
         if reason == "drained":
             if type(drain_cursor) is not int or drain_cursor < 0:
@@ -184,8 +190,20 @@ class BatchReconciler:
                 reason,
                 include_unpublished=reason != "restart_interrupted",
                 drain_cursor=drain_cursor,
+                verified_drain=verified_drain,
+                completed_at=utc_timestamp(await joined_to_thread(self._run.options.host_time))
+                if verified_drain is not None
+                else None,
             )
-            await joined_to_thread(self._run.staging.close_orphaned_drafts, reason, drain_cursor=drain_cursor)
+            await joined_to_thread(
+                self._run.staging.close_orphaned_drafts,
+                reason,
+                drain_cursor=drain_cursor,
+                verified_drain=verified_drain,
+                completed_at=utc_timestamp(await joined_to_thread(self._run.options.host_time))
+                if verified_drain is not None
+                else None,
+            )
             self._state.pending_descriptor = None
             self._state.pending_durable_next = None
             self._state.visit_frontier = None
@@ -207,7 +225,15 @@ class BatchReconciler:
             return
         if reason == "drained" and drain_cursor is not None and drain_cursor < frontier:
             raise RuntimeError("confirmed drain cursor does not cover the live batch frontier")
-        await joined_to_thread(self._run.staging.append_ready_closure, frontier, reason)
+        await joined_to_thread(
+            self._run.staging.append_ready_closure,
+            frontier,
+            reason,
+            verified_drain=verified_drain,
+            completed_at=utc_timestamp(await joined_to_thread(self._run.options.host_time))
+            if verified_drain is not None
+            else None,
+        )
         self._state.visit_frontier = None
 
     async def connected_step(
@@ -395,7 +421,11 @@ def _batch_bounds(
 
 
 async def _admit_batch(  # noqa: C901 - admission and writer cleanup preserve ordering invariants
-    current: RingInfo, run: _Run, start: int, end: int, durable_next: int | None
+    current: RingInfo,
+    run: _Run,
+    start: int,
+    end: int,
+    durable_next: int | None,
 ) -> _Batch:
     arena_start = current.read_sequence
     if durable_next is not None and current.read_sequence <= durable_next:
@@ -461,6 +491,9 @@ async def _read_and_seal(
         raise CursorConsistencyError("writer checkpoint did not return a durable prefix")
     if prefix.next_sequence != batch.end:
         raise CursorConsistencyError("READ did not produce the bounded batch prefix")
+    public_drain = run.options.public_drain
+    if public_drain is not None and prefix.next_sequence == batch.end:
+        await joined_to_thread(public_drain.arm_pending, batch.writer.attempt_id, batch.end)
     seal_precondition = _batch_milestone(batch)
     batch_machine.transition(seal_precondition, batch_machine.Event.SEAL_REQUEST)
     await _report_activity(run.options.activity, "sealing")

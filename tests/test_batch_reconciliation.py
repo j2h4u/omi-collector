@@ -17,6 +17,7 @@ import pytest
 from fakes import DelayedNotification, ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.attempt_writer import WriterError, WriterFailedError
 from omi_collector.capture.adapters.attempts import DurableSqliteSeal
+from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, read_confirmed_losses
 from omi_collector.capture.adapters.internal_audio_store import CaptureSource
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime

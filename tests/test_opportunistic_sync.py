@@ -1605,14 +1605,14 @@ async def test_recovered_confirmed_loss_completes_public_drain_token(tmp_path: P
         ),
     )
 
-    class StopAfterAway(Exception):
+    class StopAfterAwayError(Exception):
         pass
 
     def stop_after_away(event: ActivityEvent) -> None:
         if event.state == "away":
-            raise StopAfterAway
+            raise StopAfterAwayError
 
-    with pytest.raises(StopAfterAway):
+    with pytest.raises(StopAfterAwayError):
         await asyncio.wait_for(
             run_opportunistic_collector(
                 Provider([first]),

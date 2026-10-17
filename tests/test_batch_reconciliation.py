@@ -192,7 +192,9 @@ async def test_cursor_ahead_with_metrics_disabled_has_no_metrics_error_event(tmp
 
 
 @_async_test
-async def test_cursor_ahead_with_zero_durable_prefix_does_not_arm_public_drain(tmp_path: Path) -> None:
+async def test_cursor_ahead_with_zero_durable_prefix_does_not_arm_public_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def seed_empty() -> StagingStore:
         store = StagingStore(tmp_path / "spool", tmp_path / "captures")
         attempt = store.prepare_streaming_attempt(100, 2)
@@ -209,10 +211,12 @@ async def test_cursor_ahead_with_zero_durable_prefix_does_not_arm_public_drain(t
     runtime = _Runtime()
     arm_calls: list[tuple[str, int]] = []
     original_arm = store.public_drain.arm_pending
-    store.public_drain.arm_pending = lambda source_id, frontier: (
-        arm_calls.append((source_id, frontier)),
-        original_arm(source_id, frontier),
-    )
+
+    def record_arm(source_id: str, frontier: int) -> None:
+        arm_calls.append((source_id, frontier))
+        original_arm(source_id, frontier)
+
+    monkeypatch.setattr(store.public_drain, "arm_pending", record_arm)
     reconciler = BatchReconciler(
         store,
         replace(_options(), public_drain=store.public_drain),

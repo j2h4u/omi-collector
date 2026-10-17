@@ -706,6 +706,7 @@ function finalize {
     # vars
     local -i final_status=$? recovery_failed=0
     local selected_target=''
+    local fallback_python=''
     local -i selector_readable=0
 
     # code
@@ -750,11 +751,17 @@ function finalize {
     elif (( selector_readable )) && [[ "$selected_target" == "$previous_target" ]]; then
         selection_published=0
         if (( service_quiesced && initial_service_active )) && [[ -n "$previous_target" ]]; then
-            if systemctl start "$service_name"; then
+            fallback_python="${deployment_root}/${previous_target}/bin/python"
+            if [[ -x "$fallback_python" ]] \
+                && "$fallback_python" -I -B "${script_dir}/check_fallback_ledger_compatibility.py" "$state_file" \
+                && systemctl start "$service_name"; then
                 service_quiesced=0
+            elif [[ ! -x "$fallback_python" ]]; then
+                recovery_failed=1
+                printf 'ERROR: previous deployment interpreter is unavailable; service remains stopped for forward recovery\n' >&2
             else
                 recovery_failed=1
-                printf 'ERROR: could not restart the previous deployment; recovery artifacts were retained\n' >&2
+                printf 'ERROR: previous deployment cannot safely read Collector state or could not restart; service remains stopped for forward recovery\n' >&2
             fi
         fi
     else

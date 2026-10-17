@@ -12,6 +12,7 @@ from bisect import bisect_right
 from collections.abc import Iterator, Mapping
 from contextlib import closing
 from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from itertools import pairwise
@@ -196,6 +197,7 @@ _SHA256_HEX_LENGTH = 64
 _GAP_ENDPOINT_COUNT = 2
 _LEDGER_FIELDS = frozenset({"bundles", "frontier"})
 _LEDGER_ENTRY_FIELDS = frozenset({"records_sha256", "state", "start_sequence", "next_sequence", "draft_raw_sha256"})
+_PUBLICATION_DATE_FIELDS = frozenset({"formed_on_utc", "recorded_on_utc_min", "recorded_on_utc_max"})
 _LEDGER_SOURCE_FIELDS = frozenset({"start_sequence", "next_sequence", "raw_sha256"})
 _WINDMILL_CHECKPOINT_FIELDS = frozenset({"analysis_cursor", "vad_decisions", "open_speech_tail", "acknowledged"})
 _WINDMILL_TAIL_FIELDS = frozenset({"entries", "opened_at", "outputs"})
@@ -441,6 +443,28 @@ def _same_ledger_identity(left: Mapping[str, object], right: Mapping[str, object
     return all(left.get(field) == right.get(field) for field in _LEDGER_ENTRY_FIELDS | {"gaps"})
 
 
+def _valid_publication_dates(entry: Mapping[str, object]) -> bool:
+    if not _PUBLICATION_DATE_FIELDS.intersection(entry):
+        return True
+    if not _PUBLICATION_DATE_FIELDS.issubset(entry):
+        return False
+    formed, lower, upper = (entry[field] for field in ("formed_on_utc", "recorded_on_utc_min", "recorded_on_utc_max"))
+    if not _canonical_utc_date(formed):
+        return False
+    if lower is None or upper is None:
+        return lower is None and upper is None
+    return _canonical_utc_date(lower) and _canonical_utc_date(upper) and cast(str, lower) <= cast(str, upper)
+
+
+def _canonical_utc_date(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
 def resume_retired(ready_root: Path, state_db: StateDB) -> None:
     """Finish already committed retirements before reconciling new publication."""
     _prepare_directory(ready_root)
@@ -512,8 +536,8 @@ def _retire_one(
     if state == "ready":
         source = _read_ready_source(destination)
         _validate_ready_ledger_entry(entry, source)
-        lineage = source_lineage(entry) if "sources" in entry else None
-        retired_entry = _ledger_entry(records_sha256, "retired", source.facts, lineage)
+        retired_entry = dict(entry)
+        retired_entry["state"] = "retired"
         try:
             with state_db.transaction() as transaction:
                 transaction.put(StateKind.READY_PUBLICATION, bundle_id, retired_entry)
@@ -691,14 +715,10 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
     if not _is_sha256(bundle_id) or not _is_sha256(entry.get("records_sha256")):
         return False
     start, end = entry.get("start_sequence"), entry.get("next_sequence")
+    optional = set(entry) - _LEDGER_ENTRY_FIELDS
     if (
-        set(entry)
-        not in (
-            _LEDGER_ENTRY_FIELDS,
-            _LEDGER_ENTRY_FIELDS | {"gaps"},
-            _LEDGER_ENTRY_FIELDS | {"sources"},
-            _LEDGER_ENTRY_FIELDS | {"gaps", "sources"},
-        )
+        not (optional - _PUBLICATION_DATE_FIELDS <= {"gaps", "sources"})
+        or bool(optional & _PUBLICATION_DATE_FIELDS) != _PUBLICATION_DATE_FIELDS.issubset(entry)
         or entry.get("state") not in {"ready", "retired"}
         or not _valid_range(start, end)
         or not _is_sha256(entry.get("draft_raw_sha256"))
@@ -706,7 +726,7 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
         return False
     assert isinstance(start, int) and isinstance(end, int)
     gaps = _parse_ledger_gaps(entry, start, end)
-    if gaps is None:
+    if gaps is None or not _valid_publication_dates(entry):
         return False
     digest = entry["draft_raw_sha256"]
     assert isinstance(digest, str)
@@ -976,6 +996,8 @@ class _TypedGroup:
     facts: _BundleFacts
     ranges: tuple[dict[str, object], ...]
     output_sha256: str
+    recorded_on_utc_min: str | None
+    recorded_on_utc_max: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1790,8 +1812,8 @@ def _make_typed_group(slices: tuple[_TypedSlice, ...], page_limit: int, clock_se
     )
     facts = _BundleFacts(slices[0].start_sequence, slices[-1].next_sequence, count, raw_sha256, gaps)
     ranges = _typed_clear_unrepresentable_ranges(slices, _time_ranges(facts, clock_segments), page_limit)
-    output_digest = _typed_output_digest(slices, ranges, page_limit)
-    return _TypedGroup(slices, facts, ranges, output_digest)
+    output_digest, recorded_min, recorded_max = _typed_output_digest(slices, ranges, page_limit)
+    return _TypedGroup(slices, facts, ranges, output_digest, recorded_min, recorded_max)
 
 
 def _typed_clear_unrepresentable_ranges(
@@ -1829,8 +1851,11 @@ def _typed_raw_digest(slices: tuple[_TypedSlice, ...], page_limit: int) -> str:
 
 def _typed_output_digest(
     slices: tuple[_TypedSlice, ...], ranges: tuple[dict[str, object], ...], page_limit: int
-) -> str:
+) -> tuple[str, str | None, str | None]:
     digest = sha256()
+    lower: int | None = None
+    upper: int | None = None
+    complete = True
     range_index = 0
     next_sequence = cast(int, ranges[0]["next_sequence"])
     for item in slices:
@@ -1839,8 +1864,38 @@ def _typed_output_digest(
             while sequence >= next_sequence:
                 range_index += 1
                 next_sequence = cast(int, ranges[range_index]["next_sequence"])
-            digest.update(_convert_record(record.raw_bytes, ranges[range_index]))
-    return digest.hexdigest()
+            time_range = ranges[range_index]
+            converted = _convert_record(record.raw_bytes, time_range)
+            digest.update(converted)
+            utc = time_range["utc"]
+            if utc is None:
+                complete = False
+                continue
+            assert isinstance(utc, Mapping)
+            timestamp = int.from_bytes(converted[:TIMESTAMP_SIZE], "big")
+            bounds = _utc_record_bounds(timestamp, utc)
+            if bounds is None:
+                complete = False
+                continue
+            lower = bounds[0] if lower is None else min(lower, bounds[0])
+            upper = bounds[1] if upper is None else max(upper, bounds[1])
+    if not complete or lower is None or upper is None:
+        return digest.hexdigest(), None, None
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    try:
+        lower_date = (epoch + timedelta(seconds=lower)).date().isoformat()
+        upper_date = (epoch + timedelta(seconds=upper)).date().isoformat()
+    except OverflowError:
+        lower_date = upper_date = None
+    return digest.hexdigest(), lower_date, upper_date
+
+
+def _utc_record_bounds(timestamp: int, utc: Mapping[str, object]) -> tuple[int, int] | None:
+    uncertainty = _finite_number(utc["uncertainty_seconds"])
+    try:
+        return math.floor(timestamp - uncertainty), math.ceil(timestamp + uncertainty)
+    except OverflowError, ValueError:
+        return None
 
 
 def _typed_cohort_id(
@@ -2784,7 +2839,8 @@ def _typed_group_from_frozen(
     facts = _BundleFacts(slices[0].start_sequence, slices[-1].next_sequence, count, digest.hexdigest(), gaps)
     if ranges[0]["start_sequence"] != facts.start_sequence or ranges[-1]["next_sequence"] != facts.next_sequence:
         raise ReadyBundleError("typed stage time ranges do not cover the group")
-    return _TypedGroup(slices, facts, ranges, _typed_output_digest(slices, ranges, page_limit))
+    output_digest, recorded_min, recorded_max = _typed_output_digest(slices, ranges, page_limit)
+    return _TypedGroup(slices, facts, ranges, output_digest, recorded_min, recorded_max)
 
 
 def _same_typed_stage(left: _TypedStage, right: _TypedStage) -> bool:
@@ -3111,6 +3167,11 @@ def _typed_stage_metadata_bytes(stage: _TypedStage, member_rows: int) -> int:
         stage.group.facts,
         lineage,
     )
+    entry.update(
+        formed_on_utc="2000-01-01",
+        recorded_on_utc_min=stage.group.recorded_on_utc_min,
+        recorded_on_utc_max=stage.group.recorded_on_utc_max,
+    )
     text_bytes = sum(
         len(value.encode())
         for value in (
@@ -3271,6 +3332,14 @@ def _commit_typed_stage(
     existing = cast(dict[str, object], ledger["bundles"]).get(result.bundle_id)
     if existing is not None and (not isinstance(existing, dict) or not _same_ledger_identity(existing, entry)):
         raise ReadyBundleError("typed ready ledger conflicts with its frozen stage")
+    if isinstance(existing, dict):
+        entry = dict(existing)
+    else:
+        entry.update(
+            formed_on_utc=datetime.now(UTC).date().isoformat(),
+            recorded_on_utc_min=stage.group.recorded_on_utc_min,
+            recorded_on_utc_max=stage.group.recorded_on_utc_max,
+        )
     coverage = _typed_coverage_proposals(audio_store, cohort, progress)
     proposal = _FinalCommit(cohort, stage, result, entry, progress, coverage, all_complete, ledger)
     for attempt in range(2):

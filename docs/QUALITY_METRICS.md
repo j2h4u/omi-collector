@@ -89,6 +89,9 @@ totals remain visible in `quality_window` but do not change the top-level
 status by themselves. `publication` reports the currently visible bundle
 inventory. Its `loss_ratio` estimates unproven sequence holes among those
 visible bundles; it is not the fraction of historically confirmed loss.
+For v2 publications, `downloaded_records` and `downloaded_raw_bytes` describe
+physical captured-record custody from the ready publication ledger; they are
+not derived from the encoded `audio.ogg` file size or its packet count.
 `quality_window` reports recent advertisements, transfer sessions, pooled
 bytes per second, outcome counts, termination-class counts, and confirmed-loss
 totals as `confirmed_loss_events`, `confirmed_lost_records`, and

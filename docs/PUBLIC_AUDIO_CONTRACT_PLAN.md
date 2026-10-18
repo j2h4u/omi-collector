@@ -1,8 +1,8 @@
 # Public Audio Contract Plan
 
-Status: **Reviewed; ready for implementation**  
+Status: **Collector implementation complete; coordinated cutover pending**
 Parent: OMIC-49  
-Implementation: not started; runtime unimplemented  
+Implementation: Collector v2 implemented; activation is tracked by OMIC-55
 Premium adversarial review: **GO**
 
 ## Decision
@@ -117,7 +117,11 @@ exact capture instant nor silence duration.
 
 At Prepare, the descriptor freezes each record's public label and uncertainty, causal clock-segment membership, and
 comparability with its predecessor. This includes unknown-clock membership and uncertainty boundaries that current
-clock projection can otherwise drop. A span is maximal only while exact public label, quality, uncertainty, causal
+clock projection can otherwise drop. These facts are frozen through a versioned canonical ClockState snapshot, the
+initial predecessor frontier, and authenticated immutable source slices, rather than a second per-record copy. Prepare
+and resume stream that basis to reproduce the projection and compare its domain-separated digest, exact audio hash,
+and canonical manifest hash. The current clock state never changes an already prepared artifact. A span is maximal
+only while exact public label, quality, uncertainty, causal
 membership, and predecessor comparability all match and no boundary intervenes. A private offset or observation change
 may coalesce only when those public and causal facts remain identical. Equal labels on opposite sides of uncertain
 causality remain separate and carry `time_incomparable`.
@@ -213,7 +217,8 @@ the frozen run flags and source gaps; manifest and proof hashes bind that projec
 
 The hash/run subtotal is `32R` hash bytes plus at most `32R` normalization-run bytes: normally about 7.2% and at worst
 about 14.5% of 444-byte raw records. Capacity and acceptance measurements also include page indices, source lineage,
-physical and packet-projection runs, staging overlap, SQLite pages, WAL/journal growth, and transaction margin. The
+physical runs, the frozen clock basis and projection digest, staging overlap, SQLite pages, WAL/journal growth, and
+transaction margin. No per-record packet-projection table or duplicate raw audio is retained. The
 existing host-space reserve is extended to cover those v2 costs before Prepare; insufficient reserve enters the
 existing storage-blocked path without persisting stage intent. No new option, metric, or physical database ratio is
 needed or promised. Retaining capture rows until all dependent ACKs would delay reclamation and require a
@@ -264,22 +269,24 @@ retire ledger/proof and public bytes. A matching retired `(id, audio_sha256)` is
 active proof; the same retired ID with a stale hash is rejected. Consumer crash tests cover results, tail, checkpoint,
 and ACK.
 
-## Shared Ogg package
+## Isolated Collector muxer
 
-The `audio-primitives` owner will produce a separate versioned `omi-ogg-opus` distribution containing only the
-standard-library muxer API and public result/config types. Collector pins an immutable wheel and hash in `uv.lock`; the
-pipeline wrapper imports the same distribution.
+Collector owns a small standard-library-only Ogg muxer module. It receives Opus packets and writes or hashes an Ogg
+stream; it imports no Collector state, Bluetooth, clock, publication, or pipeline code. An architecture test enforces
+this boundary. The existing v2 adapter fixes the public audio profile and checks the expected result.
 
-The package MUST NOT bring the current `package=false` project, NumPy, HTTPX, or Windmill runtime into Collector. Its
-owner supplies provenance metadata. The simplified downstream test module is neither copied nor equivalence evidence.
+The implementation reuses the vetted muxer source with provenance recorded, but has no build-time or runtime
+relationship with Windmill or the private `audio-primitives` repository. Collector requires no external wheel,
+repository credentials, or shared deployment. This replaces the initial shared-package decision at the operator's
+request; the separately completed package is not a Collector dependency.
 
-Package acceptance includes isolated wheel installation, deterministic retry bytes, packet byte/order round-trip,
-Ogg CRC and page behavior, real ffmpeg/ffprobe decode, granule duration, pinned config behavior, and a pipeline-wrapper
-test proving the profile's serial zero is used rather than deriving a serial from the artifact ID.
+Acceptance includes deterministic retry bytes, packet byte/order round-trip, Ogg CRC and page behavior, real
+ffmpeg/ffprobe decode, granule duration, and the fixed serial-zero profile. Decoder tools are validation tools, not
+runtime dependencies. Downstream chooses its own implementation against the public artifact contract.
 
 ## Durable cutover
 
-One live cutover follows proof, package, Collector v2, and downstream v2 gates. The proof cluster may land first on the
+One live cutover follows private proof, the embedded muxer, Collector v2, and downstream v2 gates. The proof cluster may land first on the
 branch, but is not a separate production activation by default. The old production binary cannot enter the new mode,
 so installation begins with a transition-capable Collector release operating in `legacy_open`, plus a verified v2
 consumer candidate installed but paused. That Collector temporarily supports the legacy writer before activation and
@@ -321,9 +328,9 @@ bytes are never rewritten, old READY is not backfilled, and historical restore i
 |---|---|---|---|
 | OMIC-50 Contract and review | Collector owner; this plan and README link | None | Final premium review returns GO with every finding resolved before implementation. |
 | OMIC-51 Current-format private proof | Collector owner; proof codec/staging, current `records.bin` replay/ACK behavior, and focused tests | OMIC-50 | Current-format proof commit, partial replay, source/capture GC authorization, ACK GC, and extended existing host-space reserve pass. This does not claim the full v2 crash matrix or a separate production activation. |
-| OMIC-52 Shared muxer package | `audio-primitives` owner; narrow package and pipeline wrapper | OMIC-50 | Versioned zero-runtime-dependency wheel, immutable hash, provenance, deterministic retry, serial-zero wrapper, extraction, EOS, and real-decode checks pass. |
-| OMIC-53 Collector v2 writer | Collector owner; v2 writer, manifest, ACK, contract mode, migration, metrics, docs, and tests | OMIC-50, OMIC-51, OMIC-52 | Packet parity, schema, causal timeline, cross-cohort sentinel, zero-packet custody, identity/recovery, ACK race, retired `audio_sha256`, reserve, and the full v2 crash matrix pass. |
-| OMIC-54 Consumer and checkpoint | Dagster/pipeline owner; discovery/parser, VAD input, passport/checkpoint, results/tail crash tests | OMIC-50, OMIC-52 | Reads Ogg directly, validates invariants, proves/reset drained legacy cursor/VAD/tail, preserves result semantics, and emits ACK only after irrevocable release. No Collector edits. |
+| OMIC-52 Initial muxer package experiment | Completed independently; no Collector dependency | OMIC-50 | Isolated wheel and real decode were verified. The operator superseded shared packaging with an embedded, architecturally isolated Collector module under OMIC-53. |
+| OMIC-53 Collector v2 writer | Collector owner; v2 writer, manifest, ACK, contract mode, migration, metrics, docs, and tests | OMIC-50, OMIC-51 | Embedded muxer isolation, packet parity, schema, causal timeline, cross-cohort sentinel, zero-packet custody, identity/recovery, ACK race, retired `audio_sha256`, reserve, and the full v2 crash matrix pass. |
+| OMIC-54 Consumer and checkpoint | Dagster/pipeline owner; discovery/parser, VAD input, passport/checkpoint, results/tail crash tests | OMIC-50 | Reads Ogg directly, validates invariants, proves/reset drained legacy cursor/VAD/tail, preserves result semantics, and emits ACK only after irrevocable release. No Collector edits. |
 | OMIC-55 Joint cutover and removal | Collector owner plus Dagster operator | OMIC-53, OMIC-54 | Transition release, quiesce/checkpoint migration, real v2 publish/process/ACK/GC, and subthreshold survival succeed before legacy removal; both repositories pass release gates. |
 
 Tests belong to the behavior-changing ticket; there is no QA-only ticket. Dagster runtime and pipeline code remain
@@ -337,7 +344,7 @@ outside Collector ownership and require the explicit OMIC-54 handoff.
 - `tests/test_ready_conflict_quarantine.py`, `tests/test_staging_attempts.py`,
   `tests/test_staging_publication.py`, and `tests/test_staging_recovery.py`:
   current overlap, conflict, schema, and restart expectations.
-- `audio-primitives/.../ogg_opus.py`: real standard-library muxer in a currently non-installable project.
+- `audio-primitives/.../ogg_opus.py`: vetted source provenance for the embedded standard-library muxer; not a dependency.
 - `tests/test_ready_bundles.py`: current mismatch behavior expects three feed groups rather than publication failure.
 - `tests/test_ready_sql_publication.py`: equal clock mappings separated by uncertain causality stay distinct.
 - `ready_bundles.py`: the existing pre-stage host-space check accounts for output, SQLite growth, journal, and headroom.

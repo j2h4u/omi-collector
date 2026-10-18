@@ -456,7 +456,9 @@ function check_candidate_collector_state {
         case "$output" in
             '{"schema_version":null,"status":"state_compatible"}'|\
             '{"schema_version":0,"status":"state_compatible"}'|\
-            '{"schema_version":3,"status":"state_compatible"}')
+            '{"schema_version":2,"status":"state_compatible"}'|\
+            '{"schema_version":3,"status":"state_compatible"}'|\
+            '{"schema_version":4,"status":"state_compatible"}')
                 printf -v "$output_name" '%s' 'compatible'
                 return ;;
             *) die 'candidate returned an unexpected Collector state check record' ;;

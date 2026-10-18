@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from omi_collector.capture.domain.opus_duration import count_20ms_packets
+from omi_collector.capture.domain.opus_duration import count_20ms_packets, inspect_20ms_record, inspect_mono_20ms_record
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 
 
@@ -20,6 +20,35 @@ def test_counts_actual_valid_20ms_packets_including_multiframe_opus() -> None:
     assert count_20ms_packets(_record(two_10ms_frames)) == 1
     assert count_20ms_packets(_record(two_10ms_vbr_frames)) == 1
     assert count_20ms_packets(bytes(4) + bytes(RECORD_SIZE - 4)) == 0
+
+
+def test_inspection_exposes_complete_packets_and_keeps_overflow_as_a_sentinel() -> None:
+    record = bytearray(_record(bytes((8, 0x55))))
+    record[4 + 3] = 0
+    layout = inspect_20ms_record(bytes(record))
+
+    assert layout.packets == (bytes((8, 0x55)),)
+    assert layout.packet_count == 1
+    assert layout.overflow_size is None
+
+
+def test_mono_inspection_rejects_stereo_without_changing_legacy_inspection() -> None:
+    stereo = _record(bytes((0x0C, 0x55)))
+
+    assert inspect_20ms_record(stereo).packet_count == 1
+    with pytest.raises(ValueError, match="20 ms"):
+        inspect_mono_20ms_record(stereo)
+
+
+def test_mono_inspection_ignores_terminal_overflow_sentinel() -> None:
+    record = bytearray(RECORD_SIZE)
+    record[4 + 437 : 4 + 440] = bytes((2, 8, 0xA5))
+
+    layout = inspect_mono_20ms_record(bytes(record))
+
+    assert layout.packets == ()
+    assert layout.packet_count == 0
+    assert layout.overflow_size == 2
 
 
 def test_rejects_malformed_opus_framing_instead_of_guessing_duration() -> None:

@@ -22,6 +22,7 @@ class RecordAudioLayout:
     packet_count: int
     first_size: int
     overflow_size: int | None
+    packets: tuple[bytes, ...] = ()
 
 
 def count_20ms_packets(record: bytes) -> int:
@@ -31,10 +32,20 @@ def count_20ms_packets(record: bytes) -> int:
 
 def inspect_20ms_record(record: bytes) -> RecordAudioLayout:
     """Validate one record and expose its cross-record continuation markers."""
+    return _inspect_record(record, mono=False)
+
+
+def inspect_mono_20ms_record(record: bytes) -> RecordAudioLayout:
+    """Validate one record of complete mono 20 ms Opus packets."""
+    return _inspect_record(record, mono=True)
+
+
+def _inspect_record(record: bytes, *, mono: bool) -> RecordAudioLayout:
     payload = record[4:]
     offset = 0
     count = 0
     overflow_size: int | None = None
+    packets: list[bytes] = []
     while offset < _PAYLOAD_DATA_LIMIT:
         size = payload[offset]
         offset += 1
@@ -46,11 +57,13 @@ def inspect_20ms_record(record: bytes) -> RecordAudioLayout:
                 raise ValueError("invalid Opus packet size")
             overflow_size = size
             break
-        if size > _MAX_PACKET_SIZE or not _is_20ms(payload[offset:end]):
+        packet = payload[offset:end]
+        if size > _MAX_PACKET_SIZE or not _is_20ms(packet) or (mono and packet[0] & 0x04):
             raise ValueError("invalid 20 ms Opus packet")
         count += 1
+        packets.append(packet)
         offset = end
-    return RecordAudioLayout(count, payload[0], overflow_size)
+    return RecordAudioLayout(count, payload[0], overflow_size, tuple(packets))
 
 
 def _is_20ms(packet: bytes) -> bool:

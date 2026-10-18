@@ -61,11 +61,11 @@ def _source(store: InternalAudioStore, *, limit: int = 100, source_id: str = "a"
     return source_id
 
 
-def test_fresh_database_is_v3_and_has_typed_tables(tmp_path: Path) -> None:
+def test_fresh_database_is_v4_and_has_typed_tables(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     StateDB(path)
     connection = sqlite3.connect(path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     table_rows = cast(
         list[tuple[str]],
         cast(object, connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()),
@@ -85,6 +85,8 @@ def test_fresh_database_is_v3_and_has_typed_tables(tmp_path: Path) -> None:
         "ready_stage_range",
         "ready_replay_proof",
         "ready_replay_proof_page",
+        "ready_v2_output_stage",
+        "ready_v2_stage_range",
     }
     connection.close()
 
@@ -133,7 +135,7 @@ def test_state_connections_refuse_symlink_swap(tmp_path: Path) -> None:
     assert path.is_symlink() and path.resolve() == target
 
 
-def test_v3_validation_rejects_unexpected_tables(tmp_path: Path) -> None:
+def test_v4_validation_rejects_unexpected_tables(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     StateDB(path)
     connection = sqlite3.connect(path)

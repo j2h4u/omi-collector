@@ -127,6 +127,64 @@ def test_current_runtime_rejects_unowned_stage_lookalike(tmp_path: Path) -> None
         open_runtime_state(layout)
 
 
+def test_current_runtime_accepts_owned_v2_stage_inventory_and_rejects_unsafe_entries(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    cohort_id, artifact_id = "a" * 64, "b" * 64
+    identity = f"{cohort_id}:0:{artifact_id}"
+    stage_id = sha256(identity.encode()).hexdigest()
+    stage = layout.publication.root / f".{artifact_id}.{stage_id[:16]}.stage"
+    stage.mkdir(parents=True)
+    audio = stage / "audio.ogg"
+    manifest = stage / "manifest.json"
+    audio.write_bytes(b"audio")
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO publication_cohort(cohort_id,lifecycle,cursor) VALUES (?,'staging',0)", (cohort_id,)
+        )
+        connection.execute(
+            "INSERT INTO ready_v2_output_stage(stage_id,group_identity,owned_path,stage_nonce,public_order,"
+            "artifact_id,config_sha256,descriptor,descriptor_sha256,expected_audio_sha256,"
+            "expected_manifest_sha256,expected_physical_count,expected_packet_count,expected_page_count,"
+            "expected_audio_bytes,pending_overflow_size,owner_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                stage_id,
+                identity,
+                str(stage),
+                bytes(32),
+                bytes(8),
+                artifact_id,
+                "c" * 64,
+                b"descriptor",
+                "d" * 64,
+                "e" * 64,
+                "f" * 64,
+                1,
+                1,
+                1,
+                5,
+                None,
+                stage_id,
+            ),
+        )
+        connection.commit()
+
+    assert open_runtime_state(layout, read_only=True).path == db.path
+    manifest.write_bytes(b"manifest")
+    assert open_runtime_state(layout, read_only=True).path == db.path
+
+    foreign = stage / "foreign-marker"
+    foreign.write_bytes(b"foreign")
+    with pytest.raises(InternalAudioCutoverRequiredError, match="unowned ready scratch"):
+        open_runtime_state(layout)
+    foreign.unlink()
+
+    manifest.unlink()
+    manifest.symlink_to(audio)
+    with pytest.raises(InternalAudioCutoverRequiredError, match="unowned ready scratch"):
+        open_runtime_state(layout)
+
+
 def test_historical_migration_payload_is_inert(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)

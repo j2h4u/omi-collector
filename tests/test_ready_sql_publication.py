@@ -298,8 +298,12 @@ def _publish(  # noqa: PLR0913 - the test boundary mirrors the publication contr
 
 def _downgrade_proof_schema_to_v2(database: StateDB) -> None:
     with closing(database.open_connection()) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE ready_v2_stage_range")
+        connection.execute("DROP TABLE ready_v2_output_stage")
         connection.execute("DROP TABLE ready_replay_proof_page")
         connection.execute("DROP TABLE ready_replay_proof")
+        connection.execute("DELETE FROM state WHERE kind IN ('publication_contract','publication_v2_frontier')")
         connection.execute("PRAGMA user_version = 2")
         connection.commit()
 
@@ -893,12 +897,30 @@ def test_stopped_v2_migration_backfills_active_proof_and_rejects_corrupt_ready(t
     bundle = published.published[0]
     _downgrade_proof_schema_to_v2(database)
 
-    bundle.path.joinpath("records.bin").write_bytes(_record(100, 9))
+    corrupted_ready = _record(100, 9)
+    bundle.path.joinpath("records.bin").write_bytes(corrupted_ready)
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        before_state = cast(
+            tuple[tuple[object, ...], ...],
+            tuple(connection.execute("SELECT kind,id,payload FROM state ORDER BY kind,id")),
+        )
+        before_sources = cast(
+            tuple[tuple[object, ...], ...],
+            tuple(connection.execute("SELECT * FROM capture_source ORDER BY source_id")),
+        )
+        before_records = cast(
+            tuple[tuple[object, ...], ...],
+            tuple(connection.execute("SELECT * FROM capture_record ORDER BY source_id,ordinal")),
+        )
     with pytest.raises(InternalAudioMigrationError, match="replay-proof migration failed"):
         initialize_collector_state(layout)
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (2,)
         assert connection.execute("SELECT name FROM sqlite_master WHERE name='ready_replay_proof'").fetchone() is None
+        assert tuple(connection.execute("SELECT kind,id,payload FROM state ORDER BY kind,id")) == before_state
+        assert tuple(connection.execute("SELECT * FROM capture_source ORDER BY source_id")) == before_sources
+        assert tuple(connection.execute("SELECT * FROM capture_record ORDER BY source_id,ordinal")) == before_records
+    assert bundle.path.joinpath("records.bin").read_bytes() == corrupted_ready
 
 
 def test_stopped_v2_migration_backfills_valid_active_proof(tmp_path: Path) -> None:
@@ -913,7 +935,7 @@ def test_stopped_v2_migration_backfills_valid_active_proof(tmp_path: Path) -> No
         _publish(store, (_source(store, "a" * 32, 100, (_record(100, 1),)),), ready, frontier=101)
     _downgrade_proof_schema_to_v2(database)
 
-    assert initialize_collector_state(layout) == {"schema_version": 3}
+    assert initialize_collector_state(layout) == {"schema_version": 4}
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         assert connection.execute("SELECT lifecycle,record_count FROM ready_replay_proof").fetchone() == ("active", 1)
         assert connection.execute("SELECT count(*) FROM ready_replay_proof_page").fetchone() == (1,)
@@ -942,7 +964,7 @@ def test_stopped_v2_migration_backfills_completed_owned_stage(tmp_path: Path, mo
     assert len(tuple(path for path in ready.iterdir() if not path.name.startswith("."))) == 1
     _downgrade_proof_schema_to_v2(database)
 
-    assert initialize_collector_state(layout) == {"schema_version": 3}
+    assert initialize_collector_state(layout) == {"schema_version": 4}
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         assert connection.execute("SELECT lifecycle FROM ready_replay_proof").fetchone() == ("staging",)
     with InternalAudioStore(StateDB(layout.collector.state_db)) as restarted:

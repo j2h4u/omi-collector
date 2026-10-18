@@ -56,8 +56,9 @@ def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
         raise StateMigrationError("Collector SQLite state cannot be validated") from error
 
 
-_TYPED_SCHEMA = 3
-_PREVIOUS_TYPED_SCHEMA = 2
+_TYPED_SCHEMA = 4
+_PREVIOUS_TYPED_SCHEMA = 3
+_LEGACY_TYPED_SCHEMA = 2
 
 
 def _validate_current(connection: sqlite3.Connection) -> None:
@@ -67,8 +68,10 @@ def _validate_current(connection: sqlite3.Connection) -> None:
         raise StateMigrationError("Collector SQLite schema version is unavailable")
     if version_row[0] == 1:
         raise InternalAudioCutoverRequiredError("Collector v1 state is unsupported by this release")
-    if version_row[0] == _PREVIOUS_TYPED_SCHEMA:
-        raise InternalAudioCutoverRequiredError("Collector v2 state requires stopped-service init-state migration")
+    if version_row[0] in {_LEGACY_TYPED_SCHEMA, _PREVIOUS_TYPED_SCHEMA}:
+        raise InternalAudioCutoverRequiredError(
+            f"Collector v{version_row[0]} state requires stopped-service init-state migration"
+        )
     if version_row[0] != _TYPED_SCHEMA:
         raise StateMigrationError("Collector SQLite schema version is unsupported")
     try:
@@ -85,15 +88,31 @@ def _validate_v2(connection: sqlite3.Connection) -> None:
 
     connection.row_factory = sqlite3.Row
     version_row = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
-    if version_row is None or version_row[0] != _PREVIOUS_TYPED_SCHEMA:
+    if version_row is None or version_row[0] != _LEGACY_TYPED_SCHEMA:
         raise StateMigrationError("Collector SQLite schema is not v2")
     try:
         _validate_schema(connection)
-        _validate_audio_schema(connection, version=_PREVIOUS_TYPED_SCHEMA)
+        _validate_audio_schema(connection, version=_LEGACY_TYPED_SCHEMA)
     except StateDBError as error:
         raise StateMigrationError("Collector SQLite v2 typed schema is invalid") from error
     if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
         raise InternalAudioCutoverRequiredError("legacy capture rows remain in v2 state")
+
+
+def _validate_v3(connection: sqlite3.Connection) -> None:
+    """Validate the stopped-service source schema for the v4 migration."""
+
+    connection.row_factory = sqlite3.Row
+    version_row = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
+    if version_row is None or version_row[0] != _PREVIOUS_TYPED_SCHEMA:
+        raise StateMigrationError("Collector SQLite schema is not v3")
+    try:
+        _validate_schema(connection)
+        _validate_audio_schema(connection, version=_PREVIOUS_TYPED_SCHEMA)
+    except StateDBError as error:
+        raise StateMigrationError("Collector SQLite v3 typed schema is invalid") from error
+    if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
+        raise InternalAudioCutoverRequiredError("legacy capture rows remain in v3 state")
 
 
 def open_runtime_state(layout: StorageLayout, *, read_only: bool = False) -> StateDB:
@@ -163,6 +182,10 @@ def _owned_typed_ready_stage(entry: Path, connection: sqlite3.Connection) -> boo
     match = re.fullmatch(r"\.([0-9a-f]{64})\.([0-9a-f]{16})\.stage", entry.name)
     if match is None or not stat.S_ISDIR(entry.lstat().st_mode):
         return False
+    return _owned_legacy_ready_stage(entry, match, connection) or _owned_v2_ready_stage(entry, match, connection)
+
+
+def _owned_legacy_ready_stage(entry: Path, match: re.Match[str], connection: sqlite3.Connection) -> bool:
     rows = cast(
         list[tuple[str, str, str]],
         connection.execute(
@@ -181,13 +204,45 @@ def _owned_typed_ready_stage(entry: Path, connection: sqlite3.Connection) -> boo
         or match.groups() != (parts[3], stage_id[:16])
     ):
         return False
-    cohort = cast(
-        tuple[str, int] | None,
-        connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (parts[1],)).fetchone(),
-    )
-    if cohort is None or (cohort[0], cohort[1]) != ("staging", int(parts[2])) or str(cohort[1]) != parts[2]:
+    if not _owned_stage_cohort(connection, parts):
         return False
     return all(
         child.name in {"records.bin", "manifest.json"} and stat.S_ISREG(child.lstat().st_mode)
         for child in entry.iterdir()
     )
+
+
+def _owned_v2_ready_stage(entry: Path, match: re.Match[str], connection: sqlite3.Connection) -> bool:
+    rows = cast(
+        list[tuple[str, str, str, str]],
+        connection.execute(
+            "SELECT stage_id,group_identity,artifact_id,owner_token FROM ready_v2_output_stage WHERE owned_path=?",
+            (str(entry),),
+        ).fetchall(),
+    )
+    if len(rows) != 1:
+        return False
+    stage_id, identity, artifact_id, owner_token = rows[0]
+    parts = re.fullmatch(r"([0-9a-f]{64}):([0-9]{1,19}):([0-9a-f]{64})", identity)
+    if (
+        parts is None
+        or stage_id != sha256(identity.encode()).hexdigest()
+        or owner_token != stage_id
+        or artifact_id != parts[3]
+        or match.groups() != (artifact_id, stage_id[:16])
+    ):
+        return False
+    if not _owned_stage_cohort(connection, parts):
+        return False
+    return all(
+        child.name in {"audio.ogg", "manifest.json"} and stat.S_ISREG(child.lstat().st_mode)
+        for child in entry.iterdir()
+    )
+
+
+def _owned_stage_cohort(connection: sqlite3.Connection, parts: re.Match[str]) -> bool:
+    cohort = cast(
+        tuple[str, int] | None,
+        connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (parts[1],)).fetchone(),
+    )
+    return cohort is not None and (cohort[0], cohort[1]) == ("staging", int(parts[2])) and str(cohort[1]) == parts[2]

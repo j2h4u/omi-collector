@@ -23,6 +23,7 @@ from typing import NoReturn, Protocol, cast
 
 from ...config import ReadyConfig
 from ..application.storage_fault import TransientInternalAudioStorageError
+from ..domain.clock_state import ClockState, ClockStateError
 from ..domain.internal_audio_machine import (
     QUARANTINE_CUSTODY_HOLD_REASONS,
     AudioAction,
@@ -48,7 +49,19 @@ from ..domain.internal_audio_machine import (
 from ..domain.internal_audio_machine import (
     Stage as StageEvent,
 )
-from ..domain.opus_duration import inspect_20ms_record
+from ..domain.opus_duration import RecordAudioLayout, inspect_20ms_record, inspect_mono_20ms_record
+from ..domain.public_audio_v2 import (
+    BoundaryFact,
+    FrozenPublicTime,
+    FrozenRecordProjection,
+    PublicProjection,
+    Quality,
+    canonical_manifest,
+    derive_artifact_id,
+    parse_v2_acknowledged,
+    project_public_timeline,
+)
+from ..domain.publication_contract import ContractEvent, ContractMode, contract_policy, contract_transition
 from ..domain.replay_proof import (
     NormalizationMode,
     NormalizationRun,
@@ -64,7 +77,14 @@ from ..domain.replay_proof import (
 )
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
 from .clock_segments import ClockSegmentMap
-from .collector_state_db import StateDB, StateDBError, StateKind, raise_if_sqlite_corrupt, raise_if_sqlite_storage_fault
+from .collector_state_db import (
+    StateDB,
+    StateDBError,
+    StateKind,
+    StateTransaction,
+    raise_if_sqlite_corrupt,
+    raise_if_sqlite_storage_fault,
+)
 from .internal_audio_store import (
     CaptureRecord,
     CaptureSource,
@@ -73,8 +93,10 @@ from .internal_audio_store import (
     decode_uint64,
     encode_uint64,
 )
+from .public_time_facts import FrozenTimePredecessor, freeze_public_time
 from .sqlite_compaction import mark_retirement_compaction_pending
 from .staging_contract import FatalInternalAudioStorageError
+from .v2_audio import V2AudioDigest, hash_v2_audio, write_v2_audio
 
 
 class ReadyBundleError(RuntimeError):
@@ -145,6 +167,115 @@ class ReadyPublicationStats:
     gap_records: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationContractState:
+    """The durable producer contract and next order reservation."""
+
+    mode: ContractMode
+    next_public_order: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PublicAudioV2Options:
+    """Inputs that freeze one v2 publication attempt."""
+
+    config: ReadyConfig
+    clock_state: ClockState
+    frontier: int | None = None
+    drained: bool = False
+    page_limit: int = 128
+    custody_cache: ReadyCustodyCache | None = None
+
+
+_PUBLICATION_CONTRACT_ID = "current"
+_UINT64_MAX = 2**64 - 1
+_UINT64_BYTES = 8
+
+
+def publication_contract_state(state_db: StateDB) -> PublicationContractState:
+    """Read and strictly validate the single durable publication contract."""
+
+    payload = state_db.get(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID)
+    return _parse_publication_contract(payload)
+
+
+def begin_publication_cutover(state_db: StateDB) -> PublicationContractState:
+    """Stop accepting new legacy cohorts while preserving resumable legacy work."""
+
+    with state_db.transaction() as state:
+        current = _parse_publication_contract(state.get(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID))
+        try:
+            mode = contract_transition(current.mode, ContractEvent.BEGIN_CUTOVER)
+        except ValueError as error:
+            raise ReadyBundleError("publication contract cannot begin cutover") from error
+        proposed = PublicationContractState(mode, current.next_public_order)
+        state.put(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID, _publication_contract_payload(proposed))
+    return proposed
+
+
+def activate_public_audio_v2(
+    audio_store: InternalAudioStore, ready_root: Path, checkpoint_path: Path
+) -> PublicationContractState:
+    """Activate v2 only after legacy custody is fully drained and a checkpoint exists."""
+    if not checkpoint_path.exists():
+        raise ReadyBundleError("public audio v2 checkpoint is missing")
+    try:
+        acknowledged = parse_v2_acknowledged(_read_json(checkpoint_path))
+    except ValueError as error:
+        raise ReadyBundleError("public audio v2 checkpoint is invalid") from error
+    if acknowledged:
+        raise ReadyBundleError("public audio v2 checkpoint is not empty at activation")
+    ledger = _read_ledger(audio_store.state_db)
+    entries = cast(dict[str, object], ledger["bundles"])
+    if any(isinstance(entry, dict) and entry.get("format") == "omi-audio-v2" for entry in entries.values()):
+        raise ReadyBundleError("public audio v2 publication state already exists")
+    if any(
+        isinstance(entry, dict) and entry.get("format") != "omi-audio-v2" and entry.get("state") == "ready"
+        for entry in entries.values()
+    ):
+        raise ReadyBundleError("legacy ready custody must be drained before v2 activation")
+    _prepare_directory(ready_root)
+    if tuple(ready_root.iterdir()):
+        raise ReadyBundleError("ready storage must be empty before v2 activation")
+    with audio_store.publication_transaction() as (state, connection):
+        current = _parse_publication_contract(state.get(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID))
+        try:
+            mode = contract_transition(current.mode, ContractEvent.ACTIVATE_V2)
+        except ValueError as error:
+            raise ReadyBundleError("publication contract cannot activate v2") from error
+        active = _sql_one(
+            connection.execute(
+                "SELECT (SELECT count(*) FROM publication_cohort) + "
+                "(SELECT count(*) FROM ready_output_stage) + (SELECT count(*) FROM ready_v2_output_stage) + "
+                "(SELECT count(*) FROM ready_replay_proof WHERE format='omi-audio-v2')"
+            )
+        )
+        if active != (0,):
+            raise ReadyBundleError("publication work must quiesce before v2 activation")
+        proposed = PublicationContractState(mode, 0)
+        state.put(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID, _publication_contract_payload(proposed))
+    return proposed
+
+
+def _parse_publication_contract(payload: dict[str, object] | None) -> PublicationContractState:
+    if payload is None or set(payload) != {"version", "mode", "next_public_order"} or payload["version"] != 1:
+        raise ReadyBundleError("publication contract state is invalid")
+    try:
+        mode = ContractMode(cast(str, payload["mode"]))
+    except (TypeError, ValueError) as error:
+        raise ReadyBundleError("publication contract mode is invalid") from error
+    order = payload["next_public_order"]
+    if order is not None and (type(order) is not int or not 0 <= order <= _UINT64_MAX):
+        raise ReadyBundleError("publication order state is invalid")
+    if (mode is ContractMode.V2_OPEN) != (order is not None):
+        raise ReadyBundleError("publication contract order state is invalid")
+    return PublicationContractState(mode, cast(int | None, order))
+
+
+def _publication_contract_payload(contract: PublicationContractState) -> dict[str, object]:
+    return {"version": 1, "mode": contract.mode.value, "next_public_order": contract.next_public_order}
+
+
 SourceRevision = tuple[tuple[str, int, int, int, int, int, int], ...]
 
 
@@ -204,6 +335,7 @@ class _ReadySource:
 
 _MANIFEST_NAME = "manifest.json"
 _RAW_NAME = "records.bin"
+_V2_AUDIO_NAME = "audio.ogg"
 _READY_DIRECTORY_MODE = 0o2750
 _READY_DIRECTORY_CREATE_MODE = _READY_DIRECTORY_MODE & 0o777
 _READY_FILE_MODE = 0o640
@@ -212,6 +344,18 @@ _SHA256_HEX_LENGTH = 64
 _GAP_ENDPOINT_COUNT = 2
 _LEDGER_FIELDS = frozenset({"bundles", "frontier"})
 _LEDGER_ENTRY_FIELDS = frozenset({"records_sha256", "state", "start_sequence", "next_sequence", "draft_raw_sha256"})
+_V2_LEDGER_FIELDS = _LEDGER_ENTRY_FIELDS | frozenset(
+    {
+        "format",
+        "order",
+        "audio_sha256",
+        "audio_bytes",
+        "manifest_sha256",
+        "manifest_bytes",
+        "packet_count",
+        "sources",
+    }
+)
 _PUBLICATION_DATE_FIELDS = frozenset({"formed_on_utc", "recorded_on_utc_min", "recorded_on_utc_max"})
 _LEDGER_SOURCE_FIELDS = frozenset({"start_sequence", "next_sequence", "raw_sha256"})
 _WINDMILL_CHECKPOINT_FIELDS = frozenset({"analysis_cursor", "vad_decisions", "open_speech_tail", "acknowledged"})
@@ -229,6 +373,12 @@ _TYPED_STAGE_RANGE_COLUMNS = 15
 _TYPED_STAGE_IDENTITY_PARTS = 3
 _V2_STAGE_OWNERSHIP_COLUMNS = 4
 _REPLAY_PROOF_ROOT_COLUMNS = 11
+_V2_STAGE_ROW_COLUMNS = 18
+_V2_STAGE_RANGE_COLUMNS = 7
+_V2_REPLAY_PROOF_COLUMNS = 14
+_REPLAY_PROOF_PAGE_COLUMNS = 5
+_V2_NONCE_BYTES = 32
+_MAX_OPUS_PACKET_BYTES = 160
 _PROOF_SCRATCH_CACHE_KIB = 256
 _DURABILITY_IO_FAILURE = "durability_io_error"
 
@@ -249,6 +399,21 @@ class _ProofContent:
     page_index: bytes
     normalization_runs: bytes
     immutable_metadata: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _V2ProofContent:
+    artifact_id: str
+    order: int
+    audio_sha256: str
+    manifest_sha256: str
+    records_sha256: str
+    record_count: int
+    packet_count: int
+    projection_sha256: str
+    page_index: bytes
+    normalization_runs: bytes
+    descriptor: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,6 +716,114 @@ def retire_acknowledged(
     return tuple(retired)
 
 
+def acknowledged_public_audio_v2(checkpoint_path: Path) -> tuple[tuple[str, str], ...]:
+    """Read one strict public audio v2 acknowledgement snapshot."""
+    if not checkpoint_path.exists():
+        return ()
+    try:
+        return parse_v2_acknowledged(_read_json(checkpoint_path))
+    except ValueError as error:
+        raise ReadyBundleError("public audio v2 checkpoint is invalid") from error
+
+
+def resume_retired_public_audio_v2(ready_root: Path, state_db: StateDB) -> None:
+    """Finish filesystem removal for v2 retirements already committed in SQLite."""
+    _prepare_directory(ready_root)
+    entries = cast(dict[str, object], _read_ledger(state_db)["bundles"])
+    for artifact_id, entry in entries.items():
+        if isinstance(entry, dict) and entry.get("format") == "omi-audio-v2" and entry.get("state") == "retired":
+            _remove_retired_v2(ready_root / artifact_id)
+
+
+def retire_acknowledged_public_audio_v2(
+    ready_root: Path,
+    state_db: StateDB,
+    checkpoint_path: Path,
+    *,
+    acknowledged: tuple[tuple[str, str], ...] | None = None,
+) -> tuple[ReadyBundleResult, ...]:
+    """Retire v2 artifacts only after the full ACK batch authenticates."""
+    if acknowledged is None:
+        acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+    if not acknowledged:
+        return ()
+    resume_retired_public_audio_v2(ready_root, state_db)
+    cache = _v2_ready_custody(ready_root, state_db)
+    ledger = _read_ledger(state_db)
+    entries = cast(dict[str, object], ledger["bundles"])
+    _require_v2_acknowledgements(entries, cache, acknowledged)
+    retired: list[ReadyBundleResult] = []
+    for artifact_id, audio_sha256 in acknowledged:
+        entry = cast(dict[str, object], entries[artifact_id])
+        if entry["state"] == "ready":
+            entry = _record_v2_retirement(state_db, artifact_id, entry)
+            entries[artifact_id] = entry
+        path = ready_root / artifact_id
+        _remove_retired_v2(path)
+        retired.append(
+            ReadyBundleResult(
+                artifact_id,
+                path,
+                _entry_next_sequence(entry),
+                _entry_count(entry),
+                cast(str, entry["records_sha256"]),
+            )
+        )
+        if entry["audio_sha256"] != audio_sha256:
+            raise ReadyBundleError("public audio v2 acknowledgement changed during retirement")
+    return tuple(retired)
+
+
+def _require_v2_acknowledgements(
+    entries: Mapping[str, object],
+    cache: ReadyCustodyCache,
+    acknowledged: tuple[tuple[str, str], ...],
+) -> None:
+    for artifact_id, audio_sha256 in acknowledged:
+        entry = entries.get(artifact_id)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("format") != "omi-audio-v2"
+            or entry.get("audio_sha256") != audio_sha256
+            or entry.get("state") not in {"ready", "retired"}
+        ):
+            raise ReadyBundleError("public audio v2 acknowledgement is not a published artifact")
+        if entry["state"] == "ready" and artifact_id not in cache.custody.proofs:
+            raise ReadyDurabilityFatalError("public audio v2 acknowledgement has no active replay proof")
+
+
+def _record_v2_retirement(state_db: StateDB, artifact_id: str, entry: dict[str, object]) -> dict[str, object]:
+    updated = dict(entry)
+    updated["state"] = "retired"
+    try:
+        with state_db.transaction() as transaction:
+            if transaction.get(StateKind.READY_PUBLICATION, artifact_id) != entry:
+                raise ReadyBundleError("public audio v2 custody changed before retirement")
+            transaction.put(StateKind.READY_PUBLICATION, artifact_id, updated)
+            if not transaction.delete_active_replay_proof(artifact_id):
+                raise ReadyDurabilityFatalError("public audio v2 ACK found no active replay proof")
+    except (OSError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyBundleError("public audio v2 retirement could not be recorded") from error
+    return updated
+
+
+def _remove_retired_v2(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        raise ReadyBundleError("retired public audio v2 artifact is unsafe")
+    entries = {item.name: item for item in path.iterdir()}
+    if set(entries) != {_V2_AUDIO_NAME, _MANIFEST_NAME}:
+        raise ReadyBundleError("retired public audio v2 artifact inventory is invalid")
+    for item in entries.values():
+        if item.is_symlink() or not item.is_file():
+            raise ReadyBundleError("retired public audio v2 artifact is unsafe")
+        item.unlink()
+    path.rmdir()
+    _sync_directory(path.parent)
+
+
 def _preflight_retirement(ready_root: Path, ledger: Mapping[str, object], bundle_id: str, records_sha256: str) -> None:
     bundles = ledger["bundles"]
     assert isinstance(bundles, dict)
@@ -761,6 +1034,8 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
     if not _is_sha256(bundle_id) or not _is_sha256(entry.get("records_sha256")):
         return False
     start, end = entry.get("start_sequence"), entry.get("next_sequence")
+    if entry.get("format") == "omi-audio-v2":
+        return _valid_v2_ledger_entry(bundle_id, entry, start, end)
     optional = set(entry) - _LEDGER_ENTRY_FIELDS
     if (
         not (optional - _PUBLICATION_DATE_FIELDS <= {"gaps", "sources"})
@@ -780,6 +1055,40 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
     return bundle_id == _bundle_id(facts) and (
         "sources" not in entry or _parse_sources(entry["sources"], facts) is not None
     )
+
+
+def _valid_v2_ledger_entry(_bundle_id: str, entry: Mapping[str, object], start: object, end: object) -> bool:
+    valid = all(
+        (
+            set(entry) == _V2_LEDGER_FIELDS | ({"gaps"} if "gaps" in entry else set()),
+            entry.get("state") in {"ready", "retired"},
+            _valid_range(start, end),
+            type(entry.get("order")) is int,
+            type(entry.get("packet_count")) is int,
+            type(entry.get("audio_bytes")) is int,
+            type(entry.get("manifest_bytes")) is int,
+            _is_sha256(entry.get("audio_sha256")),
+            _is_sha256(entry.get("manifest_sha256")),
+        )
+    )
+    if not valid:
+        return False
+    if not all(
+        (
+            0 <= cast(int, entry["order"]) <= _UINT64_MAX,
+            cast(int, entry["packet_count"]) > 0,
+            cast(int, entry["audio_bytes"]) > 0,
+            cast(int, entry["manifest_bytes"]) > 0,
+        )
+    ):
+        return False
+    assert isinstance(start, int) and isinstance(end, int)
+    gaps = _parse_ledger_gaps(entry, start, end)
+    digest = entry.get("draft_raw_sha256")
+    if gaps is None or not isinstance(digest, str):
+        return False
+    facts = _BundleFacts(start, end, end - start - sum(right - left for left, right in gaps), digest, gaps)
+    return _parse_sources(entry.get("sources"), facts) is not None
 
 
 def _parse_ledger_gaps(entry: Mapping[str, object], start: int, end: int) -> tuple[tuple[int, int], ...] | None:
@@ -1496,6 +1805,97 @@ class _TypedStage:
 
 
 @dataclass(frozen=True, slots=True)
+class _V2Frontier:
+    sequence: int
+    time: FrozenPublicTime
+    pending_overflow_size: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _V2PreparedGroup:
+    slices: tuple[_TypedSlice, ...]
+    facts: _BundleFacts
+    projection_sha256: str
+    projection: PublicProjection
+    audio: V2AudioDigest
+    config_sha256: str
+    clock_state: ClockState
+    initial_frontier: _V2Frontier | None
+    final_frontier: _V2Frontier
+
+
+@dataclass(frozen=True, slots=True)
+class _V2Stage:
+    stage_id: str
+    group_identity: str
+    path: Path
+    artifact_id: str
+    order: int
+    nonce: bytes
+    descriptor: bytes
+    descriptor_sha256: str
+    manifest: bytes
+    manifest_sha256: str
+    group: _V2PreparedGroup
+    owner_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredV2Stage:
+    stage_id: str
+    identity: str
+    owned_path: str
+    nonce: bytes
+    order: int
+    artifact_id: str
+    config_sha256: str
+    descriptor: bytes
+    descriptor_sha256: str
+    audio_sha256: str
+    manifest_sha256: str
+    physical_count: int
+    packet_count: int
+    page_count: int
+    audio_bytes: int
+    pending_overflow: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _V2ActiveProofRow:
+    stage_id: str
+    owner: str
+    record_count: int
+    records_sha256: str
+    manifest_sha256: str
+    page_index: bytes
+    packed_runs: bytes
+    descriptor: bytes
+    content_sha256: str
+    order: int
+    audio_sha256: str
+    packet_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _V2ResumeContext:
+    ready_root: Path
+    clock_state: ClockState
+    page_limit: int
+    custody_cache: ReadyCustodyCache | None
+    prepared_slices: tuple[_TypedSlice, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _V2Commit:
+    cohort: _TypedCohort
+    stage: _V2Stage
+    entry: dict[str, object]
+    progress: tuple[_MemberProgress, ...]
+    coverage: tuple[_SourceCoverage, ...]
+    all_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _MemberProgress:
     member_ordinal: int
     old_cursor: int
@@ -1578,14 +1978,16 @@ class _StageHeader:
 
 def _sql_one(cursor: sqlite3.Cursor) -> tuple[object, ...] | None:
     try:
-        return cast(tuple[object, ...] | None, cursor.fetchone())
+        row = cast(tuple[object, ...] | sqlite3.Row | None, cursor.fetchone())
+        return None if row is None else tuple(row)
     finally:
         cursor.close()
 
 
 def _sql_all(cursor: sqlite3.Cursor) -> tuple[tuple[object, ...], ...]:
     try:
-        return tuple(cast(list[tuple[object, ...]], cursor.fetchall()))
+        rows = cast(list[tuple[object, ...] | sqlite3.Row], cursor.fetchall())
+        return tuple(tuple(row) for row in rows)
     finally:
         cursor.close()
 
@@ -1623,6 +2025,7 @@ def finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps storag
     drained: bool = False,
     page_limit: int = 128,
     custody_cache: ReadyCustodyCache | None = None,
+    allow_accept: bool = True,
 ) -> ReadyOutcome:
     """Publish or resume exactly one durable SQL cohort."""
     with audio_store.publication_reader():
@@ -1636,6 +2039,7 @@ def finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps storag
             drained=drained,
             page_limit=page_limit,
             custody_cache=custody_cache,
+            allow_accept=allow_accept,
         )
 
 
@@ -1650,8 +2054,11 @@ def _finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps stora
     drained: bool,
     page_limit: int,
     custody_cache: ReadyCustodyCache | None,
+    allow_accept: bool,
 ) -> ReadyOutcome:
     _validate_typed_request(frontier, drained, page_limit)
+    if not isinstance(allow_accept, bool):
+        raise ReadyBundleError("typed publication acceptance policy is invalid")
     _prepare_directory(ready_root)
     _require_shared_ready_directory(ready_root)
     threshold = ceil(config.target_audio_seconds * 50)
@@ -1660,6 +2067,12 @@ def _finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps stora
     stats: ReadyPublicationStats | None = None
     prepared_slices: tuple[_TypedSlice, ...] | None = None
     if cohort is None:
+        if not allow_accept:
+            return ReadyOutcome(
+                ReadyOutcomeState.WAITING,
+                reason="publication_contract_quiescing",
+                remaining_at_frontier=True,
+            )
         custody_cache = _typed_ready_custody(ready_root, audio_store.state_db, custody_cache)
         custody = custody_cache.custody
         admissions = _typed_source_admissions(audio_store, sources, frontier)
@@ -1718,6 +2131,84 @@ def _finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps stora
 
 publish_typed_sources = finalize_typed_sources
 finalize_sql_sources = finalize_typed_sources
+
+
+def finalize_public_audio_v2(
+    audio_store: InternalAudioStore,
+    sources: tuple[TypedPublicationSource, ...] | list[TypedPublicationSource],
+    ready_root: Path,
+    options: PublicAudioV2Options,
+) -> ReadyOutcome:
+    """Publish or resume one v2 cohort under the durable v2 contract."""
+    with audio_store.publication_reader():
+        outcome = _finalize_public_audio_v2(audio_store, sources, ready_root, options)
+        retirement_pending = _retire_one_typed_source(audio_store, options.page_limit)
+        return replace(outcome, retirement_pending=retirement_pending)
+
+
+def _finalize_public_audio_v2(
+    audio_store: InternalAudioStore,
+    sources: tuple[TypedPublicationSource, ...] | list[TypedPublicationSource],
+    ready_root: Path,
+    options: PublicAudioV2Options,
+) -> ReadyOutcome:
+    _validate_typed_request(options.frontier, options.drained, options.page_limit)
+    contract = publication_contract_state(audio_store.state_db)
+    if not contract_policy(contract.mode).allow_v2_accept:
+        raise ReadyBundleError("public audio v2 contract is not open")
+    _prepare_directory(ready_root)
+    _require_shared_ready_directory(ready_root)
+    threshold = ceil(options.config.target_audio_seconds * 50)
+    cohort = _load_active_typed_cohort(audio_store)
+    stats: ReadyPublicationStats | None = None
+    prepared_slices: tuple[_TypedSlice, ...] | None = None
+    custody_cache = options.custody_cache
+    if cohort is None:
+        custody_cache = _v2_ready_custody(ready_root, audio_store.state_db, custody_cache)
+        custody = custody_cache.custody
+        admissions = _typed_source_admissions(audio_store, sources, options.frontier)
+        if options.drained:
+            admissions = _cover_typed_full_replays(audio_store, admissions, custody, options.page_limit)
+        slices = _normalize_typed_admissions(admissions, options.page_limit, custody)
+        _require_typed_admissions_current(audio_store, admissions)
+        stats = _typed_stats(admissions, slices, threshold)
+        if not options.drained:
+            return ReadyOutcome(
+                ReadyOutcomeState.WAITING,
+                reason="waiting_for_drain",
+                remaining_at_frontier=bool(admissions),
+                stats=stats,
+                custody_cache=custody_cache,
+            )
+        if not slices or stats.audio_packets < threshold:
+            return ReadyOutcome(
+                ReadyOutcomeState.WAITING,
+                reason="waiting_for_threshold",
+                remaining_at_frontier=bool(admissions),
+                stats=stats,
+                custody_cache=custody_cache,
+            )
+        cohort = _create_typed_cohort(audio_store, admissions, threshold, options.frontier, _v2_config_sha256())
+        prepared_slices = _rebind_typed_slices(slices, cohort.admissions)
+    published, custody_cache = _resume_v2_cohort(
+        audio_store,
+        cohort,
+        _V2ResumeContext(
+            ready_root,
+            options.clock_state,
+            options.page_limit,
+            custody_cache,
+            prepared_slices,
+        ),
+    )
+    return ReadyOutcome(
+        ReadyOutcomeState.PUBLISHED if published else ReadyOutcomeState.WAITING,
+        tuple(published),
+        None if published else "already_published",
+        bool(cohort.admissions) and not published,
+        stats=stats,
+        custody_cache=custody_cache,
+    )
 
 
 def _validate_typed_request(frontier: int | None, drained: bool, page_limit: int) -> None:
@@ -2375,6 +2866,12 @@ def _typed_stats(
 def _typed_groups(
     slices: tuple[_TypedSlice, ...], page_limit: int, clock_segments: ClockSegmentMap
 ) -> tuple[_TypedGroup, ...]:
+    return tuple(
+        _make_typed_group(group, page_limit, clock_segments) for group in _typed_physical_groups(slices, page_limit)
+    )
+
+
+def _typed_physical_groups(slices: tuple[_TypedSlice, ...], page_limit: int) -> tuple[tuple[_TypedSlice, ...], ...]:
     physical: list[_TypedSlice] = []
     for item in slices:
         cursor = item.start_sequence
@@ -2392,7 +2889,1531 @@ def _typed_groups(
             groups.append([])
         groups[-1].append(item)
         previous = item
-    return tuple(_make_typed_group(tuple(group), page_limit, clock_segments) for group in groups)
+    return tuple(tuple(group) for group in groups)
+
+
+def _v2_physical_groups(slices: tuple[_TypedSlice, ...], page_limit: int) -> tuple[tuple[_TypedSlice, ...], ...]:
+    groups: list[tuple[_TypedSlice, ...]] = []
+    pending: list[_TypedSlice] = []
+    for group in _typed_physical_groups(slices, page_limit):
+        if sum(item.audio_packets for item in group) == 0:
+            pending.extend(group)
+            continue
+        groups.append((*pending, *group))
+        pending.clear()
+    if pending and groups:
+        groups[-1] = (*groups[-1], *pending)
+    return tuple(groups)
+
+
+def _v2_config_sha256() -> str:
+    return sha256(
+        _canonical(
+            {
+                "format": "omi-audio-v2",
+                "packets_per_page": 50,
+                "samples_per_packet": 960,
+                "channels": 1,
+                "pre_skip": 0,
+                "input_sample_rate": 16_000,
+                "output_gain": 0,
+                "mapping_family": 0,
+                "stream_serial": 0,
+                "vendor": "",
+                "comments": [],
+            }
+        )
+    ).hexdigest()
+
+
+def _v2_frontier(state_db: StateDB) -> _V2Frontier | None:
+    payload = state_db.get(StateKind.PUBLICATION_V2_FRONTIER, "current")
+    if payload is None:
+        return None
+    return _v2_frontier_from_payload(payload)
+
+
+def _v2_frontier_from_payload(payload: Mapping[str, object]) -> _V2Frontier:
+    if set(payload) != {"version", "sequence", "time", "pending_overflow_size"} or payload["version"] != 1:
+        raise ReadyBundleError("v2 publication frontier is invalid")
+    sequence = payload["sequence"]
+    time_value = payload["time"]
+    pending = payload["pending_overflow_size"]
+    valid_time = isinstance(time_value, Mapping) and set(time_value) == {
+        "quality",
+        "seconds",
+        "utc_uncertainty_seconds",
+        "causal_membership",
+        "comparable_to_previous",
+    }
+    valid_pending = pending is None or (type(pending) is int and 1 <= pending <= _MAX_OPUS_PACKET_BYTES)
+    if type(sequence) is not int or not 0 <= sequence <= _UINT64_MAX or not valid_time or not valid_pending:
+        raise ReadyBundleError("v2 publication frontier is invalid")
+    time_mapping = cast(Mapping[str, object], time_value)
+    try:
+        time = FrozenPublicTime(
+            cast(Quality, time_mapping["quality"]),
+            cast(int, time_mapping["seconds"]),
+            cast(float | None, time_mapping["utc_uncertainty_seconds"]),
+            cast(str, time_mapping["causal_membership"]),
+            cast(bool, time_mapping["comparable_to_previous"]),
+        )
+        project_public_timeline((FrozenRecordProjection(1, time),))
+    except (TypeError, ValueError) as error:
+        raise ReadyBundleError("v2 publication frontier is invalid") from error
+    return _V2Frontier(sequence, time, cast(int | None, pending))
+
+
+def _v2_frontier_payload(frontier: _V2Frontier) -> dict[str, object]:
+    return {
+        "version": 1,
+        "sequence": frontier.sequence,
+        "time": {
+            "quality": frontier.time.quality,
+            "seconds": frontier.time.seconds,
+            "utc_uncertainty_seconds": frontier.time.utc_uncertainty_seconds,
+            "causal_membership": frontier.time.causal_membership,
+            "comparable_to_previous": frontier.time.comparable_to_previous,
+        },
+        "pending_overflow_size": frontier.pending_overflow_size,
+    }
+
+
+def _v2_physical_records(slices: tuple[_TypedSlice, ...], page_limit: int) -> Iterator[tuple[int, CaptureRecord]]:
+    for item in slices:
+        for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+            yield item.admission.snapshot.sequence_start + record.ordinal, record
+
+
+def _prepare_v2_group(
+    slices: tuple[_TypedSlice, ...],
+    page_limit: int,
+    clock_state: ClockState,
+    initial_frontier: _V2Frontier | None,
+) -> _V2PreparedGroup:
+    if not slices:
+        raise ReadyBundleError("cannot publish an empty v2 group")
+    raw_digest = sha256()
+
+    def packets() -> Iterator[bytes]:
+        for _sequence, record in _v2_physical_records(slices, page_limit):
+            raw_digest.update(record.raw_bytes)
+            try:
+                layout = inspect_mono_20ms_record(record.raw_bytes)
+            except ValueError as error:
+                raise ReadyBundleError("v2 source contains invalid mono 20 ms Opus") from error
+            yield from layout.packets
+
+    try:
+        audio = hash_v2_audio(packets())
+    except ValueError as error:
+        raise ReadyBundleError("v2 audio stream is invalid") from error
+    projection, final_frontier, projection_sha256 = _freeze_v2_public_projection(
+        slices, page_limit, clock_state, initial_frontier
+    )
+    count = sum(item.record_count for item in slices)
+    gaps = tuple(
+        (left.next_sequence, right.start_sequence)
+        for left, right in pairwise(slices)
+        if left.next_sequence < right.start_sequence
+    )
+    facts = _BundleFacts(slices[0].start_sequence, slices[-1].next_sequence, count, raw_digest.hexdigest(), gaps)
+    return _V2PreparedGroup(
+        slices,
+        facts,
+        projection_sha256,
+        projection,
+        audio,
+        _v2_config_sha256(),
+        clock_state,
+        initial_frontier,
+        final_frontier,
+    )
+
+
+def _freeze_v2_public_projection(
+    slices: tuple[_TypedSlice, ...],
+    page_limit: int,
+    clock_state: ClockState,
+    initial_frontier: _V2Frontier | None,
+) -> tuple[PublicProjection, _V2Frontier, str]:
+    digest = sha256(b"omi-audio-v2-record-projection-v1\0")
+    final_frontier = initial_frontier
+    seen = False
+
+    def records() -> Iterator[FrozenRecordProjection]:
+        nonlocal final_frontier, seen
+        for index, (_sequence, _record, _layout, projected, frontier) in enumerate(
+            _v2_projected_records(slices, page_limit, clock_state, initial_frontier)
+        ):
+            value = _canonical(
+                {
+                    "record_index": index,
+                    "packet_count": projected.packet_count,
+                    "time": {
+                        "quality": projected.time.quality,
+                        "seconds": projected.time.seconds,
+                        "utc_uncertainty_seconds": projected.time.utc_uncertainty_seconds,
+                        "causal_membership": projected.time.causal_membership,
+                        "comparable_to_previous": projected.time.comparable_to_previous,
+                    },
+                    "boundary_before": sorted(projected.boundary_before),
+                }
+            )
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+            final_frontier = frontier
+            seen = True
+            yield projected
+
+    projection = project_public_timeline(records())
+    if not seen or final_frontier is None:
+        raise ReadyBundleError("v2 group has no physical records")
+    return projection, final_frontier, digest.hexdigest()
+
+
+def _v2_projected_records(
+    slices: tuple[_TypedSlice, ...],
+    page_limit: int,
+    clock_state: ClockState,
+    initial_frontier: _V2Frontier | None,
+) -> Iterator[tuple[int, CaptureRecord, RecordAudioLayout, FrozenRecordProjection, _V2Frontier]]:
+    previous = initial_frontier
+    for sequence, record in _v2_physical_records(slices, page_limit):
+        try:
+            layout = inspect_mono_20ms_record(record.raw_bytes)
+        except ValueError as error:
+            raise ReadyBundleError("v2 source contains invalid mono 20 ms Opus") from error
+        adjacent = previous is not None and previous.sequence + 1 == sequence
+        predecessor = FrozenTimePredecessor(previous.sequence, previous.time) if adjacent and previous else None
+        time = freeze_public_time(
+            clock_state,
+            sequence=sequence,
+            raw_timestamp=record.device_timestamp,
+            predecessor=predecessor,
+        )
+        facts: set[BoundaryFact] = set()
+        if previous is not None and not adjacent:
+            facts.add("source_loss")
+        elif (
+            previous is not None
+            and previous.pending_overflow_size is not None
+            and previous.pending_overflow_size != layout.first_size
+        ):
+            facts.add("time_incomparable")
+        if not time.comparable_to_previous:
+            facts.add("time_incomparable")
+        projected = FrozenRecordProjection(layout.packet_count, time, frozenset(facts))
+        previous = _V2Frontier(sequence, time, layout.overflow_size)
+        yield sequence, record, layout, projected, previous
+
+
+def _v2_descriptor(group: _V2PreparedGroup) -> bytes:
+    initial = None if group.initial_frontier is None else _v2_frontier_payload(group.initial_frontier)
+    return _canonical(
+        {
+            "format": "omi-audio-v2-private-descriptor-v1",
+            "config_sha256": group.config_sha256,
+            "projector": "public-time-facts-v1",
+            "clock_state": group.clock_state.to_payload(),
+            "physical": {
+                "start_sequence": group.facts.start_sequence,
+                "next_sequence": group.facts.next_sequence,
+                "record_count": group.facts.record_count,
+                "raw_sha256": group.facts.raw_sha256,
+                "gaps": [list(item) for item in group.facts.gaps],
+            },
+            "sources": [
+                {
+                    "source_id": item.admission.snapshot.source_id,
+                    "start_ordinal": item.start_ordinal,
+                    "record_count": item.record_count,
+                    "sequence_start": item.start_sequence,
+                    "next_sequence": item.next_sequence,
+                    "raw_sha256": item.raw_sha256,
+                }
+                for item in group.slices
+            ],
+            "record_projection_sha256": group.projection_sha256,
+            "initial_frontier": initial,
+            "final_frontier": _v2_frontier_payload(group.final_frontier),
+        }
+    )
+
+
+def _v2_normalization_runs(group: _V2PreparedGroup, page_limit: int) -> tuple[NormalizationRun, ...]:
+    runs: list[NormalizationRun] = []
+    for index, (_sequence, record, _layout, projection, _frontier) in enumerate(
+        _v2_projected_records(group.slices, page_limit, group.clock_state, group.initial_frontier)
+    ):
+        if projection.time.quality == "unknown":
+            mode = NormalizationMode.RAW
+            offset = 0.0
+        else:
+            mode = NormalizationMode.MAPPED
+            offset = float(projection.time.seconds - record.device_timestamp)
+        boundary = int("source_loss" in projection.boundary_before)
+        boundary |= 2 * int(
+            "time_incomparable" in projection.boundary_before or not projection.time.comparable_to_previous
+        )
+        if runs and boundary == 0 and runs[-1].mode is mode and runs[-1].offset_seconds == offset:
+            runs[-1] = replace(runs[-1], next_record_index=index + 1)
+        else:
+            runs.append(NormalizationRun(index, index + 1, offset, mode, boundary))
+    return tuple(runs)
+
+
+def _v2_normalized_records(
+    group: _V2PreparedGroup,
+    page_limit: int,
+    runs: tuple[NormalizationRun, ...],
+) -> Iterator[bytes]:
+    run_index = 0
+    for index, (_, record) in enumerate(_v2_physical_records(group.slices, page_limit)):
+        while index >= runs[run_index].next_record_index:
+            run_index += 1
+        yield normalize_record(record.raw_bytes, runs[run_index])
+
+
+def _v2_packets_from_frozen(group: _V2PreparedGroup, page_limit: int) -> Iterator[bytes]:
+    projection, final_frontier, projection_sha256 = _freeze_v2_public_projection(
+        group.slices, page_limit, group.clock_state, group.initial_frontier
+    )
+    if (
+        projection != group.projection
+        or final_frontier != group.final_frontier
+        or projection_sha256 != group.projection_sha256
+    ):
+        raise ReadyBundleError("v2 frozen record projection changed")
+    for _sequence, _record, layout, _projection, _frontier in _v2_projected_records(
+        group.slices, page_limit, group.clock_state, group.initial_frontier
+    ):
+        yield from layout.packets
+
+
+def _v2_proof_content_sha256(content: _V2ProofContent) -> str:
+    digest = sha256(b"omi-collector-replay-proof-v2\0")
+    for value in (
+        bytes.fromhex(content.artifact_id),
+        content.order.to_bytes(8, "big"),
+        bytes.fromhex(content.audio_sha256),
+        bytes.fromhex(content.manifest_sha256),
+        bytes.fromhex(content.records_sha256),
+        content.record_count.to_bytes(8, "big"),
+        content.packet_count.to_bytes(8, "big"),
+        bytes.fromhex(content.projection_sha256),
+        content.page_index,
+        content.normalization_runs,
+        content.descriptor,
+    ):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.hexdigest()
+
+
+def _require_v2_stage_space(audio_store: InternalAudioStore, ready_root: Path, group: _V2PreparedGroup) -> None:
+    database = audio_store.state_db.path
+    try:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
+            page_size_row = _sql_one(connection.execute("PRAGMA page_size"))
+            page_count_row = _sql_one(connection.execute("PRAGMA page_count"))
+        if page_size_row is None or page_count_row is None:
+            raise ReadyBundleError("v2 publication SQLite page accounting is unavailable")
+        page_size, page_count = cast(int, page_size_row[0]), cast(int, page_count_row[0])
+        if page_size <= 0 or page_count <= 0:
+            raise ReadyBundleError("v2 publication SQLite page accounting is invalid")
+        proof_pages = ceil(group.facts.record_count / 128)
+        payload = (
+            group.facts.record_count * 64
+            + proof_pages * 64
+            + len(_v2_descriptor(group))
+            + len(group.slices) * _TYPED_METADATA_ROW_BYTES
+            + 16 * 1024
+        )
+        mutations = len(group.slices) + proof_pages + 12
+        dirty_pages = _TYPED_BTREE_PAGES_PER_LEVEL * max(1, page_count.bit_length()) * mutations
+        database_bytes = (
+            min(page_count, dirty_pages) + dirty_pages + ceil(payload / page_size) + _TYPED_JOURNAL_MARGIN_PAGES
+        ) * page_size
+        output_bytes = group.audio.byte_count + 64 * 1024
+        ready_stat = ready_root.stat()
+        database_stat = database.stat()
+        if ready_stat.st_dev == database_stat.st_dev:
+            _require_typed_filesystem_space(ready_root, output_bytes + database_bytes + _TYPED_SPACE_HEADROOM)
+        else:
+            _require_typed_filesystem_space(ready_root, output_bytes + _TYPED_SPACE_HEADROOM)
+            _require_typed_filesystem_space(database.parent, database_bytes + _TYPED_SPACE_HEADROOM)
+    except ReadyBundleError:
+        raise
+    except (OSError, StateDBError, sqlite3.DatabaseError, TypeError, IndexError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyBundleError("v2 publication space reserve could not be inspected") from error
+
+
+def _create_v2_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _V2PreparedGroup,
+    page_limit: int,
+) -> _V2Stage:
+    _require_v2_stage_space(audio_store, ready_root, group)
+    descriptor = _v2_descriptor(group)
+    descriptor_sha256 = sha256(descriptor).hexdigest()
+    runs = _v2_normalization_runs(group, page_limit)
+    packed_runs = pack_normalization_runs(runs, record_count=group.facts.record_count)
+    records_digest = sha256()
+
+    def normalized_records() -> Iterator[bytes]:
+        for record in _v2_normalized_records(group, page_limit, runs):
+            records_digest.update(record)
+            yield record
+
+    with (
+        _proof_page_scratch(normalized_records(), record_count=group.facts.record_count) as (page_index, scratch),
+        audio_store.publication_transaction() as (state, connection),
+    ):
+        contract = _parse_publication_contract(state.get(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID))
+        if contract.mode is not ContractMode.V2_OPEN or contract.next_public_order is None:
+            raise ReadyBundleError("v2 publication contract is not open")
+        if contract.next_public_order == _UINT64_MAX:
+            raise ReadyBundleError("v2 publication order is exhausted")
+        if _sql_one(
+            connection.execute(
+                "SELECT (SELECT count(*) FROM ready_output_stage) + (SELECT count(*) FROM ready_v2_output_stage)"
+            )
+        ) != (0,):
+            raise ReadyBundleError("another publication stage is active")
+        if _sql_one(
+            connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,))
+        ) != ("accepted", cohort.cursor):
+            raise ReadyBundleError("v2 cohort changed before stage intent")
+        order = contract.next_public_order
+        nonce = os.urandom(_V2_NONCE_BYTES)
+        artifact_id = derive_artifact_id(
+            stage_nonce=nonce,
+            order=order,
+            config_sha256=group.config_sha256,
+            descriptor_sha256=descriptor_sha256,
+        )
+        identity = f"{cohort.cohort_id}:{cohort.cursor}:{artifact_id}"
+        stage_id = sha256(identity.encode()).hexdigest()
+        path = ready_root / f".{artifact_id}.{stage_id[:16]}.stage"
+        manifest = canonical_manifest(
+            artifact_id=artifact_id,
+            order=order,
+            audio_sha256=group.audio.sha256,
+            projection=group.projection,
+        )
+        manifest_sha256 = sha256(manifest).hexdigest()
+        connection.execute(
+            "INSERT INTO ready_v2_output_stage(stage_id,group_identity,owned_path,stage_nonce,public_order,"
+            "artifact_id,config_sha256,descriptor,descriptor_sha256,expected_audio_sha256,"
+            "expected_manifest_sha256,expected_physical_count,expected_packet_count,expected_page_count,"
+            "expected_audio_bytes,pending_overflow_size,owner_token) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                stage_id,
+                identity,
+                str(path),
+                nonce,
+                encode_uint64(order),
+                artifact_id,
+                group.config_sha256,
+                descriptor,
+                descriptor_sha256,
+                group.audio.sha256,
+                manifest_sha256,
+                group.facts.record_count,
+                group.audio.packet_count,
+                group.audio.page_count,
+                group.audio.byte_count,
+                group.final_frontier.pending_overflow_size,
+                stage_id,
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO ready_v2_stage_range(stage_id,range_ordinal,source_id,start_ordinal,record_count,"
+            "sequence_start,next_sequence,raw_sha256) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                (
+                    stage_id,
+                    index,
+                    item.admission.snapshot.source_id,
+                    item.start_ordinal,
+                    item.record_count,
+                    encode_uint64(item.start_sequence),
+                    encode_uint64(item.next_sequence),
+                    item.raw_sha256,
+                )
+                for index, item in enumerate(group.slices)
+            ),
+        )
+        connection.execute(
+            "INSERT INTO ready_replay_proof(bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,"
+            "manifest_sha256,page_index,normalization_runs,immutable_metadata,proof_content_sha256,format,"
+            "public_order,audio_sha256,packet_count) "
+            "VALUES (?,'staging',?,?,?,?,?,?,?,?,?,'omi-audio-v2',?,?,?)",
+            (
+                artifact_id,
+                stage_id,
+                stage_id,
+                group.facts.record_count,
+                records_digest.hexdigest(),
+                manifest_sha256,
+                page_index,
+                packed_runs,
+                descriptor,
+                _v2_proof_content_sha256(
+                    _V2ProofContent(
+                        artifact_id,
+                        order,
+                        group.audio.sha256,
+                        manifest_sha256,
+                        records_digest.hexdigest(),
+                        group.facts.record_count,
+                        group.audio.packet_count,
+                        group.projection_sha256,
+                        page_index,
+                        packed_runs,
+                        descriptor,
+                    )
+                ),
+                encode_uint64(order),
+                group.audio.sha256,
+                group.audio.packet_count,
+            ),
+        )
+        _insert_replay_proof_pages(connection, artifact_id, scratch)
+        changed = connection.execute(
+            "UPDATE publication_cohort SET lifecycle='staging' WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
+            (cohort.cohort_id, cohort.cursor),
+        )
+        if changed.rowcount != 1:
+            raise ReadyBundleError("v2 cohort changed before stage intent")
+        state.put(
+            StateKind.PUBLICATION_CONTRACT,
+            _PUBLICATION_CONTRACT_ID,
+            _publication_contract_payload(PublicationContractState(ContractMode.V2_OPEN, order + 1)),
+        )
+        state.mark_publication_changed()
+    return _V2Stage(
+        stage_id,
+        identity,
+        path,
+        artifact_id,
+        order,
+        nonce,
+        descriptor,
+        descriptor_sha256,
+        manifest,
+        manifest_sha256,
+        group,
+        stage_id,
+    )
+
+
+def _v2_descriptor_basis(
+    descriptor: bytes,
+) -> tuple[ClockState, _V2Frontier | None, _V2Frontier, str]:
+    try:
+        value = cast(object, json.loads(descriptor))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+        raise ReadyBundleError("v2 stage descriptor is invalid") from error
+    if not isinstance(value, dict) or _canonical(value) != descriptor:
+        raise ReadyBundleError("v2 stage descriptor is invalid")
+    if (
+        set(value)
+        != {
+            "format",
+            "config_sha256",
+            "projector",
+            "clock_state",
+            "physical",
+            "sources",
+            "record_projection_sha256",
+            "initial_frontier",
+            "final_frontier",
+        }
+        or value.get("format") != "omi-audio-v2-private-descriptor-v1"
+        or value.get("projector") != "public-time-facts-v1"
+    ):
+        raise ReadyBundleError("v2 stage descriptor is invalid")
+    initial_value = value.get("initial_frontier")
+    final_value = value.get("final_frontier")
+    clock_value = value.get("clock_state")
+    projection_sha256 = value.get("record_projection_sha256")
+    if initial_value is not None and not isinstance(initial_value, Mapping):
+        raise ReadyBundleError("v2 stage descriptor frontier is invalid")
+    if not isinstance(final_value, Mapping) or not isinstance(clock_value, dict) or not _is_sha256(projection_sha256):
+        raise ReadyBundleError("v2 stage descriptor frontier is invalid")
+    try:
+        clock_state = ClockState.from_payload(clock_value)
+    except ClockStateError as error:
+        raise ReadyBundleError("v2 stage clock basis is invalid") from error
+    initial = None if initial_value is None else _v2_frontier_from_payload(initial_value)
+    return clock_state, initial, _v2_frontier_from_payload(final_value), cast(str, projection_sha256)
+
+
+def _load_v2_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    page_limit: int,
+) -> _V2Stage:
+    try:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
+            rows = _sql_all(
+                connection.execute(
+                    "SELECT stage_id,group_identity,owned_path,stage_nonce,public_order,artifact_id,config_sha256,"
+                    "descriptor,descriptor_sha256,expected_audio_sha256,expected_manifest_sha256,"
+                    "expected_physical_count,expected_packet_count,expected_page_count,expected_audio_bytes,"
+                    "pending_overflow_size,owner_token,failure_reason FROM ready_v2_output_stage ORDER BY stage_id"
+                )
+            )
+            if len(rows) != 1:
+                raise ReadyBundleError("STAGING cohort does not own exactly one v2 stage intent")
+            row = rows[0]
+            range_rows = _sql_all(
+                connection.execute(
+                    "SELECT range_ordinal,source_id,start_ordinal,record_count,sequence_start,next_sequence,raw_sha256 "
+                    "FROM ready_v2_stage_range WHERE stage_id=? ORDER BY range_ordinal",
+                    (row[0],),
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyBundleError("v2 stage intent is unreadable") from error
+    stored = _parse_stored_v2_stage(row, ready_root, cohort)
+    slices = _load_v2_stage_slices(cohort, range_rows, page_limit)
+    if not slices:
+        raise ReadyBundleError("v2 stage has no source ranges")
+    group = _rebuild_v2_stage_group(stored, slices, page_limit)
+    manifest = canonical_manifest(
+        artifact_id=stored.artifact_id,
+        order=stored.order,
+        audio_sha256=group.audio.sha256,
+        projection=group.projection,
+    )
+    _require_rebuilt_v2_stage(stored, group, manifest)
+    stage = _V2Stage(
+        stored.stage_id,
+        stored.identity,
+        Path(stored.owned_path),
+        stored.artifact_id,
+        stored.order,
+        stored.nonce,
+        stored.descriptor,
+        stored.descriptor_sha256,
+        manifest,
+        stored.manifest_sha256,
+        group,
+        stored.stage_id,
+    )
+    _require_v2_staging_proof(audio_store.state_db, stage, page_limit)
+    return stage
+
+
+def _rebuild_v2_stage_group(
+    stored: _StoredV2Stage, slices: tuple[_TypedSlice, ...], page_limit: int
+) -> _V2PreparedGroup:
+    basis = _v2_descriptor_basis(stored.descriptor)
+    gaps = tuple(
+        (left.next_sequence, right.start_sequence)
+        for left, right in pairwise(slices)
+        if left.next_sequence < right.start_sequence
+    )
+    facts = _BundleFacts(
+        slices[0].start_sequence,
+        slices[-1].next_sequence,
+        sum(item.record_count for item in slices),
+        _typed_raw_digest(tuple(slices), page_limit),
+        gaps,
+    )
+    projected = _freeze_v2_public_projection(slices, page_limit, basis[0], basis[1])
+    if projected[1] != basis[2] or projected[2] != basis[3]:
+        raise ReadyBundleError("v2 stage frozen projection changed")
+    provisional = _V2PreparedGroup(
+        slices,
+        facts,
+        basis[3],
+        projected[0],
+        V2AudioDigest(stored.packet_count, stored.page_count, stored.audio_bytes, stored.audio_sha256),
+        stored.config_sha256,
+        basis[0],
+        basis[1],
+        basis[2],
+    )
+    actual_audio = hash_v2_audio(_v2_packets_from_frozen(provisional, page_limit))
+    return replace(provisional, audio=actual_audio)
+
+
+def _require_rebuilt_v2_stage(stored: _StoredV2Stage, group: _V2PreparedGroup, manifest: bytes) -> None:
+    expected = (
+        stored.physical_count,
+        stored.packet_count,
+        stored.page_count,
+        stored.audio_bytes,
+        stored.pending_overflow,
+        stored.config_sha256,
+        stored.descriptor,
+        stored.audio_sha256,
+        stored.manifest_sha256,
+    )
+    actual = (
+        group.facts.record_count,
+        group.audio.packet_count,
+        group.audio.page_count,
+        group.audio.byte_count,
+        group.final_frontier.pending_overflow_size,
+        _v2_config_sha256(),
+        _v2_descriptor(group),
+        group.audio.sha256,
+        sha256(manifest).hexdigest(),
+    )
+    if actual != expected:
+        raise ReadyBundleError("v2 stage frozen output changed")
+
+
+def _parse_stored_v2_stage(row: tuple[object, ...], ready_root: Path, cohort: _TypedCohort) -> _StoredV2Stage:
+    if len(row) != _V2_STAGE_ROW_COLUMNS or row[17] == _DURABILITY_IO_FAILURE:
+        raise ReadyBundleError("v2 stage is blocked by a recorded durability I/O failure")
+    if not all(
+        (
+            isinstance(row[0], str),
+            isinstance(row[1], str),
+            isinstance(row[2], str),
+            isinstance(row[3], bytes),
+            len(cast(bytes, row[3])) == _V2_NONCE_BYTES,
+            isinstance(row[4], bytes),
+            _is_sha256(row[5]),
+            _is_sha256(row[6]),
+            isinstance(row[7], bytes),
+            _is_sha256(row[8]),
+            _is_sha256(row[9]),
+            _is_sha256(row[10]),
+            type(row[11]) is int,
+            type(row[12]) is int,
+            type(row[13]) is int,
+            type(row[14]) is int,
+            row[15] is None or type(row[15]) is int,
+            row[16] == row[0],
+            row[17] is None,
+        )
+    ):
+        raise ReadyBundleError("v2 stage ownership is invalid")
+    stored = _StoredV2Stage(
+        cast(str, row[0]),
+        cast(str, row[1]),
+        cast(str, row[2]),
+        cast(bytes, row[3]),
+        decode_uint64(cast(bytes, row[4])),
+        cast(str, row[5]),
+        cast(str, row[6]),
+        cast(bytes, row[7]),
+        cast(str, row[8]),
+        cast(str, row[9]),
+        cast(str, row[10]),
+        cast(int, row[11]),
+        cast(int, row[12]),
+        cast(int, row[13]),
+        cast(int, row[14]),
+        cast(int | None, row[15]),
+    )
+    expected_identity = f"{cohort.cohort_id}:{cohort.cursor}:{stored.artifact_id}"
+    expected_path = ready_root / f".{stored.artifact_id}.{stored.stage_id[:16]}.stage"
+    derived_artifact = derive_artifact_id(
+        stage_nonce=stored.nonce,
+        order=stored.order,
+        config_sha256=stored.config_sha256,
+        descriptor_sha256=stored.descriptor_sha256,
+    )
+    if not all(
+        (
+            stored.identity == expected_identity,
+            stored.stage_id == sha256(stored.identity.encode()).hexdigest(),
+            stored.owned_path == str(expected_path),
+            stored.artifact_id == derived_artifact,
+            sha256(stored.descriptor).hexdigest() == stored.descriptor_sha256,
+        )
+    ):
+        raise ReadyBundleError("v2 stage immutable identity changed")
+    return stored
+
+
+def _load_v2_stage_slices(
+    cohort: _TypedCohort,
+    range_rows: tuple[tuple[object, ...], ...],
+    page_limit: int,
+) -> tuple[_TypedSlice, ...]:
+    by_source = {item.snapshot.source_id: item for item in cohort.admissions}
+    slices: list[_TypedSlice] = []
+    for expected_ordinal, raw in enumerate(range_rows):
+        if len(raw) != _V2_STAGE_RANGE_COLUMNS:
+            raise ReadyBundleError("v2 stage source ranges are invalid")
+        if not all(
+            (
+                raw[0] == expected_ordinal,
+                isinstance(raw[1], str),
+                raw[1] in by_source,
+                type(raw[2]) is int,
+                type(raw[3]) is int,
+                isinstance(raw[4], bytes),
+                isinstance(raw[5], bytes),
+                _is_sha256(raw[6]),
+            )
+        ):
+            raise ReadyBundleError("v2 stage source ranges are invalid")
+        item = _typed_slice(by_source[cast(str, raw[1])], cast(int, raw[2]), cast(int, raw[3]), page_limit)
+        if (item.start_sequence, item.next_sequence, item.raw_sha256) != (
+            decode_uint64(cast(bytes, raw[4])),
+            decode_uint64(cast(bytes, raw[5])),
+            raw[6],
+        ):
+            raise ReadyBundleError("v2 stage source range changed")
+        slices.append(item)
+    return tuple(slices)
+
+
+def _require_v2_staging_proof(state_db: StateDB, stage: _V2Stage, page_limit: int) -> None:
+    runs = _v2_normalization_runs(stage.group, page_limit)
+    packed_runs = pack_normalization_runs(runs, record_count=stage.group.facts.record_count)
+    normalized_digest = sha256()
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+            root = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,stage_id,owner_token,record_count,records_sha256,manifest_sha256,page_index,"
+                    "normalization_runs,immutable_metadata,proof_content_sha256,format,public_order,audio_sha256,"
+                    "packet_count FROM ready_replay_proof WHERE bundle_id=?",
+                    (stage.artifact_id,),
+                )
+            )
+            pages = _sql_all(
+                connection.execute(
+                    "SELECT page_ordinal,first_record_index,record_count,hashes,page_sha256 "
+                    "FROM ready_replay_proof_page WHERE bundle_id=? ORDER BY page_ordinal",
+                    (stage.artifact_id,),
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyDurabilityFatalError("v2 staging replay proof is unreadable") from error
+    if root is None or len(root) != _V2_REPLAY_PROOF_COLUMNS:
+        raise ReadyDurabilityFatalError("v2 staging replay proof is missing")
+    page_index = root[6]
+    records_sha256 = root[4]
+    if not isinstance(page_index, bytes) or not isinstance(records_sha256, str):
+        raise ReadyDurabilityFatalError("v2 staging replay proof is invalid")
+    try:
+        index = unpack_page_index(page_index, record_count=stage.group.facts.record_count)
+        expected_hashes = _validated_v2_stage_hashes(pages, index)
+        normalized = _v2_normalized_records(stage.group, page_limit, runs)
+        for record, expected_hash in zip(normalized, expected_hashes, strict=True):
+            normalized_digest.update(record)
+            if not hmac.compare_digest(record_sha256(record), expected_hash):
+                raise ValueError
+    except (IndexError, TypeError, ValueError) as error:
+        raise ReadyDurabilityFatalError("v2 staging replay proof pages are corrupt") from error
+    content_sha256 = _v2_proof_content_sha256(
+        _V2ProofContent(
+            stage.artifact_id,
+            stage.order,
+            stage.group.audio.sha256,
+            stage.manifest_sha256,
+            normalized_digest.hexdigest(),
+            stage.group.facts.record_count,
+            stage.group.audio.packet_count,
+            stage.group.projection_sha256,
+            page_index,
+            packed_runs,
+            stage.descriptor,
+        )
+    )
+    expected = (
+        "staging",
+        stage.stage_id,
+        stage.owner_token,
+        stage.group.facts.record_count,
+        normalized_digest.hexdigest(),
+        stage.manifest_sha256,
+        page_index,
+        packed_runs,
+        stage.descriptor,
+        content_sha256,
+        "omi-audio-v2",
+        encode_uint64(stage.order),
+        stage.group.audio.sha256,
+        stage.group.audio.packet_count,
+    )
+    if tuple(root) != expected:
+        raise ReadyDurabilityFatalError("v2 staging replay proof root is corrupt")
+
+
+def _validated_v2_stage_hashes(
+    pages: tuple[tuple[object, ...], ...],
+    index: tuple[tuple[int, int, bytes], ...],
+) -> tuple[bytes, ...]:
+    expected_hashes: list[bytes] = []
+    for ordinal, raw in enumerate(pages):
+        if len(raw) != _REPLAY_PROOF_PAGE_COLUMNS or raw[0] != ordinal:
+            raise ValueError
+        page = ProofPage(cast(int, raw[1]), cast(int, raw[2]), cast(bytes, raw[3]), cast(bytes, raw[4]))
+        hashes = validate_proof_page(page, expected_first_record_index=index[ordinal][0])
+        if (page.record_count, page.page_sha256) != (index[ordinal][1], index[ordinal][2]):
+            raise ValueError
+        expected_hashes.extend(hashes)
+    return tuple(expected_hashes)
+
+
+def _resume_v2_cohort(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    context: _V2ResumeContext,
+) -> tuple[list[ReadyBundleResult], ReadyCustodyCache | None]:
+    published: list[ReadyBundleResult] = []
+    current: _TypedCohort | None = cohort
+    custody_cache = context.custody_cache
+    prepared_slices = context.prepared_slices
+    while current is not None:
+        _require_typed_admissions_current(audio_store, current.admissions)
+        if current.lifecycle == "staging":
+            stage = _load_v2_stage(audio_store, context.ready_root, current, context.page_limit)
+        elif current.lifecycle == "accepted":
+            custody_cache = _v2_ready_custody(context.ready_root, audio_store.state_db, custody_cache)
+            current = _advance_typed_ready_custody(audio_store, current, custody_cache.custody, context.page_limit)
+            if current is None:
+                break
+            slices = _accepted_typed_slices(
+                audio_store, current, context.page_limit, custody_cache.custody, prepared_slices
+            )
+            prepared_slices = None
+            if not slices:
+                _complete_empty_typed_cohort(audio_store, current)
+                break
+            groups = _v2_physical_groups(slices, context.page_limit)
+            if not groups:
+                raise ReadyBundleError("accepted v2 cohort has no audio packets")
+            group = _prepare_v2_group(
+                groups[0],
+                context.page_limit,
+                context.clock_state,
+                _v2_frontier(audio_store.state_db),
+            )
+            stage = _ensure_v2_stage(audio_store, context.ready_root, current, group, context.page_limit)
+        else:
+            raise ReadyBundleError("v2 publication cohort lifecycle is invalid")
+        result = _materialize_v2_stage_with_failure_latch(audio_store, current, stage, context.page_limit)
+        _commit_v2_stage(audio_store, current, stage, result)
+        published.append(result)
+        current = _load_active_typed_cohort(audio_store)
+        if current is not None and current.cohort_id != cohort.cohort_id:
+            _typed_fail_stop(audio_store, "v2 publication cohort changed during resume")
+    return published, custody_cache
+
+
+def _ensure_v2_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _V2PreparedGroup,
+    page_limit: int,
+) -> _V2Stage:
+    if cohort.lifecycle == "staging":
+        return _load_v2_stage(audio_store, ready_root, cohort, page_limit)
+    for attempt in range(2):
+        try:
+            return _create_v2_stage(audio_store, ready_root, cohort, group, page_limit)
+        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
+            raise_if_sqlite_corrupt(error)
+            durable = _load_active_for_reconciliation(audio_store)
+            if durable is not None and durable.cohort_id == cohort.cohort_id and durable.lifecycle == "staging":
+                return _load_v2_stage(audio_store, ready_root, durable, page_limit)
+            if durable is not None and _same_typed_cohort(durable, cohort) and attempt == 0:
+                continue
+            if durable is not None and _same_typed_cohort(durable, cohort):
+                raise_if_sqlite_storage_fault(error)
+                raise ReadyBundleError("v2 stage intent was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous v2 stage intent has a third state")
+    raise AssertionError("unreachable")
+
+
+def _materialize_v2_stage(stage: _V2Stage, page_limit: int) -> ReadyBundleResult:
+    destination = stage.path.parent / stage.artifact_id
+    if os.path.lexists(destination):
+        _require_v2_destination(destination, stage)
+        _discard_v2_stage(stage.path)
+    else:
+        if os.path.lexists(stage.path):
+            try:
+                _require_v2_destination(stage.path, stage, require_name=False)
+            except ReadyBundleError:
+                _discard_v2_stage(stage.path)
+        if not os.path.lexists(stage.path):
+            _write_v2_stage(stage, page_limit)
+        _require_v2_destination(stage.path, stage, require_name=False)
+        try:
+            stage.path.rename(destination)
+        except FileExistsError:
+            _require_v2_destination(destination, stage)
+            _discard_v2_stage(stage.path)
+        _sync_directory(destination.parent)
+    _require_v2_destination(destination, stage)
+    return ReadyBundleResult(
+        stage.artifact_id,
+        destination,
+        stage.group.facts.next_sequence,
+        stage.group.facts.record_count,
+        _v2_stage_records_sha256(stage),
+    )
+
+
+def _materialize_v2_stage_with_failure_latch(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _V2Stage,
+    page_limit: int,
+) -> ReadyBundleResult:
+    try:
+        result = _materialize_v2_stage(stage, page_limit)
+        _require_v2_staging_proof(audio_store.state_db, stage, page_limit)
+        return result
+    except OSError as error:
+        if error.errno != errno.EIO:
+            raise
+        _latch_v2_durability_failure(audio_store, cohort, stage)
+        raise ReadyBundleError("v2 stage is blocked by a recorded durability I/O failure") from error
+
+
+def _latch_v2_durability_failure(audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _V2Stage) -> None:
+    try:
+        with audio_store.publication_transaction() as (state, connection):
+            cohort_row = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,)
+                )
+            )
+            stage_row = _sql_one(
+                connection.execute(
+                    "SELECT group_identity,owned_path,owner_token,failure_reason FROM ready_v2_output_stage "
+                    "WHERE stage_id=?",
+                    (stage.stage_id,),
+                )
+            )
+            expected = (stage.group_identity, str(stage.path), stage.owner_token)
+            if cohort_row != ("staging", cohort.cursor) or stage_row is None or tuple(stage_row)[:3] != expected:
+                raise ReadyDurabilityFatalError("v2 durability failure could not be attached to its stage")
+            if stage_row[3] == _DURABILITY_IO_FAILURE:
+                return
+            if stage_row[3] is not None:
+                raise ReadyDurabilityFatalError("v2 durability failure encountered an invalid stage latch")
+            changed = connection.execute(
+                "UPDATE ready_v2_output_stage SET failure_reason=? WHERE stage_id=? AND group_identity=? "
+                "AND owned_path=? AND owner_token=? AND failure_reason IS NULL",
+                (_DURABILITY_IO_FAILURE, stage.stage_id, *expected),
+            )
+            if changed.rowcount != 1:
+                raise ReadyDurabilityFatalError("v2 durability failure latch lost its compare-and-swap")
+            state.mark_publication_changed()
+    except FatalInternalAudioStorageError:
+        raise
+    except Exception as error:
+        if _v2_durability_failure_is_latched(audio_store, cohort, stage):
+            return
+        raise ReadyDurabilityFatalError("v2 durability failure could not be recorded") from error
+
+
+def _v2_durability_failure_is_latched(audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _V2Stage) -> bool:
+    try:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
+            row = _sql_one(
+                connection.execute(
+                    "SELECT p.lifecycle,p.cursor,s.group_identity,s.owned_path,s.owner_token,s.failure_reason "
+                    "FROM publication_cohort AS p JOIN ready_v2_output_stage AS s ON s.stage_id=? "
+                    "WHERE p.cohort_id=?",
+                    (stage.stage_id, cohort.cohort_id),
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
+        raise_if_sqlite_corrupt(error)
+        return False
+    return row == (
+        "staging",
+        cohort.cursor,
+        stage.group_identity,
+        str(stage.path),
+        stage.owner_token,
+        _DURABILITY_IO_FAILURE,
+    )
+
+
+def _write_v2_stage(stage: _V2Stage, page_limit: int) -> None:
+    stage.path.mkdir(mode=_READY_DIRECTORY_CREATE_MODE)
+    _require_operator_ready_directory(stage.path)
+    audio_path = stage.path / _V2_AUDIO_NAME
+    try:
+        write_v2_audio(audio_path, _v2_packets_from_frozen(stage.group, page_limit), stage.group.audio)
+    except ValueError as error:
+        raise ReadyBundleError("v2 audio changed while staging") from error
+    audio_path.chmod(_READY_FILE_MODE)
+    _sync_regular_file(audio_path)
+    _write_file(stage.path / _MANIFEST_NAME, stage.manifest)
+    _sync_directory(stage.path)
+
+
+def _require_v2_destination(path: Path, stage: _V2Stage, *, require_name: bool = True) -> None:
+    if (
+        path.is_symlink()
+        or not path.is_dir()
+        or (require_name and path.name != stage.artifact_id)
+        or {item.name for item in path.iterdir()} != {_V2_AUDIO_NAME, _MANIFEST_NAME}
+    ):
+        raise ReadyBundleError("v2 ready artifact inventory is invalid")
+    audio_path = path / _V2_AUDIO_NAME
+    manifest_path = path / _MANIFEST_NAME
+    if any(item.is_symlink() or not item.is_file() for item in (audio_path, manifest_path)):
+        raise ReadyBundleError("v2 ready artifact inventory is unsafe")
+    if _digest(audio_path) != stage.group.audio.sha256 or _digest(manifest_path) != stage.manifest_sha256:
+        raise ReadyBundleError("v2 ready artifact changed")
+
+
+def _discard_v2_stage(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        raise ReadyBundleError("v2 ready stage is unsafe")
+    entries = {item.name: item for item in path.iterdir()}
+    if not set(entries) <= {_V2_AUDIO_NAME, _MANIFEST_NAME}:
+        raise ReadyBundleError("v2 ready stage contains an unsafe entry")
+    for item in entries.values():
+        if item.is_symlink() or not item.is_file():
+            raise ReadyBundleError("v2 ready stage contains an unsafe entry")
+        item.unlink()
+    path.rmdir()
+    _sync_directory(path.parent)
+
+
+def _v2_stage_records_sha256(stage: _V2Stage) -> str:
+    digest = sha256()
+    runs = _v2_normalization_runs(stage.group, _TYPED_PAGE_MAX)
+    for record in _v2_normalized_records(stage.group, _TYPED_PAGE_MAX, runs):
+        digest.update(record)
+    return digest.hexdigest()
+
+
+def _v2_ledger_entry(stage: _V2Stage, records_sha256: str) -> dict[str, object]:
+    entry = _ledger_entry(
+        records_sha256,
+        "ready",
+        stage.group.facts,
+        tuple((item.start_sequence, item.next_sequence, item.raw_sha256) for item in stage.group.slices),
+    )
+    entry.update(
+        format="omi-audio-v2",
+        order=stage.order,
+        audio_sha256=stage.group.audio.sha256,
+        audio_bytes=stage.group.audio.byte_count,
+        manifest_sha256=stage.manifest_sha256,
+        manifest_bytes=len(stage.manifest),
+        packet_count=stage.group.audio.packet_count,
+    )
+    return entry
+
+
+def _commit_v2_stage(
+    audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _V2Stage, result: ReadyBundleResult
+) -> None:
+    _require_v2_staging_proof(audio_store.state_db, stage, _TYPED_PAGE_MAX)
+    progress = _typed_member_progress(cohort, stage.group.facts)
+    all_complete = all(
+        item.new_cursor == admission.admitted_count for item, admission in zip(progress, cohort.admissions, strict=True)
+    )
+    coverage = _typed_coverage_proposals(audio_store, cohort, progress)
+    entry = _v2_ledger_entry(stage, result.records_sha256)
+    proposal = _V2Commit(cohort, stage, entry, progress, coverage, all_complete)
+    for attempt in range(2):
+        try:
+            _commit_v2_stage_once(audio_store, proposal)
+            return
+        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
+            raise_if_sqlite_corrupt(error)
+            state = _inspect_v2_commit(audio_store, proposal, result.path)
+            if state == "proposed":
+                return
+            if state == "old" and attempt == 0:
+                continue
+            if state == "old":
+                raise_if_sqlite_storage_fault(error)
+                raise ReadyBundleError("v2 final commit was rolled back") from error
+            _typed_fail_stop(audio_store, "ambiguous v2 final commit has a third state")
+    raise AssertionError("unreachable")
+
+
+def _inspect_v2_commit(audio_store: InternalAudioStore, proposal: _V2Commit, destination: Path) -> str:
+    cohort, stage = proposal.cohort, proposal.stage
+    try:
+        _require_v2_destination(destination, stage)
+        entry = audio_store.state_db.get(StateKind.READY_PUBLICATION, stage.artifact_id)
+        frontier = audio_store.state_db.get(StateKind.PUBLICATION_V2_FRONTIER, "current")
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
+            cohort_row = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,)
+                )
+            )
+            stage_row = _sql_one(
+                connection.execute(
+                    "SELECT group_identity,owned_path,owner_token,failure_reason FROM ready_v2_output_stage "
+                    "WHERE stage_id=?",
+                    (stage.stage_id,),
+                )
+            )
+            proof = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,stage_id,owner_token FROM ready_replay_proof WHERE bundle_id=?",
+                    (stage.artifact_id,),
+                )
+            )
+            member_rows = _sql_all(
+                connection.execute(
+                    "SELECT member_ordinal,cursor FROM publication_cohort_member WHERE cohort_id=? "
+                    "ORDER BY member_ordinal",
+                    (cohort.cohort_id,),
+                )
+            )
+    except (
+        OSError,
+        ReadyBundleError,
+        StateDBError,
+        sqlite3.DatabaseError,
+        TransientInternalAudioStorageError,
+    ) as error:
+        raise_if_sqlite_corrupt(error)
+        return "third"
+    source_states = tuple(_typed_source_coverage_state(audio_store, item.source_id) for item in proposal.coverage)
+    proposed_sources = all(state == item.proposed for state, item in zip(source_states, proposal.coverage, strict=True))
+    old_sources = all(state == item.old for state, item in zip(source_states, proposal.coverage, strict=True))
+    proposed_cohort = (
+        cohort_row is None
+        if proposal.all_complete
+        else cohort_row == ("accepted", cohort.cursor + 1)
+        and member_rows == tuple((item.member_ordinal, item.new_cursor) for item in proposal.progress)
+    )
+    if all(
+        (
+            entry == proposal.entry,
+            frontier == _v2_frontier_payload(stage.group.final_frontier),
+            stage_row is None,
+            proof == ("active", stage.stage_id, stage.owner_token),
+            proposed_cohort,
+            proposed_sources,
+        )
+    ):
+        return "proposed"
+    old_members = tuple((item.member_ordinal, item.old_cursor) for item in proposal.progress)
+    if all(
+        (
+            entry is None,
+            frontier
+            == (None if stage.group.initial_frontier is None else _v2_frontier_payload(stage.group.initial_frontier)),
+            cohort_row == ("staging", cohort.cursor),
+            stage_row == (stage.group_identity, str(stage.path), stage.owner_token, None),
+            proof == ("staging", stage.stage_id, stage.owner_token),
+            member_rows == old_members,
+            old_sources,
+        )
+    ):
+        return "old"
+    return "third"
+
+
+def _commit_v2_stage_once(audio_store: InternalAudioStore, proposal: _V2Commit) -> None:
+    cohort, stage = proposal.cohort, proposal.stage
+    with audio_store.publication_transaction() as (state, connection):
+        _require_v2_commit_ownership(state, connection, proposal)
+        activated = connection.execute(
+            "UPDATE ready_replay_proof SET lifecycle='active' WHERE bundle_id=? AND lifecycle='staging' "
+            "AND stage_id=? AND owner_token=?",
+            (stage.artifact_id, stage.stage_id, stage.owner_token),
+        )
+        if activated.rowcount != 1:
+            raise ReadyDurabilityFatalError("v2 private replay proof activation changed")
+        state.put(StateKind.READY_PUBLICATION, stage.artifact_id, proposal.entry)
+        frontier_payload = state.get(StateKind.READY_PUBLICATION, "frontier")
+        if frontier_payload is None:
+            old_frontier = 0
+        elif set(frontier_payload) == {"value"} and type(frontier_payload["value"]) is int:
+            old_frontier = cast(int, frontier_payload["value"])
+        else:
+            raise ReadyBundleError("ready publication frontier is invalid")
+        state.put(
+            StateKind.READY_PUBLICATION,
+            "frontier",
+            {"value": max(old_frontier, stage.group.facts.next_sequence)},
+        )
+        state.put(StateKind.PUBLICATION_V2_FRONTIER, "current", _v2_frontier_payload(stage.group.final_frontier))
+        for item in proposal.progress:
+            changed = connection.execute(
+                "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
+                (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
+            )
+            if changed.rowcount != 1:
+                raise ReadyBundleError("v2 cohort member changed before final commit")
+        _apply_typed_coverage(connection, proposal.coverage)
+        connection.execute("DELETE FROM ready_v2_output_stage WHERE stage_id=?", (stage.stage_id,))
+        _advance_v2_commit_cohort(connection, proposal)
+        state.mark_publication_changed()
+
+
+def _require_v2_commit_ownership(
+    state: StateTransaction,
+    connection: sqlite3.Connection,
+    proposal: _V2Commit,
+) -> None:
+    cohort, stage = proposal.cohort, proposal.stage
+    row = _sql_one(
+        connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,))
+    )
+    if row != ("staging", cohort.cursor):
+        raise ReadyBundleError("v2 cohort changed before final commit")
+    stage_row = _sql_one(
+        connection.execute(
+            "SELECT group_identity,owned_path,owner_token,failure_reason FROM ready_v2_output_stage WHERE stage_id=?",
+            (stage.stage_id,),
+        )
+    )
+    if stage_row != (stage.group_identity, str(stage.path), stage.owner_token, None):
+        raise ReadyBundleError("v2 stage ownership changed before final commit")
+    proof = _sql_one(
+        connection.execute(
+            "SELECT lifecycle,stage_id,owner_token FROM ready_replay_proof WHERE bundle_id=?",
+            (stage.artifact_id,),
+        )
+    )
+    if proof != ("staging", stage.stage_id, stage.owner_token):
+        raise ReadyDurabilityFatalError("v2 stage has no complete private replay proof")
+    if state.get(StateKind.READY_PUBLICATION, stage.artifact_id) is not None:
+        raise ReadyBundleError("v2 artifact identity already exists in the publication ledger")
+
+
+def _advance_v2_commit_cohort(connection: sqlite3.Connection, proposal: _V2Commit) -> None:
+    cohort = proposal.cohort
+    if proposal.all_complete:
+        changed = connection.execute(
+            "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='staging' AND cursor=?",
+            (cohort.cohort_id, cohort.cursor),
+        )
+        message = "v2 cohort completion changed before final commit"
+    else:
+        changed = connection.execute(
+            "UPDATE publication_cohort SET lifecycle='accepted',cursor=? WHERE cohort_id=? "
+            "AND lifecycle='staging' AND cursor=?",
+            (cohort.cursor + 1, cohort.cohort_id, cohort.cursor),
+        )
+        message = "v2 cohort cursor changed before final commit"
+    if changed.rowcount != 1:
+        raise ReadyBundleError(message)
+
+
+def _read_v2_ready_source(path: Path, entry: Mapping[str, object]) -> _ReadySource:
+    if (
+        path.is_symlink()
+        or not path.is_dir()
+        or {item.name for item in path.iterdir()}
+        != {
+            _V2_AUDIO_NAME,
+            _MANIFEST_NAME,
+        }
+    ):
+        raise ReadyBundleError("v2 ready artifact inventory is invalid")
+    audio = path / _V2_AUDIO_NAME
+    manifest = path / _MANIFEST_NAME
+    if any(item.is_symlink() or not item.is_file() for item in (audio, manifest)):
+        raise ReadyBundleError("v2 ready artifact is unsafe")
+    if _digest(audio) != entry["audio_sha256"] or _digest(manifest) != entry["manifest_sha256"]:
+        raise ReadyBundleError("v2 ready artifact digest conflicts with its ledger")
+    manifest_value = _read_json(manifest)
+    if not isinstance(manifest_value, dict) or manifest_value.get("format") != "omi-audio-v2":
+        raise ReadyBundleError("v2 ready manifest is invalid")
+    if (
+        manifest_value.get("id") != path.name
+        or manifest_value.get("order") != entry["order"]
+        or manifest_value.get("audio_sha256") != entry["audio_sha256"]
+        or manifest_value.get("packet_count") != entry["packet_count"]
+    ):
+        raise ReadyBundleError("v2 ready manifest conflicts with its ledger")
+    facts = _entry_facts(entry)
+    return _ReadySource(
+        ReadyBundleResult(
+            path.name,
+            path,
+            facts.next_sequence,
+            facts.record_count,
+            cast(str, entry["records_sha256"]),
+        ),
+        facts,
+        (),
+    )
+
+
+def _v2_active_proof(row: tuple[object, ...], source: _ReadySource, entry: Mapping[str, object]) -> _ReplayProof:
+    proof_row = _parse_v2_active_proof_row(row, source.result.bundle_id)
+    projection_sha256 = _v2_descriptor_basis(proof_row.descriptor)[3]
+    expected_content = _v2_proof_content_sha256(
+        _V2ProofContent(
+            source.result.bundle_id,
+            proof_row.order,
+            proof_row.audio_sha256,
+            proof_row.manifest_sha256,
+            proof_row.records_sha256,
+            proof_row.record_count,
+            proof_row.packet_count,
+            projection_sha256,
+            proof_row.page_index,
+            proof_row.packed_runs,
+            proof_row.descriptor,
+        )
+    )
+    if (
+        proof_row.record_count,
+        proof_row.records_sha256,
+        proof_row.manifest_sha256,
+        proof_row.order,
+        proof_row.audio_sha256,
+        proof_row.packet_count,
+        proof_row.content_sha256,
+    ) != (
+        source.facts.record_count,
+        source.result.records_sha256,
+        entry["manifest_sha256"],
+        entry["order"],
+        entry["audio_sha256"],
+        entry["packet_count"],
+        expected_content,
+    ):
+        raise ReadyDurabilityFatalError("active v2 replay proof conflicts with its ledger")
+    index = unpack_page_index(proof_row.page_index, record_count=proof_row.record_count)
+    runs = unpack_normalization_runs(proof_row.packed_runs, record_count=proof_row.record_count)
+    return _ReplayProof(
+        source.result.bundle_id,
+        "active",
+        proof_row.stage_id,
+        proof_row.owner,
+        proof_row.record_count,
+        proof_row.records_sha256,
+        proof_row.manifest_sha256,
+        proof_row.page_index,
+        proof_row.packed_runs,
+        proof_row.descriptor,
+        proof_row.content_sha256,
+        index,
+        runs,
+    )
+
+
+def _parse_v2_active_proof_row(row: tuple[object, ...], artifact_id: str) -> _V2ActiveProofRow:
+    if len(row) != _V2_REPLAY_PROOF_COLUMNS or row[0] != artifact_id or row[1] != "active":
+        raise ReadyDurabilityFatalError("active v2 replay proof is invalid")
+    if not all(
+        (
+            isinstance(row[2], str),
+            isinstance(row[3], str),
+            type(row[4]) is int,
+            isinstance(row[5], str),
+            isinstance(row[6], str),
+            isinstance(row[7], bytes),
+            isinstance(row[8], bytes),
+            isinstance(row[9], bytes),
+            isinstance(row[10], str),
+            isinstance(row[11], bytes) and len(row[11]) == _UINT64_BYTES,
+            isinstance(row[12], str),
+            type(row[13]) is int,
+        )
+    ):
+        raise ReadyDurabilityFatalError("active v2 replay proof has invalid columns")
+    if not 1 <= cast(int, row[4]) <= _UINT32_MAX or not 1 <= cast(int, row[13]) <= _UINT64_MAX:
+        raise ReadyDurabilityFatalError("active v2 replay proof has invalid counts")
+    return _V2ActiveProofRow(
+        cast(str, row[2]),
+        cast(str, row[3]),
+        cast(int, row[4]),
+        cast(str, row[5]),
+        cast(str, row[6]),
+        cast(bytes, row[7]),
+        cast(bytes, row[8]),
+        cast(bytes, row[9]),
+        cast(str, row[10]),
+        decode_uint64(cast(bytes, row[11])),
+        cast(str, row[12]),
+        cast(int, row[13]),
+    )
+
+
+def _v2_ready_custody(
+    ready_root: Path, state_db: StateDB, previous: ReadyCustodyCache | None = None
+) -> ReadyCustodyCache:
+    ledger = _read_ledger(state_db)
+    entries = {
+        bundle_id: cast(dict[str, object], entry)
+        for bundle_id, entry in cast(dict[str, object], ledger["bundles"]).items()
+        if isinstance(entry, dict) and (entry.get("format") == "omi-audio-v2" or entry.get("state") == "retired")
+    }
+    revision = source_revision(ready_root)
+    proof_revision = _replay_proof_rows(state_db)
+    if (
+        previous is not None
+        and previous.revision == revision
+        and previous.proof_revision == proof_revision
+        and previous.custody.entries == entries
+    ):
+        return previous
+    active_ids = {bundle_id for bundle_id, entry in entries.items() if entry["state"] == "ready"}
+    paths = tuple(sorted(_visible_children(ready_root), key=lambda item: item.name))
+    if {path.name for path in paths} != active_ids:
+        raise ReadyBundleError("v2 ready files do not match the active publication ledger")
+    active = tuple(sorted((_read_v2_ready_source(path, entries[path.name]) for path in paths), key=_ready_start))
+    source_by_id = {source.result.bundle_id: source for source in active}
+    rows = {cast(str, row[0]): row for row in _v2_replay_proof_rows(state_db)}
+    if set(rows) != active_ids:
+        raise ReadyDurabilityFatalError("active v2 replay proofs do not match the ledger")
+    try:
+        proofs = {
+            bundle_id: _v2_active_proof(rows[bundle_id], source_by_id[bundle_id], entries[bundle_id])
+            for bundle_id in active_ids
+        }
+    except (ReadyBundleError, ValueError, TypeError, IndexError) as error:
+        raise ReadyDurabilityFatalError("active v2 replay proof is corrupt") from error
+    if revision != source_revision(ready_root):
+        raise ReadyBundleError("v2 ready custody changed during authentication")
+    return ReadyCustodyCache(revision, proof_revision, _TypedReadyCustody(state_db, active, entries, proofs))
+
+
+def _v2_replay_proof_rows(state_db: StateDB) -> tuple[tuple[object, ...], ...]:
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+            return _sql_all(
+                connection.execute(
+                    "SELECT bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,manifest_sha256,"
+                    "page_index,normalization_runs,immutable_metadata,proof_content_sha256,public_order,"
+                    "audio_sha256,packet_count FROM ready_replay_proof WHERE format='omi-audio-v2' AND lifecycle='active' "
+                    "ORDER BY bundle_id"
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyDurabilityFatalError("active v2 replay proofs are unreadable") from error
 
 
 def _make_typed_group(slices: tuple[_TypedSlice, ...], page_limit: int, clock_segments: ClockSegmentMap) -> _TypedGroup:

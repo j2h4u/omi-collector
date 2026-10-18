@@ -19,8 +19,9 @@ from urllib.parse import quote
 from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from .sqlite_admission import admit_exclusive, admit_immediate, commit_with_busy_retry
 
-_SCHEMA_VERSION = 3
-_PREVIOUS_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
+_PREVIOUS_SCHEMA_VERSION = 3
+_LEGACY_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5_000
 _STATE_DB_MODE = 0o640
 
@@ -43,6 +44,8 @@ class StateKind(StrEnum):
     COMPACTION = "compaction"
     PENDANT_DRAIN = "pendant_drain"
     BLE_SCAN_INCIDENT = "ble_scan_incident"
+    PUBLICATION_CONTRACT = "publication_contract"
+    PUBLICATION_V2_FRONTIER = "publication_v2_frontier"
 
 
 class StateDBError(RuntimeError):
@@ -502,6 +505,14 @@ class StateDB(_Operations):
                 )
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 install_audio_schema(connection)
+                connection.execute(
+                    "INSERT INTO state(kind,id,payload) VALUES (?,?,?)",
+                    (
+                        StateKind.PUBLICATION_CONTRACT.value,
+                        "current",
+                        _encode({"version": 1, "mode": "legacy_open", "next_public_order": None}),
+                    ),
+                )
             elif version != _SCHEMA_VERSION or "state" not in tables:
                 raise StateDBError("state database schema is unsupported")
             _validate_schema(connection)
@@ -684,6 +695,8 @@ def _is_publication_input(kind: StateKind) -> bool:
         StateKind.READY_PUBLICATION,
         StateKind.READY_CLOSURE,
         StateKind.CLOCK,
+        StateKind.PUBLICATION_CONTRACT,
+        StateKind.PUBLICATION_V2_FRONTIER,
     }
 
 
@@ -796,6 +809,8 @@ _AUDIO_TABLES = (
     "ready_stage_range",
     "ready_replay_proof",
     "ready_replay_proof_page",
+    "ready_v2_output_stage",
+    "ready_v2_stage_range",
 )
 
 
@@ -931,7 +946,13 @@ _AUDIO_DDL = (
         "page_index BLOB NOT NULL CHECK (typeof(page_index) = 'blob' AND length(page_index) > 0),"
         "normalization_runs BLOB NOT NULL CHECK (typeof(normalization_runs) = 'blob' AND length(normalization_runs) > 0),"
         "immutable_metadata BLOB NOT NULL CHECK (typeof(immutable_metadata) = 'blob' AND length(immutable_metadata) > 0),"
-        "proof_content_sha256 TEXT NOT NULL CHECK (length(proof_content_sha256) = 64 AND lower(proof_content_sha256) = proof_content_sha256 AND proof_content_sha256 NOT GLOB '*[^0-9a-f]*')"
+        "proof_content_sha256 TEXT NOT NULL CHECK (length(proof_content_sha256) = 64 AND lower(proof_content_sha256) = proof_content_sha256 AND proof_content_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "format TEXT NOT NULL DEFAULT 'legacy-records-v1' CHECK (format IN ('legacy-records-v1','omi-audio-v2')),"
+        "public_order BLOB CHECK (public_order IS NULL OR (typeof(public_order) = 'blob' AND length(public_order) = 8)),"
+        "audio_sha256 TEXT CHECK (audio_sha256 IS NULL OR (length(audio_sha256) = 64 AND lower(audio_sha256) = audio_sha256 AND audio_sha256 NOT GLOB '*[^0-9a-f]*')),"
+        "packet_count INTEGER CHECK (packet_count IS NULL OR packet_count >= 1),"
+        "CHECK ((format = 'legacy-records-v1' AND public_order IS NULL AND audio_sha256 IS NULL AND packet_count IS NULL) OR "
+        "(format = 'omi-audio-v2' AND public_order IS NOT NULL AND audio_sha256 IS NOT NULL AND packet_count IS NOT NULL))"
         ") WITHOUT ROWID"
     ),
     _ddl(
@@ -945,10 +966,58 @@ _AUDIO_DDL = (
         "FOREIGN KEY (bundle_id) REFERENCES ready_replay_proof(bundle_id) ON DELETE CASCADE"
         ") WITHOUT ROWID"
     ),
+    _ddl(
+        "CREATE TABLE ready_v2_output_stage ("
+        "stage_id TEXT PRIMARY KEY NOT NULL CHECK (length(stage_id) = 64 AND lower(stage_id) = stage_id AND stage_id NOT GLOB '*[^0-9a-f]*'),"
+        "group_identity TEXT NOT NULL UNIQUE, owned_path TEXT NOT NULL,"
+        "stage_nonce BLOB NOT NULL CHECK (typeof(stage_nonce) = 'blob' AND length(stage_nonce) = 32),"
+        "public_order BLOB NOT NULL CHECK (typeof(public_order) = 'blob' AND length(public_order) = 8),"
+        "artifact_id TEXT NOT NULL UNIQUE CHECK (length(artifact_id) = 64 AND lower(artifact_id) = artifact_id AND artifact_id NOT GLOB '*[^0-9a-f]*'),"
+        "config_sha256 TEXT NOT NULL CHECK (length(config_sha256) = 64 AND lower(config_sha256) = config_sha256 AND config_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "descriptor BLOB NOT NULL CHECK (typeof(descriptor) = 'blob' AND length(descriptor) > 0),"
+        "descriptor_sha256 TEXT NOT NULL CHECK (length(descriptor_sha256) = 64 AND lower(descriptor_sha256) = descriptor_sha256 AND descriptor_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "expected_audio_sha256 TEXT NOT NULL CHECK (length(expected_audio_sha256) = 64 AND lower(expected_audio_sha256) = expected_audio_sha256 AND expected_audio_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "expected_manifest_sha256 TEXT NOT NULL CHECK (length(expected_manifest_sha256) = 64 AND lower(expected_manifest_sha256) = expected_manifest_sha256 AND expected_manifest_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "expected_physical_count INTEGER NOT NULL CHECK (expected_physical_count BETWEEN 1 AND 4294967295),"
+        "expected_packet_count INTEGER NOT NULL CHECK (expected_packet_count >= 1),"
+        "expected_page_count INTEGER NOT NULL CHECK (expected_page_count >= 1),"
+        "expected_audio_bytes INTEGER NOT NULL CHECK (expected_audio_bytes >= 1),"
+        "pending_overflow_size INTEGER CHECK (pending_overflow_size IS NULL OR pending_overflow_size BETWEEN 1 AND 160),"
+        "owner_token TEXT NOT NULL, failure_reason TEXT CHECK (failure_reason IS NULL OR failure_reason = 'durability_io_error')"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE ready_v2_stage_range ("
+        "stage_id TEXT NOT NULL, range_ordinal INTEGER NOT NULL CHECK (range_ordinal BETWEEN 0 AND 4294967295),"
+        "source_id TEXT NOT NULL, start_ordinal INTEGER NOT NULL CHECK (start_ordinal BETWEEN 0 AND 4294967295),"
+        "record_count INTEGER NOT NULL CHECK (record_count BETWEEN 1 AND 4294967295),"
+        "sequence_start BLOB NOT NULL CHECK (typeof(sequence_start) = 'blob' AND length(sequence_start) = 8),"
+        "next_sequence BLOB NOT NULL CHECK (typeof(next_sequence) = 'blob' AND length(next_sequence) = 8 AND next_sequence > sequence_start),"
+        "raw_sha256 TEXT NOT NULL CHECK (length(raw_sha256) = 64 AND lower(raw_sha256) = raw_sha256 AND raw_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "PRIMARY KEY (stage_id, range_ordinal),"
+        "FOREIGN KEY (stage_id) REFERENCES ready_v2_output_stage(stage_id) ON DELETE CASCADE,"
+        "FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
+        ") WITHOUT ROWID"
+    ),
 )
 
-_V2_AUDIO_TABLES = _AUDIO_TABLES[:-2]
-_V2_AUDIO_DDL = _AUDIO_DDL[:-2]
+_V3_REPLAY_PROOF_DDL = _ddl(
+    "CREATE TABLE ready_replay_proof ("
+    "bundle_id TEXT PRIMARY KEY NOT NULL CHECK (length(bundle_id) = 64 AND lower(bundle_id) = bundle_id AND bundle_id NOT GLOB '*[^0-9a-f]*'),"
+    "lifecycle TEXT NOT NULL CHECK (lifecycle IN ('staging','active')), stage_id TEXT NOT NULL, owner_token TEXT NOT NULL,"
+    "record_count INTEGER NOT NULL CHECK (record_count BETWEEN 1 AND 4294967295),"
+    "records_sha256 TEXT NOT NULL CHECK (length(records_sha256) = 64 AND lower(records_sha256) = records_sha256 AND records_sha256 NOT GLOB '*[^0-9a-f]*'),"
+    "manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64 AND lower(manifest_sha256) = manifest_sha256 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'),"
+    "page_index BLOB NOT NULL CHECK (typeof(page_index) = 'blob' AND length(page_index) > 0),"
+    "normalization_runs BLOB NOT NULL CHECK (typeof(normalization_runs) = 'blob' AND length(normalization_runs) > 0),"
+    "immutable_metadata BLOB NOT NULL CHECK (typeof(immutable_metadata) = 'blob' AND length(immutable_metadata) > 0),"
+    "proof_content_sha256 TEXT NOT NULL CHECK (length(proof_content_sha256) = 64 AND lower(proof_content_sha256) = proof_content_sha256 AND proof_content_sha256 NOT GLOB '*[^0-9a-f]*')"
+    ") WITHOUT ROWID"
+)
+_V3_AUDIO_TABLES = _AUDIO_TABLES[:-2]
+_V3_AUDIO_DDL = (*_AUDIO_DDL[:10], _V3_REPLAY_PROOF_DDL, _AUDIO_DDL[11])
+_V2_AUDIO_TABLES = _V3_AUDIO_TABLES[:-2]
+_V2_AUDIO_DDL = _V3_AUDIO_DDL[:-2]
 
 _AUDIO_INDEXES = {
     "capture_record_mapping_revision_idx": (
@@ -991,19 +1060,67 @@ def install_replay_proof_schema_for_upgrade(connection: sqlite3.Connection) -> N
 
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    if _user_version(connection) != _PREVIOUS_SCHEMA_VERSION:
+    if _user_version(connection) != _LEGACY_SCHEMA_VERSION:
         raise StateDBError("state database schema is not eligible for proof migration")
     _validate_schema(connection)
+    _validate_audio_schema(connection, version=_LEGACY_SCHEMA_VERSION)
+    for ddl in _V3_AUDIO_DDL[-2:]:
+        connection.execute(ddl)
+
+
+def install_public_audio_v2_schema_for_upgrade(connection: sqlite3.Connection) -> None:
+    """Extend one validated v3 transaction without committing its migration."""
+
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    if _user_version(connection) != _PREVIOUS_SCHEMA_VERSION:
+        raise StateDBError("state database schema is not eligible for public audio v2 migration")
+    _validate_schema(connection)
     _validate_audio_schema(connection, version=_PREVIOUS_SCHEMA_VERSION)
+    _upgrade_replay_proof_root(connection)
     for ddl in _AUDIO_DDL[-2:]:
         connection.execute(ddl)
 
 
+def _upgrade_replay_proof_root(connection: sqlite3.Connection) -> None:
+    """Rebuild the proof root as a tagged union while retaining shared proof pages."""
+
+    connection.execute(
+        "CREATE TEMP TABLE replay_root_backup AS SELECT bundle_id,lifecycle,stage_id,owner_token,record_count,"
+        "records_sha256,manifest_sha256,page_index,normalization_runs,immutable_metadata,proof_content_sha256 "
+        "FROM ready_replay_proof"
+    )
+    connection.execute(
+        "CREATE TEMP TABLE replay_page_backup AS SELECT bundle_id,page_ordinal,first_record_index,record_count,"
+        "hashes,page_sha256 FROM ready_replay_proof_page"
+    )
+    connection.execute("DROP TABLE ready_replay_proof_page")
+    connection.execute("DROP TABLE ready_replay_proof")
+    connection.execute(_AUDIO_DDL[10])
+    connection.execute(
+        "INSERT INTO ready_replay_proof(bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,"
+        "manifest_sha256,page_index,normalization_runs,immutable_metadata,proof_content_sha256) "
+        "SELECT bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,manifest_sha256,page_index,"
+        "normalization_runs,immutable_metadata,proof_content_sha256 FROM replay_root_backup"
+    )
+    connection.execute(_AUDIO_DDL[11])
+    connection.execute(
+        "INSERT INTO ready_replay_proof_page(bundle_id,page_ordinal,first_record_index,record_count,hashes,page_sha256) "
+        "SELECT bundle_id,page_ordinal,first_record_index,record_count,hashes,page_sha256 FROM replay_page_backup"
+    )
+    connection.execute("DROP TABLE replay_page_backup")
+    connection.execute("DROP TABLE replay_root_backup")
+
+
 def _validate_audio_schema(connection: sqlite3.Connection, *, version: int = _SCHEMA_VERSION) -> None:
-    tables = _AUDIO_TABLES if version == _SCHEMA_VERSION else _V2_AUDIO_TABLES
-    ddl_statements = _AUDIO_DDL if version == _SCHEMA_VERSION else _V2_AUDIO_DDL
-    if version not in {_PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}:
+    schemas = {
+        _LEGACY_SCHEMA_VERSION: (_V2_AUDIO_TABLES, _V2_AUDIO_DDL),
+        _PREVIOUS_SCHEMA_VERSION: (_V3_AUDIO_TABLES, _V3_AUDIO_DDL),
+        _SCHEMA_VERSION: (_AUDIO_TABLES, _AUDIO_DDL),
+    }
+    if version not in schemas:
         raise StateDBError("state database typed schema version is unsupported")
+    tables, ddl_statements = schemas[version]
     rows = _fetchall(connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'"))
     user_tables = {_row_text(row, "name") for row in rows if not _row_text(row, "name").startswith("sqlite_")}
     expected_tables = {"state", *tables}

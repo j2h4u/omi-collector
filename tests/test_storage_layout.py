@@ -57,6 +57,18 @@ def test_config_wires_bundle_minimum(tmp_path: Path) -> None:
     assert loaded.config.ready.target_audio_seconds == 1200.0
 
 
+def test_config_accepts_optional_scan_silence_threshold(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 3600.0\nscan_silence_seconds = 240.0\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_operator_config(path)
+
+    assert loaded.config.presence.scan_silence_seconds == 240.0
+
+
 @pytest.mark.parametrize("seconds", ["0.0", "nan", "inf", "1e308"])
 def test_config_rejects_invalid_bundle_minimum(tmp_path: Path, seconds: str) -> None:
     path = tmp_path / "config.toml"

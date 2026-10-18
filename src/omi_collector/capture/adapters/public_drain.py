@@ -15,15 +15,16 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
+from omi_collector.capture.adapters.ble_scan_health_store import read_ble_scan_incident
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind, StateTransaction
 from omi_collector.capture.domain.ring_protocol import RingInfo
 
 _ROW_ID = "current"
 _VERSION = 1
+_PUBLIC_VERSION = 2
 _ROW_FIELDS = frozenset(
     {"version", "ring", "last_drain", "battery", "pending_event_id", "pending_source_id", "pending_frontier"}
 )
-_PUBLIC_FIELDS = frozenset({"version", "ring", "last_drain", "battery"})
 _OBSERVATION_FIELDS = 2
 _MAX_BATTERY_PERCENT = 100
 _PRIVATE_TEMP_MODES = frozenset({0o600, 0o640})
@@ -75,7 +76,7 @@ class PublicDrainProjection:
                     continue
             self._stale_files_scanned = True
         row = self._state_db.get(StateKind.PENDANT_DRAIN, _ROW_ID)
-        public = _public_row(row)
+        public = _public_row(row, read_ble_scan_incident(self._state_db))
         encoded = (json.dumps(public, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         if not self._needs_sync and _matches_public_file(self.path, encoded, parent_stat.st_gid):
             return
@@ -183,11 +184,46 @@ class PublicDrainProjection:
         tx.put(StateKind.PENDANT_DRAIN, _ROW_ID, row)
 
 
-def _public_row(row: dict[str, object] | None) -> dict[str, object]:
+def _public_row(row: dict[str, object] | None, incident: dict[str, object] | None) -> dict[str, object]:
+    bluetooth = _public_incident(incident)
     if row is None:
-        return {"version": _VERSION, "ring": None, "last_drain": None, "battery": None}
+        return {"version": _PUBLIC_VERSION, "ring": None, "last_drain": None, "battery": None, "bluetooth": bluetooth}
     validated = _validate_row(row)
-    return {key: validated[key] for key in _PUBLIC_FIELDS}
+    return {
+        "version": _PUBLIC_VERSION,
+        "ring": validated["ring"],
+        "last_drain": validated["last_drain"],
+        "battery": validated["battery"],
+        "bluetooth": bluetooth,
+    }
+
+
+def _public_incident(incident: dict[str, object] | None) -> dict[str, object] | None:
+    if incident is None:
+        return None
+    allowed = {"scan_silence", "scan_start_failed", "scan_stop_failed"}
+    status = incident.get("status")
+    reason = incident.get("reason")
+    incident_id = incident.get("incident_id")
+    detected_at = incident.get("detected_at")
+    resolved_at = incident.get("resolved_at")
+    if status not in {"open", "resolved"} or reason not in allowed:
+        raise ValueError("Bluetooth scan incident summary is invalid")
+    if not isinstance(incident_id, str) or not incident_id.strip():
+        raise ValueError("Bluetooth scan incident summary is invalid")
+    _validate_timestamp(cast(str, detected_at))
+    if status == "open":
+        if resolved_at is not None:
+            raise ValueError("Bluetooth scan incident summary is invalid")
+    else:
+        _validate_timestamp(cast(str, resolved_at))
+    return {
+        "incident_id": incident_id,
+        "status": status,
+        "reason": reason,
+        "detected_at": detected_at,
+        "resolved_at": resolved_at,
+    }
 
 
 def _row_or_empty(row: dict[str, object] | None) -> dict[str, object]:

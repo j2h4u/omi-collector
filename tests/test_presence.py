@@ -7,6 +7,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from omi_collector.capture.application import presence as presence_module
+from omi_collector.capture.application.ble_scan_health import ScanRadioActivity
 from omi_collector.capture.application.presence import (
     PresenceAdvertisement,
     PresenceEnd,
@@ -170,7 +171,9 @@ def test_bleak_observer_requests_duplicate_data_and_filters_exact_address() -> N
         callback(matching, Advertisement())  # type: ignore[operator]
         await observer.stop()
 
-        assert seen == [PresenceAdvertisement(matching, -73)]
+        assert len(seen) == 3
+        assert all(isinstance(item, ScanRadioActivity) for item in seen[:2])
+        assert seen[2] == PresenceAdvertisement(matching, -73)
         assert kwargs["bluez"] == {"adapter": "hci0", "filters": {"DuplicateData": True}}
         assert events == ["start", "stop"]
 

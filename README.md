@@ -141,6 +141,9 @@ observations with no gap of 10 seconds or more before GATT opens. To tune it,
 set both optional flat keys `presence_arrival_stability_seconds` and
 `presence_arrival_max_gap_seconds`; they are omitted from the example because
 the defaults are suitable for most installations.
+The optional flat key `scan_silence_seconds` defaults to `180` positive
+seconds and sets the all-device receive-fault threshold; pendant absence does
+not count as a scan fault.
 The installer creates the service account, keeps the configuration root-owned
 and readable by both services as mode `0644`, and enables the service. It does not start the
 service unless `--restart` is explicit. Complete the first successful
@@ -212,18 +215,29 @@ their custody boundaries.
 For a notification consumer, Collector publishes the small atomic snapshot
 `collector/public/pendant-drain.json` beside the private state database. Mount
 only `collector/public` read-only; the consumer does not need SQLite, READY,
-or service-control access. The version-1 document has exactly four fields:
+or service-control access. Consumers must accept both version 1 and version 2
+before version 2 is deployed. The version-2 document has exactly five fields:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "ring": {"observed_at": "2026-10-17T12:00:00+00:00", "unread_packets": 0},
   "last_drain": {"event_id": "example-stable-id", "completed_at": "2026-10-17T12:00:00+00:00"},
-  "battery": {"percent": 85, "observed_at": "2026-10-17T11:59:59+00:00"}
+  "battery": {"percent": 85, "observed_at": "2026-10-17T11:59:59+00:00"},
+  "bluetooth": null
 }
 ```
 
 `ring`, `last_drain`, and `battery` may each be `null` when unknown.
+`bluetooth` is `null` until a scan-health incident exists, then contains its
+stable incident ID, open/resolved status, reason, detection time, and optional
+resolution time. It omits diagnostic details. The fixed host adapter is
+expected to observe ambient Bluetooth advertisements continuously: zero
+advertisements for 180 seconds while scanning is expected indicates a scan
+fault. Pendant absence is normal; GATT work and intentional scan pauses are
+excluded. The initial behavior records bounded evidence and does not restart
+the scanner automatically. A resolved incident remains visible as the latest
+summary until another incident replaces it.
 Observation timestamps are when
 the device was read, not when the JSON was generated. `last_drain` records a
 confirmed empty ring after durable host storage; its ID survives restarts and

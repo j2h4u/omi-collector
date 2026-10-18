@@ -102,6 +102,7 @@ def _parse_settings(document: dict[str, object]) -> tuple[str, CollectorConfig]:
         "bundle_min_audio_seconds",
         "presence_arrival_stability_seconds",
         "presence_arrival_max_gap_seconds",
+        "scan_silence_seconds",
     }
     required = {"pendant_address", "bundle_min_audio_seconds"}
     if not isinstance(document, dict):
@@ -143,7 +144,18 @@ def _parse_settings(document: dict[str, object]) -> tuple[str, CollectorConfig]:
         )
     except ValueError as error:
         raise StorageLayoutError(f"bundle settings are invalid: {error}") from error
+    runtime_config = _scan_silence_config(document, runtime_config)
     return address, runtime_config
+
+
+def _scan_silence_config(document: dict[str, object], config: CollectorConfig) -> CollectorConfig:
+    if "scan_silence_seconds" not in document:
+        return config
+    silence = _number_fields(document, {"scan_silence_seconds"})["scan_silence_seconds"]
+    try:
+        return replace(config, presence=replace(config.presence, scan_silence_seconds=silence))
+    except ValueError as error:
+        raise StorageLayoutError(f"scan_silence_seconds is invalid: {error}") from error
 
 
 def _number_fields(document: dict[str, object], keys: set[str]) -> dict[str, float]:

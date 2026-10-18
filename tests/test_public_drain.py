@@ -24,15 +24,17 @@ def test_projection_starts_unknown_and_private_pending_token_is_never_exported(t
 
     projection.publish_snapshot()
     assert json.loads(projection.path.read_text(encoding="utf-8")) == {
-        "version": 1,
+        "version": 2,
         "ring": None,
         "last_drain": None,
         "battery": None,
+        "bluetooth": None,
     }
     projection.update_observations(ring=(3, _NOW), battery=(81, _NOW))
     projection.arm_pending("source-a", 10)
     initial_private = projection._state_db.get(StateKind.PENDANT_DRAIN, "current")
     assert initial_private is not None
+    assert initial_private["version"] == 1
     initial_event_id = initial_private["pending_event_id"]
     projection.arm_pending("source-a", 10)
     assert projection._state_db.get(StateKind.PENDANT_DRAIN, "current")["pending_event_id"] == initial_event_id  # type: ignore[index]
@@ -41,14 +43,71 @@ def test_projection_starts_unknown_and_private_pending_token_is_never_exported(t
     exported = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
     private = projection._state_db.get(StateKind.PENDANT_DRAIN, "current")
     assert exported == {
-        "version": 1,
+        "version": 2,
         "ring": {"unread_packets": 3, "observed_at": _NOW},
         "last_drain": None,
         "battery": {"percent": 81, "observed_at": _NOW},
+        "bluetooth": None,
     }
     assert private is not None and isinstance(private["pending_event_id"], str)
     assert "pending_event_id" not in exported
     assert projection.path.stat().st_mode & 0o777 == 0o640
+
+
+def test_projection_exports_only_bounded_bluetooth_incident_summary(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    projection = PublicDrainProjection(db, tmp_path / "public" / "pendant-drain.json")
+    projection.path.parent.mkdir(mode=0o2750)
+    projection.path.parent.chmod(0o2750)
+    db.put(
+        StateKind.BLE_SCAN_INCIDENT,
+        "open",
+        {
+            "incident_id": "incident-1",
+            "status": "open",
+            "detected_at": _NOW,
+            "context": {"reason": "scan_silence", "private_context": "omit me"},
+            "diagnostics": {"controller": "omit me"},
+        },
+    )
+    projection.publish_snapshot()
+    opened = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
+    assert opened["version"] == 2
+    assert opened["bluetooth"] == {
+        "incident_id": "incident-1",
+        "status": "open",
+        "reason": "scan_silence",
+        "detected_at": _NOW,
+        "resolved_at": None,
+    }
+    assert "private_context" not in projection.path.read_text(encoding="utf-8")
+    assert "diagnostics" not in projection.path.read_text(encoding="utf-8")
+
+    db.delete(StateKind.BLE_SCAN_INCIDENT, "open")
+    db.put(
+        StateKind.BLE_SCAN_INCIDENT,
+        "history",
+        {
+            "entries": [
+                {
+                    "incident_id": "incident-1",
+                    "detected_at": _NOW,
+                    "resolved_at": "2026-10-17T12:05:00+00:00",
+                    "context": {"reason": "scan_silence"},
+                    "diagnostics": {"private": "omit me"},
+                }
+            ]
+        },
+    )
+    projection.publish_snapshot()
+    resolved = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
+    assert resolved["bluetooth"] == {
+        "incident_id": "incident-1",
+        "status": "resolved",
+        "reason": "scan_silence",
+        "detected_at": _NOW,
+        "resolved_at": "2026-10-17T12:05:00+00:00",
+    }
 
 
 def test_completion_requires_zero_info_and_frontier_and_preserves_identity_without_token(tmp_path: Path) -> None:

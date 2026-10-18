@@ -17,6 +17,7 @@ from typing import Literal, Protocol, cast
 
 from ...config import DEFAULT_CONFIG
 from . import presence_machine as machine
+from .ble_scan_health import ScanHealthMonitor, ScanRadioActivity
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,10 +123,12 @@ class PresenceScheduler:
         observer: PresenceObserver,
         *,
         policy: PresencePolicy | None = None,
+        scan_health: ScanHealthMonitor | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], object] = asyncio.sleep,
     ) -> None:
         self._observer = observer
+        self._scan_health = scan_health
         self._policy = policy or PresencePolicy()
         self._machine_policy = self._policy.machine_policy()
         self._clock = clock
@@ -193,12 +196,15 @@ class PresenceScheduler:
         """Idempotently close product state and make one bounded stop attempt."""
         self._close_state()
         await self._best_effort_stop(force=self._force_stop_required)
+        if self._scan_health is not None:
+            await self._scan_health.flush_recovery()
 
     async def _wait_for_attempt(self) -> PresenceWake | PresenceEnd:
         while True:
             if isinstance(self._state, machine.Closed):
                 raise RuntimeError("presence scheduler is closed")
             await self._start_scan()
+            await self._flush_scan_recovery()
             if isinstance(self._state, machine.Closed):
                 raise RuntimeError("presence scheduler is closed")
             advertisement = self._next_advertisement()
@@ -216,11 +222,18 @@ class PresenceScheduler:
             wake = await self._wait_until_event(deadline)
             if wake is not None:
                 return wake
+            await self._flush_scan_recovery()
+
+    async def _flush_scan_recovery(self) -> None:
+        if self._scan_health is not None:
+            await self._scan_health.flush_recovery()
 
     async def _wait_until_event(self, deadline: float) -> PresenceWake | PresenceEnd | None:
         self._changed.clear()
         advertisement_task = asyncio.create_task(self._advertisements.get())
-        timer_task = asyncio.create_task(self._sleep_until(deadline))
+        scan_deadline = self._scan_health.next_deadline if self._scan_health is not None else None
+        wake_deadline = min(deadline, scan_deadline) if scan_deadline is not None else deadline
+        timer_task = asyncio.create_task(self._sleep_until(wake_deadline))
         changed_task = asyncio.create_task(self._changed.wait())
         try:
             done, _ = await asyncio.wait(
@@ -235,6 +248,10 @@ class PresenceScheduler:
             advertisement = self._next_advertisement()
             if advertisement is not None:
                 return await self._handle_advertisement(advertisement)
+            if self._scan_health is not None:
+                await self._scan_health.check_deadline(self._clock())
+            if self._clock() < deadline:
+                return None
             return await self._handle_timer(deadline)
         finally:
             await _cancel_task(advertisement_task)
@@ -288,6 +305,8 @@ class PresenceScheduler:
         self._next_scanner_generation += 1
         self._active_scanner_generation = generation
         try:
+            if self._scan_health is not None:
+                await self._scan_health.prepare(generation)
             await _transition(
                 self._observer.start(lambda observation: self._receive_advertisement(generation, observation)),
                 policy=self._policy,
@@ -297,16 +316,22 @@ class PresenceScheduler:
             self._active_scanner_generation = None
             self._discard_advertisements()
             self._interrupt_presence()
-            await self._best_effort_stop_locked(force=True)
+            try:
+                await self._best_effort_stop_locked(force=True)
+            finally:
+                if self._scan_health is not None:
+                    await self._scan_health.scan_stopped(generation)
             raise
-        except PresenceScanTransitionError:
+        except PresenceScanTransitionError as error:
+            await self._record_scan_start_failure(generation, error)
             self._active_scanner_generation = None
             self._force_stop_required = True
             self._discard_advertisements()
             self._close_state()
             await self._best_effort_stop_locked(force=True)
             raise
-        except Exception:  # noqa: BLE001 - a normal scanner-start refusal is soft
+        except Exception as error:  # noqa: BLE001 - a normal scanner-start refusal is soft
+            await self._record_scan_start_failure(generation, error)
             self._active_scanner_generation = None
             self._discard_advertisements()
             self._interrupt_presence()
@@ -315,7 +340,13 @@ class PresenceScheduler:
         if isinstance(self._state, machine.Closed):
             await self._best_effort_stop_locked(force=True)
             return False
+        if self._scan_health is not None:
+            self._scan_health.scan_started(generation, self._clock())
         return True
+
+    async def _record_scan_start_failure(self, generation: int, error: Exception) -> None:
+        if self._scan_health is not None:
+            await self._scan_health.scan_start_failed(generation, error)
 
     async def _stop_scan(self, *, force: bool = False) -> None:
         async with self._scanner_transition_lock:
@@ -324,23 +355,48 @@ class PresenceScheduler:
     async def _stop_scan_locked(self, *, force: bool) -> None:
         if self._active_scanner_generation is None and not force:
             return
+        generation = self._active_scanner_generation
         self._active_scanner_generation = None
         self._discard_advertisements()
+        if self._scan_health is not None and generation is not None:
+            self._scan_health.scan_stopping(generation)
         try:
             await _transition(self._observer.stop(), policy=self._policy, operation="stop")
         except asyncio.CancelledError:
             self._force_stop_required = True
             self._close_state()
+            if self._scan_health is not None and generation is not None:
+                await self._scan_health.scan_stopped(generation)
             raise
         except (TimeoutError, PresenceScanTransitionError) as error:
             self._force_stop_required = True
+            if self._scan_health is not None and generation is not None:
+                await self._scan_health.scan_stop_failed(generation, error)
             raise PresenceScanStopError(str(error)) from error
         except Exception as error:
             self._force_stop_required = True
+            if self._scan_health is not None and generation is not None:
+                await self._scan_health.scan_stop_failed(generation, error)
             raise PresenceScanStopError("presence scanner stop failed") from error
         self._force_stop_required = False
+        if self._scan_health is not None and generation is not None:
+            await self._scan_health.scan_stopped(generation)
 
     def _receive_advertisement(self, generation: int, observation: object) -> None:
+        if isinstance(observation, ScanRadioActivity):
+            loop = self._loop
+            if loop is None:
+                return
+            try:
+                callback_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop.call_soon_threadsafe(self._receive_scan_radio_activity, generation, observation.observed_at)
+                return
+            if callback_loop is loop:
+                self._receive_scan_radio_activity(generation, observation.observed_at)
+            else:
+                loop.call_soon_threadsafe(self._receive_scan_radio_activity, generation, observation.observed_at)
+            return
         advertisement = (
             observation if isinstance(observation, PresenceAdvertisement) else PresenceAdvertisement(observation)
         )
@@ -351,6 +407,12 @@ class PresenceScheduler:
         )
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._buffer_advertisement, generation, event)
+
+    def _receive_scan_radio_activity(self, generation: int, observed_at: float) -> None:
+        if generation != self._active_scanner_generation or isinstance(self._state, machine.Closed):
+            return
+        if self._scan_health is not None and self._scan_health.radio_activity(generation, observed_at):
+            self._changed.set()
 
     def _buffer_advertisement(self, generation: int, advertisement: machine.Advertisement) -> None:
         if generation != self._active_scanner_generation or isinstance(self._state, machine.Closed):

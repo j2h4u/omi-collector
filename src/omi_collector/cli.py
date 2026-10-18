@@ -812,6 +812,7 @@ def _sync(
             loaded.pendant.address,
             _capture_cli().SUPPORTED_ADAPTER,
             config=loaded.config,
+            staging=staging,
         )
         sync_operation = _capture_cli().sync(
             loaded.pendant.address,

@@ -20,6 +20,7 @@ from omi_collector.capture.adapters.bleak_transport import (
     RingGattValidationError,
     validate_ring_characteristics,
 )
+from omi_collector.capture.application.ble_scan_health import ScanRadioActivity
 from omi_collector.capture.application.collector import RingTransferError
 from omi_collector.capture.application.operational_telemetry import (
     TIME_READ_UUID,
@@ -353,7 +354,7 @@ async def test_presence_observer_forwards_only_matching_device_with_integer_rssi
         scanner_options.update(kwargs)
         return Scanner()
 
-    observed: list[bleak_transport.PresenceAdvertisement] = []
+    observed: list[object] = []
     observer = bleak_transport.BleakPresenceObserver("aa:bb", scanner_factory=scanner_factory)
     await observer.start(
         lambda advertisement: observed.append(cast(bleak_transport.PresenceAdvertisement, advertisement))
@@ -363,7 +364,9 @@ async def test_presence_observer_forwards_only_matching_device_with_integer_rssi
     detect(target, SimpleNamespace(rssi=-42))
     detect(BLEDevice("AA:BC", "other", object()), SimpleNamespace(rssi=-1))
     detect(target, SimpleNamespace(rssi=True))
-    assert [(entry.candidate, entry.rssi_dbm) for entry in observed] == [(target, -42), (target, None)]
+    assert sum(isinstance(entry, ScanRadioActivity) for entry in observed) == 3
+    advertisements = [entry for entry in observed if isinstance(entry, bleak_transport.PresenceAdvertisement)]
+    assert [(entry.candidate, entry.rssi_dbm) for entry in advertisements] == [(target, -42), (target, None)]
     await observer.stop()
 
 

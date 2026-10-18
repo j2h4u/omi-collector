@@ -22,6 +22,7 @@ from bleak.backends.device import BLEDevice
 
 from ..config import DEFAULT_CONFIG, CollectorConfig
 from ..core import package_version
+from .adapters.ble_scan_health_store import BleScanIncidentStore, ScanDiagnosticsFacade
 from .adapters.bleak_transport import BleakPresenceObserver, BleakRingTransport, Device
 from .adapters.collector_state_db import StateDB
 from .adapters.opportunistic_runtime import OpportunisticRuntime, create_quality_metrics_owned
@@ -197,6 +198,7 @@ def make_presence_scheduler(
     *,
     policy: PresencePolicy | None = None,
     config: CollectorConfig = DEFAULT_CONFIG,
+    staging: StagingStore | None = None,
 ) -> PresenceScheduler:
     """Build the production exact-address observer and monotonic scheduler."""
     if policy is None:
@@ -212,7 +214,17 @@ def make_presence_scheduler(
             scan_cancel_grace_max_seconds=config.presence.scan_cancel_grace_max_seconds,
             scan_cancel_grace_fraction=config.presence.scan_cancel_grace_fraction,
         )
-    return PresenceScheduler(BleakPresenceObserver(address, adapter), policy=policy)
+    health = None
+    if staging is not None:
+        from .application.ble_scan_health import ScanHealthMonitor
+
+        diagnostics = ScanDiagnosticsFacade(adapter)
+        health = ScanHealthMonitor(
+            BleScanIncidentStore(staging.state_db, diagnostics, on_change=staging.public_drain.wake),
+            diagnostics,
+            threshold_seconds=config.presence.scan_silence_seconds,
+        )
+    return PresenceScheduler(BleakPresenceObserver(address, adapter), policy=policy, scan_health=health)
 
 
 async def phy_check(adapter: str) -> None:

@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from omi_collector.capture.adapters.ble_scan_health_store import read_ble_scan_incident
 from omi_collector.capture.adapters.collector_state_db import (
     StateDB,
     StateDBError,
@@ -268,6 +269,7 @@ def collect_operator_status(
         operational_status = read_operational_status(db, current_identity)
         runtime = _runtime_status(db, end.astimezone(UTC), operational_status)
         custody_holds = _custody_hold_count(db)
+        ble_scan_incident = _ble_scan_incident_summary(db)
     except (
         ConfirmedLossError,
         QualityMetricsError,
@@ -281,17 +283,80 @@ def collect_operator_status(
     window_status = _window_status(quality, operational_status=operational_status)
     if runtime["attention_reasons"]:
         window_status = "attention"
+    if ble_scan_incident["active"]:
+        window_status = "attention"
     return {
         "device": device,
         "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
         "publication": spool.current_window.as_dict(),
         "quality_window": quality.as_dict(),
         "custody_holds": custody_holds,
+        "ble_scan_incident": ble_scan_incident,
         "runtime": runtime,
         "schema_version": 2,
         "status": window_status,
         "window_hours": hours,
     }
+
+
+def _ble_scan_incident_summary(db: StateDB) -> dict[str, object]:
+    incident = db.get(StateKind.BLE_SCAN_INCIDENT, "open")
+    history = db.get(StateKind.BLE_SCAN_INCIDENT, "history")
+    entries = history.get("entries", []) if history is not None else []
+    if not isinstance(entries, list):
+        raise OperatorStatusError("BLE scan incident history is invalid")
+    latest = entries[-1] if entries and isinstance(entries[-1], dict) else {}
+    public_incident = read_ble_scan_incident(db)
+    if incident is None:
+        return {
+            "active": False,
+            **(public_incident or {}),
+            "resolved_count": min(len(entries), 8),
+            "last_resolved_at": latest.get("resolved_at"),
+        }
+    context = incident.get("context")
+    if not isinstance(context, dict):
+        raise OperatorStatusError("BLE scan incident context is invalid")
+    diagnostics = incident.get("diagnostics")
+    bluez = diagnostics.get("bluez") if isinstance(diagnostics, dict) else None
+    hci = diagnostics.get("hci") if isinstance(diagnostics, dict) else None
+    return {
+        "active": True,
+        **(public_incident or {}),
+        "fault_category": "host_ble_receive_unavailable"
+        if context.get("reason") == "scan_silence"
+        else context.get("reason"),
+        "reason": context.get("reason"),
+        "active_seconds": context.get("active_seconds"),
+        "bleak_callbacks": context.get("bleak_callbacks"),
+        "last_callback_age_seconds": context.get("last_callback_age_seconds"),
+        "threshold_seconds": context.get("threshold_seconds"),
+        "bluez": _incident_diag_summary(bluez, ("powered", "discovering", "devices_count")),
+        "hci": _incident_diag_summary(hci, ("status", "failure", "counts")),
+        "resolved_count": min(len(entries), 8),
+        "last_resolved_at": latest.get("resolved_at"),
+    }
+
+
+def _incident_diag_summary(value: object, keys: tuple[str, ...]) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {"available": False}
+    result: dict[str, object] = {"available": value.get("available", value.get("status") == "available") is True}
+    for key in keys:
+        item = value.get(key)
+        if key in {"powered", "discovering"}:
+            result[key] = item if type(item) is bool else None
+        elif key == "devices_count":
+            result[key] = item if type(item) is int and item >= 0 else None
+        elif key == "counts" and isinstance(item, dict):
+            result[key] = {
+                name: count if type(count) is int and count >= 0 else None
+                for name in ("legacy_advertising", "extended_advertising", "hardware_error", "malformed")
+                if (count := item.get(name)) is not None
+            }
+        elif key in {"status", "failure"}:
+            result[key] = item[:64] if isinstance(item, str) else None
+    return result
 
 
 def _custody_hold_count(db: StateDB) -> int:

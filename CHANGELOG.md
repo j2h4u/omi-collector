@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.1](https://github.com/j2h4u/omi-collector/compare/v0.17.0...v0.17.1) (2026-10-18)
+
+
+### Fixes
+
+* inherit setgid under systemd restrictions ([70c4718](https://github.com/j2h4u/omi-collector/commit/70c4718da38f9371060602d9946def3c1dd6db43))
+* preserve operator access on ready bundles ([70c4718](https://github.com/j2h4u/omi-collector/commit/70c4718da38f9371060602d9946def3c1dd6db43))
+
 ## [0.17.0](https://github.com/j2h4u/omi-collector/compare/v0.16.1...v0.17.0) (2026-10-18)
 
 

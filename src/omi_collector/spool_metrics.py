@@ -296,7 +296,9 @@ def _read_json(path: Path, label: str) -> dict[str, object]:
     _require_regular_file(path, label)
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except OSError as error:
+        raise SpoolMetricsError(f"cannot read {label}: {path}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SpoolMetricsError(f"{label} is invalid JSON: {path}") from error
     if not isinstance(value, dict):
         raise SpoolMetricsError(f"{label} must be a JSON object: {path}")

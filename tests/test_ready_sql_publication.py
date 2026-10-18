@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import shutil
 import sqlite3
 from collections.abc import Callable
@@ -145,6 +146,52 @@ def _quarantine_unclassified(store: InternalAudioStore, source_id: str) -> None:
 def _ready_bytes(outcome: ReadyOutcome) -> bytes:
     published = outcome.published
     return b"".join(result.path.joinpath("records.bin").read_bytes() for result in published)
+
+
+def _assert_operator_access_bundle(path: Path, ready: Path) -> None:
+    assert path.stat().st_mode & 0o7777 == 0o2750
+    assert path.stat().st_gid == ready.stat().st_gid
+    assert path.joinpath("manifest.json").stat().st_gid == ready.stat().st_gid
+    assert path.joinpath("records.bin").stat().st_gid == ready.stat().st_gid
+
+
+def test_operator_access_validation_rejects_directory_without_inherited_setgid(tmp_path: Path) -> None:
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    bundle = ready / "bundle"
+    bundle.mkdir(mode=0o2750)
+    bundle.chmod(0o750)
+
+    with pytest.raises(ReadyBundleError, match="did not inherit operator access"):
+        ready_bundles._require_operator_ready_directory(bundle)
+
+
+def test_typed_bundle_sync_rejects_files_outside_operator_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    ready.chmod(0o2750)
+    bundle = ready / "bundle"
+    bundle.mkdir(mode=0o2750)
+    (bundle / "manifest.json").write_text("{}", encoding="utf-8")
+    (bundle / "records.bin").write_bytes(b"synthetic")
+    monkeypatch.setattr(ready_bundles, "_typed_files_match", lambda *_args, **_kwargs: True)
+    original_stat = Path.stat
+
+    def wrong_records_group(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        result = original_stat(path, follow_symlinks=follow_symlinks)
+        if path == bundle / "records.bin":
+            fields = list(result)
+            fields[5] = result.st_gid + 1
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, "stat", wrong_records_group)
+
+    with pytest.raises(ReadyBundleError, match="do not inherit the operator group"):
+        ready_bundles._sync_typed_bundle(bundle, cast(ready_bundles._TypedGroup, object()), require_bundle_name=True)
 
 
 def _fault_transaction(
@@ -303,6 +350,8 @@ def test_sql_publication_preserves_ready_bytes_and_reports_gap_stats(tmp_path: P
     assert outcome.stats.gap_count == 1
     assert outcome.stats.gap_records == 2
     assert len(outcome.published) == 2
+    for result in outcome.published:
+        _assert_operator_access_bundle(result.path, ready)
     assert (
         b"".join(result.path.joinpath("records.bin").read_bytes() for result in outcome.published)
         == first_raw + second_raw
@@ -1158,6 +1207,7 @@ def test_runtime_reopens_sql_owned_ready_stage_after_sigkill_and_finishes_public
         assert process.exitcode == -9
         hidden = tuple(path for path in ready.iterdir() if path.name.startswith("."))
         assert len(hidden) == 1
+        _assert_operator_access_bundle(hidden[0], ready)
         assert hidden[0].joinpath("records.bin").read_bytes() == raw
 
         assert open_runtime_state(layout).path == database.path
@@ -1166,6 +1216,7 @@ def test_runtime_reopens_sql_owned_ready_stage_after_sigkill_and_finishes_public
             outcome = _publish(reopened, (_Source(reopened, "a" * 32),), ready)
             assert outcome.state is ReadyOutcomeState.PUBLISHED
             assert _ready_bytes(outcome) == raw
+            _assert_operator_access_bundle(outcome.published[0].path, ready)
             assert not hidden[0].exists()
         finally:
             reopened.close()

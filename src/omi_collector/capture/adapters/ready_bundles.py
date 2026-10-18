@@ -190,7 +190,7 @@ class _ReadySource:
 
 _MANIFEST_NAME = "manifest.json"
 _RAW_NAME = "records.bin"
-_READY_DIRECTORY_MODE = 0o750
+_READY_DIRECTORY_MODE = 0o2750
 _READY_FILE_MODE = 0o640
 _UINT32_MAX = (1 << 32) - 1
 _SHA256_HEX_LENGTH = 64
@@ -873,6 +873,17 @@ def _require_shared_ready_directory(path: Path) -> None:
     required = stat.S_ISGID | stat.S_IRGRP | stat.S_IXGRP
     if mode & required != required:
         raise ReadyBundleError("ready directory is not group-readable and setgid")
+
+
+def _require_operator_ready_directory(path: Path) -> None:
+    directory = path.lstat()
+    parent = path.parent.stat()
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or stat.S_IMODE(directory.st_mode) != _READY_DIRECTORY_MODE
+        or directory.st_gid != parent.st_gid
+    ):
+        raise ReadyBundleError("ready bundle directory did not inherit operator access")
 
 
 def _write_file(path: Path, payload: bytes) -> None:
@@ -3226,9 +3237,12 @@ def _require_typed_destination(path: Path, group: _TypedGroup) -> None:
 
 
 def _sync_typed_bundle(path: Path, group: _TypedGroup, *, require_bundle_name: bool) -> None:
+    _require_operator_ready_directory(path)
     if not _typed_files_match(path, group, require_bundle_name=require_bundle_name):
         raise ReadyBundleError("typed ready output conflicts with its frozen stage")
-    path.chmod(_READY_DIRECTORY_MODE)
+    directory_gid = path.stat().st_gid
+    if any((path / name).stat().st_gid != directory_gid for name in (_RAW_NAME, _MANIFEST_NAME)):
+        raise ReadyBundleError("typed ready files do not inherit the operator group")
     _sync_regular_file(path / _RAW_NAME)
     _sync_regular_file(path / _MANIFEST_NAME)
     _sync_directory(path)
@@ -3283,7 +3297,7 @@ def _write_typed_stage_files(path: Path, group: _TypedGroup, page_limit: int) ->
     if os.path.lexists(path):
         raise ReadyBundleError("typed ready stage already exists")
     path.mkdir(mode=_READY_DIRECTORY_MODE)
-    path.chmod(_READY_DIRECTORY_MODE)
+    _require_operator_ready_directory(path)
     digest = sha256()
     range_index = 0
     next_sequence = cast(int, group.ranges[0]["next_sequence"])

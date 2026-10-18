@@ -100,6 +100,12 @@ def _install_custody(tmp_path: Path, database: StateDB, ready: Path, records: tu
         shutil.copytree(outcome.published[0].path, destination)
     for item_id, payload in seed_database.list(StateKind.READY_PUBLICATION):
         database.put(StateKind.READY_PUBLICATION, item_id, payload)
+    with closing(database.open_connection()) as connection:
+        connection.execute("ATTACH DATABASE ? AS seed", (str(seed_database.path),))
+        connection.execute("INSERT INTO ready_replay_proof SELECT * FROM seed.ready_replay_proof")
+        connection.execute("INSERT INTO ready_replay_proof_page SELECT * FROM seed.ready_replay_proof_page")
+        connection.commit()
+        connection.execute("DETACH DATABASE seed")
 
 
 def _source_snapshot(database: StateDB, source_id: str) -> tuple[object, ...]:

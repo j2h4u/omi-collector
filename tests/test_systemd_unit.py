@@ -553,13 +553,13 @@ def _write_build_fakes(
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"$1\" == recover-state-journal ]]; then' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\\"PRAGMA integrity_check\\").fetchone(); c.close()" "$DEPLOY_STATE_FILE"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":2,\\"status\\":\\"state_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":3,\\"status\\":\\"state_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"$1\" == init-state ]]; then' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    printf "initialization selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    if [[ "${DEPLOY_INIT_CREATES_DATABASE:-0}" == 1 || "${DEPLOY_INIT_FAIL:-0}" != 1 ]]; then mkdir -p -- "${DEPLOY_STATE_FILE%/*}"; : > "$DEPLOY_STATE_FILE"; chmod 0640 "$DEPLOY_STATE_FILE"; fi\' >> "$entrypoint"\n'
         "printf '%s\\n' '    if [[ \"${DEPLOY_INIT_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":2}\\n"; exit 0\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":3}\\n"; exit 0\' >> "$entrypoint"\n'
         "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
         "printf '%s\\n' 'if [[ \"${DEPLOY_CONFIG_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
         f'printf \'%s\\n\' \'printf \'"\'"\'{{"config":"{config_file}","status":"config_valid"}}\\n\'"\'"\'\' >> "$entrypoint"\n'
@@ -945,7 +945,7 @@ def _previous_release(harness: _DeploymentHarness) -> Path:
 def _canonical_state(harness: _DeploymentHarness, *, version: int) -> None:
     path = Path(harness.environment["DEPLOY_STATE_FILE"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    if version == 2:
+    if version == 3:
         StateDB(path).put(StateKind.RUNTIME_STATUS, "current", {"last_error": "original"})
         return
     with closing(sqlite3.connect(path)) as connection:
@@ -1060,7 +1060,7 @@ def test_deployer_stopped_preflight_refusal_keeps_old_release_and_state(tmp_path
     harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=2))
     previous = _previous_release(harness)
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    _canonical_state(harness, version=2)
+    _canonical_state(harness, version=3)
     before = state_file.read_bytes()
 
     result = _run_deployer(harness)
@@ -1333,7 +1333,7 @@ def test_deployer_restores_previous_service_when_selector_publish_fails_before_r
         ),
     )
     previous = _previous_release(harness)
-    _canonical_state(harness, version=2)
+    _canonical_state(harness, version=3)
     script = harness.deployer.read_text(encoding="utf-8")
     publish = 'mv -T -- "$temporary_link" "$current_link" || die \'could not publish current deployment selector\''
     assert publish in script
@@ -1734,11 +1734,11 @@ def test_deployer_rejects_public_data_root_symlink_before_mutating_roots(tmp_pat
     assert "systemctl args=stop omi-collector.service" not in harness.log.read_text(encoding="utf-8")
 
 
-def test_deployer_recovers_true_hot_journal_before_selector_and_v2_initialization(tmp_path: Path) -> None:
+def test_deployer_recovers_true_hot_journal_before_selector_and_v3_initialization(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(recovery_required=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
     state_file.parent.mkdir(parents=True)
-    _canonical_state(harness, version=2)
+    _canonical_state(harness, version=3)
     _make_true_hot_journal(state_file)
 
     result = _run_deployer(harness)
@@ -1753,12 +1753,12 @@ def test_deployer_recovers_true_hot_journal_before_selector_and_v2_initializatio
     assert not state_file.with_name(state_file.name + "-journal").exists()
 
 
-def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_v2_preservation(tmp_path: Path) -> None:
+def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_v3_preservation(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
     state_file.parent.mkdir(parents=True)
     state_file.parent.chmod(0o2750)
-    _canonical_state(harness, version=2)
+    _canonical_state(harness, version=3)
     _make_true_hot_journal(state_file)
     previous = _previous_release(harness)
 
@@ -1789,13 +1789,13 @@ def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_v2_preservati
     assert harness.current_link.resolve(strict=True) != previous
     assert not state_file.with_name(state_file.name + "-journal").exists()
     with closing(sqlite3.connect(state_file)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         assert connection.execute("SELECT payload FROM state WHERE kind='runtime_status'").fetchone() == (
             '{"last_error":"original"}',
         )
 
 
-def test_deployer_initializes_fresh_v2_state_through_real_cli(tmp_path: Path) -> None:
+def test_deployer_initializes_fresh_v3_state_through_real_cli(tmp_path: Path) -> None:
     harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
 
@@ -1807,7 +1807,7 @@ def test_deployer_initializes_fresh_v2_state_through_real_cli(tmp_path: Path) ->
     assert f"initialization selector={harness.current_link.readlink()}" in commands
     assert state_file.is_file()
     with closing(sqlite3.connect(state_file)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
@@ -1815,7 +1815,7 @@ def test_deployer_does_not_recover_on_arbitrary_state_check_refusal(tmp_path: Pa
     harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=1, recovery_required=True))
     state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
     state_file.parent.mkdir(parents=True)
-    _canonical_state(harness, version=2)
+    _canonical_state(harness, version=3)
     _make_true_hot_journal(state_file)
 
     result = _run_deployer(harness)

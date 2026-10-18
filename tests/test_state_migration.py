@@ -16,7 +16,7 @@ from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.state_migration import (
     InternalAudioCutoverRequiredError,
     StateMigrationError,
-    _validate_v2,
+    _validate_current,
     open_runtime_state,
 )
 from omi_collector.storage_layout import StorageLayout, load_operator_config
@@ -46,7 +46,7 @@ def test_known_v1_requires_stopped_cutover(tmp_path: Path) -> None:
         open_runtime_state(layout)
 
 
-def test_v2_receipt_is_inert_and_private_audio_must_be_gone(tmp_path: Path) -> None:
+def test_current_receipt_is_inert_and_private_audio_must_be_gone(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "CLEANUP_PENDING"})
@@ -59,7 +59,7 @@ def test_v2_receipt_is_inert_and_private_audio_must_be_gone(tmp_path: Path) -> N
         open_runtime_state(layout)
 
 
-def test_v2_rejects_legacy_mutable_rows(tmp_path: Path) -> None:
+def test_current_rejects_legacy_mutable_rows(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
@@ -75,7 +75,7 @@ def test_runtime_schema_validation_does_not_scan_retained_audio(tmp_path: Path) 
     statements: list[str] = []
     with closing(sqlite3.connect(db.path)) as connection:
         connection.set_trace_callback(statements.append)
-        _validate_v2(connection)
+        _validate_current(connection)
     assert statements
     assert all("quick_check" not in statement.lower() for statement in statements)
     assert all(
@@ -83,7 +83,7 @@ def test_runtime_schema_validation_does_not_scan_retained_audio(tmp_path: Path) 
     )
 
 
-def test_v2_runtime_accepts_only_sql_owned_partial_ready_stage(tmp_path: Path) -> None:
+def test_current_runtime_accepts_only_sql_owned_partial_ready_stage(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
@@ -117,7 +117,7 @@ def test_v2_runtime_accepts_only_sql_owned_partial_ready_stage(tmp_path: Path) -
     assert open_runtime_state(layout).path == db.path
 
 
-def test_v2_runtime_rejects_unowned_stage_lookalike(tmp_path: Path) -> None:
+def test_current_runtime_rejects_unowned_stage_lookalike(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})

@@ -1,4 +1,4 @@
-"""Stopped-service v2 state initialization and SQLite journal recovery."""
+"""Stopped-service state initialization, v2 migration, and journal recovery."""
 
 from __future__ import annotations
 
@@ -11,8 +11,19 @@ from typing import cast
 from urllib.parse import quote
 
 from omi_collector.capture.adapters.collector_guard import collector_guard
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, raise_if_sqlite_storage_fault
-from omi_collector.state_migration import StateMigrationError, _assert_private_audio_gone, _validate_v2
+from omi_collector.capture.adapters.collector_state_db import (
+    StateDB,
+    StateDBError,
+    install_replay_proof_schema_for_upgrade,
+    raise_if_sqlite_storage_fault,
+)
+from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, backfill_v2_replay_proofs
+from omi_collector.state_migration import (
+    StateMigrationError,
+    _assert_private_audio_gone,
+    _validate_current,
+    _validate_v2,
+)
 from omi_collector.storage_layout import StorageLayout
 
 
@@ -20,8 +31,11 @@ class InternalAudioMigrationError(RuntimeError):
     """Stopped-service state initialization or recovery was refused."""
 
 
+_PREVIOUS_SCHEMA_VERSION = 2
+
+
 def initialize_collector_state(layout: StorageLayout) -> dict[str, int]:
-    """Initialize an empty installation or validate an existing v2 database."""
+    """Initialize an empty installation or migrate a validated v2 database."""
 
     with collector_guard(layout.collector.lock):
         path = layout.collector.state_db
@@ -35,16 +49,18 @@ def initialize_collector_state(layout: StorageLayout) -> dict[str, int]:
                 raise InternalAudioMigrationError("canonical SQLite identity changed during state inspection")
             if inspection["schema_version"] == 0:
                 StateDB(path)
+            elif inspection["schema_version"] == _PREVIOUS_SCHEMA_VERSION:
+                _migrate_v2(layout)
             else:
                 with closing(_connect(path, read_only=True)) as connection:
-                    _validate_v2(connection)
+                    _validate_current(connection)
                     _assert_private_audio_gone(layout, connection)
             _handoff_canonical(path)
-            return {"schema_version": 2}
+            return {"schema_version": 3}
         _validate_empty_install(layout)
         StateDB(path)
         _handoff_canonical(path)
-        return {"schema_version": 2}
+        return {"schema_version": 3}
 
 
 def inspect_collector_state(layout: StorageLayout) -> dict[str, object]:
@@ -62,9 +78,13 @@ def inspect_collector_state(layout: StorageLayout) -> dict[str, object]:
                 _validate_empty_schema(connection)
                 _validate_empty_install(layout)
                 return {"schema_version": 0, "status": "state_compatible"}
-            _validate_v2(connection)
+            version_value = None if version is None else version[0]
+            if version_value == _PREVIOUS_SCHEMA_VERSION:
+                _validate_v2(connection)
+            else:
+                _validate_current(connection)
             _assert_private_audio_gone(layout, connection)
-            return {"schema_version": 2, "status": "state_compatible"}
+            return {"schema_version": version_value, "status": "state_compatible"}
     except _HotJournalError:
         return {"reason": "canonical_hot_journal", "status": "recovery_required"}
     except (InternalAudioMigrationError, StateMigrationError, StateDBError, OSError, sqlite3.DatabaseError) as error:
@@ -94,6 +114,31 @@ def recover_canonical_journal(layout: StorageLayout) -> dict[str, object]:
         if result.get("status") != "state_compatible":
             raise InternalAudioMigrationError("canonical state remains incompatible after SQLite recovery")
         return result
+
+
+def _migrate_v2(layout: StorageLayout) -> None:
+    path = layout.collector.state_db
+    with closing(_connect(path)) as connection:
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            _validate_v2(connection)
+            _assert_private_audio_gone(layout, connection)
+            install_replay_proof_schema_for_upgrade(connection)
+            backfill_v2_replay_proofs(layout.publication.root, connection)
+            connection.execute("PRAGMA user_version = 3")
+            _validate_current(connection)
+            connection.commit()
+        except (
+            OSError,
+            sqlite3.DatabaseError,
+            StateDBError,
+            StateMigrationError,
+            ReadyBundleError,
+            ValueError,
+        ) as error:
+            connection.rollback()
+            raise_if_sqlite_storage_fault(error)
+            raise InternalAudioMigrationError("Collector v2 replay-proof migration failed") from error
 
 
 class _HotJournalError(Exception):

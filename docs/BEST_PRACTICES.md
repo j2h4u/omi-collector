@@ -317,11 +317,11 @@ The deployer checks state before stopping the service and repeats the check
 under the stable guard after stop. A verified hot rollback journal is recovered
 by SQLite under that guard, then a read-only check must accept the recovered
 state. The selected release's `omi-collector init-state --config PATH` creates
-v2 only for an empty installation and validates existing v2 without rewriting
-it. Missing databases alongside READY, private audio, control data, or unknown
-scratch fail closed. Existing v1 databases are refused unchanged; this command
-never imports or deletes old data. Runtime also refuses v1 and never creates a
-replacement database. Keep the service stopped while repairing an incompatible
+v3 only for an empty installation, upgrades existing v2, and validates existing
+v3 without rewriting it. Missing databases alongside READY, private audio,
+control data, or unknown scratch fail closed. Existing v1 databases are refused
+unchanged; this command never imports or deletes old data. Runtime also refuses
+v1 and never creates a replacement database. Keep the service stopped while repairing an incompatible
 state, and preserve the stable lock inode through deploy and recovery.
 
 Before restarting the previous release after an interrupted deployment, its

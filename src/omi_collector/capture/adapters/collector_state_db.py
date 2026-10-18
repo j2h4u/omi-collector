@@ -19,7 +19,8 @@ from urllib.parse import quote
 from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from .sqlite_admission import admit_exclusive, admit_immediate, commit_with_busy_retry
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+_PREVIOUS_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5_000
 _STATE_DB_MODE = 0o640
 
@@ -166,6 +167,22 @@ class StateTransaction(_Operations):
         """Wake publication for a typed audio mutation in this transaction."""
 
         self._publication_changed = True
+
+    def delete_active_replay_proof(self, bundle_id: str) -> bool:
+        """Delete one active proof and its pages in this ledger transaction."""
+
+        try:
+            cursor = self._connection.execute(
+                "DELETE FROM ready_replay_proof WHERE bundle_id=? AND lifecycle='active'", (bundle_id,)
+            )
+        except sqlite3.DatabaseError as error:
+            raise _database_failure("private replay proof deletion failed", error) from error
+        try:
+            deleted = cursor.rowcount == 1
+        finally:
+            cursor.close()
+        self._publication_changed |= deleted
+        return deleted
 
     def payload_bytes(self, kind: StateKind, *, row_overhead: int = 0) -> int:
         _validate_kind(kind)
@@ -777,6 +794,8 @@ _AUDIO_TABLES = (
     "publication_cohort_member",
     "ready_output_stage",
     "ready_stage_range",
+    "ready_replay_proof",
+    "ready_replay_proof_page",
 )
 
 
@@ -902,7 +921,34 @@ _AUDIO_DDL = (
         "PRIMARY KEY (stage_id, range_ordinal), FOREIGN KEY (stage_id) REFERENCES ready_output_stage(stage_id) ON DELETE CASCADE, FOREIGN KEY (source_id) REFERENCES capture_source(source_id)"
         ") WITHOUT ROWID"
     ),
+    _ddl(
+        "CREATE TABLE ready_replay_proof ("
+        "bundle_id TEXT PRIMARY KEY NOT NULL CHECK (length(bundle_id) = 64 AND lower(bundle_id) = bundle_id AND bundle_id NOT GLOB '*[^0-9a-f]*'),"
+        "lifecycle TEXT NOT NULL CHECK (lifecycle IN ('staging','active')), stage_id TEXT NOT NULL, owner_token TEXT NOT NULL,"
+        "record_count INTEGER NOT NULL CHECK (record_count BETWEEN 1 AND 4294967295),"
+        "records_sha256 TEXT NOT NULL CHECK (length(records_sha256) = 64 AND lower(records_sha256) = records_sha256 AND records_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64 AND lower(manifest_sha256) = manifest_sha256 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'),"
+        "page_index BLOB NOT NULL CHECK (typeof(page_index) = 'blob' AND length(page_index) > 0),"
+        "normalization_runs BLOB NOT NULL CHECK (typeof(normalization_runs) = 'blob' AND length(normalization_runs) > 0),"
+        "immutable_metadata BLOB NOT NULL CHECK (typeof(immutable_metadata) = 'blob' AND length(immutable_metadata) > 0),"
+        "proof_content_sha256 TEXT NOT NULL CHECK (length(proof_content_sha256) = 64 AND lower(proof_content_sha256) = proof_content_sha256 AND proof_content_sha256 NOT GLOB '*[^0-9a-f]*')"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE ready_replay_proof_page ("
+        "bundle_id TEXT NOT NULL, page_ordinal INTEGER NOT NULL CHECK (page_ordinal BETWEEN 0 AND 4294967295),"
+        "first_record_index INTEGER NOT NULL CHECK (first_record_index BETWEEN 0 AND 4294967295),"
+        "record_count INTEGER NOT NULL CHECK (record_count BETWEEN 1 AND 128),"
+        "hashes BLOB NOT NULL CHECK (typeof(hashes) = 'blob' AND length(hashes) = record_count * 32),"
+        "page_sha256 BLOB NOT NULL CHECK (typeof(page_sha256) = 'blob' AND length(page_sha256) = 32),"
+        "PRIMARY KEY (bundle_id, page_ordinal),"
+        "FOREIGN KEY (bundle_id) REFERENCES ready_replay_proof(bundle_id) ON DELETE CASCADE"
+        ") WITHOUT ROWID"
+    ),
 )
+
+_V2_AUDIO_TABLES = _AUDIO_TABLES[:-2]
+_V2_AUDIO_DDL = _AUDIO_DDL[:-2]
 
 _AUDIO_INDEXES = {
     "capture_record_mapping_revision_idx": (
@@ -940,18 +986,33 @@ def install_audio_schema(connection: sqlite3.Connection) -> None:
     _validate_audio_schema(connection)
 
 
-def _validate_audio_schema(connection: sqlite3.Connection) -> None:
+def install_replay_proof_schema_for_upgrade(connection: sqlite3.Connection) -> None:
+    """Extend one validated v2 transaction without committing its migration."""
+
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    if _user_version(connection) != _PREVIOUS_SCHEMA_VERSION:
+        raise StateDBError("state database schema is not eligible for proof migration")
+    _validate_schema(connection)
+    _validate_audio_schema(connection, version=_PREVIOUS_SCHEMA_VERSION)
+    for ddl in _AUDIO_DDL[-2:]:
+        connection.execute(ddl)
+
+
+def _validate_audio_schema(connection: sqlite3.Connection, *, version: int = _SCHEMA_VERSION) -> None:
+    tables = _AUDIO_TABLES if version == _SCHEMA_VERSION else _V2_AUDIO_TABLES
+    ddl_statements = _AUDIO_DDL if version == _SCHEMA_VERSION else _V2_AUDIO_DDL
+    if version not in {_PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}:
+        raise StateDBError("state database typed schema version is unsupported")
     rows = _fetchall(connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'"))
     user_tables = {_row_text(row, "name") for row in rows if not _row_text(row, "name").startswith("sqlite_")}
-    expected_tables = {"state", *_AUDIO_TABLES}
+    expected_tables = {"state", *tables}
     if user_tables != expected_tables:
         raise StateDBError("state database typed schema has unexpected tables")
-    statements = {
-        _row_text(row, "name"): _row_text(row, "sql") for row in rows if _row_text(row, "name") in _AUDIO_TABLES
-    }
-    if set(statements) != set(_AUDIO_TABLES):
+    statements = {_row_text(row, "name"): _row_text(row, "sql") for row in rows if _row_text(row, "name") in tables}
+    if set(statements) != set(tables):
         raise StateDBError("state database typed schema is incomplete")
-    for table, ddl in zip(_AUDIO_TABLES, _AUDIO_DDL, strict=True):
+    for table, ddl in zip(tables, ddl_statements, strict=True):
         if _normalize_sql(statements[table]) != _normalize_sql(ddl):
             raise StateDBError("state database typed table is unsupported")
     for name, ddl in _AUDIO_INDEXES.items():

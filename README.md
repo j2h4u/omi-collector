@@ -315,9 +315,10 @@ The canonical systemd deployment persists the sealed release, checks Collector
 state before stopping the service, and rechecks it under the stable lock before
 selecting the release. A verified SQLite hot rollback journal is recovered by
 SQLite after stop, then checked again. The selected release runs `init-state`:
-it creates a v2 database only when the database and Collector data roots are
-empty, and validates an existing v2 database without rewriting it. Existing v1
-state and unknown private artifacts fail closed and remain untouched. Runtime
+it creates a v3 database only when the database and Collector data roots are
+empty, upgrades an existing v2 database, and validates an existing v3 database
+without rewriting it. Existing v1 state and unknown private artifacts fail
+closed and remain untouched. Runtime
 never creates or upgrades state. See [Best practices](docs/BEST_PRACTICES.md#state-ownership-and-state-initialization)
 for the deploy sequence and the [OMIC-16 acceptance receipt](docs/qa/2026-10-13-omic-16-implementation.md)
 for production and release evidence.

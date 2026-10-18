@@ -36,6 +36,7 @@ from omi_collector.capture.adapters.staging_contract import FatalInternalAudioSt
 from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockIntent, ClockRange, ClockState
 from omi_collector.config import ReadyConfig
+from omi_collector.internal_audio_migration import InternalAudioMigrationError, initialize_collector_state
 from omi_collector.state_migration import open_runtime_state
 from omi_collector.storage_layout import load_operator_config
 
@@ -293,6 +294,14 @@ def _publish(  # noqa: PLR0913 - the test boundary mirrors the publication contr
         drained=True,
         page_limit=page_limit,
     )
+
+
+def _downgrade_proof_schema_to_v2(database: StateDB) -> None:
+    with closing(database.open_connection()) as connection:
+        connection.execute("DROP TABLE ready_replay_proof_page")
+        connection.execute("DROP TABLE ready_replay_proof")
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
 
 
 def _pause_after_typed_stage(database_path: Path, ready: Path, sender: Connection) -> None:
@@ -871,6 +880,78 @@ def test_sql_full_active_replay_below_threshold_retires_without_second_bundle(tm
     store.close()
 
 
+def test_stopped_v2_migration_backfills_active_proof_and_rejects_corrupt_ready(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
+    layout = load_operator_config(config).storage
+    database = StateDB(layout.collector.state_db)
+    ready = layout.publication.root
+    ready.mkdir(parents=True)
+    ready.chmod(0o2750)
+    with InternalAudioStore(database) as store:
+        published = _publish(store, (_source(store, "a" * 32, 100, (_record(100, 1),)),), ready, frontier=101)
+    bundle = published.published[0]
+    _downgrade_proof_schema_to_v2(database)
+
+    bundle.path.joinpath("records.bin").write_bytes(_record(100, 9))
+    with pytest.raises(InternalAudioMigrationError, match="replay-proof migration failed"):
+        initialize_collector_state(layout)
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name='ready_replay_proof'").fetchone() is None
+
+
+def test_stopped_v2_migration_backfills_valid_active_proof(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
+    layout = load_operator_config(config).storage
+    database = StateDB(layout.collector.state_db)
+    ready = layout.publication.root
+    ready.mkdir(parents=True)
+    ready.chmod(0o2750)
+    with InternalAudioStore(database) as store:
+        _publish(store, (_source(store, "a" * 32, 100, (_record(100, 1),)),), ready, frontier=101)
+    _downgrade_proof_schema_to_v2(database)
+
+    assert initialize_collector_state(layout) == {"schema_version": 3}
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("SELECT lifecycle,record_count FROM ready_replay_proof").fetchone() == ("active", 1)
+        assert connection.execute("SELECT count(*) FROM ready_replay_proof_page").fetchone() == (1,)
+
+
+def test_stopped_v2_migration_backfills_completed_owned_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
+    layout = load_operator_config(config).storage
+    database = StateDB(layout.collector.state_db)
+    ready = layout.publication.root
+    ready.mkdir(parents=True)
+    ready.chmod(0o2750)
+    store = InternalAudioStore(database)
+    source = _source(store, "a" * 32, 100, (_record(100, 1),))
+    original_commit = ready_bundles._commit_typed_stage_once
+
+    def stop_before_final_commit(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.DatabaseError("stop after rename and proof staging")
+
+    monkeypatch.setattr(ready_bundles, "_commit_typed_stage_once", stop_before_final_commit)
+    with pytest.raises(ReadyBundleError, match="final commit was rolled back"):
+        _publish(store, (source,), ready, frontier=101)
+    monkeypatch.setattr(ready_bundles, "_commit_typed_stage_once", original_commit)
+    store.close()
+    assert len(tuple(path for path in ready.iterdir() if not path.name.startswith("."))) == 1
+    _downgrade_proof_schema_to_v2(database)
+
+    assert initialize_collector_state(layout) == {"schema_version": 3}
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("SELECT lifecycle FROM ready_replay_proof").fetchone() == ("staging",)
+    with InternalAudioStore(StateDB(layout.collector.state_db)) as restarted:
+        outcome = _publish(restarted, (_Source(restarted, "a" * 32),), ready, frontier=101)
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("SELECT lifecycle FROM ready_replay_proof").fetchone() == ("active",)
+
+
 def test_sql_active_prefix_replay_publishes_only_unique_suffix(tmp_path: Path) -> None:
     database = StateDB(tmp_path / "state.sqlite3")
     store = InternalAudioStore(database)
@@ -1439,6 +1520,12 @@ def test_staging_restart_resumes_persisted_group_instead_of_replanning_ready_ove
         shutil.copytree(installed.path, ready / installed.bundle_id)
     for item_id, payload in seed_database.list(StateKind.READY_PUBLICATION):
         database.put(StateKind.READY_PUBLICATION, item_id, payload)
+    with closing(database.open_connection()) as connection:
+        connection.execute("ATTACH DATABASE ? AS seed", (str(seed_database.path),))
+        connection.execute("INSERT INTO ready_replay_proof SELECT * FROM seed.ready_replay_proof")
+        connection.execute("INSERT INTO ready_replay_proof_page SELECT * FROM seed.ready_replay_proof_page")
+        connection.commit()
+        connection.execute("DETACH DATABASE seed")
 
     import omi_collector.capture.adapters.ready_bundles as ready_bundles
 

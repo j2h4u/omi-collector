@@ -453,7 +453,7 @@ def config_check(
 def initialize_collector_state_command(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Initialize empty Collector state or validate the existing v2 database."""
+    """Initialize empty Collector state or validate the existing v3 database."""
     from omi_collector.capture.adapters.collector_state_db import StateDBError
     from omi_collector.capture.application.storage_fault import (
         FatalInternalAudioStorageError,

@@ -177,7 +177,23 @@ def _install_ready_custody(
         shutil.copytree(result.path, destination)
     for item_id, payload in seed_database.list(StateKind.READY_PUBLICATION):
         database.put(StateKind.READY_PUBLICATION, item_id, payload)
+    with closing(database.open_connection()) as connection:
+        connection.execute("ATTACH DATABASE ? AS seed", (str(seed_database.path),))
+        connection.execute("INSERT INTO ready_replay_proof SELECT * FROM seed.ready_replay_proof")
+        connection.execute("INSERT INTO ready_replay_proof_page SELECT * FROM seed.ready_replay_proof_page")
+        connection.commit()
+        connection.execute("DETACH DATABASE seed")
     return destination
+
+
+def _retire_ready_custody(database: StateDB) -> None:
+    active = tuple(
+        (item_id, payload) for item_id, payload in database.list(StateKind.READY_PUBLICATION) if item_id != "frontier"
+    )
+    with database.transaction() as transaction:
+        for item_id, payload in active:
+            transaction.put(StateKind.READY_PUBLICATION, item_id, {**payload, "state": "retired"})
+            assert transaction.delete_active_replay_proof(item_id)
 
 
 def _source_state(database: StateDB, source_id: str) -> tuple[object, ...] | None:
@@ -499,11 +515,7 @@ def test_partial_retired_ready_overlap_blocks_without_full_source_lineage(
         source = _source(store, "a" * 32, 100, (_record(100, 1), _record(101, 2)))
         _pause_after_cohort_acceptance(monkeypatch, store, source, ready, frontier=102)
         installed = _install_ready_custody(tmp_path, database, ready, (_record(101, 7),), start=101)
-        for item_id, payload in database.list(StateKind.READY_PUBLICATION):
-            if item_id == "frontier":
-                continue
-            assert isinstance(payload, dict)
-            database.put(StateKind.READY_PUBLICATION, item_id, {**payload, "state": "retired"})
+        _retire_ready_custody(database)
         shutil.rmtree(installed)
 
         with pytest.raises(ReadyBundleError, match="retired custody"):
@@ -605,10 +617,7 @@ def test_partial_retired_overlap_preserves_subthreshold_remainder_after_restart(
         monkeypatch.setattr(ready_bundles, "_resume_typed_cohort", original_resume)
         old_cohort, old_members = _active_cohort_snapshot(database)
         installed = _install_ready_custody(tmp_path, database, ready, (_record(101, 7),), start=101)
-        for item_id, payload in database.list(StateKind.READY_PUBLICATION):
-            if item_id != "frontier":
-                assert isinstance(payload, dict)
-                database.put(StateKind.READY_PUBLICATION, item_id, {**payload, "state": "retired"})
+        _retire_ready_custody(database)
         shutil.rmtree(installed)
 
         with pytest.raises(ReadyBundleError, match="retired custody"):

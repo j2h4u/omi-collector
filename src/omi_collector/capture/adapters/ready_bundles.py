@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import errno
+import hmac
 import json
 import math
 import os
 import sqlite3
 import stat
 from bisect import bisect_right
-from collections.abc import Iterator, Mapping
-from contextlib import closing
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
-from itertools import pairwise
+from itertools import pairwise, zip_longest
 from math import ceil
 from pathlib import Path
 from typing import NoReturn, Protocol, cast
@@ -48,6 +49,19 @@ from ..domain.internal_audio_machine import (
     Stage as StageEvent,
 )
 from ..domain.opus_duration import inspect_20ms_record
+from ..domain.replay_proof import (
+    NormalizationMode,
+    NormalizationRun,
+    ProofPage,
+    build_proof_pages,
+    normalize_record,
+    pack_normalization_runs,
+    pack_page_index,
+    record_sha256,
+    unpack_normalization_runs,
+    unpack_page_index,
+    validate_proof_page,
+)
 from ..domain.ring_protocol import RECORD_SIZE, TIMESTAMP_SIZE
 from .clock_segments import ClockSegmentMap
 from .collector_state_db import StateDB, StateDBError, StateKind, raise_if_sqlite_corrupt, raise_if_sqlite_storage_fault
@@ -213,7 +227,35 @@ _TYPED_BTREE_PAGES_PER_LEVEL = 3
 _TYPED_METADATA_ROW_BYTES = 256
 _TYPED_STAGE_RANGE_COLUMNS = 15
 _TYPED_STAGE_IDENTITY_PARTS = 3
+_V2_STAGE_OWNERSHIP_COLUMNS = 4
+_REPLAY_PROOF_ROOT_COLUMNS = 11
+_PROOF_SCRATCH_CACHE_KIB = 256
 _DURABILITY_IO_FAILURE = "durability_io_error"
+
+
+@dataclass(frozen=True, slots=True)
+class _ProofOwnership:
+    lifecycle: str
+    stage_id: str
+    owner_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ProofContent:
+    bundle_id: str
+    records_sha256: str
+    manifest_sha256: str
+    record_count: int
+    page_index: bytes
+    normalization_runs: bytes
+    immutable_metadata: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadyOverlap:
+    source: _ReadySource
+    sequence_range: tuple[int, int]
+    ready_offset: int
 
 
 def _visible_children(root: Path) -> tuple[Path, ...]:
@@ -224,7 +266,7 @@ def _ready_start(source: _ReadySource) -> int:
     return source.facts.start_sequence
 
 
-def _read_ready_source(path: Path) -> _ReadySource:
+def _read_ready_source(path: Path, *, require_bundle_name: bool = True) -> _ReadySource:
     if path.is_symlink() or not path.is_dir() or {item.name for item in path.iterdir()} != {_MANIFEST_NAME, _RAW_NAME}:
         raise ReadyBundleError("ready bundle inventory is invalid")
     value = _read_json(path / _MANIFEST_NAME)
@@ -249,7 +291,7 @@ def _read_ready_source(path: Path) -> _ReadySource:
         raise ReadyBundleError("ready manifest range is invalid")
     gaps = _validate_ready_ranges(value["time_ranges"], start, next_sequence, count)
     facts = _BundleFacts(start, next_sequence, count, draft_raw_sha256, gaps)
-    if bundle_id != _bundle_id(facts) or path.name != bundle_id:
+    if bundle_id != _bundle_id(facts) or (require_bundle_name and path.name != bundle_id):
         raise ReadyBundleError("ready manifest identity is invalid")
     raw = path / _RAW_NAME
     if (
@@ -500,6 +542,7 @@ def retire_acknowledged(
     if not acknowledged:
         return ()
     ledger = _read_ledger(state_db)
+    _typed_ready_custody(ready_root, state_db)
     for bundle_id, records_sha256 in acknowledged:
         _preflight_retirement(ready_root, ledger, bundle_id, records_sha256)
     retired: list[ReadyBundleResult] = []
@@ -542,6 +585,8 @@ def _retire_one(
         try:
             with state_db.transaction() as transaction:
                 transaction.put(StateKind.READY_PUBLICATION, bundle_id, retired_entry)
+                if not transaction.delete_active_replay_proof(bundle_id):
+                    raise ReadyDurabilityFatalError("ACK found no active private replay proof")
         except (OSError, ValueError, StateDBError) as error:
             raise_if_sqlite_storage_fault(error)
             raise ReadyBundleError("ready retirement could not be recorded") from error
@@ -914,6 +959,359 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False).encode()
 
 
+def _replay_normalization_runs(
+    ranges: tuple[Mapping[str, object], ...], record_count: int
+) -> tuple[NormalizationRun, ...]:
+    runs: list[NormalizationRun] = []
+    record_index = 0
+    previous_sequence: int | None = None
+    for item in ranges:
+        start = cast(int, item["start_sequence"])
+        end = cast(int, item["next_sequence"])
+        utc = item["utc"]
+        boundary = 0
+        if previous_sequence is not None and start != previous_sequence:
+            boundary |= 1
+            # Current manifests do not retain the causal facts needed to assert time_incomparable.
+        if utc is None:
+            mode = NormalizationMode.RAW
+            offset = 0.0
+        else:
+            assert isinstance(utc, Mapping)
+            mode = NormalizationMode.MAPPED
+            offset = _finite_number(utc["offset_seconds"])
+        count = end - start
+        runs.append(NormalizationRun(record_index, record_index + count, offset, mode, boundary))
+        record_index += count
+        previous_sequence = end
+    packed = pack_normalization_runs(runs, record_count=record_count)
+    return unpack_normalization_runs(packed, record_count=record_count)
+
+
+def _replay_immutable_metadata(
+    source: _ReadySource,
+    manifest_sha256: str,
+    lineage: tuple[SourceLineage, ...],
+) -> bytes:
+    return _canonical(
+        {
+            "bundle_id": source.result.bundle_id,
+            "draft_raw_sha256": source.facts.raw_sha256,
+            "gaps": [list(item) for item in source.facts.gaps],
+            "manifest_sha256": manifest_sha256,
+            "next_sequence": source.facts.next_sequence,
+            "record_count": source.facts.record_count,
+            "records_sha256": source.result.records_sha256,
+            "sources": [
+                {"next_sequence": end, "raw_sha256": digest, "start_sequence": start} for start, end, digest in lineage
+            ],
+            "start_sequence": source.facts.start_sequence,
+            "time_ranges": [dict(item) for item in source.time_ranges],
+        }
+    )
+
+
+def _replay_proof_content_sha256(content: _ProofContent) -> str:
+    digest = sha256(b"omi-collector-replay-proof-content-v1\0")
+    for value in (
+        content.bundle_id.encode(),
+        content.records_sha256.encode(),
+        content.manifest_sha256.encode(),
+        content.record_count.to_bytes(8, "big"),
+        content.page_index,
+        content.normalization_runs,
+        content.immutable_metadata,
+    ):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.hexdigest()
+
+
+def backfill_v2_replay_proofs(ready_root: Path, connection: sqlite3.Connection) -> None:
+    """Backfill v2 READY and complete owned stages inside the upgrade transaction."""
+
+    ledger = _migration_ledger(connection)
+    bundles = cast(dict[str, object], ledger["bundles"])
+    known_visible = set(bundles)
+    _backfill_v2_active_proofs(ready_root, connection, bundles)
+    known_visible.update(_backfill_v2_stage_proofs(ready_root, connection))
+    visible = {path.name for path in _visible_children(ready_root)} if ready_root.is_dir() else set()
+    if not visible <= known_visible:
+        raise ReadyBundleError("v2 READY inventory contains an unowned publication")
+
+
+def _backfill_v2_active_proofs(ready_root: Path, connection: sqlite3.Connection, bundles: Mapping[str, object]) -> None:
+    for bundle_id, value in bundles.items():
+        entry = cast(dict[str, object], value)
+        if entry["state"] != "ready":
+            continue
+        source = _read_ready_source(ready_root / bundle_id)
+        _validate_ready_ledger_entry(entry, source)
+        _insert_migrated_replay_proof(
+            connection,
+            source,
+            source_lineage(entry),
+            _ProofOwnership("active", "migration-v2", "migration-v2"),
+        )
+
+
+def _backfill_v2_stage_proofs(ready_root: Path, connection: sqlite3.Connection) -> set[str]:
+    stages = _sql_all(
+        connection.execute(
+            "SELECT stage_id,group_identity,owned_path,owner_token FROM ready_output_stage ORDER BY stage_id"
+        )
+    )
+    visible: set[str] = set()
+    for row in stages:
+        bundle_id = _backfill_v2_stage_proof(ready_root, connection, row)
+        if bundle_id is not None:
+            visible.add(bundle_id)
+    return visible
+
+
+def _backfill_v2_stage_proof(ready_root: Path, connection: sqlite3.Connection, row: tuple[object, ...]) -> str | None:
+    if len(row) != _V2_STAGE_OWNERSHIP_COLUMNS or not all(isinstance(value, str) for value in row):
+        raise ReadyBundleError("v2 stage ownership is invalid")
+    stage_id, identity, owned_path, owner_token = cast(tuple[str, str, str, str], row)
+    parts = identity.split(":")
+    if len(parts) != _TYPED_STAGE_IDENTITY_PARTS or not _is_sha256(parts[2]):
+        raise ReadyBundleError("v2 stage identity is invalid")
+    bundle_id = parts[2]
+    destination = ready_root / bundle_id
+    stage_path = Path(owned_path)
+    proof_path = destination if destination.exists() else stage_path
+    if not proof_path.exists():
+        return None
+    entries = {item.name for item in proof_path.iterdir()} if proof_path.is_dir() else set()
+    if entries != {_RAW_NAME, _MANIFEST_NAME}:
+        if proof_path == stage_path and entries <= {_RAW_NAME, _MANIFEST_NAME}:
+            return None
+        raise ReadyBundleError("v2 completed stage inventory is invalid")
+    source = _read_ready_source(proof_path, require_bundle_name=False)
+    if source.result.bundle_id != bundle_id:
+        raise ReadyBundleError("v2 completed stage identity is invalid")
+    _insert_migrated_replay_proof(
+        connection,
+        source,
+        _migration_stage_lineage(connection, stage_id),
+        _ProofOwnership("staging", stage_id, owner_token),
+    )
+    return bundle_id if proof_path == destination else None
+
+
+def _migration_ledger(connection: sqlite3.Connection) -> dict[str, object]:
+    bundles: dict[str, object] = {}
+    frontier = 0
+    rows = _sql_all(
+        connection.execute(
+            "SELECT id,payload FROM state WHERE kind=? ORDER BY id", (StateKind.READY_PUBLICATION.value,)
+        )
+    )
+    try:
+        for item_id, payload in rows:
+            if not isinstance(item_id, str) or not isinstance(payload, str):
+                raise ValueError("ledger row type")
+            value = cast(object, json.loads(payload))
+            if item_id == "frontier":
+                if not isinstance(value, dict) or set(value) != {"value"}:
+                    raise ValueError("frontier")
+                frontier = value["value"]
+            else:
+                bundles[item_id] = value
+        _validate_ledger_values(bundles, frontier)
+        _validate_ledger_entries(bundles)
+    except (json.JSONDecodeError, ValueError, TypeError) as error:
+        raise ReadyBundleError("v2 ready publication ledger is invalid") from error
+    return {"bundles": bundles, "frontier": frontier}
+
+
+def _insert_migrated_replay_proof(
+    connection: sqlite3.Connection,
+    source: _ReadySource,
+    lineage: tuple[SourceLineage, ...],
+    ownership: _ProofOwnership,
+) -> None:
+    with _proof_page_scratch(
+        _ready_normalized_records(source.result.path / _RAW_NAME),
+        record_count=source.facts.record_count,
+    ) as (page_index, scratch):
+        runs = _replay_normalization_runs(source.time_ranges, source.facts.record_count)
+        packed_runs = pack_normalization_runs(runs, record_count=source.facts.record_count)
+        manifest_sha256 = _digest(source.result.path / _MANIFEST_NAME)
+        metadata = _replay_immutable_metadata(source, manifest_sha256, lineage)
+        content_sha256 = _replay_proof_content_sha256(
+            _ProofContent(
+                source.result.bundle_id,
+                source.result.records_sha256,
+                manifest_sha256,
+                source.facts.record_count,
+                page_index,
+                packed_runs,
+                metadata,
+            )
+        )
+        connection.execute(
+            "INSERT INTO ready_replay_proof(bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,"
+            "manifest_sha256,page_index,normalization_runs,immutable_metadata,proof_content_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                source.result.bundle_id,
+                ownership.lifecycle,
+                ownership.stage_id,
+                ownership.owner_token,
+                source.facts.record_count,
+                source.result.records_sha256,
+                manifest_sha256,
+                page_index,
+                packed_runs,
+                metadata,
+                content_sha256,
+            ),
+        )
+        _insert_replay_proof_pages(connection, source.result.bundle_id, scratch)
+
+
+def _ready_normalized_records(path: Path) -> Iterator[bytes]:
+    with path.open("rb") as stream:
+        while record := stream.read(RECORD_SIZE):
+            if len(record) != RECORD_SIZE:
+                raise ReadyBundleError("v2 READY records end in a partial record")
+            yield record
+
+
+@contextmanager
+def _proof_page_scratch(records: Iterable[bytes], *, record_count: int) -> Iterator[tuple[bytes, sqlite3.Connection]]:
+    try:
+        scratch = sqlite3.connect(":memory:")
+    except sqlite3.DatabaseError as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyBundleError("private replay proof scratch could not be opened") from error
+    try:
+        try:
+            scratch.execute("PRAGMA temp_store = FILE")
+            mode = _sql_one(scratch.execute("PRAGMA temp_store"))
+            if mode != (1,):
+                raise ReadyBundleError("private replay proof scratch is not file-backed")
+            scratch.execute(f"PRAGMA temp.cache_size = -{_PROOF_SCRATCH_CACHE_KIB}")
+            cache_size = _sql_one(scratch.execute("PRAGMA temp.cache_size"))
+            if cache_size != (-_PROOF_SCRATCH_CACHE_KIB,):
+                raise ReadyBundleError("private replay proof scratch cache is unbounded")
+            scratch.execute(
+                "CREATE TEMP TABLE replay_proof_page ("
+                "page_ordinal INTEGER PRIMARY KEY, first_record_index INTEGER NOT NULL, record_count INTEGER NOT NULL,"
+                "hashes BLOB NOT NULL, page_sha256 BLOB NOT NULL) WITHOUT ROWID"
+            )
+
+            def prepared_pages() -> Iterator[ProofPage]:
+                for ordinal, page in enumerate(build_proof_pages(records)):
+                    scratch.execute(
+                        "INSERT INTO replay_proof_page VALUES (?, ?, ?, ?, ?)",
+                        (ordinal, page.first_record_index, page.record_count, page.hashes, page.page_sha256),
+                    )
+                    yield page
+
+            page_index = pack_page_index(prepared_pages(), record_count=record_count)
+            scratch.commit()
+        except sqlite3.DatabaseError as error:
+            raise_if_sqlite_storage_fault(error)
+            raise ReadyBundleError("private replay proof scratch failed") from error
+        yield page_index, scratch
+    finally:
+        scratch.close()
+
+
+def _replay_proof_page_values(connection: sqlite3.Connection) -> Iterator[tuple[object, ...]]:
+    yield from _stream_sql_rows(
+        connection.execute(
+            "SELECT page_ordinal,first_record_index,record_count,hashes,page_sha256 "
+            "FROM replay_proof_page ORDER BY page_ordinal"
+        )
+    )
+
+
+def _stream_sql_rows(cursor: sqlite3.Cursor) -> Iterator[tuple[object, ...]]:
+    try:
+        while True:
+            raw_batch = cast(object, cursor.fetchmany(_TYPED_PAGE_MAX))
+            if not isinstance(raw_batch, list):
+                raise ReadyBundleError("SQLite row stream returned an invalid batch")
+            if not raw_batch:
+                return
+            for raw_row in raw_batch:
+                if not isinstance(raw_row, (tuple, sqlite3.Row)):
+                    raise ReadyBundleError("SQLite row stream returned an invalid row")
+                yield tuple(cast(Iterable[object], raw_row))
+    finally:
+        cursor.close()
+
+
+def _insert_replay_proof_pages(
+    connection: sqlite3.Connection,
+    bundle_id: str,
+    scratch: sqlite3.Connection,
+) -> None:
+    connection.executemany(
+        "INSERT INTO ready_replay_proof_page(bundle_id,page_ordinal,first_record_index,record_count,hashes,"
+        "page_sha256) VALUES (?, ?, ?, ?, ?, ?)",
+        ((bundle_id, *values) for values in _replay_proof_page_values(scratch)),
+    )
+
+
+def _migration_stage_lineage(connection: sqlite3.Connection, stage_id: str) -> tuple[SourceLineage, ...]:
+    rows = _sql_all(
+        connection.execute(
+            "SELECT source_id,start_ordinal,record_count,sequence_start,next_sequence FROM ready_stage_range "
+            "WHERE stage_id=? ORDER BY range_ordinal",
+            (stage_id,),
+        )
+    )
+    if not rows:
+        raise ReadyBundleError("v2 completed stage has no frozen ranges")
+    combined: list[tuple[str, int, int, int, int]] = []
+    for source_id, start, count, sequence_start, next_sequence in rows:
+        if not (
+            isinstance(source_id, str)
+            and type(start) is int
+            and type(count) is int
+            and isinstance(sequence_start, bytes)
+            and isinstance(next_sequence, bytes)
+        ):
+            raise ReadyBundleError("v2 completed stage range is invalid")
+        sequence = decode_uint64(sequence_start)
+        end_sequence = decode_uint64(next_sequence)
+        item = (source_id, start, count, sequence, end_sequence)
+        if combined and (
+            combined[-1][0] == source_id and combined[-1][1] + combined[-1][2] == start and combined[-1][4] == sequence
+        ):
+            previous = combined[-1]
+            combined[-1] = (source_id, previous[1], previous[2] + count, previous[3], end_sequence)
+        else:
+            combined.append(item)
+    lineage: list[SourceLineage] = []
+    for source_id, start, count, sequence, end_sequence in combined:
+        digest = sha256()
+        records = connection.execute(
+            "SELECT ordinal,device_timestamp,payload FROM capture_record WHERE source_id=? AND ordinal>=? "
+            "AND ordinal<? ORDER BY ordinal",
+            (source_id, start, start + count),
+        )
+        expected = start
+        for ordinal, timestamp, payload in _stream_sql_rows(records):
+            if (
+                type(ordinal) is not int
+                or ordinal != expected
+                or type(timestamp) is not int
+                or not isinstance(payload, bytes)
+            ):
+                raise ReadyBundleError("v2 completed stage source row is invalid")
+            digest.update(timestamp.to_bytes(TIMESTAMP_SIZE, "big") + payload)
+            expected += 1
+        if expected != start + count:
+            raise ReadyBundleError("v2 completed stage source rows are incomplete")
+        lineage.append((sequence, end_sequence, digest.hexdigest()))
+    return tuple(lineage)
+
+
 def _digest(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise ReadyBundleError("ready records are not a regular file")
@@ -1014,8 +1412,27 @@ class _TypedGroup:
 
 @dataclass(frozen=True, slots=True)
 class _TypedReadyCustody:
+    state_db: StateDB
     active: tuple[_ReadySource, ...]
     entries: dict[str, dict[str, object]]
+    proofs: dict[str, _ReplayProof]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayProof:
+    bundle_id: str
+    lifecycle: str
+    stage_id: str
+    owner_token: str
+    record_count: int
+    records_sha256: str
+    manifest_sha256: str
+    page_index: bytes
+    normalization_runs: bytes
+    immutable_metadata: bytes
+    proof_content_sha256: str
+    index: tuple[tuple[int, int, bytes], ...]
+    runs: tuple[NormalizationRun, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,6 +1440,7 @@ class ReadyCustodyCache:
     """Authenticated ready custody reusable while its complete identity is unchanged."""
 
     revision: SourceRevision
+    proof_revision: tuple[tuple[object, ...], ...]
     custody: _TypedReadyCustody
 
 
@@ -1434,6 +1852,110 @@ def _typed_records(
             cursor = record.ordinal
 
 
+def _replay_proof_rows(state_db: StateDB) -> tuple[tuple[object, ...], ...]:
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+            return _sql_all(
+                connection.execute(
+                    "SELECT bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,manifest_sha256,"
+                    "page_index,normalization_runs,immutable_metadata,proof_content_sha256 "
+                    "FROM ready_replay_proof ORDER BY bundle_id"
+                )
+            )
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyDurabilityFatalError("private replay proof roots are unreadable") from error
+
+
+def _active_replay_proofs(
+    rows: tuple[tuple[object, ...], ...],
+    entries: Mapping[str, dict[str, object]],
+    sources: tuple[_ReadySource, ...],
+) -> dict[str, _ReplayProof]:
+    active_rows = {
+        cast(str, row[0]): row for row in rows if len(row) == _REPLAY_PROOF_ROOT_COLUMNS and row[1] == "active"
+    }
+    active_ids = {bundle_id for bundle_id, entry in entries.items() if entry["state"] == "ready"}
+    if set(active_rows) != active_ids:
+        raise ReadyDurabilityFatalError("active private replay proofs do not match the READY ledger")
+    source_by_id = {source.result.bundle_id: source for source in sources}
+    proofs: dict[str, _ReplayProof] = {}
+    try:
+        for bundle_id in sorted(active_ids):
+            proofs[bundle_id] = _validated_active_replay_proof(
+                bundle_id,
+                active_rows[bundle_id],
+                source_by_id[bundle_id],
+                entries[bundle_id],
+            )
+    except (KeyError, IndexError, ReadyBundleError, ValueError) as error:
+        raise ReadyDurabilityFatalError("active private replay proof is corrupt") from error
+    return proofs
+
+
+def _validated_active_replay_proof(
+    bundle_id: str,
+    row: tuple[object, ...],
+    source: _ReadySource,
+    entry: Mapping[str, object],
+) -> _ReplayProof:
+    if not (
+        isinstance(row[2], str)
+        and isinstance(row[3], str)
+        and type(row[4]) is int
+        and isinstance(row[5], str)
+        and isinstance(row[6], str)
+        and isinstance(row[7], bytes)
+        and isinstance(row[8], bytes)
+        and isinstance(row[9], bytes)
+        and isinstance(row[10], str)
+    ):
+        raise ValueError("proof root column type is invalid")
+    record_count = cast(int, row[4])
+    index = unpack_page_index(cast(bytes, row[7]), record_count=record_count)
+    runs = unpack_normalization_runs(cast(bytes, row[8]), record_count=record_count)
+    manifest_sha256 = _digest(source.result.path / _MANIFEST_NAME)
+    expected_runs = _replay_normalization_runs(source.time_ranges, source.facts.record_count)
+    metadata = _replay_immutable_metadata(source, manifest_sha256, source_lineage(entry))
+    content_sha256 = _replay_proof_content_sha256(
+        _ProofContent(
+            bundle_id,
+            source.result.records_sha256,
+            manifest_sha256,
+            source.facts.record_count,
+            cast(bytes, row[7]),
+            cast(bytes, row[8]),
+            metadata,
+        )
+    )
+    stored_identity = (record_count, row[5], row[6], runs, row[9], row[10])
+    expected_identity = (
+        source.facts.record_count,
+        source.result.records_sha256,
+        manifest_sha256,
+        expected_runs,
+        metadata,
+        content_sha256,
+    )
+    if stored_identity != expected_identity:
+        raise ValueError("proof root does not match immutable READY metadata")
+    return _ReplayProof(
+        bundle_id,
+        "active",
+        cast(str, row[2]),
+        cast(str, row[3]),
+        record_count,
+        cast(str, row[5]),
+        manifest_sha256,
+        cast(bytes, row[7]),
+        cast(bytes, row[8]),
+        metadata,
+        content_sha256,
+        index,
+        runs,
+    )
+
+
 def _typed_ready_custody(
     ready_root: Path,
     state_db: StateDB,
@@ -1443,7 +1965,13 @@ def _typed_ready_custody(
     bundles = cast(dict[str, object], ledger["bundles"])
     entries = {bundle_id: cast(dict[str, object], entry) for bundle_id, entry in bundles.items()}
     revision = source_revision(ready_root)
-    if previous is not None and previous.revision == revision and previous.custody.entries == entries:
+    proof_rows = _replay_proof_rows(state_db)
+    if (
+        previous is not None
+        and previous.revision == revision
+        and previous.proof_revision == proof_rows
+        and previous.custody.entries == entries
+    ):
         return previous
     active_ids = {bundle_id for bundle_id, entry in entries.items() if entry["state"] == "ready"}
     paths = tuple(sorted(_visible_children(ready_root), key=lambda path: path.name))
@@ -1452,36 +1980,86 @@ def _typed_ready_custody(
     active = tuple(sorted((_read_ready_source(path) for path in paths), key=_ready_start))
     for source in active:
         _validate_ready_ledger_entry(entries[source.result.bundle_id], source)
+    proofs = _active_replay_proofs(proof_rows, entries, active)
     if revision != source_revision(ready_root) or entries != cast(dict[str, object], _read_ledger(state_db)["bundles"]):
         raise ReadyBundleError("typed ready custody changed during authentication")
-    return ReadyCustodyCache(revision, _TypedReadyCustody(active, entries))
+    return ReadyCustodyCache(revision, proof_rows, _TypedReadyCustody(state_db, active, entries, proofs))
 
 
 def _typed_ready_overlap(
     admission: _TypedAdmission,
-    source: _ReadySource,
-    sequence_range: tuple[int, int],
-    ready_offset: int,
+    custody: _TypedReadyCustody,
+    overlap: _ReadyOverlap,
     page_limit: int,
 ) -> None:
-    start, end = sequence_range
+    start, end = overlap.sequence_range
     ordinal = start - admission.snapshot.sequence_start
-    range_index = 0
-    with (source.result.path / _RAW_NAME).open("rb") as published:
-        published.seek(ready_offset * RECORD_SIZE)
-        for record in _typed_records(admission, ordinal, end - start, page_limit):
-            sequence = admission.snapshot.sequence_start + record.ordinal
-            while range_index < len(source.time_ranges) and sequence >= cast(
-                int, source.time_ranges[range_index]["next_sequence"]
-            ):
-                range_index += 1
-            if range_index == len(source.time_ranges) or sequence < cast(
-                int, source.time_ranges[range_index]["start_sequence"]
-            ):
-                raise ReadyBundleError("typed ready overlap has no timestamp mapping")
-            expected = _convert_record(record.raw_bytes, source.time_ranges[range_index])
-            if published.read(RECORD_SIZE) != expected:
-                raise ConflictingOverlapError("typed ready overlap conflicts with its source record")
+    proof = custody.proofs[overlap.source.result.bundle_id]
+    expected_hashes = _replay_proof_hashes(custody.state_db, proof, overlap.ready_offset, end - start)
+    run_index = 0
+    for offset, (record, expected_hash) in enumerate(
+        zip(_typed_records(admission, ordinal, end - start, page_limit), expected_hashes, strict=True)
+    ):
+        publication_index = overlap.ready_offset + offset
+        while publication_index >= proof.runs[run_index].next_record_index:
+            run_index += 1
+        try:
+            normalized = normalize_record(record.raw_bytes, proof.runs[run_index])
+        except ValueError as error:
+            raise ConflictingOverlapError("typed ready overlap cannot be normalized") from error
+        if not hmac.compare_digest(record_sha256(normalized), expected_hash):
+            raise ConflictingOverlapError("typed ready overlap conflicts with its source record")
+
+
+def _replay_proof_hashes(
+    state_db: StateDB, proof: _ReplayProof, first_record_index: int, record_count: int
+) -> tuple[bytes, ...]:
+    end = first_record_index + record_count
+    if first_record_index < 0 or record_count <= 0 or end > proof.record_count:
+        raise ReadyDurabilityFatalError("private replay proof request is outside its root")
+    hashes: list[bytes] = []
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+            connection.execute("BEGIN")
+            root = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,proof_content_sha256 FROM ready_replay_proof WHERE bundle_id=?",
+                    (proof.bundle_id,),
+                )
+            )
+            if root is None or tuple(root) != ("active", proof.proof_content_sha256):
+                raise ValueError("proof root changed")
+            for page_ordinal, (page_first, page_count, page_sha256) in enumerate(proof.index):
+                page_end = page_first + page_count
+                if page_end <= first_record_index or page_first >= end:
+                    continue
+                row = _sql_one(
+                    connection.execute(
+                        "SELECT first_record_index,record_count,hashes,page_sha256 "
+                        "FROM ready_replay_proof_page WHERE bundle_id=? AND page_ordinal=?",
+                        (proof.bundle_id, page_ordinal),
+                    )
+                )
+                if row is None or not (
+                    type(row[0]) is int
+                    and type(row[1]) is int
+                    and isinstance(row[2], bytes)
+                    and isinstance(row[3], bytes)
+                ):
+                    raise ValueError("proof page is missing")
+                page = ProofPage(cast(int, row[0]), cast(int, row[1]), cast(bytes, row[2]), cast(bytes, row[3]))
+                values = validate_proof_page(page, expected_first_record_index=page_first)
+                if (page.record_count, page.page_sha256) != (page_count, page_sha256):
+                    raise ValueError("proof page does not match index")
+                left = max(first_record_index, page_first) - page_first
+                right = min(end, page_end) - page_first
+                hashes.extend(values[left:right])
+    except (OSError, StateDBError, sqlite3.DatabaseError, ValueError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyDurabilityFatalError("private replay proof page is corrupt") from error
+    if len(hashes) != record_count:
+        raise ReadyDurabilityFatalError("private replay proof pages do not cover the replay")
+    return tuple(hashes)
 
 
 def _typed_active_segments(source: _ReadySource) -> Iterator[tuple[int, int, int]]:
@@ -1535,7 +2113,10 @@ def _typed_full_ready_proofs(
                 return None
             overlap_end = min(run_end, end)
             _typed_ready_overlap(
-                admission, source, (cursor, overlap_end), ready_offset + cursor - run_start, page_limit
+                admission,
+                custody,
+                _ReadyOverlap(source, (cursor, overlap_end), ready_offset + cursor - run_start),
+                page_limit,
             )
             proof = (source.result.bundle_id, custody.entries[source.result.bundle_id])
             if not proofs or proofs[-1][0] != proof[0]:
@@ -1566,7 +2147,10 @@ def _typed_ready_prefix(
                 return cursor - admission.snapshot.sequence_start, tuple(proofs)
             overlap_end = min(run_end, end)
             _typed_ready_overlap(
-                admission, source, (cursor, overlap_end), ready_offset + cursor - run_start, page_limit
+                admission,
+                custody,
+                _ReadyOverlap(source, (cursor, overlap_end), ready_offset + cursor - run_start),
+                page_limit,
             )
             proof = (source.result.bundle_id, custody.entries[source.result.bundle_id])
             if not proofs or proofs[-1][0] != proof[0]:
@@ -1712,9 +2296,8 @@ def _unique_against_typed_ready(
             if cursor < overlap_end:
                 _typed_ready_overlap(
                     candidate.admission,
-                    source,
-                    (cursor, overlap_end),
-                    ready_offset + cursor - run_start,
+                    custody,
+                    _ReadyOverlap(source, (cursor, overlap_end), ready_offset + cursor - run_start),
                     page_limit,
                 )
                 cursor = overlap_end
@@ -2433,32 +3016,33 @@ def _ensure_typed_stage(
     rows = _stage_ranges(group, page_limit)
     proposed = _TypedStage(stage_id, group_identity, path, group, rows, stage_id)
     _require_typed_stage_space(audio_store, cohort, proposed)
-    for attempt in range(2):
-        try:
-            _insert_typed_stage(audio_store, cohort, proposed)
-            return proposed
-        except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
-            raise_if_sqlite_corrupt(error)
-            durable_cohort = _load_active_for_reconciliation(audio_store)
-            durable = _load_stage_for_reconciliation(audio_store, durable_cohort, key, page_limit)
-            if (
-                durable_cohort is not None
-                and _same_typed_cohort(durable_cohort, replace(cohort, lifecycle="staging"))
-                and durable is not None
-                and _same_typed_stage(durable, proposed)
-            ):
-                return durable
-            if (
-                durable_cohort is not None
-                and _same_typed_cohort(durable_cohort, cohort)
-                and durable is None
-                and attempt == 0
-            ):
-                continue
-            if durable_cohort is not None and _same_typed_cohort(durable_cohort, cohort) and durable is None:
-                raise_if_sqlite_storage_fault(error)
-                raise ReadyBundleError("typed stage intent was rolled back") from error
-            _typed_fail_stop(audio_store, "ambiguous typed stage intent has a third state")
+    with _stage_replay_proof(proposed, _staged_result(proposed), page_limit) as (proof, scratch):
+        for attempt in range(2):
+            try:
+                _insert_typed_stage(audio_store, cohort, proposed, proof, scratch)
+                return proposed
+            except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
+                raise_if_sqlite_corrupt(error)
+                durable_cohort = _load_active_for_reconciliation(audio_store)
+                durable = _load_stage_for_reconciliation(audio_store, durable_cohort, key, page_limit)
+                if (
+                    durable_cohort is not None
+                    and _same_typed_cohort(durable_cohort, replace(cohort, lifecycle="staging"))
+                    and durable is not None
+                    and _same_typed_stage(durable, proposed)
+                ):
+                    return durable
+                if (
+                    durable_cohort is not None
+                    and _same_typed_cohort(durable_cohort, cohort)
+                    and durable is None
+                    and attempt == 0
+                ):
+                    continue
+                if durable_cohort is not None and _same_typed_cohort(durable_cohort, cohort) and durable is None:
+                    raise_if_sqlite_storage_fault(error)
+                    raise ReadyBundleError("typed stage intent was rolled back") from error
+                _typed_fail_stop(audio_store, "ambiguous typed stage intent has a third state")
     raise AssertionError("unreachable")
 
 
@@ -2476,7 +3060,13 @@ def _load_stage_for_reconciliation(
         _typed_fail_stop(audio_store, "ambiguous typed stage intent could not be inspected")
 
 
-def _insert_typed_stage(audio_store: InternalAudioStore, cohort: _TypedCohort, stage: _TypedStage) -> None:
+def _insert_typed_stage(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _TypedStage,
+    proof: _ReplayProof,
+    proof_scratch: sqlite3.Connection,
+) -> None:
     ranges_digest = sha256(_canonical(stage.group.ranges)).hexdigest()
     first = stage.rows[0]
     last = stage.rows[-1]
@@ -2520,6 +3110,7 @@ def _insert_typed_stage(audio_store: InternalAudioStore, cohort: _TypedCohort, s
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (_stage_range_values(stage.stage_id, index, item) for index, item in enumerate(stage.rows)),
         )
+        _insert_staging_replay_proof(connection, proof, proof_scratch)
         state.mark_publication_changed()
 
 
@@ -2884,7 +3475,7 @@ def _publish_typed_group(
 ) -> ReadyBundleResult:
     stage = _ensure_typed_stage(audio_store, ready_root, cohort, group, page_limit)
     result = _materialize_typed_stage_with_failure_latch(audio_store, cohort, stage, page_limit)
-    _commit_typed_stage(audio_store, cohort, stage, result)
+    _commit_typed_stage(audio_store, cohort, stage, result, page_limit)
     return result
 
 
@@ -2923,7 +3514,7 @@ def _resume_persisted_typed_stage(
             raise ReadyBundleError("STAGING cohort lost its typed stage intent")
         _require_typed_stage_space(audio_store, cohort, stage)
         result = _materialize_typed_stage_with_failure_latch(audio_store, cohort, stage, page_limit)
-        _commit_typed_stage(audio_store, cohort, stage, result)
+        _commit_typed_stage(audio_store, cohort, stage, result, page_limit)
         return result
     except InternalAudioStoreError:
         raise
@@ -2980,12 +3571,209 @@ def _materialize_typed_stage_with_failure_latch(
     page_limit: int,
 ) -> ReadyBundleResult:
     try:
-        return _materialize_typed_stage(stage, page_limit)
+        result = _materialize_typed_stage(stage, page_limit)
+        _require_staging_replay_proof(audio_store, cohort, stage, result, page_limit)
+        return result
     except OSError as error:
         if error.errno != errno.EIO:
             raise
         _latch_typed_durability_failure(audio_store, cohort, stage)
         raise ReadyBundleError("typed stage is blocked by a recorded durability I/O failure") from error
+
+
+def _typed_normalized_records(group: _TypedGroup, page_limit: int) -> Iterator[bytes]:
+    range_index = 0
+    next_sequence = cast(int, group.ranges[0]["next_sequence"])
+    runs = _replay_normalization_runs(cast(tuple[Mapping[str, object], ...], group.ranges), group.facts.record_count)
+    record_index = 0
+    for item in group.slices:
+        for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+            sequence = item.admission.snapshot.sequence_start + record.ordinal
+            while sequence >= next_sequence:
+                range_index += 1
+                next_sequence = cast(int, group.ranges[range_index]["next_sequence"])
+            while record_index >= runs[range_index].next_record_index:
+                range_index += 1
+            yield normalize_record(record.raw_bytes, runs[range_index])
+            record_index += 1
+
+
+@contextmanager
+def _stage_replay_proof(
+    stage: _TypedStage, result: ReadyBundleResult, page_limit: int
+) -> Iterator[tuple[_ReplayProof, sqlite3.Connection]]:
+    with _proof_page_scratch(
+        _typed_normalized_records(stage.group, page_limit),
+        record_count=stage.group.facts.record_count,
+    ) as (page_index, scratch):
+        runs = _replay_normalization_runs(
+            cast(tuple[Mapping[str, object], ...], stage.group.ranges), stage.group.facts.record_count
+        )
+        packed_runs = pack_normalization_runs(runs, record_count=stage.group.facts.record_count)
+        manifest = _canonical(_ready_manifest(stage.group.facts, stage.group.output_sha256, stage.group.ranges))
+        manifest_sha256 = sha256(manifest).hexdigest()
+        lineage = _typed_stage_lineage(stage, page_limit)
+        source = _ReadySource(result, stage.group.facts, cast(tuple[Mapping[str, object], ...], stage.group.ranges))
+        metadata = _replay_immutable_metadata(source, manifest_sha256, lineage)
+        content_sha256 = _replay_proof_content_sha256(
+            _ProofContent(
+                result.bundle_id,
+                result.records_sha256,
+                manifest_sha256,
+                stage.group.facts.record_count,
+                page_index,
+                packed_runs,
+                metadata,
+            )
+        )
+        yield (
+            _ReplayProof(
+                result.bundle_id,
+                "staging",
+                stage.stage_id,
+                stage.owner_token,
+                stage.group.facts.record_count,
+                result.records_sha256,
+                manifest_sha256,
+                page_index,
+                packed_runs,
+                metadata,
+                content_sha256,
+                unpack_page_index(page_index, record_count=stage.group.facts.record_count),
+                runs,
+            ),
+            scratch,
+        )
+
+
+def _typed_stage_lineage(stage: _TypedStage, page_limit: int) -> tuple[SourceLineage, ...]:
+    combined: list[tuple[_TypedAdmission, int, int, int, int]] = []
+    for item in stage.group.slices:
+        admission = item.admission
+        if combined and (
+            combined[-1][0].snapshot.source_id == admission.snapshot.source_id
+            and combined[-1][1] + combined[-1][2] == item.start_ordinal
+            and combined[-1][4] == item.start_sequence
+        ):
+            previous = combined[-1]
+            combined[-1] = (admission, previous[1], previous[2] + item.record_count, previous[3], item.next_sequence)
+        else:
+            combined.append((admission, item.start_ordinal, item.record_count, item.start_sequence, item.next_sequence))
+    return tuple(
+        (start_sequence, next_sequence, _typed_slice(admission, start, count, page_limit).raw_sha256)
+        for admission, start, count, start_sequence, next_sequence in combined
+    )
+
+
+def _staged_result(stage: _TypedStage) -> ReadyBundleResult:
+    bundle_id = _bundle_id(stage.group.facts)
+    return ReadyBundleResult(
+        bundle_id,
+        stage.path.parent / bundle_id,
+        stage.group.facts.next_sequence,
+        stage.group.facts.record_count,
+        stage.group.output_sha256,
+    )
+
+
+def _insert_staging_replay_proof(
+    connection: sqlite3.Connection,
+    proof: _ReplayProof,
+    scratch: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        "INSERT INTO ready_replay_proof(bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,"
+        "manifest_sha256,page_index,normalization_runs,immutable_metadata,proof_content_sha256) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (proof.bundle_id, *_replay_proof_values(proof)),
+    )
+    _insert_replay_proof_pages(connection, proof.bundle_id, scratch)
+
+
+def _require_staging_replay_proof(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _TypedStage,
+    result: ReadyBundleResult,
+    page_limit: int,
+) -> None:
+    with _stage_replay_proof(stage, result, page_limit) as (proof, scratch):
+        try:
+            with (
+                closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+                audio_store.state_db.access(connection),
+            ):
+                stage_row = _sql_one(
+                    connection.execute(
+                        "SELECT group_identity,owner_token FROM ready_output_stage WHERE stage_id=?",
+                        (stage.stage_id,),
+                    )
+                )
+                cohort_row = _sql_one(
+                    connection.execute(
+                        "SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,)
+                    )
+                )
+                stored = _sql_one(
+                    connection.execute(
+                        "SELECT lifecycle,stage_id,owner_token,record_count,records_sha256,manifest_sha256,page_index,"
+                        "normalization_runs,immutable_metadata,proof_content_sha256 "
+                        "FROM ready_replay_proof WHERE bundle_id=?",
+                        (proof.bundle_id,),
+                    )
+                )
+                pages_match = _replay_proof_pages_match(connection, proof.bundle_id, scratch)
+        except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+            raise_if_sqlite_storage_fault(error)
+            raise ReadyBundleError("staging private replay proof is unreadable") from error
+        if stage_row is None or tuple(stage_row) != (stage.group_identity, stage.owner_token):
+            raise ReadyBundleError("typed stage changed before replay proof validation")
+        if cohort_row is None or tuple(cohort_row) != ("staging", cohort.cursor):
+            raise ReadyBundleError("typed cohort changed before replay proof validation")
+        if stored is None or tuple(stored) != _replay_proof_values(proof) or not pages_match:
+            raise ReadyDurabilityFatalError("staging private replay proof conflicts with its owner")
+
+
+def _replay_proof_values(proof: _ReplayProof) -> tuple[object, ...]:
+    return (
+        proof.lifecycle,
+        proof.stage_id,
+        proof.owner_token,
+        proof.record_count,
+        proof.records_sha256,
+        proof.manifest_sha256,
+        proof.page_index,
+        proof.normalization_runs,
+        proof.immutable_metadata,
+        proof.proof_content_sha256,
+    )
+
+
+def _stored_replay_page_values(connection: sqlite3.Connection, bundle_id: str) -> Iterator[tuple[object, ...]]:
+    yield from _stream_sql_rows(
+        connection.execute(
+            "SELECT page_ordinal,first_record_index,record_count,hashes,page_sha256 "
+            "FROM ready_replay_proof_page WHERE bundle_id=? ORDER BY page_ordinal",
+            (bundle_id,),
+        )
+    )
+
+
+def _replay_proof_pages_match(
+    connection: sqlite3.Connection,
+    bundle_id: str,
+    scratch: sqlite3.Connection,
+) -> bool:
+    missing = object()
+    matches = True
+    for stored, expected in zip_longest(
+        _stored_replay_page_values(connection, bundle_id),
+        _replay_proof_page_values(scratch),
+        fillvalue=missing,
+    ):
+        if stored is missing or expected is missing or stored != expected:
+            matches = False
+    return matches
 
 
 def _latch_typed_durability_failure(
@@ -3154,10 +3942,11 @@ def _typed_database_reserve_bytes(
 ) -> int:
     range_rows = len(stage.rows)
     member_rows = len(cohort.admissions)
+    proof_pages = ceil(stage.group.facts.record_count / 128)
     # The final transaction is the larger case: range deletion, member cursor
     # update, source coverage update, possible member cascade, three state rows,
     # the stage table plus its unique index, and the cohort row.
-    btree_mutations = range_rows + 3 * member_rows + 6
+    btree_mutations = range_rows + proof_pages + 3 * member_rows + 8
     # A binary tree is the least-fanout SQLite b-tree, so bit_length(page_count)
     # bounds its depth. At each level a mutation can dirty the path page, one
     # rebalance sibling and one parent/split page. Each schema index above is
@@ -3204,12 +3993,15 @@ def _typed_stage_metadata_bytes(stage: _TypedStage, member_rows: int) -> int:
         )
         for item in stage.rows
     )
-    row_count = len(stage.rows) + member_rows + 4
+    proof_pages = ceil(stage.group.facts.record_count / 128)
+    proof_bytes = stage.group.facts.record_count * 64 + proof_pages * 42
+    row_count = len(stage.rows) + proof_pages + member_rows + 5
     return (
         text_bytes
         + row_text_bytes
         + len(_canonical(stage.group.ranges))
         + len(_canonical(entry))
+        + proof_bytes
         + row_count * _TYPED_METADATA_ROW_BYTES
     )
 
@@ -3332,6 +4124,7 @@ def _commit_typed_stage(
     cohort: _TypedCohort,
     stage: _TypedStage,
     result: ReadyBundleResult,
+    page_limit: int,
 ) -> None:
     progress = _typed_member_progress(cohort, stage.group.facts)
     all_complete = all(
@@ -3341,7 +4134,7 @@ def _commit_typed_stage(
         stage.group.output_sha256,
         "ready",
         stage.group.facts,
-        tuple((item.start_sequence, item.next_sequence, item.raw_sha256) for item in stage.group.slices),
+        _typed_stage_lineage(stage, page_limit),
     )
     ledger = _read_ledger(audio_store.state_db)
     existing = cast(dict[str, object], ledger["bundles"]).get(result.bundle_id)
@@ -3906,6 +4699,21 @@ def _commit_typed_stage_once(audio_store: InternalAudioStore, proposal: _FinalCo
             None,
         ):
             raise ReadyBundleError("typed stage ownership changed before final commit")
+        proof = _sql_one(
+            connection.execute(
+                "SELECT lifecycle,stage_id,owner_token FROM ready_replay_proof WHERE bundle_id=?",
+                (proposal.result.bundle_id,),
+            )
+        )
+        if proof is None or tuple(proof) != ("staging", stage.stage_id, stage.owner_token):
+            raise ReadyDurabilityFatalError("typed stage has no complete private replay proof")
+        activated = connection.execute(
+            "UPDATE ready_replay_proof SET lifecycle='active' "
+            "WHERE bundle_id=? AND lifecycle='staging' AND stage_id=? AND owner_token=?",
+            (proposal.result.bundle_id, stage.stage_id, stage.owner_token),
+        )
+        if activated.rowcount != 1:
+            raise ReadyDurabilityFatalError("typed private replay proof activation changed")
         state.put(StateKind.READY_PUBLICATION, proposal.result.bundle_id, proposal.entry)
         state.put(StateKind.READY_PUBLICATION, "frontier", {"value": ledger["frontier"]})
         for item in proposal.progress:
@@ -3992,6 +4800,12 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
                     (stage.stage_id,),
                 )
             )
+            proof_row = _sql_one(
+                connection.execute(
+                    "SELECT lifecycle,stage_id,owner_token FROM ready_replay_proof WHERE bundle_id=?",
+                    (proposal.result.bundle_id,),
+                )
+            )
             cursors = tuple(
                 _sql_one(
                     connection.execute(
@@ -4043,9 +4857,18 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
         row is not None and row[0] == item.new_cursor for row, item in zip(cursors, proposal.progress, strict=True)
     )
     if (
-        ledger == _typed_proposed_ledger(proposal)
-        and proposed_cohort
-        and stage_row is None
+        (
+            ledger,
+            proposed_cohort,
+            None if stage_row is None else tuple(stage_row),
+            None if proof_row is None else tuple(proof_row),
+        )
+        == (
+            _typed_proposed_ledger(proposal),
+            True,
+            None,
+            ("active", stage.stage_id, stage.owner_token),
+        )
         and proposed_cursors
         and proposed_sources
     ):
@@ -4057,11 +4880,13 @@ def _inspect_typed_final(audio_store: InternalAudioStore, proposal: _FinalCommit
         ledger,
         None if cohort_row is None else tuple(cohort_row),
         None if stage_row is None else tuple(stage_row),
+        None if proof_row is None else tuple(proof_row),
     )
     expected_control_state = (
         proposal.ledger,
         ("staging", cohort.cursor),
         (stage.group_identity, None),
+        ("staging", stage.stage_id, stage.owner_token),
     )
     if durable_control_state == expected_control_state and old_cursors and old_sources:
         return "old"

@@ -43,7 +43,7 @@ def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
         mode = "ro" if read_only else "rw"
         uri = f"file:{quote(path.absolute().as_posix(), safe='/')}?mode={mode}"
         with closing(sqlite3.connect(uri, uri=True, timeout=5)) as connection:
-            _validate_v2(connection)
+            _validate_current(connection)
             _assert_private_audio_gone(layout, connection)
     except FileNotFoundError as error:
         raise StateMigrationError("Collector SQLite database is missing; run stopped-service init-state") from error
@@ -56,16 +56,19 @@ def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
         raise StateMigrationError("Collector SQLite state cannot be validated") from error
 
 
-_TYPED_SCHEMA = 2
+_TYPED_SCHEMA = 3
+_PREVIOUS_TYPED_SCHEMA = 2
 
 
-def _validate_v2(connection: sqlite3.Connection) -> None:
+def _validate_current(connection: sqlite3.Connection) -> None:
     connection.row_factory = sqlite3.Row
     version_row = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
     if version_row is None:
         raise StateMigrationError("Collector SQLite schema version is unavailable")
     if version_row[0] == 1:
         raise InternalAudioCutoverRequiredError("Collector v1 state is unsupported by this release")
+    if version_row[0] == _PREVIOUS_TYPED_SCHEMA:
+        raise InternalAudioCutoverRequiredError("Collector v2 state requires stopped-service init-state migration")
     if version_row[0] != _TYPED_SCHEMA:
         raise StateMigrationError("Collector SQLite schema version is unsupported")
     try:
@@ -74,11 +77,27 @@ def _validate_v2(connection: sqlite3.Connection) -> None:
     except StateDBError as error:
         raise StateMigrationError("Collector SQLite typed schema is invalid") from error
     if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
+        raise InternalAudioCutoverRequiredError("legacy capture rows remain in typed state")
+
+
+def _validate_v2(connection: sqlite3.Connection) -> None:
+    """Validate the sole stopped-service source schema for the v3 migration."""
+
+    connection.row_factory = sqlite3.Row
+    version_row = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
+    if version_row is None or version_row[0] != _PREVIOUS_TYPED_SCHEMA:
+        raise StateMigrationError("Collector SQLite schema is not v2")
+    try:
+        _validate_schema(connection)
+        _validate_audio_schema(connection, version=_PREVIOUS_TYPED_SCHEMA)
+    except StateDBError as error:
+        raise StateMigrationError("Collector SQLite v2 typed schema is invalid") from error
+    if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
         raise InternalAudioCutoverRequiredError("legacy capture rows remain in v2 state")
 
 
 def open_runtime_state(layout: StorageLayout, *, read_only: bool = False) -> StateDB:
-    """Open only a complete v2 database; runtime never creates or upgrades it."""
+    """Open only a complete current database; runtime never creates or upgrades it."""
 
     _validate_canonical(layout, read_only=read_only)
     try:

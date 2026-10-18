@@ -138,6 +138,31 @@ def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
     }
 
 
+def test_unreadable_manifest_is_reported_as_read_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bundle = _bundle(tmp_path, "unreadable", (_record(1),))
+    original_read_text = Path.read_text
+
+    def deny_manifest_read(
+        path: Path, *, encoding: str | None = None, errors: str | None = None, newline: str | None = None
+    ) -> str:
+        if path == bundle / "manifest.json":
+            raise PermissionError(errno.EACCES, "permission denied", str(path))
+        return original_read_text(path, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "read_text", deny_manifest_read)
+
+    with pytest.raises(SpoolMetricsError, match=r"cannot read manifest\.json"):
+        collect_spool_metrics(tmp_path)
+
+
+def test_malformed_manifest_is_reported_as_invalid_json(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "malformed", (_record(1),))
+    (bundle / "manifest.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(SpoolMetricsError, match=r"manifest\.json is invalid JSON"):
+        collect_spool_metrics(tmp_path)
+
+
 @pytest.mark.parametrize("kind", ["unexpected_field", "boolean_record_count"])
 def test_metrics_rejects_noncanonical_bundle_evidence(tmp_path: Path, kind: str) -> None:
     device_root = tmp_path

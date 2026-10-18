@@ -458,6 +458,8 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
 
 ## Documentation
 
+- [Public audio contract plan](docs/PUBLIC_AUDIO_CONTRACT_PLAN.md) — reviewed
+  Ogg Opus handoff, private replay custody, and coordinated cutover design.
 - [Device protocol](docs/DEVICE_PROTOCOL.md) — GATT services, ring framing,
   commands, notifications, and firmware behavior.
 - [Security](docs/SECURITY.md) — BLE privacy observations and data-handling

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/j2h4u/omi-collector/compare/v0.17.2...v0.18.0) (2026-10-18)
+
+
+### Features
+
+* preserve replay custody in bounded SQLite proof pages ([#278](https://github.com/j2h4u/omi-collector/issues/278)) ([2e3c4b9](https://github.com/j2h4u/omi-collector/commit/2e3c4b9a561d28470bcf4985aa4bb508ef11b64d))
+
 ## [0.17.2](https://github.com/j2h4u/omi-collector/compare/v0.17.1...v0.17.2) (2026-10-18)
 
 

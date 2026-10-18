@@ -187,6 +187,23 @@ def test_unrepresentable_mapping_clears_to_useful_unknown_label() -> None:
     assert second.comparable_to_previous is True
 
 
+def test_unrepresentable_mapped_raw_labels_do_not_bridge_offset_changes() -> None:
+    state = ClockState((_mapped(10, 11, -1000.0, "before"), _mapped(11, 12, -2000.0, "after")))
+    first = freeze_public_time(state, sequence=10, raw_timestamp=1)
+
+    second = freeze_public_time(
+        state,
+        sequence=11,
+        raw_timestamp=1005,
+        predecessor=FrozenTimePredecessor(10, first),
+    )
+
+    assert (first.quality, first.seconds) == ("unknown", 1)
+    assert (second.quality, second.seconds) == ("unknown", 1005)
+    assert first.causal_membership != second.causal_membership
+    assert second.comparable_to_previous is False
+
+
 def test_sequence_gap_is_time_incomparable_within_one_mapped_component() -> None:
     state = ClockState((_mapped(10, 20, 0.0, "anchor"),))
     first = freeze_public_time(state, sequence=10, raw_timestamp=100)

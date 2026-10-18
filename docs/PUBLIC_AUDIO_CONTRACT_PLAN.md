@@ -1,8 +1,8 @@
 # Public Audio Contract Plan
 
-Status: **Reviewed; ready for implementation**  
+Status: **Collector implementation complete; coordinated cutover pending**
 Parent: OMIC-49  
-Implementation: private replay foundation verified; v2 writer in progress; not activated
+Implementation: Collector v2 implemented; activation is tracked by OMIC-55
 Premium adversarial review: **GO**
 
 ## Decision

@@ -207,7 +207,7 @@ def test_alternate_root_allowed_without_installed_config_or_collector_authority(
     cli._require_host_singleton(load_operator_config(alternate))
 
 
-def test_init_state_cli_initializes_empty_v3_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_init_state_cli_initializes_empty_v4_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     state_file = load_operator_config(config_path).storage.collector.state_db
     state_file.unlink()
@@ -221,13 +221,13 @@ def test_init_state_cli_initializes_empty_v3_database(monkeypatch: pytest.Monkey
     result = CliRunner().invoke(app, ["init-state", "--config", str(config_path)])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == {"schema_version": 3}
+    assert json.loads(result.output) == {"schema_version": 4}
     assert state_file.is_file()
     with closing(sqlite3.connect(state_file)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
 
 
-def test_init_state_preserves_existing_receiptless_v3_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_init_state_preserves_existing_receiptless_v4_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     state_file = load_operator_config(config_path).storage.collector.state_db
     before = state_file.read_bytes()
@@ -237,9 +237,51 @@ def test_init_state_preserves_existing_receiptless_v3_database(monkeypatch: pyte
     result = CliRunner().invoke(app, ["init-state", "--config", str(config_path)])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == {"schema_version": 3}
+    assert json.loads(result.output) == {"schema_version": 4}
     assert state_file.read_bytes() == before
     assert StateDB(state_file).get(StateKind.RUNTIME_STATUS, "current") == {"last_error": "original"}
+
+
+@pytest.mark.parametrize("command", ["begin-publication-cutover", "activate-public-audio-v2"])
+def test_public_audio_cutover_commands_require_confirmation(
+    command: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(app, [command, "--config", str(config_path)])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert result.stderr.strip() == "refusing operation without --confirm-cutover"
+
+
+def test_public_audio_cutover_commands_transition_to_v2_open(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    loaded = load_operator_config(config_path)
+    checkpoint = loaded.storage.publication.root.parent / "work" / "omi-ready-checkpoint.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text('{"acknowledged":[]}', encoding="utf-8")
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
+
+    quiescing = CliRunner().invoke(
+        app,
+        ["begin-publication-cutover", "--config", str(config_path), "--confirm-cutover"],
+    )
+    activated = CliRunner().invoke(
+        app,
+        ["activate-public-audio-v2", "--config", str(config_path), "--confirm-cutover"],
+    )
+
+    assert quiescing.exit_code == 0, quiescing.output
+    assert json.loads(quiescing.output) == {"mode": "quiescing"}
+    assert activated.exit_code == 0, activated.output
+    assert json.loads(activated.output) == {"mode": "v2_open", "next_public_order": 0}
+    assert StateDB(loaded.storage.collector.state_db).get(StateKind.PUBLICATION_CONTRACT, "current") == {
+        "version": 1,
+        "mode": "v2_open",
+        "next_public_order": 0,
+    }
 
 
 def test_init_state_refuses_v1_database_without_changing_it(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -299,7 +341,7 @@ def test_check_state_classifies_v1_as_refused_without_mutating_it(tmp_path: Path
     assert state_file.read_bytes() == before
 
 
-def test_recover_state_journal_recovers_real_v3_journal_only_when_stopped(
+def test_recover_state_journal_recovers_real_v4_journal_only_when_stopped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config_path = _layout(tmp_path)
@@ -336,7 +378,7 @@ def test_recover_state_journal_recovers_real_v3_journal_only_when_stopped(
     stopped = CliRunner().invoke(app, ["recover-state-journal", "--config", str(config_path)])
 
     assert stopped.exit_code == 0, stopped.output
-    assert json.loads(stopped.output) == {"schema_version": 3, "status": "state_compatible"}
+    assert json.loads(stopped.output) == {"schema_version": 4, "status": "state_compatible"}
     assert not journal.exists()
     assert StateDB(state_file).get(StateKind.RUNTIME_STATUS, "current") == {"last_error": "original"}
 

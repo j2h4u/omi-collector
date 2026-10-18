@@ -59,7 +59,7 @@ def _same_causal_component(
     if previous_membership == membership:
         return True
     kind = membership.partition(":")[0]
-    if kind not in {"mapped", "mapped-raw"} or previous_membership.partition(":")[0] != kind:
+    if kind != "mapped" or previous_membership.partition(":")[0] != kind:
         return False
     start, end = _mapped_component(state, sequence)
     return start <= predecessor.sequence < end
@@ -74,23 +74,35 @@ def _public_label(state: ClockState, sequence: int, raw_timestamp: int) -> tuple
         and (intent.write_sequence_after is None or sequence < intent.write_sequence_after)
     ):
         end = "open" if intent.write_sequence_after is None else str(intent.write_sequence_after)
-        return "unknown", raw_timestamp, None, (
-            f"unknown-intent:{intent.write_sequence_before}:{end}:{intent.operation_id}:{sequence}"
+        return (
+            "unknown",
+            raw_timestamp,
+            None,
+            f"unknown-intent:{intent.write_sequence_before}:{end}:{intent.operation_id}:{sequence}",
         )
 
     clock_range = _range_for(state.ranges, sequence)
     if clock_range is None:
         return "unknown", raw_timestamp, None, f"unknown-uncovered:{sequence}"
     if clock_range.offset_seconds is None:
-        return "unknown", raw_timestamp, None, (
-            f"unknown-range:{clock_range.start_sequence}:{clock_range.next_sequence}:{clock_range.source_id}"
+        return (
+            "unknown",
+            raw_timestamp,
+            None,
+            f"unknown-range:{clock_range.start_sequence}:{clock_range.next_sequence}:{clock_range.source_id}",
         )
 
     component = _mapped_component(state, sequence)
     membership = f"mapped:{component[0]}:{component[1]}"
     normalized = math.floor(raw_timestamp + clock_range.offset_seconds + 0.5)
     if not 0 <= normalized <= _UINT32_MAX:
-        return "unknown", raw_timestamp, None, f"mapped-raw:{component[0]}:{component[1]}"
+        offset = float(clock_range.offset_seconds).hex()
+        return (
+            "unknown",
+            raw_timestamp,
+            None,
+            f"mapped-raw:{clock_range.start_sequence}:{clock_range.next_sequence}:{offset}",
+        )
     quality = "approximate" if clock_range.confidence == "approximate" else "known"
     return quality, normalized, clock_range.uncertainty_seconds, membership
 
@@ -107,18 +119,12 @@ def _mapped_component(state: ClockState, sequence: int) -> tuple[int, int]:
             continue
         component_start, component_end = start, end
         cursor = index - 1
-        while (
-            cursor >= 0
-            and intervals[cursor][1] == component_start
-            and component_start not in causal_boundaries
-        ):
+        while cursor >= 0 and intervals[cursor][1] == component_start and component_start not in causal_boundaries:
             component_start = intervals[cursor][0]
             cursor -= 1
         cursor = index + 1
         while (
-            cursor < len(intervals)
-            and intervals[cursor][0] == component_end
-            and component_end not in causal_boundaries
+            cursor < len(intervals) and intervals[cursor][0] == component_end and component_end not in causal_boundaries
         ):
             component_end = intervals[cursor][1]
             cursor += 1

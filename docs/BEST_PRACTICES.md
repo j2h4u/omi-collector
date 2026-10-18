@@ -305,8 +305,10 @@ All mutable structured Collector state lives in
 `collector/collector-state.sqlite3`, using SQLite's DELETE rollback journal,
 `synchronous=EXTRA`, and a bounded busy timeout. Private attempt, draft, and
 quarantine audio and its recovery evidence live in typed tables in that same
-database. Public ready bundles remain immutable filesystem artifacts containing
-only `records.bin` and `manifest.json`. Keep the separate, zero-content
+database. Public v2 ready artifacts remain immutable filesystem directories
+containing only `audio.ogg` and `manifest.json`; transition releases retain the
+legacy reader and writer only while the durable publication contract is
+`legacy_open` or `quiescing`. Keep the separate, zero-content
 `collector/collector.lock` stable: the service holds its flock for the full
 invocation, and every state-mutating manual command and stopped-service
 initialization takes that same guard before opening writable state. Read-only
@@ -317,8 +319,8 @@ The deployer checks state before stopping the service and repeats the check
 under the stable guard after stop. A verified hot rollback journal is recovered
 by SQLite under that guard, then a read-only check must accept the recovered
 state. The selected release's `omi-collector init-state --config PATH` creates
-v3 only for an empty installation, upgrades existing v2, and validates existing
-v3 without rewriting it. Missing databases alongside READY, private audio,
+v4 only for an empty installation, upgrades existing v2 or v3, and validates existing
+v4 without rewriting it. Missing databases alongside READY, private audio,
 control data, or unknown scratch fail closed. Existing v1 databases are refused
 unchanged; this command never imports or deletes old data. Runtime also refuses
 v1 and never creates a replacement database. Keep the service stopped while repairing an incompatible
@@ -448,7 +450,7 @@ sudo -n /usr/local/sbin/omi-collector-status
 ```
 
 Routine status and `device metrics` validate READY manifest structure, identity,
-file type, and exact payload size without reading `records.bin`; their counts
+file type, and exact payload size without reading `records.bin` or `audio.ogg`; their counts
 describe visible metadata. Publication, reuse, and retirement automatically
 verify payload hashes at their custody boundaries.
 

@@ -7,8 +7,9 @@ import stat
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from typing import TypeGuard, cast
 
+from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError
 from omi_collector.capture.adapters.firmware_observations import (
     FirmwareObservation,
@@ -111,23 +112,40 @@ def collect_spool_metrics(
 ) -> SpoolMetrics:
     """Report visible bundle metadata without reading raw audio payloads."""
     _require_directory(publication_root, "publication root")
+    ledger_entries = _ready_ledger_entries(state_db) if state_db is not None else None
     try:
         observations = read_firmware_observations(state_db) if state_db is not None else ()
     except (FirmwareObservationError, StateDBError) as error:
         raise SpoolMetricsError(f"firmware observations are invalid: {error}") from error
-    measurements = _current_measurements(publication_root)
+    measurements = _current_measurements(publication_root, ledger_entries)
     current = _aggregate_window(measurements)
     return SpoolMetrics(current, FirmwareLifetimeMetrics(*_firmware_metrics(observations)))
 
 
-def _current_measurements(publication_root: Path) -> tuple[_BundleMeasurement, ...]:
-    return _read_artifacts(publication_root)
+def _ready_ledger_entries(state_db: StateDB) -> dict[str, object]:
+    try:
+        ledger = ready_bundles._read_ledger(state_db)
+    except (ReadyBundleError, StateDBError) as error:
+        raise SpoolMetricsError(f"ready publication ledger is invalid: {error}") from error
+    return cast(dict[str, object], ledger["bundles"])
 
 
-def _read_artifacts(root: Path) -> tuple[_BundleMeasurement, ...]:
+def _current_measurements(
+    publication_root: Path, ledger_entries: dict[str, object] | None
+) -> tuple[_BundleMeasurement, ...]:
+    return _read_artifacts(publication_root, ledger_entries)
+
+
+def _read_artifacts(root: Path, ledger_entries: dict[str, object] | None) -> tuple[_BundleMeasurement, ...]:
     measurements: list[_BundleMeasurement] = []
     for entry in _entries(root, "ready publication"):
         if entry.name.startswith("."):
+            continue
+        ledger_entry = ledger_entries.get(entry.name) if ledger_entries is not None else None
+        if _is_v2_ledger_entry(ledger_entry):
+            if entry.is_symlink() or not entry.is_dir():
+                raise SpoolMetricsError(f"v2 ready artifact is not a real directory: {entry}")
+            measurements.append(_read_v2_artifact(entry, ledger_entry))
             continue
         if entry.is_symlink():
             continue
@@ -137,6 +155,27 @@ def _read_artifacts(root: Path) -> tuple[_BundleMeasurement, ...]:
         if measurement is not None:
             measurements.append(measurement)
     return tuple(measurements)
+
+
+def _is_v2_ledger_entry(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict) and value.get("format") == "omi-audio-v2"
+
+
+def _read_v2_artifact(path: Path, entry: dict[str, object]) -> _BundleMeasurement:
+    members = _entries(path, "v2 ready artifact")
+    if {member.name for member in members} != {"audio.ogg", "manifest.json"}:
+        raise SpoolMetricsError(f"v2 ready artifact inventory is invalid: {path}")
+    audio_size = _require_regular_file(path / "audio.ogg", "audio.ogg")
+    manifest_size = _require_regular_file(path / "manifest.json", "manifest.json")
+    if audio_size != entry["audio_bytes"] or manifest_size != entry["manifest_bytes"]:
+        raise SpoolMetricsError(f"v2 ready artifact sizes conflict with publication ledger: {path}")
+    facts = ready_bundles._entry_facts(entry)
+    return _BundleMeasurement(
+        ("ready", path.name),
+        facts.record_count,
+        facts.record_count * RECORD_SIZE,
+        ready_bundles._physical_runs(facts),
+    )
 
 
 def _read_artifact(path: Path) -> _BundleMeasurement | None:

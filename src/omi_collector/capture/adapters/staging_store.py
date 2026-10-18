@@ -7,6 +7,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from functools import partial
 from logging import getLogger
 from pathlib import Path
@@ -17,6 +18,8 @@ from uuid import uuid4
 
 from ..application.ports import StagingWriterTargetPort, StorageLeasePort
 from ..application.storage_fault import TransientInternalAudioStorageError
+from ..domain.clock_state import ClockState, ClockStateError
+from ..domain.publication_contract import contract_policy
 from ..domain.quarantine_machine import QuarantineState
 from ..domain.ready_machine import (
     CaptureBegin,
@@ -62,16 +65,22 @@ from .internal_audio_store import (
 )
 from .public_drain import AcceptedDrainCustody, PublicDrainProjection
 from .ready_bundles import (
+    PublicAudioV2Options,
     ReadyBundleError,
     ReadyCustodyCache,
     ReadyOutcome,
     ReadyOutcomeState,
     SqlitePublicationSource,
     _typed_source_admissions,
+    acknowledged_public_audio_v2,
     acknowledged_ready,
+    finalize_public_audio_v2,
     finalize_typed_sources,
+    publication_contract_state,
     resume_retired,
+    resume_retired_public_audio_v2,
     retire_acknowledged,
+    retire_acknowledged_public_audio_v2,
     source_revision,
 )
 from .sqlite_compaction import compaction_failure_outcome, pending_compaction_generation, vacuum_pending
@@ -764,20 +773,32 @@ class StagingStore:
             raise ReadyBundleError("typed publication source inventory is unreadable") from error
         return tuple(str(row[0]) for row in rows)
 
+    def _publication_clock_metadata(self, require_v2: bool) -> tuple[ClockState | None, ClockSegmentMap]:
+        try:
+            from .clock_state_store import ClockStateStore
+
+            clock_store = ClockStateStore(self._state_db)
+            return clock_store.state(), clock_store.segment_map()
+        except (ClockSegmentError, ClockStateError, ValueError) as error:
+            if require_v2:
+                raise ReadyBundleError("clock metadata unavailable for public audio v2") from error
+            _LOGGER.warning("clock metadata unavailable; publishing ready audio without UTC normalization: %s", error)
+            return None, ClockSegmentMap(())
+
     def _recover_and_publish_unlocked(self) -> ReadyOutcome:
         publication_root = self._publication_root
         if publication_root is None:
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
-        acknowledged = acknowledged_ready(checkpoint_path)
-        try:
-            from .clock_state_store import ClockStateStore
-
-            segments = ClockStateStore(self._state_db).segment_map()
-        except (ClockSegmentError, ValueError) as error:
-            _LOGGER.warning("clock metadata unavailable; publishing ready audio without UTC normalization: %s", error)
-            segments = ClockSegmentMap(())
-        resume_retired(publication_root, self._state_db)
+        contract = publication_contract_state(self._state_db)
+        policy = contract_policy(contract.mode)
+        clock_state, segments = self._publication_clock_metadata(policy.allow_v2_accept)
+        if policy.allow_v2_accept:
+            resume_retired_public_audio_v2(publication_root, self._state_db)
+            acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+        else:
+            resume_retired(publication_root, self._state_db)
+            acknowledged = acknowledged_ready(checkpoint_path)
         closures = ready_closures.coalesce(self._state_db)
         closure = closures[-1] if closures else None
         frontier = None if closure is None else closure.next_sequence
@@ -791,26 +812,49 @@ class StagingStore:
                     SqlitePublicationSource(audio_store, source_id)
                     for source_id in self._typed_publication_source_ids()
                 )
-                outcome = finalize_typed_sources(
-                    audio_store,
-                    sources,
-                    publication_root,
-                    config=self._filesystem._ready,
-                    clock_segments=segments,
-                    frontier=frontier,
-                    drained=drained,
-                    page_limit=self._config.writer.chunk_records,
-                    custody_cache=self._ready_custody_cache,
-                )
+                if policy.allow_v2_accept:
+                    if clock_state is None:
+                        raise ReadyBundleError("clock metadata unavailable for public audio v2")
+                    outcome = finalize_public_audio_v2(
+                        audio_store,
+                        sources,
+                        publication_root,
+                        PublicAudioV2Options(
+                            self._filesystem._ready,
+                            clock_state,
+                            frontier,
+                            drained,
+                            self._config.writer.chunk_records,
+                            self._ready_custody_cache,
+                        ),
+                    )
+                else:
+                    outcome = finalize_typed_sources(
+                        audio_store,
+                        sources,
+                        publication_root,
+                        config=self._filesystem._ready,
+                        clock_segments=segments,
+                        frontier=frontier,
+                        drained=drained,
+                        page_limit=self._config.writer.chunk_records,
+                        custody_cache=self._ready_custody_cache,
+                        allow_accept=policy.allow_legacy_accept,
+                    )
                 if outcome.custody_cache is not None:
                     self._ready_custody_cache = outcome.custody_cache
         except ReadyBundleError as error:
             outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
         if closure is not None and not outcome.remaining_at_frontier:
             ready_closures.remove(self._state_db, closure)
-        retired = retire_acknowledged(publication_root, self._state_db, checkpoint_path, acknowledged=acknowledged)
+        if policy.allow_v2_accept:
+            retired = retire_acknowledged_public_audio_v2(
+                publication_root, self._state_db, checkpoint_path, acknowledged=acknowledged
+            )
+        else:
+            retired = retire_acknowledged(publication_root, self._state_db, checkpoint_path, acknowledged=acknowledged)
         if retired and outcome.state is ReadyOutcomeState.WAITING:
-            outcome = ReadyOutcome(ReadyOutcomeState.WAITING, reason="ack_retired")
+            outcome = replace(outcome, reason="ack_retired")
         return outcome
 
     @property

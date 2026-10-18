@@ -63,22 +63,24 @@ Omi pendant -> Omi Collector -> ready/<bundle_id> -> Windmill -> speech/*.ogg + 
 ```
 
 Omi Collector owns Bluetooth transfer, interruption recovery, sequence-loss
-reporting, clock correction, and finalization of ready bundles. Its public
-handoff is one immutable directory per bundle in `ready`. Each directory
-contains `records.bin` and `manifest.json`.
+reporting, clock correction, and finalization of ready bundles. Its v2 public
+handoff is one immutable directory per artifact in `ready`. Each directory
+contains `audio.ogg` and `manifest.json`.
 
-`records.bin` stores consecutive 444-byte pendant records: a UTC timestamp
-only for confirmed clock ranges, otherwise the original device timestamp,
-followed by the unchanged packed Opus payload. The manifest binds the sequence
-range, record count, hashes, and time ranges. Windmill discovers only complete
-ready bundles. The `draft` and `collector` directories remain internal to Omi Collector,
+`audio.ogg` is a deterministic single-stream Ogg Opus file containing every
+validated non-empty pendant packet in physical order. The manifest binds its
+identity, monotonic publication order, audio hash, packet count, public
+timeline, and explicit discontinuity facts. Zero-packet records remain in
+private replay custody and still affect the timeline. Consumers discover only
+complete ready artifacts. The `draft` and `collector` directories remain internal to Omi Collector,
 `work` is temporary Windmill state, and `speech` contains Windmill's completed
 audio and passport artifacts.
 
-Windmill's durable checkpoint acknowledges a ready bundle only after every
-packet has durable speech or no-speech handling. The collector validates that
-ACK against the ready manifest and its producer ledger, records retirement,
-then removes the exact ready directory. An open speech tail is never an ACK.
+Windmill's durable checkpoint acknowledges an artifact by its ID and
+`audio_sha256` only after every packet has durable speech or no-speech handling.
+The collector validates the complete ACK batch against its private ledger and
+replay proof, records retirement, then removes the exact ready directory and
+proof. An open speech tail is never an ACK.
 
 ## Requirements
 
@@ -315,13 +317,28 @@ The canonical systemd deployment persists the sealed release, checks Collector
 state before stopping the service, and rechecks it under the stable lock before
 selecting the release. A verified SQLite hot rollback journal is recovered by
 SQLite after stop, then checked again. The selected release runs `init-state`:
-it creates a v3 database only when the database and Collector data roots are
-empty, upgrades an existing v2 database, and validates an existing v3 database
-without rewriting it. Existing v1 state and unknown private artifacts fail
+it creates a v4 database only when the database and Collector data roots are
+empty, upgrades an existing v2 or v3 database, and validates an existing v4
+database without rewriting it. Existing v1 state and unknown private artifacts fail
 closed and remain untouched. Runtime
 never creates or upgrades state. See [Best practices](docs/BEST_PRACTICES.md#state-ownership-and-state-initialization)
 for the deploy sequence and the [OMIC-16 acceptance receipt](docs/qa/2026-10-13-omic-16-implementation.md)
 for production and release evidence.
+
+Migration seeds the durable publication contract in `legacy_open`, so an
+upgrade does not change the existing handoff. Once a compatible downstream is
+installed and paused, stop the service and run:
+
+```bash
+omi-collector begin-publication-cutover --confirm-cutover
+```
+
+Let legacy READY custody drain and ACK-retire completely,
+freeze the legacy checkpoint writer, and write the strict empty v2 checkpoint.
+Then run `omi-collector activate-public-audio-v2 --confirm-cutover`. Activation refuses a
+missing or non-empty checkpoint, visible legacy READY, active publication work,
+or any file already present in `ready`; subthreshold private source custody is
+preserved. Both commands use the Collector singleton guard and survive restart.
 Published bundles are a shared boundary. If another local account consumes
 them, configure either a shared Unix group or a default ACL on the ready root.
 For a named downstream account, the ACL shape is:

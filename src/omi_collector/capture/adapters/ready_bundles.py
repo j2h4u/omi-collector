@@ -191,6 +191,7 @@ class _ReadySource:
 _MANIFEST_NAME = "manifest.json"
 _RAW_NAME = "records.bin"
 _READY_DIRECTORY_MODE = 0o2750
+_READY_DIRECTORY_CREATE_MODE = _READY_DIRECTORY_MODE & 0o777
 _READY_FILE_MODE = 0o640
 _UINT32_MAX = (1 << 32) - 1
 _SHA256_HEX_LENGTH = 64
@@ -863,7 +864,7 @@ def _bundle_id(facts: _BundleFacts) -> str:
 
 
 def _prepare_directory(path: Path) -> None:
-    path.mkdir(mode=_READY_DIRECTORY_MODE, parents=True, exist_ok=True)
+    path.mkdir(mode=_READY_DIRECTORY_CREATE_MODE, parents=True, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
         raise ReadyBundleError("ready storage root is unsafe")
 
@@ -3296,7 +3297,7 @@ def _discard_owned_typed_stage(path: Path) -> None:
 def _write_typed_stage_files(path: Path, group: _TypedGroup, page_limit: int) -> None:
     if os.path.lexists(path):
         raise ReadyBundleError("typed ready stage already exists")
-    path.mkdir(mode=_READY_DIRECTORY_MODE)
+    path.mkdir(mode=_READY_DIRECTORY_CREATE_MODE)
     _require_operator_ready_directory(path)
     digest = sha256()
     range_index = 0

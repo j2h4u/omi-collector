@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.0](https://github.com/j2h4u/omi-collector/compare/v0.18.0...v0.19.0) (2026-10-18)
+
+
+### Features
+
+* add isolated local Ogg Opus packaging and public audio timelines ([d3af7ce](https://github.com/j2h4u/omi-collector/commit/d3af7ce66730cf479303eed1f65b0012d23acbc9))
+* integrate recoverable publication with private SQLite custody and coordinated cutover ([d3af7ce](https://github.com/j2h4u/omi-collector/commit/d3af7ce66730cf479303eed1f65b0012d23acbc9))
+
 ## [0.18.0](https://github.com/j2h4u/omi-collector/compare/v0.17.2...v0.18.0) (2026-10-18)
 
 

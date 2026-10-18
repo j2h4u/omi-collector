@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/j2h4u/omi-collector/compare/v0.17.1...v0.17.2) (2026-10-18)
+
+
+### Documentation
+
+* define reviewed public audio contract and rollout ([#276](https://github.com/j2h4u/omi-collector/issues/276)) ([9634adb](https://github.com/j2h4u/omi-collector/commit/9634adb75bcc52a9da1a3a4c1b61afe22a451e66))
+
 ## [0.17.1](https://github.com/j2h4u/omi-collector/compare/v0.17.0...v0.17.1) (2026-10-18)
 
 

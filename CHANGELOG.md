@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/j2h4u/omi-collector/compare/v0.16.1...v0.17.0) (2026-10-18)
+
+
+### Features
+
+* detect and preserve silent BLE receive failures ([#272](https://github.com/j2h4u/omi-collector/issues/272)) ([0aba9fc](https://github.com/j2h4u/omi-collector/commit/0aba9fc69a8590c1397fa62e18a62bd538a3e893))
+
 ## [0.16.1](https://github.com/j2h4u/omi-collector/compare/v0.16.0...v0.16.1) (2026-10-17)
 
 

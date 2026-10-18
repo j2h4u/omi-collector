@@ -41,6 +41,7 @@ class StateKind(StrEnum):
     QUALITY_EVENT_BUDGET = "quality_event_budget"
     COMPACTION = "compaction"
     PENDANT_DRAIN = "pendant_drain"
+    BLE_SCAN_INCIDENT = "ble_scan_incident"
 
 
 class StateDBError(RuntimeError):

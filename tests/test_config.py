@@ -29,6 +29,7 @@ def test_default_config_is_hierarchical_and_immutable() -> None:
     assert isinstance(DEFAULT_CONFIG.retry, RetryConfig)
     assert DEFAULT_CONFIG.presence.absence_seconds == 60.0
     assert DEFAULT_CONFIG.presence.scan_recheck_seconds == 300.0
+    assert DEFAULT_CONFIG.presence.scan_silence_seconds == 180.0
     assert DEFAULT_CONFIG.presence.drain_cooldown_seconds == 900.0
     assert DEFAULT_CONFIG.presence.arrival_stability_seconds == 30.0
     assert DEFAULT_CONFIG.presence.arrival_max_gap_seconds == 10.0
@@ -88,6 +89,7 @@ def test_retired_close_timeout_config_key_fails_fast(factory: type[object]) -> N
     ("factory", "field", "value"),
     [
         (PresenceConfig, "absence_seconds", 0.0),
+        (PresenceConfig, "scan_silence_seconds", 0.0),
         (RetryConfig, "max_storage_not_ready_responses", 0),
         (TransferConfig, "info_timeout_seconds", 0.0),
         (MemoryConfig, "arena_max_bytes", 0),

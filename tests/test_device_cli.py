@@ -1083,7 +1083,9 @@ def test_collect_no_data_result_is_safe_json(monkeypatch: pytest.MonkeyPatch, tm
         dict[str, object],
         json.loads((tmp_path / "collector/public/pendant-drain.json").read_text(encoding="utf-8")),
     )
-    assert set(projection) == {"version", "ring", "last_drain", "battery"}
+    assert set(projection) == {"version", "ring", "last_drain", "battery", "bluetooth"}
+    assert projection["version"] == 2
+    assert projection["bluetooth"] is None
     assert projection["last_drain"] is None
 
 

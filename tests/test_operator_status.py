@@ -170,6 +170,41 @@ def test_operator_status_reads_committed_state_during_runtime_write(tmp_path: Pa
     assert db.get(StateKind.CLOCK, "current") == {"status": "new"}
 
 
+def test_operator_status_marks_open_ble_scan_incident_as_attention(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    layout.publication.root.mkdir()
+    db = _state_db(layout)
+    db.put(
+        StateKind.BLE_SCAN_INCIDENT,
+        "open",
+        {
+            "incident_id": "ble-scan-test",
+            "detected_at": "2026-09-08T10:00:00+00:00",
+            "status": "open",
+            "context": {
+                "reason": "scan_silence",
+                "active_seconds": 180.0,
+                "bleak_callbacks": 0,
+                "last_callback_age_seconds": None,
+                "threshold_seconds": 180.0,
+            },
+            "diagnostics": {
+                "hci": {"status": "degraded", "failure": "cap_net_raw_unavailable", "counts": {}},
+                "bluez": {"available": True, "powered": True, "discovering": False, "devices_count": 0},
+            },
+        },
+    )
+
+    status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    assert status["status"] == "attention"
+    incident = cast(dict[str, object], status["ble_scan_incident"])
+    assert incident["incident_id"] == "ble-scan-test"
+    assert incident["fault_category"] == "host_ble_receive_unavailable"
+    assert cast(dict[str, object], incident["bluez"])["devices_count"] == 0
+    assert "diagnostics" not in incident
+
+
 def _put_quality_events(layout: StorageLayout, events: tuple[dict[str, object], ...] | list[dict[str, object]]) -> None:
     db = _state_db(layout)
     rows = tuple((quality_event_id(event, suffix=f"{index:08d}"), event) for index, event in enumerate(events))

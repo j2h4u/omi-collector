@@ -73,6 +73,7 @@ class PresenceConfig:
     drain_cooldown_seconds: float = 900.0
     arrival_stability_seconds: float = 30.0
     arrival_max_gap_seconds: float = 10.0
+    scan_silence_seconds: float = 180.0
     scan_transition_seconds: float = 2.0
     max_scan_recheck_seconds: float = 300.0
     max_drain_cooldown_seconds: float = 900.0
@@ -87,6 +88,7 @@ class PresenceConfig:
             ("drain_cooldown_seconds", self.drain_cooldown_seconds),
             ("arrival_stability_seconds", self.arrival_stability_seconds),
             ("arrival_max_gap_seconds", self.arrival_max_gap_seconds),
+            ("scan_silence_seconds", self.scan_silence_seconds),
             ("scan_transition_seconds", self.scan_transition_seconds),
             ("max_scan_recheck_seconds", self.max_scan_recheck_seconds),
             ("max_drain_cooldown_seconds", self.max_drain_cooldown_seconds),

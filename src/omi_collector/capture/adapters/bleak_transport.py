@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from bleak.exc import BleakDeviceNotFoundError, BleakError
 from dbus_fast import Message, MessageType, Variant
 
 from ...config import DEFAULT_CONFIG
+from ..application.ble_scan_health import ScanRadioActivity
 from ..application.operational_telemetry import (
     BATTERY_SERVICE_UUID,
     BATTERY_UUID,
@@ -87,6 +89,7 @@ class BleakPresenceObserver:
             raise RuntimeError("presence scanner is already active")
 
         def detected(device: BLEDevice, advertisement: object) -> None:
+            callback(ScanRadioActivity(time.monotonic()))
             if _normalize_address(device.address) == self._address:
                 # Keep the exact ephemeral BLEDevice, including its BlueZ
                 # object path.  A later BleakClient can then connect directly

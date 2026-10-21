@@ -47,6 +47,7 @@ from omi_collector.capture.application.quality_metrics import (
     utc_timestamp,
 )
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy, SessionPhaseState
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     DoneNotification,
@@ -1192,6 +1193,62 @@ async def _admit_partial_and_cancel(
         await _close_real_writers(runtime)
         await session.close()
         raise
+
+
+@_async_test
+@pytest.mark.parametrize("reason", ["absence", "recovery_exhausted", "restart_interrupted"])
+async def test_close_visit_after_interrupted_leg_publishes_ack_without_second_checkpoint(
+    tmp_path: Path, reason: str
+) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    try:
+        interrupted = proxy.interrupted_prefix
+        assert interrupted is not None
+        assert interrupted.record_count == 1
+
+        await reconciler.close_visit(reason)
+
+        assert proxy.checkpoint_calls == 0
+        assert not proxy.thread.is_alive()
+        assert reconciler._state.batch is None
+        source = attempt_source(store, proxy.attempt_id)
+        assert source is not None
+        assert source.lifecycle == "sealed_waiting"
+        assert source.committed_count == 1
+        assert attempt_records(store, proxy.attempt_id) == (_record(100),)
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": reason}]
+        await reconciler.close_visit(reason)
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": reason}]
+    finally:
+        await asyncio.gather(*(item.writer.close() for item in runtime.proxies), return_exceptions=True)
+        assert all(not item.thread.is_alive() for item in runtime.proxies)
+        await session.close()
+
+
+@_async_test
+async def test_close_visit_does_not_publish_interrupted_prefix_after_fatal_writer_failure(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    proxy.failure_fault = fatal
+    try:
+        assert proxy.interrupted_prefix is not None
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await reconciler.close_visit("absence")
+        assert raised.value is fatal
+        assert closure_rows(store) == []
+        source = attempt_source(store, proxy.attempt_id)
+        assert source is not None
+        assert source.lifecycle == "interrupted"
+        assert attempt_records(store, proxy.attempt_id) == (_record(100),)
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
 
 
 @_async_test

@@ -611,7 +611,7 @@ def test_read_begin_failure_latches_and_forbids_later_controls() -> None:
 
 
 async def _test_read_begin_failure_latches_and_forbids_later_controls() -> None:
-    target = FakeTarget(fail_read_begin=True)
+    target = FakeTarget(block_read_begin=True)
     async with _owned_writer(
         target,
         bytearray(RECORD_SIZE),
@@ -620,8 +620,19 @@ async def _test_read_begin_failure_latches_and_forbids_later_controls() -> None:
     ) as writer:
         await writer.start()
         future = writer.submit_read_begin("bad")
-        with pytest.raises(WriterFailedError, match="target failed"):
+        assert await asyncio.to_thread(target.read_begin_started.wait, 1)
+        queued_read_begin = writer.submit_read_begin("queued")
+        await asyncio.sleep(0)
+        with writer._lock:
+            assert len(writer._commands) == 1
+        target.fail_read_begin_after_block = True
+        target.release_read_begin.set()
+        with pytest.raises(WriterFailedError, match="target failed") as failed_read_begin:
             await future
+        assert failed_read_begin.value.__cause__ is writer.failure
+        with pytest.raises(WriterFailedError, match="target failed") as dropped_read_begin:
+            await queued_read_begin
+        assert dropped_read_begin.value.__cause__ is writer.failure
         with pytest.raises(WriterFailedError, match="target failed"):
             await writer.checkpoint()
         with pytest.raises(WriterFailedError, match="target failed"):
@@ -943,6 +954,9 @@ async def _test_target_failure_latches_and_prevents_seal() -> None:
 
         with pytest.raises(WriterFailedError, match="target failed"):
             await writer.barrier()
+        with pytest.raises(WriterFailedError, match="target failed") as failure:
+            await writer.checkpoint()
+        assert isinstance(failure.value.__cause__, OSError)
         assert writer.state is WriterState.FAILED
         with pytest.raises(WriterFailedError, match="target failed"):
             await writer.seal("done")

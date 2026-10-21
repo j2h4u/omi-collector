@@ -209,7 +209,7 @@ class BatchReconciler:
             self._state.visit_frontier = None
             return
         if batch.seal is None and batch.writer.progress.submitted:
-            durable = await _checkpoint_batch(batch)
+            durable = _adopt_interrupted_prefix(batch) or await _checkpoint_batch(batch)
             self._state.pending_durable_next = durable.next_sequence
             _retain_durable_frontier(self._state, durable)
             if durable.record_count:
@@ -787,6 +787,9 @@ async def _checkpoint_batch(batch: _Batch) -> DurablePrefixShape:
 
 def _adopt_interrupted_prefix(batch: _Batch) -> DurablePrefixShape | None:
     """Adopt the durable result already committed while ending the current leg."""
+    failure = batch.writer.failure
+    if failure is not None:
+        raise failure
     durable = batch.writer.interrupted_prefix
     if durable is None:
         return None

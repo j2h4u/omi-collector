@@ -1144,7 +1144,7 @@ def test_real_attempt_writer_failure_stops_a_quiet_read_and_preserves_the_first_
         finally:
             with pytest.raises(WriterFailedError) as close_error:
                 await writer.close()
-            assert close_error.value.args[1] is fatal
+            assert close_error.value.__cause__ is fatal
 
     asyncio.run(scenario())
 

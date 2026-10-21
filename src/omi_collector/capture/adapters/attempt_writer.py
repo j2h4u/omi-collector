@@ -140,6 +140,11 @@ class WriterClosedError(WriterError):
 class WriterFailedError(WriterError):
     """The target failed; sealing and further data publication are forbidden."""
 
+    def __init__(self, message: str, cause: BaseException | None = None) -> None:
+        super().__init__(message)
+        if cause is not None:
+            self.__cause__ = cause
+
 
 class WriterQueueFullError(WriterError):
     """The bounded control-command queue is full."""

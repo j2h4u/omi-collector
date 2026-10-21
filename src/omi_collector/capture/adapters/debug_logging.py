@@ -393,7 +393,8 @@ def _emit_debug_event(
     journal_fields = _journal_fields(fields)
     safe_traceback = _exception_summary(_exception_info(exc_info)) if exc_info else None
     with suppress(Exception):
-        target.debug(
+        log = target.error if event == "attempt_writer_failed" else target.debug
+        log(
             "diagnostic",
             extra={
                 "debug_event": _journal_code(event),
@@ -610,7 +611,23 @@ def _is_expected_connect_timeout(event: str, error: BaseException, fields: Mappi
 
 
 def _exception_summary(exc_info: LoggedExceptionInfo) -> _SafeTraceback:
-    error_type, _, traceback_ = exc_info
+    error_type, error, traceback_ = exc_info
+    summaries: list[str] = []
+    seen: set[int] = set()
+    while error is not None and len(summaries) < DEFAULT_CONFIG.observability.max_error_chain_entries:
+        if id(error) in seen:
+            break
+        seen.add(id(error))
+        summaries.append(_single_exception_summary(type(error), error.__traceback__).text)
+        error = error.__cause__ or (error.__context__ if not error.__suppress_context__ else None)
+    if summaries:
+        return _SafeTraceback(" <- ".join(summaries))
+    return _single_exception_summary(error_type, traceback_)
+
+
+def _single_exception_summary(
+    error_type: type[BaseException] | None, traceback_: TracebackType | None
+) -> _SafeTraceback:
     name = error_type.__name__ if error_type is not None else "Exception"
     package_root = Path(__file__).resolve().parents[2]
     frames: list[str] = []

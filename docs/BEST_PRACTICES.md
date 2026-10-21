@@ -382,6 +382,18 @@ logs. Keep the private diagnostic ring access-restricted.
 
 ## Observability
 
+### Writer failures after a Bluetooth disconnect
+
+An interrupted READ already returns a durable-prefix acknowledgment. Visit
+closure must reuse it instead of checkpointing a target whose READ has ended.
+A latched writer failure still takes precedence over that acknowledgment.
+
+The first `attempt_writer_failed` event is emitted at ERROR, including bounded
+exception types and package-relative stack locations for its cause chain.
+Messages, locals, source text, and absolute paths are omitted. Start an
+investigation with this event; the later `writer_close_error` is often a
+consequence. Worker futures must retain their original exception as `__cause__`.
+
 ### Pendant missing while nearby
 
 When the operator confirms the pendant is nearby and switched on, check host

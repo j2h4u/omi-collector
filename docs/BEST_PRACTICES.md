@@ -382,20 +382,6 @@ logs. Keep the private diagnostic ring access-restricted.
 
 ## Observability
 
-### Writer failures after a Bluetooth disconnect
-
-Preparation and interruption return authenticated durable-prefix receipts.
-They remain usable until the next READ_BEGIN is submitted. Session cleanup
-and visit closure must use this current-leg receipt, not lifetime byte counts;
-a recovered prefix can need publication even when no new bytes arrived.
-A latched writer failure still takes precedence over any receipt.
-
-The first `attempt_writer_failed` event is emitted at ERROR, including bounded
-exception types and package-relative stack locations for its cause chain.
-Messages, locals, source text, and absolute paths are omitted. Start an
-investigation with this event; the later `writer_close_error` is often a
-consequence. Worker futures must retain their original exception as `__cause__`.
-
 ### Pendant missing while nearby
 
 When the operator confirms the pendant is nearby and switched on, check host

@@ -121,7 +121,7 @@ def test_v2_activation_requires_migrated_drained_checkpoint(
     database, store = audio_store
     ready = _ready_root(tmp_path)
     checkpoint = _checkpoint(tmp_path)
-    migrated = json.loads(checkpoint.read_text(encoding="utf-8"))
+    migrated = cast(dict[str, object], json.loads(checkpoint.read_text(encoding="utf-8")))
     assert begin_publication_cutover(database).mode is ContractMode.QUIESCING
     invalid = (
         {"analysis_cursor": None, "vad_decisions": [], "open_speech_tail": None, "acknowledged": []},

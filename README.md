@@ -475,8 +475,6 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
 
 ## Documentation
 
-- [October 2026 redteam review](docs/qa/2026-10-21-redteam.md) — methods,
-  verified fixes, rejected claims and remaining live acceptance.
 - [Public audio contract plan](docs/PUBLIC_AUDIO_CONTRACT_PLAN.md) — reviewed
   Ogg Opus handoff, private replay custody, and coordinated cutover design.
 - [Device protocol](docs/DEVICE_PROTOCOL.md) — GATT services, ring framing,

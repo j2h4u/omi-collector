@@ -657,8 +657,9 @@ declare initial_service_state
 declare readiness_snapshot readiness_state readiness_pid readiness_restarts readiness_invocation
 declare -i readiness_seen=0 selection_published=0 deployment_committed=0
 declare -i readiness_observation_failed=0
+declare -i readiness_started_at=0
 declare -i service_quiesced=0 initial_service_active=0 release_created=0 deployment_lock_fd=-1
-declare -ri readiness_poll_interval_seconds=1 stability_interval_seconds=6
+declare -ri readiness_poll_interval_seconds=1 readiness_timeout_seconds=900 stability_interval_seconds=6
 
 script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve script directory'
 repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
@@ -881,6 +882,7 @@ initial_snapshot=$(read_service_snapshot "$service_name") \
 service_quiesced=0
 IFS='|' read -r _ _ initial_invocation <<< "$initial_snapshot"
 expected_readiness=$(printf '{"config":"%s","status":"deployment_ready"}' "$config_file")
+readiness_started_at=$SECONDS
 while (( ! readiness_seen )); do
     readiness_snapshot=$(read_service_readiness_snapshot "$service_name") || {
         readiness_observation_failed=1
@@ -903,6 +905,9 @@ while (( ! readiness_seen )); do
     fi
     if grep --fixed-strings -- '"status":"deployment_ready"' <<< "$journal_output" &> /dev/null; then
         die "${service_name} did not announce readiness for ${config_file}: readiness event config does not match"
+    fi
+    if (( SECONDS - readiness_started_at >= readiness_timeout_seconds )); then
+        die "${service_name} did not announce readiness within ${readiness_timeout_seconds} seconds"
     fi
     sleep "$readiness_poll_interval_seconds" || { readiness_observation_failed=1; die 'could not wait for application readiness'; }
 done

@@ -384,9 +384,11 @@ logs. Keep the private diagnostic ring access-restricted.
 
 ### Writer failures after a Bluetooth disconnect
 
-An interrupted READ already returns a durable-prefix acknowledgment. Visit
-closure must reuse it instead of checkpointing a target whose READ has ended.
-A latched writer failure still takes precedence over that acknowledgment.
+Preparation and interruption return authenticated durable-prefix receipts.
+They remain usable until the next READ_BEGIN is submitted. Session cleanup
+and visit closure must use this current-leg receipt, not lifetime byte counts;
+a recovered prefix can need publication even when no new bytes arrived.
+A latched writer failure still takes precedence over any receipt.
 
 The first `attempt_writer_failed` event is emitted at ERROR, including bounded
 exception types and package-relative stack locations for its cause chain.

@@ -216,14 +216,26 @@ def begin_publication_cutover(state_db: StateDB) -> PublicationContractState:
 def activate_public_audio_v2(
     audio_store: InternalAudioStore, ready_root: Path, checkpoint_path: Path
 ) -> PublicationContractState:
-    """Activate v2 only after legacy custody is fully drained and a checkpoint exists."""
+    """Activate v2 only after legacy custody and the consumer checkpoint are drained."""
     if not checkpoint_path.exists():
         raise ReadyBundleError("public audio v2 checkpoint is missing")
+    checkpoint = _read_json(checkpoint_path)
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("audio_contract") != "omi-audio-v2"
+        or not {"analysis_cursor", "vad_decisions", "open_speech_tail", "acknowledged"} <= checkpoint.keys()
+    ):
+        raise ReadyBundleError("public audio v2 checkpoint is invalid")
     try:
-        acknowledged = parse_v2_acknowledged(_read_json(checkpoint_path))
+        acknowledged = parse_v2_acknowledged(checkpoint)
     except ValueError as error:
         raise ReadyBundleError("public audio v2 checkpoint is invalid") from error
-    if acknowledged:
+    if (
+        acknowledged
+        or checkpoint["analysis_cursor"] is not None
+        or checkpoint["vad_decisions"] != []
+        or checkpoint["open_speech_tail"] is not None
+    ):
         raise ReadyBundleError("public audio v2 checkpoint is not empty at activation")
     ledger = _read_ledger(audio_store.state_db)
     entries = cast(dict[str, object], ledger["bundles"])

@@ -208,12 +208,8 @@ class BatchReconciler:
             self._state.pending_durable_next = None
             self._state.visit_frontier = None
             return
-        if batch.seal is None and batch.writer.progress.submitted:
-            durable = _adopt_interrupted_prefix(batch) or await _checkpoint_batch(batch)
-            self._state.pending_durable_next = durable.next_sequence
-            _retain_durable_frontier(self._state, durable)
-            if durable.record_count:
-                await batch.writer.publish_prefix()
+        if batch.seal is None:
+            await _publish_closing_prefix(self._state, batch)
         elif batch.seal is not None and batch.count:
             self._state.visit_frontier = max(self._state.visit_frontier or batch.end, batch.end)
         await batch.writer.close()
@@ -283,6 +279,18 @@ def _retain_durable_frontier(state: _State, prefix: DurablePrefixShape) -> None:
         state.visit_frontier = max(state.visit_frontier or prefix.next_sequence, prefix.next_sequence)
 
 
+async def _publish_closing_prefix(state: _State, batch: _Batch) -> None:
+    durable = _adopt_settled_prefix(batch)
+    if durable is None and batch.writer.progress.submitted:
+        durable = await _checkpoint_batch(batch)
+    if durable is None:
+        return
+    state.pending_durable_next = durable.next_sequence
+    _retain_durable_frontier(state, durable)
+    if durable.record_count:
+        await batch.writer.publish_prefix()
+
+
 async def _checkpoint_after_session(state: _State, run: _Run) -> None:
     batch = state.batch
     if batch is None or batch.seal is not None:
@@ -291,7 +299,7 @@ async def _checkpoint_after_session(state: _State, run: _Run) -> None:
         return
     if not batch.writer.progress.submitted:
         return
-    # The writer queue already orders this checkpoint after READ_BEGIN.
+    # A prior leg's submitted bytes do not authorize a checkpoint before this leg's READ_BEGIN.
     try:
         await _checkpoint_batch(batch)
     except BaseException as error:
@@ -785,12 +793,12 @@ async def _checkpoint_batch(batch: _Batch) -> DurablePrefixShape:
     return durable
 
 
-def _adopt_interrupted_prefix(batch: _Batch) -> DurablePrefixShape | None:
-    """Adopt the durable result already committed while ending the current leg."""
+def _adopt_settled_prefix(batch: _Batch) -> DurablePrefixShape | None:
+    """Adopt an authenticated prefix when no READ_BEGIN remains outstanding."""
     failure = batch.writer.failure
     if failure is not None:
         raise failure
-    durable = batch.writer.interrupted_prefix
+    durable = batch.writer.settled_prefix
     if durable is None:
         return None
     batch.durable = durable
@@ -810,11 +818,11 @@ async def _adopt_completed_session_result(state: _State, batch: _Batch) -> bool:
     """Adopt a terminal writer acknowledgment before issuing another checkpoint."""
     if await _adopt_seal_result(batch):
         return True
-    interrupted = _adopt_interrupted_prefix(batch)
-    if interrupted is None:
+    settled = _adopt_settled_prefix(batch)
+    if settled is None:
         return False
-    state.pending_durable_next = interrupted.next_sequence
-    _retain_durable_frontier(state, interrupted)
+    state.pending_durable_next = settled.next_sequence
+    _retain_durable_frontier(state, settled)
     return True
 
 
@@ -831,8 +839,8 @@ async def _finalize_batch(
         if batch.seal is None:
             try:
                 sealed = await _adopt_seal_result(batch)
-                interrupted = _adopt_interrupted_prefix(batch) is not None
-                if not sealed and not interrupted and batch.writer.progress.submitted:
+                settled = _adopt_settled_prefix(batch) is not None
+                if not sealed and not settled and batch.writer.progress.submitted:
                     await _checkpoint_batch(batch)
             except OSError as error:
                 checkpoint_error = error

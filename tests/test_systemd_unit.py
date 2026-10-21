@@ -40,6 +40,7 @@ _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 class _DeploymentScenario:
     initial_service_active: bool = True
     readiness_config: str | None = None
+    readiness_missing: bool = False
     config_check_failure: bool = False
     crash_loop: bool = False
     git_status: str = ""
@@ -726,10 +727,15 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
     (fake_bin / "systemctl").chmod(0o755)
 
     readiness_config = scenario.readiness_config or str(context.config_file)
+    readiness_line = (
+        "collector started"
+        if scenario.readiness_missing
+        else f'{{"config":"{readiness_config}","status":"deployment_ready"}}'
+    )
     (fake_bin / "journalctl").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "journalctl args=%s\\n" "$*" >> {quoted_log}\n'
-        f'printf \'%s\\n\' \'{{"config":"{readiness_config}","status":"deployment_ready"}}\'\n',
+        f"printf '%s\\n' {shlex.quote(readiness_line)}\n",
         encoding="utf-8",
     )
     (fake_bin / "journalctl").chmod(0o755)
@@ -886,6 +892,9 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
     for production_value, harness_value in replacements:
         assert production_value in deployer
         deployer = deployer.replace(production_value, harness_value)
+    if scenario.readiness_missing:
+        assert "readiness_timeout_seconds=900" in deployer
+        deployer = deployer.replace("readiness_timeout_seconds=900", "readiness_timeout_seconds=0")
     harness_deployer = scripts_dir / _DEPLOYER.name
     harness_deployer.write_text(deployer, encoding="utf-8")
     harness_deployer.chmod(0o755)
@@ -1683,6 +1692,22 @@ def test_deployer_keeps_selected_release_stopped_when_readiness_fails(tmp_path: 
 
     assert result.returncode != 0
     assert "did not announce readiness" in result.stderr
+    assert "requires forward Collector recovery" in result.stderr
+    assert harness.current_link.resolve(strict=True) != previous
+    commands = harness.log.read_text(encoding="utf-8")
+    assert commands.count("systemctl args=stop omi-collector.service") == 2
+    assert commands.count("systemctl args=restart omi-collector.service") == 1
+    assert "systemctl args=start omi-collector.service" not in commands
+
+
+def test_deployer_stops_selected_release_when_readiness_never_arrives(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(readiness_missing=True))
+    previous = _previous_release(harness)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "did not announce readiness within 0 seconds" in result.stderr
     assert "requires forward Collector recovery" in result.stderr
     assert harness.current_link.resolve(strict=True) != previous
     commands = harness.log.read_text(encoding="utf-8")

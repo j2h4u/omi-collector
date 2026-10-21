@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from threading import Thread
 from typing import cast
@@ -88,7 +89,7 @@ class _BatchWriter:
         self._target = target
         self._attempt_id: str | None = None
         self._initial_prefix: DurablePrefixShape | None = None
-        self._interrupted_prefix: DurablePrefixShape | None = None
+        self._settled_prefix: DurablePrefixShape | None = None
 
     @property
     def attempt_id(self) -> str:
@@ -131,6 +132,7 @@ class _BatchWriter:
                 raise TypeError("writer returned an invalid initial durable prefix")
             self._attempt_id = self._target.attempt_id
             self._initial_prefix = result
+            self._settled_prefix = result
 
         await join_owned(settle())
 
@@ -141,22 +143,22 @@ class _BatchWriter:
         return self._initial_prefix
 
     @property
-    def interrupted_prefix(self) -> DurablePrefixShape | None:
-        """Return the current-leg interruption acknowledgment, when committed."""
-        return self._interrupted_prefix
+    def settled_prefix(self) -> DurablePrefixShape | None:
+        """Return a durable prefix only while no READ_BEGIN is outstanding."""
+        return self._settled_prefix
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefixShape:
         async def settle() -> DurablePrefixShape:
             result = await self._writer.prepare_leg(start_sequence, record_count)
             if not isinstance(result, DurablePrefixShape):
                 raise TypeError("writer returned an invalid durable prefix")
-            self._interrupted_prefix = None
+            self._settled_prefix = result
             return result
 
         return await join_owned(settle())
 
     async def read_begin(self, notice: ReadBeginNotification) -> object:
-        return await self._writer.read_begin(notice)
+        return await join_owned(self.submit_read_begin(notice))
 
     async def checkpoint(self) -> DurablePrefixShape:
         result = await self._writer.checkpoint()
@@ -175,7 +177,7 @@ class _BatchWriter:
             result = await self._writer.interrupt()
             if not isinstance(result, DurablePrefixShape):
                 raise TypeError("writer returned an invalid interrupted prefix")
-            self._interrupted_prefix = result
+            self._settled_prefix = result
             return result
 
         return await join_owned(settle())
@@ -204,8 +206,10 @@ class _BatchWriter:
     def publish(self, high_water: int, tail: bytes = b"") -> bool:
         return self._writer.publish(high_water, tail)
 
-    def submit_read_begin(self, notice: ReadBeginNotification) -> object:
-        return self._writer.submit_read_begin(notice)
+    def submit_read_begin(self, notice: ReadBeginNotification) -> asyncio.Future[object]:
+        future = self._writer.submit_read_begin(notice)
+        self._settled_prefix = None
+        return future
 
 
 class OpportunisticRuntime(CaptureRuntimePort):

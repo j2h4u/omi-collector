@@ -94,12 +94,50 @@ def _source(
 def _checkpoint(root: Path, acknowledged: list[dict[str, str]] | None = None) -> Path:
     path = root / "work" / "omi-ready-checkpoint.json"
     path.parent.mkdir()
-    path.write_text(json.dumps({"acknowledged": acknowledged or []}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "audio_contract": "omi-audio-v2",
+                "analysis_cursor": None,
+                "vad_decisions": [],
+                "open_speech_tail": None,
+                "acknowledged": acknowledged or [],
+                "consumer": {"retained": True},
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
 def _activate(store: InternalAudioStore, ready: Path, checkpoint: Path) -> None:
     assert begin_publication_cutover(store.state_db).mode is ContractMode.QUIESCING
+    assert activate_public_audio_v2(store, ready, checkpoint).mode is ContractMode.V2_OPEN
+
+
+def test_v2_activation_requires_migrated_drained_checkpoint(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    checkpoint = _checkpoint(tmp_path)
+    migrated = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert begin_publication_cutover(database).mode is ContractMode.QUIESCING
+    invalid = (
+        {"analysis_cursor": None, "vad_decisions": [], "open_speech_tail": None, "acknowledged": []},
+        {**migrated, "audio_contract": "legacy"},
+        {**migrated, "analysis_cursor": {"order": 1}},
+        {**migrated, "vad_decisions": [{}]},
+        {**migrated, "open_speech_tail": {"entries": []}},
+        {**migrated, "acknowledged": [{"id": "a" * 64, "audio_sha256": "b" * 64}]},
+    )
+    for value in invalid:
+        checkpoint.write_text(json.dumps(value), encoding="utf-8")
+        with pytest.raises(ReadyBundleError, match="public audio v2 checkpoint"):
+            activate_public_audio_v2(store, ready, checkpoint)
+        assert publication_contract_state(database).mode is ContractMode.QUIESCING
+        assert tuple(ready.iterdir()) == ()
+    checkpoint.write_text(json.dumps(migrated), encoding="utf-8")
     assert activate_public_audio_v2(store, ready, checkpoint).mode is ContractMode.V2_OPEN
 
 

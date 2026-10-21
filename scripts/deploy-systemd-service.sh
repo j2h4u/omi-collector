@@ -468,6 +468,10 @@ function check_candidate_collector_state {
         printf -v "$output_name" '%s' 'recovery_required'
         return
     fi
+    if [[ "$stopped" == 'false' && $command_status == 1 && "$output" == '{"detail":"canonical audio database is busy","fault":"transient","reason":"inspection_failed","status":"state_refused"}' ]]; then
+        printf -v "$output_name" '%s' 'online_busy'
+        return
+    fi
     if [[ -n "$output" ]]; then
         printf 'Collector state check response (exit %s): %s\n' "$command_status" "$output" >&2
     fi

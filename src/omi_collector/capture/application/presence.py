@@ -371,9 +371,7 @@ class PresenceScheduler:
             self._force_stop_required = True
             self._close_state()
             if self._scan_health is not None and generation is not None:
-                await self._scan_health.scan_stop_failed(
-                    generation, PresenceScanTransitionError("presence scanner stop was cancelled; completion is unknown")
-                )
+                await self._scan_health.scan_stopped(generation)
             raise
         except Exception as error:
             self._force_stop_required = True

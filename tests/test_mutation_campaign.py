@@ -508,6 +508,8 @@ def test_fresh_public_launch_snapshots_without_mutating_the_project(
     assert len(jobs) == 1
     assert len(sync_calls) == 1
     assert owner_calls == [(jobs[0], "fresh", json.loads((jobs[0] / "owner.json").read_text())["run_token"])]
+
+
 def _raise_in_test(error: Exception) -> None:
     raise error
 

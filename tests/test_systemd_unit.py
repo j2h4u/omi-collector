@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fcntl
-import grp
 import json
 import os
 import pwd
@@ -109,9 +108,14 @@ def test_bluetooth_ready_powers_controller_with_bounded_polling(tmp_path: Path) 
     assert "--timeout 10 power on" in log.read_text(encoding="utf-8")
 
 
-def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_mismatch: bool = False, readiness_sequence: tuple[str, ...] = ("active:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",), hot_journal: bool = False, recovery_fail: bool = False) -> tuple[Path, dict[str, str]]:
-    if readiness_mismatch:
-        readiness_sequence = ("failed:0:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",)
+def _fake_deployer(
+    tmp_path: Path,
+    *,
+    stopped_refusal: bool = False,
+    readiness_sequence: tuple[str, ...] = ("active:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",),
+    hot_journal: bool = False,
+    recovery_fail: bool = False,
+) -> tuple[Path, dict[str, str]]:
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
     source = repo / "src" / "omi_collector"
@@ -119,7 +123,9 @@ def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_m
     source.parent.mkdir(parents=True)
     shutil.copytree(_SOURCE_PACKAGE, source)
     shutil.copy2(_DEPLOYER, scripts / _DEPLOYER.name)
-    shutil.copy2(_ROOT / "scripts" / "check_fallback_ledger_compatibility.py", scripts / "check_fallback_ledger_compatibility.py")
+    shutil.copy2(
+        _ROOT / "scripts" / "check_fallback_ledger_compatibility.py", scripts / "check_fallback_ledger_compatibility.py"
+    )
     deployer = scripts / _DEPLOYER.name
     content = deployer.read_text(encoding="utf-8").replace(
         "(( EUID != 0 )) || die 'run as the service owner, without sudo'", "true"
@@ -132,7 +138,6 @@ def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_m
     home = tmp_path / "home"
     home.mkdir()
     user = pwd.getpwuid(os.getuid())
-    primary_group = grp.getgrgid(user.pw_gid).gr_name
     config = tmp_path / "config.toml"
     config.write_text('pendant_address = "12:34:56:78:9A:BC"\nbundle_min_audio_seconds = 3600.0\n', encoding="utf-8")
     active = tmp_path / "service.active"
@@ -141,39 +146,39 @@ def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_m
     call_count = tmp_path / "state-checks"
     (fake_bin / "getent").write_text(
         "#!/usr/bin/env bash\n"
-        f"if [[ \"$1 $2\" == \"passwd {user.pw_name}\" ]]; then printf '%s\\n' "
+        f'if [[ "$1 $2" == "passwd {user.pw_name}" ]]; then printf \'%s\\n\' '
         f"{shlex.quote(f'{user.pw_name}:x:{user.pw_uid}:{user.pw_gid}:test:{home}:/bin/bash')}; exit 0; fi\n"
-        "exec /usr/bin/getent \"$@\"\n",
+        'exec /usr/bin/getent "$@"\n',
         encoding="utf-8",
     )
     (fake_bin / "getent").chmod(0o755)
     (fake_bin / "git").write_text(
-        "#!/usr/bin/env bash\ncase \"$3\" in rev-parse) printf '%040d\\n' 0 ;; status) [[ \"${FAKE_GIT_ERROR:-0}\" == 1 ]] && exit 3; [[ \"${FAKE_GIT_DIRTY:-0}\" == 1 ]] && printf ' M source.py\\n'; exit 0 ;; *) exit 2 ;; esac\n",
+        '#!/usr/bin/env bash\ncase "$3" in rev-parse) printf \'%040d\\n\' 0 ;; status) [[ "${FAKE_GIT_ERROR:-0}" == 1 ]] && exit 3; [[ "${FAKE_GIT_DIRTY:-0}" == 1 ]] && printf \' M source.py\\n\'; exit 0 ;; *) exit 2 ;; esac\n',
         encoding="utf-8",
     )
     (fake_bin / "git").chmod(0o755)
     (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
-        f"{shlex.quote(sys.executable)} -m venv --copies \"$UV_PROJECT_ENVIRONMENT\"\n"
+        f'{shlex.quote(sys.executable)} -m venv --without-pip --copies "$UV_PROJECT_ENVIRONMENT"\n'
         'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c \'import sysconfig; print(sysconfig.get_path("purelib"))\')\n'
-        f"cp -a {shlex.quote(str(source))} \"$purelib/omi_collector\"\n"
+        f'cp -a {shlex.quote(str(source))} "$purelib/omi_collector"\n'
         "cat > \"$UV_PROJECT_ENVIRONMENT/bin/omi-collector\" <<'CLI'\n"
         "#!/usr/bin/env bash\n"
         f"printf 'collector %s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
-        "case \"$1\" in\n"
-        "config) if [[ \"${FAKE_CONFIG_INVALID:-0}\" == 1 ]]; then printf '{\"config\":\"wrong\",\"status\":\"config_valid\"}\\n'; else printf '{\"config\":\"%s\",\"status\":\"config_valid\"}\\n' \"$4\"; fi ;;\n"
+        'case "$1" in\n'
+        'config) if [[ "${FAKE_CONFIG_INVALID:-0}" == 1 ]]; then printf \'{"config":"wrong","status":"config_valid"}\\n\'; else printf \'{"config":"%s","status":"config_valid"}\\n\' "$4"; fi ;;\n'
         "check-state)\n"
         f"  count=0; [[ ! -f {shlex.quote(str(call_count))} ]] || read -r count < {shlex.quote(str(call_count))}\n"
         f"  count=$((count+1)); printf '%s\\n' \"$count\" > {shlex.quote(str(call_count))}\n"
-        f"  if [[ \"$*\" == *--stopped* && {int(stopped_refusal)} == 1 ]]; then printf '{{\"detail\":\"refused\",\"reason\":\"state_validation_failed\",\"status\":\"state_refused\"}}\\n'; exit 1; fi\n"
-        f"  printf 'hot=%s args=%s\\n' \"$FAKE_HOT_JOURNAL\" \"$*\" >> {shlex.quote(str(log))}\n"
-        f"  if [[ {int(hot_journal)} == 1 && ! -f {shlex.quote(str(call_count))}.recovered ]]; then printf '{{\"reason\":\"canonical_hot_journal\",\"status\":\"recovery_required\"}}\\n'; exit 1; fi\n"
-        "  printf '{\"schema_version\":4,\"status\":\"state_compatible\"}\\n' ;;\n"
+        f'  if [[ "$*" == *--stopped* && {int(stopped_refusal)} == 1 ]]; then printf \'{{"detail":"refused","reason":"state_validation_failed","status":"state_refused"}}\\n\'; exit 1; fi\n'
+        f'  printf \'hot=%s args=%s\\n\' "$FAKE_HOT_JOURNAL" "$*" >> {shlex.quote(str(log))}\n'
+        f'  if [[ {int(hot_journal)} == 1 && ! -f {shlex.quote(str(call_count))}.recovered ]]; then printf \'{{"reason":"canonical_hot_journal","status":"recovery_required"}}\\n\'; exit 1; fi\n'
+        '  printf \'{"schema_version":4,"status":"state_compatible"}\\n\' ;;\n'
         f"recover-state-journal) printf 'collector recover-state-journal\\n' >> {shlex.quote(str(log))}; [[ {int(recovery_fail)} == 1 ]] && exit 1; touch {shlex.quote(str(call_count))}.recovered; printf '{{\"status\":\"recovered\"}}\\n' ;;\n"
-        "init-state) [[ \"${FAKE_INIT_FAIL:-0}\" == 1 ]] && exit 1; printf '{\"schema_version\":4}\\n' ;;\n"
+        'init-state) [[ "${FAKE_INIT_FAIL:-0}" == 1 ]] && exit 1; printf \'{"schema_version":4}\\n\' ;;\n'
         "*) exit 2 ;;\n"
         "esac\n"
-        "CLI\nchmod 0755 \"$UV_PROJECT_ENVIRONMENT/bin/omi-collector\"\n",
+        'CLI\nchmod 0755 "$UV_PROJECT_ENVIRONMENT/bin/omi-collector"\n',
         encoding="utf-8",
     )
     (fake_bin / "uv").chmod(0o755)
@@ -181,13 +186,13 @@ def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_m
     fake_systemctl.write_text(
         "#!/usr/bin/env bash\n"
         f"printf 'systemctl %s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
-        "case \"$1\" in\n"
+        'case "$1" in\n'
         f"show) if [[ \"$*\" != *MainPID* ]]; then [[ -e {shlex.quote(str(active))} ]] && printf 'ActiveState=active\\n' || printf 'ActiveState=inactive\\n'; exit 0; fi\n"
         "  IFS=';' read -r -a states <<< \"$READINESS_SEQUENCE\"\n"
         f"  index=0; [[ ! -f {shlex.quote(str(call_count))}.systemctl ]] || read -r index < {shlex.quote(str(call_count))}.systemctl\n"
         f"  printf '%s\\n' $((index+1)) > {shlex.quote(str(call_count))}.systemctl\n"
-        "  (( index < ${#states[@]} )) || index=$((${#states[@]}-1)); IFS=: read -r active_state main_pid restarts invocation job <<< \"${states[index]}\"\n"
-        "  printf 'ActiveState=%s\\nMainPID=%s\\nNRestarts=%s\\nInvocationID=%s\\nJob=%s\\n' \"$active_state\" \"$main_pid\" \"$restarts\" \"$invocation\" \"$job\" ;;\n"
+        '  (( index < ${#states[@]} )) || index=$((${#states[@]}-1)); IFS=: read -r active_state main_pid restarts invocation job <<< "${states[index]}"\n'
+        '  printf \'ActiveState=%s\\nMainPID=%s\\nNRestarts=%s\\nInvocationID=%s\\nJob=%s\\n\' "$active_state" "$main_pid" "$restarts" "$invocation" "$job" ;;\n'
         f"stop) rm -f {shlex.quote(str(active))} ;;\n"
         f"start|restart) touch {shlex.quote(str(active))} ;;\n"
         "*) exit 2 ;;\nesac\n",
@@ -195,9 +200,9 @@ def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_m
     )
     fake_systemctl.chmod(0o755)
     (fake_bin / "sudo").write_text(
-        "#!/usr/bin/env bash\n[[ \"$1\" == -n ]] && shift\n"
-        f"if [[ \"$1\" == /usr/bin/systemctl ]]; then shift; exec {shlex.quote(str(fake_systemctl))} \"$@\"; fi\n"
-        "exec \"$@\"\n",
+        '#!/usr/bin/env bash\n[[ "$1" == -n ]] && shift\n'
+        f'if [[ "$1" == /usr/bin/systemctl ]]; then shift; exec {shlex.quote(str(fake_systemctl))} "$@"; fi\n'
+        'exec "$@"\n',
         encoding="utf-8",
     )
     (fake_bin / "sudo").chmod(0o755)
@@ -219,7 +224,9 @@ def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_m
 
 
 def _run_fake_deployer(deployer: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run((str(deployer),), env=env, cwd=deployer.parent.parent, text=True, capture_output=True, check=False)
+    return subprocess.run(
+        (str(deployer),), env=env, cwd=deployer.parent.parent, text=True, capture_output=True, check=False
+    )
 
 
 def test_deployer_builds_and_selects_candidate_then_removes_previous_release(tmp_path: Path) -> None:
@@ -239,12 +246,15 @@ def test_deployer_builds_and_selects_candidate_then_removes_previous_release(tmp
     selected = (runtime / "current").resolve(strict=True)
     assert selected.parent == runtime / "releases"
     assert not previous.exists()
-    metadata = json.loads((selected / "share/omi-collector/release.json").read_text(encoding="utf-8"))
-    assert metadata == {"source_revision": "0" * 40}
+    assert json.loads((selected / "share/omi-collector/release.json").read_text(encoding="utf-8")) == {
+        "source_revision": "0" * 40
+    }
     commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8")
     assert commands.index("systemctl stop") < commands.index("--stopped") if "--stopped" in commands else True
     assert "UV_LINK_MODE=hardlink" in deployer.read_text(encoding="utf-8")
-    assert commands.index("systemctl restart --no-block") < commands.index("systemctl show omi-collector.service --property=ActiveState --property=MainPID")
+    assert commands.index("systemctl restart --no-block") < commands.index(
+        "systemctl show omi-collector.service --property=ActiveState --property=MainPID"
+    )
 
 
 def test_deployer_restores_compatible_previous_release_on_stopped_state_refusal(tmp_path: Path) -> None:
@@ -266,7 +276,7 @@ def test_deployer_restores_compatible_previous_release_on_stopped_state_refusal(
 
 
 def test_deployer_leaves_unverified_selected_release_stopped(tmp_path: Path) -> None:
-    deployer, env = _fake_deployer(tmp_path, readiness_mismatch=True)
+    deployer, env = _fake_deployer(tmp_path, readiness_sequence=("failed:0:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",))
 
     result = _run_fake_deployer(deployer, env)
 
@@ -379,7 +389,9 @@ def test_deployer_preserves_confirmed_invocation_when_readiness_is_pending(tmp_p
     deployer, env = _fake_deployer(
         tmp_path, readiness_sequence=("activating:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",)
     )
-    content = deployer.read_text(encoding="utf-8").replace("readiness_timeout_seconds=900", "readiness_timeout_seconds=0")
+    content = deployer.read_text(encoding="utf-8").replace(
+        "readiness_timeout_seconds=900", "readiness_timeout_seconds=0"
+    )
     deployer.write_text(content, encoding="utf-8")
 
     result = _run_fake_deployer(deployer, env)

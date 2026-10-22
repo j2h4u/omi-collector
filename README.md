@@ -117,16 +117,34 @@ builds, deployment, and status command all belong to that account. Persistent
 pipeline data and configuration remain under `/srv/pipelines/omi`; release
 runtime files are kept under `$HOME/.local/share/omi-collector`.
 
-Keep the operator configuration at `/srv/pipelines/omi/config.toml`. For the
-one-time unit installation, use a clean, committed, reviewed checkout. Stage
-that commit as a root-owned archive, install the unit from the staged copy,
-then remove the staging directory:
+Keep `/srv/pipelines/omi/config.toml` owned and writable by the same personal
+user that runs the service. The `collector` and `ready` roots must also be
+writable by that user. The installer creates missing roots with that user's
+primary group and mode `2750`; existing roots must already match those
+requirements and are not recursively changed. It does not touch neighboring
+`work` or `speech` directories.
+
+For the one-time unit installation, run this from the operator-owned checkout
+after reviewing a clean, committed revision. It stages only that commit in a
+unique root-owned directory under `/opt` and removes only that directory:
 
 ```bash
-sudo install -d -o root -g root -m 0700 /opt/omi-collector-install
-sudo bash -o pipefail -c 'git -C /home/j2h4u/repos/j2h4u/omi-collector archive --format=tar HEAD | tar --extract --directory=/opt/omi-collector-install --no-same-owner'
-sudo /opt/omi-collector-install/scripts/install-systemd-unit.sh
-sudo rm -rf /opt/omi-collector-install
+set -euo pipefail
+repo=$(git rev-parse --show-toplevel)
+if [[ -n "$(git status --porcelain)" ]]; then
+  printf 'Review and commit a clean candidate before installing the unit.\n' >&2
+  exit 1
+fi
+reviewed_commit=$(git rev-parse --verify 'HEAD^{commit}')
+install_root=$(sudo mktemp -d /opt/omi-collector-install.XXXXXX) || {
+  printf 'Could not create a root-owned staging directory under /opt.\n' >&2
+  exit 1
+}
+trap 'sudo rm -rf -- "$install_root"' EXIT
+sudo bash -o pipefail -c \
+  'git -C "$1" archive --format=tar "$2" | tar --extract --directory="$3" --no-same-owner' \
+  _ "$repo" "$reviewed_commit" "$install_root"
+sudo "$install_root/scripts/install-systemd-unit.sh"
 ```
 
 The installer binds the unit to the invoking non-root user and installs the
@@ -290,39 +308,10 @@ Collector state. Read-only `device status` and `device metrics` use read-only
 database access and can run while the service is active. Keep the guard file in
 place; migration replaces the database file but never the guard inode.
 
-The operator account owns the `collector`, `draft`, `ready`,
-`collector/attempts`, and `collector/quarantine` roots under the existing
+The operator account owns the `collector` and `ready` roots under the existing
 pipeline storage root. New files remain private to that account unless a
-downstream reader is explicitly granted access. Existing nested files from
-older releases may need a one-time ownership/mode repair.
+downstream reader is explicitly granted access.
 
-The systemd deployment persists the selected release, checks Collector
-state before stopping the service, and rechecks it under the stable lock before
-selecting the release. A verified SQLite hot rollback journal is recovered by
-SQLite after stop, then checked again. The selected release runs `init-state`:
-it creates a v4 database only when the database and Collector data roots are
-empty, upgrades an existing v2 or v3 database, and validates an existing v4
-database without rewriting it. Existing v1 state and unknown private artifacts fail
-closed and remain untouched. Runtime never creates or upgrades state. See
-[Best practices](docs/BEST_PRACTICES.md#state-ownership-and-state-initialization)
-for the deploy sequence.
-
-Migration seeds the durable publication contract in `legacy_open`, so an
-upgrade does not change the existing handoff. Once a compatible downstream is
-installed and paused, stop the service and run:
-
-```bash
-omi-collector begin-publication-cutover --confirm-cutover
-```
-
-Let legacy READY custody drain and ACK-retire completely,
-freeze the legacy checkpoint writer, and write the strict empty v2 checkpoint.
-Then run `omi-collector activate-public-audio-v2 --confirm-cutover`. Activation refuses a
-missing or non-empty checkpoint, visible legacy READY, active publication work,
-or any file already present in `ready`; subthreshold private source custody is
-preserved. Both commands use the Collector singleton guard and survive restart.
-Published bundles are a shared boundary. If another local account consumes
-them, configure either a shared Unix group or a default ACL on the ready root.
 For a downstream account, grant access to the `ready` root through a shared
 Unix group or a default ACL, and ensure every parent directory is traversable.
 Verify access as that account after the first bundle is published.

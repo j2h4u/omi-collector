@@ -231,8 +231,13 @@ exact selected set on every exit path, including cancellation and recovery.
 systemd is the production supervisor and runs as the personal non-root operator
 account. The operator owns the source checkout, builds, releases, and status
 command. Runtime files live under
-`$HOME/.local/share/omi-collector/{releases,current,python,.deployment.lock}`;
+`$HOME/.local/share/omi-collector/{releases,current,.deployment.lock}`;
 persistent pipeline configuration and data remain under `/srv/pipelines/omi`.
+The operator account must own and be able to write the configuration file and
+the `collector` and `ready` roots. The installer creates missing roots with the
+operator's primary group and mode `2750`; existing roots must already match and
+are not recursively changed. It leaves neighboring `work` and `speech`
+directories untouched.
 
 Install or update the unit once from a clean, committed, reviewed candidate
 using the root-owned staging sequence in [Production installation](../README.md#production-installation).
@@ -248,10 +253,9 @@ convenience command is also unprivileged:
 `scripts/dev-deploy-release.sh vMAJOR.MINOR.PATCH`.
 The notification boundary is the single atomic
 `collector/public/pendant-drain.json` projection. Keep `collector/public`
-owned by the operator account with mode `2750`; its JSON file is `0640`. A downstream container mounts only this directory read-only,
-without the private database or other Collector roots. On this host the public
-directory owner/group are numeric `996:1000`; application code derives paths
-and inherits the provisioned group rather than hardcoding these identities.
+owned by the operator account; its JSON file is `0640`. A downstream container
+mounts only this directory read-only, without the private database or other
+Collector roots. Configure consumer access to that directory explicitly.
 The completion receipt lives in SQLite and is exported again after restart.
 Its ID denotes a verified empty ring after accepted durable custody, including
 the existing quality-loss classification. Repeated empty observations do not

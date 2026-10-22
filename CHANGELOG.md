@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.2](https://github.com/j2h4u/omi-collector/compare/v0.19.1...v0.19.2) (2026-10-22)
+
+
+### Fixes
+
+* retain Bluetooth scanner teardown across timeout and intentional shutdown ([2ef24aa](https://github.com/j2h4u/omi-collector/commit/2ef24aa7e930253f37cb7376f5ee459518f5f764))
+
+
+### Refactoring
+
+* run Collector deployment and runtime under the personal owner ([2ef24aa](https://github.com/j2h4u/omi-collector/commit/2ef24aa7e930253f37cb7376f5ee459518f5f764))
+
 ## [0.19.1](https://github.com/j2h4u/omi-collector/compare/v0.19.0...v0.19.1) (2026-10-22)
 
 

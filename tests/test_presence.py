@@ -180,7 +180,7 @@ def test_bleak_observer_requests_duplicate_data_and_filters_exact_address() -> N
     _run(scenario())
 
 
-def test_bleak_observer_retains_scanner_when_failed_start_cleanup_fails() -> None:
+def test_bleak_observer_retains_failed_start_cleanup_failure() -> None:
     pytest.importorskip("bleak")
     from omi_collector.capture.adapters.bleak_transport import BleakPresenceObserver
 
@@ -217,16 +217,17 @@ def test_bleak_observer_retains_scanner_when_failed_start_cleanup_fails() -> Non
             await observer.start(lambda _observation: None)
         assert len(scanners) == 1
 
-        await observer.stop()
-        assert scanners[0].stop_calls == 2
-        await observer.start(lambda _observation: None)
-        assert len(scanners) == 2
-        await observer.stop()
+        with pytest.raises(RuntimeError, match="scanner cleanup stop failed"):
+            await observer.stop()
+        with pytest.raises(RuntimeError, match="already active"):
+            await observer.start(lambda _observation: None)
+        assert scanners[0].stop_calls == 1
+        assert len(scanners) == 1
 
     _run(scenario())
 
 
-def test_bleak_observer_retains_scanner_after_stop_failure_until_retry() -> None:
+def test_bleak_observer_retains_failed_stop_operation() -> None:
     pytest.importorskip("bleak")
     from omi_collector.capture.adapters.bleak_transport import BleakPresenceObserver
 
@@ -260,13 +261,135 @@ def test_bleak_observer_retains_scanner_after_stop_failure_until_retry() -> None
             await observer.start(lambda _observation: None)
         assert len(scanners) == 1
 
-        await observer.stop()
-        assert scanners[0].stop_calls == 2
-        await observer.start(lambda _observation: None)
-        assert len(scanners) == 2
-        await observer.stop()
+        with pytest.raises(RuntimeError, match="scanner stop failed"):
+            await observer.stop()
+        with pytest.raises(RuntimeError, match="already active"):
+            await observer.start(lambda _observation: None)
+        assert scanners[0].stop_calls == 1
+        assert len(scanners) == 1
 
     _run(scenario())
+
+
+def test_scheduler_joins_bleak_stop_after_fast_observation_timeout() -> None:
+    pytest.importorskip("bleak")
+    from omi_collector.capture.adapters.bleak_transport import BleakPresenceObserver
+
+    async def scenario() -> None:
+        class Device:
+            address = "aa:bb"
+
+        class Advertisement:
+            rssi = -70
+
+        class Scanner:
+            stop_calls = 0
+
+            def __init__(self, **options: object) -> None:
+                self.detected = options["detection_callback"]
+
+            async def start(self) -> None:
+                return None
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                await asyncio.sleep(0.03)
+
+        instance: Scanner | None = None
+
+        def factory(**options: object) -> Scanner:
+            nonlocal instance
+            instance = Scanner(**options)
+            return instance
+
+        observer = BleakPresenceObserver("aa:bb", scanner_factory=factory)
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(
+                scan_transition_seconds=0.01,
+                scan_cancel_grace_min_seconds=0.002,
+                scan_cancel_grace_max_seconds=0.002,
+                scan_cancel_grace_fraction=1.0,
+            ),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                while instance is None:
+                    await asyncio.sleep(0)
+            callback = instance.detected
+            assert callable(callback)
+            callback(Device(), Advertisement())
+            callback(Device(), Advertisement())
+            wake = await asyncio.wait_for(waiter, timeout=_READINESS_TIMEOUT_SECONDS)
+            assert isinstance(wake, PresenceWake)
+            assert instance.stop_calls == 1
+        finally:
+            await _cancel_waiter_and_close(scheduler, waiter)
+
+
+def test_scheduler_fails_closed_when_bleak_stop_exceeds_recovery_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("bleak")
+    from omi_collector.capture.adapters.bleak_transport import BleakPresenceObserver
+
+    async def scenario() -> None:
+        release_stop = asyncio.Event()
+
+        class Device:
+            address = "aa:bb"
+
+        class Advertisement:
+            rssi = -70
+
+        class Scanner:
+            stop_calls = 0
+
+            def __init__(self, **options: object) -> None:
+                self.detected = options["detection_callback"]
+
+            async def start(self) -> None:
+                return None
+
+            async def stop(self) -> None:
+                self.stop_calls += 1
+                await release_stop.wait()
+
+        instance: Scanner | None = None
+
+        def factory(**options: object) -> Scanner:
+            nonlocal instance
+            instance = Scanner(**options)
+            return instance
+
+        monkeypatch.setattr(presence_module, "_SCAN_STOP_RECOVERY_SECONDS", 0.01)
+        observer = BleakPresenceObserver("aa:bb", scanner_factory=factory)
+        scheduler = PresenceScheduler(
+            observer,
+            policy=_test_policy(
+                scan_transition_seconds=0.01,
+                scan_cancel_grace_min_seconds=0.002,
+                scan_cancel_grace_max_seconds=0.002,
+                scan_cancel_grace_fraction=1.0,
+            ),
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
+                while instance is None:
+                    await asyncio.sleep(0)
+            callback = instance.detected
+            assert callable(callback)
+            callback(Device(), Advertisement())
+            callback(Device(), Advertisement())
+            with pytest.raises(PresenceScanStopError, match="remained pending after recovery"):
+                await asyncio.wait_for(waiter, timeout=_READINESS_TIMEOUT_SECONDS)
+            assert instance.stop_calls == 1
+            with pytest.raises(RuntimeError, match="closed"):
+                await scheduler.wait_for_attempt()
+        finally:
+            release_stop.set()
+            await observer.stop()
+            await _cancel_waiter_and_close(scheduler, waiter)
 
 
 def test_callback_during_scanner_start_is_buffered_and_redeemed_after_stop() -> None:
@@ -1447,8 +1570,8 @@ def test_close_retries_observer_stop_after_first_attempt_fails(failure: str) -> 
                 async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                     await closing
 
-            assert observer.active
             assert observer.stop_calls == 1
+            assert observer.active
             with pytest.raises(RuntimeError, match="closed"):
                 async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                     await waiter

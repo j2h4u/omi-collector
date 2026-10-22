@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from contextlib import closing, contextmanager
 from os import stat_result
 from pathlib import Path
 from shutil import rmtree
-from typing import cast
+from typing import Never, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -44,6 +45,7 @@ _CAPTURE_ROOTS: set[Path] = set()
 @pytest.fixture(autouse=True)
 def _isolate_installed_host_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "installed" / "config.toml")
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
 
 
 def _capture_root(tmp_path: Path) -> Path:
@@ -568,6 +570,70 @@ def test_config_check_reports_canonical_path(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert json.loads(result.output) == {"config": str(path), "status": "config_valid"}
+
+
+def test_systemd_ready_notification_supports_filesystem_and_abstract_sockets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for address in (str(tmp_path / "notify.sock"), f"@omi-collector-{tmp_path.name}"):
+        receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            receiver.settimeout(1)
+            bind_address = "\0" + address[1:] if address.startswith("@") else address
+            receiver.bind(bind_address)
+            monkeypatch.setenv("NOTIFY_SOCKET", address)
+            cli._notify_systemd_ready()
+            assert receiver.recv(64) == b"READY=1"
+        finally:
+            receiver.close()
+
+
+def test_systemd_ready_notification_is_optional_without_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    cli._notify_systemd_ready()
+
+
+def test_service_does_not_start_sync_when_systemd_notification_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _layout(tmp_path)
+    monkeypatch.setenv("NOTIFY_SOCKET", str(tmp_path / "missing-notify.sock"))
+    monkeypatch.setattr(
+        "omi_collector.capture.application.operational_telemetry.system_host_boot_id",
+        lambda: "00000000-0000-0000-0000-000000000001",
+    )
+    sync_calls: list[None] = []
+    monkeypatch.setattr(cli, "_sync", lambda *_args, **_kwargs: sync_calls.append(None))
+
+    result = CliRunner().invoke(app, ["service", "--config", str(path)])
+
+    assert result.exit_code == 1
+    assert "could not notify systemd that Collector is ready" in result.stderr
+    assert not sync_calls
+
+
+def test_service_preflight_failure_sends_no_systemd_ready_notification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _layout(tmp_path)
+    notify_path = tmp_path / "notify.sock"
+    receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    receiver.settimeout(0.1)
+    receiver.bind(str(notify_path))
+    monkeypatch.setenv("NOTIFY_SOCKET", str(notify_path))
+
+    def fail_preflight(_staging: object) -> Never:
+        raise cli.typer.Exit(code=1)
+
+    monkeypatch.setattr(cli, "_preflight_storage", fail_preflight)
+    try:
+        result = CliRunner().invoke(app, ["service", "--config", str(path)])
+
+        assert result.exit_code == 1
+        with pytest.raises(socket.timeout):
+            receiver.recv(64)
+    finally:
+        receiver.close()
 
 
 def test_service_announces_readiness_after_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

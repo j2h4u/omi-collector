@@ -4,6 +4,7 @@ import gc
 import logging
 import weakref
 from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
 from typing import cast
 
@@ -26,7 +27,7 @@ from omi_collector.capture.adapters.debug_logging import (
     write_runtime_status_event,
 )
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
-from omi_collector.config import DebugLogConfig
+from omi_collector.config import DEFAULT_CONFIG, DebugLogConfig
 
 
 def test_safe_exception_summary_keeps_tail_frames_and_omits_exception_data() -> None:
@@ -69,6 +70,45 @@ def test_safe_exception_summary_marks_external_and_missing_frames() -> None:
     assert "<external>:" in external
     assert "private message" not in external
     assert safe_exception_summary(ValueError("secret")) == "ValueError at <no stack>"
+
+
+def test_safe_exception_summary_bounds_and_guards_chained_causes() -> None:
+    errors = [RuntimeError(f"secret-{index}") for index in range(10)]
+    for outer, inner in pairwise(errors):
+        outer.__cause__ = inner
+
+    summary = safe_exception_summary(errors[0])
+
+    assert summary.count(" at <no stack>") == DEFAULT_CONFIG.observability.max_error_chain_entries
+    assert "secret-" not in summary
+    assert "RuntimeError" in summary
+
+    errors[1].__cause__ = errors[0]
+    cyclic = safe_exception_summary(errors[0])
+    assert cyclic.count(" at <no stack>") == 2
+
+    contextual_error = LookupError("outer secret")
+    contextual_error.__context__ = ValueError("context secret")
+    contextual = safe_exception_summary(contextual_error)
+    assert contextual.startswith("LookupError at <no stack>")
+    assert "ValueError at <no stack>" in contextual
+    assert "secret" not in contextual
+    contextual_error.__suppress_context__ = True
+    suppressed = safe_exception_summary(contextual_error)
+    assert "LookupError at <no stack>" in suppressed
+    assert "ValueError" not in suppressed
+
+
+def test_attempt_writer_failure_event_is_logged_at_error(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+    try:
+        raise OSError("private message")
+    except OSError as error:
+        debug_exception("attempt_writer_failed", error)
+
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+    assert "OSError" in caplog.text
+    assert "private message" not in caplog.text
 
 
 def test_safe_exception_summary_resolves_current_symlink_frame_paths(

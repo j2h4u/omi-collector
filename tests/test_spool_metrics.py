@@ -95,7 +95,18 @@ def v2_spool(tmp_path: Path) -> Iterator[tuple[StateDB, Path, tuple[Path, ...]]]
     ready.chmod(0o2750)
     checkpoint = tmp_path / "work" / "omi-ready-checkpoint.json"
     checkpoint.parent.mkdir()
-    checkpoint.write_text(json.dumps({"acknowledged": []}), encoding="utf-8")
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "audio_contract": "omi-audio-v2",
+                "analysis_cursor": None,
+                "vad_decisions": [],
+                "open_speech_tail": None,
+                "acknowledged": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     begin_publication_cutover(database)
     activate_public_audio_v2(store, ready, checkpoint)
     clock = ClockState((ClockRange(10, 17, 1.0, 0.25, "confirmed", "test"),))

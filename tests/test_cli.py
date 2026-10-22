@@ -261,7 +261,18 @@ def test_public_audio_cutover_commands_transition_to_v2_open(monkeypatch: pytest
     loaded = load_operator_config(config_path)
     checkpoint = loaded.storage.publication.root.parent / "work" / "omi-ready-checkpoint.json"
     checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text('{"acknowledged":[]}', encoding="utf-8")
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "audio_contract": "omi-audio-v2",
+                "analysis_cursor": None,
+                "vad_decisions": [],
+                "open_speech_tail": None,
+                "acknowledged": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
 
     quiescing = CliRunner().invoke(

@@ -548,7 +548,7 @@ class _SealResultBatchWriter:
         return self.writer.failure
 
     @property
-    def interrupted_prefix(self) -> None:
+    def settled_prefix(self) -> None:
         return None
 
     async def checkpoint(self) -> DurablePrefix:
@@ -3954,7 +3954,7 @@ async def test_post_session_checkpoint_surfaces_latched_writer_failure_identity(
     class FailedWriter:
         progress = WriterProgress(RECORD_SIZE, 0)
         failure = latched
-        interrupted_prefix = None
+        settled_prefix = None
 
         async def await_seal_result(self) -> object | None:
             return None

@@ -40,6 +40,7 @@ _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 class _DeploymentScenario:
     initial_service_active: bool = True
     readiness_config: str | None = None
+    readiness_missing: bool = False
     config_check_failure: bool = False
     crash_loop: bool = False
     git_status: str = ""
@@ -53,6 +54,8 @@ class _DeploymentScenario:
     service_work_traversable: bool = True
     service_checkpoint_readable: bool = True
     preflight_failure_at: int | None = None
+    online_busy: bool = False
+    stopped_busy: bool = False
     init_creates_database: bool = False
     init_failure: bool = False
     operator_can_write_state: bool = False
@@ -547,6 +550,7 @@ def _write_build_fakes(
         "printf '%s\\n' '    call_file=\"${DEPLOY_PREFLIGHT_CALL_FILE}\"' >> \"$entrypoint\"\n"
         'printf \'%s\\n\' \'    calls=0; [[ ! -f "$call_file" ]] || calls=$(<"$call_file")\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    calls=$((calls + 1)); printf "%s\\n" "$calls" > "$call_file"\' >> "$entrypoint"\n'
+        'printf \'%s\\n\' \'    if [[ ( "${DEPLOY_ONLINE_BUSY:-0}" == 1 && "$calls" == 1 ) || ( "${DEPLOY_STOPPED_BUSY:-0}" == 1 && "$calls" == 2 ) ]]; then printf "{\\"detail\\":\\"canonical audio database is busy\\",\\"fault\\":\\"transient\\",\\"reason\\":\\"inspection_failed\\",\\"status\\":\\"state_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_FAIL_AT:-0}" == "$calls" ]]; then printf "{\\"detail\\":\\"injected refusal\\",\\"reason\\":\\"state_validation_failed\\",\\"status\\":\\"state_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    if [[ "${DEPLOY_RECOVERY_REQUIRED:-0}" == 1 && "$calls" == 2 ]]; then printf "{\\"reason\\":\\"canonical_hot_journal\\",\\"status\\":\\"recovery_required\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
         'printf \'%s\\n\' \'    printf "{\\"schema_version\\":null,\\"status\\":\\"state_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
@@ -726,10 +730,15 @@ def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScen
     (fake_bin / "systemctl").chmod(0o755)
 
     readiness_config = scenario.readiness_config or str(context.config_file)
+    readiness_line = (
+        "collector started"
+        if scenario.readiness_missing
+        else f'{{"config":"{readiness_config}","status":"deployment_ready"}}'
+    )
     (fake_bin / "journalctl").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "journalctl args=%s\\n" "$*" >> {quoted_log}\n'
-        f'printf \'%s\\n\' \'{{"config":"{readiness_config}","status":"deployment_ready"}}\'\n',
+        f"printf '%s\\n' {shlex.quote(readiness_line)}\n",
         encoding="utf-8",
     )
     (fake_bin / "journalctl").chmod(0o755)
@@ -886,6 +895,9 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
     for production_value, harness_value in replacements:
         assert production_value in deployer
         deployer = deployer.replace(production_value, harness_value)
+    if scenario.readiness_missing:
+        assert "readiness_timeout_seconds=900" in deployer
+        deployer = deployer.replace("readiness_timeout_seconds=900", "readiness_timeout_seconds=0")
     harness_deployer = scripts_dir / _DEPLOYER.name
     harness_deployer.write_text(deployer, encoding="utf-8")
     harness_deployer.chmod(0o755)
@@ -899,6 +911,8 @@ def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT
         "DEPLOY_INIT_FAIL": "1" if scenario.init_failure else "0",
         "DEPLOY_OPERATOR_CAN_WRITE_STATE": "1" if scenario.operator_can_write_state else "0",
         "DEPLOY_PREFLIGHT_FAIL_AT": str(scenario.preflight_failure_at or 0),
+        "DEPLOY_ONLINE_BUSY": "1" if scenario.online_busy else "0",
+        "DEPLOY_STOPPED_BUSY": "1" if scenario.stopped_busy else "0",
         "DEPLOY_RECOVERY_REQUIRED": "1" if scenario.recovery_required else "0",
         "DEPLOY_REAL_STATE_CLI": "1" if scenario.real_state_cli else "0",
         "DEPLOY_FALLBACK_COMPATIBLE": "1" if scenario.fallback_ledger_compatible else "0",
@@ -1054,6 +1068,58 @@ def test_deployer_preflight_refusal_keeps_previous_service_and_selector_untouche
     assert "systemctl args=stop omi-collector.service" not in commands
     assert "systemctl args=start omi-collector.service" not in commands
     assert "systemctl args=restart omi-collector.service" not in commands
+
+
+def test_deployer_defers_exact_online_busy_until_stopped_check(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(online_busy=True))
+    _previous_release(harness)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode == 0, result.stderr
+    commands = harness.log.read_text(encoding="utf-8")
+    stopped_check = f"preflight args=check-state --config {harness.config_file} --stopped"
+    assert commands.index("systemctl args=stop omi-collector.service") < commands.index(stopped_check)
+    assert commands.index(stopped_check) < commands.index("candidate args=init-state")
+    assert "systemctl args=restart omi-collector.service" in commands
+
+
+def test_deployer_stopped_refusal_after_online_busy_restores_old_service(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(online_busy=True, preflight_failure_at=2))
+    previous = _previous_release(harness)
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    _canonical_state(harness, version=4)
+    before = state_file.read_bytes()
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "candidate refused the Collector state check" in result.stderr
+    assert harness.current_link.resolve(strict=True) == previous
+    assert state_file.read_bytes() == before
+    commands = harness.log.read_text(encoding="utf-8")
+    assert commands.count("systemctl args=stop omi-collector.service") == 1
+    assert commands.count("systemctl args=start omi-collector.service") == 1
+    assert "candidate args=init-state" not in commands
+
+
+def test_deployer_stopped_busy_after_online_busy_restores_old_service(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(online_busy=True, stopped_busy=True))
+    previous = _previous_release(harness)
+    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+    _canonical_state(harness, version=4)
+    before = state_file.read_bytes()
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert '"detail":"canonical audio database is busy"' in result.stderr
+    assert harness.current_link.resolve(strict=True) == previous
+    assert state_file.read_bytes() == before
+    commands = harness.log.read_text(encoding="utf-8")
+    assert commands.count("systemctl args=stop omi-collector.service") == 1
+    assert commands.count("systemctl args=start omi-collector.service") == 1
+    assert "candidate args=init-state" not in commands
 
 
 def test_deployer_stopped_preflight_refusal_keeps_old_release_and_state(tmp_path: Path) -> None:
@@ -1683,6 +1749,22 @@ def test_deployer_keeps_selected_release_stopped_when_readiness_fails(tmp_path: 
 
     assert result.returncode != 0
     assert "did not announce readiness" in result.stderr
+    assert "requires forward Collector recovery" in result.stderr
+    assert harness.current_link.resolve(strict=True) != previous
+    commands = harness.log.read_text(encoding="utf-8")
+    assert commands.count("systemctl args=stop omi-collector.service") == 2
+    assert commands.count("systemctl args=restart omi-collector.service") == 1
+    assert "systemctl args=start omi-collector.service" not in commands
+
+
+def test_deployer_stops_selected_release_when_readiness_never_arrives(tmp_path: Path) -> None:
+    harness = _deployment_harness(tmp_path, _DeploymentScenario(readiness_missing=True))
+    previous = _previous_release(harness)
+
+    result = _run_deployer(harness)
+
+    assert result.returncode != 0
+    assert "did not announce readiness within 0 seconds" in result.stderr
     assert "requires forward Collector recovery" in result.stderr
     assert harness.current_link.resolve(strict=True) != previous
     commands = harness.log.read_text(encoding="utf-8")

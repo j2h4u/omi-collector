@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from functools import wraps
 from pathlib import Path
 from struct import pack
-from threading import Thread
+from threading import Event, Thread
 from typing import cast, override
 
 import pytest
@@ -47,6 +47,7 @@ from omi_collector.capture.application.quality_metrics import (
     utc_timestamp,
 )
 from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy, SessionPhaseState
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
     DoneNotification,
@@ -400,8 +401,8 @@ class _WriterProxy:
         return self._initial_prefix
 
     @property
-    def interrupted_prefix(self) -> DurablePrefixShape | None:
-        return self.writer.interrupted_prefix
+    def settled_prefix(self) -> DurablePrefixShape | None:
+        return self.writer.settled_prefix
 
     async def prepare_leg(self, start_sequence: int, record_count: int) -> DurablePrefixShape:
         if self.prepare_fault is not None:
@@ -1194,6 +1195,215 @@ async def _admit_partial_and_cancel(
         raise
 
 
+async def _disconnect_recovery_before_begin(reconciler: BatchReconciler) -> ScriptedRingSession:
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            WriteStep(b"\x11" + (101).to_bytes(8, "big") + (1).to_bytes(4, "big")),
+            WriteStep(b"\x13"),
+        ),
+    )
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    task = asyncio.create_task(reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")))
+    try:
+        async with asyncio.timeout(5):
+            while not session.writes:
+                if task.done():
+                    await task
+                    raise AssertionError("recovery READ was never issued")
+                await asyncio.sleep(0)
+        session.disconnect()
+        with pytest.raises(TransferInterruptedError):
+            await task
+        return session
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await session.close()
+        raise
+
+
+@_async_test
+async def test_fresh_recovery_prefix_closes_after_prebegin_disconnect(tmp_path: Path) -> None:
+    store, source, records = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    descriptor = store.pending_attempts()[0]
+    runtime = _Runtime()
+    reconciler = BatchReconciler(store, _options(), runtime, _ignore_quarantine)
+    reconciler.set_startup_state(descriptor, 101)
+    session = await _disconnect_recovery_before_begin(reconciler)
+    try:
+        proxy = runtime.proxies[0]
+        assert proxy.progress.submitted == 0
+        await reconciler.checkpoint_after_session()
+        await reconciler.close_visit("absence")
+        assert proxy.checkpoint_calls == 0
+        assert not proxy.thread.is_alive()
+        updated = attempt_source(store, source.source_id)
+        assert updated is not None and updated.lifecycle == "sealed_waiting"
+        assert attempt_records(store, source.source_id) == records
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
+        await reconciler.close_visit("absence")
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_interrupted_prefix_survives_retry_disconnect_before_begin(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    first = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    await reconciler.checkpoint_after_session()
+    second: ScriptedRingSession | None = None
+    try:
+        second = await _disconnect_recovery_before_begin(reconciler)
+        assert proxy.progress.submitted == RECORD_SIZE
+        await reconciler.checkpoint_after_session()
+        await reconciler.close_visit("recovery_exhausted")
+        assert proxy.checkpoint_calls == 0
+        source = attempt_source(store, proxy.attempt_id)
+        assert source is not None and source.lifecycle == "sealed_waiting"
+        assert attempt_records(store, proxy.attempt_id) == (_record(100),)
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": "recovery_exhausted"}]
+    finally:
+        await _close_real_writers(runtime)
+        await first.close()
+        if second is not None:
+            await second.close()
+
+
+@_async_test
+async def test_finalize_uses_settled_prefix_after_prebegin_retry_disconnect(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    first = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    await reconciler.checkpoint_after_session()
+    second: ScriptedRingSession | None = None
+    try:
+        second = await _disconnect_recovery_before_begin(reconciler)
+        result = await reconciler.finalize_active()
+        assert result.checkpoint_error is None
+        assert result.close_error is None
+        assert result.preserved_source_id == proxy.attempt_id
+        assert proxy.checkpoint_calls == 0
+        assert not proxy.thread.is_alive()
+        assert attempt_records(store, proxy.attempt_id) == (_record(100),)
+    finally:
+        await _close_real_writers(runtime)
+        await first.close()
+        if second is not None:
+            await second.close()
+
+
+@_async_test
+async def test_queued_read_begin_invalidates_old_prefix_before_new_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, source, _records = _seed_partial(tmp_path / "spool", tmp_path / "captures")
+    entered = Event()
+    release = Event()
+    original = StagingWriter.read_begin
+
+    def held_begin(writer: StagingWriter, notice: ReadBeginNotification) -> None:
+        entered.set()
+        assert release.wait(5)
+        original(writer, notice)
+
+    monkeypatch.setattr(StagingWriter, "read_begin", held_begin)
+    runtime = OpportunisticRuntime()
+    writer = runtime.make_batch_writer(
+        store,
+        100,
+        2,
+        source_start=101,
+        source=memoryview(bytearray(_record(101))),
+        config=DEFAULT_CONFIG.writer,
+    )
+    try:
+        await writer.start()
+        await writer.prepare_leg(101, 1)
+        assert writer.settled_prefix is not None
+        assert writer.settled_prefix.next_sequence == 101
+        begin = cast(asyncio.Future[object], writer.submit_read_begin(ReadBeginNotification(101, 1)))
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert writer.settled_prefix is None
+        release.set()
+        await begin
+        assert writer.publish(RECORD_SIZE)
+        await writer.barrier()
+        await writer.seal(DoneNotification(0, 102))
+    finally:
+        release.set()
+        await writer.close()
+    updated = attempt_source(store, source.source_id)
+    assert updated is not None and updated.lifecycle == "sealed_waiting"
+    assert attempt_records(store, source.source_id) == (_record(100), _record(101))
+
+
+@_async_test
+@pytest.mark.parametrize("reason", ["absence", "recovery_exhausted", "restart_interrupted"])
+async def test_close_visit_after_interrupted_leg_publishes_ack_without_second_checkpoint(
+    tmp_path: Path, reason: str
+) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    try:
+        interrupted = proxy.settled_prefix
+        assert interrupted is not None
+        assert interrupted.record_count == 1
+
+        await reconciler.close_visit(reason)
+
+        assert proxy.checkpoint_calls == 0
+        assert not proxy.thread.is_alive()
+        assert reconciler._state.batch is None
+        source = attempt_source(store, proxy.attempt_id)
+        assert source is not None
+        assert source.lifecycle == "sealed_waiting"
+        assert source.committed_count == 1
+        assert attempt_records(store, proxy.attempt_id) == (_record(100),)
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": reason}]
+        await reconciler.close_visit(reason)
+        assert closure_rows(store) == [{"next_sequence": 101, "reason": reason}]
+    finally:
+        await asyncio.gather(*(item.writer.close() for item in runtime.proxies), return_exceptions=True)
+        assert all(not item.thread.is_alive() for item in runtime.proxies)
+        await session.close()
+
+
+@_async_test
+async def test_close_visit_does_not_publish_interrupted_prefix_after_fatal_writer_failure(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    session = await _admit_partial_and_cancel(reconciler, runtime)
+    proxy = runtime.proxies[0]
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    proxy.failure_fault = fatal
+    try:
+        assert proxy.settled_prefix is not None
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await reconciler.close_visit("absence")
+        assert raised.value is fatal
+        assert closure_rows(store) == []
+        source = attempt_source(store, proxy.attempt_id)
+        assert source is not None
+        assert source.lifecycle == "interrupted"
+        assert attempt_records(store, proxy.attempt_id) == (_record(100),)
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
 @_async_test
 async def test_checkpoint_after_interrupted_leg_adopts_ack_without_second_checkpoint(tmp_path: Path) -> None:
     runtime = _Runtime()
@@ -1201,7 +1411,7 @@ async def test_checkpoint_after_interrupted_leg_adopts_ack_without_second_checkp
     session = await _admit_partial_and_cancel(reconciler, runtime)
     proxy = runtime.proxies[0]
     try:
-        interrupted = proxy.interrupted_prefix
+        interrupted = proxy.settled_prefix
         assert interrupted is not None
         assert interrupted.record_count == 1
         assert proxy.checkpoint_calls == 0

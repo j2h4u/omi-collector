@@ -76,7 +76,18 @@ def _source(store: InternalAudioStore, source_id: str, start: int, count: int = 
 def _checkpoint(root: Path) -> Path:
     path = root / "work" / "omi-ready-checkpoint.json"
     path.parent.mkdir()
-    path.write_text(json.dumps({"acknowledged": []}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "audio_contract": "omi-audio-v2",
+                "analysis_cursor": None,
+                "vad_decisions": [],
+                "open_speech_tail": None,
+                "acknowledged": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 

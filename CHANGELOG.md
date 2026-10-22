@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.1](https://github.com/j2h4u/omi-collector/compare/v0.19.0...v0.19.1) (2026-10-22)
+
+
+### Fixes
+
+* close recovery lifecycle and cutover gaps ([a4f56db](https://github.com/j2h4u/omi-collector/commit/a4f56db5f985174dd83938ba282ae303140fd2ed))
+* reuse interrupted capture receipts when closing visits ([a4f56db](https://github.com/j2h4u/omi-collector/commit/a4f56db5f985174dd83938ba282ae303140fd2ed))
+
 ## [0.19.0](https://github.com/j2h4u/omi-collector/compare/v0.18.0...v0.19.0) (2026-10-18)
 
 

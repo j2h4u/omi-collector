@@ -1095,6 +1095,41 @@ async def test_presence_observer_cleans_failed_start_before_retry() -> None:
 
 
 @_async_test
+async def test_presence_observer_shields_and_joins_one_delayed_stop() -> None:
+    entered_stop = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class Scanner:
+        stops = 0
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.stops += 1
+            entered_stop.set()
+            await release_stop.wait()
+
+    scanner = Scanner()
+    observer = bleak_transport.BleakPresenceObserver("aa:bb", scanner_factory=lambda **_kwargs: scanner)
+    await observer.start(lambda _advertisement: None)
+    first_stop = asyncio.create_task(observer.stop())
+    await entered_stop.wait()
+    first_stop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_stop
+
+    with pytest.raises(RuntimeError, match="already active"):
+        await observer.start(lambda _advertisement: None)
+    second_stop = asyncio.create_task(observer.stop())
+    release_stop.set()
+    await second_stop
+    assert scanner.stops == 1
+    await observer.start(lambda _advertisement: None)
+    await observer.stop()
+
+
+@_async_test
 async def test_transport_rejects_invalid_queue_and_disconnects_unstarted_client() -> None:
     with pytest.raises(ValueError, match="buffer byte budget must be positive"):
         BleakRingTransport("fake", notification_buffer_bytes=0)

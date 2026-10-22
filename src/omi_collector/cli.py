@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import sqlite3
 import subprocess
 import time
@@ -116,6 +117,16 @@ def _decimal(value: str | None) -> int | None:
         return int(value) if value is not None else None
     except ValueError:
         return None
+
+
+def _notify_systemd_ready() -> None:
+    """Mark the main process ready when systemd supplied a notification socket."""
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+    address = "\0" + notify_socket[1:] if notify_socket.startswith("@") else notify_socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as connection:
+        connection.sendto(b"READY=1", address)
 
 
 def _capture_cli() -> _CaptureCli:
@@ -681,6 +692,11 @@ def _service_locked(loaded: OperatorConfig, state_db: StateDB, *, stop_intent: S
         assert operational_status is not None
         if stop_intent is not None:
             stop_intent.check()
+        try:
+            _notify_systemd_ready()
+        except OSError as error:
+            typer.echo(f"could not notify systemd that Collector is ready: {error}", err=True)
+            raise typer.Exit(code=1) from error
         typer.echo(
             json.dumps(
                 {"config": str(loaded.path), "status": "deployment_ready"},

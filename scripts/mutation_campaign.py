@@ -91,10 +91,6 @@ RELEVANT_ENV = (
     "UV_PROJECT_ENVIRONMENT",
     "VIRTUAL_ENV",
 )
-RELEASE_WRAPPER = "scripts/omi-collector-deploy-release"
-RELEASE_SUDOERS = "scripts/omi-collector-deploy-release.sudoers"
-RELEASE_WRAPPER_MODE = 0o755
-RELEASE_SUDOERS_MODE = 0o644
 
 
 @dataclass
@@ -1517,17 +1513,6 @@ def _read_receipt_from(path: Path) -> dict[str, object] | None:
     return cast(dict[str, object], value)
 
 
-def _canonicalize_snapshot_modes(checkout: Path) -> None:
-    for relative, expected_mode in (
-        (RELEASE_WRAPPER, RELEASE_WRAPPER_MODE),
-        (RELEASE_SUDOERS, RELEASE_SUDOERS_MODE),
-    ):
-        path = checkout / relative
-        if not path.is_file() or path.is_symlink():
-            raise ValueError(f"mutation snapshot is missing a regular tracked path: {relative}")
-        path.chmod(expected_mode)
-
-
 def _snapshot_identity(checkout: Path, environment: dict[str, str]) -> dict[str, object]:
     dirty = subprocess.run(
         ["git", "status", "--porcelain", "--untracked-files=all"],
@@ -1592,10 +1577,6 @@ def _tracked_inputs_digest(checkout: Path) -> str:
             content = path.read_bytes()
         else:
             raise ValueError(f"mutation input has an unsupported Git mode: {relative}")
-        if relative == RELEASE_WRAPPER and actual_mode != RELEASE_WRAPPER_MODE:
-            raise ValueError(f"release wrapper mode changed: {actual_mode:o}")
-        if relative == RELEASE_SUDOERS and actual_mode != RELEASE_SUDOERS_MODE:
-            raise ValueError(f"release sudoers mode changed: {actual_mode:o}")
         digest.update(mode.encode())
         digest.update(f"{actual_mode:o}".encode())
         digest.update(b"\0")
@@ -1686,7 +1667,6 @@ def _new_job(repo: Path) -> Path:
             env={**os.environ, JOB_TOKEN_ENV: cast(str, receipt["run_token"])},
             check=True,
         )
-        _canonicalize_snapshot_modes(checkout)
         status = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
             cwd=checkout,
@@ -1695,7 +1675,7 @@ def _new_job(repo: Path) -> Path:
             text=True,
         ).stdout
         if status:
-            raise ValueError("canonical mutation snapshot is not clean: " + status.strip())
+            raise ValueError("mutation snapshot is not clean: " + status.strip())
         sync_environment = {**_job_environment(job_root), JOB_TOKEN_ENV: cast(str, receipt["run_token"])}
         _sync_job_environment(job_root, sync_environment)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:

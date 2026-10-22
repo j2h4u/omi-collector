@@ -1,4 +1,0 @@
-%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-status ""
-j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl start omi-collector.service
-j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl stop omi-collector.service
-j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl restart omi-collector.service

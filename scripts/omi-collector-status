@@ -3,10 +3,18 @@
 set -uo pipefail
 
 if (( $# != 0 )); then
-    printf 'Usage: omi-collector-status\n' >&2
+    printf 'Usage: scripts/omi-collector-status\n' >&2
     exit 2
 fi
-
-exec /usr/sbin/runuser --user omi-collector -- \
-    /var/lib/omi-collector-deployments/current/bin/omi-collector \
+(( EUID != 0 )) || {
+    printf 'ERROR: run status as the service owner, without sudo\n' >&2
+    exit 1
+}
+operator_user=$(id --user --name) || exit 1
+operator_home=$(getent passwd "$operator_user" | cut -d: -f6) || exit 1
+[[ -n "$operator_home" && -d "$operator_home" ]] || {
+    printf 'ERROR: cannot resolve service owner home\n' >&2
+    exit 1
+}
+exec "${operator_home}/.local/share/omi-collector/current/bin/omi-collector" \
     device status --config /srv/pipelines/omi/config.toml --hours 24

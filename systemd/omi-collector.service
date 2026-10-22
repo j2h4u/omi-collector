@@ -5,12 +5,14 @@ After=bluetooth.service
 StartLimitIntervalSec=0
 
 [Service]
-Type=exec
-User=omi-collector
-Group=omi-collector
-Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 XDG_STATE_HOME=/var/lib/omi-collector
-ExecStartPre=+/usr/local/sbin/omi-collector-bluetooth-ready
-ExecStart=/var/lib/omi-collector-deployments/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=infinity
+User=@OMI_COLLECTOR_USER@
+Group=@OMI_COLLECTOR_GROUP@
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/local/sbin/omi-collector-bluetooth-ready
+ExecStart=@OMI_COLLECTOR_HOME@/.local/share/omi-collector/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml
 Restart=always
 RestartPreventExitStatus=78
 RestartSec=5s
@@ -25,9 +27,7 @@ UMask=0027
 AmbientCapabilities=CAP_NET_RAW
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/omi-collector /srv/pipelines/omi
-StateDirectory=omi-collector
-StateDirectoryMode=0750
+ReadWritePaths=/srv/pipelines/omi
 PrivateTmp=yes
 RestrictSUIDSGID=yes
 

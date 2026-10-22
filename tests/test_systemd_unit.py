@@ -138,9 +138,8 @@ def _fake_deployer(
     )
     deployer.write_text(content, encoding="utf-8")
     deployer.chmod(0o755)
-    copied_content = deployer.read_text(encoding="utf-8")
-    assert f"declare config_file={shlex.quote(str(config))}" in copied_content
-    assert "/srv/pipelines/omi/config.toml" not in copied_content
+    assert f"declare config_file={shlex.quote(str(config))}" in deployer.read_text(encoding="utf-8")
+    assert "/srv/pipelines/omi/config.toml" not in deployer.read_text(encoding="utf-8")
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

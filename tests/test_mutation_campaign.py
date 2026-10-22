@@ -45,20 +45,11 @@ def campaign_project(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     (repo / "src" / "omi_collector" / "demo.py").write_text("value = 'before'\n", encoding="utf-8")
     (repo / "scripts").mkdir()
     (repo / "scripts" / "demo.py").write_text("script_value = 2\n", encoding="utf-8")
-    wrapper = repo / "scripts" / "omi-collector-deploy-release"
-    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    sudoers = repo / "scripts" / "omi-collector-deploy-release.sudoers"
-    sudoers.write_text("operator ALL=(root) NOPASSWD: /usr/bin/true\n", encoding="utf-8")
-    wrapper.chmod(0o755)
-    sudoers.chmod(0o644)
     subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "Campaign test"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "campaign-test@example.invalid"], cwd=repo, check=True)
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "--quiet", "-m", "campaign fixture"], cwd=repo, check=True)
-    # Simulate the shared-filesystem mode drift from the failed host bootstrap.
-    wrapper.chmod(0o775)
-    sudoers.chmod(0o664)
     env = os.environ.copy()
     env.update(COVERAGE_CORE="ctrace", COVERAGE_FILE="", PYTEST_ADDOPTS="", UV_LINK_MODE="hardlink")
     return repo, env
@@ -470,7 +461,7 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_project(
+def test_fresh_public_launch_snapshots_without_mutating_the_project(
     campaign_project: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo, env = campaign_project
@@ -495,8 +486,6 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
         assert runner_environment["TMPDIR"] == str(job_root / "tmp")
         assert not Path(runner_environment["TMPDIR"]).is_relative_to(checkout)
         owner_calls.append((job_root, mode, token))
-        assert (checkout / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o755
-        assert (checkout / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o644
         assert (checkout / "src/omi_collector/demo.py").read_text(encoding="utf-8") == "value = 'before'\n"
         (repo / "src" / "omi_collector" / "demo.py").write_text("value = 'edited while running'\n", encoding="utf-8")
         assert (checkout / "src/omi_collector/demo.py").read_text(encoding="utf-8") == "value = 'before'\n"
@@ -519,10 +508,6 @@ def test_fresh_public_launch_snapshots_and_normalizes_without_mutating_the_proje
     assert len(jobs) == 1
     assert len(sync_calls) == 1
     assert owner_calls == [(jobs[0], "fresh", json.loads((jobs[0] / "owner.json").read_text())["run_token"])]
-    assert (repo / "scripts/omi-collector-deploy-release").stat().st_mode & 0o777 == 0o775
-    assert (repo / "scripts/omi-collector-deploy-release.sudoers").stat().st_mode & 0o777 == 0o664
-
-
 def _raise_in_test(error: Exception) -> None:
     raise error
 
@@ -568,7 +553,6 @@ def _inject_fresh_bootstrap_failure(stage: str, monkeypatch: pytest.MonkeyPatch)
         monkeypatch.setattr(mutation_campaign, "_sync_job_environment", sync)
     else:
         target, error = {
-            "mode": ("_canonicalize_snapshot_modes", ValueError("mode")),
             "metadata": ("_snapshot_identity", ValueError("metadata")),
             "socket": ("remove_stale_socket", OSError("socket")),
             "preflight": ("_preflight_process_control", ValueError("preflight")),
@@ -581,7 +565,7 @@ def _inject_fresh_bootstrap_failure(stage: str, monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.parametrize(
-    "failure_stage", ("worktree", "mode", "status", "sync", "metadata", "socket", "preflight", "preflight_uncertain")
+    "failure_stage", ("worktree", "status", "sync", "metadata", "socket", "preflight", "preflight_uncertain")
 )
 def test_fresh_bootstrap_failures_are_receipted_and_clean_owned_resources(
     campaign_project: tuple[Path, dict[str, str]],
@@ -904,7 +888,6 @@ def test_generated_gremlins_coverage_config_stays_out_of_snapshot_identity(
     campaign_project: tuple[Path, dict[str, str]],
 ) -> None:
     repo, environment = campaign_project
-    mutation_campaign._canonicalize_snapshot_modes(repo)
     generated = repo / ".coveragerc.gremlins"
     generated.write_text("[run]\nbranch = True\n", encoding="utf-8")
 

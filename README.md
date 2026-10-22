@@ -112,24 +112,31 @@ sends an explicit `ADVANCE` command.
 
 ## Production installation
 
-The supported production shape is a root-owned checkout, a dedicated
-`omi-collector` service account, and one shared pipeline root at
-`/srv/pipelines/omi`. The operator configuration lives at
-`/srv/pipelines/omi/config.toml`; its parent is also the fixed storage root.
+The service runs as the personal, non-root operator account. The checkout,
+builds, deployment, and status command all belong to that account. Persistent
+pipeline data and configuration remain under `/srv/pipelines/omi`; release
+runtime files are kept under `$HOME/.local/share/omi-collector`.
+
+Keep the operator configuration at `/srv/pipelines/omi/config.toml`. For the
+one-time unit installation, use a clean, committed, reviewed checkout. Stage
+that commit as a root-owned archive, install the unit from the staged copy,
+then remove the staging directory:
 
 ```bash
-sudo git clone https://github.com/j2h4u/omi-collector.git /opt/omi-collector
-cd /opt/omi-collector
-UV_BIN=$(command -v uv)
-[[ "$UV_BIN" == /usr/local/bin/uv ]] || \
-  sudo install -o root -g root -m 0755 "$UV_BIN" /usr/local/bin/uv
-sudo install -d -o root -g root -m 0755 /srv/pipelines/omi
-sudo install -o root -g root -m 0644 config/config.toml.example /srv/pipelines/omi/config.toml
-sudoedit /srv/pipelines/omi/config.toml
-sudo scripts/install-systemd-unit.sh
+sudo install -d -o root -g root -m 0700 /opt/omi-collector-install
+sudo bash -o pipefail -c 'git -C /home/j2h4u/repos/j2h4u/omi-collector archive --format=tar HEAD | tar --extract --directory=/opt/omi-collector-install --no-same-owner'
+sudo /opt/omi-collector-install/scripts/install-systemd-unit.sh
+sudo rm -rf /opt/omi-collector-install
+```
+
+The installer binds the unit to the invoking non-root user and installs the
+Bluetooth readiness helper and narrow service-control sudoers rules. Enable
+BlueZ and deploy as the operator:
+
+```bash
 sudo systemctl enable --now bluetooth.service
-sudo -u omi-collector bluetoothctl show
-sudo scripts/deploy-systemd-service.sh
+bluetoothctl show
+scripts/deploy-systemd-service.sh
 ```
 
 Replace `pendant_address` with the uppercase Bluetooth address printed by
@@ -146,22 +153,10 @@ the defaults are suitable for most installations.
 The optional flat key `scan_silence_seconds` defaults to `180` positive
 seconds and sets the all-device receive-fault threshold; pendant absence does
 not count as a scan fault.
-The installer creates the service account, keeps the configuration root-owned
-and readable by both services as mode `0644`, and enables the service. It does not start the
-service unless `--restart` is explicit. Complete the first successful
-deployment before rebooting or leaving the host unattended because the unit
-has no selected runtime before then.
-
-The installer also installs the root-owned release wrapper at
-`/usr/local/sbin/omi-collector-deploy-release` and its fixed sudo policy. The
-wrapper accepts exactly one `vMAJOR.MINOR.PATCH` tag and delegates to the
-checked-in transactional `scripts/dev-deploy-release.sh` in `/opt/omi-collector`:
-
-```bash
-sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
-```
-
-It does not perform clock recovery or accept arbitrary commands.
+The setup grants only the required service start, stop, and restart operations.
+It does not create separate service or build accounts. Complete the first
+successful deployment before rebooting because the unit has no selected
+runtime before then.
 
 Follow the service with:
 
@@ -193,7 +188,7 @@ publication, and recent transfer/loss evidence,
 run:
 
 ```bash
-sudo -n /usr/local/sbin/omi-collector-status
+scripts/omi-collector-status
 ```
 
 Interpret `status=ok` as at least one completed transfer in the window, an
@@ -256,37 +251,27 @@ For subsequent updates, select the reviewed revision in the production
 checkout and run:
 
 ```bash
-sudo scripts/deploy-systemd-service.sh
+scripts/deploy-systemd-service.sh
 ```
 
 The deployment command validates the operator configuration, builds a
-versioned root-owned environment under `/var/lib/omi-collector-deployments`,
-writes its source revision into the release, atomically selects it, and
-starts the service. It
-requires both application readiness and a stable process. Before selecting a
+versioned environment under `$HOME/.local/share/omi-collector`, writes its
+source revision into the release, atomically selects it, and starts the service.
+The unit uses systemd `Type=notify`; the collector signals readiness through
+the notify socket, and deployment confirms an active, stable process. Before selecting a
 new release, recovery may restart a compatible previous release. After a new
 release is selected, failed verification stops the service for forward
 recovery. Known
 obsolete release directories are pruned only after a successful deployment.
 
-### Maintainer Dev Script
+### Release Tag Deployment
 
-`scripts/dev-deploy-release.sh` is a host-specific convenience tool for the
-project maintainer. It is intended only for deployments whose live checkout is
-fixed under an operator-owned `/opt` tree, following the same convention as
-Docker services under `/opt/docker/<service>`. This systemd deployment uses
-`/opt/omi-collector` instead. The script fetches and validates a published
-release tag in that exact checkout, refuses local changes or an unexpected
-origin, and then invokes the transactional deployer above.
-
-It is not part of the portable installation contract. Other operators should
-select their reviewed revision in the production checkout and run
-`deploy-systemd-service.sh` directly.
-
-On the maintainer host, run it from the source checkout with an explicit tag:
+`scripts/dev-deploy-release.sh` fetches and validates a published release tag
+in the current checkout, refuses local changes or an unexpected origin, and
+then invokes the transactional deployer. Run it as the operator:
 
 ```bash
-sudo scripts/dev-deploy-release.sh v0.3.0
+scripts/dev-deploy-release.sh v0.3.0
 ```
 
 ## Storage
@@ -305,25 +290,22 @@ Collector state. Read-only `device status` and `device metrics` use read-only
 database access and can run while the service is active. Keep the guard file in
 place; migration replaces the database file but never the guard inode.
 
-The installer and every deployment keep the `collector`, `draft`, `ready`,
-`collector/attempts`, and `collector/quarantine` roots owned by the service with
-setgid group `j2h4u` and mode `2750`. New data inherits that group; the SQLite
-state database is `0640`, while the singleton lock remains private at `0600`.
-This gives the local operator password-free read and inventory access without
-allowing edits to Collector state. Existing nested files from older releases
-need a one-time ownership/mode repair before the operator can read them.
+The operator account owns the `collector`, `draft`, `ready`,
+`collector/attempts`, and `collector/quarantine` roots under the existing
+pipeline storage root. New files remain private to that account unless a
+downstream reader is explicitly granted access. Existing nested files from
+older releases may need a one-time ownership/mode repair.
 
-The canonical systemd deployment persists the sealed release, checks Collector
+The systemd deployment persists the selected release, checks Collector
 state before stopping the service, and rechecks it under the stable lock before
 selecting the release. A verified SQLite hot rollback journal is recovered by
 SQLite after stop, then checked again. The selected release runs `init-state`:
 it creates a v4 database only when the database and Collector data roots are
 empty, upgrades an existing v2 or v3 database, and validates an existing v4
 database without rewriting it. Existing v1 state and unknown private artifacts fail
-closed and remain untouched. Runtime
-never creates or upgrades state. See [Best practices](docs/BEST_PRACTICES.md#state-ownership-and-state-initialization)
-for the deploy sequence and the [OMIC-16 acceptance receipt](docs/qa/2026-10-13-omic-16-implementation.md)
-for production and release evidence.
+closed and remain untouched. Runtime never creates or upgrades state. See
+[Best practices](docs/BEST_PRACTICES.md#state-ownership-and-state-initialization)
+for the deploy sequence.
 
 Migration seeds the durable publication contract in `legacy_open`, so an
 upgrade does not change the existing handoff. Once a compatible downstream is
@@ -341,16 +323,9 @@ or any file already present in `ready`; subthreshold private source custody is
 preserved. Both commands use the Collector singleton guard and survive restart.
 Published bundles are a shared boundary. If another local account consumes
 them, configure either a shared Unix group or a default ACL on the ready root.
-For a named downstream account, the ACL shape is:
-
-```bash
-sudo setfacl -m u:omi-collector:rwx,u:DOWNSTREAM:rwx /srv/pipelines/omi/ready
-sudo setfacl -m d:u:omi-collector:rwx,d:u:DOWNSTREAM:rwx /srv/pipelines/omi/ready
-```
-
-Replace `DOWNSTREAM`, and ensure every parent directory is traversable by both
-accounts. Verify access as the downstream account after the first bundle is
-published.
+For a downstream account, grant access to the `ready` root through a shared
+Unix group or a default ACL, and ensure every parent directory is traversable.
+Verify access as that account after the first bundle is published.
 
 ## Safety model
 
@@ -486,13 +461,8 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
   guidance.
 - [Local candidate workflow](edge.md) — local checks, host feedback, and
   subsequent GitHub delivery.
-- [Internal SQLite capture plan](docs/OMIC-16-IMPLEMENTATION-PLAN.md) and
-  [review receipt](docs/qa/2026-10-13-omic-16-plan-review.md) — approved design
-  and remaining implementation gates.
 - [Transfer-quality evidence](docs/QUALITY_METRICS.md) — the durable metric
   journal and how operators interpret its records.
-- [Service audit tracker](docs/SERVICE_AUDIT.md) — root-cause fixes and
-  acceptance checks for the eight service-audit findings.
 - [Acceptance specification (Gherkin)](features/opportunistic_collection.feature)
   — presence, transfer, interruption, recovery, and publication behavior.
   The specification is reviewed alongside the executable pytest suite; the

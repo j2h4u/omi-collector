@@ -130,15 +130,23 @@ def _fake_deployer(
     content = deployer.read_text(encoding="utf-8").replace(
         "(( EUID != 0 )) || die 'run as the service owner, without sudo'", "true"
     )
+    config = tmp_path / "config.toml"
+    state_file = tmp_path / "collector-state.sqlite3"
+    content = content.replace(
+        "declare config_file='/srv/pipelines/omi/config.toml' state_file='/srv/pipelines/omi/collector/collector-state.sqlite3'",
+        f"declare config_file={shlex.quote(str(config))} state_file={shlex.quote(str(state_file))}",
+    )
     deployer.write_text(content, encoding="utf-8")
     deployer.chmod(0o755)
+    copied_content = deployer.read_text(encoding="utf-8")
+    assert f"declare config_file={shlex.quote(str(config))}" in copied_content
+    assert "/srv/pipelines/omi/config.toml" not in copied_content
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     home = tmp_path / "home"
     home.mkdir()
     user = pwd.getpwuid(os.getuid())
-    config = tmp_path / "config.toml"
     config.write_text('pendant_address = "12:34:56:78:9A:BC"\nbundle_min_audio_seconds = 3600.0\n', encoding="utf-8")
     active = tmp_path / "service.active"
     active.touch()

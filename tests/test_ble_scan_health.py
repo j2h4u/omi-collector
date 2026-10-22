@@ -191,7 +191,8 @@ def test_cancelled_scan_stop_closes_passive_diagnostics() -> None:
                     await asyncio.Future()
 
         diagnostics = FakeDiagnostics(events)
-        monitor = ScanHealthMonitor(FakeSink(), diagnostics, 180.0)
+        sink = FakeSink()
+        monitor = ScanHealthMonitor(sink, diagnostics, 180.0)
         scheduler = PresenceScheduler(CancelledStop(events), scan_health=monitor)
         await scheduler._start_scan()
         stopping_task = asyncio.create_task(scheduler._stop_scan())
@@ -211,6 +212,7 @@ def test_cancelled_scan_stop_closes_passive_diagnostics() -> None:
             await asyncio.gather(stopping_task, return_exceptions=True)
             await scheduler.close()
         assert events == ["prepare:0", "start", "stop", "close:0", "stop"]
+        assert sink.opened == []
 
     asyncio.run(scenario())
 

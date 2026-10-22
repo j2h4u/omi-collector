@@ -46,13 +46,11 @@ logs only while investigating failures or recording acceptance, then delete
 them once the useful result is recorded in WorkGraph. Preserve reusable mutation
 campaign results; they are not disposable test scratch.
 
-Git tracks only whether a source file is executable (`100644` or `100755`),
-not its full worktree permission bits. Tests of source-file executability must
-read the Git index mode instead of comparing `stat()` with exact `0755` or
-`0644` permissions that umask can change. Keep installer safety checks exact:
-the installed wrapper must be `root:root 0755` and sudoers files `0440`.
-Correcting a mistaken source-mode assertion must not weaken these installed
-permission checks.
+Git tracks whether a source file is executable (`100644` or `100755`), not its
+full worktree permission bits. Tests of source-file executability must read the
+Git index mode instead of comparing `stat()` with exact permissions that umask
+can change. The installed Bluetooth readiness helper remains root-owned and
+executable; its narrow sudoers entries remain mode `0440`.
 
 ## Mutation testing
 
@@ -230,57 +228,42 @@ exact selected set on every exit path, including cancellation and recovery.
 
 ## Runtime operations
 
-systemd is the production supervisor. The public unit runs as the dedicated
-`omi-collector` system user. Keep the checkout root-owned and readable; keep
-`/srv/pipelines/omi/config.toml` root-owned and readable by both the system
-collector and the user-owned pipeline, mode `0644`; and keep the service-local state directory
-`omi-collector:omi-collector` mode `0750`.
+systemd is the production supervisor and runs as the personal non-root operator
+account. The operator owns the source checkout, builds, releases, and status
+command. Runtime files live under
+`$HOME/.local/share/omi-collector/{releases,current,.deployment.lock}`;
+persistent pipeline configuration and data remain under `/srv/pipelines/omi`.
+The operator account must own and be able to write the configuration file and
+the `collector` and `ready` roots. The installer creates missing roots with the
+operator's primary group and mode `2750`; existing roots must already match and
+are not recursively changed. It leaves neighboring `work` and `speech`
+directories untouched.
 
-Initial setup is deliberately small. Keep the checkout root-owned under
-`/opt`, copy and edit `config/config.toml.example` at
-`/srv/pipelines/omi/config.toml`, then run
-`sudo scripts/install-systemd-unit.sh`. The installer creates or validates the
-system account and state ownership, protects the configuration, validates the
-staged unit, and restores the prior unit if installation cannot be reloaded or
-enabled. It never starts the service without `--restart`.
-It also provisions the fixed Collector data roots as
-`omi-collector:j2h4u` mode `2750`. The setgid bit keeps new ready bundles and
-service-created files in the operator's read group.
-The operator group must also have a same-named operator account: stopped
-migration checks that account's effective read-only access before completion.
-Each deployment reapplies these root modes and sets the SQLite state database
-to `omi-collector:j2h4u` mode `0640`; the singleton lock remains private
-`omi-collector:omi-collector` mode `0600`. This operator access is read-only:
-service control and deployment use their separate bounded commands. Older
-nested data and retained root-owned recovery packages require a one-time,
-audited group-read repair; do not recursively chown unrelated pipeline state.
+Install or update the unit once from a clean, committed, reviewed candidate
+using the root-owned staging sequence in [Production installation](../README.md#production-installation).
+The installer binds the unit to the invoking operator and installs the
+root-owned Bluetooth readiness helper plus narrow service-control sudoers
+rules. It does not create separate service or build accounts. Deploy from the
+checkout as the operator with
+`scripts/deploy-systemd-service.sh`; it builds the clean committed `HEAD`,
+selects the release transactionally, and starts the service. The unit uses
+systemd `Type=notify`; deployment waits for the readiness signal and then checks
+that the process remains active and stable. The release-tag
+convenience command is also unprivileged:
+`scripts/dev-deploy-release.sh vMAJOR.MINOR.PATCH`.
 The notification boundary is the single atomic
-`collector/public/pendant-drain.json` projection. Provision `collector/public`
-with the same service owner, operator read group and mode `2750`; its JSON
-file is `0640`. A downstream container mounts only this directory read-only,
-without the private database or other Collector roots. On this host the public
-directory owner/group are numeric `996:1000`; application code derives paths
-and inherits the provisioned group rather than hardcoding these identities.
+`collector/public/pendant-drain.json` projection. Keep `collector/public`
+owned by the operator account; its JSON file is `0640`. A downstream container
+mounts only this directory read-only, without the private database or other
+Collector roots. Configure consumer access to that directory explicitly.
 The completion receipt lives in SQLite and is exported again after restart.
 Its ID denotes a verified empty ring after accepted durable custody, including
 the existing quality-loss classification. Repeated empty observations do not
 create new completions; later unread data retains the previous receipt.
 Notification delivery, consumer deduplication and mounting belong to the
 downstream service.
-The installed sudo policy permits `j2h4u` to start, stop, or restart only
-`omi-collector.service`, alongside the existing fixed status and release
-wrappers.
-
-The installer also installs the root-owned
-`/usr/local/sbin/omi-collector-deploy-release` wrapper and its fixed sudo
-policy. The wrapper accepts exactly one `vMAJOR.MINOR.PATCH` tag and delegates
-to the checked-in transactional `/opt/omi-collector/scripts/dev-deploy-release.sh`;
-it does not perform clock recovery or accept arbitrary commands. Run a
-reviewed release as:
-
-```bash
-sudo -n /usr/local/sbin/omi-collector-deploy-release v0.3.0
-```
+The installed sudo policy permits the operator to start, stop, or restart only
+`omi-collector.service`. Build and deployment commands do not use sudo.
 
 The configuration is strict and contains `[pendant] address`, plus optional
 `[presence]` and `[ready]` sections. `[ready]` accepts `target_audio_seconds`
@@ -358,21 +341,15 @@ consumer identity, including its supplementary groups. Keep dependent
 processing disabled until those checks pass; checkpoint readability alone
 does not show that an existing publication backlog was processed.
 
-After installing the unit, run `sudo scripts/deploy-systemd-service.sh`. It
-checks the installed unit and fixed operator configuration, records the full
-source revision, builds the environment as the dedicated build account, and
-copies dependencies into it. It then seals the selected release as root-owned under
-`/var/lib/omi-collector-deployments`. The first successful deployment creates
-the `current` selector used by the fixed unit command.
+After installing the unit, run `scripts/deploy-systemd-service.sh` as the
+operator. It validates configuration, builds into the operator's runtime
+directory, records the source revision, and selects the release transactionally.
+The first successful deployment creates the `current` selector used by the unit.
 
-Enable BlueZ and verify its normal user-level access with
-`sudo -u omi-collector bluetoothctl show`. The default long-running sync keeps
-`--force-1m` off. If an explicit weak-RF fallback is required, allow only the
-exact `/usr/bin/bluetoothctl --timeout 5 mgmt.phy` forms needed by the service
-through a dedicated `visudo -f /etc/sudoers.d/omi-collector-bluetoothctl` file.
-The base allowlist is the no-argument query plus `LE1MTX LE1MRX` and
-`LE1MTX LE1MRX LE2MTX LE2MRX`; add a different sequence only after observing it.
-Do not grant general `bluetoothctl`, shell, or unrestricted sudo access.
+Enable BlueZ and verify access as the operator with `bluetoothctl show`. The
+system unit retains the BlueZ startup ordering and `CAP_NET_RAW` needed for HCI
+diagnostics; its installed readiness helper checks and powers the controller
+as the operator. The default long-running sync keeps `--force-1m` off.
 
 Docker is for packaging and runtime QA only; it is not a production Bluetooth
 supervisor. Keep production state and publication roots configured explicitly,
@@ -392,7 +369,7 @@ service with `sudo -n /usr/bin/systemctl start bluetooth.service`; enable a
 disabled controller with `bluetoothctl --timeout 5 power on`. Those flags, `Discovering: yes`,
 and cached devices do not confirm that fresh BLE advertisements arrive.
 
-Read `sudo -n /usr/local/sbin/omi-collector-status` first. If it shows fresh
+Read `scripts/omi-collector-status` first. If it shows fresh
 transfer progress, leave collection running; do not scan or restart Bluetooth.
 For an idle discovery investigation, stop the collector gracefully and count
 fresh BLE devices in a bounded independent scan from the maintainer checkout:
@@ -446,7 +423,7 @@ progress and battery observation, firmware state, published-bundle metrics,
 and the retained recent quality-event window in the shared StateDB:
 
 ```bash
-sudo -n /usr/local/sbin/omi-collector-status
+scripts/omi-collector-status
 ```
 
 Routine status and `device metrics` validate READY manifest structure, identity,
@@ -480,7 +457,7 @@ Confirmed-loss totals remain visible in the quality window but do not change
 status by themselves. The quality window includes outcome and
 termination-class counts. A missing `device` object means no firmware
 observation has been recorded yet.
-Treat status as an operational summary: inspect the journal and sealed bundles
+Treat status as an operational summary: inspect the journal and published bundles
 before diagnosing a specific transfer.
 
 ## Documentation hygiene

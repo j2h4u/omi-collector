@@ -82,10 +82,11 @@ class BleakPresenceObserver:
         self._adapter = adapter
         self._scanner_factory = scanner_factory or BleakScanner
         self._scanner: PresenceScannerLike | None = None
+        self._stop_task: asyncio.Task[object] | None = None
 
     async def start(self, callback: PresenceCallback) -> None:
         """Start a fresh scan and forward only matching detection callbacks."""
-        if self._scanner is not None:
+        if self._scanner is not None or self._stop_task is not None:
             raise RuntimeError("presence scanner is already active")
 
         def detected(device: BLEDevice, advertisement: object) -> None:
@@ -104,26 +105,32 @@ class BleakPresenceObserver:
         try:
             await scanner.start()
         except BaseException:
-            # A failed BlueZ start must be cleaned up, while retaining the
-            # scanner if cleanup itself fails so a later stop can retry it.
-            cleanup_succeeded = False
             with suppress(BaseException):
-                await scanner.stop()
-                cleanup_succeeded = True
-            if cleanup_succeeded:
-                self._scanner = None
+                await self.stop()
             raise
 
     async def stop(self) -> None:
         """Stop active observation before a GATT provider is constructed."""
         scanner = self._scanner
         if scanner is not None:
-            await scanner.stop()
-            self._scanner = None
+            task = self._stop_task
+            if task is None:
+                task = asyncio.create_task(scanner.stop())
+                task.add_done_callback(_consume_task_exception)
+                self._stop_task = task
+            await asyncio.shield(task)
+            if self._stop_task is task:
+                self._scanner = None
+                self._stop_task = None
 
 
 def _normalize_address(address: str) -> str:
     return address.strip().lower()
+
+
+def _consume_task_exception(task: asyncio.Task[object]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _advertisement_rssi(advertisement: object) -> int | None:

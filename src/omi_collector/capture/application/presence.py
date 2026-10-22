@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -18,6 +19,10 @@ from typing import Literal, Protocol, cast
 from ...config import DEFAULT_CONFIG
 from . import presence_machine as machine
 from .ble_scan_health import ScanHealthMonitor, ScanRadioActivity
+
+# Hard safety cap after the short transition timeout; this is not a BlueZ limit.
+_SCAN_STOP_RECOVERY_SECONDS = 30.0
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,23 +366,19 @@ class PresenceScheduler:
         if self._scan_health is not None and generation is not None:
             self._scan_health.scan_stopping(generation)
         try:
-            await _transition(self._observer.stop(), policy=self._policy, operation="stop")
+            await _stop_observer(self._observer, self._policy, recover=not force)
         except asyncio.CancelledError:
             self._force_stop_required = True
             self._close_state()
             if self._scan_health is not None and generation is not None:
                 await self._scan_health.scan_stopped(generation)
             raise
-        except (TimeoutError, PresenceScanTransitionError) as error:
-            self._force_stop_required = True
-            if self._scan_health is not None and generation is not None:
-                await self._scan_health.scan_stop_failed(generation, error)
-            raise PresenceScanStopError(str(error)) from error
         except Exception as error:
             self._force_stop_required = True
             if self._scan_health is not None and generation is not None:
                 await self._scan_health.scan_stop_failed(generation, error)
-            raise PresenceScanStopError("presence scanner stop failed") from error
+            message = str(error) if isinstance(error, PresenceScanTransitionError) else "presence scanner stop failed"
+            raise PresenceScanStopError(message) from error
         self._force_stop_required = False
         if self._scan_health is not None and generation is not None:
             await self._scan_health.scan_stopped(generation)
@@ -471,6 +472,46 @@ class PresenceScheduler:
             await result
 
 
+async def _stop_observer(observer: PresenceObserver, policy: PresencePolicy, *, recover: bool) -> None:
+    started = time.monotonic()
+    try:
+        await _transition(observer.stop(), policy=policy, operation="stop")
+    except _PresenceTransitionTimeoutError as error:
+        elapsed = time.monotonic() - started
+        if not recover:
+            raise PresenceScanStopError("presence scanner stop recovery is disabled during forced cleanup") from error
+        _LOGGER.info(
+            "presence scanner stop exceeded transition timeout after %.3fs; joining the same stop operation",
+            elapsed,
+        )
+        try:
+            await _transition(
+                observer.stop(),
+                policy=policy,
+                operation="stop recovery",
+                timeout_seconds=_SCAN_STOP_RECOVERY_SECONDS,
+            )
+        except (_PresenceTransitionTimeoutError, PresenceScanTransitionError) as recovery_error:
+            _LOGGER.warning(
+                "presence scanner stop recovery failed after %.3fs (%s)",
+                time.monotonic() - started,
+                type(recovery_error).__name__,
+            )
+            raise PresenceScanStopError("presence scanner stop remained pending after recovery") from recovery_error
+        except Exception as recovery_error:
+            _LOGGER.warning(
+                "presence scanner stop operation failed during recovery after %.3fs (%s)",
+                time.monotonic() - started,
+                type(recovery_error).__name__,
+            )
+            raise PresenceScanStopError("presence scanner stop failed during recovery") from recovery_error
+        _LOGGER.info("presence scanner stop recovered after %.3fs", time.monotonic() - started)
+
+
+class _PresenceTransitionTimeoutError(TimeoutError):
+    """The scheduler stopped waiting; the observer operation may still finish."""
+
+
 def _waiting_state(state: machine.PresenceState) -> machine.WaitingState:
     if isinstance(state, machine.Attempting | machine.Closed):
         raise RuntimeError("presence scheduler has no waiting deadline")
@@ -488,13 +529,20 @@ def _wake(trigger: machine.AttemptTrigger) -> PresenceWake:
     )
 
 
-async def _transition(awaitable: object, *, policy: PresencePolicy, operation: str) -> None:
+async def _transition(
+    awaitable: object,
+    *,
+    policy: PresencePolicy,
+    operation: str,
+    timeout_seconds: float | None = None,
+) -> None:
     """Bound scanner transitions and detach only cancellation-uncertain work."""
     if not inspect.isawaitable(awaitable):
         return
+    timeout = policy.scan_transition_seconds if timeout_seconds is None else timeout_seconds
     task = asyncio.ensure_future(awaitable)
     try:
-        done, _ = await asyncio.wait({task}, timeout=policy.scan_transition_seconds)
+        done, _ = await asyncio.wait({task}, timeout=timeout)
     except asyncio.CancelledError:
         if not await _cancel_bounded(cast(asyncio.Task[object], task), policy):
             task.add_done_callback(_consume_task)
@@ -504,7 +552,7 @@ async def _transition(awaitable: object, *, policy: PresencePolicy, operation: s
         if not await _cancel_bounded(cast(asyncio.Task[object], task), policy):
             task.add_done_callback(_consume_task)
             raise PresenceScanTransitionError(f"presence scanner {operation} cancellation is uncertain")
-        raise TimeoutError(f"presence scanner {operation} timed out after {policy.scan_transition_seconds:g}s")
+        raise _PresenceTransitionTimeoutError(f"presence scanner {operation} timed out after {timeout:g}s")
     task.result()
 
 

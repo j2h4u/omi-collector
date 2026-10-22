@@ -3,790 +3,155 @@
 set -uo pipefail
 
 function die {
-    local -r message="${1:-operation failed}"
-    local -ri exit_status="${2:-1}"
-
-    printf 'ERROR: %s\n' "$message"
-    exit "$exit_status"
-} 1>&2
-
-function handle_signal {
-    # args
-    local -r signal_name="$1"
-    local -ri exit_status="$2"
-
-    # code
-    if (( selection_published && ! deployment_committed )); then
-        readiness_observation_failed=1
-    fi
-    die "deployment interrupted by ${signal_name}" "$exit_status"
+    printf 'ERROR: %s\n' "${1:-operation failed}" >&2
+    exit "${2:-1}"
 }
 
-function read_service_snapshot {
-    # args
-    local -r unit_name="$1"
-
-    # vars
-    local active_state process_id restart_count invocation_id output line key value
-
-    # code
-    output=$(systemctl show "$unit_name" --property=ActiveState --property=MainPID --property=NRestarts \
-        --property=InvocationID) || return 1
-    active_state=''
-    process_id=''
-    restart_count=''
-    invocation_id=''
+function service_snapshot {
+    local output
+    output=$(systemctl show omi-collector.service --property=ActiveState --property=MainPID \
+        --property=NRestarts --property=InvocationID) || return 1
+    local active_state='' process_id='' restarts='' invocation_id='' line key value
     while IFS= read -r line || [[ -n "$line" ]]; do
         key=${line%%=*}
         value=${line#*=}
         case "$key" in
             ActiveState) active_state=$value ;;
             MainPID) process_id=$value ;;
-            NRestarts) restart_count=$value ;;
+            NRestarts) restarts=$value ;;
             InvocationID) invocation_id=$value ;;
         esac
     done <<< "$output"
-
-    # result: one valid active-process snapshot
-    [[ "$active_state" == active && "$process_id" =~ ^[1-9][0-9]*$ && "$restart_count" =~ ^[0-9]+$ \
+    [[ "$active_state" == active && "$process_id" =~ ^[1-9][0-9]*$ && "$restarts" =~ ^[0-9]+$ \
         && "$invocation_id" =~ ^[[:xdigit:]]{32}$ ]] || return 1
-    printf '%s|%s|%s\n' "$process_id" "$restart_count" "$invocation_id"
+    printf '%s|%s|%s\n' "$process_id" "$restarts" "$invocation_id"
 }
 
-function read_service_readiness_snapshot {
-    # args
-    local -r unit_name="$1"
-
-    # vars
-    local active_state process_id restart_count invocation_id output line key value
-
-    # code
-    output=$(systemctl show "$unit_name" --property=ActiveState --property=MainPID --property=NRestarts \
-        --property=InvocationID) || return 1
-    active_state=''
-    process_id=''
-    restart_count=''
-    invocation_id=''
+function candidate_is_live {
+    local output state='' process_id='' restarts='' invocation='' line key value
+    output=$(systemctl show omi-collector.service --property=ActiveState --property=MainPID \
+        --property=NRestarts --property=InvocationID) || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
-        key=${line%%=*}
-        value=${line#*=}
+        key=${line%%=*}; value=${line#*=}
         case "$key" in
-            ActiveState) active_state=$value ;;
+            ActiveState) state=$value ;;
             MainPID) process_id=$value ;;
-            NRestarts) restart_count=$value ;;
-            InvocationID) invocation_id=$value ;;
+            NRestarts) restarts=$value ;;
+            InvocationID) invocation=$value ;;
         esac
     done <<< "$output"
-
-    [[ "$active_state" == active || "$active_state" == activating || "$active_state" == failed \
-        || "$active_state" == inactive || "$active_state" == deactivating ]] || return 1
-    [[ "$restart_count" =~ ^[0-9]+$ && "$invocation_id" =~ ^[[:xdigit:]]{32}$ ]] || return 1
-    printf '%s|%s|%s|%s\n' "$active_state" "$process_id" "$restart_count" "$invocation_id"
+    [[ "$state" == activating || "$state" == active ]] || return 1
+    [[ "$process_id" == "$observed_pid" && "$invocation" == "$observed_invocation" \
+        && "$process_id" =~ ^[1-9][0-9]*$ && "$invocation" =~ ^[[:xdigit:]]{32}$ && "$restarts" == 0 ]]
 }
 
-function validate_operator_config_file {
-    # args
-    local -r config_file="$1" account_group="$2"
-
-    # vars
-    local metadata
-
-    # code
-    # assert: deployment reads the same regular configuration as systemd
-    [[ -r "$config_file" && -f "$config_file" && ! -L "$config_file" ]] \
-        || die "operator configuration is missing or unreadable: ${config_file}"
-    metadata=$(stat -c '%U:%G:%a' -- "$config_file") \
-        || die "could not inspect operator configuration: ${config_file}"
-    # assert: the system collector and user-owned pipeline can both read it
-    [[ "$metadata" == "root:root:644" ]] \
-        || die "operator configuration must be root:root 0644: ${config_file}"
-}
-
-function validate_publication_checkpoint_access {
-    # args
-    local -r runuser_bin="$1" account_user="$2" account_group="$3" work_dir="$4"
-
-    # vars
-    local checkpoint_file
-
-    # code
-    checkpoint_file="${work_dir}/omi-ready-checkpoint.json"
-    if [[ -L "$work_dir" ]]; then
-        die "publication work path must not be a symlink: ${work_dir}"
-    fi
-    if [[ ! -e "$work_dir" ]]; then
-        return
-    fi
-    [[ -d "$work_dir" ]] || die "publication work path is not a directory: ${work_dir}"
-    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -x "$work_dir" \
-        || die "${account_user} cannot traverse publication work directory; rerun install-systemd-unit.sh: ${work_dir}"
-    if [[ -L "$checkpoint_file" ]]; then
-        die "publication checkpoint must not be a symlink: ${checkpoint_file}"
-    fi
-    if [[ ! -e "$checkpoint_file" ]]; then
-        # Windmill may not have published its first checkpoint yet.
-        return
-    fi
-    [[ -f "$checkpoint_file" ]] || die "publication checkpoint is not a regular file: ${checkpoint_file}"
-    # Windmill must preserve the checkpoint's read ACL when atomically replacing it.
-    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -r "$checkpoint_file" \
-        || die "${account_user} cannot read publication checkpoint: ${checkpoint_file}"
-}
-
-function ensure_build_account {
-    # args
-    local -r build_user="$1" build_group="$2" build_state_dir="$3" service_user="$4" service_group="$5"
-
-    # vars
-    local primary_group build_uid build_gid service_uid service_gid supplementary_output group_id
-    local -a build_groups
-
-    # code
-    # assert: candidate code has a dedicated unprivileged identity
-    [[ "$build_user" != "$service_user" && "$build_group" != "$service_group" ]] \
-        || die 'build identity names must differ from the live service identity'
-    [[ ! -L "$build_state_dir" ]] || die "build state directory must not be a symlink: ${build_state_dir}"
-    if ! getent group "$build_group" &> /dev/null; then
-        groupadd --system "$build_group" || die "could not create build group ${build_group}"
-    fi
-    if ! getent passwd "$build_user" &> /dev/null; then
-        useradd --system --gid "$build_group" --home-dir "$build_state_dir" --shell /usr/sbin/nologin --no-create-home \
-            "$build_user" || die "could not create build user ${build_user}"
-    fi
-    primary_group=$(id -gn "$build_user") || die "could not determine primary group for ${build_user}"
-    build_uid=$(id -u "$build_user") || die "could not determine UID for ${build_user}"
-    build_gid=$(id -g "$build_user") || die "could not determine primary GID for ${build_user}"
-    service_uid=$(id -u "$service_user") || die "could not determine UID for ${service_user}"
-    service_gid=$(id -g "$service_user") || die "could not determine primary GID for ${service_user}"
-    supplementary_output=$(id -G "$build_user") || die "could not determine supplementary groups for ${build_user}"
-    read -r -a build_groups <<< "$supplementary_output"
-    # assert: the build account cannot inherit the service account group
-    [[ "$primary_group" == "$build_group" ]] \
-        || die "build user ${build_user} must have primary group ${build_group}"
-    [[ "$build_uid" =~ ^[0-9]+$ && "$build_gid" =~ ^[0-9]+$ && "$service_uid" =~ ^[0-9]+$ && "$service_gid" =~ ^[0-9]+$ ]] \
-        || die 'build and service account identifiers must be numeric'
-    [[ "$build_uid" != "$service_uid" ]] \
-        || die 'build UID must differ from the live service UID'
-    [[ "$build_gid" != "$service_gid" ]] \
-        || die 'build primary GID must differ from the live service GID'
-    (( ${#build_groups[@]} > 0 )) || die "build user ${build_user} has no initialized groups"
-    for group_id in "${build_groups[@]}"; do
-        [[ "$group_id" =~ ^[0-9]+$ ]] || die "build user ${build_user} has an invalid group identifier"
-        [[ "$group_id" != "$service_gid" ]] \
-            || die 'build user must not belong to the live service group'
-    done
-}
-
-function prepare_deployment_directories {
-    # args
-    local -r build_state_dir="$1" uv_cache_dir="$2" deployment_root="$3" deployments_dir="$4"
-    local -r python_install_dir="$5" build_user="$6" build_group="$7"
-
-    # code
-    # assert: candidate cache and release storage have fixed, non-overlapping roles
-    [[ "$build_state_dir" == /* && ! -L "$build_state_dir" ]] \
-        || die 'build state directory must be a dedicated absolute state path'
-    [[ "$uv_cache_dir" == "${build_state_dir}"/* && ! -L "$uv_cache_dir" ]] \
-        || die "UV cache directory must be below ${build_state_dir}"
-    [[ "$deployment_root" == /* && "$deployment_root" != "${build_state_dir}"/* && ! -L "$deployment_root" ]] \
-        || die 'deployment root must be a dedicated absolute state path'
-    [[ "$deployments_dir" == "${deployment_root}"/* && ! -L "$deployments_dir" ]] \
-        || die "deployment directory must be below ${deployment_root}"
-    [[ "$python_install_dir" == "${deployment_root}"/* && ! -L "$python_install_dir" ]] \
-        || die "managed Python directory must be below ${deployment_root}"
-    install -d -o root -g root -m 0755 -- "$build_state_dir" "$deployment_root" "$deployments_dir" \
-        || die 'could not prepare root-owned deployment directories'
-    if [[ ! -e "$uv_cache_dir" && ! -L "$uv_cache_dir" ]]; then
-        install -d -o "$build_user" -g "$build_group" -m 0750 -- "$uv_cache_dir" \
-            || die 'could not prepare build UV cache'
-    fi
-    if [[ ! -e "$python_install_dir" && ! -L "$python_install_dir" ]]; then
-        install -d -o "$build_user" -g "$build_group" -m 0755 -- "$python_install_dir" \
-            || die 'could not prepare managed Python installation directory'
-    fi
-    # assert: the service cannot write the builder cache or release selectors
-    [[ $(stat -c '%U:%G:%a' -- "$build_state_dir") == 'root:root:755' && ! -L "$build_state_dir" ]] \
-        || die "build state directory must be root:root 0755: ${build_state_dir}"
-    [[ $(stat -c '%U:%G:%a' -- "$uv_cache_dir") == "${build_user}:${build_group}:750" && ! -L "$uv_cache_dir" ]] \
-        || die "UV cache directory must be ${build_user}:${build_group} 0750: ${uv_cache_dir}"
-    [[ $(stat -c '%U:%G:%a' -- "$deployment_root") == 'root:root:755' ]] \
-        || die "deployment root must be root:root 0755: ${deployment_root}"
-    [[ $(stat -c '%U:%G:%a' -- "$deployments_dir") == 'root:root:755' ]] \
-        || die "deployment directory must be root:root 0755: ${deployments_dir}"
-}
-
-function find_managed_build_python {
-    # args
-    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" uv_cache_dir="$5"
-    local -r python_install_dir="$6" uv_bin="$7"
-
-    # code
-    # assert: the build user can resolve the exact offline managed interpreter used by uv sync
-    "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
-        UV_CACHE_DIR="$uv_cache_dir" \
-        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
-        UV_NO_CONFIG=1 \
-        "$uv_bin" python find --managed-python --no-python-downloads --no-project 3.14
-}
-
-function install_managed_build_python_if_missing {
-    # args
-    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" uv_cache_dir="$5"
-    local -r python_install_dir="$6" uv_bin="$7"
-
-    # vars
-    local metadata
-
-    # code
-    if find_managed_build_python "$runuser_bin" "$build_user" "$build_group" "$build_home" "$uv_cache_dir" \
-        "$python_install_dir" "$uv_bin" &> /dev/null; then
-        return
-    fi
-    [[ -d "$python_install_dir" && ! -L "$python_install_dir" ]] \
-        || die "managed Python installation is missing or unsafe: ${python_install_dir}"
-    metadata=$(stat -c '%U:%G:%a' -- "$python_install_dir") \
-        || die "could not inspect managed Python installation: ${python_install_dir}"
-    if [[ "$metadata" == 'root:root:755' ]]; then
-        die "managed Python 3.14 is absent from root-sealed installation; refusing to modify ${python_install_dir}"
-    fi
-    [[ "$metadata" == "${build_user}:${build_group}:755" ]] \
-        || die "managed Python installation must be build-owned or root-sealed: ${python_install_dir}"
-    if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
-        UV_CACHE_DIR="$uv_cache_dir" \
-        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
-        UV_NO_CONFIG=1 \
-        "$uv_bin" python install 3.14; then
-        die 'could not install the managed build Python'
-    fi
-    find_managed_build_python "$runuser_bin" "$build_user" "$build_group" "$build_home" "$uv_cache_dir" \
-        "$python_install_dir" "$uv_bin" \
-        || die 'managed build Python 3.14 is unavailable after installation'
-}
-
-function write_release_metadata {
-    # args
-    local -r environment="$1" deployments_dir="$2" source_revision="$3"
-
-    # vars
-    local metadata_dir metadata_file
-
-    # code
-    # assert: provenance is one full lowercase Git object ID
-    [[ "$source_revision" =~ ^[0-9a-f]{40,64}$ ]] \
-        || die "source revision is not a full lowercase Git object ID: ${source_revision}"
-    # assert: root metadata is added only after a release is sealed at its fixed location
-    [[ "$environment" == "${deployments_dir}"/release-* && -d "$environment" && ! -L "$environment" ]] \
-        || die "completed deployment is missing or unsafe: ${environment}"
-    [[ $(stat -c '%U:%G:%a' -- "$environment") == 'root:root:755' ]] \
-        || die "completed deployment must be root:root 0755: ${environment}"
-    metadata_dir="${environment}/share/omi-collector"
-    metadata_file="${metadata_dir}/release.json"
-    # assert: no build-controlled path can redirect root metadata writes
-    [[ ! -e "${environment}/share" && ! -L "${environment}/share" ]] \
-        || die 'candidate created an unsafe release metadata path'
-    install -d -o root -g root -m 0755 -- "$metadata_dir" || die 'could not create release metadata directory'
-    [[ -d "$metadata_dir" && ! -L "$metadata_dir" && $(stat -c '%U:%G:%a' -- "$metadata_dir") == 'root:root:755' ]] \
-        || die 'release metadata directory is unsafe after creation'
-    printf '{"source_revision":"%s"}\n' "$source_revision" > "$metadata_file" \
-        || die 'could not write release provenance'
-    # assert: the just-created metadata file cannot redirect the root mode update
-    [[ -f "$metadata_file" && ! -L "$metadata_file" ]] \
-        || die 'release metadata file is unsafe after creation'
-    chmod 0644 "$metadata_file" || die 'could not set release provenance mode'
-}
-
-function seal_tree_with_descriptors {
-    # args
-    local -r sealer_python="$1" sealer_script="$2" tree_root="$3" owner="$4" allowed_external="$5"
-
-    # vars
-    local -a command
-
-    # code
-    # assert: the fixed interpreter cannot import a builder-controlled site package
-    command=("$sealer_python" '-I' '-B' '-S' "$sealer_script" '--root' "$tree_root" '--owner' "$owner")
-    if [[ -n "$allowed_external" ]]; then
-        command+=('--allow-external' "$allowed_external")
-    fi
-    "${command[@]}" || die "could not seal completed deployment tree: ${tree_root}"
-}
-
-function seal_deployment_environment {
-    # args
-    local -r environment="$1" deployments_dir="$2" sealer_python="$3" sealer_script="$4" sealer_owner="$5"
-    local -r python_install_dir="$6"
-
-    # code
-    # assert: root seals exactly one builder-created release, without following its links
-    [[ "$environment" == "${deployments_dir}"/release-* && -d "$environment" && ! -L "$environment" ]] \
-        || die "staged deployment is missing or unsafe: ${environment}"
-    seal_tree_with_descriptors "$sealer_python" "$sealer_script" "$environment" "$sealer_owner" "$python_install_dir"
-    # assert: selected releases cannot be modified by the service account
-    [[ $(stat -c '%U:%G:%a' -- "$environment") == 'root:root:755' ]] \
-        || die "completed deployment must be root:root 0755: ${environment}"
-}
-
-function seal_managed_python {
-    # args
-    local -r python_install_dir="$1" deployment_root="$2" sealer_python="$3" sealer_script="$4" sealer_owner="$5"
-
-    # code
-    # assert: root seals only the fixed build-owned Python installation location
-    [[ "$python_install_dir" == "${deployment_root}"/* && -d "$python_install_dir" && ! -L "$python_install_dir" ]] \
-        || die "managed Python installation is missing or unsafe: ${python_install_dir}"
-    seal_tree_with_descriptors "$sealer_python" "$sealer_script" "$python_install_dir" "$sealer_owner" ''
-    # assert: later candidates can read but cannot replace the runtime interpreter
-    [[ $(stat -c '%U:%G:%a' -- "$python_install_dir") == 'root:root:755' ]] \
-        || die "managed Python installation must be root:root 0755: ${python_install_dir}"
-}
-
-function persist_sealed_tree {
-    # args
-    local -r tree_root="$1" parent_dir="$2" trusted_python="$3"
-
-    # code
-    # assert: only a sealed, real tree under its expected parent may be persisted
-    [[ "$tree_root" == "${parent_dir}"/* && -d "$tree_root" && ! -L "$tree_root" ]] \
-        || die "sealed deployment tree is missing or unsafe: ${tree_root}"
-    "$trusted_python" -I -B -S - "$tree_root" "$parent_dir" <<'PY' \
-        || die "could not durably persist sealed deployment tree: ${tree_root}"
-import os
-import stat
-import sys
-
-root, parent = sys.argv[1:]
-flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-for directory, _children, files, directory_fd in os.fwalk(root, topdown=False, follow_symlinks=False):
-    for name in files:
-        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISLNK(entry.st_mode):
-            continue
-        if not stat.S_ISREG(entry.st_mode):
-            raise OSError(f"unsupported sealed tree entry: {directory}/{name}")
-        descriptor = os.open(name, flags, dir_fd=directory_fd)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    os.fsync(directory_fd)
-parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
-try:
-    os.fsync(parent_fd)
-finally:
-    os.close(parent_fd)
-PY
-}
-
-function verify_installed_package {
-    # args
-    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" environment="$5" source_package="$6"
-
-    # vars
-    local resolver_output resolved_purelib package_dir compare_status
-    local -a resolver_paths
-
-    # code
-    # assert: the staged environment has its own interpreter and entry point
-    [[ -x "${environment}/bin/python" && -x "${environment}/bin/omi-collector" ]] \
-        || die "staged environment is incomplete: ${environment}"
-    resolver_output=$("$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" \
-        "${environment}/bin/python" -I -B -c '
-import importlib.util
-from pathlib import Path
-import sysconfig
-
-purelib = Path(sysconfig.get_path("purelib")).resolve()
-spec = importlib.util.find_spec("omi_collector")
-if spec is None or spec.submodule_search_locations is None:
-    raise SystemExit("omi_collector package is not importable")
-print(purelib)
-print(Path(next(iter(spec.submodule_search_locations))).resolve())
-') || die 'could not resolve the staged project environment Python paths'
-    mapfile -t resolver_paths <<< "$resolver_output"
-    # assert: imports resolve exclusively inside the staged release
-    (( ${#resolver_paths[@]} == 2 )) || die 'staged project environment returned invalid path resolution'
-    resolved_purelib=${resolver_paths[0]}
-    package_dir=${resolver_paths[1]}
-    [[ -d "$resolved_purelib" && "$resolved_purelib" == "${environment}"/* ]] \
-        || die "resolved Python purelib is outside staged environment: ${resolved_purelib}"
-    [[ -d "$package_dir" && "$package_dir" == "${resolved_purelib}"/* ]] \
-        || die "resolved omi_collector package is outside Python purelib: ${package_dir}"
-    if diff --recursive --brief --exclude __pycache__ --exclude '*.pyc' --exclude '*.pyo' -- \
-        "$source_package" "$package_dir"; then
-        return
-    fi
-    compare_status=$?
-    (( compare_status == 1 )) && die 'installed omi_collector package is stale; systemd was not touched'
-    die "could not compare omi_collector package trees (status ${compare_status})"
-}
-
-function validate_candidate_config {
-    # args
-    local -r runuser_bin="$1" build_user="$2" build_group="$3" build_home="$4" environment="$5" config_file="$6"
-
-    # vars
-    local output expected
-
-    # code
-    output=$("$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home" "${environment}/bin/omi-collector" \
-        config check --config "$config_file") || die 'candidate rejected the operator configuration'
-    expected=$(printf '{"config":"%s","status":"config_valid"}' "$config_file")
-    # assert: the candidate validated the exact production configuration
-    [[ "$output" == "$expected" ]] || die 'candidate returned an unexpected configuration validation record'
-}
-
-function check_candidate_collector_state {
-    # args
-    local -r environment="$1" config_file="$2" stopped="$3" output_name="$4"
-
-    # vars
-    local output command_status
-    local -a stopped_args=()
-
-    # code
-    if [[ "$stopped" == 'true' ]]; then
-        stopped_args+=( '--stopped' )
-    fi
-    if output=$("${environment}/bin/omi-collector" check-state --config "$config_file" "${stopped_args[@]}"); then
-        command_status=0
-    else
-        command_status=$?
-    fi
-    if (( command_status == 0 )); then
+function state_check {
+    local -r environment="$1" stopped="$2"
+    local -a args=()
+    local output status
+    [[ "$stopped" == true ]] && args+=(--stopped)
+    if output=$("$environment/bin/omi-collector" check-state --config "$config_file" "${args[@]}"); then
         case "$output" in
             '{"schema_version":null,"status":"state_compatible"}'|\
             '{"schema_version":0,"status":"state_compatible"}'|\
             '{"schema_version":2,"status":"state_compatible"}'|\
             '{"schema_version":3,"status":"state_compatible"}'|\
-            '{"schema_version":4,"status":"state_compatible"}')
-                printf -v "$output_name" '%s' 'compatible'
-                return ;;
+            '{"schema_version":4,"status":"state_compatible"}') printf 'compatible\n'; return ;;
             *) die 'candidate returned an unexpected Collector state check record' ;;
         esac
+    else
+        status=$?
     fi
-    if (( command_status == 1 )) && [[ "$output" == '{"reason":"canonical_hot_journal","status":"recovery_required"}' ]]; then
-        printf -v "$output_name" '%s' 'recovery_required'
+    if (( status == 1 )) && [[ "$output" == '{"reason":"canonical_hot_journal","status":"recovery_required"}' ]]; then
+        printf 'recovery_required\n'
         return
     fi
-    if [[ "$stopped" == 'false' && $command_status == 1 && "$output" == '{"detail":"canonical audio database is busy","fault":"transient","reason":"inspection_failed","status":"state_refused"}' ]]; then
-        printf -v "$output_name" '%s' 'online_busy'
+    if [[ "$stopped" == false && $status == 1 \
+        && "$output" == '{"detail":"canonical audio database is busy","fault":"transient","reason":"inspection_failed","status":"state_refused"}' ]]; then
+        printf 'online_busy\n'
         return
     fi
-    if [[ -n "$output" ]]; then
-        printf 'Collector state check response (exit %s): %s\n' "$command_status" "$output" >&2
-    fi
+    [[ -z "$output" ]] || printf 'Collector state check response (exit %s): %s\n' "$status" "$output" >&2
     die 'candidate refused the Collector state check'
 }
 
-function recover_stopped_canonical_journal {
-    local -r environment="$1" config_file="$2"
-
-    "$environment/bin/omi-collector" recover-state-journal --config "$config_file" \
-        || die 'candidate refused guarded Collector SQLite journal recovery'
-}
-
-function initialize_stopped_collector_state {
-    # args
-    local -r environment="$1" config_file="$2" state_file="$3"
-    local -r runuser_bin="$4" account_user="$5" account_group="$6" operator_group="$7"
-    local -r lock_file="${state_file%/*}/collector.lock"
-
-    # code
-    [[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
-    "$environment/bin/omi-collector" init-state --config "$config_file" \
-        || die 'stopped-service Collector state initialization failed; service remains stopped'
-    [[ ! -e "$lock_file" && ! -L "$lock_file" ]] \
-        || [[ -f "$lock_file" && ! -L "$lock_file" ]] \
-        || die "Collector singleton lock is not a regular file: ${lock_file}"
-    [[ -f "$state_file" && ! -L "$state_file" ]] \
-        || die "stopped-service initialization did not install a regular Collector state database: ${state_file}"
-    [[ -f "$lock_file" && ! -L "$lock_file" ]] \
-        || die "Collector singleton lock is not a regular file: ${lock_file}"
-    # Verify service and operator ownership after initialization.
-    [[ $(stat -c '%U:%G:%a' -- "$state_file") == "${account_user}:${operator_group}:640" ]] \
-        || die 'Collector state database ownership or mode is unexpected after initialization'
-    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -r "$state_file" \
-        || die 'service account cannot read Collector state database'
-    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "$state_file" \
-        || die 'service account cannot write Collector state database'
-    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "${state_file%/*}" \
-        || die 'service account cannot write Collector state journal directory'
-    "$runuser_bin" --user "$operator_group" --group "$operator_group" -- test -r "$state_file" \
-        || die 'operator account cannot read Collector state database'
-    if "$runuser_bin" --user "$operator_group" --group "$operator_group" -- test -w "$state_file"; then
-        die 'operator account can write Collector state database'
+function publish_selector {
+    local -r target="$1" temporary="${current_link%/*}/.current.${BASHPID}.${RANDOM}"
+    [[ ! -e "$temporary" && ! -L "$temporary" ]] || die 'temporary selector already exists'
+    ln -s -- "$target" "$temporary" || die 'could not stage deployment selector'
+    if ! mv -Tf -- "$temporary" "$current_link"; then
+        rm -f -- "$temporary"
+        die 'could not publish deployment selector'
     fi
-}
-
-function provision_operator_data_access {
-    # args
-    local -r storage_root="$1" account_user="$2" operator_group="$3"
-
-    # vars
-    local directory
-    local legacy_directory
-    local -a directories=(
-        "${storage_root}/collector"
-        "${storage_root}/collector/public"
-        "${storage_root}/ready"
-    )
-
-    # code
-    # assert: the state path's parent is an existing real pipeline storage root
-    [[ -d "$storage_root" && ! -L "$storage_root" ]] || die 'Collector storage root is missing or unsafe'
-    getent group "$operator_group" &> /dev/null || die "operator group is missing: ${operator_group}"
-    for legacy_directory in "${storage_root}/collector/attempts" "${storage_root}/collector/quarantine" "${storage_root}/draft"; do
-        if [[ -e "$legacy_directory" || -L "$legacy_directory" ]]; then
-            directories+=("$legacy_directory")
-        fi
-    done
-    for directory in "${directories[@]}"; do
-        # assert: reject every unsafe root before changing any of them
-        [[ ! -L "$directory" ]] || die "Collector data root must not be a symlink: ${directory}"
-    done
-    for directory in "${directories[@]}"; do
-        install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory" \
-            || die "could not provision Collector data root: ${directory}"
-        [[ $(stat -c '%U:%G:%a' -- "$directory") == "${account_user}:${operator_group}:2750" ]] \
-            || die "Collector data root has unexpected ownership or mode: ${directory}"
-    done
-}
-
-function prepare_service_singleton_lock {
-    # args
-    local -r lock_file="$1" runuser_bin="$2" account_user="$3" account_group="$4"
-
-    # code
-    [[ ! -L "${lock_file%/*}" ]] || return 1
-    if [[ ! -d "${lock_file%/*}" ]]; then
-        return
-    fi
-    if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
-        (set -o noclobber; : > "$lock_file") || return 1
-    fi
-    [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
-    chown "$account_user:$account_group" -- "$lock_file" || return 1
-    chmod 0600 -- "$lock_file" || return 1
-    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -w "$lock_file"
-}
-
-function read_current_target {
-    # args
-    local -r current_link="$1" deployments_dir="$2" output_name="$3"
-
-    # vars
-    local target resolved
-
-    # code
-    if [[ ! -e "$current_link" && ! -L "$current_link" ]]; then
-        printf -v "$output_name" '%s' ''
-        return
-    fi
-    # assert: release selection is one relative symlink managed by this deployer
-    [[ -L "$current_link" ]] || die "current deployment selector is not a symlink: ${current_link}"
-    target=$(readlink -- "$current_link") || die 'could not read current deployment selector'
-    [[ "$target" =~ ^releases/release-[0-9a-f]{40,64}-[0-9]+-[0-9]+$ ]] \
-        || die "current deployment selector has an unsupported target: ${target}"
-    resolved="$(dirname -- "$current_link")/${target}"
-    [[ -d "$resolved" && ! -L "$resolved" && "$resolved" == "${deployments_dir}"/release-* ]] \
-        || die "current deployment target is missing or unsafe: ${resolved}"
-    printf -v "$output_name" '%s' "$target"
-}
-
-function publish_current_target {
-    # args
-    local -r current_link="$1" target="$2" temporary_link="$3"
-
-    # code
-    # assert: a deployment transaction owns an unused temporary selector
-    [[ ! -e "$temporary_link" && ! -L "$temporary_link" ]] \
-        || die "temporary deployment selector already exists: ${temporary_link}"
-    ln --symbolic -- "$target" "$temporary_link" || die 'could not stage current deployment selector'
-    mv -T -- "$temporary_link" "$current_link" || die 'could not publish current deployment selector'
-    "$sealer_python" - "${current_link%/*}" <<'PY' || die 'could not durably publish current deployment selector'
-import os
-import sys
-
-directory = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    python3 -I -S - "$runtime_root" <<'PY' || die 'could not persist deployment selector'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
 try:
-    os.fsync(directory)
+    os.fsync(fd)
 finally:
-    os.close(directory)
+    os.close(fd)
 PY
 }
 
-function prune_obsolete_deployments {
-    # args
-    local -r deployments_dir="$1" selected_environment="$2"
-
-    # vars
-    local candidate name
-
-    # code
-    while IFS= read -r -d '' candidate; do
-        name=$(basename -- "$candidate")
-        [[ "$candidate" == "$selected_environment" ]] && continue
-        [[ "$name" =~ ^release-[0-9a-f]{40,64}-[0-9]+-[0-9]+$ ]] || continue
-        # assert: only known regular release directories are pruned
-        [[ -d "$candidate" && ! -L "$candidate" ]] \
-            || die "known deployment is not a regular directory: ${candidate}"
-        rm -rf -- "$candidate" || die "could not prune obsolete deployment: ${candidate}"
-    done < <(find "$deployments_dir" -mindepth 1 -maxdepth 1 -type d -print0)
-}
-
-function require_clean_source_tree {
-    # args
-    local -r project_dir="$1"
-
-    # vars
-    local source_tree_status
-
-    # code
-    source_tree_status=$(git -C "$project_dir" status --porcelain=v1 --untracked-files=all) \
-        || die 'could not inspect the checked-out source tree'
-    # assert: deployment exactly matches one committed source revision
-    [[ -z "$source_tree_status" ]] \
-        || die 'refusing deployment from a dirty source tree; commit, stash, or remove every change first'
-}
-
-declare script_dir repo_root source_package source_unit installed_unit config_file publication_work_dir service_name
-declare uv_bin runuser_bin sealer_python sealer_script sealer_owner account_user account_group operator_group build_user build_group
-declare build_state_dir uv_cache_dir python_install_dir
-declare deployment_root deployments_dir deployment_lock_file current_link temporary_link
-declare state_file
-declare state_preflight
-declare source_revision release_name release_path staged_environment previous_target deployment_epoch
-declare initial_snapshot initial_invocation final_snapshot final_pid final_restarts expected_readiness journal_output
-declare initial_service_state
-declare readiness_snapshot readiness_state readiness_pid readiness_restarts readiness_invocation
-declare -i readiness_seen=0 selection_published=0 deployment_committed=0
-declare -i readiness_observation_failed=0
-declare -i readiness_started_at=0
-declare -i service_quiesced=0 initial_service_active=0 release_created=0 deployment_lock_fd=-1
-declare -ri readiness_poll_interval_seconds=1 readiness_timeout_seconds=900 stability_interval_seconds=6
-
-script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve script directory'
-repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
-# assert: build-user processes inherit the reviewed production checkout, never the caller directory
-builtin cd -- "$repo_root" || die 'cannot enter repository root'
-source_package="${repo_root}/src/omi_collector"
-source_unit="${repo_root}/systemd/omi-collector.service"
-installed_unit='/etc/systemd/system/omi-collector.service'
-config_file='/srv/pipelines/omi/config.toml'
-publication_work_dir='/srv/pipelines/omi/work'
-service_name='omi-collector.service'
-uv_bin='/usr/local/bin/uv'
-sealer_python='/usr/bin/python3'
-sealer_script="${script_dir}/seal_deployment_tree.py"
-sealer_owner='0:0'
-account_user='omi-collector'
-account_group='omi-collector'
-operator_group='j2h4u'
-build_user='omi-collector-build'
-build_group='omi-collector-build'
-build_state_dir='/var/lib/omi-collector-build'
-uv_cache_dir='/var/lib/omi-collector-build/uv-cache'
-deployment_root='/var/lib/omi-collector-deployments'
-deployments_dir='/var/lib/omi-collector-deployments/releases'
-python_install_dir='/var/lib/omi-collector-deployments/python'
-deployment_lock_file='/var/lib/omi-collector-deployments/.deployment.lock'
-current_link='/var/lib/omi-collector-deployments/current'
-state_file='/srv/pipelines/omi/collector/collector-state.sqlite3'
-temporary_link="${deployment_root}/.current.${BASHPID}.${RANDOM}"
-release_path=''
-staged_environment=''
-previous_target=''
-
-function cleanup {
-    # args
-    local -ri preserve_recovery="${1:-0}"
-
-    # code
-    [[ -e "$temporary_link" || -L "$temporary_link" ]] && rm -f -- "$temporary_link"
-    if (( ! preserve_recovery )); then
-        if (( release_created && ! deployment_committed && ! selection_published )); then
-            if [[ "$release_path" == "${deployments_dir}"/release-* && -d "$release_path" && ! -L "$release_path" ]]; then
-                rm -rf -- "$release_path" || printf 'ERROR: could not remove unpublished deployment: %s\n' "$release_path" >&2
-            fi
-        fi
-    fi
+function previous_is_compatible {
+    local -r previous="$1"
+    [[ -x "$previous/bin/python" ]] \
+        && "$previous/bin/python" -I -B "${script_dir}/check_fallback_ledger_compatibility.py" "$state_file"
 }
 
 function finalize {
-    # vars
-    local -i final_status=$? recovery_failed=0
-    local selected_target=''
-    local fallback_python=''
-    local -i selector_readable=0
-
-    # code
-    trap '' INT TERM HUP QUIT USR1 USR2
+    local -i status=$? recovery_failed=0
+    local selected=''
+    trap - EXIT INT TERM HUP QUIT USR1 USR2
     if [[ -L "$current_link" ]]; then
-        if selected_target=$(readlink -- "$current_link"); then
-            selector_readable=1
-        fi
-    elif [[ ! -e "$current_link" ]]; then
-        selector_readable=1
+        selected=$(readlink -- "$current_link") || selected='ambiguous'
+    elif [[ -e "$current_link" ]]; then
+        selected='ambiguous'
     fi
     if (( deployment_committed )); then
-        selection_published=0
-    elif (( ! service_quiesced && ! selection_published )); then
-        : # The deployer has not stopped the service or attempted selector publication.
-    elif (( selector_readable && readiness_observation_failed )) \
-        && [[ "$selected_target" == "releases/${release_name}" ]] \
-        && readiness_snapshot=$(read_service_readiness_snapshot "$service_name") \
-        && IFS='|' read -r readiness_state readiness_pid readiness_restarts readiness_invocation <<< "$readiness_snapshot" \
-        && [[ "$readiness_state" == active || "$readiness_state" == activating ]] \
-        && [[ "$readiness_pid" =~ ^[1-9][0-9]*$ ]]; then
-        local -r expected_identity="$initial_snapshot"
-        local -r observed_identity="${readiness_pid}|${readiness_restarts}|${readiness_invocation}"
-        if [[ "$observed_identity" == "$expected_identity" ]]; then
-            selection_published=0
-            printf 'ERROR: selected release is unverified, running in the same invocation; invocation=%s\n' \
-                "$readiness_invocation" >&2
-            recovery_failed=1
+        :
+    elif (( readiness_pending )) && [[ "$selected" == "releases/${release_name}" ]] && candidate_is_live; then
+        printf 'ERROR: selected service is still starting; deployment remains unverified and in progress\n' >&2
+        recovery_failed=1
+    elif [[ "$selected" == "releases/${release_name}" || "$selected" == ambiguous ]]; then
+        sudo -n /usr/bin/systemctl stop omi-collector.service || recovery_failed=1
+        printf 'ERROR: selected release needs forward recovery; service remains stopped\n' >&2
+        recovery_failed=1
+    elif (( service_stopped && service_was_active )) && [[ -n "$previous_target" ]]; then
+        if previous_is_compatible "${runtime_root}/${previous_target}"; then
+            sudo -n /usr/bin/systemctl start --no-block omi-collector.service || recovery_failed=1
         else
-            selection_published=1
-            if ! systemctl stop "$service_name"; then recovery_failed=1; fi
-            printf 'ERROR: selected new release requires forward Collector recovery; service is stopped and recovery state retained\n' >&2
+            printf 'ERROR: previous release is not compatible with current state; service remains stopped\n' >&2
             recovery_failed=1
         fi
-    elif (( selector_readable )) && [[ "$selected_target" == "releases/${release_name}" ]]; then
-        selection_published=1
-        if ! systemctl stop "$service_name"; then
-            recovery_failed=1
-        fi
-        printf 'ERROR: selected new release requires forward Collector recovery; service is stopped and recovery state retained\n' >&2
-        recovery_failed=1
-    elif (( selector_readable )) && [[ "$selected_target" == "$previous_target" ]]; then
-        selection_published=0
-        if (( service_quiesced && initial_service_active )) && [[ -n "$previous_target" ]]; then
-            fallback_python="${deployment_root}/${previous_target}/bin/python"
-            if [[ -x "$fallback_python" ]] \
-                && "$fallback_python" -I -B "${script_dir}/check_fallback_ledger_compatibility.py" "$state_file" \
-                && systemctl start "$service_name"; then
-                service_quiesced=0
-            elif [[ ! -x "$fallback_python" ]]; then
-                recovery_failed=1
-                printf 'ERROR: previous deployment interpreter is unavailable; service remains stopped for forward recovery\n' >&2
-            else
-                recovery_failed=1
-                printf 'ERROR: previous deployment cannot safely read Collector state or could not restart; service remains stopped for forward recovery\n' >&2
-            fi
-        fi
-    else
-        selection_published=1
-        if ! systemctl stop "$service_name"; then
-            recovery_failed=1
-        fi
-        printf 'ERROR: deployment selector is ambiguous; service is stopped and recovery state retained\n' >&2
-        recovery_failed=1
     fi
-    cleanup "$recovery_failed"
-    trap - EXIT
-    exit "$final_status"
+    if (( release_created && ! selector_published && ! deployment_committed && ! recovery_failed )); then
+        rm -rf -- "$release_path" || printf 'ERROR: could not remove unpublished release: %s\n' "$release_path" >&2
+    fi
+    exit "$status"
 }
 
+function handle_signal {
+    if (( restart_requested )) && [[ -n "$observed_pid" && -n "$observed_invocation" ]]; then
+        readiness_pending=1
+    fi
+    die "deployment interrupted by $1" "$2"
+}
+
+declare script_dir='' repo_root='' runtime_root='' releases_dir='' current_link='' lock_file=''
+declare config_file='/srv/pipelines/omi/config.toml' state_file='/srv/pipelines/omi/collector/collector-state.sqlite3'
+declare source_revision='' release_name='' release_path='' previous_target=''
+declare initial_snapshot='' final_snapshot='' snapshot=''
+declare readiness_started_at='' active_state='' main_pid='' restart_count='' current_invocation='' job='' line='' key='' value=''
+declare initial_state='' state_preflight='' candidate_config='' resolved_package='' operator_user='' operator_home=''
+declare candidate='' deployment_epoch=''
+declare -i service_was_active=0 service_stopped=0 selector_published=0 deployment_committed=0 release_created=0 readiness_pending=0 restart_requested=0
+declare -i lock_fd=-1
+declare observed_pid='' observed_invocation=''
+declare -ri readiness_timeout_seconds=900 stability_seconds=6
+
+(( EUID != 0 )) || die 'run as the service owner, without sudo'
+(( $# == 0 )) || die 'this command does not accept arguments'
 trap finalize EXIT
 trap 'handle_signal SIGINT 130' INT
 trap 'handle_signal SIGTERM 143' TERM
@@ -794,141 +159,166 @@ trap 'handle_signal SIGHUP 129' HUP
 trap 'handle_signal SIGQUIT 131' QUIT
 trap 'handle_signal SIGUSR1 138' USR1
 trap 'handle_signal SIGUSR2 140' USR2
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve script directory'
+repo_root=$(cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
+cd -- "$repo_root" || die 'cannot enter repository root'
+source_revision=$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}') || die 'could not resolve source revision'
+[[ "$source_revision" =~ ^[0-9a-f]{40,64}$ ]] || die 'source revision is not a full Git object ID'
+source_status=$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all) \
+    || die 'could not inspect source checkout state'
+[[ -z "$source_status" ]] || die 'refusing deployment from a dirty source tree'
 
-# assert: deployment has fixed privileged inputs and no operator overrides
-(( $# == 0 )) || die 'this command does not accept arguments'
-(( EUID == 0 )) || die 'must run as root (use sudo)'
-[[ -f "$source_unit" && -d "$source_package" ]] || die 'checked-in deployment sources are missing'
-[[ -f "$uv_bin" && -x "$uv_bin" && ! -L "$uv_bin" ]] \
-    || die "uv must be installed as an executable regular file: ${uv_bin}"
-[[ -x "$sealer_python" && -f "$sealer_script" && ! -L "$sealer_script" ]] \
-    || die 'trusted descriptor-based deployment sealer is missing or unsafe'
-[[ -r "$installed_unit" && -f "$installed_unit" && ! -L "$installed_unit" ]] \
-    || die 'installed systemd unit is missing or unsafe; run sudo scripts/install-systemd-unit.sh once'
-cmp --silent -- "$source_unit" "$installed_unit" \
-    || die 'installed systemd unit differs; run sudo scripts/install-systemd-unit.sh once'
-runuser_bin=$(command -v runuser || true)
-[[ -n "$runuser_bin" || -x /usr/sbin/runuser ]] || die 'runuser is required to synchronize the service environment'
-[[ -n "$runuser_bin" ]] || runuser_bin='/usr/sbin/runuser'
+operator_user=$(id --user --name) || die 'cannot identify service owner'
+operator_home=$(getent passwd "$operator_user" | cut -d: -f6) || die 'cannot resolve service owner home'
+[[ -n "$operator_home" && "$operator_home" == /* && -d "$operator_home" ]] || die 'service owner home is missing'
+runtime_root="${operator_home}/.local/share/omi-collector"
+releases_dir="${runtime_root}/releases"
+current_link="${runtime_root}/current"
+lock_file="${runtime_root}/.deployment.lock"
+[[ -r "$config_file" && -f "$config_file" && ! -L "$config_file" ]] || die 'operator configuration is missing or unsafe'
+[[ ! -L "${operator_home}/.local" && ! -L "${operator_home}/.local/share" && ! -L "$runtime_root" ]] \
+    || die 'runtime path must not contain symlinks'
+mkdir -p -- "$releases_dir" || die 'could not create operator-owned release directory'
+[[ -d "$runtime_root" && -d "$releases_dir" && ! -L "$releases_dir" ]] || die 'runtime directories are unsafe'
+exec {lock_fd}>>"$lock_file" || die 'could not open deployment lock'
+flock --nonblock "$lock_fd" || die 'another deployment is already in progress'
 
-validate_operator_config_file "$config_file" "$account_group"
-source_revision=$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}') \
-    || die 'could not resolve the checked-out source revision'
-[[ "$source_revision" =~ ^[0-9a-f]{40,64}$ ]] \
-    || die "source revision is not a full lowercase Git object ID: ${source_revision}"
-require_clean_source_tree "$repo_root"
-ensure_build_account "$build_user" "$build_group" "$build_state_dir" "$account_user" "$account_group"
-prepare_deployment_directories "$build_state_dir" "$uv_cache_dir" "$deployment_root" "$deployments_dir" \
-    "$python_install_dir" "$build_user" "$build_group"
-exec {deployment_lock_fd}>>"$deployment_lock_file" || die 'could not open the deployment transaction lock'
-flock --nonblock "$deployment_lock_fd" || die 'another deployment transaction is already in progress'
-read_current_target "$current_link" "$deployments_dir" previous_target
-
+previous_target=''
+if [[ -e "$current_link" || -L "$current_link" ]]; then
+    [[ -L "$current_link" ]] || die 'current deployment selector is not a symlink'
+    previous_target=$(readlink -- "$current_link") || die 'could not read current selector'
+    [[ "$previous_target" =~ ^releases/release-[0-9a-f]{40,64}-[0-9]+-[0-9]+$ \
+        && -d "${runtime_root}/${previous_target}" && ! -L "${runtime_root}/${previous_target}" ]] \
+        || die 'current deployment selector is unsafe'
+fi
 printf -v deployment_epoch '%(%s)T' -1
 release_name="release-${source_revision}-${deployment_epoch}-$$"
-release_path="${deployments_dir}/${release_name}"
-mkdir --mode=0750 -- "$release_path" || die 'could not create deployment environment'
+release_path="${releases_dir}/${release_name}"
+mkdir -m 0755 -- "$release_path" || die 'could not create candidate release directory'
 release_created=1
-staged_environment="$release_path"
-chown "$build_user:$build_group" "$staged_environment" \
-    || die 'could not set staged deployment ownership'
-chmod 0750 "$staged_environment" || die 'could not set staged deployment mode'
-
-install_managed_build_python_if_missing "$runuser_bin" "$build_user" "$build_group" "$uv_cache_dir" "$uv_cache_dir" \
-    "$python_install_dir" "$uv_bin"
-if ! "$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$uv_cache_dir" \
-    UV_PROJECT_ENVIRONMENT="$staged_environment" \
-    UV_LINK_MODE=copy \
-    UV_CACHE_DIR="$uv_cache_dir" \
-    UV_PYTHON_INSTALL_DIR="$python_install_dir" \
-    UV_NO_CONFIG=1 \
-    "$uv_bin" sync --project "$repo_root" --locked --no-dev --no-editable --reinstall-package omi-collector \
-        --managed-python --no-python-downloads; then
-    die 'uv sync failed; systemd was not touched'
+UV_PROJECT_ENVIRONMENT="$release_path" UV_LINK_MODE=hardlink \
+    uv sync --project "$repo_root" --locked --no-dev --no-editable --reinstall-package omi-collector \
+    || die 'uv sync failed; the running service was not touched'
+[[ -x "$release_path/bin/python" && -x "$release_path/bin/omi-collector" ]] || die 'candidate environment is incomplete'
+resolved_package=$("$release_path/bin/python" -I -B -c 'import importlib.util; from pathlib import Path; spec=importlib.util.find_spec("omi_collector"); print(Path(next(iter(spec.submodule_search_locations))).resolve() if spec and spec.submodule_search_locations else "")') \
+    || die 'candidate package could not be imported'
+[[ "$resolved_package" == "$release_path"/* ]] || die 'candidate imports package outside its release environment'
+diff --recursive --brief --exclude __pycache__ --exclude '*.pyc' --exclude '*.pyo' \
+    "$repo_root/src/omi_collector" "$resolved_package" >/dev/null \
+    || die 'installed candidate package differs from the checked-out source'
+mkdir -p -- "$release_path/share/omi-collector" || die 'could not create release metadata directory'
+python3 -I -S - "$release_path/share/omi-collector/release.json" "$source_revision" <<'PYMETA' \
+    || die 'could not write release source metadata'
+import json, os, sys, tempfile
+path, revision = sys.argv[1:]
+fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".release.")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump({"source_revision": revision}, stream, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PYMETA
+candidate_config=$("$release_path/bin/omi-collector" config check --config "$config_file") \
+    || die 'candidate rejected production configuration'
+[[ "$candidate_config" == "$(printf '{\"config\":\"%s\",\"status\":\"config_valid\"}' "$config_file")" ]] \
+    || die 'candidate returned an unexpected configuration validation record'
+state_preflight=$(state_check "$release_path" false) || die 'candidate refused Collector state'
+if [[ "$state_preflight" == online_busy ]]; then
+    : # A live capture may hold SQLite; repeat under the stopped-service guard.
 fi
-verify_installed_package "$runuser_bin" "$build_user" "$build_group" "$uv_cache_dir" "$staged_environment" "$source_package"
-validate_candidate_config "$runuser_bin" "$build_user" "$build_group" "$uv_cache_dir" "$staged_environment" "$config_file"
-seal_managed_python "$python_install_dir" "$deployment_root" "$sealer_python" "$sealer_script" "$sealer_owner"
-seal_deployment_environment "$staged_environment" "$deployments_dir" "$sealer_python" "$sealer_script" "$sealer_owner" \
-    "$python_install_dir"
-write_release_metadata "$staged_environment" "$deployments_dir" "$source_revision"
-persist_sealed_tree "$python_install_dir" "$deployment_root" "$sealer_python"
-persist_sealed_tree "$staged_environment" "$deployments_dir" "$sealer_python"
-validate_publication_checkpoint_access "$runuser_bin" "$account_user" "$account_group" "$publication_work_dir"
-provision_operator_data_access "${state_file%/collector/collector-state.sqlite3}" "$account_user" "$operator_group"
-check_candidate_collector_state "$staged_environment" "$config_file" 'false' state_preflight
-initial_service_state=$(systemctl show "$service_name" --property=ActiveState) \
-    || die "could not inspect initial ${service_name} state before stop"
-case "$initial_service_state" in
-    ActiveState=active) initial_service_active=1 ;;
+initial_state=$(systemctl show omi-collector.service --property=ActiveState) || die 'could not inspect service state'
+case "$initial_state" in
+    ActiveState=active) service_was_active=1 ;;
     ActiveState=inactive|ActiveState=failed) ;;
-    *) die "ambiguous initial ${service_name} state before stop: ${initial_service_state}" ;;
+    *) die "ambiguous service state: ${initial_state}" ;;
 esac
-service_quiesced=1
-systemctl stop "$service_name" || die "could not stop ${service_name} before selecting deployment"
-[[ ! -L "$state_file" ]] || die "Collector state database must not be a symlink: ${state_file}"
-prepare_service_singleton_lock "${state_file%/*}/collector.lock" "$runuser_bin" "$account_user" "$account_group" \
-    || die 'could not prepare the stable Collector singleton lock for state initialization'
-check_candidate_collector_state "$staged_environment" "$config_file" 'true' state_preflight
-if [[ "$state_preflight" == 'recovery_required' ]]; then
-    recover_stopped_canonical_journal "$staged_environment" "$config_file"
-    check_candidate_collector_state "$staged_environment" "$config_file" 'true' state_preflight
-    [[ "$state_preflight" == 'compatible' ]] \
-        || die 'Collector state still needs recovery after guarded SQLite rollback'
+service_stopped=1
+sudo -n /usr/bin/systemctl stop omi-collector.service || die 'could not stop service before state migration'
+[[ ! -L "$state_file" ]] || die 'Collector database must not be a symlink'
+state_preflight=$(state_check "$release_path" true) || die 'stopped Collector state check failed'
+if [[ "$state_preflight" == recovery_required ]]; then
+    "$release_path/bin/omi-collector" recover-state-journal --config "$config_file" \
+        || die 'guarded SQLite journal recovery failed'
+    [[ $(state_check "$release_path" true) == compatible ]] || die 'Collector state remains incompatible after journal recovery'
 fi
-selection_published=1
-publish_current_target "$current_link" "releases/${release_name}" "$temporary_link"
-initialize_stopped_collector_state "$current_link" "$config_file" "$state_file" \
-    "$runuser_bin" "$account_user" "$account_group" "$operator_group"
-systemctl restart "$service_name" || die "could not restart ${service_name}"
-initial_snapshot=$(read_service_snapshot "$service_name") \
-    || die "${service_name} did not provide a valid active-process snapshot after deployment"
-service_quiesced=0
-IFS='|' read -r _ _ initial_invocation <<< "$initial_snapshot"
-expected_readiness=$(printf '{"config":"%s","status":"deployment_ready"}' "$config_file")
+publish_selector "releases/${release_name}"
+selector_published=1
+"${current_link}/bin/omi-collector" init-state --config "$config_file" || die 'state migration failed; service remains stopped'
+sudo -n /usr/bin/systemctl restart --no-block omi-collector.service || die 'could not start selected service'
+restart_requested=1
 readiness_started_at=$SECONDS
-while (( ! readiness_seen )); do
-    readiness_snapshot=$(read_service_readiness_snapshot "$service_name") || {
-        readiness_observation_failed=1
-        die "could not observe ${service_name} while waiting for readiness"
-    }
-    IFS='|' read -r readiness_state readiness_pid readiness_restarts readiness_invocation <<< "$readiness_snapshot"
-    if [[ "$readiness_state" == failed || "$readiness_state" == inactive || "$readiness_state" == deactivating ]]; then
-        die "${service_name} entered ${readiness_state} before readiness"
+while :; do
+    snapshot=$(systemctl show omi-collector.service --property=ActiveState --property=MainPID \
+        --property=NRestarts --property=InvocationID --property=Job) || die 'could not observe service readiness'
+    active_state='' main_pid='' restart_count='' current_invocation='' job=''
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        key=${line%%=*}; value=${line#*=}
+        case "$key" in
+            ActiveState) active_state=$value ;;
+            MainPID) main_pid=$value ;;
+            NRestarts) restart_count=$value ;;
+            InvocationID) current_invocation=$value ;;
+            Job) job=$value ;;
+        esac
+    done <<< "$snapshot"
+    if [[ "$active_state" == activating || "$active_state" == active ]]; then
+        [[ "$restart_count" == 0 ]] || die 'service restarted before readiness'
     fi
-    [[ "$readiness_pid" =~ ^[1-9][0-9]*$ ]] \
-        || { readiness_observation_failed=1; die "${service_name} has no live main process while waiting for readiness"; }
-    if [[ "${readiness_pid}|${readiness_restarts}|${readiness_invocation}" != "$initial_snapshot" ]]; then
-        die "${service_name} changed invocation before readiness"
+    if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        if [[ -n "$observed_pid" && "$main_pid" != "$observed_pid" ]]; then
+            die 'service changed process before readiness'
+        fi
+        observed_pid=$main_pid
+        if [[ "$current_invocation" =~ ^[[:xdigit:]]{32}$ ]]; then
+            if [[ -n "$observed_invocation" && "$current_invocation" != "$observed_invocation" ]]; then
+                die 'service changed invocation before readiness'
+            fi
+            observed_invocation=$current_invocation
+        fi
     fi
-    journal_output=$(journalctl --unit "$service_name" "_SYSTEMD_INVOCATION_ID=${initial_invocation}" --output cat --no-pager) \
-        || { readiness_observation_failed=1; die "could not read ${service_name} journal for readiness"; }
-    if grep --fixed-strings --line-regexp -- "$expected_readiness" <<< "$journal_output" &> /dev/null; then
-        readiness_seen=1
+    if [[ "$active_state" == active ]]; then
+        [[ "$main_pid" =~ ^[1-9][0-9]*$ && "$restart_count" == 0 \
+            && "$current_invocation" =~ ^[[:xdigit:]]{32}$ \
+            && "$main_pid" == "$observed_pid" && "$current_invocation" == "$observed_invocation" ]] \
+            || die 'active service has an invalid process snapshot'
+        initial_snapshot="${main_pid}|${restart_count}|${current_invocation}"
         break
     fi
-    if grep --fixed-strings -- '"status":"deployment_ready"' <<< "$journal_output" &> /dev/null; then
-        die "${service_name} did not announce readiness for ${config_file}: readiness event config does not match"
+    if [[ "$active_state" == inactive || "$active_state" == failed ]]; then
+        [[ -n "$job" && "$job" != 0 && -z "$observed_pid" ]] \
+            || die "service became ${active_state} without a queued start job"
+    elif [[ "$active_state" != activating ]]; then
+        die "service entered ${active_state} before readiness"
     fi
     if (( SECONDS - readiness_started_at >= readiness_timeout_seconds )); then
-        die "${service_name} did not announce readiness within ${readiness_timeout_seconds} seconds"
+        if [[ -n "$observed_pid" && "$observed_invocation" =~ ^[[:xdigit:]]{32}$ ]] && candidate_is_live; then
+            readiness_pending=1
+            die 'service is still activating; deployment remains unverified and in progress'
+        fi
+        die 'service readiness timed out without a confirmed live invocation'
     fi
-    sleep "$readiness_poll_interval_seconds" || { readiness_observation_failed=1; die 'could not wait for application readiness'; }
+    sleep 1 || die 'readiness poll wait failed'
 done
-sleep "$stability_interval_seconds" || {
-    readiness_observation_failed=1
-    die 'could not wait for the deployment stability interval'
-}
-final_snapshot=$(read_service_snapshot "$service_name") || {
-    readiness_observation_failed=1
-    die "${service_name} did not remain active during the stability interval"
-}
-[[ "$final_snapshot" == "$initial_snapshot" ]] || die "${service_name} restarted during the stability interval"
-IFS='|' read -r final_pid final_restarts _ <<< "$final_snapshot"
-
-# The new release is verified; failures from this point must not roll it back.
+sleep "$stability_seconds" || die 'service stability wait failed'
+final_snapshot=$(service_snapshot) || die 'service did not remain active'
+[[ "$final_snapshot" == "$initial_snapshot" ]] || die 'service restarted during stability interval'
+IFS='|' read -r main_pid restart_count _ <<< "$final_snapshot"
 deployment_committed=1
-selection_published=0
-prune_obsolete_deployments "$deployments_dir" "$staged_environment"
-printf 'Deployed and verified %s: pid=%s restarts=%s config=%s.\n' \
-    "$service_name" "$final_pid" "$final_restarts" "$config_file"
+selector_published=0
+for candidate in "$releases_dir"/release-*; do
+    [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+    [[ "${candidate##*/}" =~ ^release-[0-9a-f]{40,64}-[0-9]+-[0-9]+$ ]] || continue
+    [[ "$candidate" == "$release_path" ]] || rm -rf -- "$candidate" || die "could not remove previous release: $candidate"
+done
+printf 'Deployed and verified omi-collector.service: pid=%s restarts=%s config=%s.\n' \
+    "$main_pid" "$restart_count" "$config_file"

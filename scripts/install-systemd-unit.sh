@@ -3,387 +3,141 @@
 set -uo pipefail
 
 function die {
-    local -r message="${1:-operation failed}"
-    local -ri exit_status="${2:-1}"
-
-    printf 'ERROR: %s\n' "$message"
-    exit "$exit_status"
-} 1>&2
-
-function usage {
-    printf 'Usage: %s [--restart]\n' "$(basename -- "$0")"
-    printf 'Install and enable omi-collector.service; restart only with --restart.\n'
+    printf 'ERROR: %s\n' "${1:-operation failed}" >&2
+    exit "${2:-1}"
 }
-
-function ensure_service_account {
-    # args
-    local -r account_user="$1" account_group="$2" state_dir="$3"
-
-    # vars
-    local primary_group
-
-    # code
-    # assert: the service state path is not a symlink
-    [[ ! -L "$state_dir" ]] || die "state directory must not be a symlink: ${state_dir}"
-    if ! getent group "$account_group" &> /dev/null; then
-        groupadd --system "$account_group" || die "could not create system group ${account_group}"
-    fi
-    if ! getent passwd "$account_user" &> /dev/null; then
-        useradd --system --gid "$account_group" --home-dir "$state_dir" --shell /usr/sbin/nologin --no-create-home \
-            "$account_user" || die "could not create system user ${account_user}"
-    fi
-    primary_group=$(id -gn "$account_user") || die "could not determine primary group for ${account_user}"
-    # assert: the existing account uses the dedicated group
-    [[ "$primary_group" == "$account_group" ]] \
-        || die "system user ${account_user} must have primary group ${account_group}"
-    install -d -o "$account_user" -g "$account_group" -m 0750 -- "$state_dir" \
-        || die "could not provision state directory ${state_dir}"
-    # assert: systemd and the deployer see the expected service-state ownership
-    [[ $(stat -c '%U:%G:%a' -- "$state_dir") == "${account_user}:${account_group}:750" && ! -L "$state_dir" ]] \
-        || die "state directory must be ${account_user}:${account_group} 0750: ${state_dir}"
-}
-
-function provision_operator_data_access {
-    # args
-    local -r storage_root="$1" account_user="$2" operator_group="$3"
-
-    # vars
-    local directory
-    local -a directories=(
-        "${storage_root}/collector"
-        "${storage_root}/collector/public"
-        "${storage_root}/ready"
-    )
-    local legacy_directory
-
-    # code
-    # assert: only the fixed Collector data roots may receive operator read access
-    [[ "$storage_root" == '/srv/pipelines/omi' ]] || die 'unexpected Collector storage root'
-    getent group "$operator_group" &> /dev/null || die "operator group is missing: ${operator_group}"
-    for legacy_directory in "${storage_root}/collector/attempts" "${storage_root}/collector/quarantine" "${storage_root}/draft"; do
-        if [[ -e "$legacy_directory" || -L "$legacy_directory" ]]; then
-            directories+=("$legacy_directory")
-        fi
-    done
-    for directory in "${directories[@]}"; do
-        # assert: reject every unsafe root before changing any of them
-        [[ ! -L "$directory" ]] || die "Collector data root must not be a symlink: ${directory}"
-    done
-    for directory in "${directories[@]}"; do
-        install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory" \
-            || die "could not provision Collector data root: ${directory}"
-        [[ $(stat -c '%U:%G:%a' -- "$directory") == "${account_user}:${operator_group}:2750" ]] \
-            || die "Collector data root has unexpected ownership or mode: ${directory}"
-    done
-}
-
-function validate_operator_config_file {
-    # args
-    local -r config_file="$1" account_group="$2"
-
-    # code
-    # assert: the one operator configuration is a regular local file
-    [[ -f "$config_file" && ! -L "$config_file" ]] \
-        || die "operator configuration is missing or unsafe: ${config_file}"
-    chown root:root -- "$config_file" \
-        || die "could not set operator configuration ownership: ${config_file}"
-    chmod 0644 -- "$config_file" \
-        || die "could not set operator configuration mode: ${config_file}"
-    # assert: both the system collector and user-owned pipeline can read it
-    [[ $(stat -c '%U:%G:%a' -- "$config_file") == "root:root:644" ]] \
-        || die "operator configuration must be root:root 0644: ${config_file}"
-}
-
-function provision_publication_checkpoint_traversal {
-    # args
-    local -r work_dir="$1" account_user="$2" account_group="$3"
-
-    # vars
-    local setfacl_bin runuser_bin
-
-    # code
-    # assert: only provision an existing Windmill directory; do not create or take ownership of its state
-    if [[ ! -e "$work_dir" && ! -L "$work_dir" ]]; then
-        return
-    fi
-    [[ -d "$work_dir" && ! -L "$work_dir" ]] \
-        || die "publication work path must be an existing real directory: ${work_dir}"
-    setfacl_bin=$(command -v setfacl || true)
-    [[ -n "$setfacl_bin" ]] || die 'setfacl is required to grant publication checkpoint traversal'
-    # assert: add execute-only access for the collector without widening the existing ACL mask
-    "$setfacl_bin" --no-mask --modify "u:${account_user}:--x" -- "$work_dir" \
-        || die "could not grant ${account_user} traversal of ${work_dir}"
-    runuser_bin=$(command -v runuser || true)
-    [[ -n "$runuser_bin" || -x /usr/sbin/runuser ]] || die 'runuser is required to verify publication traversal'
-    [[ -n "$runuser_bin" ]] || runuser_bin='/usr/sbin/runuser'
-    "$runuser_bin" --user "$account_user" --group "$account_group" -- test -x "$work_dir" \
-        || die "${account_user} cannot traverse publication work directory: ${work_dir}"
-}
-
-function stage_file {
-    # args
-    local -r source="$1" target="$2" mode="$3" output_name="$4"
-
-    # vars
-    local target_dir temporary metadata
-
-    # code
-    target_dir=$(dirname -- "$target") || die "could not resolve target directory for ${target}"
-    install -d -o root -g root -m 0755 -- "$target_dir" || die "could not create ${target_dir}"
-    temporary=$(mktemp --tmpdir="$target_dir" ".$(basename -- "$target").tmp.XXXXXX") \
-        || die "could not create temporary file beside ${target}"
-    printf -v "$output_name" '%s' "$temporary"
-    if ! install -o root -g root -m "$mode" -- "$source" "$temporary"; then
-        rm -f -- "$temporary" || true
-        printf -v "$output_name" '%s' ''
-        die "could not stage ${target}"
-    fi
-    metadata=$(stat -c '%u:%g:%a' -- "$temporary") || die "could not inspect staged file: ${temporary}"
-    # assert: staged system material is a root-owned regular file
-    [[ "$metadata" == "0:0:${mode#0}" && -f "$temporary" && ! -L "$temporary" ]] \
-        || die "staged file metadata is not root:root ${mode}: ${temporary}"
-}
-
-function backup_target {
-    # args
-    local -r target="$1" output_name="$2"
-
-    # vars
-    local target_dir backup
-
-    # code
-    if [[ ! -e "$target" && ! -L "$target" ]]; then
-        printf -v "$output_name" '%s' ''
-        return
-    fi
-    # assert: an existing installed unit is replaceable without following links
-    [[ -f "$target" && ! -L "$target" ]] || die "existing target is not a regular file: ${target}"
-    target_dir=$(dirname -- "$target") || die "could not resolve target directory for ${target}"
-    backup=$(mktemp --tmpdir="$target_dir" ".$(basename -- "$target").backup.XXXXXX") \
-        || die "could not create backup beside ${target}"
-    printf -v "$output_name" '%s' "$backup"
-    cp --preserve=mode,ownership,timestamps -- "$target" "$backup" || die "could not back up ${target}"
-}
-
-function restore_target {
-    # args
-    local -r target="$1" backup="$2"
-
-    # code
-    if [[ -n "$backup" ]]; then
-        mv -f -- "$backup" "$target" || die "could not restore ${target}"
-    else
-        rm -f -- "$target" || die "could not remove incomplete ${target}"
-    fi
-}
-
-function validate_staged_unit {
-    # args
-    local -r staged_unit="$1" service_name="$2"
-
-    # vars
-    local validation_root validation_unit validation_bluetooth
-
-    # code
-    validation_root=$(mktemp -d) || die 'could not create staged validation root'
-    validation_unit="${validation_root}/${service_name}"
-    validation_bluetooth="${validation_root}/bluetooth.service"
-    if ! sed -e 's|^ExecStartPre=.*|ExecStartPre=/usr/bin/true|' \
-        -e 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$staged_unit" > "$validation_unit"; then
-        rm -rf -- "$validation_root" || true
-        die 'could not prepare staged unit for validation'
-    fi
-    printf '[Service]\nExecStart=/usr/bin/true\n' > "$validation_bluetooth" \
-        || die 'could not prepare Bluetooth validation unit'
-    if ! chown root:root -- "$validation_unit" "$validation_bluetooth" \
-        || ! chmod 0644 -- "$validation_unit" "$validation_bluetooth"; then
-        rm -rf -- "$validation_root" || true
-        die 'could not protect staged validation unit'
-    fi
-    if ! systemd-analyze verify "$validation_bluetooth" "$validation_unit"; then
-        rm -rf -- "$validation_root" || true
-        die 'systemd unit validation failed'
-    fi
-    rm -rf -- "$validation_root" || die 'could not remove staged validation root'
-}
-
-declare script_dir repo_root source_unit source_bluetooth_ready source_status source_status_sudoers source_deploy_release source_deploy_release_sudoers
-declare config_file storage_root publication_work_dir unit_target bluetooth_ready_target status_target status_sudoers_target deploy_release_target deploy_release_sudoers_target service_name
-declare account_user account_group operator_group state_dir staged_status staged_status_sudoers staged_deploy_release staged_deploy_release_sudoers staged_unit staged_bluetooth_ready
-declare status_backup status_sudoers_backup deploy_release_backup deploy_release_sudoers_backup unit_backup bluetooth_ready_backup
-declare -i restart_requested=0
-
-script_dir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve installer directory'
-repo_root=$(builtin cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
-source_unit="${repo_root}/systemd/omi-collector.service"
-source_bluetooth_ready="${repo_root}/scripts/omi-collector-bluetooth-ready"
-source_status="${repo_root}/scripts/omi-collector-status"
-source_status_sudoers="${repo_root}/scripts/omi-collector-status.sudoers"
-source_deploy_release="${repo_root}/scripts/omi-collector-deploy-release"
-source_deploy_release_sudoers="${repo_root}/scripts/omi-collector-deploy-release.sudoers"
-config_file='/srv/pipelines/omi/config.toml'
-storage_root=$(dirname -- "$config_file") || die 'cannot resolve storage root'
-publication_work_dir="${storage_root}/work"
-unit_target='/etc/systemd/system/omi-collector.service'
-bluetooth_ready_target='/usr/local/sbin/omi-collector-bluetooth-ready'
-status_target='/usr/local/sbin/omi-collector-status'
-status_sudoers_target='/etc/sudoers.d/omi-collector-status'
-deploy_release_target='/usr/local/sbin/omi-collector-deploy-release'
-deploy_release_sudoers_target='/etc/sudoers.d/omi-collector-deploy-release'
-service_name='omi-collector.service'
-account_user='omi-collector'
-account_group='omi-collector'
-operator_group='j2h4u'
-state_dir='/var/lib/omi-collector'
-staged_status=''
-staged_status_sudoers=''
-staged_deploy_release=''
-staged_deploy_release_sudoers=''
-staged_unit=''
-staged_bluetooth_ready=''
-status_backup=''
-status_sudoers_backup=''
-deploy_release_backup=''
-deploy_release_sudoers_backup=''
-unit_backup=''
-bluetooth_ready_backup=''
 
 function cleanup {
-    if [[ -n "$staged_status" && ( -e "$staged_status" || -L "$staged_status" ) ]]; then
-        rm -f -- "$staged_status" || true
+    [[ -z "$staged_unit" || ! -e "$staged_unit" ]] || rm -f -- "$staged_unit"
+    [[ -z "$staged_policy" || ! -e "$staged_policy" ]] || rm -f -- "$staged_policy"
+    [[ -z "$validation_root" || ! -d "$validation_root" ]] || rm -rf -- "$validation_root"
+}
+
+function validate_runtime_directory {
+    local -r path="$1"
+    local owner_group_mode
+    if [[ -L "$path" ]]; then
+        die "Collector data path must not be a symlink: ${path}"
     fi
-    if [[ -n "$staged_status_sudoers" && ( -e "$staged_status_sudoers" || -L "$staged_status_sudoers" ) ]]; then
-        rm -f -- "$staged_status_sudoers" || true
-    fi
-    if [[ -n "$staged_deploy_release" && ( -e "$staged_deploy_release" || -L "$staged_deploy_release" ) ]]; then
-        rm -f -- "$staged_deploy_release" || true
-    fi
-    if [[ -n "$staged_deploy_release_sudoers" && ( -e "$staged_deploy_release_sudoers" || -L "$staged_deploy_release_sudoers" ) ]]; then
-        rm -f -- "$staged_deploy_release_sudoers" || true
-    fi
-    if [[ -n "$staged_unit" && ( -e "$staged_unit" || -L "$staged_unit" ) ]]; then
-        rm -f -- "$staged_unit" || true
-    fi
-    if [[ -n "$staged_bluetooth_ready" && ( -e "$staged_bluetooth_ready" || -L "$staged_bluetooth_ready" ) ]]; then
-        rm -f -- "$staged_bluetooth_ready" || true
-    fi
-    if [[ -n "$status_backup" && ( -e "$status_backup" || -L "$status_backup" ) ]]; then
-        rm -f -- "$status_backup" || true
-    fi
-    if [[ -n "$status_sudoers_backup" && ( -e "$status_sudoers_backup" || -L "$status_sudoers_backup" ) ]]; then
-        rm -f -- "$status_sudoers_backup" || true
-    fi
-    if [[ -n "$deploy_release_backup" && ( -e "$deploy_release_backup" || -L "$deploy_release_backup" ) ]]; then
-        rm -f -- "$deploy_release_backup" || true
-    fi
-    if [[ -n "$deploy_release_sudoers_backup" && ( -e "$deploy_release_sudoers_backup" || -L "$deploy_release_sudoers_backup" ) ]]; then
-        rm -f -- "$deploy_release_sudoers_backup" || true
-    fi
-    if [[ -n "$unit_backup" && ( -e "$unit_backup" || -L "$unit_backup" ) ]]; then
-        rm -f -- "$unit_backup" || true
-    fi
-    if [[ -n "$bluetooth_ready_backup" && ( -e "$bluetooth_ready_backup" || -L "$bluetooth_ready_backup" ) ]]; then
-        rm -f -- "$bluetooth_ready_backup" || true
+    if [[ -e "$path" ]]; then
+        [[ -d "$path" ]] || die "Collector data path is not a directory: ${path}"
+        owner_group_mode=$(stat -c '%u:%g:%a' -- "$path") || die "cannot inspect Collector data path: ${path}"
+        [[ "$owner_group_mode" == "${operator_uid}:${operator_gid}:2750" ]] \
+            || die "Collector data path must be owned by ${operator_user}:${operator_group} with mode 2750: ${path}"
     fi
 }
-trap cleanup EXIT
 
-while (( $# > 0 )); do
-    case "$1" in
-        --restart) restart_requested=1 ;;
-        --help|-h) usage; exit 0 ;;
-        *) die "unknown argument: $1" ;;
-    esac
-    shift
+declare script_dir='' repo_root='' source_unit='' source_helper='' target_unit='' target_helper=''
+declare target_policy='' staged_unit='' staged_policy='' validation_root=''
+declare operator_user='' operator_group='' operator_uid='' operator_gid='' operator_home=''
+declare source='' owner='' mode='' data_directory='' data_root='/srv/pipelines/omi' config_owner=''
+declare directory=''
+declare -i restart_requested=0
+
+if (( EUID != 0 )); then
+    printf 'Usage: sudo scripts/install-systemd-unit.sh [--restart]\n' >&2
+    die 'this one-time installer requires root'
+fi
+if [[ "${1:-}" == '--restart' && $# == 1 ]]; then
+    restart_requested=1
+elif (( $# != 0 )); then
+    die 'usage: install-systemd-unit.sh [--restart]' 2
+fi
+[[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]] || die 'run through sudo from the nonroot service owner'
+operator_user=$SUDO_USER
+passwd_record=$(getent passwd "$operator_user") || die 'could not resolve invoking user'
+IFS=: read -r _ _ operator_uid operator_gid _ operator_home _ <<< "$passwd_record"
+operator_group=$(getent group "$operator_gid" | cut -d: -f1) || die 'could not resolve invoking user primary group'
+[[ "$operator_uid" =~ ^[1-9][0-9]*$ && "$operator_home" =~ ^/[A-Za-z0-9._/-]+$ && -d "$operator_home" ]] \
+    || die 'invoking user must have a normal account and home directory'
+[[ "$operator_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ && "$operator_group" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] \
+    || die 'invoking user or primary group cannot be safely rendered into the systemd unit'
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die 'cannot resolve installer directory'
+repo_root=$(cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repository root'
+source_unit="${repo_root}/systemd/omi-collector.service"
+source_helper="${repo_root}/scripts/omi-collector-bluetooth-ready"
+target_unit='/etc/systemd/system/omi-collector.service'
+target_helper='/usr/local/sbin/omi-collector-bluetooth-ready'
+target_policy='/etc/sudoers.d/omi-collector-service-control'
+
+# assert: root only installs from the frozen root-owned source used for the one-time cutover
+for source in "${BASH_SOURCE[0]}" "$source_unit" "$source_helper"; do
+    [[ -f "$source" && ! -L "$source" ]] || die "trusted install source is missing or unsafe: ${source}"
+    read -r owner mode <<< "$(stat -c '%u %a' -- "$source")" || die "cannot inspect install source: ${source}"
+    if [[ "$owner" != 0 ]] || (( (8#$mode & 022) != 0 )); then
+        die "install source must be root-owned and not group/world writable: ${source}"
+    fi
+done
+directory="$repo_root"
+while [[ "$directory" != / ]]; do
+    read -r owner mode <<< "$(stat -c '%u %a' -- "$directory")" || die "cannot inspect source directory: ${directory}"
+    if [[ "$owner" != 0 ]] || (( (8#$mode & 022) != 0 )); then
+        die "frozen install source path must be root-owned and not group/world writable: ${directory}"
+    fi
+    directory=$(dirname -- "$directory") || die 'cannot inspect frozen source path'
 done
 
-# assert: installation has the authority and tools needed to change systemd
-(( EUID == 0 )) || die 'must run as root (use sudo)'
-[[ -f "$source_unit" ]] || die "checked-in systemd unit is missing: ${source_unit}"
-[[ -f "$source_bluetooth_ready" ]] || die "checked-in Bluetooth readiness helper is missing: ${source_bluetooth_ready}"
-command -v systemd-analyze &> /dev/null || die 'systemd-analyze is required'
-command -v systemctl &> /dev/null || die 'systemctl is required'
-[[ -x /usr/sbin/visudo ]] || die 'visudo is required'
+# The runtime root is operator-owned, without changing any foreign child tree.
+[[ -d "$data_root" && ! -L "$data_root" ]] || die 'Collector data root must be a real directory'
+chown "$operator_user:$operator_group" -- "$data_root" || die 'could not assign Collector data root to the operator'
+chmod 0755 -- "$data_root" || die 'could not set Collector data root mode'
+[[ -f /srv/pipelines/omi/config.toml && ! -L /srv/pipelines/omi/config.toml ]] \
+    || die 'operator configuration must be a regular non-symlink file'
+config_owner=$(stat -c '%u' -- /srv/pipelines/omi/config.toml) || die 'cannot inspect operator configuration owner'
+[[ "$config_owner" == "$operator_uid" ]] || die 'operator configuration must be owned by the service user'
 
-ensure_service_account "$account_user" "$account_group" "$state_dir"
-[[ -d "$storage_root" && ! -L "$storage_root" ]] \
-    || die "storage root is missing or unsafe: ${storage_root}"
-provision_operator_data_access "$storage_root" "$account_user" "$operator_group"
-provision_publication_checkpoint_traversal "$publication_work_dir" "$account_user" "$account_group"
-validate_operator_config_file "$config_file" "$account_group"
-/usr/sbin/visudo -cf "$source_status_sudoers" || die 'status sudo policy is invalid'
-/usr/sbin/visudo -cf "$source_deploy_release_sudoers" || die 'release deploy sudo policy is invalid'
-stage_file "$source_status" "$status_target" 0755 staged_status
-stage_file "$source_status_sudoers" "$status_sudoers_target" 0440 staged_status_sudoers
-stage_file "$source_deploy_release" "$deploy_release_target" 0755 staged_deploy_release
-stage_file "$source_deploy_release_sudoers" "$deploy_release_sudoers_target" 0440 staged_deploy_release_sudoers
-stage_file "$source_unit" "$unit_target" 0644 staged_unit
-stage_file "$source_bluetooth_ready" "$bluetooth_ready_target" 0755 staged_bluetooth_ready
-validate_staged_unit "$staged_unit" "$service_name"
-backup_target "$status_target" status_backup
-backup_target "$status_sudoers_target" status_sudoers_backup
-backup_target "$deploy_release_target" deploy_release_backup
-backup_target "$deploy_release_sudoers_target" deploy_release_sudoers_backup
-backup_target "$unit_target" unit_backup
-backup_target "$bluetooth_ready_target" bluetooth_ready_backup
+# Existing data dirs must already have the ownership needed by the rendered service identity.
+for data_directory in /srv/pipelines/omi/collector /srv/pipelines/omi/ready; do
+    validate_runtime_directory "$data_directory"
+done
 
-if ! mv -f -- "$staged_status" "$status_target" \
-    || ! mv -f -- "$staged_status_sudoers" "$status_sudoers_target" \
-    || ! mv -f -- "$staged_deploy_release" "$deploy_release_target" \
-    || ! mv -f -- "$staged_deploy_release_sudoers" "$deploy_release_sudoers_target" \
-    || ! mv -f -- "$staged_unit" "$unit_target" \
-    || ! mv -f -- "$staged_bluetooth_ready" "$bluetooth_ready_target"; then
-    restore_target "$status_target" "$status_backup"
-    restore_target "$status_sudoers_target" "$status_sudoers_backup"
-    restore_target "$deploy_release_target" "$deploy_release_backup"
-    restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
-    restore_target "$unit_target" "$unit_backup"
-    restore_target "$bluetooth_ready_target" "$bluetooth_ready_backup"
-    die 'could not install systemd and operator material'
-fi
-staged_status=''
-staged_status_sudoers=''
-staged_deploy_release=''
-staged_deploy_release_sudoers=''
-staged_unit=''
-staged_bluetooth_ready=''
-if ! systemctl daemon-reload; then
-    restore_target "$status_target" "$status_backup"
-    restore_target "$status_sudoers_target" "$status_sudoers_backup"
-    restore_target "$deploy_release_target" "$deploy_release_backup"
-    restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
-    restore_target "$unit_target" "$unit_backup"
-    restore_target "$bluetooth_ready_target" "$bluetooth_ready_backup"
-    systemctl daemon-reload || die 'daemon-reload failed while restoring the previous unit'
-    die 'systemd daemon-reload failed; restored previous systemd and operator material'
-fi
-if ! systemctl enable "$service_name"; then
-    restore_target "$status_target" "$status_backup"
-    restore_target "$status_sudoers_target" "$status_sudoers_backup"
-    restore_target "$deploy_release_target" "$deploy_release_backup"
-    restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"
-    restore_target "$unit_target" "$unit_backup"
-    restore_target "$bluetooth_ready_target" "$bluetooth_ready_backup"
-    systemctl daemon-reload || die 'daemon-reload failed while restoring the previous unit'
-    die "could not enable ${service_name}; restored previous systemd and operator material"
-fi
-rm -f -- "$status_backup" || die 'could not remove installed status-command rollback backup'
-status_backup=''
-rm -f -- "$status_sudoers_backup" || die 'could not remove installed status-policy rollback backup'
-status_sudoers_backup=''
-rm -f -- "$deploy_release_backup" || die 'could not remove installed release-deployer rollback backup'
-deploy_release_backup=''
-rm -f -- "$deploy_release_sudoers_backup" || die 'could not remove installed release-deployer policy rollback backup'
-deploy_release_sudoers_backup=''
-rm -f -- "$unit_backup" || die 'could not remove installed-unit rollback backup'
-unit_backup=''
-rm -f -- "$bluetooth_ready_backup" || die 'could not remove installed Bluetooth readiness rollback backup'
-bluetooth_ready_backup=''
+# Revoke old root entrypoints before this unit can point at an operator-owned environment.
+rm -f -- /usr/local/sbin/omi-collector-deploy-release /etc/sudoers.d/omi-collector-deploy-release \
+    /usr/local/sbin/omi-collector-status /etc/sudoers.d/omi-collector-status \
+    || die 'could not revoke obsolete privileged entrypoints'
 
-printf 'Installed and enabled %s.\n' "$service_name"
+trap cleanup EXIT
+install -d -o root -g root -m 0755 -- "$(dirname -- "$target_unit")" "$(dirname -- "$target_helper")" \
+    "$(dirname -- "$target_policy")" || die 'could not prepare system configuration directories'
+staged_unit=$(mktemp --tmpdir="$(dirname -- "$target_unit")" .omi-collector.service.XXXXXX) \
+    || die 'could not stage systemd unit'
+sed -e "s/@OMI_COLLECTOR_USER@/${operator_user}/g" \
+    -e "s/@OMI_COLLECTOR_GROUP@/${operator_group}/g" \
+    -e "s|@OMI_COLLECTOR_HOME@|${operator_home}|g" "$source_unit" > "$staged_unit" \
+    || die 'could not render systemd unit'
+chown root:root -- "$staged_unit" || die 'could not set staged unit ownership'
+chmod 0644 -- "$staged_unit" || die 'could not protect staged unit'
+validation_root=$(mktemp -d) || die 'could not stage systemd validation unit'
+sed -e 's|^ExecStartPre=.*|ExecStartPre=/usr/bin/true|' \
+    -e 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$staged_unit" > "${validation_root}/omi-collector.service" \
+    || die 'could not prepare systemd validation unit'
+printf '[Unit]\nDescription=Bluetooth validation dependency\n\n[Service]\nExecStart=/usr/bin/true\n' \
+    > "${validation_root}/bluetooth.service" || die 'could not prepare validation dependency'
+systemd-analyze verify "${validation_root}/bluetooth.service" "${validation_root}/omi-collector.service" \
+    || die 'systemd unit validation failed'
+
+staged_policy=$(mktemp --tmpdir="$(dirname -- "$target_policy")" .omi-collector-service-control.XXXXXX) \
+    || die 'could not stage service-control policy'
+printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start omi-collector.service, /usr/bin/systemctl start --no-block omi-collector.service, /usr/bin/systemctl stop omi-collector.service, /usr/bin/systemctl restart omi-collector.service, /usr/bin/systemctl restart --no-block omi-collector.service\n' \
+    "$operator_user" > "$staged_policy" || die 'could not write service-control policy'
+chown root:root -- "$staged_policy" || die 'could not set service-control policy ownership'
+chmod 0440 -- "$staged_policy" || die 'could not protect service-control policy'
+visudo --check --file "$staged_policy" || die 'service-control policy validation failed'
+for data_directory in /srv/pipelines/omi/collector /srv/pipelines/omi/ready; do
+    if [[ ! -e "$data_directory" ]]; then
+        install -d -o "$operator_user" -g "$operator_group" -m 2750 -- "$data_directory" \
+            || die "could not create Collector data directory: ${data_directory}"
+    fi
+done
+
+install -o root -g root -m 0755 -- "$source_helper" "$target_helper" || die 'could not install Bluetooth readiness helper'
+install -o root -g root -m 0644 -- "$staged_unit" "$target_unit" || die 'could not install systemd unit'
+install -o root -g root -m 0440 -- "$staged_policy" "$target_policy" || die 'could not install service-control policy'
+systemctl daemon-reload || die 'systemd daemon-reload failed'
+systemctl enable omi-collector.service || die 'could not enable omi-collector.service'
 if (( restart_requested )); then
-    systemctl restart "$service_name" || die "could not restart ${service_name}"
-    printf 'Restarted %s.\n' "$service_name"
-else
-    printf 'Systemd configuration installed; application deployment starts the service.\n'
+    systemctl restart --no-block omi-collector.service || die 'could not enqueue omi-collector.service restart'
+    printf 'Restart queued for omi-collector.service; verify service readiness with scripts/omi-collector-status.\n'
 fi
+printf 'Installed the system unit for %s.\n' "$operator_user"

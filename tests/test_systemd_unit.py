@@ -1,2041 +1,405 @@
 from __future__ import annotations
 
 import fcntl
-import getpass
 import grp
 import json
 import os
 import pwd
 import shlex
 import shutil
-import sqlite3
-import stat
 import subprocess
 import sys
-from contextlib import closing
-from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
-
 _ROOT = Path(__file__).parents[1]
 _UNIT = _ROOT / "systemd" / "omi-collector.service"
 _INSTALLER = _ROOT / "scripts" / "install-systemd-unit.sh"
-_BLUETOOTH_READY = _ROOT / "scripts" / "omi-collector-bluetooth-ready"
+_HELPER = _ROOT / "scripts" / "omi-collector-bluetooth-ready"
 _DEPLOYER = _ROOT / "scripts" / "deploy-systemd-service.sh"
-_SEALER = _ROOT / "scripts" / "seal_deployment_tree.py"
-_FALLBACK_LEDGER_CHECK = _ROOT / "scripts" / "check_fallback_ledger_compatibility.py"
-_DEV_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
-_STATUS_COMMAND = _ROOT / "scripts" / "omi-collector-status"
-_STATUS_SUDOERS = _ROOT / "scripts" / "omi-collector-status.sudoers"
-_RELEASE_COMMAND = _ROOT / "scripts" / "omi-collector-deploy-release"
-_RELEASE_SUDOERS = _ROOT / "scripts" / "omi-collector-deploy-release.sudoers"
-_FEATURE = _ROOT / "features" / "opportunistic_collection.feature"
+_RELEASE_DEPLOYER = _ROOT / "scripts" / "dev-deploy-release.sh"
+_STATUS = _ROOT / "scripts" / "omi-collector-status"
 _SOURCE_PACKAGE = _ROOT / "src" / "omi_collector"
 
 
-@dataclass(frozen=True, slots=True)
-class _DeploymentScenario:
-    initial_service_active: bool = True
-    readiness_config: str | None = None
-    readiness_missing: bool = False
-    config_check_failure: bool = False
-    crash_loop: bool = False
-    git_status: str = ""
-    metadata_symlink: bool = False
-    same_uid: bool = False
-    same_primary_gid: bool = False
-    service_group_membership: bool = False
-    busybox_tools: bool = False
-    root_sealed_python_without_interpreter: bool = False
-    versioned_python_alias: bool = False
-    service_work_traversable: bool = True
-    service_checkpoint_readable: bool = True
-    preflight_failure_at: int | None = None
-    online_busy: bool = False
-    stopped_busy: bool = False
-    init_creates_database: bool = False
-    init_failure: bool = False
-    operator_can_write_state: bool = False
-    recovery_required: bool = False
-    real_state_cli: bool = False
-    fallback_ledger_compatible: bool = True
-
-
-_DEFAULT_SCENARIO = _DeploymentScenario()
-
-
-@dataclass(frozen=True, slots=True)
-class _FakeCommandContext:
-    fake_bin: Path
-    log: Path
-    config_file: Path
-    source_package: Path
-    build_state: Path
-    uv_cache: Path
-    python_install: Path
-    deployment_root: Path
-    deployments_dir: Path
-    account_user: str
-    account_group: str
-    operator_group: str
-    build_user: str
-    build_group: str
-
-
-@dataclass(frozen=True, slots=True)
-class _DeploymentHarness:
-    deployer: Path
-    deployment_root: Path
-    current_link: Path
-    config_file: Path
-    log: Path
-    publication_work_dir: Path
-    environment: dict[str, str]
-
-
-def _git_index_mode(path: Path) -> str:
-    """Use Git's executable bit; checkout permissions also reflect the caller's umask."""
-    relative_path = path.relative_to(_ROOT)
-    result = subprocess.run(
-        ("git", "ls-files", "--stage", "--", str(relative_path)),
-        cwd=_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    records = result.stdout.splitlines()
-    assert len(records) == 1
-    mode, _object_id, stage_and_path = records[0].split(" ", 2)
-    assert stage_and_path == f"0\t{relative_path}"
-    return mode
-
-
-def _unit_sections() -> dict[str, dict[str, str]]:
-    sections: dict[str, dict[str, str]] = {}
-    section: dict[str, str] | None = None
-    for raw_line in _UNIT.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = {}
-            sections[line[1:-1]] = section
-            continue
-        assert section is not None, f"directive outside a section: {line}"
-        key, separator, value = line.partition("=")
-        assert separator, f"invalid unit directive: {line}"
-        section[key] = f"{section[key]}\n{value}" if key in section else value
-    return sections
-
-
-def test_production_unit_uses_one_config_and_the_selected_release() -> None:
-    service = _unit_sections()["Service"]
-
-    assert service["User"] == "omi-collector"
-    assert service["Group"] == "omi-collector"
-    assert service["Type"] == "exec"
-    assert service["TimeoutStopSec"] == "180s"
-    assert service["ExecStartPre"] == "+/usr/local/sbin/omi-collector-bluetooth-ready"
-    assert "EnvironmentFile" not in service
-    assert service["ExecStart"] == (
-        "/var/lib/omi-collector-deployments/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml"
-    )
-    assert service["RestartPreventExitStatus"] == "78"
-    assert service["ReadWritePaths"].split() == [
-        "/var/lib/omi-collector",
-        "/srv/pipelines/omi",
-    ]
-    assert service["Environment"] == (
-        "PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 XDG_STATE_HOME=/var/lib/omi-collector"
-    )
-    assert service["StateDirectory"] == "omi-collector"
-    assert service["AmbientCapabilities"] == "CAP_NET_RAW"
-    assert "WorkingDirectory" not in service
-    unit = _unit_sections()["Unit"]
-    assert unit["Requires"] == "bluetooth.service"
-
-
-def test_systemd_material_uses_only_the_fixed_unit_and_release_selector() -> None:
-    installer = _INSTALLER.read_text(encoding="utf-8")
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
+def test_unit_runs_as_rendered_owner_with_read_only_selected_code() -> None:
     unit = _UNIT.read_text(encoding="utf-8")
 
-    assert {path.name for path in (_ROOT / "systemd").iterdir()} == {_UNIT.name}
-    assert "EnvironmentFile" not in unit
-    assert 'source_bluetooth_ready="${repo_root}/scripts/omi-collector-bluetooth-ready"' in installer
-    assert "bluetooth_ready_target='/usr/local/sbin/omi-collector-bluetooth-ready'" in installer
-    assert "config_file='/srv/pipelines/omi/config.toml'" in installer
-    assert "config_file='/srv/pipelines/omi/config.toml'" in deployer
-    assert "current_link='/var/lib/omi-collector-deployments/current'" in deployer
-    assert 'config check --config "$config_file"' in deployer
-    assert "share/omi-collector" in deployer
-    assert '{"source_revision":"%s"}' in deployer
-    assert "build_user='omi-collector-build'" in deployer
-    assert "build_group='omi-collector-build'" in deployer
-    assert "uv_cache_dir='/var/lib/omi-collector-build/uv-cache'" in deployer
-    assert "python_install_dir='/var/lib/omi-collector-deployments/python'" in deployer
+    assert "User=@OMI_COLLECTOR_USER@" in unit
+    assert "Group=@OMI_COLLECTOR_GROUP@" in unit
+    assert "ExecStart=@OMI_COLLECTOR_HOME@/.local/share/omi-collector/current/bin/omi-collector" in unit
+    assert "ExecStartPre=+/" not in unit
+    assert "ExecStartPre=/usr/local/sbin/omi-collector-bluetooth-ready" in unit
+    assert "Requires=bluetooth.service" in unit and "After=bluetooth.service" in unit
+    assert "AmbientCapabilities=CAP_NET_RAW" in unit
+    assert "ProtectHome=read-only" in unit
+    assert ".local/share/omi-collector" not in unit.split("ReadWritePaths=", 1)[1]
+    assert "StateDirectory=" not in unit
+    assert "/var/lib/omi-collector" not in unit
 
 
-def test_deployer_runs_candidate_code_only_as_the_dedicated_build_identity() -> None:
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
-
-    assert "build_user='omi-collector-build'" in deployer
-    assert "account_user='omi-collector'" in deployer
-    assert '[[ "$build_user" != "$service_user" && "$build_group" != "$service_group" ]]' in deployer
-    assert 'build_uid=$(id -u "$build_user")' in deployer
-    assert 'service_uid=$(id -u "$service_user")' in deployer
-    assert 'supplementary_output=$(id -G "$build_user")' in deployer
-    assert '"$group_id" != "$service_gid"' in deployer
-    assert 'verify_installed_package "$runuser_bin" "$build_user"' in deployer
-    assert 'validate_candidate_config "$runuser_bin" "$build_user"' in deployer
-    assert '"$runuser_bin" --user "$build_user" --group "$build_group" -- env HOME="$build_home"' in deployer
-    python_command = deployer.index('"${environment}/bin/python" -I -B -c')
-    assert deployer.rfind('"$runuser_bin" --user "$build_user" --group "$build_group"', 0, python_command) >= 0
-    assert deployer.index('validate_candidate_config "$runuser_bin" "$build_user"') < deployer.index(
-        'seal_deployment_environment "$staged_environment"'
-    )
-
-
-def test_deployer_seals_candidate_paths_before_root_metadata_writes() -> None:
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
-
-    assert "seal_tree_with_descriptors" in deployer
-    assert "sealer_python='/usr/bin/python3'" in deployer
-    assert "'-I' '-B' '-S'" in deployer
-    assert "chown -hRP root:root" not in deployer
-    assert "find -P" not in deployer
-    assert '[[ ! -e "${environment}/share" && ! -L "${environment}/share" ]]' in deployer
-    assert deployer.index('seal_deployment_environment "$staged_environment"') < deployer.index(
-        'write_release_metadata "$staged_environment"'
-    )
-
-
-def test_deployer_persists_the_selected_tree_before_stopping_service() -> None:
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
-
-    assert deployer.index('write_release_metadata "$staged_environment"') < deployer.index(
-        'persist_sealed_tree "$python_install_dir"'
-    )
-    assert deployer.index('persist_sealed_tree "$python_install_dir"') < deployer.index(
-        'persist_sealed_tree "$staged_environment"'
-    )
-    assert deployer.index('persist_sealed_tree "$staged_environment"') < deployer.rindex(
-        'systemctl stop "$service_name"'
-    )
-
-
-def test_installer_keeps_the_unit_and_config_targets_fixed() -> None:
+def test_installer_revokes_old_root_entrypoints_before_installing_the_unit() -> None:
     installer = _INSTALLER.read_text(encoding="utf-8")
 
-    assert "unit_target='/etc/systemd/system/omi-collector.service'" in installer
-    assert "ensure_service_account" in installer
-    assert "groupadd --system" in installer
-    assert "useradd --system" in installer
-    assert 'chmod 0644 -- "$config_file"' in installer
-    assert 'stage_file "$source_unit" "$unit_target" 0644 staged_unit' in installer
-    assert 'stage_file "$source_bluetooth_ready" "$bluetooth_ready_target" 0755 staged_bluetooth_ready' in installer
-    assert "ExecStart=/usr/bin/true" in installer
-    assert "systemd-analyze verify" in installer
-    assert "rollback" in installer.lower()
-    assert "--root=" not in installer
-    assert "/usr/local/sbin/omi-collector-status" in installer
-    assert "/etc/sudoers.d/omi-collector-status" in installer
-    assert "/usr/sbin/visudo -cf" in installer
+    revoke = installer.index("rm -f -- /usr/local/sbin/omi-collector-deploy-release")
+    install = installer.index('install -o root -g root -m 0644 -- "$staged_unit" "$target_unit"')
+    assert revoke < install
+    assert "@OMI_COLLECTOR_HOME@" in installer
+    assert "systemctl start --no-block omi-collector.service" in installer
+    assert "systemctl stop omi-collector.service" in installer
+    assert "systemctl restart omi-collector.service" in installer
+    assert "useradd" not in installer and "groupadd" not in installer
+    assert 'chown root:root -- "$staged_unit"' in installer
 
 
-def test_installer_provisions_only_execute_access_to_existing_publication_work() -> None:
-    installer = _INSTALLER.read_text(encoding="utf-8")
+def test_status_and_release_helpers_are_unprivileged() -> None:
+    status = _STATUS.read_text(encoding="utf-8")
+    deploy = _RELEASE_DEPLOYER.read_text(encoding="utf-8")
 
-    assert 'publication_work_dir="${storage_root}/work"' in installer
-    assert "function provision_publication_checkpoint_traversal" in installer
-    assert '"$setfacl_bin" --no-mask --modify "u:${account_user}:--x" -- "$work_dir"' in installer
-    assert '"$runuser_bin" --user "$account_user" --group "$account_group" -- test -x "$work_dir"' in installer
-    assert 'if [[ ! -e "$work_dir" && ! -L "$work_dir" ]]; then' in installer
-    assert 'provision_publication_checkpoint_traversal "$publication_work_dir"' in installer
-    assert "--default" not in installer
-    assert 'install -d -- "$work_dir"' not in installer
-    assert 'chown -- "$work_dir"' not in installer
-
-
-def test_installer_and_deployer_provision_the_narrow_public_data_root() -> None:
-    installer = _INSTALLER.read_text(encoding="utf-8")
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
-
-    for script in (installer, deployer):
-        assert '"${storage_root}/collector/public"' in script
-        assert 'install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory"' in script
-        assert '[[ ! -L "$directory" ]] || die "Collector data root must not be a symlink:' in script
-        assert script.index('[[ ! -L "$directory" ]] || die "Collector data root') < script.index(
-            'install -d -o "$account_user" -g "$operator_group" -m 2750 -- "$directory"'
-        )
-    assert "local -a directories=(" in installer
-    assert "local -a directories=(" in deployer
+    assert "EUID != 0" in status and "sudo " not in status
+    assert "current/bin/omi-collector" in status
+    assert "EUID != 0" in deploy and "sudo " not in deploy
+    assert "worktree add --detach" in deploy
+    assert "worktree remove --force" in deploy
+    assert not (_ROOT / "scripts" / "omi-collector-deploy-release").exists()
+    assert not (_ROOT / "scripts" / "omi-collector-deploy-release.sudoers").exists()
+    assert not (_ROOT / "scripts" / "omi-collector-status.sudoers").exists()
+    assert not (_ROOT / "scripts" / "seal_deployment_tree.py").exists()
+    assert not (_ROOT / "tests" / "test_deployment_sealer.py").exists()
 
 
-def test_deployer_validates_publication_checkpoint_access_before_stopping_service() -> None:
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
-
-    assert "publication_work_dir='/srv/pipelines/omi/work'" in deployer
-    assert "function validate_publication_checkpoint_access" in deployer
-    assert 'test -x "$work_dir"' in deployer
-    assert 'test -r "$checkpoint_file"' in deployer
-    assert 'if [[ -L "$checkpoint_file" ]]; then' in deployer
-    assert "Windmill may not have published its first checkpoint yet." in deployer
+@pytest.mark.parametrize(
+    "script",
+    (_INSTALLER, _DEPLOYER, _RELEASE_DEPLOYER, _STATUS, _HELPER),
+)
+def test_shell_scripts_are_syntactically_valid(script: Path) -> None:
+    subprocess.run(("bash", "-n", str(script)), check=True)
 
 
-def test_installer_stages_root_owned_release_deploy_material_with_rollback() -> None:
-    installer = _INSTALLER.read_text(encoding="utf-8")
-
-    assert 'source_deploy_release="${repo_root}/scripts/omi-collector-deploy-release"' in installer
-    assert 'source_deploy_release_sudoers="${repo_root}/scripts/omi-collector-deploy-release.sudoers"' in installer
-    assert "deploy_release_target='/usr/local/sbin/omi-collector-deploy-release'" in installer
-    assert "deploy_release_sudoers_target='/etc/sudoers.d/omi-collector-deploy-release'" in installer
-    assert '/usr/sbin/visudo -cf "$source_deploy_release_sudoers"' in installer
-    assert 'stage_file "$source_deploy_release" "$deploy_release_target" 0755 staged_deploy_release' in installer
-    assert (
-        'stage_file "$source_deploy_release_sudoers" "$deploy_release_sudoers_target" 0440 '
-        "staged_deploy_release_sudoers"
-    ) in installer
-    assert 'backup_target "$deploy_release_target" deploy_release_backup' in installer
-    assert 'backup_target "$deploy_release_sudoers_target" deploy_release_sudoers_backup' in installer
-    assert 'restore_target "$deploy_release_target" "$deploy_release_backup"' in installer
-    assert 'restore_target "$deploy_release_sudoers_target" "$deploy_release_sudoers_backup"' in installer
-
-
-def test_release_deploy_wrapper_has_fixed_privileged_contract() -> None:
-    command = _RELEASE_COMMAND.read_text(encoding="utf-8")
-    policy = _RELEASE_SUDOERS.read_text(encoding="utf-8")
-
-    assert command.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
-    assert "declare -r deployer='/opt/omi-collector/scripts/dev-deploy-release.sh'" in command
-    assert "[[ $# -eq 1 ]]" in command
-    assert '[[ "$1" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]' in command
-    assert 'exec "$deployer" "$1"' in command
-    assert "stat -c '%U:%G:%a' \"$deployer\"" in command
-    assert "root:root:755" in command
-    assert policy == "%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-deploy-release\n"
-    assert _git_index_mode(_RELEASE_COMMAND) == "100755"
-    assert _git_index_mode(_RELEASE_SUDOERS) == "100644"
-
-
-def test_release_deploy_wrapper_rejects_invalid_arguments_without_delegating() -> None:
-    command = _RELEASE_COMMAND.read_text(encoding="utf-8")
-
-    assert "printf 'Usage: sudo -n omi-collector-deploy-release vMAJOR.MINOR.PATCH\\n'" in command
-    assert "printf 'ERROR: invalid release tag: %s\\n' \"$1\"" in command
-    assert "exit 2" in command
-    assert command.index("[[ $# -eq 1 ]]") < command.index('[[ "$1" =~')
-    assert command.index('[[ "$1" =~') < command.index('exec "$deployer" "$1"')
-    assert "clock-recover" not in command
-
-
-def test_operator_status_command_has_no_arguments_or_extra_privilege() -> None:
-    command = _STATUS_COMMAND.read_text(encoding="utf-8")
-    policy = _STATUS_SUDOERS.read_text(encoding="utf-8")
-
-    assert "(( $# != 0 ))" in command
-    assert "runuser --user omi-collector" in command
-    assert "device status --config /srv/pipelines/omi/config.toml --hours 24" in command.replace("\\\n", "")
-    assert policy.splitlines() == [
-        '%sudo ALL=(root) NOPASSWD: /usr/local/sbin/omi-collector-status ""',
-        "j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl start omi-collector.service",
-        "j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl stop omi-collector.service",
-        "j2h4u ALL=(root) NOPASSWD: /usr/bin/systemctl restart omi-collector.service",
-    ]
-
-
-def test_shell_scripts_are_syntactically_clean() -> None:
-    scripts = (_INSTALLER, _BLUETOOTH_READY, _DEPLOYER, _DEV_DEPLOYER, _STATUS_COMMAND, _RELEASE_COMMAND)
-
-    subprocess.run(("bash", "-n", *(str(script) for script in scripts)), check=True)
-    subprocess.run(("shellcheck", *(str(script) for script in scripts)), check=True)
-
-
-def test_checked_in_unit_passes_systemd_validation(tmp_path: Path) -> None:
-    validation_unit = tmp_path / "omi-collector.service"
-    bluetooth_unit = tmp_path / "bluetooth.service"
-    validation_unit.write_text(
-        _UNIT.read_text(encoding="utf-8")
-        .replace(
-            "ExecStart=/var/lib/omi-collector-deployments/current/bin/omi-collector "
-            "service --config /srv/pipelines/omi/config.toml",
-            "ExecStart=/usr/bin/true",
-        )
-        .replace("ExecStartPre=+/usr/local/sbin/omi-collector-bluetooth-ready", "ExecStartPre=/usr/bin/true"),
-        encoding="utf-8",
-    )
-    bluetooth_unit.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
-
-    subprocess.run(("systemd-analyze", "verify", str(bluetooth_unit), str(validation_unit)), check=True)
-
-
-def _bluetooth_ready_harness(tmp_path: Path, mode: str) -> tuple[Path, Path]:
-    fake_bluetoothctl = tmp_path / "bluetoothctl"
-    calls = tmp_path / "calls"
-    state = tmp_path / "powered"
-    fake_bluetoothctl.write_text(
+def test_bluetooth_ready_powers_controller_with_bounded_polling(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    bluetoothctl = fake_bin / "bluetoothctl"
+    bluetoothctl.write_text(
         "#!/usr/bin/env bash\n"
-        "set -uo pipefail\n"
-        f"calls={shlex.quote(str(calls))}\n"
-        f"state={shlex.quote(str(state))}\n"
-        f"mode={shlex.quote(mode)}\n"
-        'if [[ "$3" == power && "$4" == on ]]; then\n'
-        "    printf 'power on\\n' >> \"$calls\"\n"
-        '    if [[ "$mode" == false-success ]]; then exit 0; fi\n'
-        '    : > "$state"\n'
-        "    exit 0\n"
-        "fi\n"
-        'if [[ "$3" != show ]]; then exit 2; fi\n'
-        "printf 'show\\n' >> \"$calls\"\n"
-        'if [[ "$mode" == no-controller ]]; then\n'
-        "    printf 'No default controller available\\n'\n"
-        "    exit 0\n"
-        "fi\n"
-        'show_calls=$(wc -l < "$calls")\n'
-        'if [[ "$mode" == delayed && "$show_calls" -lt 2 ]]; then\n'
-        "    printf 'No default controller available\\n'\n"
-        "    exit 0\n"
-        "fi\n"
-        'if [[ -f "$state" ]]; then\n'
-        "    printf 'Controller 12:34:56:78:9A:BC (public)\\n\\tPowered: yes\\n'\n"
-        "else\n"
-        "    printf 'Controller 12:34:56:78:9A:BC (public)\\n\\tPowered: no\\n'\n"
-        "fi\n",
+        'if [[ "$*" == *" show" ]]; then printf "Controller AA:BB:CC:DD:EE:FF\n Powered: yes\n"; fi\n'
+        'printf "%s\\n" "$*" >> "$BLUETOOTH_LOG"\n',
         encoding="utf-8",
     )
-    fake_bluetoothctl.chmod(0o755)
+    bluetoothctl.chmod(0o755)
+    sleep = fake_bin / "sleep"
+    sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    sleep.chmod(0o755)
+    log = tmp_path / "bluetooth.log"
     helper = tmp_path / "omi-collector-bluetooth-ready"
     helper.write_text(
-        _BLUETOOTH_READY.read_text(encoding="utf-8")
-        .replace("bluetoothctl_bin='/usr/bin/bluetoothctl'", f"bluetoothctl_bin={shlex.quote(str(fake_bluetoothctl))}")
-        .replace("wait_seconds=30", "wait_seconds=8"),
-        encoding="utf-8",
+        _HELPER.read_text(encoding="utf-8").replace("/usr/bin/bluetoothctl", str(bluetoothctl)), encoding="utf-8"
     )
     helper.chmod(0o755)
-    return helper, calls
-
-
-def test_bluetooth_ready_waits_for_controller_and_verifies_power(tmp_path: Path) -> None:
-    helper, calls = _bluetooth_ready_harness(tmp_path, "delayed")
-
-    result = subprocess.run((str(helper),), check=False, capture_output=True, text=True, timeout=15)
-
+    result = subprocess.run(
+        (str(helper),),
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "BLUETOOTH_LOG": str(log)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert result.returncode == 0, result.stderr
-    assert calls.read_text(encoding="utf-8").splitlines().count("power on") == 1
+    assert "show" in log.read_text(encoding="utf-8")
+    assert "--timeout 10 power on" in log.read_text(encoding="utf-8")
 
 
-def test_bluetooth_ready_fails_without_controller(tmp_path: Path) -> None:
-    helper, calls = _bluetooth_ready_harness(tmp_path, "no-controller")
-
-    result = subprocess.run((str(helper),), check=False, capture_output=True, text=True, timeout=15)
-
-    assert result.returncode != 0
-    assert "Powered: yes" in result.stderr
-    assert "power on" not in calls.read_text(encoding="utf-8")
-
-
-def test_bluetooth_ready_rejects_false_success_from_power_command(tmp_path: Path) -> None:
-    helper, calls = _bluetooth_ready_harness(tmp_path, "false-success")
-
-    result = subprocess.run((str(helper),), check=False, capture_output=True, text=True, timeout=15)
-
-    assert result.returncode != 0
-    assert "Powered: yes" in result.stderr
-    assert calls.read_text(encoding="utf-8").splitlines().count("power on") == 1
-
-
-def test_dev_release_deployer_accepts_https_with_readonly_caller_variable() -> None:
-    function_prelude = _DEV_DEPLOYER.read_text(encoding="utf-8").split("declare -r PROJECT_DIR", maxsplit=1)[0]
-    command = "\n".join(
-        (
-            function_prelude,
-            "declare -r origin_url='https://github.com/j2h4u/omi-collector.git'",
-            'is_expected_origin "$origin_url"',
-        )
+def _fake_deployer(tmp_path: Path, *, stopped_refusal: bool = False, readiness_mismatch: bool = False, readiness_sequence: tuple[str, ...] = ("active:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",), hot_journal: bool = False, recovery_fail: bool = False) -> tuple[Path, dict[str, str]]:
+    if readiness_mismatch:
+        readiness_sequence = ("failed:0:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",)
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    source = repo / "src" / "omi_collector"
+    scripts.mkdir(parents=True)
+    source.parent.mkdir(parents=True)
+    shutil.copytree(_SOURCE_PACKAGE, source)
+    shutil.copy2(_DEPLOYER, scripts / _DEPLOYER.name)
+    shutil.copy2(_ROOT / "scripts" / "check_fallback_ledger_compatibility.py", scripts / "check_fallback_ledger_compatibility.py")
+    deployer = scripts / _DEPLOYER.name
+    content = deployer.read_text(encoding="utf-8").replace(
+        "(( EUID != 0 )) || die 'run as the service owner, without sudo'", "true"
     )
+    deployer.write_text(content, encoding="utf-8")
+    deployer.chmod(0o755)
 
-    subprocess.run(("bash", "-c", command), check=True)
-
-
-@pytest.mark.parametrize("entrypoint", (_RELEASE_COMMAND, _DEV_DEPLOYER))
-def test_release_deploy_entrypoints_reset_restrictive_umask(entrypoint: Path, tmp_path: Path) -> None:
-    source = entrypoint.read_text(encoding="utf-8")
-    prefix = (
-        source.split("function die", maxsplit=1)[0]
-        if entrypoint == _DEV_DEPLOYER
-        else source.split("(( EUID == 0 ))", maxsplit=1)[0]
-    )
-    target = tmp_path / "checkout-file"
-    command = "\n".join(("umask 0077", prefix, 'printf "public\\n" > "$1"', "stat -c '%a' -- \"$1\""))
-
-    result = subprocess.run(("bash", "-c", command, "bash", str(target)), check=True, capture_output=True, text=True)
-
-    assert result.stdout.strip() == "644"
-
-
-def test_feature_rules_do_not_contain_steps_outside_a_scenario() -> None:
-    step_context = "feature"
-    for raw_line in _FEATURE.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line.startswith("Background:"):
-            step_context = "background"
-        elif line.startswith("Rule:"):
-            step_context = "rule"
-        elif line.startswith("Scenario:"):
-            step_context = "scenario"
-        elif line.startswith(("Given ", "When ", "Then ", "And ", "But ")):
-            assert step_context in {"background", "scenario"}, f"step outside Scenario: {line}"
-
-
-def _write_build_fakes(
-    context: _FakeCommandContext,
-    scenario: _DeploymentScenario,
-) -> None:
-    fake_bin = context.fake_bin
-    config_file = context.config_file
-    quoted_log = shlex.quote(str(context.log))
-    quoted_source = shlex.quote(str(context.source_package))
-    quoted_user = shlex.quote(context.build_user)
-    quoted_service_user = shlex.quote(context.account_user)
-    quoted_service_group = shlex.quote(context.account_group)
-    quoted_operator_group = shlex.quote(context.operator_group)
-    alias_directory = "cpython-3.14-linux-x86_64-gnu"
-    versioned_directory = "cpython-3.14.6-linux-x86_64-gnu"
-    managed_python_directory = alias_directory if scenario.versioned_python_alias else "cpython-3.14"
-    installed_python_directory = versioned_directory if scenario.versioned_python_alias else managed_python_directory
-    alias_install = (
-        f'    ln --symbolic -- "$UV_PYTHON_INSTALL_DIR/{versioned_directory}" '
-        f'"$UV_PYTHON_INSTALL_DIR/{alias_directory}"\n'
-        if scenario.versioned_python_alias
-        else ""
-    )
-
-    (fake_bin / "uv").write_text(
-        "#!/usr/bin/env bash\n"
-        "set -uo pipefail\n"
-        f'printf "uv cwd=%s UV_NO_CONFIG=%s args=%s\\n" "$PWD" "${{UV_NO_CONFIG:-}}" "$*" >> {quoted_log}\n'
-        '[[ "$DEPLOY_BUILD_FAIL" != 1 ]] || exit 1\n'
-        'if [[ "$1" == python && "$2" == find ]]; then\n'
-        f'    [[ -x "$UV_PYTHON_INSTALL_DIR/{managed_python_directory}/bin/python" ]] || exit 1\n'
-        f'    printf "%s\\n" "$UV_PYTHON_INSTALL_DIR/{managed_python_directory}/bin/python"\n'
-        "    exit 0\n"
-        "fi\n"
-        'if [[ "$1" == python && "$2" == install ]]; then\n'
-        f'    mkdir --parents "$UV_PYTHON_INSTALL_DIR/{installed_python_directory}/bin"\n'
-        f'    : > "$UV_PYTHON_INSTALL_DIR/{installed_python_directory}/bin/python"\n'
-        f'    chmod 0755 "$UV_PYTHON_INSTALL_DIR/{installed_python_directory}/bin/python"\n'
-        f"{alias_install}"
-        "    exit 0\n"
-        "fi\n"
-        f'[[ -x "$UV_PYTHON_INSTALL_DIR/{managed_python_directory}/bin/python" ]] || exit 3\n'
-        'python3 -m venv --copies --clear "$UV_PROJECT_ENVIRONMENT"\n'
-        'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c '
-        "'import sysconfig; print(sysconfig.get_path(\"purelib\"))')\n"
-        f'cp -a {quoted_source} "$purelib/omi_collector"\n'
-        'entrypoint="$UV_PROJECT_ENVIRONMENT/bin/omi-collector"\n'
-        "printf '%s\\n' '#!/usr/bin/env bash' > \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'printf "candidate args=%s\\n" "$*" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'if [[ "${DEPLOY_REAL_STATE_CLI:-0}" == 1 && ( "$1" == check-state || "$1" == recover-state-journal || "$1" == init-state ) ]]; then\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    [[ "$1" != recover-state-journal ]] || printf "recovery selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    [[ "$1" != init-state ]] || printf "initialization selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    export DEPLOY_CANDIDATE_PREFIX="$(dirname -- "$(dirname -- "$0")")"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    PYTHONPATH="$DEPLOY_SOURCE_PACKAGE_PARENT" python3 -c "import os,sys; from pathlib import Path; sys.prefix=os.environ[\\"DEPLOY_CANDIDATE_PREFIX\\"]; from omi_collector import cli; cli.DEFAULT_CONFIG_PATH=Path(os.environ[\\"DEPLOY_CONFIG_FILE\\"]); cli._require_host_singleton=lambda _loaded: None; from omi_collector.cli import app; app()" "$@" 2>> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        "printf '%s\\n' '    exit $?' >> \"$entrypoint\"\n"
-        "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
-        "printf '%s\\n' 'if [[ \"$1\" == check-state ]]; then' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    printf "preflight args=%s\\n" "$*" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        "printf '%s\\n' '    call_file=\"${DEPLOY_PREFLIGHT_CALL_FILE}\"' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    calls=0; [[ ! -f "$call_file" ]] || calls=$(<"$call_file")\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    calls=$((calls + 1)); printf "%s\\n" "$calls" > "$call_file"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ ( "${DEPLOY_ONLINE_BUSY:-0}" == 1 && "$calls" == 1 ) || ( "${DEPLOY_STOPPED_BUSY:-0}" == 1 && "$calls" == 2 ) ]]; then printf "{\\"detail\\":\\"canonical audio database is busy\\",\\"fault\\":\\"transient\\",\\"reason\\":\\"inspection_failed\\",\\"status\\":\\"state_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ "${DEPLOY_PREFLIGHT_FAIL_AT:-0}" == "$calls" ]]; then printf "{\\"detail\\":\\"injected refusal\\",\\"reason\\":\\"state_validation_failed\\",\\"status\\":\\"state_refused\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ "${DEPLOY_RECOVERY_REQUIRED:-0}" == 1 && "$calls" == 2 ]]; then printf "{\\"reason\\":\\"canonical_hot_journal\\",\\"status\\":\\"recovery_required\\"}\\n"; exit 1; fi\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":null,\\"status\\":\\"state_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
-        "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
-        "printf '%s\\n' 'if [[ \"$1\" == recover-state-journal ]]; then' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\\"PRAGMA integrity_check\\").fetchone(); c.close()" "$DEPLOY_STATE_FILE"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":4,\\"status\\":\\"state_compatible\\"}\\n"; exit 0\' >> "$entrypoint"\n'
-        "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
-        "printf '%s\\n' 'if [[ \"$1\" == init-state ]]; then' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    printf "initialization selector=%s\\n" "$(readlink "$DEPLOY_CURRENT_LINK")" >> "$DEPLOY_LOG"\' >> "$entrypoint"\n'
-        'printf \'%s\\n\' \'    if [[ "${DEPLOY_INIT_CREATES_DATABASE:-0}" == 1 || "${DEPLOY_INIT_FAIL:-0}" != 1 ]]; then mkdir -p -- "${DEPLOY_STATE_FILE%/*}"; : > "$DEPLOY_STATE_FILE"; chmod 0640 "$DEPLOY_STATE_FILE"; fi\' >> "$entrypoint"\n'
-        "printf '%s\\n' '    if [[ \"${DEPLOY_INIT_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
-        'printf \'%s\\n\' \'    printf "{\\"schema_version\\":4}\\n"; exit 0\' >> "$entrypoint"\n'
-        "printf '%s\\n' 'fi' >> \"$entrypoint\"\n"
-        "printf '%s\\n' 'if [[ \"${DEPLOY_CONFIG_FAIL:-0}\" == 1 ]]; then exit 2; fi' >> \"$entrypoint\"\n"
-        f'printf \'%s\\n\' \'printf \'"\'"\'{{"config":"{config_file}","status":"config_valid"}}\\n\'"\'"\'\' >> "$entrypoint"\n'
-        'chmod 0755 "$entrypoint"\n'
-        'if [[ "${DEPLOY_METADATA_SYMLINK:-0}" == 1 ]]; then\n'
-        '    ln --symbolic -- "$DEPLOY_SENTINEL" "$UV_PROJECT_ENVIRONMENT/share"\n'
-        "fi\n",
-        encoding="utf-8",
-    )
-    (fake_bin / "uv").chmod(0o755)
-
-    (fake_bin / "git").write_text(
-        "#!/usr/bin/env bash\n"
-        '[[ "$1" == -C ]] || exit 2\n'
-        'case "$3" in\n'
-        "rev-parse) printf '%040d\\n' 0 ;;\n"
-        f"status) printf '%s' {shlex.quote(scenario.git_status)} ;;\n"
-        "*) exit 2 ;;\n"
-        "esac\n",
-        encoding="utf-8",
-    )
-    (fake_bin / "git").chmod(0o755)
-
-    (fake_bin / "runuser").write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "runuser args=%s\\n" "$*" >> {quoted_log}\n'
-        f'if [[ "$1" == --user && "$2" == {quoted_service_user} && "$3" == --group '
-        f'&& "$4" == {quoted_service_group} && "$5" == -- ]]; then\n'
-        "    shift 5\n"
-        f'    printf "runuser service args=%s\\n" "$*" >> {quoted_log}\n'
-        '    if [[ "$1" == test && "$2" == -x ]]; then\n'
-        '        [[ "${DEPLOY_SERVICE_WORK_TRAVERSABLE:-1}" == 1 ]] || exit 1\n'
-        "        exit 0\n"
-        "    fi\n"
-        '    if [[ "$1" == test && "$2" == -r ]]; then\n'
-        '        [[ "${DEPLOY_SERVICE_CHECKPOINT_READABLE:-1}" == 1 ]] || exit 1\n'
-        "        exit 0\n"
-        "    fi\n"
-        '    if [[ "$1" == test && "$2" == -w ]]; then exit 0; fi\n'
-        "    exit 2\n"
-        "fi\n"
-        f'if [[ "$1" == --user && "$2" == {quoted_operator_group} && "$3" == --group && "$4" == {quoted_operator_group} && "$5" == -- ]]; then\n'
-        "    shift 5\n"
-        f'    printf "runuser operator args=%s\\n" "$*" >> {quoted_log}\n'
-        '    [[ "$1" == test && ( "$2" == -r || "$2" == -w ) && "$3" == "$DEPLOY_STATE_FILE" ]] || exit 2\n'
-        '    [[ -f "$3" && "$(/usr/bin/stat -c %a -- "$3")" == 640 ]] || exit 1\n'
-        '    if [[ "$2" == -w ]]; then [[ "${DEPLOY_OPERATOR_CAN_WRITE_STATE:-0}" == 1 ]] && exit 0 || exit 1; fi\n'
-        "    exit 0\n"
-        "fi\n"
-        f'[[ "$1" == --user && "$2" == {quoted_user} && "$3" == --group && "$4" == {shlex.quote(context.build_group)} && "$5" == -- ]] || exit 2\n'
-        "shift 5\n"
-        'exec "$@"\n',
-        encoding="utf-8",
-    )
-    (fake_bin / "runuser").chmod(0o755)
-
-
-def _write_filesystem_fakes(context: _FakeCommandContext, scenario: _DeploymentScenario) -> None:
-    fake_bin = context.fake_bin
-    quoted_log = shlex.quote(str(context.log))
-    quoted_config = shlex.quote(str(context.config_file))
-    quoted_build_state = shlex.quote(str(context.build_state))
-    quoted_uv_cache = shlex.quote(str(context.uv_cache))
-    quoted_python_install = shlex.quote(str(context.python_install))
-    quoted_deployment_root = shlex.quote(str(context.deployment_root))
-    quoted_deployments_dir = shlex.quote(str(context.deployments_dir))
-
-    busybox_check = 'case "$*" in *--no-dereference*|*--recursive*) exit 64 ;; esac\n' if scenario.busybox_tools else ""
-    (fake_bin / "chown").write_text(
-        f'#!/usr/bin/env bash\n{busybox_check}printf "chown args=%s\\n" "$*" >> {quoted_log}\nexit 0\n',
-        encoding="utf-8",
-    )
-    (fake_bin / "chown").chmod(0o755)
-
-    if scenario.busybox_tools:
-        busybox = shutil.which("busybox")
-        assert busybox is not None
-        quoted_busybox = shlex.quote(busybox)
-        for tool_name in ("chmod", "find"):
-            (fake_bin / tool_name).write_text(
-                f'#!/usr/bin/env bash\nexec {quoted_busybox} {tool_name} "$@"\n',
-                encoding="utf-8",
-            )
-            (fake_bin / tool_name).chmod(0o755)
-
-    (fake_bin / "install").write_text(
-        "#!/usr/bin/env bash\n"
-        "set -uo pipefail\n"
-        "args=()\n"
-        "while (( $# > 0 )); do\n"
-        '    case "$1" in\n'
-        "        -o|-g) shift 2 ;;\n"
-        '        *) args+=("$1"); shift ;;\n'
-        "    esac\n"
-        "done\n"
-        'exec /usr/bin/install "${args[@]}"\n',
-        encoding="utf-8",
-    )
-    (fake_bin / "install").chmod(0o755)
-
-    managed_python_directory = "cpython-3.14-linux-x86_64-gnu" if scenario.versioned_python_alias else "cpython-3.14"
-    python_install_status = (
-        "root:root:755"
-        if scenario.root_sealed_python_without_interpreter
-        else f"$(if [[ -x {quoted_python_install}/{managed_python_directory}/bin/python ]]; then "
-        f"printf '%s' 'root:root:755'; else printf '%s' '{context.build_user}:{context.build_group}:755'; fi)"
-    )
-    (fake_bin / "stat").write_text(
-        "#!/usr/bin/env bash\n"
-        'path="${@: -1}"\n'
-        f'if [[ "$path" == "$DEPLOY_STATE_FILE" && -f "$path" ]]; then printf \'%s:%s:%s\\n\' {shlex.quote(context.account_user)} {shlex.quote(context.operator_group)} "$(/usr/bin/stat -c %a -- "$path")"; exit 0; fi\n'
-        f'if [[ ( "$path" == "${{DEPLOY_STATE_FILE%/*}}" || "$path" == "${{DEPLOY_STATE_FILE%/*}}/public" || "$path" == "${{DEPLOY_STATE_FILE%/collector/collector-state.sqlite3}}/ready" ) && -d "$path" ]]; then printf \'%s:%s:%s\\n\' {shlex.quote(context.account_user)} {shlex.quote(context.operator_group)} "$(/usr/bin/stat -c %a -- "$path")"; exit 0; fi\n'
-        f"if [[ \"$path\" == {quoted_config} ]]; then printf '%s\\n' 'root:root:644'; exit 0; fi\n"
-        f"if [[ \"$path\" == {quoted_build_state} ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
-        f"if [[ \"$path\" == {quoted_uv_cache} ]]; then printf '%s\\n' "
-        f"'{context.build_user}:{context.build_group}:750'; exit 0; fi\n"
-        f'if [[ "$path" == {quoted_python_install} ]]; then printf "%s\\n" "{python_install_status}"; exit 0; fi\n'
-        f'if [[ "$path" == {quoted_deployment_root} || "$path" == {quoted_deployments_dir} '
-        f'|| "$path" == {quoted_deployments_dir}/release-* '
-        "|| \"$path\" == */share/omi-collector ]]; then printf '%s\\n' 'root:root:755'; exit 0; fi\n"
-        'exec /usr/bin/stat "$@"\n',
-        encoding="utf-8",
-    )
-    (fake_bin / "stat").chmod(0o755)
-
-
-def _write_service_fakes(context: _FakeCommandContext, scenario: _DeploymentScenario) -> None:
-    fake_bin = context.fake_bin
-    quoted_log = shlex.quote(str(context.log))
-
-    initial_invocation = "a" * 32
-    restarted_invocation = "b" * 32
-    crash_clause = (
-        f"if (( count > 2 )); then pid=5252; restarts=1; invocation={restarted_invocation}; fi\n"
-        if scenario.crash_loop
-        else ""
-    )
-    (fake_bin / "systemctl").write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "systemctl args=%s\\n" "$*" >> {quoted_log}\n'
-        'case "$1" in\n'
-        'stop) rm -f -- "$DEPLOY_SERVICE_STARTED_FILE"; exit 0 ;;\n'
-        'start|restart) : > "$DEPLOY_SERVICE_STARTED_FILE"; exit 0 ;;\n'
-        "show)\n"
-        'if [[ "$#" == 3 && "$3" == "--property=ActiveState" ]]; then\n'
-        f"    printf 'ActiveState=%s\\n' '{'active' if scenario.initial_service_active else 'inactive'}'\n"
-        "    exit 0\n"
-        "fi\n"
-        f"count_file={shlex.quote(str(fake_bin / 'show-count'))}\n"
-        'count=0; [[ -f "$count_file" ]] && read -r count < "$count_file"\n'
-        '(( count++ )); printf "%s\\n" "$count" > "$count_file"\n'
-        f"pid=4242; restarts=0; invocation={initial_invocation}\n"
-        f"{crash_clause}"
-        f"active_state={'inactive' if scenario.real_state_cli else 'active'}\n"
-        'if [[ "${DEPLOY_REAL_STATE_CLI:-0}" == 1 && -f "$DEPLOY_SERVICE_STARTED_FILE" ]]; then active_state=active; fi\n'
-        'printf "ActiveState=%s\\nMainPID=%s\\nNRestarts=%s\\nInvocationID=%s\\n" '
-        '"$active_state" '
-        '"$pid" "$restarts" "$invocation"\n'
-        ";;\n"
-        "*) exit 2 ;;\n"
-        "esac\n",
-        encoding="utf-8",
-    )
-    (fake_bin / "systemctl").chmod(0o755)
-
-    readiness_config = scenario.readiness_config or str(context.config_file)
-    readiness_line = (
-        "collector started"
-        if scenario.readiness_missing
-        else f'{{"config":"{readiness_config}","status":"deployment_ready"}}'
-    )
-    (fake_bin / "journalctl").write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "journalctl args=%s\\n" "$*" >> {quoted_log}\n'
-        f"printf '%s\\n' {shlex.quote(readiness_line)}\n",
-        encoding="utf-8",
-    )
-    (fake_bin / "journalctl").chmod(0o755)
-    (fake_bin / "sleep").write_text(
-        f'#!/usr/bin/env bash\nprintf "sleep args=%s\\n" "$*" >> {quoted_log}\n',
-        encoding="utf-8",
-    )
-    (fake_bin / "sleep").chmod(0o755)
-
-
-def _write_fake_commands(context: _FakeCommandContext, scenario: _DeploymentScenario) -> None:
-    _write_build_fakes(context, scenario)
-    _write_filesystem_fakes(context, scenario)
-    _write_service_fakes(context, scenario)
-    _write_identity_fakes(context, scenario)
-
-
-def _write_identity_fakes(context: _FakeCommandContext, scenario: _DeploymentScenario) -> None:
-    fake_bin = context.fake_bin
-    quoted_build_user = shlex.quote(context.build_user)
-    quoted_build_group = shlex.quote(context.build_group)
-    quoted_service_user = shlex.quote(context.account_user)
-    quoted_operator_group = shlex.quote(context.operator_group)
-    build_uid = "1000" if scenario.same_uid else "1001"
-    build_gid = "2000" if scenario.same_primary_gid else "2001"
-    build_groups = f"{build_gid} 2000" if scenario.service_group_membership else build_gid
-    quoted_build_groups = shlex.quote(build_groups)
-
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    user = pwd.getpwuid(os.getuid())
+    primary_group = grp.getgrgid(user.pw_gid).gr_name
+    config = tmp_path / "config.toml"
+    config.write_text('pendant_address = "12:34:56:78:9A:BC"\nbundle_min_audio_seconds = 3600.0\n', encoding="utf-8")
+    active = tmp_path / "service.active"
+    active.touch()
+    log = tmp_path / "commands.log"
+    call_count = tmp_path / "state-checks"
     (fake_bin / "getent").write_text(
         "#!/usr/bin/env bash\n"
-        f'if [[ "$1" == group && "$2" == {quoted_operator_group} ]]; then printf \'%s:x:2002:\\n\' {quoted_operator_group}; exit 0; fi\n'
-        f'if [[ "$1" == group && "$2" == {quoted_build_group} ]]; then exit 0; fi\n'
-        f'if [[ "$1" == passwd && "$2" == {quoted_build_user} ]]; then exit 0; fi\n'
-        'exec /usr/bin/getent "$@"\n',
+        f"if [[ \"$1 $2\" == \"passwd {user.pw_name}\" ]]; then printf '%s\\n' "
+        f"{shlex.quote(f'{user.pw_name}:x:{user.pw_uid}:{user.pw_gid}:test:{home}:/bin/bash')}; exit 0; fi\n"
+        "exec /usr/bin/getent \"$@\"\n",
         encoding="utf-8",
     )
     (fake_bin / "getent").chmod(0o755)
-    (fake_bin / "id").write_text(
+    (fake_bin / "git").write_text(
+        "#!/usr/bin/env bash\ncase \"$3\" in rev-parse) printf '%040d\\n' 0 ;; status) [[ \"${FAKE_GIT_ERROR:-0}\" == 1 ]] && exit 3; [[ \"${FAKE_GIT_DIRTY:-0}\" == 1 ]] && printf ' M source.py\\n'; exit 0 ;; *) exit 2 ;; esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "git").chmod(0o755)
+    (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
-        f'if [[ "$1" == -gn && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {quoted_build_group}; exit 0; fi\n'
-        f'if [[ "$1" == -u && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {build_uid}; exit 0; fi\n'
-        f'if [[ "$1" == -g && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {build_gid}; exit 0; fi\n'
-        f'if [[ "$1" == -u && "$2" == {quoted_service_user} ]]; then printf \'%s\\n\' 1000; exit 0; fi\n'
-        f'if [[ "$1" == -g && "$2" == {quoted_service_user} ]]; then printf \'%s\\n\' 2000; exit 0; fi\n'
-        f'if [[ "$1" == -G && "$2" == {quoted_build_user} ]]; then printf \'%s\\n\' {quoted_build_groups}; exit 0; fi\n'
-        'exec /usr/bin/id "$@"\n',
+        f"{shlex.quote(sys.executable)} -m venv --copies \"$UV_PROJECT_ENVIRONMENT\"\n"
+        'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c \'import sysconfig; print(sysconfig.get_path("purelib"))\')\n'
+        f"cp -a {shlex.quote(str(source))} \"$purelib/omi_collector\"\n"
+        "cat > \"$UV_PROJECT_ENVIRONMENT/bin/omi-collector\" <<'CLI'\n"
+        "#!/usr/bin/env bash\n"
+        f"printf 'collector %s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        "case \"$1\" in\n"
+        "config) if [[ \"${FAKE_CONFIG_INVALID:-0}\" == 1 ]]; then printf '{\"config\":\"wrong\",\"status\":\"config_valid\"}\\n'; else printf '{\"config\":\"%s\",\"status\":\"config_valid\"}\\n' \"$4\"; fi ;;\n"
+        "check-state)\n"
+        f"  count=0; [[ ! -f {shlex.quote(str(call_count))} ]] || read -r count < {shlex.quote(str(call_count))}\n"
+        f"  count=$((count+1)); printf '%s\\n' \"$count\" > {shlex.quote(str(call_count))}\n"
+        f"  if [[ \"$*\" == *--stopped* && {int(stopped_refusal)} == 1 ]]; then printf '{{\"detail\":\"refused\",\"reason\":\"state_validation_failed\",\"status\":\"state_refused\"}}\\n'; exit 1; fi\n"
+        f"  printf 'hot=%s args=%s\\n' \"$FAKE_HOT_JOURNAL\" \"$*\" >> {shlex.quote(str(log))}\n"
+        f"  if [[ {int(hot_journal)} == 1 && ! -f {shlex.quote(str(call_count))}.recovered ]]; then printf '{{\"reason\":\"canonical_hot_journal\",\"status\":\"recovery_required\"}}\\n'; exit 1; fi\n"
+        "  printf '{\"schema_version\":4,\"status\":\"state_compatible\"}\\n' ;;\n"
+        f"recover-state-journal) printf 'collector recover-state-journal\\n' >> {shlex.quote(str(log))}; [[ {int(recovery_fail)} == 1 ]] && exit 1; touch {shlex.quote(str(call_count))}.recovered; printf '{{\"status\":\"recovered\"}}\\n' ;;\n"
+        "init-state) [[ \"${FAKE_INIT_FAIL:-0}\" == 1 ]] && exit 1; printf '{\"schema_version\":4}\\n' ;;\n"
+        "*) exit 2 ;;\n"
+        "esac\n"
+        "CLI\nchmod 0755 \"$UV_PROJECT_ENVIRONMENT/bin/omi-collector\"\n",
         encoding="utf-8",
     )
-    (fake_bin / "id").chmod(0o755)
-
-
-def _stage_harness_repository(tmp_path: Path) -> tuple[Path, Path, Path]:
-    staged_repo = tmp_path / "repo"
-    scripts_dir = staged_repo / "scripts"
-    systemd_dir = staged_repo / "systemd"
-    source_root = staged_repo / "src"
-    source_package = source_root / "omi_collector"
-    scripts_dir.mkdir(parents=True)
-    systemd_dir.mkdir()
-    source_root.mkdir()
-    shutil.copytree(_SOURCE_PACKAGE, source_package)
-    shutil.copy2(_SEALER, scripts_dir / _SEALER.name)
-    shutil.copy2(_FALLBACK_LEDGER_CHECK, scripts_dir / _FALLBACK_LEDGER_CHECK.name)
-    shutil.copy2(_UNIT, systemd_dir / _UNIT.name)
-    installed_unit = tmp_path / "installed" / "omi-collector.service"
-    installed_unit.parent.mkdir()
-    shutil.copy2(systemd_dir / _UNIT.name, installed_unit)
-    return scripts_dir, source_package, installed_unit
-
-
-def _fake_command_context(tmp_path: Path, source_package: Path) -> _FakeCommandContext:
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    log = tmp_path / "commands.log"
-    log.touch()
-    build_state = tmp_path / "build-state"
-    uv_cache = build_state / "uv-cache"
-    deployment_root = tmp_path / "deployments"
-    deployments_dir = deployment_root / "releases"
-    python_install = deployment_root / "python"
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        'pendant_address = "12:34:56:78:9A:BC"\nbundle_min_audio_seconds = 3600.0\n',
+    (fake_bin / "uv").chmod(0o755)
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'systemctl %s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        "case \"$1\" in\n"
+        f"show) if [[ \"$*\" != *MainPID* ]]; then [[ -e {shlex.quote(str(active))} ]] && printf 'ActiveState=active\\n' || printf 'ActiveState=inactive\\n'; exit 0; fi\n"
+        "  IFS=';' read -r -a states <<< \"$READINESS_SEQUENCE\"\n"
+        f"  index=0; [[ ! -f {shlex.quote(str(call_count))}.systemctl ]] || read -r index < {shlex.quote(str(call_count))}.systemctl\n"
+        f"  printf '%s\\n' $((index+1)) > {shlex.quote(str(call_count))}.systemctl\n"
+        "  (( index < ${#states[@]} )) || index=$((${#states[@]}-1)); IFS=: read -r active_state main_pid restarts invocation job <<< \"${states[index]}\"\n"
+        "  printf 'ActiveState=%s\\nMainPID=%s\\nNRestarts=%s\\nInvocationID=%s\\nJob=%s\\n' \"$active_state\" \"$main_pid\" \"$restarts\" \"$invocation\" \"$job\" ;;\n"
+        f"stop) rm -f {shlex.quote(str(active))} ;;\n"
+        f"start|restart) touch {shlex.quote(str(active))} ;;\n"
+        "*) exit 2 ;;\nesac\n",
         encoding="utf-8",
     )
-    config_file.chmod(0o644)
-    account_user = getpass.getuser()
-    account_group = grp.getgrgid(pwd.getpwnam(account_user).pw_gid).gr_name
-    operator_group = "omi-operator-test"
-    build_user = "omi-collector-build-test"
-    build_group = "omi-collector-build-test"
-    return _FakeCommandContext(
-        fake_bin,
-        log,
-        config_file,
-        source_package,
-        build_state,
-        uv_cache,
-        python_install,
-        deployment_root,
-        deployments_dir,
-        account_user,
-        account_group,
-        operator_group,
-        build_user,
-        build_group,
+    fake_systemctl.chmod(0o755)
+    (fake_bin / "sudo").write_text(
+        "#!/usr/bin/env bash\n[[ \"$1\" == -n ]] && shift\n"
+        f"if [[ \"$1\" == /usr/bin/systemctl ]]; then shift; exec {shlex.quote(str(fake_systemctl))} \"$@\"; fi\n"
+        "exec \"$@\"\n",
+        encoding="utf-8",
     )
-
-
-def _deployment_harness(tmp_path: Path, scenario: _DeploymentScenario = _DEFAULT_SCENARIO) -> _DeploymentHarness:
-    scripts_dir, source_package, installed_unit = _stage_harness_repository(tmp_path)
-    context = _fake_command_context(tmp_path, source_package)
-    if scenario.real_state_cli:
-        context = replace(context, config_file=tmp_path / "pipeline" / "omi" / "config.toml")
-        context.config_file.parent.mkdir(parents=True, exist_ok=True)
-        context.config_file.write_text(
-            'pendant_address = "12:34:56:78:9A:BC"\nbundle_min_audio_seconds = 3600.0\n',
-            encoding="utf-8",
-        )
-        context.config_file.chmod(0o644)
-    publication_work_dir = tmp_path / "pipeline" / "omi" / "work"
-    _write_fake_commands(
-        context,
-        scenario,
-    )
-
-    current_link = context.deployment_root / "current"
-    state_file = tmp_path / "pipeline" / "omi" / "collector" / "collector-state.sqlite3"
-    state_file.parent.parent.mkdir(parents=True, exist_ok=True)
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
-    replacements = (
-        ("/etc/systemd/system/omi-collector.service", str(installed_unit)),
-        ("/srv/pipelines/omi/config.toml", str(context.config_file)),
-        ("/srv/pipelines/omi/work", str(publication_work_dir)),
-        ("/srv/pipelines/omi/collector/collector-state.sqlite3", str(state_file)),
-        ("/usr/local/bin/uv", str(context.fake_bin / "uv")),
-        ("/var/lib/omi-collector-deployments/releases", str(context.deployments_dir)),
-        (
-            "/var/lib/omi-collector-deployments/.deployment.lock",
-            str(context.deployment_root / ".deployment.lock"),
-        ),
-        ("/var/lib/omi-collector-deployments/current", str(current_link)),
-        ("/var/lib/omi-collector-deployments", str(context.deployment_root)),
-        ("/var/lib/omi-collector-build/uv-cache", str(context.uv_cache)),
-        ("/var/lib/omi-collector-build", str(context.build_state)),
-        ("account_user='omi-collector'", f"account_user={shlex.quote(context.account_user)}"),
-        ("account_group='omi-collector'", f"account_group={shlex.quote(context.account_group)}"),
-        ("operator_group='j2h4u'", f"operator_group={shlex.quote(context.operator_group)}"),
-        ("build_user='omi-collector-build'", f"build_user={shlex.quote(context.build_user)}"),
-        ("build_group='omi-collector-build'", f"build_group={shlex.quote(context.build_group)}"),
-        ("sealer_owner='0:0'", f"sealer_owner='{os.getuid()}:{os.getgid()}'"),
-        ("(( EUID == 0 ))", "true"),
-    )
-    for production_value, harness_value in replacements:
-        assert production_value in deployer
-        deployer = deployer.replace(production_value, harness_value)
-    if scenario.readiness_missing:
-        assert "readiness_timeout_seconds=900" in deployer
-        deployer = deployer.replace("readiness_timeout_seconds=900", "readiness_timeout_seconds=0")
-    harness_deployer = scripts_dir / _DEPLOYER.name
-    harness_deployer.write_text(deployer, encoding="utf-8")
-    harness_deployer.chmod(0o755)
-
-    environment = {
+    (fake_bin / "sudo").chmod(0o755)
+    (fake_bin / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (fake_bin / "sleep").chmod(0o755)
+    env = {
         **os.environ,
-        "PATH": f"{context.fake_bin}{os.pathsep}{os.environ['PATH']}",
-        "DEPLOY_BUILD_FAIL": "0",
-        "DEPLOY_CONFIG_FAIL": "1" if scenario.config_check_failure else "0",
-        "DEPLOY_INIT_CREATES_DATABASE": "1" if scenario.init_creates_database else "0",
-        "DEPLOY_INIT_FAIL": "1" if scenario.init_failure else "0",
-        "DEPLOY_OPERATOR_CAN_WRITE_STATE": "1" if scenario.operator_can_write_state else "0",
-        "DEPLOY_PREFLIGHT_FAIL_AT": str(scenario.preflight_failure_at or 0),
-        "DEPLOY_ONLINE_BUSY": "1" if scenario.online_busy else "0",
-        "DEPLOY_STOPPED_BUSY": "1" if scenario.stopped_busy else "0",
-        "DEPLOY_RECOVERY_REQUIRED": "1" if scenario.recovery_required else "0",
-        "DEPLOY_REAL_STATE_CLI": "1" if scenario.real_state_cli else "0",
-        "DEPLOY_FALLBACK_COMPATIBLE": "1" if scenario.fallback_ledger_compatible else "0",
-        "DEPLOY_SOURCE_PACKAGE_PARENT": str(context.source_package.parent),
-        "DEPLOY_CANDIDATE_PREFIX": str(context.deployment_root / "candidate-prefix"),
-        "DEPLOY_CONFIG_FILE": str(context.config_file),
-        "DEPLOY_PREFLIGHT_CALL_FILE": str(tmp_path / "preflight.calls"),
-        "DEPLOY_STATE_FILE": str(state_file),
-        "DEPLOY_CURRENT_LINK": str(current_link),
-        "DEPLOY_SERVICE_STARTED_FILE": str(tmp_path / "service-started"),
-        "DEPLOY_LOG": str(context.log),
-        "DEPLOY_METADATA_SYMLINK": "1" if scenario.metadata_symlink else "0",
-        "DEPLOY_SERVICE_WORK_TRAVERSABLE": "1" if scenario.service_work_traversable else "0",
-        "DEPLOY_SERVICE_CHECKPOINT_READABLE": "1" if scenario.service_checkpoint_readable else "0",
-        "DEPLOY_SENTINEL": str(tmp_path / "metadata-sentinel"),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "TEST_HOME": str(home),
+        "TEST_CONFIG": str(config),
+        "FAKE_GIT_DIRTY": "0",
+        "FAKE_GIT_ERROR": "0",
+        "FAKE_CONFIG_INVALID": "0",
+        "FAKE_INIT_FAIL": "0",
+        "TEST_LOG": str(log),
+        "READINESS_SEQUENCE": ";".join(readiness_sequence),
     }
-    return _DeploymentHarness(
-        harness_deployer,
-        context.deployment_root,
-        current_link,
-        context.config_file,
-        context.log,
-        publication_work_dir,
-        environment,
-    )
+    return deployer, env
 
 
-def _previous_release(harness: _DeploymentHarness) -> Path:
-    release = harness.deployment_root / "releases" / ("release-" + "1" * 40 + "-1-1")
-    release.mkdir(parents=True)
-    fake_python = release / "bin" / "python"
+def _run_fake_deployer(deployer: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run((str(deployer),), env=env, cwd=deployer.parent.parent, text=True, capture_output=True, check=False)
+
+
+def test_deployer_builds_and_selects_candidate_then_removes_previous_release(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path)
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
+    previous = runtime / "releases" / ("release-" + "1" * 40 + "-1-1")
+    previous.mkdir(parents=True)
+    fake_python = previous / "bin/python"
     fake_python.parent.mkdir()
-    fake_python.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf 'fallback compatibility args=%s\\n' \"$*\" >> {shlex.quote(str(harness.log))}\n"
-        '[[ "${DEPLOY_FALLBACK_COMPATIBLE:-1}" == 1 ]]\n',
-        encoding="utf-8",
-    )
+    fake_python.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     fake_python.chmod(0o755)
-    harness.current_link.symlink_to(f"releases/{release.name}")
-    return release
+    (runtime / "current").symlink_to(f"releases/{previous.name}")
 
-
-def _canonical_state(harness: _DeploymentHarness, *, version: int) -> None:
-    path = Path(harness.environment["DEPLOY_STATE_FILE"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if version == 4:
-        StateDB(path).put(StateKind.RUNTIME_STATUS, "current", {"last_error": "original"})
-        return
-    with closing(sqlite3.connect(path)) as connection:
-        connection.execute(
-            "CREATE TABLE state(kind TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(kind,id))"
-        )
-        connection.execute(f"PRAGMA user_version={version}")
-        connection.commit()
-
-
-def _make_true_hot_journal(path: Path) -> None:
-    with closing(sqlite3.connect(path)) as connection:
-        connection.execute(
-            "INSERT OR REPLACE INTO state VALUES ('runtime_status','current',?)", ('{"last_error":"original"}',)
-        )
-        connection.executemany(
-            "INSERT INTO state VALUES ('padding',?,?)",
-            ((str(index), "x" * 1000) for index in range(1000)),
-        )
-        connection.commit()
-    subprocess.run(
-        (
-            sys.executable,
-            "-c",
-            (
-                "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1],isolation_level=None); "
-                "c.execute('PRAGMA cache_size=1'); c.execute('BEGIN IMMEDIATE'); c.execute(\"UPDATE state SET payload='transient'\"); os._exit(0)"
-            ),
-            str(path),
-        ),
-        check=True,
-    )
-    assert path.with_name(path.name + "-journal").is_file()
-
-
-def _run_deployer(harness: _DeploymentHarness, caller_cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [harness.deployer],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=harness.environment,
-        cwd=caller_cwd,
-    )
-
-
-def test_deployer_builds_validates_selects_and_seals_one_release(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    obsolete = harness.deployment_root / "releases" / ("release-" + "2" * 40 + "-1-1")
-    obsolete.mkdir(parents=True)
-    unrelated = harness.deployment_root / "releases" / "keep-me"
-    unrelated.mkdir()
-
-    result = _run_deployer(harness)
+    result = _run_fake_deployer(deployer, env)
 
     assert result.returncode == 0, result.stderr
-    assert harness.current_link.is_symlink()
-    selected = harness.current_link.resolve(strict=True)
-    assert selected.name.startswith("release-" + "0" * 40)
-    release_metadata = selected / "share" / "omi-collector" / "release.json"
-    assert release_metadata.read_bytes() == b'{"source_revision":"0000000000000000000000000000000000000000"}\n'
-    assert json.loads(release_metadata.read_text(encoding="utf-8")) == {"source_revision": "0" * 40}
-    assert not obsolete.exists()
-    assert unrelated.is_dir()
-    assert tuple(path for path in (harness.deployment_root / "releases").glob("release-*")) == (selected,)
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "uv cwd=" in commands
-    assert "args=sync --project" in commands
-    assert "config check --config" in commands
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    lock = state_file.parent / "collector.lock"
-    assert [line for line in commands.splitlines() if line.startswith("runuser service args=")] == [
-        f"runuser service args=test -w {lock}",
-        f"runuser service args=test -r {state_file}",
-        f"runuser service args=test -w {state_file}",
-        f"runuser service args=test -w {state_file.parent}",
-    ]
-    assert "systemctl args=stop omi-collector.service" in commands
-    assert "systemctl args=restart omi-collector.service" in commands
-    preflights = [line for line in commands.splitlines() if line.startswith("preflight args=")]
-    assert preflights == [
-        f"preflight args=check-state --config {harness.config_file}",
-        f"preflight args=check-state --config {harness.config_file} --stopped",
-    ]
-    assert commands.index(preflights[0]) < commands.index("systemctl args=stop omi-collector.service")
-    assert commands.index("systemctl args=stop omi-collector.service") < commands.index(preflights[1])
-    assert commands.index(preflights[1]) < commands.index("candidate args=init-state")
-    assert f"config={harness.config_file}" in result.stdout
+    selected = (runtime / "current").resolve(strict=True)
+    assert selected.parent == runtime / "releases"
+    assert not previous.exists()
+    metadata = json.loads((selected / "share/omi-collector/release.json").read_text(encoding="utf-8"))
+    assert metadata == {"source_revision": "0" * 40}
+    commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8")
+    assert commands.index("systemctl stop") < commands.index("--stopped") if "--stopped" in commands else True
+    assert "UV_LINK_MODE=hardlink" in deployer.read_text(encoding="utf-8")
+    assert commands.index("systemctl restart --no-block") < commands.index("systemctl show omi-collector.service --property=ActiveState --property=MainPID")
 
 
-def test_deployer_preflight_refusal_keeps_previous_service_and_selector_untouched(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=1))
-    previous = _previous_release(harness)
+def test_deployer_restores_compatible_previous_release_on_stopped_state_refusal(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path, stopped_refusal=True)
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
+    previous = runtime / "releases" / ("release-" + "1" * 40 + "-1-1")
+    (previous / "bin").mkdir(parents=True)
+    python = previous / "bin/python"
+    python.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    python.chmod(0o755)
+    (runtime / "current").symlink_to(f"releases/{previous.name}")
 
-    result = _run_deployer(harness)
+    result = _run_fake_deployer(deployer, env)
 
     assert result.returncode != 0
-    assert "candidate refused the Collector state check" in result.stderr
-    assert (
-        "Collector state check response (exit 1): "
-        '{"detail":"injected refusal","reason":"state_validation_failed","status":"state_refused"}'
-    ) in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("preflight args=") == 1
-    assert "systemctl args=stop omi-collector.service" not in commands
-    assert "systemctl args=start omi-collector.service" not in commands
-    assert "systemctl args=restart omi-collector.service" not in commands
+    assert (runtime / "current").resolve(strict=True) == previous
+    assert Path(tmp_path / "service.active").exists()
+    assert "systemctl start --no-block omi-collector.service" in Path(env["TEST_LOG"]).read_text(encoding="utf-8")
 
 
-def test_deployer_defers_exact_online_busy_until_stopped_check(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(online_busy=True))
-    _previous_release(harness)
+def test_deployer_leaves_unverified_selected_release_stopped(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path, readiness_mismatch=True)
 
-    result = _run_deployer(harness)
+    result = _run_fake_deployer(deployer, env)
 
-    assert result.returncode == 0, result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    stopped_check = f"preflight args=check-state --config {harness.config_file} --stopped"
-    assert commands.index("systemctl args=stop omi-collector.service") < commands.index(stopped_check)
-    assert commands.index(stopped_check) < commands.index("candidate args=init-state")
-    assert "systemctl args=restart omi-collector.service" in commands
-
-
-def test_deployer_stopped_refusal_after_online_busy_restores_old_service(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(online_busy=True, preflight_failure_at=2))
-    previous = _previous_release(harness)
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    _canonical_state(harness, version=4)
-    before = state_file.read_bytes()
-
-    result = _run_deployer(harness)
-
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
     assert result.returncode != 0
-    assert "candidate refused the Collector state check" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert state_file.read_bytes() == before
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=stop omi-collector.service") == 1
-    assert commands.count("systemctl args=start omi-collector.service") == 1
-    assert "candidate args=init-state" not in commands
-
-
-def test_deployer_stopped_busy_after_online_busy_restores_old_service(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(online_busy=True, stopped_busy=True))
-    previous = _previous_release(harness)
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    _canonical_state(harness, version=4)
-    before = state_file.read_bytes()
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert '"detail":"canonical audio database is busy"' in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert state_file.read_bytes() == before
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=stop omi-collector.service") == 1
-    assert commands.count("systemctl args=start omi-collector.service") == 1
-    assert "candidate args=init-state" not in commands
-
-
-def test_deployer_stopped_preflight_refusal_keeps_old_release_and_state(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=2))
-    previous = _previous_release(harness)
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    _canonical_state(harness, version=4)
-    before = state_file.read_bytes()
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "candidate refused the Collector state check" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert state_file.read_bytes() == before
-    commands = harness.log.read_text(encoding="utf-8")
-    preflights = [line for line in commands.splitlines() if line.startswith("preflight args=")]
-    assert preflights == [
-        f"preflight args=check-state --config {harness.config_file}",
-        f"preflight args=check-state --config {harness.config_file} --stopped",
-    ]
-    assert commands.count("systemctl args=stop omi-collector.service") == 1
-    assert commands.count("systemctl args=start omi-collector.service") == 1
-    assert "systemctl args=restart omi-collector.service" not in commands
-    assert "candidate args=init-state" not in commands
-
-
-def test_deployer_refuses_v1_state_before_stopping_or_changing_it(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
-    previous = _previous_release(harness)
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    _canonical_state(harness, version=1)
-    before = state_file.read_bytes()
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "candidate refused the Collector state check" in result.stderr
-    assert "Collector v1 state is unsupported" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert state_file.read_bytes() == before
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("candidate args=check-state") == 1
-    assert "systemctl args=stop omi-collector.service" not in commands
-    assert "candidate args=init-state" not in commands
-
-
-def test_deployer_checks_existing_publication_checkpoint_as_service_before_stop(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    harness.publication_work_dir.mkdir(parents=True)
-    checkpoint = harness.publication_work_dir / "omi-ready-checkpoint.json"
-    checkpoint.write_text("{}\n", encoding="utf-8")
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    service_checks = [line for line in commands.splitlines() if line.startswith("runuser service args=")]
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    lock = state_file.parent / "collector.lock"
-    assert service_checks == [
-        f"runuser service args=test -x {harness.publication_work_dir}",
-        f"runuser service args=test -r {checkpoint}",
-        f"runuser service args=test -w {lock}",
-        f"runuser service args=test -r {state_file}",
-        f"runuser service args=test -w {state_file}",
-        f"runuser service args=test -w {state_file.parent}",
-    ]
-    stop = commands.index("systemctl args=stop omi-collector.service")
-    assert all(commands.index(check) < stop for check in service_checks[:2])
-    assert stop < commands.index(service_checks[2])
-
-
-def test_deployer_allows_existing_work_without_first_checkpoint(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    harness.publication_work_dir.mkdir(parents=True)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    service_checks = [
-        line
-        for line in harness.log.read_text(encoding="utf-8").splitlines()
-        if line.startswith("runuser service args=")
-    ]
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    lock = state_file.parent / "collector.lock"
-    assert service_checks == [
-        f"runuser service args=test -x {harness.publication_work_dir}",
-        f"runuser service args=test -w {lock}",
-        f"runuser service args=test -r {state_file}",
-        f"runuser service args=test -w {state_file}",
-        f"runuser service args=test -w {state_file.parent}",
-    ]
-
-
-@pytest.mark.parametrize(
-    ("scenario", "error_message"),
-    [
-        (_DeploymentScenario(service_work_traversable=False), "cannot traverse publication work directory"),
-        (_DeploymentScenario(service_checkpoint_readable=False), "cannot read publication checkpoint"),
-    ],
-)
-def test_deployer_rejects_unreadable_publication_inputs_before_stopping_service(
-    tmp_path: Path, scenario: _DeploymentScenario, error_message: str
-) -> None:
-    harness = _deployment_harness(tmp_path, scenario)
-    harness.publication_work_dir.mkdir(parents=True)
-    (harness.publication_work_dir / "omi-ready-checkpoint.json").write_text("{}\n", encoding="utf-8")
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert error_message in result.stderr
-    assert "systemctl args=stop omi-collector.service" not in harness.log.read_text(encoding="utf-8")
-
-
-def test_deployer_rejects_symlinked_publication_checkpoint(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    harness.publication_work_dir.mkdir(parents=True)
-    checkpoint = harness.publication_work_dir / "omi-ready-checkpoint.json"
-    checkpoint_target = tmp_path / "checkpoint-target"
-    checkpoint_target.write_text("{}\n", encoding="utf-8")
-    checkpoint.symlink_to(checkpoint_target)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "publication checkpoint must not be a symlink" in result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    assert f"runuser service args=test -x {harness.publication_work_dir}" in commands
-    assert "runuser service args=test -r" not in commands
-    assert "systemctl args=stop omi-collector.service" not in commands
-
-
-def test_deployer_verifies_candidate_as_builder_before_root_seals_or_restarts(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    builder_runs = [
-        line for line in commands.splitlines() if line.startswith("runuser args=--user omi-collector-build-test ")
-    ]
-    assert len(builder_runs) == 6
-    assert all("--user omi-collector-build-test --group omi-collector-build-test --" in line for line in builder_runs)
-    assert "python find --managed-python --no-python-downloads --no-project 3.14" in builder_runs[0]
-    assert "python install 3.14" in builder_runs[1]
-    assert "python find --managed-python --no-python-downloads --no-project 3.14" in builder_runs[2]
-    assert "sync --project" in builder_runs[3]
-    assert "--managed-python --no-python-downloads" in builder_runs[3]
-    assert "/bin/python -I -B -c" in builder_runs[4]
-    assert "config check --config" in builder_runs[5]
-    config_check = commands.index("config check --config")
-    restart = commands.index("systemctl args=stop omi-collector.service")
-    assert config_check < restart
-    deployer = harness.deployer.read_text(encoding="utf-8")
-    assert deployer.index('validate_candidate_config "$runuser_bin" "$build_user"') < deployer.index(
-        'seal_deployment_environment "$staged_environment"'
-    )
-
-
-def test_deployer_build_user_isolates_uv_config_from_caller_and_checkout(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    caller_cwd = tmp_path / "caller"
-    caller_cwd.mkdir()
-
-    result = _run_deployer(harness, caller_cwd)
-
-    assert result.returncode == 0, result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    expected_cwd = harness.deployer.parents[1]
-    uv_runs = [line for line in commands.splitlines() if line.startswith("uv cwd=")]
-    assert len(uv_runs) == 4
-    assert all("UV_NO_CONFIG=1" in line for line in uv_runs)
-    assert all(f"uv cwd={expected_cwd} " in line for line in uv_runs)
-    assert all(f"uv cwd={caller_cwd} " not in line for line in uv_runs)
-    assert "args=python find --managed-python --no-python-downloads --no-project 3.14" in uv_runs[0]
-    assert "args=python install 3.14" in uv_runs[1]
-    assert "args=python find --managed-python --no-python-downloads --no-project 3.14" in uv_runs[2]
-    assert "args=sync --project" in uv_runs[3]
-    assert "--managed-python --no-python-downloads" in uv_runs[3]
-
-
-def test_deployer_bootstraps_a_preexisting_empty_managed_python_directory(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    python_install = harness.deployment_root / "python"
-    python_install.mkdir(parents=True)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    assert (python_install / "cpython-3.14" / "bin" / "python").is_file()
-    uv_runs = [line for line in harness.log.read_text(encoding="utf-8").splitlines() if line.startswith("uv cwd=")]
-    install = next(index for index, line in enumerate(uv_runs) if "args=python install 3.14" in line)
-    sync = next(index for index, line in enumerate(uv_runs) if "args=sync --project" in line)
-    assert install < sync
-
-
-def test_deployer_seals_managed_python_with_an_absolute_uv_alias(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(versioned_python_alias=True))
-
-    result = _run_deployer(harness)
-
-    python_install = harness.deployment_root / "python"
-    versioned = python_install / "cpython-3.14.6-linux-x86_64-gnu"
-    alias = python_install / "cpython-3.14-linux-x86_64-gnu"
-    assert result.returncode == 0, result.stderr
-    assert alias.is_symlink()
-    assert alias.readlink() == versioned
-    assert (alias / "bin" / "python").is_file()
-
-
-def test_deployer_fails_closed_for_an_empty_root_sealed_managed_python_directory(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(root_sealed_python_without_interpreter=True))
-    previous = _previous_release(harness)
-    (harness.deployment_root / "python").mkdir(exist_ok=True)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "absent from root-sealed installation" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "python install 3.14" not in commands
-    assert "args=sync --project" not in commands
-    assert "systemctl args=" not in commands
-
-
-def test_deployer_keeps_the_service_untouched_when_the_build_user_uv_command_fails(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    previous = _previous_release(harness)
-    harness.environment["DEPLOY_BUILD_FAIL"] = "1"
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "could not install the managed build Python" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
-    assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
-
-
-def test_deployer_keeps_previous_release_running_when_persistence_barrier_fails(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    previous = _previous_release(harness)
-    script = harness.deployer.read_text(encoding="utf-8")
-    assert "os.fsync(descriptor)" in script
-    harness.deployer.write_text(
-        script.replace("os.fsync(descriptor)", 'raise OSError("injected release fsync failure")'),
-        encoding="utf-8",
-    )
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "could not durably persist sealed deployment tree" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
-    assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize(
-    ("initial_service_active", "fallback_ledger_compatible"),
-    [(True, True), (False, True), (True, False)],
-)
-def test_deployer_restores_previous_service_when_selector_publish_fails_before_rename(
-    tmp_path: Path, initial_service_active: bool, fallback_ledger_compatible: bool
-) -> None:
-    harness = _deployment_harness(
-        tmp_path,
-        _DeploymentScenario(
-            initial_service_active=initial_service_active,
-            fallback_ledger_compatible=fallback_ledger_compatible,
-        ),
-    )
-    previous = _previous_release(harness)
-    _canonical_state(harness, version=4)
-    script = harness.deployer.read_text(encoding="utf-8")
-    publish = 'mv -T -- "$temporary_link" "$current_link" || die \'could not publish current deployment selector\''
-    assert publish in script
-    harness.deployer.write_text(script.replace(publish, "die 'injected pre-rename failure'"), encoding="utf-8")
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "injected pre-rename failure" in result.stderr
-    assert "requires forward Collector recovery" not in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    releases = tuple((harness.deployment_root / "releases").glob("release-*"))
-    assert len(releases) == 1 + int(initial_service_active and not fallback_ledger_compatible)
-    assert previous in releases
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=stop omi-collector.service") == 1
-    assert commands.count("systemctl args=start omi-collector.service") == int(
-        initial_service_active and fallback_ledger_compatible
-    )
-    if initial_service_active:
-        assert commands.count("fallback compatibility args=") == 1
-    if initial_service_active and not fallback_ledger_compatible:
-        assert "cannot safely read Collector state" in result.stderr
-
-
-def test_deployer_retains_new_selector_when_parent_fsync_fails_after_rename(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    previous = _previous_release(harness)
-    script = harness.deployer.read_text(encoding="utf-8")
-    assert "os.fsync(directory)" in script
-    harness.deployer.write_text(
-        script.replace("os.fsync(directory)", 'raise OSError("injected selector fsync failure")'),
-        encoding="utf-8",
-    )
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "could not durably publish current deployment selector" in result.stderr
-    assert "requires forward Collector recovery" in result.stderr
-    assert harness.current_link.resolve(strict=True) != previous
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=stop omi-collector.service") == 2
-    assert "systemctl args=start omi-collector.service" not in commands
-
-
-def test_deployer_rejects_candidate_metadata_symlink_before_service_restart(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(metadata_symlink=True))
-    sentinel = Path(harness.environment["DEPLOY_SENTINEL"])
-    sentinel.write_text("preserve me\n", encoding="utf-8")
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "refusing external symlink target" in result.stderr
-    assert sentinel.read_text(encoding="utf-8") == "preserve me\n"
-    assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
-
-
-def test_deployer_sealing_is_compatible_with_busybox_paths(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(busybox_tools=True))
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "chown args=" in commands
-    assert "--no-dereference" not in commands
-
-
-def _run_tree_sealer(root: Path, *allowed_external: Path) -> subprocess.CompletedProcess[str]:
-    command = [
-        "/usr/bin/python3",
-        "-I",
-        "-B",
-        "-S",
-        str(_SEALER),
-        "--root",
-        str(root),
-        "--owner",
-        f"{os.getuid()}:{os.getgid()}",
-    ]
-    for allowed_path in allowed_external:
-        command.extend(("--allow-external", str(allowed_path)))
-    return subprocess.run(command, check=False, capture_output=True, text=True)
-
-
-def test_descriptor_sealer_rejects_swapped_candidate_symlink(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    release.mkdir()
-    sentinel = tmp_path / "sentinel"
-    sentinel.write_text("preserve me\n", encoding="utf-8")
-    candidate = release / "candidate.py"
-    candidate.write_text("candidate\n", encoding="utf-8")
-    candidate.unlink()
-    candidate.symlink_to(sentinel)
-    original_mode = sentinel.stat().st_mode
-
-    result = _run_tree_sealer(release)
-
-    assert result.returncode != 0
-    assert "refusing external symlink target" in result.stderr
-    assert sentinel.read_text(encoding="utf-8") == "preserve me\n"
-    assert sentinel.stat().st_mode == original_mode
-
-
-def test_descriptor_sealer_seals_regular_entries_without_following_safe_links(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    binary_dir = release / "bin"
-    binary_dir.mkdir(parents=True)
-    executable = binary_dir / "omi-collector"
-    executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    executable.chmod(0o700)
-    data_file = release / "data.txt"
-    data_file.write_text("data\n", encoding="utf-8")
-    data_file.chmod(0o600)
-    (release / "data-link").symlink_to("data.txt")
-
-    result = _run_tree_sealer(release)
-
-    assert result.returncode == 0, result.stderr
-    assert stat.S_IMODE(release.stat().st_mode) == 0o755
-    assert stat.S_IMODE(binary_dir.stat().st_mode) == 0o755
-    assert stat.S_IMODE(executable.stat().st_mode) == 0o755
-    assert stat.S_IMODE(data_file.stat().st_mode) == 0o644
-
-
-def test_descriptor_sealer_accepts_an_absolute_link_within_its_tree(tmp_path: Path) -> None:
-    python_root = tmp_path / "python"
-    versioned = python_root / "cpython-3.14.6-linux-x86_64-gnu"
-    versioned.mkdir(parents=True)
-    alias = python_root / "cpython-3.14-linux-x86_64-gnu"
-    alias.symlink_to(versioned)
-
-    result = _run_tree_sealer(python_root)
-
-    assert result.returncode == 0, result.stderr
-    assert alias.readlink() == versioned
-
-
-def test_descriptor_sealer_rejects_an_absolute_etc_link(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    release.mkdir()
-    (release / "etc").symlink_to("/etc")
-
-    result = _run_tree_sealer(release)
-
-    assert result.returncode != 0
-    assert "refusing external symlink target: /etc" in result.stderr
-
-
-def test_descriptor_sealer_rejects_a_textual_tree_root_prefix_escape(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    sibling = tmp_path / "release-external"
-    release.mkdir()
-    sibling.mkdir()
-    (release / "escape").symlink_to(sibling)
-
-    result = _run_tree_sealer(release)
-
-    assert result.returncode != 0
-    assert "refusing external symlink target" in result.stderr
-
-
-def test_descriptor_sealer_rejects_an_absolute_internal_parent_escape(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    release.mkdir()
-    (release / "escape").symlink_to(f"{release}/../outside")
-
-    result = _run_tree_sealer(release)
-
-    assert result.returncode != 0
-    assert "refusing external symlink target" in result.stderr
-
-
-def test_descriptor_sealer_rejects_an_allowed_root_parent_escape(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    allowed = tmp_path / "allowed"
-    release.mkdir()
-    allowed.mkdir()
-    (release / "escape").symlink_to(f"{allowed}/../outside")
-
-    result = _run_tree_sealer(release, allowed)
-
-    assert result.returncode != 0
-    assert "refusing external symlink target" in result.stderr
-
-
-def test_descriptor_sealer_accepts_an_external_link_inside_an_allowed_root(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    allowed = tmp_path / "allowed"
-    release.mkdir()
-    allowed.mkdir()
-    target = allowed / "python"
-    target.write_text("python\n", encoding="utf-8")
-    (release / "python").symlink_to(target)
-
-    result = _run_tree_sealer(release, allowed)
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_descriptor_sealer_keeps_a_symlinked_allowed_root_lexical(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    allowed = tmp_path / "allowed"
-    allowed_link = tmp_path / "allowed-link"
-    release.mkdir()
-    allowed.mkdir()
-    allowed_link.symlink_to(allowed, target_is_directory=True)
-    target = allowed_link / "python"
-    (release / "python").symlink_to(target)
-
-    result = _run_tree_sealer(release, allowed_link)
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_descriptor_sealer_does_not_resolve_a_symlinked_allowed_root(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    allowed = tmp_path / "allowed"
-    allowed_link = tmp_path / "allowed-link"
-    release.mkdir()
-    allowed.mkdir()
-    allowed_link.symlink_to(allowed, target_is_directory=True)
-    (release / "python").symlink_to(allowed / "python")
-
-    result = _run_tree_sealer(release, allowed_link)
-
-    assert result.returncode != 0
-    assert "refusing external symlink target" in result.stderr
-
-
-def test_descriptor_sealer_rejects_a_fifo_at_runtime(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    release.mkdir()
-    os.mkfifo(release / "fifo")
-
-    result = _run_tree_sealer(release)
-
-    assert result.returncode != 0
-    assert "refusing unsupported candidate filesystem entry: fifo" in result.stderr
-
-
-def test_descriptor_sealer_rejects_a_device_when_mknod_is_permitted(tmp_path: Path) -> None:
-    if os.geteuid() != 0:
-        pytest.skip("requires CAP_MKNOD")
-    release = tmp_path / "release"
-    release.mkdir()
-    device = release / "null"
-    try:
-        os.mknod(device, stat.S_IFCHR | 0o600, os.makedev(1, 3))
-    except PermissionError:
-        pytest.skip("requires CAP_MKNOD")
-
-    result = _run_tree_sealer(release)
-
-    assert result.returncode != 0
-    assert "refusing unsupported candidate filesystem entry: null" in result.stderr
-
-
-def test_descriptor_sealer_rejects_a_mount_when_mounting_is_permitted(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    mountpoint = release / "mount"
-    mountpoint.mkdir(parents=True)
-    mount = shutil.which("mount")
-    unmount = shutil.which("umount")
-    if mount is None or unmount is None:
-        pytest.skip("requires mount and umount utilities")
-    mount_result = subprocess.run(
-        (mount, "--types", "tmpfs", "--options", "size=4096", "tmpfs", str(mountpoint)),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if mount_result.returncode != 0:
-        pytest.skip("requires CAP_SYS_ADMIN")
-    try:
-        result = _run_tree_sealer(release)
-
+    assert (runtime / "current").is_symlink()
+    assert not Path(tmp_path / "service.active").exists()
+    assert "forward recovery" in result.stderr
+
+
+def test_deployer_rejects_dirty_or_uninspectable_source_before_stop(tmp_path: Path) -> None:
+    for variable, value in (("FAKE_GIT_DIRTY", "1"), ("FAKE_GIT_ERROR", "1")):
+        case = tmp_path / variable
+        deployer, env = _fake_deployer(case)
+        env[variable] = value
+        result = _run_fake_deployer(deployer, env)
+        commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8") if Path(env["TEST_LOG"]).exists() else ""
         assert result.returncode != 0
-        assert "refusing non-directory or mount escape" in result.stderr
-    finally:
-        unmount_result = subprocess.run(
-            (unmount, str(mountpoint)),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert unmount_result.returncode == 0, unmount_result.stderr
+        assert "systemctl stop" not in commands
 
 
-def test_descriptor_sealer_contract_uses_fd_identity_and_no_follow_operations() -> None:
-    sealer = _SEALER.read_text(encoding="utf-8")
-    deployer = _DEPLOYER.read_text(encoding="utf-8")
+def test_deployer_rejects_invalid_config_before_stop(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path)
+    env["FAKE_CONFIG_INVALID"] = "1"
 
-    assert "os.O_NOFOLLOW" in sealer
-    assert "os.O_DIRECTORY" in sealer
-    assert "os.fstat" in sealer
-    assert "st_dev != context.root_device" in sealer
-    assert "st_ino" in sealer
-    assert "os.fchown" in sealer
-    assert "os.fchmod" in sealer
-    assert "sealer_python='/usr/bin/python3'" in deployer
-    assert "'-I' '-B' '-S'" in deployer
+    result = _run_fake_deployer(deployer, env)
+
+    assert result.returncode != 0
+    assert "systemctl stop" not in Path(env["TEST_LOG"]).read_text(encoding="utf-8")
+
+
+def test_deployer_recovers_hot_journal_only_under_stopped_guard(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path, hot_journal=True)
+
+    result = _run_fake_deployer(deployer, env)
+
+    assert result.returncode == 0, result.stderr
+    commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8")
+    assert commands.index("systemctl stop") < commands.index("collector recover-state-journal")
+    assert commands.count("collector check-state") == 3
+    assert commands.index("collector recover-state-journal") < commands.index("collector init-state")
+
+
+def test_deployer_recovery_failure_does_not_publish_selector(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path, hot_journal=True, recovery_fail=True)
+
+    result = _run_fake_deployer(deployer, env)
+
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
+    assert result.returncode != 0
+    assert not (runtime / "current").exists()
+
+
+def test_deployer_init_failure_leaves_selected_release_stopped(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path)
+    env["FAKE_INIT_FAIL"] = "1"
+
+    result = _run_fake_deployer(deployer, env)
+
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
+    assert result.returncode != 0
+    assert (runtime / "current").is_symlink()
+    assert not (tmp_path / "service.active").exists()
 
 
 @pytest.mark.parametrize(
-    ("scenario", "message"),
+    "sequence",
     (
-        (_DeploymentScenario(same_uid=True), "build UID must differ"),
-        (_DeploymentScenario(same_primary_gid=True), "build primary GID must differ"),
-        (_DeploymentScenario(service_group_membership=True), "must not belong to the live service group"),
+        (
+            "activating:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+            "active:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+        ),
+        (
+            "inactive:0:3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:77 /start",
+            "activating:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+            "active:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+        ),
     ),
 )
-def test_deployer_rejects_build_identity_that_overlaps_the_service(
-    tmp_path: Path, scenario: _DeploymentScenario, message: str
-) -> None:
-    harness = _deployment_harness(tmp_path, scenario)
+def test_deployer_accepts_same_invocation_after_queued_job(tmp_path: Path, sequence: tuple[str, ...]) -> None:
+    deployer, env = _fake_deployer(tmp_path, readiness_sequence=sequence)
 
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert message in result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "runuser args=" not in commands
-    assert "systemctl args=" not in commands
-
-
-def test_deployer_rejects_config_before_stopping_the_previous_service(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(config_check_failure=True))
-    previous = _previous_release(harness)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "candidate rejected the operator configuration" in result.stderr
-    assert harness.current_link.resolve(strict=True) == previous
-    assert tuple((harness.deployment_root / "releases").glob("release-*")) == (previous,)
-    assert "systemctl args=" not in harness.log.read_text(encoding="utf-8")
-
-
-def test_deployer_keeps_selected_release_stopped_when_readiness_fails(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(readiness_config="/wrong/config.toml"))
-    previous = _previous_release(harness)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "did not announce readiness" in result.stderr
-    assert "requires forward Collector recovery" in result.stderr
-    assert harness.current_link.resolve(strict=True) != previous
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=stop omi-collector.service") == 2
-    assert commands.count("systemctl args=restart omi-collector.service") == 1
-    assert "systemctl args=start omi-collector.service" not in commands
-
-
-def test_deployer_stops_selected_release_when_readiness_never_arrives(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(readiness_missing=True))
-    previous = _previous_release(harness)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "did not announce readiness within 0 seconds" in result.stderr
-    assert "requires forward Collector recovery" in result.stderr
-    assert harness.current_link.resolve(strict=True) != previous
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=stop omi-collector.service") == 2
-    assert commands.count("systemctl args=restart omi-collector.service") == 1
-    assert "systemctl args=start omi-collector.service" not in commands
-
-
-def test_deployer_initializes_stopped_state_before_service_restart(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(init_creates_database=True))
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    state_file.parent.mkdir(parents=True)
-
-    result = _run_deployer(harness)
+    result = _run_fake_deployer(deployer, env)
 
     assert result.returncode == 0, result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.index("systemctl args=stop omi-collector.service") < commands.index("candidate args=init-state")
-    assert commands.index("candidate args=init-state") < commands.index("systemctl args=restart omi-collector.service")
-    assert "candidate args=init-state --config " in commands
-    selected_target = harness.current_link.readlink()
-    assert f"initialization selector={selected_target}" in commands
-    assert "runuser service args=test -w" in commands
-    assert f"runuser operator args=test -r {state_file}" in commands
-    assert f"runuser operator args=test -w {state_file}" in commands
-    assert "collector.lock" in commands
-    assert stat.S_IMODE(state_file.stat().st_mode) == 0o640
-    assert stat.S_IMODE((state_file.parent / "collector.lock").stat().st_mode) == 0o600
-    data_roots = (state_file.parent, state_file.parent / "public", state_file.parent.parent / "ready")
-    for root in data_roots:
-        assert root.stat().st_mode & 0o7777 == 0o2750
-    assert not (state_file.parent / "attempts").exists()
-    assert not (state_file.parent / "quarantine").exists()
-    assert not (state_file.parent.parent / "draft").exists()
+    assert "Deployed and verified" in result.stdout
 
 
-def test_deployer_rejects_public_data_root_symlink_before_mutating_roots(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario())
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    state_file.parent.mkdir(parents=True)
-    public_dir = state_file.parent / "public"
-    public_dir.symlink_to(tmp_path / "outside", target_is_directory=True)
+@pytest.mark.parametrize(
+    "sequence",
+    (
+        ("activating:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0", "active:4242:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0"),
+        ("activating:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0", "active:4243:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0"),
+        ("activating:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0", "active:4242:0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0"),
+        ("inactive:0:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",),
+    ),
+)
+def test_deployer_fails_closed_on_changed_or_missing_invocation(tmp_path: Path, sequence: tuple[str, ...]) -> None:
+    deployer, env = _fake_deployer(tmp_path, readiness_sequence=sequence)
 
-    result = _run_deployer(harness)
+    result = _run_fake_deployer(deployer, env)
 
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
     assert result.returncode != 0
-    assert "Collector data root must not be a symlink" in result.stderr
-    assert not state_file.parent.parent.joinpath("ready").exists()
-    assert "systemctl args=stop omi-collector.service" not in harness.log.read_text(encoding="utf-8")
+    assert (runtime / "current").is_symlink()
+    assert not (tmp_path / "service.active").exists()
 
 
-def test_deployer_recovers_true_hot_journal_before_selector_and_v4_initialization(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(recovery_required=True))
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    state_file.parent.mkdir(parents=True)
-    _canonical_state(harness, version=4)
-    _make_true_hot_journal(state_file)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    recovery = "candidate args=recover-state-journal"
-    selector = "initialization selector="
-    assert recovery in commands
-    assert commands.index("systemctl args=stop omi-collector.service") < commands.index(recovery)
-    assert commands.index(recovery) < commands.index(selector)
-    assert not state_file.with_name(state_file.name + "-journal").exists()
-
-
-def test_deployer_runs_real_state_cli_for_hot_journal_recovery_and_v4_preservation(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    state_file.parent.mkdir(parents=True)
-    state_file.parent.chmod(0o2750)
-    _canonical_state(harness, version=4)
-    _make_true_hot_journal(state_file)
-    previous = _previous_release(harness)
-
-    result = _run_deployer(harness)
-    commands = harness.log.read_text(encoding="utf-8")
-
-    assert result.returncode == 0, result.stderr + "\n" + commands
-    recovery = "recovery selector="
-    initialization = "initialization selector="
-    preflights = [line for line in commands.splitlines() if line.startswith("candidate args=check-state")]
-    assert len(preflights) == 3
-    assert recovery in commands
-    assert initialization in commands
-    recovery_selector = f"recovery selector=releases/{previous.name}"
-    selected_target = harness.current_link.readlink()
-    initialization_selector = f"initialization selector={selected_target}"
-    assert recovery_selector in commands
-    assert initialization_selector in commands
-    second_preflight_at = commands.index(preflights[1])
-    third_preflight_at = commands.index(preflights[2], second_preflight_at + 1)
-    assert commands.index("systemctl args=stop omi-collector.service") < commands.index(recovery_selector)
-    assert (
-        second_preflight_at
-        < commands.index(recovery_selector)
-        < third_preflight_at
-        < commands.index(initialization_selector)
+def test_deployer_preserves_confirmed_invocation_when_readiness_is_pending(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(
+        tmp_path, readiness_sequence=("activating:4242:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",)
     )
-    assert harness.current_link.resolve(strict=True) != previous
-    assert not state_file.with_name(state_file.name + "-journal").exists()
-    with closing(sqlite3.connect(state_file)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
-        assert connection.execute("SELECT payload FROM state WHERE kind='runtime_status'").fetchone() == (
-            '{"last_error":"original"}',
-        )
+    content = deployer.read_text(encoding="utf-8").replace("readiness_timeout_seconds=900", "readiness_timeout_seconds=0")
+    deployer.write_text(content, encoding="utf-8")
+
+    result = _run_fake_deployer(deployer, env)
+
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
+    assert result.returncode != 0
+    assert "unverified and in progress" in result.stderr
+    assert (runtime / "current").is_symlink()
+    assert (tmp_path / "service.active").exists()
 
 
-def test_deployer_initializes_fresh_v4_state_through_real_cli(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(real_state_cli=True))
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
+def test_deployer_refuses_a_concurrent_transaction(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path)
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
+    runtime.mkdir(parents=True)
+    lock = (runtime / ".deployment.lock").open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-    result = _run_deployer(harness)
-
-    commands = harness.log.read_text(encoding="utf-8")
-    assert result.returncode == 0, result.stderr + "\n" + commands
-    assert "candidate args=init-state" in commands
-    assert f"initialization selector={harness.current_link.readlink()}" in commands
-    assert state_file.is_file()
-    with closing(sqlite3.connect(state_file)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
-        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-
-
-def test_deployer_does_not_recover_on_arbitrary_state_check_refusal(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(preflight_failure_at=1, recovery_required=True))
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    state_file.parent.mkdir(parents=True)
-    _canonical_state(harness, version=4)
-    _make_true_hot_journal(state_file)
-
-    result = _run_deployer(harness)
+    result = _run_fake_deployer(deployer, env)
 
     assert result.returncode != 0
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "candidate args=recover-state-journal" not in commands
-    assert state_file.with_name(state_file.name + "-journal").exists()
-
-
-def test_deployer_prepares_lock_for_empty_existing_collector_root(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    state_file.parent.mkdir(parents=True)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode == 0, result.stderr
-    lock = state_file.parent / "collector.lock"
-    assert lock.is_file() and lock.stat().st_size == 0
-    assert state_file.is_file()
-    commands = harness.log.read_text(encoding="utf-8")
-    assert f"runuser service args=test -w {lock}" in commands
-
-
-def test_deployer_keeps_new_release_if_state_initialization_fails_before_activation(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(init_failure=True))
-    previous = _previous_release(harness)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert harness.current_link.resolve(strict=True) != previous
-    assert "requires forward Collector recovery" in result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "systemctl args=start omi-collector.service" not in commands
-    assert "systemctl args=restart omi-collector.service" not in commands
-
-
-def test_deployer_keeps_new_release_when_state_initialization_activates_then_fails(tmp_path: Path) -> None:
-    scenario = _DeploymentScenario(init_creates_database=True, init_failure=True)
-    harness = _deployment_harness(tmp_path, scenario)
-    previous = _previous_release(harness)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "requires forward Collector recovery" in result.stderr
-    assert harness.current_link.resolve(strict=True) != previous
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "systemctl args=restart omi-collector.service" not in commands
-    assert "systemctl args=start omi-collector.service" not in commands
-
-
-def test_deployer_rejects_operator_write_access_to_state_database(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(operator_can_write_state=True))
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "operator account can write Collector state database" in result.stderr
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "systemctl args=restart omi-collector.service" not in commands
-
-
-def test_deployer_never_rolls_back_old_release_with_existing_database(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(readiness_config="/wrong/config.toml"))
-    previous = _previous_release(harness)
-    state_file = Path(harness.environment["DEPLOY_STATE_FILE"])
-    state_file.parent.mkdir(parents=True)
-    state_file.touch()
-    (state_file.parent / "collector.lock").touch()
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "requires forward Collector recovery" in result.stderr
-    assert harness.current_link.resolve(strict=True) != previous
-    commands = harness.log.read_text(encoding="utf-8")
-    assert "systemctl args=start omi-collector.service" not in commands
-    assert commands.count("systemctl args=restart omi-collector.service") == 1
-
-
-def test_failed_first_deployment_keeps_selected_release_for_recovery(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(readiness_config="/wrong/config.toml"))
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert harness.current_link.is_symlink()
-    assert harness.current_link.resolve(strict=True).is_dir()
-    commands = harness.log.read_text(encoding="utf-8")
-    assert commands.count("systemctl args=restart omi-collector.service") == 1
-
-
-def test_deployer_keeps_selected_release_after_restart_during_stability(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(crash_loop=True))
-    previous = _previous_release(harness)
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "restarted during the stability interval" in result.stderr
-    assert harness.current_link.resolve(strict=True) != previous
-    assert "requires forward Collector recovery" in result.stderr
-
-
-def test_deployer_rejects_a_dirty_source_before_creating_a_release(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path, _DeploymentScenario(git_status=" M source.py\n"))
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "dirty source tree" in result.stderr
-    assert not harness.deployment_root.exists()
-
-
-def test_deployer_rejects_a_concurrent_transaction(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    harness.deployment_root.mkdir()
-    lock_path = harness.deployment_root / ".deployment.lock"
-
-    with lock_path.open("w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "another deployment transaction is already in progress" in result.stderr
-    assert not tuple((harness.deployment_root / "releases").glob("release-*"))
-
-
-def test_deployer_rejects_an_unmanaged_current_selector(tmp_path: Path) -> None:
-    harness = _deployment_harness(tmp_path)
-    harness.deployment_root.mkdir()
-    harness.current_link.symlink_to("/tmp/unmanaged-release")
-
-    result = _run_deployer(harness)
-
-    assert result.returncode != 0
-    assert "unsupported target" in result.stderr
-    assert not tuple((harness.deployment_root / "releases").glob("release-*"))
+    assert "another deployment is already in progress" in result.stderr
+    lock.close()

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.19.6](https://github.com/j2h4u/omi-collector/compare/v0.19.5...v0.19.6) (2026-10-23)
+
+
+### Fixes
+
+* **capture:** enforce the Ogg-only public audio handoff ([1b5d038](https://github.com/j2h4u/omi-collector/commit/1b5d0382361973813027754ec30fdf3d9d9a9137))
+* **migration:** preserve internal audio and actionable refusal states ([1b5d038](https://github.com/j2h4u/omi-collector/commit/1b5d0382361973813027754ec30fdf3d9d9a9137))
+* **recovery:** validate v2 publication cohorts before startup ([1b5d038](https://github.com/j2h4u/omi-collector/commit/1b5d0382361973813027754ec30fdf3d9d9a9137))
+
+
+### Tests
+
+* **capture:** cover transactional v2 recovery and custody ([1b5d038](https://github.com/j2h4u/omi-collector/commit/1b5d0382361973813027754ec30fdf3d9d9a9137))
+
 ## [0.19.5](https://github.com/j2h4u/omi-collector/compare/v0.19.4...v0.19.5) (2026-10-23)
 
 

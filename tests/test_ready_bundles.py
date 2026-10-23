@@ -234,13 +234,10 @@ def test_disjoint_subthreshold_growth_reuses_durable_packet_summary(
     ready = _ready_root(tmp_path)
     first = _source(store, "a" * 32, 10, (_two_packet_record(100, 1),))
     reads: list[str] = []
-    page_reads: list[str] = []
-    preflight_reads: list[str] = []
     read_record_page = store.read_record_page
 
     def tracked(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
         reads.append(source_id)
-        page_reads.append(source_id)
         return read_record_page(source_id, after_ordinal, limit)
 
     monkeypatch.setattr(store, "read_record_page", tracked)
@@ -270,10 +267,34 @@ def test_disjoint_subthreshold_growth_reuses_durable_packet_summary(
     assert second_wait.stats is not None
     assert (second_wait.stats.audio_packets, second_wait.stats.gap_count, second_wait.stats.gap_records) == (3, 1, 9)
 
-    page_reads.clear()
+
+def test_cached_old_sources_and_new_threshold_crossing_read_each_for_its_role(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = audio_store[1]
+    ready = _ready_root(tmp_path)
+    sources = (
+        _source(store, "a" * 32, 10, (_two_packet_record(100, 1),)),
+        _source(store, "b" * 32, 20, (_record(101, 2),)),
+    )
+    config = ReadyConfig(target_audio_seconds=0.08)
+    assert (
+        finalize_typed_sources(
+            store, sources, ready, config=config, clock_segments=ClockSegmentMap(()), frontier=21, drained=True
+        ).reason
+        == "waiting_for_threshold"
+    )
+
+    reads: list[str] = []
+    preflight_reads: list[str] = []
     normalization_reads: list[str] = []
     precomputed_sources: list[str] = []
+    read_record_page = store.read_record_page
     normalize = ready_bundles._normalize_typed_admissions
+
+    def tracked_page(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        reads.append(source_id)
+        return read_record_page(source_id, after_ordinal, limit)
 
     def tracked_normalize(
         admissions: tuple[ready_bundles._TypedAdmission, ...],
@@ -285,17 +306,17 @@ def test_disjoint_subthreshold_growth_reuses_durable_packet_summary(
         if not precomputed:
             return normalize(admissions, page_limit, custody, precomputed)
         preflight_reads.extend(reads)
-        page_reads.clear()
+        reads.clear()
         result = normalize(admissions, page_limit, custody, precomputed)
-        normalization_reads.extend(page_reads)
+        normalization_reads.extend(reads)
         return result
 
+    monkeypatch.setattr(store, "read_record_page", tracked_page)
     monkeypatch.setattr(ready_bundles, "_normalize_typed_admissions", tracked_normalize)
     third = _source(store, "d" * 32, 30, (_two_packet_record(102, 3),))
-    reads.clear()
     published = finalize_typed_sources(
         store,
-        (SqlitePublicationSource(store, first.source_id), SqlitePublicationSource(store, second.source_id), third),
+        (*sources, third),
         ready,
         config=config,
         clock_segments=ClockSegmentMap(()),
@@ -304,7 +325,7 @@ def test_disjoint_subthreshold_growth_reuses_durable_packet_summary(
     )
     assert published.state is ReadyOutcomeState.PUBLISHED
     assert precomputed_sources == [third.source_id]
-    assert normalization_reads == [first.source_id, second.source_id]
+    assert normalization_reads == [source.source_id for source in sources]
     assert preflight_reads == [third.source_id]
 
 

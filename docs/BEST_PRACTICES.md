@@ -32,11 +32,11 @@ merge; the GitHub release can follow in the background. See [edge.md](../edge.md
 for the short workflow sequence.
 
 Unit, coverage, and CRAP pytest commands yield to foreground work with the
-Linux idle CPU scheduler, nice 19, and idle I/O priority. The canonical
-`just unit` command is bounded to 600 seconds and runs without slow tests. Its
-pytest-xdist worker count can be limited with `PYTEST_XDIST_AUTO_NUM_WORKERS`;
-otherwise pytest-xdist selects workers automatically. Keep the tests and
-assertions intact.
+Linux idle CPU scheduler, nice 19, and idle I/O priority. Coverage and CRAP
+recipes use pytest-xdist with automatic workers; their count can be limited
+with `PYTEST_XDIST_AUTO_NUM_WORKERS`. The canonical `just unit` command is
+bounded to 600 seconds and runs without slow tests, with the same optional
+worker cap. Keep the tests and assertions intact.
 
 For full QA on a slow disk, put only temporary test scratch in a short,
 task-owned `TMPDIR` on tmpfs; keep logs and receipts on persistent storage.

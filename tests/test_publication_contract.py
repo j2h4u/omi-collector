@@ -1,64 +1,41 @@
 from __future__ import annotations
 
-from itertools import product
-from typing import cast
+from pathlib import Path
 
 import pytest
 
-from omi_collector.capture.domain.publication_contract import (
-    _POLICIES,
-    _TRANSITIONS,
-    ContractEvent,
-    ContractMode,
-    ContractPolicy,
-    contract_policy,
-    contract_transition,
-)
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, publication_contract_state
+from omi_collector.capture.domain.publication_contract import ContractMode
 
 
-@pytest.mark.parametrize(
-    ("mode", "expected"),
-    (
-        (ContractMode.LEGACY_OPEN, ContractPolicy(True, True, False)),
-        (ContractMode.QUIESCING, ContractPolicy(False, True, False)),
-        (ContractMode.V2_OPEN, ContractPolicy(False, False, True)),
-    ),
-)
-def test_policy_is_fixed_for_each_mode(mode: ContractMode, expected: ContractPolicy) -> None:
-    assert contract_policy(mode) == expected
+def test_new_database_starts_with_v2_publication_order_zero(tmp_path: Path) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+
+    assert publication_contract_state(database).mode is ContractMode.V2_OPEN
+    assert publication_contract_state(database).next_public_order == 0
 
 
-def test_every_mode_event_pair_has_an_explicit_result_or_rejection() -> None:
-    valid = {
-        (ContractMode.LEGACY_OPEN, ContractEvent.BEGIN_CUTOVER): ContractMode.QUIESCING,
-        (ContractMode.QUIESCING, ContractEvent.ACTIVATE_V2): ContractMode.V2_OPEN,
-    }
-    for mode, event in product(ContractMode, ContractEvent):
-        if (mode, event) in valid:
-            assert contract_transition(mode, event) is valid[mode, event]
-        else:
-            with pytest.raises(ValueError, match="unsupported"):
-                contract_transition(mode, event)
+@pytest.mark.parametrize("mode", ["legacy_open", "quiescing"])
+def test_legacy_publication_modes_are_rejected(tmp_path: Path, mode: str) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    database.put(
+        StateKind.PUBLICATION_CONTRACT,
+        "current",
+        {"version": 1, "mode": mode, "next_public_order": 0},
+    )
+
+    with pytest.raises(ReadyBundleError, match="contract mode"):
+        publication_contract_state(database)
 
 
-def test_transition_and_policy_tables_cover_the_complete_declared_space() -> None:
-    assert set(_POLICIES) == set(ContractMode)
-    assert set(_TRANSITIONS) == set(product(ContractMode, ContractEvent))
+def test_missing_v2_order_is_rejected(tmp_path: Path) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    database.put(
+        StateKind.PUBLICATION_CONTRACT,
+        "current",
+        {"version": 1, "mode": "v2_open", "next_public_order": None},
+    )
 
-
-@pytest.mark.parametrize("value", ("legacy_open", "invalid", None, 1, True))
-def test_invalid_modes_are_rejected(value: object) -> None:
-    with pytest.raises(ValueError):
-        contract_policy(cast(ContractMode, value))
-
-
-def test_invalid_event_is_rejected() -> None:
-    with pytest.raises(ValueError):
-        contract_transition(ContractMode.LEGACY_OPEN, cast(ContractEvent, "activate_v2"))
-
-
-def test_non_enum_mode_and_event_values_are_rejected() -> None:
-    with pytest.raises(ValueError):
-        contract_transition(cast(ContractMode, "legacy_open"), ContractEvent.BEGIN_CUTOVER)
-    with pytest.raises(ValueError):
-        contract_transition(ContractMode.LEGACY_OPEN, cast(ContractEvent, "begin_cutover"))
+    with pytest.raises(ReadyBundleError, match="publication order"):
+        publication_contract_state(database)

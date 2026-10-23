@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
-from json import dumps
+from json import dumps, loads
 from pathlib import Path
 from threading import Event
 from typing import cast
@@ -72,7 +72,7 @@ def _insert_source(audio_store: InternalAudioStore, source_id: str, start: int, 
 
 
 def _patch_finalize_to_add_exact_source(monkeypatch: pytest.MonkeyPatch, raw: bytes) -> list[tuple[str, ...]]:
-    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_typed_sources)
+    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_public_audio_v2)
     admitted_sources: list[tuple[str, ...]] = []
 
     def add_after_first_attempt(*args: object, **kwargs: object) -> ReadyOutcome:
@@ -83,12 +83,12 @@ def _patch_finalize_to_add_exact_source(monkeypatch: pytest.MonkeyPatch, raw: by
             _insert_source(cast(InternalAudioStore, args[0]), "b" * 32, 100, raw)
         return result
 
-    monkeypatch.setattr(staging_store_module, "finalize_typed_sources", add_after_first_attempt)
+    monkeypatch.setattr(staging_store_module, "finalize_public_audio_v2", add_after_first_attempt)
     return admitted_sources
 
 
 def _patch_finalize_to_pause(monkeypatch: pytest.MonkeyPatch, entered: Event, release: Event) -> list[int]:
-    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_typed_sources)
+    original = cast(Callable[..., ReadyOutcome], staging_store_module.finalize_public_audio_v2)
     calls = [0]
 
     def pause_after_real_finalization(*args: object, **kwargs: object) -> ReadyOutcome:
@@ -99,7 +99,7 @@ def _patch_finalize_to_pause(monkeypatch: pytest.MonkeyPatch, entered: Event, re
             raise AssertionError("test did not release the in-flight publication")
         return outcome
 
-    monkeypatch.setattr(staging_store_module, "finalize_typed_sources", pause_after_real_finalization)
+    monkeypatch.setattr(staging_store_module, "finalize_public_audio_v2", pause_after_real_finalization)
     return calls
 
 
@@ -184,10 +184,14 @@ def test_checkpoint_access_denial_is_diagnostic_and_ack_retry_self_heals(
     checkpoint.write_text(
         dumps(
             {
-                "analysis_cursor": None,
-                "vad_decisions": [],
-                "open_speech_tail": None,
-                "acknowledged": [{"bundle_id": published.bundle_id, "records_sha256": published.records_sha256}],
+                "acknowledged": [
+                    {
+                        "id": published.bundle_id,
+                        "audio_sha256": loads(published.path.joinpath("manifest.json").read_text(encoding="utf-8"))[
+                            "audio_sha256"
+                        ],
+                    }
+                ],
             }
         ),
         encoding="utf-8",

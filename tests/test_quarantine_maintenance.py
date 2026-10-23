@@ -900,10 +900,11 @@ def test_unexpected_publication_exception_is_logged_and_settled_without_retry(
         def bad_clock(_self: object) -> None:
             raise ValueError("clock metadata sentinel")
 
-        monkeypatch.setattr(ClockStateStore, "segment_map", bad_clock)
-        await asyncio.to_thread(type(store)._recover_and_publish_unlocked, store)
-        assert "clock metadata unavailable; publishing ready audio without UTC normalization" in caplog.text
-        assert "clock metadata sentinel" in caplog.text
+        monkeypatch.setattr(ClockStateStore, "state", bad_clock)
+        with pytest.raises(ReadyBundleError, match="clock metadata unavailable for public audio v2") as failure:
+            await asyncio.to_thread(type(store)._recover_and_publish_unlocked, store)
+        assert isinstance(failure.value.__cause__, ValueError)
+        assert str(failure.value.__cause__) == "clock metadata sentinel"
 
     _run(scenario())
 

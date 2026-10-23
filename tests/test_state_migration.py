@@ -8,11 +8,22 @@ import sqlite3
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from omi_collector import state_migration
+from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
+from omi_collector.capture.adapters.ready_bundles import (
+    PublicAudioV2Options,
+    ReadyBundleError,
+    finalize_public_audio_v2,
+)
+from omi_collector.capture.domain.clock_state import ClockState
+from omi_collector.capture.domain.publication_contract import ContractMode
+from omi_collector.config import ReadyConfig
 from omi_collector.state_migration import (
     InternalAudioCutoverRequiredError,
     StateMigrationError,
@@ -26,6 +37,15 @@ def _layout(tmp_path: Path) -> StorageLayout:
     config = tmp_path / "config.toml"
     config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 120\n', encoding="utf-8")
     return load_operator_config(config).storage
+
+
+def _publication_cohort_snapshot(database: StateDB) -> tuple[object, ...]:
+    with closing(database.open_connection(read_only=True)) as connection:
+        return (
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort_member")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM ready_v2_output_stage")),
+        )
 
 
 def test_runtime_never_creates_missing_database(tmp_path: Path) -> None:
@@ -68,6 +88,332 @@ def test_current_rejects_legacy_mutable_rows(tmp_path: Path) -> None:
         open_runtime_state(layout)
 
 
+@pytest.mark.parametrize("mode", ["legacy_open", "quiescing"])
+def test_current_rejects_legacy_publication_contract(tmp_path: Path, mode: str) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    db.put(StateKind.PUBLICATION_CONTRACT, "current", {"version": 1, "mode": mode, "next_public_order": 0})
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="publication contract must be v2"):
+        open_runtime_state(layout)
+
+
+def test_current_rejects_active_legacy_publication_and_accepts_retired_lineage(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    digest = "a" * 64
+    bundle_id = sha256(f"0:1:{digest}".encode()).hexdigest()
+    entry = {
+        "records_sha256": "b" * 64,
+        "state": "ready",
+        "start_sequence": 0,
+        "next_sequence": 1,
+        "formed_on_utc": "2024-01-02",
+        "recorded_on_utc_min": "2023-12-31",
+        "recorded_on_utc_max": "2024-01-02",
+        "draft_raw_sha256": digest,
+        "sources": [{"start_sequence": 0, "next_sequence": 1, "raw_sha256": digest}],
+    }
+    db.put(StateKind.READY_PUBLICATION, bundle_id, entry)
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="active legacy publication"):
+        open_runtime_state(layout)
+
+    db.put(StateKind.READY_PUBLICATION, bundle_id, {**entry, "state": "retired"})
+    assert open_runtime_state(layout, read_only=True).path == db.path
+    assert db.get(StateKind.READY_PUBLICATION, bundle_id) == {**entry, "state": "retired"}
+
+
+@pytest.mark.parametrize("with_member", [False, True], ids=["no-members", "with-member"])
+@pytest.mark.parametrize("config_digest", [None, "a" * 64], ids=["null-digest", "legacy-digest"])
+def test_runtime_rejects_unqualified_cohort_without_stage(
+    tmp_path: Path, with_member: bool, config_digest: str | None
+) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    db.put(
+        StateKind.PUBLICATION_CONTRACT,
+        "current",
+        {"version": 1, "mode": ContractMode.V2_OPEN.value, "next_public_order": 0},
+    )
+    cohort_id = "c" * 64
+    source_id = "b" * 32
+    source: tuple[int, str] | None = None
+    if with_member:
+        store = InternalAudioStore(db)
+        record = bytes(AUDIO_RECORD_SIZE)
+        store.create_source(source_id, "attempt", 10, 11)
+        current = store.prepare_leg(source_id, 10, 1)
+        current = store.record_read_begin(source_id, 10, 1)
+        store.commit_drain(source_id, 0, (record,), DrainCheckpoint(current.current_leg_generation))
+        current = store.get_source(source_id)
+        assert current is not None
+        store.seal_source(
+            source_id,
+            leg_generation=current.current_leg_generation,
+            expected_count=current.committed_count,
+            expected_sha256=current.committed_sha256,
+        )
+        source = (current.committed_count, current.committed_sha256)
+        store.close()
+
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO publication_cohort(cohort_id,lifecycle,config_digest) VALUES (?,'unqualified',?)",
+            (cohort_id, config_digest),
+        )
+        if source is not None:
+            connection.execute(
+                "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,slice_count,"
+                "admitted_lifecycle,admitted_count,admitted_sha256) VALUES (?,0,?,0,1,'sealed_waiting',?,?)",
+                (cohort_id, source_id, source[0], source[1]),
+            )
+        connection.commit()
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="publication cohort"):
+        open_runtime_state(layout)
+    with closing(db.open_connection(read_only=True)) as connection:
+        assert connection.execute("SELECT count(*) FROM publication_cohort").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM ready_v2_output_stage").fetchone()[0] == 0
+
+
+def test_runtime_rejects_valid_accepted_cohort_with_legacy_digest_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    store = InternalAudioStore(db)
+    ready = layout.publication.root
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    source_id = "f" * 32
+    record = (100).to_bytes(4, "big") + bytes((2, 8, 1)) + bytes(AUDIO_RECORD_SIZE - 7)
+    store.create_source(source_id, "attempt", 10, 11)
+    current = store.prepare_leg(source_id, 10, 1)
+    current = store.record_read_begin(source_id, 10, 1)
+    store.commit_drain(source_id, 0, (record,), DrainCheckpoint(current.current_leg_generation))
+    current = store.get_source(source_id)
+    assert current is not None
+    store.seal_source(
+        source_id,
+        leg_generation=current.current_leg_generation,
+        expected_count=current.committed_count,
+        expected_sha256=current.committed_sha256,
+    )
+
+    original_resume = ready_bundles._resume_v2_cohort
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("simulated loss after cohort acceptance")
+
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", interrupt)
+    with pytest.raises(ReadyBundleError, match="simulated loss"):
+        finalize_public_audio_v2(
+            store,
+            (ready_bundles.SqlitePublicationSource(store, source_id),),
+            ready,
+            PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 11, True),
+        )
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", original_resume)
+    cohort = ready_bundles._load_active_typed_cohort(store)
+    assert cohort is not None and cohort.lifecycle == "accepted"
+
+    wrong_digest = sha256(b"legacy publication config").hexdigest()
+    wrong_cohort_id = ready_bundles._typed_cohort_id(cohort.admissions, cohort.threshold, cohort.frontier, wrong_digest)
+    with closing(db.open_connection()) as connection:
+        member = cast(tuple[object, ...], connection.execute("SELECT * FROM publication_cohort_member").fetchone())
+        connection.execute("DELETE FROM publication_cohort_member WHERE cohort_id=?", (cohort.cohort_id,))
+        connection.execute(
+            "UPDATE publication_cohort SET cohort_id=?,accepted_permit=?,config_digest=? WHERE cohort_id=?",
+            (wrong_cohort_id, wrong_cohort_id, wrong_digest, cohort.cohort_id),
+        )
+        connection.execute(
+            "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,slice_count,"
+            "admitted_lifecycle,admitted_count,admitted_sha256,cursor) VALUES (?,?,?,?,?,?,?,?,?)",
+            (wrong_cohort_id, *member[1:]),
+        )
+        connection.commit()
+    before = _publication_cohort_snapshot(db)
+    generation = db.get_generation()
+    entries = tuple(sorted(path.name for path in ready.iterdir()))
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="legacy or unqualified publication cohort"):
+        open_runtime_state(layout)
+
+    assert _publication_cohort_snapshot(db) == before
+    assert db.get_generation() == generation
+    assert tuple(sorted(path.name for path in ready.iterdir())) == entries
+    store.close()
+
+
+def test_runtime_rejects_completed_v2_cohort_after_member_cleanup(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    db.put(
+        StateKind.PUBLICATION_CONTRACT,
+        "current",
+        {"version": 1, "mode": ContractMode.V2_OPEN.value, "next_public_order": 0},
+    )
+    cohort_id = "d" * 64
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO publication_cohort(cohort_id,lifecycle,accepted_permit,drained_threshold,cursor,config_digest) "
+            "VALUES (?,'complete',?,1,1,?)",
+            (cohort_id, cohort_id, ready_bundles._v2_config_sha256()),
+        )
+        connection.commit()
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="unsupported publication cohort lifecycle"):
+        open_runtime_state(layout, read_only=True)
+
+
+def test_current_runtime_rejects_legacy_replay_proof_custody(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO ready_replay_proof VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "a" * 64,
+                "active",
+                "legacy-stage",
+                "legacy-owner",
+                1,
+                "b" * 64,
+                "c" * 64,
+                b"index",
+                b"runs",
+                b"metadata",
+                "d" * 64,
+                "legacy-records-v1",
+                None,
+                None,
+                None,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="publication custody"):
+        open_runtime_state(layout)
+
+
+@pytest.mark.parametrize(
+    "custody",
+    (
+        "ready_replay_proof_page",
+        "publication_cohort_member",
+        "ready_stage_range",
+        "ready_v2_stage_range",
+        "cohort_member_missing_source",
+        "v2_stage_range_missing_source",
+    ),
+)
+def test_current_runtime_rejects_orphan_publication_custody(tmp_path: Path, custody: str) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    statements: dict[str, tuple[str, tuple[object, ...]]] = {
+        "ready_replay_proof_page": (
+            "INSERT INTO ready_replay_proof_page VALUES (?,?,?,?,?,?)",
+            ("a" * 64, 0, 0, 1, b"b" * 32, b"c" * 32),
+        ),
+        "publication_cohort_member": (
+            "INSERT INTO publication_cohort_member VALUES (?,?,?,?,?,?,?,?,?)",
+            ("orphan", 0, "a" * 32, 0, 0, "sealed_waiting", 0, "b" * 64, 0),
+        ),
+        "ready_stage_range": (
+            "INSERT INTO ready_stage_range VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("orphan", 0, 0, "a" * 32, 0, 1, bytes(8), (1).to_bytes(8), 0, 0, None, None, None, None, None, None),
+        ),
+        "ready_v2_stage_range": (
+            "INSERT INTO ready_v2_stage_range VALUES (?,?,?,?,?,?,?,?)",
+            ("a" * 64, 0, "b" * 32, 0, 1, bytes(8), (1).to_bytes(8), "c" * 64),
+        ),
+    }
+    with closing(sqlite3.connect(db.path)) as connection:
+        statement_key = custody
+        if custody == "cohort_member_missing_source":
+            connection.execute(
+                "INSERT INTO publication_cohort(cohort_id,lifecycle,cursor) VALUES ('orphan','accepted',0)"
+            )
+            statement_key = "publication_cohort_member"
+        elif custody == "v2_stage_range_missing_source":
+            connection.execute(
+                "INSERT INTO ready_v2_output_stage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "a" * 64,
+                    "group",
+                    "/owned/stage",
+                    bytes(32),
+                    bytes(8),
+                    "b" * 64,
+                    "c" * 64,
+                    b"descriptor",
+                    "d" * 64,
+                    "e" * 64,
+                    "f" * 64,
+                    1,
+                    1,
+                    1,
+                    1,
+                    None,
+                    "owner",
+                    None,
+                ),
+            )
+            statement_key = "ready_v2_stage_range"
+        connection.execute(*statements[statement_key])
+        connection.commit()
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="publication custody"):
+        open_runtime_state(layout)
+
+
+def test_current_runtime_preserves_v2_replay_proof_pages(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    bundle_id = "a" * 64
+    with closing(db.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO ready_replay_proof VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                bundle_id,
+                "active",
+                "v2-stage",
+                "v2-owner",
+                1,
+                "b" * 64,
+                "c" * 64,
+                b"index",
+                b"runs",
+                b"metadata",
+                "d" * 64,
+                "omi-audio-v2",
+                bytes(8),
+                "e" * 64,
+                1,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO ready_replay_proof_page VALUES (?,?,?,?,?,?)",
+            (bundle_id, 0, 0, 1, b"f" * 32, b"g" * 32),
+        )
+        connection.commit()
+    before = layout.collector.state_db.read_bytes()
+
+    opened = open_runtime_state(layout, read_only=True)
+
+    assert opened.path == db.path
+    assert layout.collector.state_db.read_bytes() == before
+    with closing(opened.open_connection(read_only=True)) as connection:
+        proof = cast(tuple[object, ...] | None, connection.execute("SELECT format FROM ready_replay_proof").fetchone())
+        page = cast(
+            tuple[object, ...] | None,
+            connection.execute("SELECT hashes,page_sha256 FROM ready_replay_proof_page").fetchone(),
+        )
+        assert proof is not None and tuple(proof) == ("omi-audio-v2",)
+        assert page is not None and tuple(page) == (b"f" * 32, b"g" * 32)
+
+
 def test_runtime_schema_validation_does_not_scan_retained_audio(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
@@ -105,7 +451,7 @@ def test_canonical_validation_uses_bounded_mode_specific_timeout(
     assert timeouts == [expected_timeout]
 
 
-def test_current_runtime_accepts_only_sql_owned_partial_ready_stage(tmp_path: Path) -> None:
+def test_current_runtime_rejects_legacy_ready_stage_scratch(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
@@ -125,18 +471,8 @@ def test_current_runtime_accepts_only_sql_owned_partial_ready_stage(tmp_path: Pa
             (stage_id, identity, str(stage), "c" * 64, stage_id),
         )
         connection.commit()
-    assert open_runtime_state(layout, read_only=True).path == db.path
-
-    foreign = layout.publication.root / ".legacy-v1-scratch"
-    foreign.mkdir()
-    with pytest.raises(InternalAudioCutoverRequiredError, match="unowned ready scratch"):
+    with pytest.raises(InternalAudioCutoverRequiredError, match="publication custody"):
         open_runtime_state(layout)
-    foreign.rmdir()
-    stage.joinpath("foreign-marker").write_bytes(b"foreign")
-    with pytest.raises(InternalAudioCutoverRequiredError, match="unowned ready scratch"):
-        open_runtime_state(layout)
-    stage.joinpath("foreign-marker").unlink()
-    assert open_runtime_state(layout).path == db.path
 
 
 def test_current_runtime_rejects_unowned_stage_lookalike(tmp_path: Path) -> None:
@@ -149,53 +485,56 @@ def test_current_runtime_rejects_unowned_stage_lookalike(tmp_path: Path) -> None
         open_runtime_state(layout)
 
 
-def test_current_runtime_accepts_owned_v2_stage_inventory_and_rejects_unsafe_entries(tmp_path: Path) -> None:
+def test_current_runtime_accepts_owned_v2_stage_inventory_and_rejects_unsafe_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
-    cohort_id, artifact_id = "a" * 64, "b" * 64
-    identity = f"{cohort_id}:0:{artifact_id}"
-    stage_id = sha256(identity.encode()).hexdigest()
-    stage = layout.publication.root / f".{artifact_id}.{stage_id[:16]}.stage"
-    stage.mkdir(parents=True)
-    audio = stage / "audio.ogg"
-    manifest = stage / "manifest.json"
+    store = InternalAudioStore(db)
+    record = (100).to_bytes(4, "big") + bytes((2, 8, 1)) + bytes(AUDIO_RECORD_SIZE - 7)
+    source_id = "e" * 32
+    store.create_source(source_id, "attempt", 10, 11)
+    source = store.prepare_leg(source_id, 10, 1)
+    source = store.record_read_begin(source_id, 10, 1)
+    store.commit_drain(source_id, 0, (record,), DrainCheckpoint(source.current_leg_generation))
+    source = store.get_source(source_id)
+    assert source is not None
+    store.seal_source(
+        source_id,
+        leg_generation=source.current_leg_generation,
+        expected_count=source.committed_count,
+        expected_sha256=source.committed_sha256,
+    )
+    layout.publication.root.mkdir(mode=0o2750)
+    layout.publication.root.chmod(0o2750)
+    original_materialize = ready_bundles._materialize_v2_stage_with_failure_latch
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("simulated loss after stage intent")
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt)
+    with pytest.raises(ReadyBundleError, match="simulated loss"):
+        finalize_public_audio_v2(
+            store,
+            (ready_bundles.SqlitePublicationSource(store, source_id),),
+            layout.publication.root,
+            PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 11, True),
+        )
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original_materialize)
+    with closing(db.open_connection(read_only=True)) as connection:
+        stage = ready_bundles._sql_one(connection.execute("SELECT owned_path FROM ready_v2_output_stage"))
+        assert stage is not None and isinstance(stage[0], str)
+        stage_path = Path(stage[0])
+    stage_path.mkdir()
+    audio = stage_path / "audio.ogg"
+    manifest = stage_path / "manifest.json"
     audio.write_bytes(b"audio")
-    with closing(db.open_connection()) as connection:
-        connection.execute(
-            "INSERT INTO publication_cohort(cohort_id,lifecycle,cursor) VALUES (?,'staging',0)", (cohort_id,)
-        )
-        connection.execute(
-            "INSERT INTO ready_v2_output_stage(stage_id,group_identity,owned_path,stage_nonce,public_order,"
-            "artifact_id,config_sha256,descriptor,descriptor_sha256,expected_audio_sha256,"
-            "expected_manifest_sha256,expected_physical_count,expected_packet_count,expected_page_count,"
-            "expected_audio_bytes,pending_overflow_size,owner_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                stage_id,
-                identity,
-                str(stage),
-                bytes(32),
-                bytes(8),
-                artifact_id,
-                "c" * 64,
-                b"descriptor",
-                "d" * 64,
-                "e" * 64,
-                "f" * 64,
-                1,
-                1,
-                1,
-                5,
-                None,
-                stage_id,
-            ),
-        )
-        connection.commit()
-
-    assert open_runtime_state(layout, read_only=True).path == db.path
     manifest.write_bytes(b"manifest")
+    store.close()
+
     assert open_runtime_state(layout, read_only=True).path == db.path
 
-    foreign = stage / "foreign-marker"
+    foreign = stage_path / "foreign-marker"
     foreign.write_bytes(b"foreign")
     with pytest.raises(InternalAudioCutoverRequiredError, match="unowned ready scratch"):
         open_runtime_state(layout)

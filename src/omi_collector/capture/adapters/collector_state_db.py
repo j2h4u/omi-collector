@@ -513,7 +513,7 @@ class StateDB(_Operations):
                     (
                         StateKind.PUBLICATION_CONTRACT.value,
                         "current",
-                        _encode({"version": 1, "mode": "legacy_open", "next_public_order": None}),
+                        _encode({"version": 1, "mode": "v2_open", "next_public_order": 0}),
                     ),
                 )
             elif version != _SCHEMA_VERSION or "state" not in tables:

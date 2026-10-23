@@ -7,7 +7,6 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
-from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
@@ -20,13 +19,18 @@ from omi_collector.capture.adapters.debug_logging import (
     write_runtime_status_event,
 )
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
-from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.quality_metrics import (
     QualityMetricsError,
     SQLiteQualityMetrics,
     import_quality_events,
     quality_event_id,
+)
+from omi_collector.capture.adapters.ready_bundles import (
+    PublicAudioV2Options,
+    SqlitePublicationSource,
+    finalize_public_audio_v2,
 )
 from omi_collector.capture.application.quality_metrics import (
     AdvertisementMetric,
@@ -38,9 +42,10 @@ from omi_collector.capture.application.storage_fault import (
     FatalInternalAudioStorageError,
     TransientInternalAudioStorageError,
 )
+from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.capture.domain.operational_status_machine import OperationalDimension, OperationalSignal
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
-from omi_collector.config import QualityMetricsConfig
+from omi_collector.config import QualityMetricsConfig, ReadyConfig
 from omi_collector.operator_status import OperatorStatusError, collect_operator_status
 from omi_collector.spool_metrics import FirmwareLifetimeMetrics, SpoolMetrics, SpoolWindowMetrics
 from omi_collector.state_migration import open_runtime_state
@@ -99,32 +104,39 @@ def test_operator_status_reads_ready_metadata_without_opening_audio(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     layout = _layout(tmp_path)
-    _state_db(layout)
-    raw = bytes(RECORD_SIZE)
-    digest = sha256(raw).hexdigest()
-    bundle_id = sha256(f"10:11:{digest}".encode()).hexdigest()
-    bundle = layout.publication.root / bundle_id
-    bundle.mkdir(parents=True)
-    (bundle / "records.bin").write_bytes(raw)
-    (bundle / "manifest.json").write_text(
-        json.dumps(
-            {
-                "bundle_id": bundle_id,
-                "start_sequence": 10,
-                "next_sequence": 11,
-                "record_count": 1,
-                "record_size": RECORD_SIZE,
-                "records_sha256": digest,
-                "draft_raw_sha256": digest,
-                "time_ranges": [{"start_sequence": 10, "next_sequence": 11, "utc": None}],
-            }
-        ),
-        encoding="utf-8",
+    layout.publication.root.mkdir(parents=True)
+    layout.publication.root.chmod(0o2750)
+    database = _state_db(layout)
+    store = InternalAudioStore(database)
+    raw = (10).to_bytes(4, "big") + bytes((2, 8, 1)) + bytes(AUDIO_RECORD_SIZE - 7)
+    source_id = "a" * 32
+    store.create_source(source_id, "attempt", 10, 11)
+    source = store.prepare_leg(source_id, 10, 1)
+    source = store.record_read_begin(source_id, 10, 1)
+    store.commit_drain(source_id, 0, (raw,), DrainCheckpoint(source.current_leg_generation))
+    source = store.get_source(source_id)
+    assert source is not None
+    store.seal_source(
+        source_id,
+        leg_generation=source.current_leg_generation,
+        expected_count=source.committed_count,
+        expected_sha256=source.committed_sha256,
     )
+    outcome = finalize_public_audio_v2(
+        store,
+        (SqlitePublicationSource(store, source_id),),
+        layout.publication.root,
+        PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 11, True, 128),
+    )
+    assert len(outcome.published) == 1
+    bundle = outcome.published[0].path
+    ledger = database.get(StateKind.READY_PUBLICATION, bundle.name)
+    assert ledger is not None and ledger["format"] == "omi-audio-v2"
+    assert cast(int, ledger["packet_count"]) > 0
     original_open = Path.open
 
     def guarded_open(path: Path, *args: object, **kwargs: object) -> object:
-        if path.name == "records.bin":
+        if path.name == "audio.ogg":
             raise AssertionError("operator status must not open audio payloads")
         return cast(Callable[..., object], original_open)(path, *args, **kwargs)
 
@@ -133,8 +145,11 @@ def test_operator_status_reads_ready_metadata_without_opening_audio(
     status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
     publication = cast(dict[str, object], status["publication"])
+    physical_records = cast(int, ledger["next_sequence"]) - cast(int, ledger["start_sequence"])
     assert publication["bundle_count"] == 1
-    assert publication["downloaded_raw_bytes"] == RECORD_SIZE
+    assert publication["downloaded_records"] == physical_records
+    assert publication["downloaded_raw_bytes"] == physical_records * RECORD_SIZE
+    store.close()
 
 
 def test_operator_status_reads_committed_state_during_runtime_write(tmp_path: Path) -> None:

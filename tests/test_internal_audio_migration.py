@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
@@ -90,7 +91,7 @@ def test_existing_v4_without_receipt_is_accepted_without_rewrite(tmp_path: Path)
     assert layout.collector.state_db.read_bytes() == before
 
 
-def _downgrade_current_database_to_v3(path: Path) -> None:
+def _downgrade_current_database_to_v3(path: Path, *, with_active_proof: bool = True) -> None:
     bundle_id = "a" * 64
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
@@ -100,55 +101,126 @@ def _downgrade_current_database_to_v3(path: Path) -> None:
         connection.execute("DROP TABLE ready_replay_proof")
         connection.execute(_V3_REPLAY_PROOF_DDL)
         connection.execute(_AUDIO_DDL[11])
-        connection.execute(
-            "INSERT INTO ready_replay_proof VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                bundle_id,
-                "active",
-                "stage",
-                "owner",
-                129,
-                "b" * 64,
-                "c" * 64,
-                b"index",
-                b"runs",
-                b"metadata",
-                "d" * 64,
-            ),
-        )
-        connection.executemany(
-            "INSERT INTO ready_replay_proof_page VALUES (?,?,?,?,?,?)",
-            (
-                (bundle_id, 0, 0, 128, b"x" * (128 * 32), b"y" * 32),
-                (bundle_id, 1, 128, 1, b"z" * 32, b"w" * 32),
-            ),
-        )
+        if with_active_proof:
+            connection.execute(
+                "INSERT INTO ready_replay_proof VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    bundle_id,
+                    "active",
+                    "stage",
+                    "owner",
+                    129,
+                    "b" * 64,
+                    "c" * 64,
+                    b"index",
+                    b"runs",
+                    b"metadata",
+                    "d" * 64,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO ready_replay_proof_page VALUES (?,?,?,?,?,?)",
+                (
+                    (bundle_id, 0, 0, 128, b"x" * (128 * 32), b"y" * 32),
+                    (bundle_id, 1, 128, 1, b"z" * 32, b"w" * 32),
+                ),
+            )
         connection.execute("DELETE FROM state WHERE kind=? AND id='current'", (StateKind.PUBLICATION_CONTRACT.value,))
         connection.execute("PRAGMA user_version = 3")
         connection.commit()
 
 
-def test_v3_migration_preserves_proof_pages_and_seeds_legacy_contract(tmp_path: Path) -> None:
+def _downgrade_current_database_to_v2(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE ready_v2_stage_range")
+        connection.execute("DROP TABLE ready_v2_output_stage")
+        connection.execute("DROP TABLE ready_replay_proof_page")
+        connection.execute("DROP TABLE ready_replay_proof")
+        connection.execute("DELETE FROM state WHERE kind=? AND id='current'", (StateKind.PUBLICATION_CONTRACT.value,))
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+
+
+def test_drained_v2_migration_seeds_v2_contract(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     StateDB(layout.collector.state_db)
-    _downgrade_current_database_to_v3(layout.collector.state_db)
+    _downgrade_current_database_to_v2(layout.collector.state_db)
+
+    assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert StateDB(layout.collector.state_db, read_only=True).get(StateKind.PUBLICATION_CONTRACT, "current") == {
+        "version": 1,
+        "mode": "v2_open",
+        "next_public_order": 0,
+    }
+
+
+def test_v2_migration_refuses_active_legacy_publication_without_mutation(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    database = StateDB(layout.collector.state_db)
+    digest = "a" * 64
+    bundle_id = sha256(f"0:1:{digest}".encode()).hexdigest()
+    database.put(
+        StateKind.READY_PUBLICATION,
+        bundle_id,
+        {
+            "records_sha256": "b" * 64,
+            "state": "ready",
+            "start_sequence": 0,
+            "next_sequence": 1,
+            "draft_raw_sha256": digest,
+        },
+    )
+    _downgrade_current_database_to_v2(layout.collector.state_db)
+
+    with pytest.raises(InternalAudioMigrationError, match="must retire"):
+        initialize_collector_state(layout)
+
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("SELECT payload FROM state WHERE id=?", (bundle_id,)).fetchone() is not None
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name='ready_replay_proof'").fetchone() is None
+
+
+def test_v2_migration_refuses_legacy_stage_without_mutation(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    StateDB(layout.collector.state_db)
+    _downgrade_current_database_to_v2(layout.collector.state_db)
+    cohort_id, bundle_id = "a" * 64, "b" * 64
+    identity = f"{cohort_id}:0:{bundle_id}"
+    stage_id = "c" * 64
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        connection.execute(
+            "INSERT INTO publication_cohort(cohort_id,lifecycle,cursor) VALUES (?,'staging',0)", (cohort_id,)
+        )
+        connection.execute(
+            "INSERT INTO ready_output_stage(stage_id,group_identity,owned_path,expected_bundle_digest,"
+            "expected_record_count,expected_slice_count,owner_token) VALUES (?,?,?,?,1,1,?)",
+            (stage_id, identity, str(layout.publication.root / "owned.stage"), "d" * 64, stage_id),
+        )
+        connection.commit()
+
+    with pytest.raises(InternalAudioMigrationError, match="publication work must finish"):
+        initialize_collector_state(layout)
+
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("SELECT stage_id FROM ready_output_stage").fetchone() == (stage_id,)
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name='ready_replay_proof'").fetchone() is None
+
+
+def test_drained_v3_migration_seeds_v2_contract_with_empty_proof_tables(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    StateDB(layout.collector.state_db)
+    _downgrade_current_database_to_v3(layout.collector.state_db, with_active_proof=False)
 
     assert inspect_collector_state(layout) == {"schema_version": 3, "status": "state_compatible"}
     assert initialize_collector_state(layout) == {"schema_version": 4}
 
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (4,)
-        assert connection.execute(
-            "SELECT format,public_order,audio_sha256,packet_count FROM ready_replay_proof"
-        ).fetchone() == ("legacy-records-v1", None, None, None)
-        page_rows = cast(
-            list[tuple[int, int, int, int, int]],
-            connection.execute(
-                "SELECT page_ordinal,first_record_index,record_count,length(hashes),length(page_sha256) "
-                "FROM ready_replay_proof_page ORDER BY page_ordinal"
-            ).fetchall(),
-        )
-        assert page_rows == [(0, 0, 128, 4096, 32), (1, 128, 1, 32, 32)]
+        assert connection.execute("SELECT count(*) FROM ready_replay_proof").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM ready_replay_proof_page").fetchone() == (0,)
         v2_table_rows = cast(
             list[tuple[str]],
             connection.execute(
@@ -158,17 +230,111 @@ def test_v3_migration_preserves_proof_pages_and_seeds_legacy_contract(tmp_path: 
         assert {row[0] for row in v2_table_rows} == {"ready_v2_output_stage", "ready_v2_stage_range"}
     assert StateDB(layout.collector.state_db, read_only=True).get(StateKind.PUBLICATION_CONTRACT, "current") == {
         "version": 1,
-        "mode": "legacy_open",
-        "next_public_order": None,
+        "mode": "v2_open",
+        "next_public_order": 0,
     }
 
 
-def test_v3_migration_rolls_back_schema_and_proof_pages_on_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_v3_migration_refuses_active_legacy_proof_without_any_mutation(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     StateDB(layout.collector.state_db)
     _downgrade_current_database_to_v3(layout.collector.state_db)
+    before_bytes = layout.collector.state_db.read_bytes()
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        before = (
+            connection.execute("PRAGMA user_version").fetchone(),
+            connection.execute("SELECT * FROM ready_replay_proof").fetchall(),
+            connection.execute("SELECT * FROM ready_replay_proof_page ORDER BY page_ordinal").fetchall(),
+        )
+
+    with pytest.raises(InternalAudioMigrationError, match="replay-proof custody must resolve"):
+        initialize_collector_state(layout)
+
+    assert layout.collector.state_db.read_bytes() == before_bytes
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert (
+            connection.execute("PRAGMA user_version").fetchone(),
+            connection.execute("SELECT * FROM ready_replay_proof").fetchall(),
+            connection.execute("SELECT * FROM ready_replay_proof_page ORDER BY page_ordinal").fetchall(),
+        ) == before
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ready_v2_output_stage'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_v3_migration_refuses_malformed_retired_ledger_before_any_mutation(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    database = StateDB(layout.collector.state_db)
+    database.put(
+        StateKind.READY_PUBLICATION,
+        "a" * 64,
+        {
+            "records_sha256": "invalid",
+            "state": "retired",
+            "start_sequence": 0,
+            "next_sequence": 1,
+            "draft_raw_sha256": "c" * 64,
+        },
+    )
+    _downgrade_current_database_to_v3(layout.collector.state_db, with_active_proof=False)
+    before_bytes = layout.collector.state_db.read_bytes()
+
+    assert inspect_collector_state(layout) == {"schema_version": 3, "status": "state_compatible"}
+    with pytest.raises(InternalAudioMigrationError, match="retired ready publication metadata is invalid"):
+        initialize_collector_state(layout)
+
+    assert layout.collector.state_db.read_bytes() == before_bytes
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+
+
+@pytest.mark.parametrize(
+    ("table", "reason"),
+    (
+        ("ready_replay_proof_page", "replay-proof custody must resolve"),
+        ("publication_cohort_member", "publication work must finish"),
+        ("ready_stage_range", "publication work must finish"),
+    ),
+)
+def test_v3_migration_refuses_orphan_legacy_custody_without_mutation(tmp_path: Path, table: str, reason: str) -> None:
+    layout = _layout(tmp_path)
+    StateDB(layout.collector.state_db)
+    _downgrade_current_database_to_v3(layout.collector.state_db, with_active_proof=False)
+    statements: dict[str, tuple[str, tuple[object, ...]]] = {
+        "ready_replay_proof_page": (
+            "INSERT INTO ready_replay_proof_page VALUES (?,?,?,?,?,?)",
+            ("a" * 64, 0, 0, 1, b"b" * 32, b"c" * 32),
+        ),
+        "publication_cohort_member": (
+            "INSERT INTO publication_cohort_member VALUES (?,?,?,?,?,?,?,?,?)",
+            ("orphan", 0, "a" * 32, 0, 0, "sealed_waiting", 0, "b" * 64, 0),
+        ),
+        "ready_stage_range": (
+            "INSERT INTO ready_stage_range VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("orphan", 0, 0, "a" * 32, 0, 1, bytes(8), (1).to_bytes(8), 0, 0, None, None, None, None, None, None),
+        ),
+    }
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        connection.execute(*statements[table])
+        connection.commit()
+    before = layout.collector.state_db.read_bytes()
+
+    with pytest.raises(InternalAudioMigrationError, match=reason):
+        initialize_collector_state(layout)
+
+    assert layout.collector.state_db.read_bytes() == before
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute(f"SELECT count(*) FROM {table}").fetchone() == (1,)
+
+
+def test_v3_migration_rolls_back_schema_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout = _layout(tmp_path)
+    StateDB(layout.collector.state_db)
+    _downgrade_current_database_to_v3(layout.collector.state_db, with_active_proof=False)
     import omi_collector.internal_audio_migration as migration
 
     original = migration.install_public_audio_v2_schema_for_upgrade
@@ -183,7 +349,7 @@ def test_v3_migration_rolls_back_schema_and_proof_pages_on_failure(
 
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (3,)
-        assert connection.execute("SELECT count(*) FROM ready_replay_proof_page").fetchone() == (2,)
+        assert connection.execute("SELECT count(*) FROM ready_replay_proof_page").fetchone() == (0,)
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ready_v2_output_stage'"
@@ -215,6 +381,42 @@ def test_unknown_existing_v0_database_is_refused_unchanged(tmp_path: Path) -> No
     with pytest.raises(InternalAudioMigrationError):
         initialize_collector_state(layout)
     assert path.read_bytes() == before
+
+
+def test_active_legacy_publication_refusal_is_preserved_through_initialization(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    database = StateDB(layout.collector.state_db)
+    database.put(
+        StateKind.PUBLICATION_CONTRACT,
+        "current",
+        {"version": 1, "mode": "v2_open", "next_public_order": 0},
+    )
+    database.put(
+        StateKind.READY_PUBLICATION,
+        "a" * 64,
+        {
+            "records_sha256": "b" * 64,
+            "state": "ready",
+            "start_sequence": 0,
+            "next_sequence": 1,
+            "draft_raw_sha256": "c" * 64,
+        },
+    )
+    before = layout.collector.state_db.read_bytes()
+
+    inspection = inspect_collector_state(layout)
+    assert inspection == {
+        "detail": "active legacy publication must retire before this release",
+        "reason": "state_validation_failed",
+        "status": "state_refused",
+    }
+    with pytest.raises(
+        InternalAudioMigrationError,
+        match="read-only check-state first: active legacy publication must retire before this release",
+    ):
+        initialize_collector_state(layout)
+
+    assert layout.collector.state_db.read_bytes() == before
 
 
 def test_v1_is_refused_without_modification(tmp_path: Path) -> None:

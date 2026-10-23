@@ -1,4 +1,4 @@
-"""Publication space admission depends on bounded metadata work, not unrelated audio pages."""
+"""Public v2 space admission reserves bounded metadata work, not unrelated audio pages."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import ready_bundles
-from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateDB
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_PAYLOAD_SIZE,
@@ -20,10 +19,11 @@ from omi_collector.capture.adapters.internal_audio_store import (
     InternalAudioStore,
 )
 from omi_collector.capture.adapters.ready_bundles import (
+    PublicAudioV2Options,
     ReadyOutcomeState,
     SqlitePublicationSource,
-    finalize_typed_sources,
 )
+from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.config import ReadyConfig
 
 _FILLER_RECORDS = 20_000
@@ -69,8 +69,9 @@ def _sealed_source(store: InternalAudioStore) -> SqlitePublicationSource:
     return SqlitePublicationSource(store, source_id)
 
 
-def test_unrelated_large_audio_database_does_not_set_publication_journal_reserve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("split_filesystem", [False, True], ids=["shared-device", "split-devices"])
+def test_v2_reserve_ignores_unrelated_audio_pages_and_checks_each_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, split_filesystem: bool
 ) -> None:
     database = StateDB(tmp_path / "state.sqlite3")
     store = InternalAudioStore(database)
@@ -85,29 +86,31 @@ def test_unrelated_large_audio_database_does_not_set_publication_journal_reserve
         page_count = cast(int, connection.execute("PRAGMA page_count").fetchone()[0])
     database_bytes = max(database.path.stat().st_size, page_size * page_count)
     available = ready_bundles._TYPED_SPACE_HEADROOM + _FREE_ABOVE_HEADROOM
-    old_whole_database_reserve = (
-        ready_bundles._TYPED_SPACE_HEADROOM
-        + database_bytes
-        + ready_bundles._TYPED_JOURNAL_MARGIN_PAGES * page_size
-        + AUDIO_RECORD_SIZE
-    )
-    assert old_whole_database_reserve > available
+    assert ready_bundles._TYPED_SPACE_HEADROOM + database_bytes > available
+
+    real_stat = Path.stat
+    database_device = real_stat(database.path).st_dev
+
+    def fake_stat(path: Path, *, follow_symlinks: bool = True):
+        result = real_stat(path, follow_symlinks=follow_symlinks)
+        device = (database_device + 1) if split_filesystem and path == database.path else result.st_dev
+        return type(result)([*tuple(result)[:2], device, *tuple(result)[3:]]) if device != result.st_dev else result
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    checked: list[Path] = []
 
     class _Available:
         f_frsize = 4096
         f_bavail = available // f_frsize
 
-    monkeypatch.setattr(ready_bundles.os, "statvfs", lambda _path: _Available())
-    outcome = finalize_typed_sources(
+    monkeypatch.setattr(ready_bundles.os, "statvfs", lambda path: checked.append(Path(path)) or _Available())
+    outcome = ready_bundles.finalize_public_audio_v2(
         store,
         (source,),
         ready,
-        config=ReadyConfig(target_audio_seconds=0.02),
-        clock_segments=ClockSegmentMap(()),
-        frontier=101,
-        drained=True,
+        PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 101, True, 128),
     )
 
     assert outcome.state is ReadyOutcomeState.PUBLISHED
-    assert outcome.published[0].path.joinpath("records.bin").read_bytes() == _record(100, 1)
+    assert set(checked) == ({ready} if not split_filesystem else {ready, database.path.parent})
     store.close()

@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from contextlib import closing
 from hashlib import sha256
+from json import loads
 from pathlib import Path
 from typing import cast
 
@@ -14,15 +15,12 @@ import pytest
 from omi_collector.capture.adapters import collector_state_db
 from omi_collector.capture.adapters import quarantine as quarantine_module
 from omi_collector.capture.adapters.attempts import RecordAcceptanceError
-from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateDBError, StateKind
-from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore, InternalAudioStoreError
+from omi_collector.capture.adapters.internal_audio_store import InternalAudioStoreError
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine import QuarantineCustodyHoldError, QuarantinePublishError
 from omi_collector.capture.adapters.ready_bundles import (
     ReadyOutcomeState,
-    SqlitePublicationSource,
-    finalize_typed_sources,
 )
 from omi_collector.capture.adapters.staging_contract import StagingError
 from omi_collector.capture.application.storage_fault import (
@@ -416,72 +414,6 @@ def test_salvaged_prefix_remains_in_sql_until_below_threshold_packaging(
         attempt.close()
 
 
-def test_replay_conflict_requires_quarantine_admission_before_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = 1_000_000_000
-    monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
-    store = _store(
-        tmp_path,
-        config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
-    )
-    attempt = _attempt(store)
-    source_id = attempt.attempt_id
-    raw = _opus_record(1, 1)
-    attempt.accept_chunk(100, raw)
-    with pytest.raises(RecordAcceptanceError, match="conflict"):
-        attempt.accept_chunk(100, _record(9))
-    attempt.close()
-    ready = tmp_path / "ready"
-    ready.mkdir(mode=0o2750)
-    ready.chmod(0o2750)
-
-    with InternalAudioStore(store.state_db) as audio_store:
-        reader = SqlitePublicationSource(audio_store, source_id)
-        waiting = finalize_typed_sources(
-            audio_store,
-            (reader,),
-            ready,
-            config=ReadyConfig(target_audio_seconds=0.02),
-            clock_segments=ClockSegmentMap(()),
-            frontier=101,
-            drained=True,
-        )
-    assert waiting.state is ReadyOutcomeState.WAITING
-    assert not tuple(ready.iterdir())
-    before = _source_row(store, source_id)
-    assert before is not None and before[3] == "unclassified"
-    assert before[6] is None
-    now += 1_000_000_000
-    assert store.sweep_terminal_quarantine().removed_source_ids == ()
-    retained = _source_row(store, source_id)
-    assert retained is not None and retained[3] == "unclassified"
-    with closing(store.state_db.open_connection(read_only=True)) as connection:
-        assert (
-            connection.execute("SELECT 1 FROM capture_conflict WHERE source_id = ?", (source_id,)).fetchone()
-            is not None
-        )
-
-    admission = store.admit_quarantined_prefix(source_id)
-    assert (admission.record_count, admission.raw_sha256) == (1, sha256(raw).hexdigest())
-    with InternalAudioStore(store.state_db) as audio_store:
-        published = finalize_typed_sources(
-            audio_store,
-            (SqlitePublicationSource(audio_store, source_id),),
-            ready,
-            config=ReadyConfig(target_audio_seconds=0.02),
-            clock_segments=ClockSegmentMap(()),
-            frontier=101,
-            drained=True,
-        )
-    assert published.state is ReadyOutcomeState.PUBLISHED
-
-    admitted = _source_row(store, source_id)
-    assert admitted is not None and isinstance(admitted[6], str)
-    assert admitted[6] == str(now + 1_000_000_000)
-    assert admitted[3] == "published_prefix"
-
-
 def test_standalone_evidence_owns_its_terminal_retention(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_000_000_000
     monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
@@ -786,8 +718,7 @@ def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_r
         zero.close(durable=True)
         store.terminalize_prefix_attempt(zero_id)
 
-        raw = _opus_record(2, 2)
-        sealed.accept_chunk(101, raw)
+        sealed.accept_chunk(101, _opus_record(2, 2))
         sealed.seal(DoneNotification(0, 102))
         sealed_id = sealed.attempt_id
         sealed.close(durable=True)
@@ -806,7 +737,15 @@ def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_r
         assert store.sweep_terminal_quarantine().removed_source_ids == (zero_id,)
         published = store.recover_and_publish()
         assert published.state is ReadyOutcomeState.PUBLISHED
-        assert published.published[0].path.joinpath("records.bin").read_bytes() == raw
+        artifact = published.published[0]
+        audio = artifact.path.joinpath("audio.ogg").read_bytes()
+        manifest = cast(dict[str, object], loads(artifact.path.joinpath("manifest.json").read_text(encoding="utf-8")))
+        assert {item.name for item in artifact.path.iterdir()} == {"audio.ogg", "manifest.json"}
+        assert artifact.record_count == 1
+        assert artifact.next_sequence == 102
+        assert manifest["id"] == artifact.bundle_id
+        assert manifest["packet_count"] == 1
+        assert manifest["audio_sha256"] == sha256(audio).hexdigest()
 
         restarted = StagingStore.from_paths(
             bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config

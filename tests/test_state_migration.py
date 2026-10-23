@@ -39,6 +39,15 @@ def _layout(tmp_path: Path) -> StorageLayout:
     return load_operator_config(config).storage
 
 
+def _publication_cohort_snapshot(database: StateDB) -> tuple[object, ...]:
+    with closing(database.open_connection(read_only=True)) as connection:
+        return (
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort_member")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM ready_v2_output_stage")),
+        )
+
+
 def test_runtime_never_creates_missing_database(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     with pytest.raises(StateMigrationError, match="missing"):
@@ -161,14 +170,83 @@ def test_runtime_rejects_unqualified_cohort_without_stage(
             )
         connection.commit()
 
-    with pytest.raises(InternalAudioCutoverRequiredError, match="legacy or unqualified publication cohort"):
+    with pytest.raises(InternalAudioCutoverRequiredError, match="publication cohort"):
         open_runtime_state(layout)
     with closing(db.open_connection(read_only=True)) as connection:
         assert connection.execute("SELECT count(*) FROM publication_cohort").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM ready_v2_output_stage").fetchone()[0] == 0
 
 
-def test_runtime_accepts_completed_v2_cohort_after_member_cleanup(tmp_path: Path) -> None:
+def test_runtime_rejects_valid_accepted_cohort_with_legacy_digest_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    store = InternalAudioStore(db)
+    ready = layout.publication.root
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    source_id = "f" * 32
+    record = (100).to_bytes(4, "big") + bytes((2, 8, 1)) + bytes(AUDIO_RECORD_SIZE - 7)
+    store.create_source(source_id, "attempt", 10, 11)
+    current = store.prepare_leg(source_id, 10, 1)
+    current = store.record_read_begin(source_id, 10, 1)
+    store.commit_drain(source_id, 0, (record,), DrainCheckpoint(current.current_leg_generation))
+    current = store.get_source(source_id)
+    assert current is not None
+    store.seal_source(
+        source_id,
+        leg_generation=current.current_leg_generation,
+        expected_count=current.committed_count,
+        expected_sha256=current.committed_sha256,
+    )
+
+    original_resume = ready_bundles._resume_v2_cohort
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("simulated loss after cohort acceptance")
+
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", interrupt)
+    with pytest.raises(ReadyBundleError, match="simulated loss"):
+        finalize_public_audio_v2(
+            store,
+            (ready_bundles.SqlitePublicationSource(store, source_id),),
+            ready,
+            PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 11, True),
+        )
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", original_resume)
+    cohort = ready_bundles._load_active_typed_cohort(store)
+    assert cohort is not None and cohort.lifecycle == "accepted"
+
+    wrong_digest = sha256(b"legacy publication config").hexdigest()
+    wrong_cohort_id = ready_bundles._typed_cohort_id(cohort.admissions, cohort.threshold, cohort.frontier, wrong_digest)
+    with closing(db.open_connection()) as connection:
+        member = cast(tuple[object, ...], connection.execute("SELECT * FROM publication_cohort_member").fetchone())
+        connection.execute("DELETE FROM publication_cohort_member WHERE cohort_id=?", (cohort.cohort_id,))
+        connection.execute(
+            "UPDATE publication_cohort SET cohort_id=?,accepted_permit=?,config_digest=? WHERE cohort_id=?",
+            (wrong_cohort_id, wrong_cohort_id, wrong_digest, cohort.cohort_id),
+        )
+        connection.execute(
+            "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,slice_count,"
+            "admitted_lifecycle,admitted_count,admitted_sha256,cursor) VALUES (?,?,?,?,?,?,?,?,?)",
+            (wrong_cohort_id, *member[1:]),
+        )
+        connection.commit()
+    before = _publication_cohort_snapshot(db)
+    generation = db.get_generation()
+    entries = tuple(sorted(path.name for path in ready.iterdir()))
+
+    with pytest.raises(InternalAudioCutoverRequiredError, match="legacy or unqualified publication cohort"):
+        open_runtime_state(layout)
+
+    assert _publication_cohort_snapshot(db) == before
+    assert db.get_generation() == generation
+    assert tuple(sorted(path.name for path in ready.iterdir())) == entries
+    store.close()
+
+
+def test_runtime_rejects_completed_v2_cohort_after_member_cleanup(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(
@@ -185,7 +263,8 @@ def test_runtime_accepts_completed_v2_cohort_after_member_cleanup(tmp_path: Path
         )
         connection.commit()
 
-    assert open_runtime_state(layout, read_only=True).path == db.path
+    with pytest.raises(InternalAudioCutoverRequiredError, match="unsupported publication cohort lifecycle"):
+        open_runtime_state(layout, read_only=True)
 
 
 def test_current_runtime_rejects_legacy_replay_proof_custody(tmp_path: Path) -> None:

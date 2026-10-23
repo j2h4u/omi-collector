@@ -161,17 +161,17 @@ def _validate_v2_cohorts(connection: sqlite3.Connection) -> None:
     active = _require_v2_cohort_inventory(rows)
     if len(active) > 1:
         raise InternalAudioCutoverRequiredError("multiple active publication cohorts require stopped-service repair")
-    for cohort_id, lifecycle, _ in active:
-        _validate_active_v2_cohort(connection, cohort_id, lifecycle)
+    for cohort_id, _, _ in active:
+        _validate_active_v2_cohort(connection, cohort_id)
 
 
 def _require_v2_cohort_inventory(
     rows: list[tuple[str, str, str | None]],
 ) -> tuple[tuple[str, str, str | None], ...]:
-    active = tuple(row for row in rows if row[1] in {"accepted", "staging", "complete"})
-    if any(row[1] not in {"accepted", "staging", "complete"} for row in rows):
+    active = tuple(row for row in rows if row[1] in {"accepted", "staging"})
+    if any(row[1] not in {"accepted", "staging"} for row in rows):
         raise InternalAudioCutoverRequiredError(
-            "legacy or unqualified publication cohort must retire before this release"
+            "unsupported publication cohort lifecycle requires stopped-service repair"
         )
     if any(row[2] != _v2_config_sha256() for row in rows):
         raise InternalAudioCutoverRequiredError(
@@ -180,7 +180,7 @@ def _require_v2_cohort_inventory(
     return active
 
 
-def _validate_active_v2_cohort(connection: sqlite3.Connection, cohort_id: str, lifecycle: str) -> None:
+def _validate_active_v2_cohort(connection: sqlite3.Connection, cohort_id: str) -> None:
     cohort = cast(
         tuple[str | None, int, int] | None,
         connection.execute(
@@ -200,9 +200,6 @@ def _validate_active_v2_cohort(connection: sqlite3.Connection, cohort_id: str, l
             (cohort_id,),
         ).fetchall(),
     )
-    # A completed cohort may outlive cleanup of its member snapshots.
-    if lifecycle == "complete" and not members:
-        return
     if not members:
         raise InternalAudioCutoverRequiredError("active publication cohort members are invalid")
     for expected, member in enumerate(members):

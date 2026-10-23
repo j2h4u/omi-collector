@@ -265,6 +265,32 @@ def test_v3_migration_refuses_active_legacy_proof_without_any_mutation(tmp_path:
         )
 
 
+def test_v3_migration_refuses_malformed_retired_ledger_before_any_mutation(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    database = StateDB(layout.collector.state_db)
+    database.put(
+        StateKind.READY_PUBLICATION,
+        "a" * 64,
+        {
+            "records_sha256": "invalid",
+            "state": "retired",
+            "start_sequence": 0,
+            "next_sequence": 1,
+            "draft_raw_sha256": "c" * 64,
+        },
+    )
+    _downgrade_current_database_to_v3(layout.collector.state_db, with_active_proof=False)
+    before_bytes = layout.collector.state_db.read_bytes()
+
+    assert inspect_collector_state(layout) == {"schema_version": 3, "status": "state_compatible"}
+    with pytest.raises(InternalAudioMigrationError, match="retired ready publication metadata is invalid"):
+        initialize_collector_state(layout)
+
+    assert layout.collector.state_db.read_bytes() == before_bytes
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+
+
 @pytest.mark.parametrize(
     ("table", "reason"),
     (
@@ -355,6 +381,42 @@ def test_unknown_existing_v0_database_is_refused_unchanged(tmp_path: Path) -> No
     with pytest.raises(InternalAudioMigrationError):
         initialize_collector_state(layout)
     assert path.read_bytes() == before
+
+
+def test_active_legacy_publication_refusal_is_preserved_through_initialization(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    database = StateDB(layout.collector.state_db)
+    database.put(
+        StateKind.PUBLICATION_CONTRACT,
+        "current",
+        {"version": 1, "mode": "v2_open", "next_public_order": 0},
+    )
+    database.put(
+        StateKind.READY_PUBLICATION,
+        "a" * 64,
+        {
+            "records_sha256": "b" * 64,
+            "state": "ready",
+            "start_sequence": 0,
+            "next_sequence": 1,
+            "draft_raw_sha256": "c" * 64,
+        },
+    )
+    before = layout.collector.state_db.read_bytes()
+
+    inspection = inspect_collector_state(layout)
+    assert inspection == {
+        "detail": "active legacy publication must retire before this release",
+        "reason": "state_validation_failed",
+        "status": "state_refused",
+    }
+    with pytest.raises(
+        InternalAudioMigrationError,
+        match="read-only check-state first: active legacy publication must retire before this release",
+    ):
+        initialize_collector_state(layout)
+
+    assert layout.collector.state_db.read_bytes() == before
 
 
 def test_v1_is_refused_without_modification(tmp_path: Path) -> None:

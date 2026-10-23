@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterator
-from hashlib import sha256
-from json import dumps
+from collections.abc import Iterator
 from pathlib import Path
 from struct import pack
-from typing import NoReturn, cast
+from typing import NoReturn, TypedDict, Unpack
 
 import pytest
 
@@ -18,17 +16,23 @@ from omi_collector.capture.adapters.internal_audio_store import (
     DrainCheckpoint,
     InternalAudioStore,
 )
-from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.capture.adapters.ready_bundles import (
+    PublicAudioV2Options,
     ReadyBundleError,
     ReadyOutcome,
     ReadyOutcomeState,
-    PublicAudioV2Options,
     SqlitePublicationSource,
-    finalize_public_audio_v2,
     _valid_publication_dates,
+    finalize_public_audio_v2,
 )
+from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.config import ReadyConfig
+
+
+class _FinalizeOptions(TypedDict, total=False):
+    config: ReadyConfig | None
+    frontier: int | None
+    drained: bool
 
 
 def _record(timestamp: int, marker: int) -> bytes:
@@ -100,21 +104,20 @@ def _finalize(
     store: InternalAudioStore,
     sources: tuple[SqlitePublicationSource, ...],
     ready: Path,
-    *,
-    config: ReadyConfig | None = None,
-    frontier: int | None = None,
-    drained: bool = True,
+    **options: Unpack[_FinalizeOptions],
 ) -> ReadyOutcome:
     end = max(source.source.sequence_start + source.source.committed_count for source in sources)
+    config = options.get("config") or ReadyConfig(target_audio_seconds=0.02)
+    frontier = options.get("frontier")
     return finalize_public_audio_v2(
         store,
         sources,
         ready,
         PublicAudioV2Options(
-            config or ReadyConfig(target_audio_seconds=0.02),
+            config,
             ClockState(),
             end if frontier is None else frontier,
-            drained,
+            options.get("drained", True),
         ),
     )
 

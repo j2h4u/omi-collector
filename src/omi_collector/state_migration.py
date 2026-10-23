@@ -158,61 +158,87 @@ def _validate_v2_cohorts(connection: sqlite3.Connection) -> None:
             "SELECT cohort_id,lifecycle,config_digest FROM publication_cohort ORDER BY cohort_id"
         ).fetchall(),
     )
-    active = tuple(row for row in rows if row[1] in {"accepted", "staging", "complete"})
-    if any(row[1] not in {"accepted", "staging", "complete"} or row[2] != _v2_config_sha256() for row in rows):
-        raise InternalAudioCutoverRequiredError(
-            "legacy or unqualified publication cohort must retire before this release"
-        )
+    active = _require_v2_cohort_inventory(rows)
     if len(active) > 1:
         raise InternalAudioCutoverRequiredError("multiple active publication cohorts require stopped-service repair")
     for cohort_id, lifecycle, _ in active:
-        cohort = cast(
-            tuple[str | None, int, int] | None,
-            connection.execute(
-                "SELECT accepted_permit,drained_threshold,cursor FROM publication_cohort WHERE cohort_id=?",
-                (cohort_id,),
-            ).fetchone(),
+        _validate_active_v2_cohort(connection, cohort_id, lifecycle)
+
+
+def _require_v2_cohort_inventory(
+    rows: list[tuple[str, str, str | None]],
+) -> tuple[tuple[str, str, str | None], ...]:
+    active = tuple(row for row in rows if row[1] in {"accepted", "staging", "complete"})
+    if any(row[1] not in {"accepted", "staging", "complete"} for row in rows):
+        raise InternalAudioCutoverRequiredError(
+            "legacy or unqualified publication cohort must retire before this release"
         )
-        members = cast(
-            list[tuple[int, str, int, int, str, int, str]],
-            connection.execute(
-                "SELECT member.member_ordinal,member.source_id,member.slice_start,member.slice_count,"
-                "member.admitted_lifecycle,member.admitted_count,member.admitted_sha256 "
-                "FROM publication_cohort_member AS member LEFT JOIN capture_source AS source "
-                "ON source.source_id=member.source_id WHERE member.cohort_id=? ORDER BY member.member_ordinal",
-                (cohort_id,),
-            ).fetchall(),
+    if any(row[2] != _v2_config_sha256() for row in rows):
+        raise InternalAudioCutoverRequiredError(
+            "legacy or unqualified publication cohort must retire before this release"
         )
-        if cohort is None or cohort[0] != cohort_id or type(cohort[1]) is not int or type(cohort[2]) is not int:
-            raise InternalAudioCutoverRequiredError("active publication cohort permit is invalid")
-        # A completed cohort may outlive cleanup of its member snapshots.
-        if lifecycle == "complete" and not members:
-            continue
-        if not members:
-            raise InternalAudioCutoverRequiredError("active publication cohort members are invalid")
-        for expected_ordinal, member in enumerate(members):
-            ordinal, source_id, start, count, admitted_lifecycle, admitted_count, digest = member
-            source = connection.execute(
-                "SELECT source_type,lifecycle,committed_count,committed_sha256,certified_prefix_count,coverage_digest "
-                "FROM capture_source WHERE source_id=?",
-                (source_id,),
-            ).fetchone()
-            if (
-                source is None
-                or ordinal != expected_ordinal
-                or start != 0
-                or count != admitted_count
-                or admitted_lifecycle not in {"sealed_waiting", "blocked"}
-                or not isinstance(digest, str)
-                or not _is_sha256(digest)
-                or source[1] not in {admitted_lifecycle, "covered", "retiring"}
-                or (admitted_lifecycle == "sealed_waiting" and tuple(source[2:4]) != (count, digest))
-                or (
-                    admitted_lifecycle == "blocked"
-                    and (source[0] != "quarantine" or tuple(source[4:6]) != (count, digest))
-                )
-            ):
-                raise InternalAudioCutoverRequiredError("active publication cohort source snapshot is invalid")
+    return active
+
+
+def _validate_active_v2_cohort(connection: sqlite3.Connection, cohort_id: str, lifecycle: str) -> None:
+    cohort = cast(
+        tuple[str | None, int, int] | None,
+        connection.execute(
+            "SELECT accepted_permit,drained_threshold,cursor FROM publication_cohort WHERE cohort_id=?",
+            (cohort_id,),
+        ).fetchone(),
+    )
+    if cohort is None or cohort[0] != cohort_id or type(cohort[1]) is not int or type(cohort[2]) is not int:
+        raise InternalAudioCutoverRequiredError("active publication cohort permit is invalid")
+    members = cast(
+        list[tuple[int, str, int, int, str, int, str, int]],
+        connection.execute(
+            "SELECT member.member_ordinal,member.source_id,member.slice_start,member.slice_count,"
+            "member.admitted_lifecycle,member.admitted_count,member.admitted_sha256,member.cursor "
+            "FROM publication_cohort_member AS member LEFT JOIN capture_source AS source "
+            "ON source.source_id=member.source_id WHERE member.cohort_id=? ORDER BY member.member_ordinal",
+            (cohort_id,),
+        ).fetchall(),
+    )
+    # A completed cohort may outlive cleanup of its member snapshots.
+    if lifecycle == "complete" and not members:
+        return
+    if not members:
+        raise InternalAudioCutoverRequiredError("active publication cohort members are invalid")
+    for expected, member in enumerate(members):
+        _validate_v2_cohort_member(connection, expected, member)
+
+
+def _validate_v2_cohort_member(
+    connection: sqlite3.Connection,
+    expected_ordinal: int,
+    member: tuple[int, str, int, int, str, int, str, int],
+) -> None:
+    ordinal, source_id, start, count, admitted_lifecycle, admitted_count, digest, cursor = member
+    if (
+        ordinal != expected_ordinal
+        or start != 0
+        or count != admitted_count
+        or admitted_lifecycle not in {"sealed_waiting", "blocked"}
+        or not _is_sha256(digest)
+    ):
+        raise InternalAudioCutoverRequiredError("active publication cohort member is invalid")
+    if not 0 <= cursor <= count:
+        raise InternalAudioCutoverRequiredError("active publication cohort member cursor is invalid")
+    source = cast(
+        tuple[object, ...] | None,
+        connection.execute(
+            "SELECT source_type,lifecycle,committed_count,committed_sha256,certified_prefix_count,coverage_digest "
+            "FROM capture_source WHERE source_id=?",
+            (source_id,),
+        ).fetchone(),
+    )
+    if source is None or source[1] not in {admitted_lifecycle, "covered", "retiring"}:
+        raise InternalAudioCutoverRequiredError("active publication cohort source snapshot is invalid")
+    if admitted_lifecycle == "sealed_waiting" and tuple(source[2:4]) != (count, digest):
+        raise InternalAudioCutoverRequiredError("active publication cohort source snapshot is invalid")
+    if admitted_lifecycle == "blocked" and (source[0] != "quarantine" or tuple(source[4:6]) != (count, digest)):
+        raise InternalAudioCutoverRequiredError("active publication cohort source snapshot is invalid")
 
 
 def _validate_v2(connection: sqlite3.Connection) -> None:

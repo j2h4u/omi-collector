@@ -21,7 +21,7 @@ def fake_docker(tmp_path: Path) -> tuple[Path, Path]:
         f"with open({str(log)!r}, 'a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
         "args = sys.argv[1:]\n"
-        "command = next((item for item in ('up', 'exec', 'down') if item in args), '')\n"
+        "command = next((item for item in ('build', 'up', 'exec', 'down') if item in args), '')\n"
         "if command == 'exec' and os.environ.get('FAKE_DOCKER_EXEC_DELAY'):\n"
         "    time.sleep(float(os.environ['FAKE_DOCKER_EXEC_DELAY']))\n"
         "if args[0] == 'inspect':\n"
@@ -72,6 +72,15 @@ def test_runtime_smoke_cleans_up_after_success(fake_docker: tuple[Path, Path]) -
 
     assert result.returncode == 0
     calls = _calls(log)
+    image_builds = [call for call in calls if call[0] == "build" and "omi-collector:local" in call]
+    no_build_ups = [call for call in calls if "up" in call and "--no-build" in call]
+    assert len(image_builds) == 1
+    assert len(no_build_ups) == 1
+    assert (
+        calls.index(image_builds[0])
+        < calls.index(no_build_ups[0])
+        < next(index for index, call in enumerate(calls) if "down" in call)
+    )
     assert any("down" in call for call in calls)
     inspect_calls = [call for call in calls if call[0] == "inspect"]
     assert len(inspect_calls) == 1

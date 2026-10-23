@@ -71,7 +71,7 @@ check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck ty
 
 # Unit tests.
 unit:
-    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
+    chrt --idle 0 nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -q -n auto -m "not slow"
 
 # Create or resume the one frozen, durable full-project audit job.
 [positional-arguments]
@@ -147,19 +147,19 @@ mutation-status:
 
 # Test coverage report.
 coverage:
-    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --cov=src/omi_collector --cov-report=term-missing
+    chrt --idle 0 nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -n auto --cov=src/omi_collector --cov-report=term-missing
 
 # Human CRAP report over the full suite.
 crap:
-    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --cov=src/omi_collector --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
+    chrt --idle 0 nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -n auto --cov=src/omi_collector --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
 
 # Hard CRAP gate: every function must stay at or below CRAP 30.
 crap-check:
     coverage_file="$(mktemp /tmp/omi-collector-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest --cov=src/omi_collector --cov-report=json:"$coverage_file"; pytest_status=$?; \
+    chrt --idle 0 nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -n auto --cov=src/omi_collector --cov-report=json:"$coverage_file"; pytest_status=$?; \
     if (( pytest_status != 0 )); then exit "$pytest_status"; fi; \
-    nice -n 19 ionice -c 3 uv run python -m scripts.crap_gate --coverage "$coverage_file" --src src/omi_collector --threshold 30
+    chrt --idle 0 nice -n 19 ionice -c 3 uv run python -m scripts.crap_gate --coverage "$coverage_file" --src src/omi_collector --threshold 30
 
 # Validate the collector package image and Compose file without running a service.
 docker-check:
@@ -175,7 +175,7 @@ docker-up:
     OMI_COLLECTOR_SOURCE_REVISION="$(git rev-parse --verify 'HEAD^{commit}')" docker compose up -d --force-recreate --remove-orphans --wait --wait-timeout 90
 
 # CI-safe runtime smoke: build, start, wait for health, exercise the installed CLI, and clean up.
-runtime-smoke:
+runtime-smoke: docker-build
     #!/usr/bin/env bash
     set -euo pipefail
     export OMI_COLLECTOR_SOURCE_REVISION="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -198,7 +198,7 @@ runtime-smoke:
     trap 'cleanup "$?"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    timeout --signal=TERM --kill-after=5s 600s docker compose -p "$project" up -d --build --force-recreate --remove-orphans --wait --wait-timeout 90
+    timeout --signal=TERM --kill-after=5s 600s docker compose -p "$project" up -d --no-build --force-recreate --remove-orphans --wait --wait-timeout 90
     timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" exec -T --user 1000:1000 omi-collector-qa omi-collector health
     timeout --signal=TERM --kill-after=5s 30s docker compose -p "$project" exec -T --user 1000:1000 \
         -e "OMI_COLLECTOR_SOURCE_REVISION=$OMI_COLLECTOR_SOURCE_REVISION" \
@@ -211,7 +211,7 @@ runtime-smoke:
     fi
 
 # Full local gate for agents before claiming completion.
-verify: check crap-check unit docker-build runtime-smoke
+verify: check crap-check runtime-smoke
 
 # Everything the PR and release metadata owe release-please before CI has to say no.
 release-check title="" body="":

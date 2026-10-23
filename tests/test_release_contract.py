@@ -15,6 +15,7 @@ from scripts.validate_release_notes import _split_messages, validate_release_not
 from scripts.validate_release_notes import main as validate_notes_main
 
 _ROOT = Path(__file__).parents[1]
+_JUSTFILE = (_ROOT / "Justfile").read_text(encoding="utf-8")
 _CI_WORKFLOW = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 _SQUASH_WORKFLOW = (_ROOT / ".github" / "workflows" / "squash-contract.yml").read_text(encoding="utf-8")
 _RELEASE_WORKFLOW = (_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
@@ -497,9 +498,21 @@ def test_release_job_timeout_exceeds_its_merge_poll_window() -> None:
 
 
 def test_release_prs_keep_the_complete_ci_gate() -> None:
-    for job in ("quality:", "test:", "crap:", "docker-build:", "runtime-smoke:"):
+    for job in ("quality:", "test:", "runtime-smoke:"):
         assert f"  {job}" in _CI_WORKFLOW
-    assert "needs: [pr-release-contract, quality, test, crap, docker-build, runtime-smoke]" in _CI_WORKFLOW
+    assert "needs: [pr-release-contract, quality, test, runtime-smoke]" in _CI_WORKFLOW
+    assert "run: just crap-check" in _CI_WORKFLOW
+    assert "run: just runtime-smoke" in _CI_WORKFLOW
+    assert "  crap:" not in _CI_WORKFLOW
+    assert "  docker-build:" not in _CI_WORKFLOW
+
+
+def test_full_crap_gate_uses_parallel_coverage_collection() -> None:
+    crap_recipe = re.search(r"(?ms)^crap-check:\n(?P<body>.*?)(?=^\S[^\n]*:\s*$)", _JUSTFILE)
+
+    assert crap_recipe is not None
+    assert "pytest -n auto --cov=src/omi_collector" in crap_recipe.group("body")
+    assert "chrt --idle 0 nice -n 19 ionice -c 3" in crap_recipe.group("body")
 
 
 def test_security_document_does_not_claim_unavailable_validity_checks() -> None:

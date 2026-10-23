@@ -22,9 +22,15 @@ from omi_collector import cli
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
-from omi_collector.capture.adapters.debug_logging import close_debug_logging, configure_debug_logging
+from omi_collector.capture.adapters.debug_logging import (
+    close_debug_logging,
+    configure_debug_logging,
+    read_runtime_status,
+    set_runtime_status_sink,
+)
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.publication import SealResult
+from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError, StagingError
 from omi_collector.capture.application.collector import CollectionResult
 from omi_collector.capture.application.session_lifecycle import ActivityEvent
@@ -1293,16 +1299,28 @@ def test_clock_status_clears_only_after_conclusive_reconciliation_without_pendin
 def test_sync_reporter_logs_filtered_debug_callback(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     lines: list[str] = []
     logger = configure_debug_logging(tmp_path, DebugLogConfig(logger_name="tests.debug.progress"))
+    database = StateDB(tmp_path / "collector-state.db")
+    identity = OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001")
+    operational_status = OperationalStatusStore(database, identity)
+    operational_status.initialize()
+    writer = SQLiteQualityMetrics(database, release_version="1.2.3")
+    set_runtime_status_sink(logger, writer.record_runtime_status)
     try:
         with caplog.at_level(logging.DEBUG, logger="tests.debug.progress"):
-            reporter = cli.SyncProgressReporter(emit=lines.append, debug_logger=logger)
-            reporter(_sync_progress(state="away"))
+            reporter = cli.SyncProgressReporter(
+                emit=lines.append, debug_logger=logger, operational_status=operational_status
+            )
+            reporter(_sync_progress(state="progress"))
+        assert writer.close(timeout_seconds=2)
     finally:
         close_debug_logging(logger)
 
-    assert lines == []
-    assert any('"status":"away"' in record.message for record in caplog.records)
+    assert len(lines) == 1
+    assert "invocation_id" not in json.loads(lines[0])
+    assert any('"status":"progress"' in record.message for record in caplog.records)
     assert not (tmp_path / "debug.jsonl").exists()
+    runtime = cast(dict[str, object], read_runtime_status(database))
+    assert cast(dict[str, object], runtime["progress"])["invocation_id"] == identity.invocation_id
 
 
 def test_sync_reporter_info_emits_clean_drain_cooldown_event() -> None:

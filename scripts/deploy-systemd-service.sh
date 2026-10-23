@@ -128,6 +128,13 @@ function finalize {
     if (( release_created && ! selector_published && ! deployment_committed && ! recovery_failed )); then
         rm -rf -- "$release_path" || printf 'ERROR: could not remove unpublished release: %s\n' "$release_path" >&2
     fi
+    if [[ -n "$source_snapshot" ]]; then
+        rm -rf -- "$source_snapshot" || { printf 'ERROR: could not remove source snapshot: %s\n' "$source_snapshot" >&2; (( status != 0 )) || status=1; }
+    fi
+    if (( status == 0 )); then
+        printf 'Deployed and verified omi-collector.service: pid=%s restarts=%s config=%s.\n' \
+            "$main_pid" "$restart_count" "$config_file"
+    fi
     exit "$status"
 }
 
@@ -138,7 +145,7 @@ function handle_signal {
     die "deployment interrupted by $1" "$2"
 }
 
-declare script_dir='' repo_root='' runtime_root='' releases_dir='' current_link='' lock_file=''
+declare script_dir='' repo_root='' runtime_root='' releases_dir='' current_link='' lock_file='' source_snapshot=''
 declare config_file='/srv/pipelines/omi/config.toml' state_file='/srv/pipelines/omi/collector/collector-state.sqlite3'
 declare source_revision='' release_name='' release_path='' previous_target=''
 declare initial_snapshot='' final_snapshot='' snapshot=''
@@ -167,6 +174,9 @@ source_revision=$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}') || die
 source_status=$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all) \
     || die 'could not inspect source checkout state'
 [[ -z "$source_status" ]] || die 'refusing deployment from a dirty source tree'
+source_snapshot=$(mktemp -d "${TMPDIR:-/tmp}/omi-collector-source.XXXXXX") || die 'could not create source snapshot directory'
+git -C "$repo_root" archive --format=tar "$source_revision" | tar -xf - -C "$source_snapshot" \
+    || die 'could not prepare frozen source snapshot'
 
 operator_user=$(id --user --name) || die 'cannot identify service owner'
 operator_home=$(getent passwd "$operator_user" | cut -d: -f6) || die 'cannot resolve service owner home'
@@ -197,15 +207,15 @@ release_path="${releases_dir}/${release_name}"
 mkdir -m 0755 -- "$release_path" || die 'could not create candidate release directory'
 release_created=1
 UV_PROJECT_ENVIRONMENT="$release_path" UV_LINK_MODE=hardlink \
-    uv sync --project "$repo_root" --locked --no-dev --no-editable --reinstall-package omi-collector \
+    uv sync --project "$source_snapshot" --locked --no-dev --no-editable --reinstall-package omi-collector \
     || die 'uv sync failed; the running service was not touched'
 [[ -x "$release_path/bin/python" && -x "$release_path/bin/omi-collector" ]] || die 'candidate environment is incomplete'
 resolved_package=$("$release_path/bin/python" -I -B -c 'import importlib.util; from pathlib import Path; spec=importlib.util.find_spec("omi_collector"); print(Path(next(iter(spec.submodule_search_locations))).resolve() if spec and spec.submodule_search_locations else "")') \
     || die 'candidate package could not be imported'
 [[ "$resolved_package" == "$release_path"/* ]] || die 'candidate imports package outside its release environment'
 diff --recursive --brief --exclude __pycache__ --exclude '*.pyc' --exclude '*.pyo' \
-    "$repo_root/src/omi_collector" "$resolved_package" >/dev/null \
-    || die 'installed candidate package differs from the checked-out source'
+    "$source_snapshot/src/omi_collector" "$resolved_package" >/dev/null \
+    || die 'installed candidate package differs from the frozen source revision'
 mkdir -p -- "$release_path/share/omi-collector" || die 'could not create release metadata directory'
 python3 -I -S - "$release_path/share/omi-collector/release.json" "$source_revision" <<'PYMETA' \
     || die 'could not write release source metadata'
@@ -320,5 +330,3 @@ for candidate in "$releases_dir"/release-*; do
     [[ "${candidate##*/}" =~ ^release-[0-9a-f]{40,64}-[0-9]+-[0-9]+$ ]] || continue
     [[ "$candidate" == "$release_path" ]] || rm -rf -- "$candidate" || die "could not remove previous release: $candidate"
 done
-printf 'Deployed and verified omi-collector.service: pid=%s restarts=%s config=%s.\n' \
-    "$main_pid" "$restart_count" "$config_file"

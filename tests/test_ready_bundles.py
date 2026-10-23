@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable, Iterator
 from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
 from struct import pack
-from typing import cast
+from typing import NoReturn, cast
 
 import pytest
 
@@ -33,6 +34,10 @@ from omi_collector.config import ReadyConfig
 
 def _record(timestamp: int, marker: int) -> bytes:
     return pack(">I", timestamp) + bytes((2, 8, marker)) + bytes(AUDIO_RECORD_SIZE - 7)
+
+
+def _two_packet_record(timestamp: int, marker: int) -> bytes:
+    return pack(">I", timestamp) + bytes((2, 8, marker, 2, 8, marker + 1)) + bytes(AUDIO_RECORD_SIZE - 10)
 
 
 def _overflow_record(timestamp: int, size: int, marker: int) -> bytes:
@@ -191,6 +196,260 @@ def test_threshold_requires_both_enough_audio_and_a_completed_drain(
     assert waiting_for_audio.reason == "waiting_for_threshold"
     assert published.state is ReadyOutcomeState.PUBLISHED
     assert published.published[0].record_count == 1
+
+
+def test_undrained_typed_publication_does_not_read_raw_pages(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _state_db, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "f" * 32, 10, (_record(100, 1),))
+    reads: list[str] = []
+    read_record_page = store.read_record_page
+
+    def tracked(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        reads.append(source_id)
+        return read_record_page(source_id, after_ordinal, limit)
+
+    monkeypatch.setattr(store, "read_record_page", tracked)
+    outcome = finalize_typed_sources(
+        store,
+        (source,),
+        ready,
+        config=ReadyConfig(target_audio_seconds=0.02),
+        clock_segments=ClockSegmentMap(()),
+        frontier=11,
+        drained=False,
+    )
+
+    assert outcome.reason == "waiting_for_drain"
+    assert outcome.stats is None
+    assert reads == []
+
+
+def test_disjoint_subthreshold_growth_reuses_durable_packet_summary(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_db, store = audio_store
+    ready = _ready_root(tmp_path)
+    first = _source(store, "a" * 32, 10, (_two_packet_record(100, 1),))
+    reads: list[str] = []
+    read_record_page = store.read_record_page
+
+    def tracked(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        reads.append(source_id)
+        return read_record_page(source_id, after_ordinal, limit)
+
+    monkeypatch.setattr(store, "read_record_page", tracked)
+    config = ReadyConfig(target_audio_seconds=0.08)
+    first_wait = finalize_typed_sources(
+        store, (first,), ready, config=config, clock_segments=ClockSegmentMap(()), frontier=11, drained=True
+    )
+    assert first_wait.reason == "waiting_for_threshold"
+    assert first_wait.stats is not None and first_wait.stats.audio_packets == 2
+    assert reads and set(reads) == {first.source_id}
+    summaries = state_db.list(StateKind.PACKET_SUMMARY)
+    assert len(summaries) == 1 and summaries[0][1]["audio_packets"] == 2
+
+    reads.clear()
+    second = _source(store, "b" * 32, 20, (_record(101, 2),))
+    second_wait = finalize_typed_sources(
+        store,
+        (SqlitePublicationSource(store, first.source_id), second),
+        ready,
+        config=config,
+        clock_segments=ClockSegmentMap(()),
+        frontier=21,
+        drained=True,
+    )
+    assert second_wait.reason == "waiting_for_threshold"
+    assert reads and set(reads) == {second.source_id}
+    assert second_wait.stats is not None
+    assert (second_wait.stats.audio_packets, second_wait.stats.gap_count, second_wait.stats.gap_records) == (3, 1, 9)
+
+
+def test_cached_old_sources_and_new_threshold_crossing_read_each_for_its_role(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = audio_store[1]
+    ready = _ready_root(tmp_path)
+    sources = (
+        _source(store, "a" * 32, 10, (_two_packet_record(100, 1),)),
+        _source(store, "b" * 32, 20, (_record(101, 2),)),
+    )
+    config = ReadyConfig(target_audio_seconds=0.08)
+    assert (
+        finalize_typed_sources(
+            store, sources, ready, config=config, clock_segments=ClockSegmentMap(()), frontier=21, drained=True
+        ).reason
+        == "waiting_for_threshold"
+    )
+
+    reads: list[str] = []
+    preflight_reads: list[str] = []
+    normalization_reads: list[str] = []
+    precomputed_sources: list[str] = []
+    read_record_page = store.read_record_page
+    normalize = ready_bundles._normalize_typed_admissions
+
+    def tracked_page(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        reads.append(source_id)
+        return read_record_page(source_id, after_ordinal, limit)
+
+    def tracked_normalize(
+        admissions: tuple[ready_bundles._TypedAdmission, ...],
+        page_limit: int,
+        custody: ready_bundles._TypedReadyCustody | None = None,
+        precomputed: tuple[ready_bundles._TypedSlice, ...] = (),
+    ) -> tuple[ready_bundles._TypedSlice, ...]:
+        precomputed_sources.extend(item.admission.snapshot.source_id for item in precomputed)
+        if not precomputed:
+            return normalize(admissions, page_limit, custody, precomputed)
+        preflight_reads.extend(reads)
+        reads.clear()
+        result = normalize(admissions, page_limit, custody, precomputed)
+        normalization_reads.extend(reads)
+        return result
+
+    monkeypatch.setattr(store, "read_record_page", tracked_page)
+    monkeypatch.setattr(ready_bundles, "_normalize_typed_admissions", tracked_normalize)
+    third = _source(store, "d" * 32, 30, (_two_packet_record(102, 3),))
+    published = finalize_typed_sources(
+        store,
+        (*sources, third),
+        ready,
+        config=config,
+        clock_segments=ClockSegmentMap(()),
+        frontier=31,
+        drained=True,
+    )
+    assert published.state is ReadyOutcomeState.PUBLISHED
+    assert precomputed_sources == [third.source_id]
+    assert normalization_reads == [source.source_id for source in sources]
+    assert preflight_reads == [third.source_id]
+
+
+def test_packet_summary_rejects_certification_change_during_lookup(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_db, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "b" * 32, 10, (_record(100, 1),))
+    options = {
+        "config": ReadyConfig(target_audio_seconds=0.04),
+        "clock_segments": ClockSegmentMap(()),
+        "frontier": 11,
+        "drained": True,
+    }
+    assert finalize_typed_sources(store, (source,), ready, **options).reason == "waiting_for_threshold"
+    get_state = state_db.get
+    changed = False
+
+    def change_certification(kind: StateKind, item_id: str) -> dict[str, object] | None:
+        nonlocal changed
+        value = get_state(kind, item_id)
+        if kind is StateKind.PACKET_SUMMARY and not changed:
+            changed = True
+            with store.publication_transaction() as (_state, connection):
+                connection.execute(
+                    "UPDATE capture_source SET coverage_digest=? WHERE source_id=?",
+                    ("a" * 64, source.source_id),
+                )
+        return value
+
+    monkeypatch.setattr(state_db, "get", change_certification)
+    with pytest.raises(ReadyBundleError, match="packet summary certification changed"):
+        finalize_typed_sources(store, (SqlitePublicationSource(store, source.source_id),), ready, **options)
+
+
+def test_threshold_crossing_reuses_preflight_slice_for_full_normalization(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _state_db, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "c" * 32, 10, (_two_packet_record(100, 1),))
+    read_record_page = store.read_record_page
+    page_reads: list[str] = []
+    normalized_reads: list[str] = []
+    precomputed_sources: list[str] = []
+
+    def tracked_page(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        page_reads.append(source_id)
+        return read_record_page(source_id, after_ordinal, limit)
+
+    normalize = ready_bundles._normalize_typed_admissions
+
+    def tracked_normalize(
+        admissions: tuple[ready_bundles._TypedAdmission, ...],
+        page_limit: int,
+        custody: ready_bundles._TypedReadyCustody | None = None,
+        precomputed: tuple[ready_bundles._TypedSlice, ...] = (),
+    ) -> tuple[ready_bundles._TypedSlice, ...]:
+        precomputed_sources.extend(item.admission.snapshot.source_id for item in precomputed)
+        page_reads.clear()
+        result = normalize(admissions, page_limit, custody, precomputed)
+        normalized_reads.extend(page_reads)
+        return result
+
+    monkeypatch.setattr(store, "read_record_page", tracked_page)
+    monkeypatch.setattr(ready_bundles, "_normalize_typed_admissions", tracked_normalize)
+    outcome = finalize_typed_sources(
+        store,
+        (source,),
+        ready,
+        config=ReadyConfig(target_audio_seconds=0.04),
+        clock_segments=ClockSegmentMap(()),
+        frontier=11,
+        drained=True,
+    )
+
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    assert precomputed_sources == [source.source_id]
+    assert normalized_reads == []
+
+
+def test_busy_packet_summary_write_keeps_subthreshold_source_retryable(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_db, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "e" * 32, 10, (_record(100, 1),))
+    generation = state_db.get_generation()
+    start_write = store._start_write
+
+    def busy_write(_connection: sqlite3.Connection) -> NoReturn:
+        error = sqlite3.OperationalError("database is locked")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(store, "_start_write", busy_write)
+    outcome = finalize_typed_sources(
+        store,
+        (source,),
+        ready,
+        config=ReadyConfig(target_audio_seconds=0.04),
+        clock_segments=ClockSegmentMap(()),
+        frontier=11,
+        drained=True,
+    )
+
+    assert outcome.reason == "waiting_for_threshold"
+    assert outcome.stats is not None and outcome.stats.audio_packets == 1
+    assert state_db.list(StateKind.PACKET_SUMMARY) == ()
+    assert state_db.get_generation() == generation
+    assert store.get_source(source.source_id) == source.source
+    monkeypatch.setattr(store, "_start_write", start_write)
+    retry = finalize_typed_sources(
+        store,
+        (source,),
+        ready,
+        config=ReadyConfig(target_audio_seconds=0.04),
+        clock_segments=ClockSegmentMap(()),
+        frontier=11,
+        drained=True,
+    )
+    assert retry.reason == "waiting_for_threshold"
+    assert len(state_db.list(StateKind.PACKET_SUMMARY)) == 1
 
 
 def test_exact_contained_and_partial_overlaps_publish_each_record_once(

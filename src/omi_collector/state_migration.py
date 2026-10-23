@@ -42,7 +42,7 @@ def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
         # journal before the logical v2 checks inspect state rows.
         mode = "ro" if read_only else "rw"
         uri = f"file:{quote(path.absolute().as_posix(), safe='/')}?mode={mode}"
-        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=30 if read_only else 5)) as connection:
             _validate_current(connection)
             _assert_private_audio_gone(layout, connection)
     except FileNotFoundError as error:

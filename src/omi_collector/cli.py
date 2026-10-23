@@ -294,7 +294,10 @@ class SyncProgressReporter:
         from omi_collector.capture.adapters.debug_logging import debug_event
 
         """Persist every aggregate callback before journal visibility filtering."""
-        debug_event("sync_progress", logger=self._debug_logger, progress=progress.as_dict())
+        runtime_progress = progress.as_dict()
+        if self._operational_status is not None:
+            runtime_progress["invocation_id"] = self._operational_status.identity.invocation_id
+        debug_event("sync_progress", logger=self._debug_logger, progress=runtime_progress)
         if self._operational_status is not None and progress.operational_event is not None:
             self._record_clock_status(progress.operational_event)
         state = progress.state

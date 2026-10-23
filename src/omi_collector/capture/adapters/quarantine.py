@@ -32,7 +32,13 @@ from ..domain.internal_audio_machine import (
 from ..domain.quarantine_machine import (
     QuarantineState,
 )
-from .collector_state_db import StateDBError, StateTransaction, raise_if_sqlite_corrupt, raise_if_sqlite_storage_fault
+from .collector_state_db import (
+    StateDBError,
+    StateKind,
+    StateTransaction,
+    raise_if_sqlite_corrupt,
+    raise_if_sqlite_storage_fault,
+)
 from .internal_audio_store import (
     DEFAULT_CHUNK_LIMIT,
     MAX_CHUNK_LIMIT,
@@ -1018,7 +1024,13 @@ def _delete_expired_typed_source(
         "AND NOT EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = ?)",
         (source_id, now, source_id),
     )
-    return deleted.rowcount == 1
+    removed = deleted.rowcount == 1
+    if removed:
+        connection.execute(
+            "DELETE FROM state WHERE kind=? AND id=?",
+            (StateKind.PACKET_SUMMARY.value, source_id),
+        )
+    return removed
 
 
 def _quarantine_state(filesystem: StagingFilesystem, source_id: str) -> QuarantineState:

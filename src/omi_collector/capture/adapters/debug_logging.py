@@ -300,6 +300,7 @@ _RUNTIME_ERROR_TYPES = {
     )
 }
 _FIRMWARE_VERSION = re.compile(r"v?\d{1,3}(?:\.\d{1,3}){1,3}")
+_INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 type ExceptionInfo = bool | BaseException | tuple[type[BaseException], BaseException, TracebackType | None] | None
 type LoggedExceptionInfo = tuple[type[BaseException], BaseException, TracebackType | None] | tuple[None, None, None]
@@ -722,5 +723,7 @@ def _runtime_progress_value(name: object, value: object) -> object | None:
     if name == "error_type" and isinstance(value, str):
         return _RUNTIME_ERROR_TYPES.get(value)
     if name == "firmware" and isinstance(value, str) and _FIRMWARE_VERSION.fullmatch(value):
+        return value
+    if name == "invocation_id" and isinstance(value, str) and _INVOCATION_ID.fullmatch(value):
         return value
     return None

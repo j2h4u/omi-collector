@@ -8,10 +8,19 @@ function die {
 }
 
 function cleanup {
+    local -i status=$? cleanup_failed=0
+    trap - EXIT
     if [[ -n "$checkout" && -d "$checkout" ]]; then
-        git -C "$repo_root" worktree remove --force "$checkout" || printf 'ERROR: could not remove release worktree %s\n' "$checkout" >&2
+        git -C "$repo_root" worktree remove --force "$checkout" || { printf 'ERROR: could not remove release worktree %s\n' "$checkout" >&2; cleanup_failed=1; }
     fi
-    [[ -z "$temporary_root" || ! -d "$temporary_root" ]] || rmdir -- "$temporary_root" 2>/dev/null || true
+    if [[ -n "$temporary_root" && -d "$temporary_root" ]]; then
+        rmdir -- "$temporary_root" || { printf 'ERROR: could not remove release work directory %s\n' "$temporary_root" >&2; cleanup_failed=1; }
+    fi
+    (( status != 0 || ! cleanup_failed )) || status=1
+    if (( status == 0 )); then
+        printf 'Deployed %s at %s.\n' "$release_tag" "$release_commit"
+    fi
+    exit "$status"
 }
 
 declare script_dir='' repo_root='' temporary_root='' checkout='' release_tag='' release_commit=''
@@ -42,4 +51,3 @@ trap cleanup EXIT
 git -C "$repo_root" worktree add --detach "$checkout" "$release_tag" \
     || die "could not prepare release worktree for ${release_tag}"
 "${checkout}/scripts/deploy-systemd-service.sh" || die "deployment failed for ${release_tag}"
-printf 'Deployed %s at %s.\n' "$release_tag" "$release_commit"

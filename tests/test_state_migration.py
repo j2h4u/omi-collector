@@ -83,6 +83,28 @@ def test_runtime_schema_validation_does_not_scan_retained_audio(tmp_path: Path) 
     )
 
 
+@pytest.mark.parametrize(("read_only", "expected_timeout"), [(True, 30), (False, 5)])
+def test_canonical_validation_uses_bounded_mode_specific_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, read_only: bool, expected_timeout: int
+) -> None:
+    layout = _layout(tmp_path)
+    StateDB(layout.collector.state_db)
+    timeouts: list[float] = []
+    connect = sqlite3.connect
+
+    def track_timeout(database: str, *, uri: bool = False, timeout: float = 5.0) -> sqlite3.Connection:
+        timeouts.append(timeout)
+        return connect(database, uri=uri, timeout=timeout)
+
+    monkeypatch.setattr(state_migration, "_validate_current", lambda _connection: None)
+    monkeypatch.setattr(state_migration, "_assert_private_audio_gone", lambda _layout, _connection: None)
+    monkeypatch.setattr(sqlite3, "connect", track_timeout)
+
+    state_migration._validate_canonical(layout, read_only=read_only)
+
+    assert timeouts == [expected_timeout]
+
+
 def test_current_runtime_accepts_only_sql_owned_partial_ready_stage(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)

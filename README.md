@@ -39,27 +39,30 @@ Omi Collector provides the narrow first stage:
 - records bounded operational metrics and a current runtime snapshot in local state.
 
 It deliberately does **not** transcode, run VAD, transcribe, or call the Omi
-cloud. Windmill owns downstream processing; the collector removes a ready
-bundle only after Windmill durably acknowledges that exact bundle and digest.
-Bundles referenced by Windmill's open speech tail remain available.
+cloud. Production downstream processing is orchestrated by Dagster, but the
+collector remains an independent producer and has no Dagster runtime
+dependency. The collector removes a ready bundle only after a downstream
+consumer durably acknowledges that exact bundle and digest. Bundles referenced
+by an open downstream speech tail remain available.
 
 ## What comes next
 
-Our production installation passes the ready bundles to a private
-Windmill flow. That downstream implementation is not published in this
-repository. Windmill prepares temporary audio for voice activity detection
-(VAD), keeps only speech for long-term storage, and publishes one ordinary Ogg
-Opus file with a compact JSON passport. The passport maps retained speech back
-to the real timeline and records removed or missing intervals.
+Our production installation passes ready bundles to a private downstream
+consumer orchestrated by Dagster. That implementation is not published in
+this repository. The consumer prepares temporary audio for voice activity
+detection (VAD), keeps only speech for long-term storage, and publishes one
+ordinary Ogg Opus file with a compact JSON passport. The passport maps
+retained speech back to the real timeline and records removed or missing
+intervals.
 
 That processing intentionally lives outside Omi Collector. This repository
-ends at durable publication of validated pendant records, so Windmill is not a
-runtime dependency and other users can attach a different processing pipeline.
+ends at durable publication of validated pendant records, so Dagster is not a
+runtime dependency and other users can attach a different downstream consumer.
 
 ### Pipeline boundary
 
 ```text
-Omi pendant -> Omi Collector -> ready/<bundle_id> -> Windmill -> speech/*.ogg + speech/*.json
+Omi pendant -> Omi Collector -> ready/<bundle_id> -> downstream consumer -> speech/*.ogg + speech/*.json
 ```
 
 Omi Collector owns Bluetooth transfer, interruption recovery, sequence-loss
@@ -72,15 +75,15 @@ validated non-empty pendant packet in physical order. The manifest binds its
 identity, monotonic publication order, audio hash, packet count, public
 timeline, and explicit discontinuity facts. Zero-packet records remain in
 private replay custody and still affect the timeline. Consumers discover only
-complete ready artifacts. The `draft` and `collector` directories remain internal to Omi Collector,
-`work` is temporary Windmill state, and `speech` contains Windmill's completed
-audio and passport artifacts.
+complete ready artifacts. The `draft` and `collector` directories remain
+internal to Omi Collector, `work` is temporary downstream state, and `speech`
+contains the consumer's completed audio and passport artifacts.
 
-Windmill's durable checkpoint acknowledges an artifact by its ID and
-`audio_sha256` only after every packet has durable speech or no-speech handling.
-The collector validates the complete ACK batch against its private ledger and
-replay proof, records retirement, then removes the exact ready directory and
-proof. An open speech tail is never an ACK.
+A downstream consumer's durable checkpoint acknowledges an artifact by its ID
+and `audio_sha256` only after every packet has durable speech or no-speech
+handling. The collector validates the complete ACK batch against its private
+ledger and replay proof, records retirement, then removes the exact ready
+directory and proof. An open speech tail is never an ACK.
 
 ## Requirements
 

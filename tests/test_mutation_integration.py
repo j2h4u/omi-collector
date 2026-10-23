@@ -7,8 +7,12 @@ import sys
 from pathlib import Path
 from typing import cast
 
+import pytest
 
-def test_runner_preserves_mutant_outcomes_with_fixture_and_parametrization(tmp_path: Path) -> None:
+
+def test_runner_preserves_mutant_outcomes_with_fixture_and_parametrization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = tmp_path / "src"
     tests = tmp_path / "tests"
     source.mkdir()
@@ -51,9 +55,14 @@ def test_runner_preserves_mutant_outcomes_with_fixture_and_parametrization(tmp_p
         encoding="utf-8",
     )
 
+    outer_coverage = tmp_path / "outer.coverage"
+    outer_coverage.write_bytes(b"outer coverage sentinel")
+    monkeypatch.setenv("COVERAGE_FILE", str(outer_coverage))
+    nested_coverage = tmp_path / ".coverage"
     env = os.environ.copy()
     env["COVERAGE_CORE"] = "ctrace"
     env["CANARY_MARKER_DIR"] = str(markers)
+    env["COVERAGE_FILE"] = str(nested_coverage)
     env["PYTEST_ADDOPTS"] = ""
     result = subprocess.run(
         [
@@ -89,6 +98,7 @@ def test_runner_preserves_mutant_outcomes_with_fixture_and_parametrization(tmp_p
         "canary-b-1",
         "canary-b-2",
     }, output
+    assert outer_coverage.read_bytes() == b"outer coverage sentinel"
 
     report_path = tmp_path / "coverage" / "gremlins" / "gremlins.json"
     report = cast(dict[str, object], json.loads(report_path.read_text(encoding="utf-8")))

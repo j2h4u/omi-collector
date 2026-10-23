@@ -76,8 +76,10 @@ def test_runtime_smoke_cleans_up_after_success(fake_docker: tuple[Path, Path]) -
     no_build_ups = [call for call in calls if "up" in call and "--no-build" in call]
     assert len(image_builds) == 1
     assert len(no_build_ups) == 1
-    assert calls.index(image_builds[0]) < calls.index(no_build_ups[0]) < next(
-        index for index, call in enumerate(calls) if "down" in call
+    assert (
+        calls.index(image_builds[0])
+        < calls.index(no_build_ups[0])
+        < next(index for index, call in enumerate(calls) if "down" in call)
     )
     assert any("down" in call for call in calls)
     inspect_calls = [call for call in calls if call[0] == "inspect"]

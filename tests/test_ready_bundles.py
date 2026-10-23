@@ -418,8 +418,15 @@ def test_busy_packet_summary_write_keeps_subthreshold_source_retryable(
     assert state_db.get_generation() == generation
     assert store.get_source(source.source_id) == source.source
     monkeypatch.setattr(store, "_start_write", start_write)
-    retry = finalize_typed_sources(store, (source,), ready, config=ReadyConfig(target_audio_seconds=0.04),
-        clock_segments=ClockSegmentMap(()), frontier=11, drained=True)
+    retry = finalize_typed_sources(
+        store,
+        (source,),
+        ready,
+        config=ReadyConfig(target_audio_seconds=0.04),
+        clock_segments=ClockSegmentMap(()),
+        frontier=11,
+        drained=True,
+    )
     assert retry.reason == "waiting_for_threshold"
     assert len(state_db.list(StateKind.PACKET_SUMMARY)) == 1
 

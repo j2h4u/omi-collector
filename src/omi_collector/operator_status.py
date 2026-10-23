@@ -397,7 +397,11 @@ def _runtime_status(
     rssi = projection.get("connection_rssi_dbm")
     rssi_at = projection.get("connection_rssi_observed_at")
     state = current.get("status", "unknown")
-    active = state == "progress" and identity.invocation_id is not None and current.get("invocation_id") == identity.invocation_id
+    active = (
+        state == "progress"
+        and identity.invocation_id is not None
+        and current.get("invocation_id") == identity.invocation_id
+    )
     if state == "progress" and not active:
         state = "unknown"
     return {

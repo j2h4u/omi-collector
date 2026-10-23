@@ -188,7 +188,7 @@ def _fake_deployer(
     (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
         f'{shlex.quote(sys.executable)} -m venv --without-pip --copies "$UV_PROJECT_ENVIRONMENT"\n'
-        'project=${3}\n'
+        "project=${3}\n"
         'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c \'import sysconfig; print(sysconfig.get_path("purelib"))\')\n'
         'cp -a "$project/src/omi_collector" "$purelib/omi_collector"\n'
         f'[[ "${{FAKE_EDIT_CHECKOUT:-0}}" == 1 ]] && printf "# concurrent edit\\n" >> {shlex.quote(str(source / "__init__.py"))}\n'
@@ -262,7 +262,9 @@ def test_deployer_builds_frozen_commit_when_checkout_changes_during_sync(tmp_pat
     runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
     assert result.returncode == 0, result.stderr
     selected = (runtime / "current").resolve(strict=True)
-    revision = subprocess.check_output(("git", "-C", str(deployer.parent.parent), "rev-parse", "HEAD"), text=True).strip()
+    revision = subprocess.check_output(
+        ("git", "-C", str(deployer.parent.parent), "rev-parse", "HEAD"), text=True
+    ).strip()
     assert json.loads((selected / "share/omi-collector/release.json").read_text(encoding="utf-8")) == {
         "source_revision": revision
     }
@@ -275,10 +277,7 @@ def test_deployer_does_not_report_success_when_snapshot_cleanup_fails(tmp_path: 
     deployer, env = _fake_deployer(tmp_path)
     fake_rm = Path(env["PATH"].split(":", 1)[0]) / "rm"
     fake_rm.write_text(
-        "#!/usr/bin/env bash\n"
-        '/usr/bin/rm "$@" || exit $?\n'
-        '[[ "$*" == *omi-collector-source.* ]] && exit 1\n'
-        "exit 0\n",
+        '#!/usr/bin/env bash\n/usr/bin/rm "$@" || exit $?\n[[ "$*" == *omi-collector-source.* ]] && exit 1\nexit 0\n',
         encoding="utf-8",
     )
     fake_rm.chmod(0o755)
@@ -300,7 +299,7 @@ def test_release_helper_fails_when_successful_deploy_cannot_clean_worktree(tmp_p
         'case "$3" in\n'
         "status|fetch|show-ref|merge-base) exit 0 ;;\n"
         "rev-list) printf '%040d\\n' 0 ;;\n"
-        f"worktree) if [[ \"$4\" == add ]]; then mkdir -p \"$6/scripts\"; printf '#!/usr/bin/env bash\\necho deployed\\n' > \"$6/scripts/deploy-systemd-service.sh\"; chmod +x \"$6/scripts/deploy-systemd-service.sh\"; else exit 1; fi ;;\n"
+        f'worktree) if [[ "$4" == add ]]; then mkdir -p "$6/scripts"; printf \'#!/usr/bin/env bash\\necho deployed\\n\' > "$6/scripts/deploy-systemd-service.sh"; chmod +x "$6/scripts/deploy-systemd-service.sh"; else exit 1; fi ;;\n'
         "*) exit 2 ;;\nesac\n",
         encoding="utf-8",
     )
@@ -345,7 +344,9 @@ def test_deployer_builds_and_selects_candidate_then_removes_previous_release(tmp
     selected = (runtime / "current").resolve(strict=True)
     assert selected.parent == runtime / "releases"
     assert not previous.exists()
-    revision = subprocess.check_output(("git", "-C", str(deployer.parent.parent), "rev-parse", "HEAD"), text=True).strip()
+    revision = subprocess.check_output(
+        ("git", "-C", str(deployer.parent.parent), "rev-parse", "HEAD"), text=True
+    ).strip()
     assert json.loads((selected / "share/omi-collector/release.json").read_text(encoding="utf-8")) == {
         "source_revision": revision
     }

@@ -2117,9 +2117,7 @@ def _finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps stora
                 retirement_pending=_retire_one_typed_source(audio_store, page_limit),
             )
         try:
-            slices = _normalize_typed_admissions(
-                admissions, page_limit, custody, () if summary is None else summary[1]
-            )
+            slices = _normalize_typed_admissions(admissions, page_limit, custody, () if summary is None else summary[1])
         except _TypedAdmissionConflictError as error:
             admission = next(item for item in admissions if item.snapshot.source_id == error.source_id)
             _block_typed_custody_conflict(audio_store, admission)
@@ -2833,7 +2831,11 @@ def _normalize_typed_admissions(
         candidate = prepared.pop(admission.snapshot.source_id, None) or _typed_slice(
             admission, admission.cursor, remaining, page_limit
         )
-        if candidate.admission != admission or candidate.start_ordinal != admission.cursor or candidate.record_count != remaining:
+        if (
+            candidate.admission != admission
+            or candidate.start_ordinal != admission.cursor
+            or candidate.record_count != remaining
+        ):
             raise ReadyBundleError("typed precomputed source slice does not match its admission")
         if admission.cursor == 0 and candidate.raw_sha256 != admission.admitted_sha256:
             raise ReadyBundleError("typed source rows do not match its admitted checkpoint")
@@ -2962,12 +2964,10 @@ def _disjoint_packet_summary(
         return None
     if any(left[1] > right[0] for left, right in pairwise(intervals)):
         return None
-    ready_runs = tuple(
-        run
-        for entry in custody.entries.values()
-        for run in _physical_runs(_entry_facts(entry))
-    )
-    if any(start < ready_end and ready_start < end for start, end in intervals for ready_start, ready_end in ready_runs):
+    ready_runs = tuple(run for entry in custody.entries.values() for run in _physical_runs(_entry_facts(entry)))
+    if any(
+        start < ready_end and ready_start < end for start, end in intervals for ready_start, ready_end in ready_runs
+    ):
         return None
     packet_counts: list[int] = []
     fresh_slices: list[_TypedSlice] = []
@@ -3015,9 +3015,7 @@ def _typed_packet_fingerprint(admission: _TypedAdmission) -> str:
     ).hexdigest()
 
 
-def _persist_typed_packet_summaries(
-    audio_store: InternalAudioStore, fresh_slices: tuple[_TypedSlice, ...]
-) -> None:
+def _persist_typed_packet_summaries(audio_store: InternalAudioStore, fresh_slices: tuple[_TypedSlice, ...]) -> None:
     if not fresh_slices:
         return
     try:
@@ -3082,7 +3080,14 @@ def _valid_packet_summary(payload: dict[str, object] | None, admission: _TypedAd
     return (
         payload is not None
         and set(payload)
-        == {"schema_version", "sequence_start", "admitted_count", "admitted_sha256", "audio_packets", "source_fingerprint"}
+        == {
+            "schema_version",
+            "sequence_start",
+            "admitted_count",
+            "admitted_sha256",
+            "audio_packets",
+            "source_fingerprint",
+        }
         and type(payload["schema_version"]) is int
         and payload["schema_version"] == 1
         and type(payload["sequence_start"]) is int

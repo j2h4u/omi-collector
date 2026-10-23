@@ -131,6 +131,10 @@ function finalize {
     if [[ -n "$source_snapshot" ]]; then
         rm -rf -- "$source_snapshot" || { printf 'ERROR: could not remove source snapshot: %s\n' "$source_snapshot" >&2; (( status != 0 )) || status=1; }
     fi
+    if (( status == 0 )); then
+        printf 'Deployed and verified omi-collector.service: pid=%s restarts=%s config=%s.\n' \
+            "$main_pid" "$restart_count" "$config_file"
+    fi
     exit "$status"
 }
 
@@ -326,5 +330,3 @@ for candidate in "$releases_dir"/release-*; do
     [[ "${candidate##*/}" =~ ^release-[0-9a-f]{40,64}-[0-9]+-[0-9]+$ ]] || continue
     [[ "$candidate" == "$release_path" ]] || rm -rf -- "$candidate" || die "could not remove previous release: $candidate"
 done
-printf 'Deployed and verified omi-collector.service: pid=%s restarts=%s config=%s.\n' \
-    "$main_pid" "$restart_count" "$config_file"

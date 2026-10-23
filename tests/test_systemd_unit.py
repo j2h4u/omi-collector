@@ -271,6 +271,25 @@ def test_deployer_builds_frozen_commit_when_checkout_changes_during_sync(tmp_pat
     assert "concurrent edit" in (deployer.parent.parent / "src/omi_collector/__init__.py").read_text(encoding="utf-8")
 
 
+def test_deployer_does_not_report_success_when_snapshot_cleanup_fails(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path)
+    fake_rm = Path(env["PATH"].split(":", 1)[0]) / "rm"
+    fake_rm.write_text(
+        "#!/usr/bin/env bash\n"
+        '/usr/bin/rm "$@" || exit $?\n'
+        '[[ "$*" == *omi-collector-source.* ]] && exit 1\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o755)
+
+    result = _run_fake_deployer(deployer, env)
+
+    assert result.returncode != 0
+    assert "could not remove source snapshot" in result.stderr
+    assert "Deployed and verified" not in result.stdout
+
+
 def test_release_helper_fails_when_successful_deploy_cannot_clean_worktree(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

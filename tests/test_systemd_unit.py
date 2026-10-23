@@ -126,6 +126,27 @@ def _fake_deployer(
     shutil.copy2(
         _ROOT / "scripts" / "check_fallback_ledger_compatibility.py", scripts / "check_fallback_ledger_compatibility.py"
     )
+    subprocess.run(("git", "init", "--quiet", str(repo)), check=True)
+    subprocess.run(
+        ("git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "add", "."),
+        check=True,
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ),
+        check=True,
+    )
     deployer = scripts / _DEPLOYER.name
     content = deployer.read_text(encoding="utf-8").replace(
         "(( EUID != 0 )) || die 'run as the service owner, without sudo'", "true"
@@ -160,15 +181,17 @@ def _fake_deployer(
     )
     (fake_bin / "getent").chmod(0o755)
     (fake_bin / "git").write_text(
-        '#!/usr/bin/env bash\ncase "$3" in rev-parse) printf \'%040d\\n\' 0 ;; status) [[ "${FAKE_GIT_ERROR:-0}" == 1 ]] && exit 3; [[ "${FAKE_GIT_DIRTY:-0}" == 1 ]] && printf \' M source.py\\n\'; exit 0 ;; *) exit 2 ;; esac\n',
+        '#!/usr/bin/env bash\ncase "$3" in rev-parse|archive) exec /usr/bin/git "$@" ;; status) [[ "${FAKE_GIT_ERROR:-0}" == 1 ]] && exit 3; [[ "${FAKE_GIT_DIRTY:-0}" == 1 ]] && printf \' M source.py\\n\'; exit 0 ;; *) exit 2 ;; esac\n',
         encoding="utf-8",
     )
     (fake_bin / "git").chmod(0o755)
     (fake_bin / "uv").write_text(
         "#!/usr/bin/env bash\n"
         f'{shlex.quote(sys.executable)} -m venv --without-pip --copies "$UV_PROJECT_ENVIRONMENT"\n'
+        'project=${3}\n'
         'purelib=$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -B -c \'import sysconfig; print(sysconfig.get_path("purelib"))\')\n'
-        f'cp -a {shlex.quote(str(source))} "$purelib/omi_collector"\n'
+        'cp -a "$project/src/omi_collector" "$purelib/omi_collector"\n'
+        f'[[ "${{FAKE_EDIT_CHECKOUT:-0}}" == 1 ]] && printf "# concurrent edit\\n" >> {shlex.quote(str(source / "__init__.py"))}\n'
         "cat > \"$UV_PROJECT_ENVIRONMENT/bin/omi-collector\" <<'CLI'\n"
         "#!/usr/bin/env bash\n"
         f"printf 'collector %s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
@@ -230,6 +253,56 @@ def _fake_deployer(
     return deployer, env
 
 
+def test_deployer_builds_frozen_commit_when_checkout_changes_during_sync(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path)
+    env["FAKE_EDIT_CHECKOUT"] = "1"
+
+    result = _run_fake_deployer(deployer, env)
+
+    runtime = Path(env["TEST_HOME"]) / ".local/share/omi-collector"
+    assert result.returncode == 0, result.stderr
+    selected = (runtime / "current").resolve(strict=True)
+    revision = subprocess.check_output(("git", "-C", str(deployer.parent.parent), "rev-parse", "HEAD"), text=True).strip()
+    assert json.loads((selected / "share/omi-collector/release.json").read_text(encoding="utf-8")) == {
+        "source_revision": revision
+    }
+    installed_source = next(selected.glob("lib/python*/site-packages/omi_collector/__init__.py"))
+    assert "concurrent edit" not in installed_source.read_text(encoding="utf-8")
+    assert "concurrent edit" in (deployer.parent.parent / "src/omi_collector/__init__.py").read_text(encoding="utf-8")
+
+
+def test_release_helper_fails_when_successful_deploy_cannot_clean_worktree(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    (fake_bin / "git").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$3" in\n'
+        "status|fetch|show-ref|merge-base) exit 0 ;;\n"
+        "rev-list) printf '%040d\\n' 0 ;;\n"
+        f"worktree) if [[ \"$4\" == add ]]; then mkdir -p \"$6/scripts\"; printf '#!/usr/bin/env bash\\necho deployed\\n' > \"$6/scripts/deploy-systemd-service.sh\"; chmod +x \"$6/scripts/deploy-systemd-service.sh\"; else exit 1; fi ;;\n"
+        "*) exit 2 ;;\nesac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "git").chmod(0o755)
+    result = subprocess.run(
+        (str(_RELEASE_DEPLOYER), "v1.2.3"),
+        cwd=_ROOT,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "TMPDIR": str(temp)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    leftovers = list(temp.iterdir())
+    assert result.returncode != 0
+    assert "could not remove release worktree" in result.stderr
+    assert "Deployed v1.2.3" not in result.stdout
+    assert leftovers
+    shutil.rmtree(leftovers[0])
+
+
 def _run_fake_deployer(deployer: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         (str(deployer),), env=env, cwd=deployer.parent.parent, text=True, capture_output=True, check=False
@@ -253,8 +326,9 @@ def test_deployer_builds_and_selects_candidate_then_removes_previous_release(tmp
     selected = (runtime / "current").resolve(strict=True)
     assert selected.parent == runtime / "releases"
     assert not previous.exists()
+    revision = subprocess.check_output(("git", "-C", str(deployer.parent.parent), "rev-parse", "HEAD"), text=True).strip()
     assert json.loads((selected / "share/omi-collector/release.json").read_text(encoding="utf-8")) == {
-        "source_revision": "0" * 40
+        "source_revision": revision
     }
     commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8")
     assert commands.index("systemctl stop") < commands.index("--stopped") if "--stopped" in commands else True

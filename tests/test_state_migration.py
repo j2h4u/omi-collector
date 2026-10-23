@@ -92,9 +92,9 @@ def test_canonical_validation_uses_bounded_mode_specific_timeout(
     timeouts: list[float] = []
     connect = sqlite3.connect
 
-    def track_timeout(*args: object, **kwargs: object) -> sqlite3.Connection:
-        timeouts.append(float(kwargs["timeout"]))
-        return connect(*args, **kwargs)
+    def track_timeout(database: str, *, uri: bool = False, timeout: float = 5.0) -> sqlite3.Connection:
+        timeouts.append(timeout)
+        return connect(database, uri=uri, timeout=timeout)
 
     monkeypatch.setattr(state_migration, "_validate_current", lambda _connection: None)
     monkeypatch.setattr(state_migration, "_assert_private_audio_gone", lambda _layout, _connection: None)

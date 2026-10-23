@@ -502,66 +502,6 @@ def initialize_collector_state_command(
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
-@app.command("begin-publication-cutover")
-def begin_publication_cutover_command(
-    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
-    confirmed: Annotated[
-        bool,
-        typer.Option("--confirm-cutover", help="Stop new legacy publication cohort acceptance."),
-    ] = False,
-) -> None:
-    """Durably quiesce legacy publication while existing legacy work finishes."""
-    _require_confirmation(confirmed, "--confirm-cutover")
-    loaded = _load_config(config_path)
-    try:
-        from omi_collector.capture.adapters.collector_guard import collector_guard
-        from omi_collector.capture.adapters.ready_bundles import begin_publication_cutover
-        from omi_collector.state_migration import open_runtime_state
-
-        _require_host_singleton(loaded)
-        with collector_guard(loaded.storage.collector.lock):
-            result = begin_publication_cutover(open_runtime_state(loaded.storage))
-    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-    typer.echo(json.dumps({"mode": result.mode.value}, sort_keys=True, separators=(",", ":")))
-
-
-@app.command("activate-public-audio-v2")
-def activate_public_audio_v2_command(
-    config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
-    confirmed: Annotated[
-        bool,
-        typer.Option("--confirm-cutover", help="Activate the public audio v2 writer after legacy drain."),
-    ] = False,
-) -> None:
-    """Activate v2 after legacy custody and the consumer checkpoint are empty."""
-    _require_confirmation(confirmed, "--confirm-cutover")
-    loaded = _load_config(config_path)
-    try:
-        from omi_collector.capture.adapters.collector_guard import collector_guard
-        from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
-        from omi_collector.capture.adapters.ready_bundles import activate_public_audio_v2
-        from omi_collector.state_migration import open_runtime_state
-
-        _require_host_singleton(loaded)
-        with collector_guard(loaded.storage.collector.lock):
-            state_db = open_runtime_state(loaded.storage)
-            with InternalAudioStore(state_db, chunk_limit=loaded.config.writer.chunk_records) as audio_store:
-                checkpoint = loaded.storage.publication.root.parent / "work" / "omi-ready-checkpoint.json"
-                result = activate_public_audio_v2(audio_store, loaded.storage.publication.root, checkpoint)
-    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-    typer.echo(
-        json.dumps(
-            {"mode": result.mode.value, "next_public_order": result.next_public_order},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
-
-
 @app.command("check-state")
 def check_collector_state(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,

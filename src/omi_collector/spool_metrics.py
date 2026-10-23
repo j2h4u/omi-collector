@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import stat
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 from typing import TypeGuard, cast
 
@@ -16,10 +14,8 @@ from omi_collector.capture.adapters.firmware_observations import (
     FirmwareObservationError,
     read_firmware_observations,
 )
-from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, _validate_ready_ranges
+from omi_collector.capture.adapters.ready_bundles import ReadyBundleError
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
-
-_SHA256_HEX_LENGTH = 64
 
 
 class SpoolMetricsError(ValueError):
@@ -94,17 +90,6 @@ class _BundleMeasurement:
     ranges: tuple[tuple[int, int], ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _ReadyManifest:
-    bundle_id: str
-    start_sequence: int
-    next_sequence: int
-    record_count: int
-    record_size: int
-    records_sha256: str
-    ranges: tuple[tuple[int, int], ...]
-
-
 def collect_spool_metrics(
     publication_root: Path,
     *,
@@ -147,13 +132,7 @@ def _read_artifacts(root: Path, ledger_entries: dict[str, object] | None) -> tup
                 raise SpoolMetricsError(f"v2 ready artifact is not a real directory: {entry}")
             measurements.append(_read_v2_artifact(entry, ledger_entry))
             continue
-        if entry.is_symlink():
-            continue
-        if not entry.is_dir():
-            raise SpoolMetricsError(f"visible spool entry is not an artifact directory: {entry}")
-        measurement = _read_artifact(entry)
-        if measurement is not None:
-            measurements.append(measurement)
+        raise SpoolMetricsError(f"visible ready entry has no omi-audio-v2 publication ledger entry: {entry}")
     return tuple(measurements)
 
 
@@ -175,95 +154,6 @@ def _read_v2_artifact(path: Path, entry: dict[str, object]) -> _BundleMeasuremen
         facts.record_count,
         facts.record_count * RECORD_SIZE,
         ready_bundles._physical_runs(facts),
-    )
-
-
-def _read_artifact(path: Path) -> _BundleMeasurement | None:
-    # A directory is a participant only when it has a real-bundle manifest;
-    # gap-only directories therefore disappear without being inspected.
-    manifest_path = path / "manifest.json"
-    if not _regular_file(manifest_path):
-        return None
-    return _read_bundle_artifact(path)
-
-
-def _read_bundle_artifact(path: Path) -> _BundleMeasurement:
-    manifest = _read_manifest_and_raw(path)
-    return _BundleMeasurement(
-        (
-            "ready",
-            manifest.bundle_id,
-        ),
-        manifest.record_count,
-        manifest.record_count * manifest.record_size,
-        manifest.ranges,
-    )
-
-
-def _read_manifest_and_raw(path: Path) -> _ReadyManifest:
-    manifest = _ready_manifest(path)
-    raw_path = path / "records.bin"
-    raw_size = _require_regular_file(raw_path, "records.bin")
-    if raw_size != manifest.record_count * RECORD_SIZE:
-        raise SpoolMetricsError(f"records.bin does not match manifest: {path}")
-    return manifest
-
-
-def _ready_manifest(path: Path) -> _ReadyManifest:
-    value = _read_json(path / "manifest.json", "manifest.json")
-    required = {
-        "bundle_id",
-        "start_sequence",
-        "next_sequence",
-        "record_count",
-        "record_size",
-        "records_sha256",
-        "draft_raw_sha256",
-        "time_ranges",
-    }
-    if set(value) != required:
-        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    return _ready_manifest_values(value, path)
-
-
-def _ready_manifest_values(value: dict[str, object], path: Path) -> _ReadyManifest:
-    numeric = ("start_sequence", "next_sequence", "record_count", "record_size")
-    if any(isinstance(value[name], bool) or not isinstance(value[name], int) for name in numeric):
-        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    start, end, count, size = (cast(int, value[name]) for name in numeric)
-    if not _ready_dimensions_are_valid(start, end, count, size):
-        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    try:
-        gaps = _validate_ready_ranges(value["time_ranges"], start, end, count)
-    except ReadyBundleError as error:
-        raise SpoolMetricsError(f"ready manifest is invalid: {path}") from error
-    if not _ready_hashes_are_valid(value):
-        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    ranges_value = cast(list[dict[str, object]], value["time_ranges"])
-    ranges = tuple((cast(int, item["start_sequence"]), cast(int, item["next_sequence"])) for item in ranges_value)
-    identity = (
-        f"{start}:{end}:{value['draft_raw_sha256']}" + "".join(f":{gap_start}-{gap_end}" for gap_start, gap_end in gaps)
-    ).encode()
-    if value["bundle_id"] != sha256(identity).hexdigest():
-        raise SpoolMetricsError(f"ready manifest is invalid: {path}")
-    return _ReadyManifest(
-        cast(str, value["bundle_id"]), start, end, count, size, cast(str, value["records_sha256"]), ranges
-    )
-
-
-def _ready_dimensions_are_valid(start: int, end: int, count: int, size: int) -> bool:
-    return start >= 0 and end > start and count > 0 and size == RECORD_SIZE
-
-
-def _ready_hashes_are_valid(value: dict[str, object]) -> bool:
-    return all(_sha256(value[name]) for name in ("bundle_id", "records_sha256", "draft_raw_sha256"))
-
-
-def _sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == _SHA256_HEX_LENGTH
-        and all(character in "0123456789abcdef" for character in value)
     )
 
 
@@ -331,19 +221,6 @@ def _unproven_hole_records(values: tuple[_BundleMeasurement, ...]) -> int:
     return holes
 
 
-def _read_json(path: Path, label: str) -> dict[str, object]:
-    _require_regular_file(path, label)
-    try:
-        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except OSError as error:
-        raise SpoolMetricsError(f"cannot read {label}: {path}") from error
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise SpoolMetricsError(f"{label} is invalid JSON: {path}") from error
-    if not isinstance(value, dict):
-        raise SpoolMetricsError(f"{label} must be a JSON object: {path}")
-    return cast(dict[str, object], value)
-
-
 def _entries(path: Path, label: str) -> tuple[Path, ...]:
     try:
         return tuple(path.iterdir())
@@ -368,11 +245,3 @@ def _require_regular_file(path: Path, label: str) -> int:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise SpoolMetricsError(f"{label} must be a regular file: {path}")
     return info.st_size
-
-
-def _regular_file(path: Path) -> bool:
-    try:
-        mode = path.lstat().st_mode
-    except OSError:
-        return False
-    return stat.S_ISREG(mode)

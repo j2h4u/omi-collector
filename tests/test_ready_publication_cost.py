@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from contextlib import closing
 from hashlib import sha256
@@ -16,7 +17,7 @@ import pytest
 from omi_collector.capture.adapters import collector_state_db, ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
-from omi_collector.capture.adapters.ready_bundles import ReadyOutcomeState
+from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, ReadyBundleResult, ReadyOutcomeState
 from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, StagingRetentionConfig, WriterConfig
 from staging_test_factory import StagingStore, attempt_source
@@ -130,24 +131,28 @@ def _source_canonical_custody(store: StagingStore, source_id: str) -> tuple[int,
     return cast(tuple[int, int, int], tuple(row))
 
 
+def _assert_v2_artifact(result: ReadyBundleResult, *, record_count: int = 1, next_sequence: int = 101) -> None:
+    audio = result.path.joinpath("audio.ogg").read_bytes()
+    manifest = cast(dict[str, object], json.loads(result.path.joinpath("manifest.json").read_text(encoding="utf-8")))
+    assert {item.name for item in result.path.iterdir()} == {"audio.ogg", "manifest.json"}
+    assert result.record_count == record_count
+    assert result.next_sequence == next_sequence
+    assert manifest["id"] == result.bundle_id
+    assert manifest["packet_count"] == record_count
+    assert manifest["audio_sha256"] == sha256(audio).hexdigest()
+
+
 def test_retirement_reuses_authenticated_custody_and_keeps_immediate_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     record_count = 1_024
     store = _store(tmp_path, threshold=0.02)
-    expected = _add_source(store, 100, record_count)
+    _add_source(store, 100, record_count)
     store.append_ready_closure(100 + record_count, "drained")
-    digest_calls = 0
     page_calls = 0
     connection_calls = 0
-    original_ready_source = ready_bundles._read_ready_source
     original_page = InternalAudioStore.read_record_page
     original_connection = StateDB.open_connection
-
-    def counted_ready_source(path: Path):
-        nonlocal digest_calls
-        digest_calls += 1
-        return original_ready_source(path)
 
     def counted_page(audio_store: InternalAudioStore, source_id: str, after_ordinal: int = -1, limit: int = 128):
         nonlocal page_calls
@@ -159,7 +164,6 @@ def test_retirement_reuses_authenticated_custody_and_keeps_immediate_progress(
         connection_calls += 1
         return original_connection(state_db, read_only=read_only)
 
-    monkeypatch.setattr(ready_bundles, "_read_ready_source", counted_ready_source)
     monkeypatch.setattr(InternalAudioStore, "read_record_page", counted_page)
     monkeypatch.setattr(StateDB, "open_connection", counted_connection)
 
@@ -170,20 +174,26 @@ def test_retirement_reuses_authenticated_custody_and_keeps_immediate_progress(
     assert page_calls >= 3 * (record_count // 128)
     assert connection_calls < page_calls
     (bundle,) = published.published
-    output = bundle.path / "records.bin"
+    output = bundle.path / "audio.ogg"
+    _assert_v2_artifact(bundle, record_count=record_count, next_sequence=100 + record_count)
     identity = output.stat().st_ino, output.stat().st_mtime_ns
-    assert output.read_bytes() == expected
+    audio_digest = sha256(output.read_bytes()).hexdigest()
 
     followups = 0
     while store.publication_followup_due():
         followups += 1
         assert followups <= 10
         store.recover_and_publish()
-        assert output.read_bytes() == expected
+        assert sha256(output.read_bytes()).hexdigest() == audio_digest
         assert (output.stat().st_ino, output.stat().st_mtime_ns) == identity
 
     assert followups == 9
-    assert digest_calls == 1
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        proof = cast(
+            tuple[str, int] | None,
+            connection.execute("SELECT lifecycle,packet_count FROM ready_replay_proof").fetchone(),
+        )
+    assert proof is not None and proof[0] == "active" and proof[1] == record_count
 
 
 def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
@@ -295,16 +305,16 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
     raw = _record(100)
     attempt.accept_chunk(100, raw, b"retained-tail")
     source_id = store.quarantine_attempt_source(attempt.attempt_id)
-    original_publish = ready_bundles._publish_typed_group
+    original_materialize = ready_bundles._materialize_v2_stage_with_failure_latch
 
-    def interrupt_publication(*_args: object, **_kwargs: object) -> object:
-        raise OSError("publication interrupted after cohort acceptance")
+    def interrupt_materialization(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("publication interrupted after cohort acceptance")
 
     try:
         _add_quarantine_residue(store, source_id)
         store.admit_quarantined_prefix(source_id)
         store.append_ready_closure(101, "drained")
-        monkeypatch.setattr(ready_bundles, "_publish_typed_group", interrupt_publication)
+        monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt_materialization)
 
         interrupted = store.recover_and_publish()
 
@@ -329,11 +339,11 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
         assert residue == (0, 0, 0)
         assert _source_canonical_custody(store, source_id) == (1, 1, 1)
 
-        monkeypatch.setattr(ready_bundles, "_publish_typed_group", original_publish)
+        monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original_materialize)
         published = store.recover_and_publish()
 
         assert published.state is ReadyOutcomeState.PUBLISHED
-        assert published.published[0].path.joinpath("records.bin").read_bytes() == raw
+        _assert_v2_artifact(published.published[0])
         for _ in range(4):
             if not store.publication_followup_due():
                 break
@@ -351,7 +361,6 @@ def test_ready_output_write_does_not_hold_shared_database_guard(
 
 async def _ready_write_guard_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = await asyncio.to_thread(_make_chunked_store, tmp_path)
-    expected = b"".join((_record(100), _record(101)))
     await asyncio.to_thread(_add_source, store, 100, 2)
     await asyncio.to_thread(store.append_ready_closure, 102, "drained")
     output_write_started = Event()
@@ -401,7 +410,7 @@ async def _ready_write_guard_scenario(tmp_path: Path, monkeypatch: pytest.Monkey
         assert publication in done, "READY publication did not finish after output write release"
         result = await publication
         assert result.state is ReadyOutcomeState.PUBLISHED
-        assert await asyncio.to_thread(result.published[0].path.joinpath("records.bin").read_bytes) == expected
+        await asyncio.to_thread(_assert_v2_artifact, result.published[0], record_count=2, next_sequence=102)
         assert await asyncio.to_thread(store.state_db.get, StateKind.QUALITY_EVENT, "independent") == {
             "committed": True
         }
@@ -432,7 +441,7 @@ def _hold_ready_output_write(
 ) -> Callable[..., BinaryIO | TextIO]:
     def open_output(path: Path, mode: str = "r", *args: object, **kwargs: object) -> BinaryIO | TextIO:
         stream = original_open(path, mode, *args, **kwargs)
-        if path.name == ready_bundles._RAW_NAME and ready_root in path.parents and mode == "xb":
+        if path.name == "audio.ogg" and ready_root in path.parents and mode == "wb":
             return cast(BinaryIO, _HeldReadyOutput(cast(BinaryIO, stream), started, release))
         return stream
 

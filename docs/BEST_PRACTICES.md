@@ -292,9 +292,9 @@ All mutable structured Collector state lives in
 `synchronous=EXTRA`, and a bounded busy timeout. Private attempt, draft, and
 quarantine audio and its recovery evidence live in typed tables in that same
 database. Public v2 ready artifacts remain immutable filesystem directories
-containing only `audio.ogg` and `manifest.json`; transition releases retain the
-legacy reader and writer only while the durable publication contract is
-`legacy_open` or `quiescing`. Keep the separate, zero-content
+containing only `audio.ogg` and `manifest.json`. The v2-only release accepts
+only the durable `v2_open` contract and retains retired legacy ledger lineage
+solely for replay and overlap rejection. Keep the separate, zero-content
 `collector/collector.lock` stable: the service holds its flock for the full
 invocation, and every state-mutating manual command and stopped-service
 initialization takes that same guard before opening writable state. Read-only
@@ -305,12 +305,19 @@ The deployer checks state before stopping the service and repeats the check
 under the stable guard after stop. A verified hot rollback journal is recovered
 by SQLite under that guard, then a read-only check must accept the recovered
 state. The selected release's `omi-collector init-state --config PATH` creates
-v4 only for an empty installation, upgrades existing v2 or v3, and validates existing
-v4 without rewriting it. Missing databases alongside READY, private audio,
-control data, or unknown scratch fail closed. Existing v1 databases are refused
-unchanged; this command never imports or deletes old data. Runtime also refuses
-v1 and never creates a replacement database. Keep the service stopped while repairing an incompatible
-state, and preserve the stable lock inode through deploy and recovery.
+v4 only for an empty installation, upgrades drained v2 or v3 state directly to
+`v2_open` at order zero, and validates existing v4 without rewriting it. A v3
+upgrade requires empty legacy proof root and page tables. Active legacy ledger
+entries, cohorts, stages, replay proofs, or READY files are refused; they must
+be resolved through controlled recovery before deployment. Refusal preserves
+the existing data; do not delete public or private artifacts to force
+initialization. Retired legacy ledger lineage remains in SQLite for replay and
+overlap rejection. Missing databases alongside READY, private audio, control
+data, or unknown scratch also fail closed. Existing v1 databases are refused
+unchanged; this command never imports or deletes old data. Runtime refuses
+non-v2 publication contracts and never creates a replacement database. Keep
+the service stopped while repairing an incompatible state, and preserve the
+stable lock inode through deploy and recovery.
 
 Before restarting the previous release after an interrupted deployment, its
 own interpreter must validate the current publication ledger read-only. Older

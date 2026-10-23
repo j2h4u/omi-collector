@@ -315,6 +315,21 @@ The operator account owns the `collector` and `ready` roots under the existing
 pipeline storage root. New files remain private to that account unless a
 downstream reader is explicitly granted access.
 
+The systemd deployer persists the sealed release, checks Collector state before
+stopping the service, and checks again under the stable lock before selecting
+the release. It recovers a verified SQLite hot rollback journal after stop,
+then runs `omi-collector init-state --config PATH` to initialize or validate
+state. The command creates v4 only when the database and Collector data roots
+are empty, upgrades eligible drained v2/v3 state, and validates existing v4
+without rewriting it. Unsupported publication contracts, unresolved custody,
+and unknown private artifacts fail closed; runtime never creates or upgrades
+state. See [Best practices](docs/BEST_PRACTICES.md#state-ownership-and-state-initialization)
+for the state and deployment rules.
+
+New databases use the durable `v2_open` publication contract at order zero. The
+collector publishes v2 immutable ready artifacts and has no legacy publisher
+or cutover commands.
+
 For a downstream account, grant access to the `ready` root through a shared
 Unix group or a default ACL, and ensure every parent directory is traversable.
 Verify access as that account after the first bundle is published.
@@ -443,8 +458,8 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
 
 ## Documentation
 
-- [Public audio contract plan](docs/PUBLIC_AUDIO_CONTRACT_PLAN.md) — reviewed
-  Ogg Opus handoff, private replay custody, and coordinated cutover design.
+- [Public audio contract](docs/PUBLIC_AUDIO_CONTRACT.md) — current Ogg Opus
+  handoff, timeline, ACK, and private replay-custody contract.
 - [Device protocol](docs/DEVICE_PROTOCOL.md) — GATT services, ring framing,
   commands, notifications, and firmware behavior.
 - [Security](docs/SECURITY.md) — BLE privacy observations and data-handling

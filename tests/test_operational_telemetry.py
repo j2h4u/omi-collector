@@ -19,7 +19,6 @@ import pytest
 
 import omi_collector.capture.application.operational_telemetry as operational_telemetry
 from fakes import ScriptedRingSession, WriteStep
-from omi_collector.capture.adapters.bundle_contract import BundleManifest, SealedReceipt
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
@@ -184,11 +183,20 @@ def _clock_bundle(root: Path, start_sequence: int, timestamp: int) -> Path:
     bundle.mkdir(parents=True)
     (bundle / "records.bin").write_bytes(raw)
     (bundle / "manifest.json").write_text(
-        json.dumps(BundleManifest(2, start_sequence, start_sequence + 1, 1, RECORD_SIZE, digest).as_dict()),
+        json.dumps(
+            {
+                "schema_version": 2,
+                "start_sequence": start_sequence,
+                "next_sequence": start_sequence + 1,
+                "record_count": 1,
+                "record_size": RECORD_SIZE,
+                "raw_sha256": digest,
+            }
+        ),
         encoding="utf-8",
     )
     (bundle / "receipt.json").write_text(
-        json.dumps(SealedReceipt("a" * 32, digest).as_dict()),
+        json.dumps({"attempt_id": "a" * 32, "raw_sha256": digest, "status": "sealed"}),
         encoding="utf-8",
     )
     return bundle

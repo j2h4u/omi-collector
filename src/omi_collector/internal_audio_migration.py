@@ -19,7 +19,10 @@ from omi_collector.capture.adapters.collector_state_db import (
     install_replay_proof_schema_for_upgrade,
     raise_if_sqlite_storage_fault,
 )
-from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, backfill_v2_replay_proofs
+from omi_collector.capture.adapters.ready_bundles import (
+    ReadyBundleError,
+    _migration_ledger,
+)
 from omi_collector.state_migration import (
     StateMigrationError,
     _assert_private_audio_gone,
@@ -136,10 +139,10 @@ def _migrate_to_v4(layout: StorageLayout, *, from_version: int) -> None:
             else:
                 raise InternalAudioMigrationError("Collector schema is not eligible for v4 migration")
             _assert_private_audio_gone(layout, connection)
+            _require_drained_publication(layout, connection, from_version=from_version)
             if from_version == _LEGACY_SCHEMA_VERSION:
                 try:
                     install_replay_proof_schema_for_upgrade(connection)
-                    backfill_v2_replay_proofs(layout.publication.root, connection)
                 except (
                     OSError,
                     sqlite3.DatabaseError,
@@ -156,7 +159,7 @@ def _migrate_to_v4(layout: StorageLayout, *, from_version: int) -> None:
                 (
                     StateKind.PUBLICATION_CONTRACT.value,
                     "current",
-                    '{"mode":"legacy_open","next_public_order":null,"version":1}',
+                    '{"mode":"v2_open","next_public_order":0,"version":1}',
                 ),
             )
             connection.execute("PRAGMA user_version = 4")
@@ -176,6 +179,35 @@ def _migrate_to_v4(layout: StorageLayout, *, from_version: int) -> None:
             connection.rollback()
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioMigrationError("Collector public audio v2 schema migration failed") from error
+
+
+def _require_drained_publication(layout: StorageLayout, connection: sqlite3.Connection, *, from_version: int) -> None:
+    ledger = _migration_ledger(connection)
+    entries = cast(dict[str, object], ledger["bundles"])
+    if any(isinstance(entry, dict) and entry.get("state") != "retired" for entry in entries.values()):
+        raise InternalAudioMigrationError("legacy ready publication must retire before v2-only migration")
+    active = cast(
+        tuple[int, int, int, int] | None,
+        connection.execute(
+            "SELECT (SELECT count(*) FROM publication_cohort), "
+            "(SELECT count(*) FROM publication_cohort_member), "
+            "(SELECT count(*) FROM ready_output_stage), (SELECT count(*) FROM ready_stage_range)"
+        ).fetchone(),
+    )
+    if active is None or tuple(active) != (0, 0, 0, 0):
+        raise InternalAudioMigrationError("legacy publication work must finish before v2-only migration")
+    if from_version == _PREVIOUS_SCHEMA_VERSION:
+        proofs = cast(
+            tuple[int, int] | None,
+            connection.execute(
+                "SELECT (SELECT count(*) FROM ready_replay_proof), (SELECT count(*) FROM ready_replay_proof_page)"
+            ).fetchone(),
+        )
+        if proofs is None or tuple(proofs) != (0, 0):
+            raise InternalAudioMigrationError("legacy replay-proof custody must resolve before v2-only migration")
+    ready_root = layout.publication.root
+    if ready_root.exists() and any(ready_root.iterdir()):
+        raise InternalAudioMigrationError("legacy ready storage must be empty before v2-only migration")
 
 
 class _HotJournalError(Exception):

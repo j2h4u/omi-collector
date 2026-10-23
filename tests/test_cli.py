@@ -250,59 +250,6 @@ def test_init_state_preserves_existing_receiptless_v4_database(monkeypatch: pyte
     assert StateDB(state_file).get(StateKind.RUNTIME_STATUS, "current") == {"last_error": "original"}
 
 
-@pytest.mark.parametrize("command", ["begin-publication-cutover", "activate-public-audio-v2"])
-def test_public_audio_cutover_commands_require_confirmation(
-    command: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    config_path = _layout(tmp_path)
-    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
-
-    result = CliRunner().invoke(app, [command, "--config", str(config_path)])
-
-    assert result.exit_code == 2
-    assert result.stdout == ""
-    assert result.stderr.strip() == "refusing operation without --confirm-cutover"
-
-
-def test_public_audio_cutover_commands_transition_to_v2_open(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    config_path = _layout(tmp_path)
-    loaded = load_operator_config(config_path)
-    checkpoint = loaded.storage.publication.root.parent / "work" / "omi-ready-checkpoint.json"
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text(
-        json.dumps(
-            {
-                "audio_contract": "omi-audio-v2",
-                "analysis_cursor": None,
-                "vad_decisions": [],
-                "open_speech_tail": None,
-                "acknowledged": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", config_path)
-
-    quiescing = CliRunner().invoke(
-        app,
-        ["begin-publication-cutover", "--config", str(config_path), "--confirm-cutover"],
-    )
-    activated = CliRunner().invoke(
-        app,
-        ["activate-public-audio-v2", "--config", str(config_path), "--confirm-cutover"],
-    )
-
-    assert quiescing.exit_code == 0, quiescing.output
-    assert json.loads(quiescing.output) == {"mode": "quiescing"}
-    assert activated.exit_code == 0, activated.output
-    assert json.loads(activated.output) == {"mode": "v2_open", "next_public_order": 0}
-    assert StateDB(loaded.storage.collector.state_db).get(StateKind.PUBLICATION_CONTRACT, "current") == {
-        "version": 1,
-        "mode": "v2_open",
-        "next_public_order": 0,
-    }
-
-
 def test_init_state_refuses_v1_database_without_changing_it(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = _layout(tmp_path)
     state_file = load_operator_config(config_path).storage.collector.state_db

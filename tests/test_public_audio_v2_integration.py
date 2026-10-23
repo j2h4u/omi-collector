@@ -4,6 +4,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from struct import pack
 from typing import cast
@@ -11,7 +12,6 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import ready_bundles
-from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
@@ -24,16 +24,11 @@ from omi_collector.capture.adapters.ready_bundles import (
     ReadyBundleError,
     ReadyOutcomeState,
     SqlitePublicationSource,
-    activate_public_audio_v2,
-    begin_publication_cutover,
     finalize_public_audio_v2,
-    finalize_typed_sources,
     publication_contract_state,
-    retire_acknowledged,
     retire_acknowledged_public_audio_v2,
 )
 from omi_collector.capture.domain.clock_state import ClockRange, ClockState
-from omi_collector.capture.domain.publication_contract import ContractMode
 from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
 from staging_test_factory import StagingStore
@@ -111,43 +106,23 @@ def _checkpoint(root: Path, acknowledged: list[dict[str, str]] | None = None) ->
     return path
 
 
-def _activate(store: InternalAudioStore, ready: Path, checkpoint: Path) -> None:
-    assert begin_publication_cutover(store.state_db).mode is ContractMode.QUIESCING
-    assert activate_public_audio_v2(store, ready, checkpoint).mode is ContractMode.V2_OPEN
+def _options(
+    clock_state: ClockState, frontier: int, *, drained: bool = True, threshold: float = 0.02
+) -> PublicAudioV2Options:
+    return PublicAudioV2Options(
+        ReadyConfig(target_audio_seconds=threshold),
+        clock_state,
+        frontier,
+        drained,
+        128,
+    )
 
 
-def test_v2_activation_requires_migrated_drained_checkpoint(
-    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+def test_v2_waiting_for_drain_does_not_read_raw_pages(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    migrated = cast(dict[str, object], json.loads(checkpoint.read_text(encoding="utf-8")))
-    assert begin_publication_cutover(database).mode is ContractMode.QUIESCING
-    invalid = (
-        {"analysis_cursor": None, "vad_decisions": [], "open_speech_tail": None, "acknowledged": []},
-        {**migrated, "audio_contract": "legacy"},
-        {**migrated, "analysis_cursor": {"order": 1}},
-        {**migrated, "vad_decisions": [{}]},
-        {**migrated, "open_speech_tail": {"entries": []}},
-        {**migrated, "acknowledged": [{"id": "a" * 64, "audio_sha256": "b" * 64}]},
-    )
-    for value in invalid:
-        checkpoint.write_text(json.dumps(value), encoding="utf-8")
-        with pytest.raises(ReadyBundleError, match="public audio v2 checkpoint"):
-            activate_public_audio_v2(store, ready, checkpoint)
-        assert publication_contract_state(database).mode is ContractMode.QUIESCING
-        assert tuple(ready.iterdir()) == ()
-    checkpoint.write_text(json.dumps(migrated), encoding="utf-8")
-    assert activate_public_audio_v2(store, ready, checkpoint).mode is ContractMode.V2_OPEN
-
-
-def test_v2_undrained_publication_does_not_read_raw_pages(
-    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _database, store = audio_store
-    ready = _ready_root(tmp_path)
-    _activate(store, ready, _checkpoint(tmp_path))
     source = _source(store, "f" * 32, 10, (_record(100),))
     reads: list[str] = []
     read_record_page = store.read_record_page
@@ -157,50 +132,32 @@ def test_v2_undrained_publication_does_not_read_raw_pages(
         return read_record_page(source_id, after_ordinal, limit)
 
     monkeypatch.setattr(store, "read_record_page", tracked)
-    outcome = finalize_public_audio_v2(
-        store,
-        (source,),
-        ready,
-        PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 11, False, 128),
-    )
+    outcome = finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11, drained=False))
 
     assert outcome.reason == "waiting_for_drain"
     assert outcome.stats is None
     assert reads == []
+    assert publication_contract_state(database).next_public_order == 0
 
 
-def _options(clock_state: ClockState, frontier: int) -> PublicAudioV2Options:
-    return PublicAudioV2Options(
-        ReadyConfig(target_audio_seconds=0.02),
-        clock_state,
-        frontier,
-        True,
-        128,
-    )
-
-
-def _publish_and_retire_legacy(
-    store: InternalAudioStore,
-    database: StateDB,
-    ready: Path,
-    source: SqlitePublicationSource,
-    frontier: int,
+def _seed_retired_legacy_lineage(
+    store: InternalAudioStore, database: StateDB, start: int, records: tuple[bytes, ...]
 ) -> None:
-    outcome = finalize_typed_sources(
-        store,
-        (source,),
-        ready,
-        config=ReadyConfig(target_audio_seconds=0.02),
-        clock_segments=ClockSegmentMap(()),
-        frontier=frontier,
-        drained=True,
-    )
-    artifact = outcome.published[0]
-    retire_acknowledged(
-        ready,
-        database,
-        ready.parent / "unused-checkpoint.json",
-        acknowledged=((artifact.bundle_id, artifact.records_sha256),),
+    source = _source(store, "a" * 32, start, records)
+    end = start + len(records)
+    digest = source.source.committed_sha256
+    bundle_id = sha256(f"{start}:{end}:{digest}".encode()).hexdigest()
+    database.put(
+        StateKind.READY_PUBLICATION,
+        bundle_id,
+        {
+            "records_sha256": "c" * 64,
+            "state": "retired",
+            "start_sequence": start,
+            "next_sequence": end,
+            "draft_raw_sha256": digest,
+            "sources": [{"start_sequence": start, "next_sequence": end, "raw_sha256": digest}],
+        },
     )
 
 
@@ -225,7 +182,6 @@ def test_v2_activation_publish_and_ack_gc_are_bound_to_audio_hash(
     database, store = audio_store
     ready = _ready_root(tmp_path)
     checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10, (_record(100),))
     clock = ClockState((ClockRange(10, 11, 1.0, 0.25, "confirmed", "test"),))
 
@@ -279,8 +235,6 @@ def test_v2_stage_reservation_restarts_with_same_nonce_order_and_id(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10, (_record(100),))
     original = ready_bundles._materialize_v2_stage_with_failure_latch
 
@@ -296,7 +250,6 @@ def test_v2_stage_reservation_restarts_with_same_nonce_order_and_id(
         )
     assert reserved is not None
     assert publication_contract_state(database).next_public_order == 1
-
     monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original)
     outcome = finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11))
 
@@ -305,13 +258,145 @@ def test_v2_stage_reservation_restarts_with_same_nonce_order_and_id(
     assert publication_contract_state(database).next_public_order == 1
 
 
+def test_v2_accepted_cohort_without_stage_resumes_after_interruption(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "a" * 32, 10, (_record(100),))
+    resume = ready_bundles._resume_v2_cohort
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("simulated loss after cohort acceptance")
+
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", interrupt)
+    with pytest.raises(ReadyBundleError, match="simulated loss"):
+        finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11))
+
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert ready_bundles._sql_one(connection.execute("SELECT lifecycle FROM publication_cohort")) == ("accepted",)
+        assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_v2_output_stage")) == (0,)
+        assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_output_stage")) == (0,)
+
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", resume)
+    outcome = finalize_public_audio_v2(store, (), ready, _options(ClockState(), 11))
+
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    assert len(outcome.published) == 1
+    assert {path.name for path in ready.iterdir()} == {outcome.published[0].bundle_id}
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_output_stage")) == (0,)
+
+
+def test_v2_staging_cohort_without_files_resumes_after_interruption(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "c" * 32, 10, (_record(100),))
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("simulated loss after stage intent")
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt)
+    with pytest.raises(ReadyBundleError, match="simulated loss"):
+        finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11))
+
+    with closing(database.open_connection(read_only=True)) as connection:
+        row = ready_bundles._sql_one(connection.execute("SELECT lifecycle FROM publication_cohort"))
+        assert row == ("staging",)
+        stage = ready_bundles._sql_one(connection.execute("SELECT owned_path FROM ready_v2_output_stage"))
+        assert stage is not None and isinstance(stage[0], str)
+        stage_path = Path(stage[0])
+        assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_output_stage")) == (0,)
+    assert not Path(stage_path).exists()
+
+    monkeypatch.undo()
+    outcome = finalize_public_audio_v2(store, (), ready, _options(ClockState(), 11))
+
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    assert len(outcome.published) == 1
+    assert {path.name for path in ready.iterdir()} == {outcome.published[0].bundle_id}
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_v2_output_stage")) == (0,)
+        assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_output_stage")) == (0,)
+
+
+def test_v2_resume_rejects_legacy_cohort_digest_before_mutation(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "b" * 32, 10, (_record(100),))
+    resume = ready_bundles._resume_v2_cohort
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("simulated loss after cohort acceptance")
+
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", interrupt)
+    with pytest.raises(ReadyBundleError, match="simulated loss"):
+        finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11))
+    monkeypatch.setattr(ready_bundles, "_resume_v2_cohort", resume)
+    cohort = ready_bundles._load_active_typed_cohort(store)
+    assert cohort is not None
+    original_cohort_id = cohort.cohort_id
+    wrong_digest = "a" * 64
+    wrong_cohort_id = ready_bundles._typed_cohort_id(cohort.admissions, cohort.threshold, cohort.frontier, wrong_digest)
+    with closing(database.open_connection()) as connection:
+        member = cast(tuple[object, ...], connection.execute("SELECT * FROM publication_cohort_member").fetchone())
+        connection.execute("DELETE FROM publication_cohort_member WHERE cohort_id=?", (original_cohort_id,))
+        connection.execute(
+            "UPDATE publication_cohort SET cohort_id=?,accepted_permit=?,config_digest=? WHERE cohort_id=?",
+            (wrong_cohort_id, wrong_cohort_id, wrong_digest, original_cohort_id),
+        )
+        connection.execute(
+            "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,slice_count,"
+            "admitted_lifecycle,admitted_count,admitted_sha256,cursor) VALUES (?,?,?,?,?,?,?,?,?)",
+            (wrong_cohort_id, *member[1:]),
+        )
+        connection.commit()
+    cohort = ready_bundles._load_active_typed_cohort(store)
+    assert cohort is not None
+    before_entries = tuple(sorted(path.name for path in ready.iterdir()))
+    with closing(database.open_connection(read_only=True)) as connection:
+        before = (
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort_member")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM ready_v2_output_stage")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM ready_output_stage")),
+        )
+    generation = database.get_generation()
+
+    with pytest.raises(ReadyBundleError, match="config does not match the active contract"):
+        ready_bundles._resume_v2_cohort(
+            store,
+            cohort,
+            ready_bundles._V2ResumeContext(ready, ClockState(), 128, None, None),
+        )
+
+    assert tuple(sorted(path.name for path in ready.iterdir())) == before_entries
+    with closing(database.open_connection(read_only=True)) as connection:
+        after = (
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM publication_cohort_member")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM ready_v2_output_stage")),
+            ready_bundles._sql_all(connection.execute("SELECT * FROM ready_output_stage")),
+        )
+    assert after == before
+    assert database.get_generation() == generation
+
+
 def test_v2_holds_all_zero_audio_without_reserving_order(
     tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10, (_zero_record(100),))
 
     outcome = finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11))
@@ -323,13 +408,28 @@ def test_v2_holds_all_zero_audio_without_reserving_order(
         assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_v2_output_stage")) == (0,)
 
 
+def test_v2_waits_for_drain_and_threshold_without_reserving_order(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "a" * 32, 10, (_record(100),))
+
+    waiting_for_drain = finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11, drained=False))
+    waiting_for_threshold = finalize_public_audio_v2(
+        store, (source,), ready, _options(ClockState(), 11, threshold=0.04)
+    )
+
+    assert waiting_for_drain.reason == "waiting_for_drain"
+    assert waiting_for_threshold.reason == "waiting_for_threshold"
+    assert publication_contract_state(database).next_public_order == 0
+
+
 def test_v2_cross_cohort_sentinel_match_then_mismatch_freezes_boundary_at_zero(
     tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
 ) -> None:
     _database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     clock = ClockState((ClockRange(10, 13, 0.0, 0.0, "confirmed", "test"),))
     first_record = bytearray(_record(100, 1))
     first_record[4 + 438] = 75
@@ -357,7 +457,6 @@ def test_v2_same_cohort_sequence_gap_splits_artifacts_and_marks_second_boundary(
 ) -> None:
     _database, store = audio_store
     ready = _ready_root(tmp_path)
-    _activate(store, ready, _checkpoint(tmp_path))
     first = _source(store, "a" * 32, 10, (_record(100),))
     second = _source(store, "b" * 32, 12, (_record(102, 2),))
 
@@ -378,7 +477,6 @@ def test_v2_zero_only_groups_join_packet_artifact_without_losing_custody(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    _activate(store, ready, _checkpoint(tmp_path))
     leading_zero = _source(store, "a" * 32, 10, (_zero_record(100),))
     audio = _source(store, "b" * 32, 12, (_record(102, 2),))
     trailing_zero = _source(store, "c" * 32, 13, (_zero_record(103),))
@@ -408,7 +506,6 @@ def test_v2_same_cohort_sentinel_mismatch_splits_artifacts_and_marks_second_boun
 ) -> None:
     _database, store = audio_store
     ready = _ready_root(tmp_path)
-    _activate(store, ready, _checkpoint(tmp_path))
     first = bytearray(_record_with_sentinels(100, 2, 75, 1))
     second = _record_with_sentinels(101, 80, 40, 2)
     source = _source(store, "a" * 32, 10, (bytes(first), second))
@@ -431,8 +528,7 @@ def test_v2_exact_replay_of_legacy_retired_lineage_is_suppressed(
     database, store = audio_store
     ready = _ready_root(tmp_path)
     records = (_record(100), _record(101, 2))
-    _publish_and_retire_legacy(store, database, ready, _source(store, "a" * 32, 10, records), 12)
-    _activate(store, ready, _checkpoint(tmp_path))
+    _seed_retired_legacy_lineage(store, database, 10, records)
     replay = _source(store, "b" * 32, 10, records)
 
     outcome = finalize_public_audio_v2(store, (replay,), ready, _options(ClockState(), 12))
@@ -449,8 +545,7 @@ def test_v2_partial_overlap_with_legacy_retired_lineage_fails_closed(
     database, store = audio_store
     ready = _ready_root(tmp_path)
     records = (_record(100), _record(101, 2))
-    _publish_and_retire_legacy(store, database, ready, _source(store, "a" * 32, 10, records), 12)
-    _activate(store, ready, _checkpoint(tmp_path))
+    _seed_retired_legacy_lineage(store, database, 10, records)
     partial = _source(store, "b" * 32, 11, (records[1],))
 
     with pytest.raises(ReadyBundleError, match="overlaps retired custody"):
@@ -458,8 +553,29 @@ def test_v2_partial_overlap_with_legacy_retired_lineage_fails_closed(
     assert publication_contract_state(database).next_public_order == 0
 
 
-def test_staging_store_quiesces_legacy_then_routes_preserved_source_to_v2(tmp_path: Path) -> None:
-    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02))
+def test_v2_active_artifact_suppresses_exact_replay_and_rejects_conflicting_overlap(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    records = (_record(100), _record(101, 2))
+    published = finalize_public_audio_v2(
+        store, (_source(store, "a" * 32, 10, records),), ready, _options(ClockState(), 12)
+    )
+    artifact = published.published[0]
+    exact = finalize_public_audio_v2(store, (_source(store, "b" * 32, 10, records),), ready, _options(ClockState(), 12))
+    before = database.list(StateKind.READY_PUBLICATION)
+    conflicting = _source(store, "c" * 32, 11, (_record(101, 9),))
+
+    assert exact.published == ()
+    with pytest.raises(ReadyBundleError):
+        finalize_public_audio_v2(store, (conflicting,), ready, _options(ClockState(), 12))
+    assert artifact.path.is_dir()
+    assert database.list(StateKind.READY_PUBLICATION) == before
+
+
+def test_staging_store_preserves_subthreshold_source_under_v2_contract(tmp_path: Path) -> None:
+    config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.04))
     draft = tmp_path / "draft"
     draft.mkdir()
     bootstrap = StagingStore(tmp_path / "spool", draft, config=config)
@@ -470,7 +586,6 @@ def test_staging_store_quiesces_legacy_then_routes_preserved_source_to_v2(tmp_pa
         publication_root=ready,
         config=config,
     )
-    assert begin_publication_cutover(store.state_db).mode is ContractMode.QUIESCING
     attempt = store.prepare_streaming_attempt(10, 1)
     attempt.prepare_leg(10, 1)
     attempt.record_read_begin(ReadBeginNotification(10, 1))
@@ -480,20 +595,14 @@ def test_staging_store_quiesces_legacy_then_routes_preserved_source_to_v2(tmp_pa
     attempt.close()
     store.append_ready_closure(11, "drained")
 
-    quiescing = store.recover_and_publish()
+    waiting = store.recover_and_publish()
 
-    assert quiescing.state is ReadyOutcomeState.WAITING, quiescing.reason
+    assert waiting.state is ReadyOutcomeState.WAITING, waiting.reason
+    assert waiting.reason == "waiting_for_threshold"
     assert tuple(ready.iterdir()) == ()
-    checkpoint = _checkpoint(tmp_path)
     with InternalAudioStore(store.state_db, chunk_limit=config.writer.chunk_records) as audio:
         source = audio.get_source(source_id)
         assert source is not None and source.lifecycle == "sealed_waiting"
-        assert activate_public_audio_v2(audio, ready, checkpoint).mode is ContractMode.V2_OPEN
-
-    published = store.recover_and_publish()
-
-    assert published.state is ReadyOutcomeState.PUBLISHED
-    assert {item.name for item in published.published[0].path.iterdir()} == {"audio.ogg", "manifest.json"}
 
 
 def test_staging_store_ack_preserves_multi_page_gc_progress_with_subthreshold_source(tmp_path: Path) -> None:
@@ -510,7 +619,6 @@ def test_staging_store_ack_preserves_multi_page_gc_progress_with_subthreshold_so
     )
     checkpoint = _checkpoint(tmp_path)
     with InternalAudioStore(store.state_db) as audio_store:
-        _activate(audio_store, ready, checkpoint)
         records = tuple(_record(100 + index, index % 254 + 1) for index in range(129))
         audio_store.create_source("a" * 32, "attempt", 10, 139)
         source = audio_store.prepare_leg("a" * 32, 10, len(records))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import sqlite3
@@ -16,10 +17,18 @@ from urllib.parse import quote
 from omi_collector.capture.adapters.collector_state_db import (
     StateDB,
     StateDBError,
+    StateKind,
     _validate_audio_schema,
     _validate_schema,
     raise_if_sqlite_storage_fault,
 )
+from omi_collector.capture.adapters.ready_bundles import (
+    ReadyBundleError,
+    _is_sha256,
+    _parse_publication_contract,
+    _v2_config_sha256,
+)
+from omi_collector.capture.domain.publication_contract import ContractMode
 from omi_collector.storage_layout import StorageLayout
 
 
@@ -81,6 +90,129 @@ def _validate_current(connection: sqlite3.Connection) -> None:
         raise StateMigrationError("Collector SQLite typed schema is invalid") from error
     if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
         raise InternalAudioCutoverRequiredError("legacy capture rows remain in typed state")
+    _validate_v2_only_publication(connection)
+
+
+def _validate_v2_only_publication(connection: sqlite3.Connection) -> None:
+    contract_row = cast(
+        tuple[str] | None,
+        connection.execute(
+            "SELECT payload FROM state WHERE kind=? AND id='current'",
+            (StateKind.PUBLICATION_CONTRACT.value,),
+        ).fetchone(),
+    )
+    try:
+        contract = json.loads(cast(str, contract_row[0])) if contract_row is not None else None
+    except (json.JSONDecodeError, TypeError) as error:
+        raise StateMigrationError("Collector publication contract is invalid") from error
+    try:
+        parsed_contract = _parse_publication_contract(contract if isinstance(contract, dict) else None)
+    except ReadyBundleError as error:
+        raise InternalAudioCutoverRequiredError(
+            "Collector publication contract must be v2 before this release"
+        ) from error
+    if parsed_contract.mode is not ContractMode.V2_OPEN:
+        raise InternalAudioCutoverRequiredError("Collector publication contract must be v2 before this release")
+    legacy_custody = cast(
+        tuple[int, int, int, int, int, int] | None,
+        connection.execute(
+            "SELECT (SELECT count(*) FROM ready_output_stage), (SELECT count(*) FROM ready_stage_range), "
+            "(SELECT count(*) FROM ready_replay_proof WHERE format!='omi-audio-v2'), "
+            "(SELECT count(*) FROM ready_replay_proof_page AS page LEFT JOIN ready_replay_proof AS proof "
+            "ON proof.bundle_id=page.bundle_id AND proof.format='omi-audio-v2' WHERE proof.bundle_id IS NULL), "
+            "(SELECT count(*) FROM publication_cohort_member AS member LEFT JOIN publication_cohort AS cohort "
+            "ON cohort.cohort_id=member.cohort_id LEFT JOIN capture_source AS member_source "
+            "ON member_source.source_id=member.source_id "
+            "WHERE cohort.cohort_id IS NULL OR member_source.source_id IS NULL), "
+            "(SELECT count(*) FROM ready_v2_stage_range AS stage_range LEFT JOIN ready_v2_output_stage AS stage "
+            "ON stage.stage_id=stage_range.stage_id LEFT JOIN capture_source AS range_source "
+            "ON range_source.source_id=stage_range.source_id "
+            "WHERE stage.stage_id IS NULL OR range_source.source_id IS NULL)"
+        ).fetchone(),
+    )
+    if legacy_custody is None or tuple(legacy_custody) != (0, 0, 0, 0, 0, 0):
+        raise InternalAudioCutoverRequiredError("unresolved publication custody must be repaired before this release")
+    _validate_v2_cohorts(connection)
+    rows = cast(
+        list[tuple[str]],
+        connection.execute(
+            "SELECT payload FROM state WHERE kind=? AND id!='frontier'",
+            (StateKind.READY_PUBLICATION.value,),
+        ).fetchall(),
+    )
+    try:
+        entries = tuple(cast(object, json.loads(row[0])) for row in rows)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise StateMigrationError("Collector publication ledger is invalid") from error
+    if any(
+        not isinstance(entry, dict) or (entry.get("format") != "omi-audio-v2" and entry.get("state") != "retired")
+        for entry in entries
+    ):
+        raise InternalAudioCutoverRequiredError("active legacy publication must retire before this release")
+
+
+def _validate_v2_cohorts(connection: sqlite3.Connection) -> None:
+    rows = cast(
+        list[tuple[str, str, str | None]],
+        connection.execute(
+            "SELECT cohort_id,lifecycle,config_digest FROM publication_cohort ORDER BY cohort_id"
+        ).fetchall(),
+    )
+    active = tuple(row for row in rows if row[1] in {"accepted", "staging", "complete"})
+    if any(row[1] not in {"accepted", "staging", "complete"} or row[2] != _v2_config_sha256() for row in rows):
+        raise InternalAudioCutoverRequiredError(
+            "legacy or unqualified publication cohort must retire before this release"
+        )
+    if len(active) > 1:
+        raise InternalAudioCutoverRequiredError("multiple active publication cohorts require stopped-service repair")
+    for cohort_id, lifecycle, _ in active:
+        cohort = cast(
+            tuple[str | None, int, int] | None,
+            connection.execute(
+                "SELECT accepted_permit,drained_threshold,cursor FROM publication_cohort WHERE cohort_id=?",
+                (cohort_id,),
+            ).fetchone(),
+        )
+        members = cast(
+            list[tuple[int, str, int, int, str, int, str]],
+            connection.execute(
+                "SELECT member.member_ordinal,member.source_id,member.slice_start,member.slice_count,"
+                "member.admitted_lifecycle,member.admitted_count,member.admitted_sha256 "
+                "FROM publication_cohort_member AS member LEFT JOIN capture_source AS source "
+                "ON source.source_id=member.source_id WHERE member.cohort_id=? ORDER BY member.member_ordinal",
+                (cohort_id,),
+            ).fetchall(),
+        )
+        if cohort is None or cohort[0] != cohort_id or type(cohort[1]) is not int or type(cohort[2]) is not int:
+            raise InternalAudioCutoverRequiredError("active publication cohort permit is invalid")
+        # A completed cohort may outlive cleanup of its member snapshots.
+        if lifecycle == "complete" and not members:
+            continue
+        if not members:
+            raise InternalAudioCutoverRequiredError("active publication cohort members are invalid")
+        for expected_ordinal, member in enumerate(members):
+            ordinal, source_id, start, count, admitted_lifecycle, admitted_count, digest = member
+            source = connection.execute(
+                "SELECT source_type,lifecycle,committed_count,committed_sha256,certified_prefix_count,coverage_digest "
+                "FROM capture_source WHERE source_id=?",
+                (source_id,),
+            ).fetchone()
+            if (
+                source is None
+                or ordinal != expected_ordinal
+                or start != 0
+                or count != admitted_count
+                or admitted_lifecycle not in {"sealed_waiting", "blocked"}
+                or not isinstance(digest, str)
+                or not _is_sha256(digest)
+                or source[1] not in {admitted_lifecycle, "covered", "retiring"}
+                or (admitted_lifecycle == "sealed_waiting" and tuple(source[2:4]) != (count, digest))
+                or (
+                    admitted_lifecycle == "blocked"
+                    and (source[0] != "quarantine" or tuple(source[4:6]) != (count, digest))
+                )
+            ):
+                raise InternalAudioCutoverRequiredError("active publication cohort source snapshot is invalid")
 
 
 def _validate_v2(connection: sqlite3.Connection) -> None:
@@ -182,34 +314,7 @@ def _owned_typed_ready_stage(entry: Path, connection: sqlite3.Connection) -> boo
     match = re.fullmatch(r"\.([0-9a-f]{64})\.([0-9a-f]{16})\.stage", entry.name)
     if match is None or not stat.S_ISDIR(entry.lstat().st_mode):
         return False
-    return _owned_legacy_ready_stage(entry, match, connection) or _owned_v2_ready_stage(entry, match, connection)
-
-
-def _owned_legacy_ready_stage(entry: Path, match: re.Match[str], connection: sqlite3.Connection) -> bool:
-    rows = cast(
-        list[tuple[str, str, str]],
-        connection.execute(
-            "SELECT stage_id,group_identity,owner_token FROM ready_output_stage WHERE owned_path=?",
-            (str(entry),),
-        ).fetchall(),
-    )
-    if len(rows) != 1:
-        return False
-    stage_id, identity, owner_token = rows[0]
-    parts = re.fullmatch(r"([0-9a-f]{64}):([0-9]{1,19}):([0-9a-f]{64})", identity)
-    if (
-        parts is None
-        or stage_id != sha256(identity.encode()).hexdigest()
-        or owner_token != stage_id
-        or match.groups() != (parts[3], stage_id[:16])
-    ):
-        return False
-    if not _owned_stage_cohort(connection, parts):
-        return False
-    return all(
-        child.name in {"records.bin", "manifest.json"} and stat.S_ISREG(child.lstat().st_mode)
-        for child in entry.iterdir()
-    )
+    return _owned_v2_ready_stage(entry, match, connection)
 
 
 def _owned_v2_ready_stage(entry: Path, match: re.Match[str], connection: sqlite3.Connection) -> bool:

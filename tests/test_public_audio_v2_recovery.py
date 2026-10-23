@@ -4,6 +4,7 @@ import errno
 import hashlib
 import json
 import sqlite3
+import stat
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from pathlib import Path
@@ -18,20 +19,19 @@ from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZ
 from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
     ReadyBundleError,
+    ReadyBundleResult,
     ReadyDurabilityFatalError,
     ReadyOutcomeState,
     SqlitePublicationSource,
     _TypedCohort,
     _V2Commit,
     _V2Stage,
-    activate_public_audio_v2,
-    begin_publication_cutover,
     finalize_public_audio_v2,
     publication_contract_state,
+    resume_retired_public_audio_v2,
     retire_acknowledged_public_audio_v2,
 )
 from omi_collector.capture.domain.clock_state import ClockRange, ClockState
-from omi_collector.capture.domain.publication_contract import ContractMode
 from omi_collector.config import ReadyConfig
 
 
@@ -91,9 +91,23 @@ def _checkpoint(root: Path) -> Path:
     return path
 
 
-def _activate(store: InternalAudioStore, ready: Path, checkpoint: Path) -> None:
-    assert begin_publication_cutover(store.state_db).mode is ContractMode.QUIESCING
-    assert activate_public_audio_v2(store, ready, checkpoint).mode is ContractMode.V2_OPEN
+def _retire_without_removing(
+    database: StateDB,
+    store: InternalAudioStore,
+    ready: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ReadyBundleResult:
+    artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
+    manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
+    with monkeypatch.context() as retirement:
+        retirement.setattr(ready_bundles, "_remove_retired_v2", lambda _path: None)
+        retire_acknowledged_public_audio_v2(
+            ready,
+            database,
+            _checkpoint(ready.parent),
+            acknowledged=((artifact.bundle_id, cast(str, manifest["audio_sha256"])),),
+        )
+    return artifact
 
 
 def _options(clock: ClockState | None = None, frontier: int = 11) -> PublicAudioV2Options:
@@ -114,6 +128,17 @@ def _counts(database: StateDB) -> tuple[int, int, int, int]:
             ),
         )
     return cast(tuple[int, int, int, int], tuple(cast(int, row[0]) for row in rows))
+
+
+def _assert_publication_operator_access(path: Path, ready: Path) -> None:
+    assert stat.S_IMODE(path.stat().st_mode) == 0o2750
+    assert path.stat().st_gid == ready.stat().st_gid
+    assert {item.name for item in path.iterdir()} == {"audio.ogg", "manifest.json"}
+    for name in ("audio.ogg", "manifest.json"):
+        item = path / name
+        assert stat.S_IMODE(item.stat().st_mode) == 0o640
+        assert item.stat().st_gid == ready.stat().st_gid
+        assert item.stat().st_mode & stat.S_IRGRP
 
 
 def _install_materialization_failure(
@@ -168,8 +193,6 @@ def test_v2_stage_intent_commit_ambiguity_resumes_one_reservation(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10)
     original = store._commit
     injected = False
@@ -223,8 +246,6 @@ def test_v2_stage_intent_freezes_time_basis_across_restart(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10)
     original = ready_bundles._materialize_v2_stage_with_failure_latch
 
@@ -288,14 +309,16 @@ def test_v2_materialization_process_loss_converges_to_reserved_artifact(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10)
     with monkeypatch.context() as patcher:
         fired = _install_materialization_failure(patcher, ready, boundary, after)
         with pytest.raises(RuntimeError, match="simulated non-durable"):
             finalize_public_audio_v2(store, (source,), ready, _options())
         assert fired()
+        if boundary == "directory_sync" and after:
+            stages = tuple(ready.glob(".*.stage"))
+            assert len(stages) == 1
+            _assert_publication_operator_access(stages[0], ready)
     with closing(database.open_connection(read_only=True)) as connection:
         reserved = cast(
             tuple[object, ...] | None, connection.execute("SELECT artifact_id FROM ready_v2_output_stage").fetchone()
@@ -306,7 +329,7 @@ def test_v2_materialization_process_loss_converges_to_reserved_artifact(
         restarted_source = SqlitePublicationSource(restarted, source.source_id)
         outcome = finalize_public_audio_v2(restarted, (restarted_source,), ready, _options())
     assert outcome.published[0].bundle_id == cast(str, reserved[0])
-    assert {item.name for item in outcome.published[0].path.iterdir()} == {"audio.ogg", "manifest.json"}
+    _assert_publication_operator_access(outcome.published[0].path, ready)
     assert publication_contract_state(database).next_public_order == 1
     assert _counts(database)[1:3] == (0, 1)
 
@@ -320,8 +343,6 @@ def test_v2_ready_commit_ambiguity_converges_without_duplicate_rows(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10)
     original = ready_bundles._commit_v2_stage_once
     calls = 0
@@ -352,8 +373,6 @@ def test_v2_eio_durability_failure_latches_and_fails_closed_after_restart(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10)
     original = ready_bundles._write_file
 
@@ -386,8 +405,6 @@ def test_v2_stage_proof_damage_fail_closes_before_ready_commit(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     source = _source(store, "a" * 32, 10)
     original = ready_bundles._materialize_v2_stage_with_failure_latch
 
@@ -434,7 +451,6 @@ def test_v2_active_proof_structural_corruption_is_durability_fatal(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    _activate(store, ready, _checkpoint(tmp_path))
     source = _source(store, "a" * 32, 10)
     outcome = finalize_public_audio_v2(store, (source,), ready, _options())
     assert outcome.state is ReadyOutcomeState.PUBLISHED
@@ -490,7 +506,6 @@ def test_v2_ack_batch_preflights_both_and_retires_idempotently_after_source_gc(
     database, store = audio_store
     ready = _ready_root(tmp_path)
     checkpoint = _checkpoint(tmp_path)
-    _activate(store, ready, checkpoint)
     clock = ClockState((ClockRange(10, 13, 0.0, 0.0, "confirmed", "test"),))
     first_source = _source(store, "a" * 32, 10)
     second_source = _source(store, "b" * 32, 12)
@@ -517,12 +532,127 @@ def test_v2_ack_batch_preflights_both_and_retires_idempotently_after_source_gc(
     assert _counts(database)[2] == 0
 
 
+def test_v2_retirement_resumes_after_process_loss_between_file_unlinks(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    checkpoint = _checkpoint(tmp_path)
+    artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
+    manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
+    original_unlink = Path.unlink
+    interrupted = False
+
+    def interrupt_after_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        nonlocal interrupted
+        original_unlink(path, missing_ok=missing_ok)
+        if path.parent == artifact.path and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated process loss after first retired file unlink")
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(Path, "unlink", interrupt_after_unlink)
+        with pytest.raises(RuntimeError, match="process loss"):
+            retire_acknowledged_public_audio_v2(
+                ready,
+                database,
+                checkpoint,
+                acknowledged=((artifact.bundle_id, cast(str, manifest["audio_sha256"])),),
+            )
+
+    assert interrupted
+    assert {item.name for item in artifact.path.iterdir()} in ({"audio.ogg"}, {"manifest.json"})
+    retired = database.get(StateKind.READY_PUBLICATION, artifact.bundle_id)
+    assert retired is not None and retired["state"] == "retired"
+    assert _counts(database)[2] == 0
+
+    resume_retired_public_audio_v2(ready, database)
+
+    assert not artifact.path.exists()
+
+
+@pytest.mark.parametrize(
+    "remaining",
+    (None, (), ("audio.ogg",), ("manifest.json",), ("audio.ogg", "manifest.json")),
+    ids=("absent", "empty", "audio-only", "manifest-only", "full-pair"),
+)
+def test_v2_retired_resume_accepts_every_known_file_subset(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: tuple[str, ...] | None,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    artifact = _retire_without_removing(database, store, ready, monkeypatch)
+    retained = set(remaining or ())
+    for item in artifact.path.iterdir():
+        if item.name not in retained:
+            item.unlink()
+    if remaining is None:
+        artifact.path.rmdir()
+
+    resume_retired_public_audio_v2(ready, database)
+
+    assert not artifact.path.exists()
+
+
+@pytest.mark.parametrize("unsafe", ("foreign", "directory", "symlink"))
+def test_v2_retired_resume_rejects_foreign_and_unsafe_entries(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe: str,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    artifact = _retire_without_removing(database, store, ready, monkeypatch)
+    if unsafe == "foreign":
+        (artifact.path / "unexpected").write_bytes(b"unsafe")
+    else:
+        audio = artifact.path / "audio.ogg"
+        audio.unlink()
+        if unsafe == "directory":
+            audio.mkdir()
+        else:
+            audio.symlink_to("manifest.json")
+
+    with pytest.raises(ReadyBundleError, match=r"inventory is invalid|artifact is unsafe"):
+        resume_retired_public_audio_v2(ready, database)
+
+    assert artifact.path.exists()
+
+
+def test_v2_ready_retirement_preflight_still_requires_the_full_pair(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
+    manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
+    (artifact.path / "manifest.json").unlink()
+
+    with pytest.raises(ReadyBundleError):
+        retire_acknowledged_public_audio_v2(
+            ready,
+            database,
+            _checkpoint(tmp_path),
+            acknowledged=((artifact.bundle_id, cast(str, manifest["audio_sha256"])),),
+        )
+
+    entry = database.get(StateKind.READY_PUBLICATION, artifact.bundle_id)
+    assert entry is not None and entry["state"] == "ready"
+    assert _counts(database)[2] == 1
+
+
 def test_v2_waiting_passes_finish_multi_page_source_gc_after_ack(tmp_path: Path) -> None:
     database = StateDB(tmp_path / "collector-state.sqlite3")
     ready = _ready_root(tmp_path)
     checkpoint = _checkpoint(tmp_path)
     with InternalAudioStore(database) as store:
-        _activate(store, ready, checkpoint)
         published_source = _source(store, "a" * 32, 10, count=3)
         clock = ClockState((ClockRange(10, 21, 0.0, 0.0, "confirmed", "test"),))
         options = PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), clock, 13, True, 1)

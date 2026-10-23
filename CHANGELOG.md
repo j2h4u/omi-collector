@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.19.4](https://github.com/j2h4u/omi-collector/compare/v0.19.3...v0.19.4) (2026-10-23)
+
+
+### Fixes
+
+* **deploy:** build immutable reviewed sources and report cleanup failures ([a975d8b](https://github.com/j2h4u/omi-collector/commit/a975d8b8c4d8f6bc6fc28cae8a08fd7d862f023b))
+* **status:** bind active progress to current service and tolerate bounded busy reads ([a975d8b](https://github.com/j2h4u/omi-collector/commit/a975d8b8c4d8f6bc6fc28cae8a08fd7d862f023b))
+
+
+### Performance
+
+* **capture:** avoid repeated scans while audio accumulates below threshold ([a975d8b](https://github.com/j2h4u/omi-collector/commit/a975d8b8c4d8f6bc6fc28cae8a08fd7d862f023b))
+* **qa:** reuse full coverage and Docker builds while yielding to foreground work ([a975d8b](https://github.com/j2h4u/omi-collector/commit/a975d8b8c4d8f6bc6fc28cae8a08fd7d862f023b))
+
 ## [0.19.3](https://github.com/j2h4u/omi-collector/compare/v0.19.2...v0.19.3) (2026-10-22)
 
 

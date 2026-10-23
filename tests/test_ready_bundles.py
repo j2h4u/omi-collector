@@ -270,7 +270,7 @@ def test_disjoint_subthreshold_growth_reuses_durable_packet_summary(
     assert second_wait.stats is not None
     assert (second_wait.stats.audio_packets, second_wait.stats.gap_count, second_wait.stats.gap_records) == (3, 1, 9)
 
-    page_reads: list[str] = []
+    page_reads.clear()
     normalization_reads: list[str] = []
     precomputed_sources: list[str] = []
     normalize = ready_bundles._normalize_typed_admissions

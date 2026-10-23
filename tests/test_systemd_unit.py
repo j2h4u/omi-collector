@@ -299,7 +299,7 @@ def test_release_helper_fails_when_successful_deploy_cannot_clean_worktree(tmp_p
         'case "$3" in\n'
         "status|fetch|show-ref|merge-base) exit 0 ;;\n"
         "rev-list) printf '%040d\\n' 0 ;;\n"
-        f'worktree) if [[ "$4" == add ]]; then mkdir -p "$6/scripts"; printf \'#!/usr/bin/env bash\\necho deployed\\n\' > "$6/scripts/deploy-systemd-service.sh"; chmod +x "$6/scripts/deploy-systemd-service.sh"; else exit 1; fi ;;\n'
+        'worktree) if [[ "$4" == add ]]; then mkdir -p "$6/scripts"; printf \'#!/usr/bin/env bash\\necho deployed\\n\' > "$6/scripts/deploy-systemd-service.sh"; chmod +x "$6/scripts/deploy-systemd-service.sh"; else exit 1; fi ;;\n'
         "*) exit 2 ;;\nesac\n",
         encoding="utf-8",
     )

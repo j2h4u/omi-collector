@@ -11,9 +11,9 @@ Use `uv` and keep `uv.lock` synchronized. The required gates are:
 
 - `just check` — static, type, import, dependency, workflow, compile, and
   packaging checks;
-- `just crap-check` — the authoritative radon-backed CRAP threshold for every
-  function;
-- `just unit` — behavior tests;
+- `just crap-check` — the full pytest suite, including slow tests, and the
+  authoritative radon-backed CRAP threshold for every function;
+- `just unit` — fast behavior tests without slow tests for local iteration;
 - `just docker-build` — Dockerfile, Compose, and image validation;
 - `just runtime-smoke` — a bounded installed-CLI container smoke;
 - `just verify` — the complete local contract when a local full run is needed.
@@ -31,10 +31,12 @@ the accepted change and pass the existing remote gates before protected-main
 merge; the GitHub release can follow in the background. See [edge.md](../edge.md)
 for the short workflow sequence.
 
-Runtime QA must run serially at low CPU and idle I/O priority. The canonical
-`just unit` command is bounded to 600 seconds; set
-`PYTEST_XDIST_AUTO_NUM_WORKERS=1` so its pytest-xdist invocation uses one
-worker. Keep the tests and assertions intact.
+Unit, coverage, and CRAP pytest commands yield to foreground work with the
+Linux idle CPU scheduler, nice 19, and idle I/O priority. The canonical
+`just unit` command is bounded to 600 seconds and runs without slow tests. Its
+pytest-xdist worker count can be limited with `PYTEST_XDIST_AUTO_NUM_WORKERS`;
+otherwise pytest-xdist selects workers automatically. Keep the tests and
+assertions intact.
 
 For full QA on a slow disk, put only temporary test scratch in a short,
 task-owned `TMPDIR` on tmpfs; keep logs and receipts on persistent storage.
@@ -111,9 +113,10 @@ selectors, and credit only strict pytest/JUnit behavioral failures. Keep
 observed failures, timeouts, equivalents, and nonviable mutations distinct; a
 completed ledger is not a new full-project score.
 
-Unit, coverage, CRAP and mutation commands use CPU niceness 19 and Linux
-`ionice` idle class; child test processes inherit both priorities. Ordinary
-pytest commands remain bounded to 600 seconds. The canonical full-project
+Unit, coverage, and CRAP commands use Linux `SCHED_IDLE` CPU scheduling, CPU
+niceness 19, and `ionice` idle class; child test processes inherit these
+priorities. Mutation commands use CPU niceness 19 and Linux `ionice` idle
+class. Ordinary pytest commands remain bounded to 600 seconds. The canonical full-project
 mutation campaign uses one finite 24-hour GNU timeout with TERM and a
 five-second KILL grace; this is an operating budget, not a completion promise.
 Targeted mutants retain their 150-second budget and the independent coverage
@@ -265,9 +268,9 @@ downstream service.
 The installed sudo policy permits the operator to start, stop, or restart only
 `omi-collector.service`. Build and deployment commands do not use sudo.
 
-The configuration is strict and contains `[pendant] address`, plus optional
-`[presence]` and `[ready]` sections. `[ready]` accepts `target_audio_seconds`
-(3600 seconds by default). Only a confirmed complete
+The configuration is strict and contains the flat `pendant_address` setting,
+plus optional `presence` settings and `bundle_min_audio_seconds` (3600 seconds
+by default). Only a confirmed complete
 pendant drain permits packaging, and only when the cumulative captured Opus
 audio reaches that minimum. All accumulated eligible drafts then form one
 bundle; crossing the minimum during downloading never splits the visit.

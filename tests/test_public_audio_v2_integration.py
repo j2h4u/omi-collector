@@ -15,6 +15,7 @@ from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
+    CaptureRecord,
     DrainCheckpoint,
     InternalAudioStore,
 )
@@ -139,6 +140,33 @@ def test_v2_activation_requires_migrated_drained_checkpoint(
         assert tuple(ready.iterdir()) == ()
     checkpoint.write_text(json.dumps(migrated), encoding="utf-8")
     assert activate_public_audio_v2(store, ready, checkpoint).mode is ContractMode.V2_OPEN
+
+
+def test_v2_undrained_publication_does_not_read_raw_pages(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _database, store = audio_store
+    ready = _ready_root(tmp_path)
+    _activate(store, ready, _checkpoint(tmp_path))
+    source = _source(store, "f" * 32, 10, (_record(100),))
+    reads: list[str] = []
+    read_record_page = store.read_record_page
+
+    def tracked(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        reads.append(source_id)
+        return read_record_page(source_id, after_ordinal, limit)
+
+    monkeypatch.setattr(store, "read_record_page", tracked)
+    outcome = finalize_public_audio_v2(
+        store,
+        (source,),
+        ready,
+        PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 11, False, 128),
+    )
+
+    assert outcome.reason == "waiting_for_drain"
+    assert outcome.stats is None
+    assert reads == []
 
 
 def _options(clock_state: ClockState, frontier: int) -> PublicAudioV2Options:

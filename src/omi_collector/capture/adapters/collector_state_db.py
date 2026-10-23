@@ -47,6 +47,7 @@ class StateKind(StrEnum):
     BLE_SCAN_INCIDENT = "ble_scan_incident"
     PUBLICATION_CONTRACT = "publication_contract"
     PUBLICATION_V2_FRONTIER = "publication_v2_frontier"
+    PACKET_SUMMARY = "packet_summary"
 
 
 class StateDBError(RuntimeError):

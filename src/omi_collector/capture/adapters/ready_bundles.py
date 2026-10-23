@@ -1705,6 +1705,8 @@ class _TypedAdmission:
     admitted_sha256: str
     cursor: int = 0
     member_ordinal: int | None = None
+    certified_prefix_count: int | None = None
+    coverage_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2090,24 +2092,40 @@ def _finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps stora
         admissions = _typed_source_admissions(audio_store, sources, frontier)
         if drained:
             admissions = _cover_typed_full_replays(audio_store, admissions, custody, page_limit)
-        try:
-            slices = _normalize_typed_admissions(admissions, page_limit, custody)
-        except _TypedAdmissionConflictError as error:
-            admission = next(item for item in admissions if item.snapshot.source_id == error.source_id)
-            _block_typed_custody_conflict(audio_store, admission)
-            raise
         _require_typed_admissions_current(audio_store, admissions)
-        stats = _typed_stats(admissions, slices, threshold)
         if not drained:
             retirement_pending = _retire_one_typed_source(audio_store, page_limit)
             return ReadyOutcome(
                 ReadyOutcomeState.WAITING,
                 reason="waiting_for_drain",
                 remaining_at_frontier=bool(admissions),
-                stats=stats,
                 custody_cache=custody_cache,
                 retirement_pending=retirement_pending,
             )
+        summary = _disjoint_packet_summary(audio_store, admissions, custody, page_limit, threshold)
+        summary_packets = summary[0] if summary is not None else None
+        if summary_packets is not None and summary_packets < threshold:
+            _persist_typed_packet_summaries(audio_store, summary[1])
+            _require_typed_admissions_current(audio_store, admissions)
+            _require_typed_summary_certification_current(audio_store, admissions)
+            return ReadyOutcome(
+                ReadyOutcomeState.WAITING,
+                reason="waiting_for_threshold",
+                remaining_at_frontier=bool(admissions),
+                stats=summary[2],
+                custody_cache=custody_cache,
+                retirement_pending=_retire_one_typed_source(audio_store, page_limit),
+            )
+        try:
+            slices = _normalize_typed_admissions(
+                admissions, page_limit, custody, () if summary is None else summary[1]
+            )
+        except _TypedAdmissionConflictError as error:
+            admission = next(item for item in admissions if item.snapshot.source_id == error.source_id)
+            _block_typed_custody_conflict(audio_store, admission)
+            raise
+        _require_typed_admissions_current(audio_store, admissions)
+        stats = _typed_stats(admissions, slices, threshold)
         if not slices or stats.audio_packets < threshold:
             retirement_pending = _retire_one_typed_source(audio_store, page_limit)
             return ReadyOutcome(
@@ -2181,17 +2199,32 @@ def _finalize_public_audio_v2(
         admissions = _typed_source_admissions(audio_store, sources, options.frontier)
         if options.drained:
             admissions = _cover_typed_full_replays(audio_store, admissions, custody, options.page_limit)
-        slices = _normalize_typed_admissions(admissions, options.page_limit, custody)
         _require_typed_admissions_current(audio_store, admissions)
-        stats = _typed_stats(admissions, slices, threshold)
         if not options.drained:
             return ReadyOutcome(
                 ReadyOutcomeState.WAITING,
                 reason="waiting_for_drain",
                 remaining_at_frontier=bool(admissions),
-                stats=stats,
                 custody_cache=custody_cache,
             )
+        summary = _disjoint_packet_summary(audio_store, admissions, custody, options.page_limit, threshold)
+        summary_packets = summary[0] if summary is not None else None
+        if summary_packets is not None and summary_packets < threshold:
+            _persist_typed_packet_summaries(audio_store, summary[1])
+            _require_typed_admissions_current(audio_store, admissions)
+            _require_typed_summary_certification_current(audio_store, admissions)
+            return ReadyOutcome(
+                ReadyOutcomeState.WAITING,
+                reason="waiting_for_threshold",
+                remaining_at_frontier=bool(admissions),
+                stats=summary[2],
+                custody_cache=custody_cache,
+            )
+        slices = _normalize_typed_admissions(
+            admissions, options.page_limit, custody, () if summary is None else summary[1]
+        )
+        _require_typed_admissions_current(audio_store, admissions)
+        stats = _typed_stats(admissions, slices, threshold)
         if not slices or stats.audio_packets < threshold:
             return ReadyOutcome(
                 ReadyOutcomeState.WAITING,
@@ -2294,7 +2327,17 @@ def _typed_admission(
         return None
     if count <= 0 or snapshot.sequence_start + count > snapshot.sequence_limit:
         raise ReadyBundleError("typed publication source checkpoint is invalid")
-    return _TypedAdmission(reader, snapshot, snapshot.lifecycle, count, digest)
+    certified_count = certification[0] if type(certification[0]) is int else None
+    coverage_digest = certification[1] if isinstance(certification[1], str) else None
+    return _TypedAdmission(
+        reader,
+        snapshot,
+        snapshot.lifecycle,
+        count,
+        digest,
+        certified_prefix_count=certified_count,
+        coverage_digest=coverage_digest,
+    )
 
 
 def _blocked_typed_certification(snapshot: CaptureSource, certification: tuple[object, ...]) -> tuple[int, str] | None:
@@ -2703,6 +2746,28 @@ def _require_typed_admissions_current(
         _require_typed_snapshot(current, admission)
 
 
+def _require_typed_summary_certification_current(
+    audio_store: InternalAudioStore, admissions: tuple[_TypedAdmission, ...]
+) -> None:
+    try:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
+            for admission in admissions:
+                row = _sql_one(
+                    connection.execute(
+                        "SELECT certified_prefix_count,coverage_digest FROM capture_source WHERE source_id=?",
+                        (admission.snapshot.source_id,),
+                    )
+                )
+                if row is None or tuple(row) != (admission.certified_prefix_count, admission.coverage_digest):
+                    raise ReadyBundleError("typed packet summary certification changed")
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyBundleError("typed packet summary certification is unreadable") from error
+
+
 def _rebind_typed_slices(
     slices: tuple[_TypedSlice, ...], admissions: tuple[_TypedAdmission, ...]
 ) -> tuple[_TypedSlice, ...]:
@@ -2753,15 +2818,23 @@ def _typed_slice(admission: _TypedAdmission, start_ordinal: int, count: int, pag
 
 
 def _normalize_typed_admissions(
-    admissions: tuple[_TypedAdmission, ...], page_limit: int, custody: _TypedReadyCustody | None = None
+    admissions: tuple[_TypedAdmission, ...],
+    page_limit: int,
+    custody: _TypedReadyCustody | None = None,
+    precomputed: tuple[_TypedSlice, ...] = (),
 ) -> tuple[_TypedSlice, ...]:
     normalized: list[_TypedSlice] = []
     ends: list[int] = []
+    prepared = {item.admission.snapshot.source_id: item for item in precomputed}
     for admission in admissions:
         remaining = admission.admitted_count - admission.cursor
         if remaining <= 0:
             continue
-        candidate = _typed_slice(admission, admission.cursor, remaining, page_limit)
+        candidate = prepared.pop(admission.snapshot.source_id, None) or _typed_slice(
+            admission, admission.cursor, remaining, page_limit
+        )
+        if candidate.admission != admission or candidate.start_ordinal != admission.cursor or candidate.record_count != remaining:
+            raise ReadyBundleError("typed precomputed source slice does not match its admission")
         if admission.cursor == 0 and candidate.raw_sha256 != admission.admitted_sha256:
             raise ReadyBundleError("typed source rows do not match its admitted checkpoint")
         try:
@@ -2872,6 +2945,155 @@ def _typed_stats(
         threshold_packets=threshold,
         gap_count=len(gaps),
         gap_records=sum(end - start for start, end in gaps),
+    )
+
+
+def _disjoint_packet_summary(
+    audio_store: InternalAudioStore,
+    admissions: tuple[_TypedAdmission, ...],
+    custody: _TypedReadyCustody,
+    page_limit: int,
+    threshold: int,
+) -> tuple[int, tuple[_TypedSlice, ...], ReadyPublicationStats] | None:
+    intervals = tuple(
+        (item.snapshot.sequence_start, item.snapshot.sequence_start + item.admitted_count) for item in admissions
+    )
+    if any(item.cursor != 0 or item.member_ordinal is not None for item in admissions):
+        return None
+    if any(left[1] > right[0] for left, right in pairwise(intervals)):
+        return None
+    ready_runs = tuple(
+        run
+        for entry in custody.entries.values()
+        for run in _physical_runs(_entry_facts(entry))
+    )
+    if any(start < ready_end and ready_start < end for start, end in intervals for ready_start, ready_end in ready_runs):
+        return None
+    packet_counts: list[int] = []
+    fresh_slices: list[_TypedSlice] = []
+    for admission in admissions:
+        payload = audio_store.state_db.get(StateKind.PACKET_SUMMARY, admission.snapshot.source_id)
+        if not _valid_packet_summary(payload, admission):
+            slice_ = _typed_slice(admission, 0, admission.admitted_count, page_limit)
+            if slice_.raw_sha256 != admission.admitted_sha256:
+                raise ReadyBundleError("typed packet summary source hash changed")
+            count = slice_.audio_packets
+            fresh_slices.append(slice_)
+        else:
+            count = cast(int, payload["audio_packets"])
+        packet_counts.append(count)
+    gaps = tuple((left[1], right[0]) for left, right in pairwise(intervals) if left[1] < right[0])
+    stats = ReadyPublicationStats(
+        source_count=len(admissions),
+        record_count=sum(item.admitted_count for item in admissions),
+        audio_packets=sum(packet_counts),
+        threshold_packets=threshold,
+        gap_count=len(gaps),
+        gap_records=sum(end - start for start, end in gaps),
+    )
+    return sum(packet_counts), tuple(fresh_slices), stats
+
+
+def _typed_packet_fingerprint(admission: _TypedAdmission) -> str:
+    return sha256(
+        json.dumps(
+            (
+                admission.snapshot.source_id,
+                admission.snapshot.source_type,
+                admission.snapshot.lifecycle,
+                admission.snapshot.sequence_start,
+                admission.snapshot.sequence_limit,
+                admission.snapshot.committed_count,
+                admission.snapshot.committed_sha256,
+                admission.admitted_count,
+                admission.admitted_sha256,
+                admission.certified_prefix_count,
+                admission.coverage_digest,
+            ),
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _persist_typed_packet_summaries(
+    audio_store: InternalAudioStore, fresh_slices: tuple[_TypedSlice, ...]
+) -> None:
+    if not fresh_slices:
+        return
+    try:
+        with audio_store.publication_transaction() as (state, connection):
+            for slice_ in fresh_slices:
+                admission = slice_.admission
+                row = _sql_one(
+                    connection.execute(
+                        "SELECT source_type,lifecycle,sequence_start,sequence_limit,committed_count,"
+                        "committed_sha256,certified_prefix_count,coverage_digest "
+                        "FROM capture_source WHERE source_id=?",
+                        (admission.snapshot.source_id,),
+                    )
+                )
+                expected = (
+                    admission.snapshot.source_type,
+                    admission.admitted_lifecycle,
+                    encode_uint64(admission.snapshot.sequence_start),
+                    encode_uint64(admission.snapshot.sequence_limit),
+                    admission.snapshot.committed_count,
+                    admission.snapshot.committed_sha256,
+                    admission.certified_prefix_count,
+                    admission.coverage_digest,
+                )
+                if row is None or tuple(row) != expected:
+                    raise ReadyBundleError("typed packet summary source changed during scan")
+                state.put(
+                    StateKind.PACKET_SUMMARY,
+                    admission.snapshot.source_id,
+                    {
+                        "schema_version": 1,
+                        "sequence_start": admission.snapshot.sequence_start,
+                        "admitted_count": admission.admitted_count,
+                        "admitted_sha256": admission.admitted_sha256,
+                        "audio_packets": slice_.audio_packets,
+                        "source_fingerprint": _typed_packet_fingerprint(admission),
+                    },
+                )
+    except InternalAudioStoreError as error:
+        code = error.sqlite_errorcode
+        if type(code) is not int or code & 0xFF not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            raise
+        try:
+            for slice_ in fresh_slices:
+                admission = slice_.admission
+                if audio_store.state_db.get(StateKind.PACKET_SUMMARY, admission.snapshot.source_id) != {
+                    "schema_version": 1,
+                    "sequence_start": admission.snapshot.sequence_start,
+                    "admitted_count": admission.admitted_count,
+                    "admitted_sha256": admission.admitted_sha256,
+                    "audio_packets": slice_.audio_packets,
+                    "source_fingerprint": _typed_packet_fingerprint(admission),
+                }:
+                    return
+        except TransientInternalAudioStorageError:
+            return
+    except TransientInternalAudioStorageError:
+        return
+
+
+def _valid_packet_summary(payload: dict[str, object] | None, admission: _TypedAdmission) -> bool:
+    return (
+        payload is not None
+        and set(payload)
+        == {"schema_version", "sequence_start", "admitted_count", "admitted_sha256", "audio_packets", "source_fingerprint"}
+        and type(payload["schema_version"]) is int
+        and payload["schema_version"] == 1
+        and type(payload["sequence_start"]) is int
+        and payload["sequence_start"] == admission.snapshot.sequence_start
+        and type(payload["admitted_count"]) is int
+        and payload["admitted_count"] == admission.admitted_count
+        and isinstance(payload["admitted_sha256"], str)
+        and hmac.compare_digest(cast(str, payload["admitted_sha256"]), admission.admitted_sha256)
+        and type(payload["audio_packets"]) is int
+        and payload["audio_packets"] >= 0
+        and payload["source_fingerprint"] == _typed_packet_fingerprint(admission)
     )
 
 
@@ -4646,6 +4868,8 @@ def _persisted_admission(
         digest,
         progress,
         member_ordinal,
+        cast(int | None, certification[0]),
+        cast(str | None, certification[1]),
     )
     _require_persisted_admission(admission, certification)
     return admission
@@ -7045,10 +7269,12 @@ def _retire_typed_source_once(audio_store: InternalAudioStore, step: _Retirement
                 raise ReadyBundleError("typed retirement rows are not contiguous")
             proposed = step.old_cursor + len(ordinals)
             mark_retirement_compaction_pending(state)
-            connection.executemany(
-                "DELETE FROM capture_record WHERE source_id=? AND ordinal=?",
-                ((step.source_id, ordinal) for ordinal in ordinals),
+            deleted_records = connection.execute(
+                "DELETE FROM capture_record WHERE source_id=? AND ordinal>=? AND ordinal<?",
+                (step.source_id, step.old_cursor, proposed),
             )
+            if deleted_records.rowcount != len(ordinals):
+                raise ReadyBundleError("typed retirement rows changed before removal")
             changed = connection.execute(
                 "UPDATE capture_source SET retirement_cursor=? "
                 "WHERE source_id=? AND lifecycle='retiring' AND retirement_cursor=?",
@@ -7084,6 +7310,10 @@ def _retire_typed_source_once(audio_store: InternalAudioStore, step: _Retirement
             )
             if deleted.rowcount != 1:
                 raise ReadyBundleError("typed retirement source changed before removal")
+            connection.execute(
+                "DELETE FROM state WHERE kind=? AND id=?",
+                (StateKind.PACKET_SUMMARY.value, step.source_id),
+            )
             proposed = None
         state.mark_publication_changed()
     return _RetirementResult(proposed, True)

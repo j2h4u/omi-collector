@@ -19,7 +19,7 @@ from hashlib import sha256
 from itertools import pairwise, zip_longest
 from math import ceil
 from pathlib import Path
-from typing import NoReturn, Protocol, cast
+from typing import NoReturn, Protocol, TypeGuard, cast
 
 from ...config import ReadyConfig
 from ..application.storage_fault import TransientInternalAudioStorageError
@@ -2103,8 +2103,7 @@ def _finalize_typed_sources(  # noqa: PLR0913 - publication boundary keeps stora
                 retirement_pending=retirement_pending,
             )
         summary = _disjoint_packet_summary(audio_store, admissions, custody, page_limit, threshold)
-        summary_packets = summary[0] if summary is not None else None
-        if summary_packets is not None and summary_packets < threshold:
+        if summary is not None and summary[0] < threshold:
             _persist_typed_packet_summaries(audio_store, summary[1])
             _require_typed_admissions_current(audio_store, admissions)
             _require_typed_summary_certification_current(audio_store, admissions)
@@ -2206,8 +2205,7 @@ def _finalize_public_audio_v2(
                 custody_cache=custody_cache,
             )
         summary = _disjoint_packet_summary(audio_store, admissions, custody, options.page_limit, threshold)
-        summary_packets = summary[0] if summary is not None else None
-        if summary_packets is not None and summary_packets < threshold:
+        if summary is not None and summary[0] < threshold:
             _persist_typed_packet_summaries(audio_store, summary[1])
             _require_typed_admissions_current(audio_store, admissions)
             _require_typed_summary_certification_current(audio_store, admissions)
@@ -3076,9 +3074,9 @@ def _persist_typed_packet_summaries(audio_store: InternalAudioStore, fresh_slice
         return
 
 
-def _valid_packet_summary(payload: dict[str, object] | None, admission: _TypedAdmission) -> bool:
+def _valid_packet_summary(payload: object, admission: _TypedAdmission) -> TypeGuard[dict[str, object]]:
     return (
-        payload is not None
+        isinstance(payload, dict)
         and set(payload)
         == {
             "schema_version",

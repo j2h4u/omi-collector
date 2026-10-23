@@ -872,14 +872,21 @@ async def test_delayed_read_reports_progress_before_done(tmp_path: Path) -> None
     task = asyncio.create_task(
         run_opportunistic_collector(Provider([session]), store, replace(_options(), progress=report))
     )
+    reported_task = asyncio.create_task(reported.wait())
 
     try:
-        await asyncio.wait_for(reported.wait(), 1)
-        await asyncio.wait_for(done_waiting.wait(), 1)
+        completed, _ = await asyncio.wait({reported_task, task}, return_when=asyncio.FIRST_COMPLETED)
+        if task in completed:
+            await task
+            pytest.fail("collection completed before reporting read progress")
+        await done_waiting.wait()
         assert progress[-1].records_completed > 0
         assert not task.done()
     finally:
         release_done.set()
+        if not reported_task.done():
+            reported_task.cancel()
+        await _finish_task(reported_task)
         await _finish_task(task)
 
     result = await task

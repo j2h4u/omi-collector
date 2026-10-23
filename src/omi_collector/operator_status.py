@@ -267,7 +267,7 @@ def collect_operator_status(
         )
         current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
         operational_status = read_operational_status(db, current_identity)
-        runtime = _runtime_status(db, end.astimezone(UTC), operational_status)
+        runtime = _runtime_status(db, end.astimezone(UTC), operational_status, current_identity)
         custody_holds = _custody_hold_count(db)
         ble_scan_incident = _ble_scan_incident_summary(db)
     except (
@@ -383,7 +383,9 @@ def _custody_hold_count(db: StateDB) -> int:
     return cast(int, count)
 
 
-def _runtime_status(db: StateDB, now: datetime, operational_status: dict[str, str]) -> dict[str, object]:
+def _runtime_status(
+    db: StateDB, now: datetime, operational_status: dict[str, str], identity: OperationalIdentity
+) -> dict[str, object]:
     projection = read_runtime_status(db) or {}
     latest = _dated_projection(projection, "progress", "updated_at")
     observation = _dated_projection(projection, "observation", "observation_at")
@@ -395,7 +397,9 @@ def _runtime_status(db: StateDB, now: datetime, operational_status: dict[str, st
     rssi = projection.get("connection_rssi_dbm")
     rssi_at = projection.get("connection_rssi_observed_at")
     state = current.get("status", "unknown")
-    active = state == "progress"
+    active = state == "progress" and identity.invocation_id is not None and current.get("invocation_id") == identity.invocation_id
+    if state == "progress" and not active:
+        state = "unknown"
     return {
         "attention_reasons": sorted(
             _OPERATIONAL_ATTENTION[name] for name, state in operational_status.items() if state == "blocked"

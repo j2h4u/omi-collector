@@ -233,6 +233,7 @@ def test_runtime_projection_coalesces_aggregate_status_and_keeps_latest_observat
     set_runtime_status_sink(logger, enqueue)
     progress = {
         "status": "progress",
+        "invocation_id": "00000000000000000000000000000001",
         "records_completed": 2,
         "records_total": 4,
         "payload_bytes": 888,
@@ -266,6 +267,15 @@ def test_runtime_projection_coalesces_aggregate_status_and_keeps_latest_observat
     assert observation["firmware"] == "1.2.3"
     assert battery["battery_percent"] == 71
     assert cast(dict[str, object], projection["progress"])["status"] == "operational"
+    projected_fields = debug_logging._runtime_fields("sync_progress", {"progress": progress})
+    assert cast(dict[str, object], projected_fields["progress"])["invocation_id"] == "00000000000000000000000000000001"
+
+
+def test_runtime_projection_omits_invalid_invocation_identity() -> None:
+    fields = debug_logging._runtime_fields(
+        "sync_progress", {"progress": {"status": "progress", "invocation_id": "private-id"}}
+    )
+    assert "invocation_id" not in cast(dict[str, object], fields["progress"])
 
 
 def test_runtime_projection_does_not_store_unrelated_debug_events(tmp_path: Path) -> None:

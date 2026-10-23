@@ -800,6 +800,7 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
             "fields": {
                 "progress": {
                     "status": "progress",
+                    "invocation_id": "00000000000000000000000000000001",
                     "bytes_per_second": 64_000.0,
                     "eta_seconds": 10.0,
                     "payload_bytes": 444,
@@ -817,7 +818,12 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
     _put_runtime_events(layout, rows)
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 9, 0, 10, tzinfo=UTC))
+    result = collect_operator_status(
+        layout,
+        hours=24,
+        now=datetime(2026, 9, 8, 9, 0, 10, tzinfo=UTC),
+        identity=OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001"),
+    )
 
     runtime = cast(dict[str, object], result["runtime"])
     assert runtime["battery_percent"] == 96
@@ -831,6 +837,53 @@ def test_status_reports_latest_battery_and_active_transfer(monkeypatch: pytest.M
     transfer = cast(dict[str, object], runtime["transfer"])
     assert transfer["fraction_complete"] == 0.25
     assert transfer["remaining_bytes"] == 1_332
+
+
+@pytest.mark.parametrize(
+    ("progress_invocation", "current_invocation", "expected_state"),
+    [
+        ("00000000000000000000000000000001", "00000000000000000000000000000001", "transferring"),
+        ("00000000000000000000000000000002", "00000000000000000000000000000001", "unknown"),
+        (None, "00000000000000000000000000000001", "unknown"),
+        ("00000000000000000000000000000001", None, "unknown"),
+    ],
+)
+def test_status_only_reports_progress_for_current_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    progress_invocation: str | None,
+    current_invocation: str | None,
+    expected_state: str,
+) -> None:
+    layout = _layout(tmp_path)
+    _put_runtime_events(
+        layout,
+        [
+            {
+                "event": "sync_progress",
+                "fields": {"progress": {"status": "observed", "event": "pendant_observation", "battery_percent": 73}},
+                "timestamp": "2026-09-08T09:00:00+00:00",
+            },
+            {
+                "event": "sync_progress",
+                "fields": {"progress": {"status": "progress", "invocation_id": progress_invocation}},
+                "timestamp": "2026-09-08T09:00:01+00:00",
+            },
+        ],
+    )
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+
+    result = collect_operator_status(
+        layout,
+        hours=24,
+        now=datetime(2026, 9, 8, 10, tzinfo=UTC),
+        identity=OperationalIdentity("00000000-0000-0000-0000-000000000001", current_invocation),
+    )
+
+    runtime = cast(dict[str, object], result["runtime"])
+    assert runtime["state"] == expected_state
+    assert (runtime["transfer"] is not None) == (expected_state == "transferring")
+    assert runtime["battery_percent"] == 73
 
 
 def test_status_rejects_invalid_runtime_rssi_type(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1273,13 +1326,25 @@ def test_status_reports_fraction_only_for_positive_integer_totals(
     layout = _layout(tmp_path)
     row = {
         "event": "sync_progress",
-        "fields": {"progress": {"status": "progress", "records_completed": completed, "records_total": total}},
+        "fields": {
+            "progress": {
+                "status": "progress",
+                "invocation_id": "00000000000000000000000000000001",
+                "records_completed": completed,
+                "records_total": total,
+            }
+        },
         "timestamp": "2026-09-08T09:03:00+00:00",
     }
     _put_runtime_events(layout, [row])
     monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
 
-    result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+    result = collect_operator_status(
+        layout,
+        hours=24,
+        now=datetime(2026, 9, 8, 10, tzinfo=UTC),
+        identity=OperationalIdentity("00000000-0000-0000-0000-000000000001", "00000000000000000000000000000001"),
+    )
 
     transfer = cast(dict[str, object], cast(dict[str, object], result["runtime"])["transfer"])
     assert transfer["fraction_complete"] == expected

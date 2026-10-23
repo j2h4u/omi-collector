@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import NoReturn, cast
 
@@ -161,6 +162,15 @@ def test_write_owner_rejects_a_new_or_preexisting_second_connection(tmp_path: Pa
         pending_cursor.close()
         first.close()
         second.close()
+
+
+def test_read_connections_wait_longer_than_writer_connections(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+
+    with closing(db.open_connection(read_only=True)) as reader:
+        assert reader.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
+    with closing(db.open_connection()) as writer:
+        assert writer.execute("PRAGMA busy_timeout").fetchone()[0] == 5_000
 
 
 def test_external_shared_reader_allows_admission_but_delays_commit(tmp_path: Path) -> None:

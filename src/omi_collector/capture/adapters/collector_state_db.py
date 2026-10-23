@@ -23,6 +23,7 @@ _SCHEMA_VERSION = 4
 _PREVIOUS_SCHEMA_VERSION = 3
 _LEGACY_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5_000
+_READ_BUSY_TIMEOUT_MS = 30_000
 _STATE_DB_MODE = 0o640
 
 
@@ -303,9 +304,9 @@ class _GuardedConnection(sqlite3.Connection):
         super().rollback()
 
 
-def _guarded_connect(uri: str, state_db: StateDB) -> sqlite3.Connection:
+def _guarded_connect(uri: str, state_db: StateDB, *, timeout_ms: int) -> sqlite3.Connection:
     connection = sqlite3.connect(
-        uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None, factory=_GuardedConnection
+        uri, uri=True, timeout=timeout_ms / 1000, isolation_level=None, factory=_GuardedConnection
     )
     if isinstance(connection, _GuardedConnection):
         connection.bind(state_db)
@@ -457,9 +458,10 @@ class StateDB(_Operations):
                 raise StateDBError("state database does not exist")
             mode = "ro" if self.read_only else "rwc" if self._allow_create and not self.path.exists() else "rw"
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
-            connection = _guarded_connect(uri, self)
+            timeout_ms = _READ_BUSY_TIMEOUT_MS if self.read_only else _BUSY_TIMEOUT_MS
+            connection = _guarded_connect(uri, self, timeout_ms=timeout_ms)
             connection.row_factory = sqlite3.Row
-            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
             connection.execute("PRAGMA synchronous = EXTRA")
             connection.execute("PRAGMA foreign_keys = ON")
             journal_row = _fetchone(connection.execute("PRAGMA journal_mode"))
@@ -658,9 +660,10 @@ class StateDB(_Operations):
         connection: sqlite3.Connection | None = None
         try:
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
-            connection = _guarded_connect(uri, self)
+            timeout_ms = _READ_BUSY_TIMEOUT_MS if read_only else _BUSY_TIMEOUT_MS
+            connection = _guarded_connect(uri, self, timeout_ms=timeout_ms)
             connection.row_factory = sqlite3.Row
-            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
             connection.execute("PRAGMA synchronous = EXTRA")
             connection.execute("PRAGMA foreign_keys = ON")
             journal_row = _fetchone(connection.execute("PRAGMA journal_mode"))

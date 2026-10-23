@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.5](https://github.com/j2h4u/omi-collector/compare/v0.19.4...v0.19.5) (2026-10-23)
+
+
+### Documentation
+
+* correct downstream ownership in README ([#291](https://github.com/j2h4u/omi-collector/issues/291)) ([67a829b](https://github.com/j2h4u/omi-collector/commit/67a829b5337a9b5eeee715a338ed79792df3d883))
+
 ## [0.19.4](https://github.com/j2h4u/omi-collector/compare/v0.19.3...v0.19.4) (2026-10-23)
 
 

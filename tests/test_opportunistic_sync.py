@@ -20,7 +20,7 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakDBusError, BleakError
 
-from fakes import DelayedNotification, ScriptedRingSession, WriteStep
+from fakes import ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters import internal_audio_store, opportunistic_runtime, ready_closures
 from omi_collector.capture.adapters.attempt_writer import AttemptWriter, WriterFailedError, WriterProgress
 from omi_collector.capture.adapters.attempts import DurableSqliteSeal
@@ -829,13 +829,28 @@ async def test_progress_pump_coalesces_arbitrary_revisions_before_cadence_releas
 @_async_test
 async def test_delayed_read_reports_progress_before_done(tmp_path: Path) -> None:
     reported = asyncio.Event()
+    done_waiting = asyncio.Event()
+    release_done = asyncio.Event()
     progress: list[ProgressEvent] = []
 
     async def report(event: ProgressEvent) -> None:
         progress.append(event)
         reported.set()
 
-    session = ScriptedRingSession(
+    class GatedDoneSession(ScriptedRingSession):
+        def notifications(self) -> AsyncIterator[bytes]:
+            notifications = super().notifications()
+
+            async def gated_notifications() -> AsyncIterator[bytes]:
+                async for payload in notifications:
+                    if payload == _done(12):
+                        done_waiting.set()
+                        await release_done.wait()
+                    yield payload
+
+            return gated_notifications()
+
+    session = GatedDoneSession(
         _status(),
         (
             WriteStep(b"\x10", (_info(10, 12),)),
@@ -845,7 +860,7 @@ async def test_delayed_read_reports_progress_before_done(tmp_path: Path) -> None
                     _begin(10, 2),
                     _data(_record(10)),
                     _data(_record(11)),
-                    DelayedNotification(0.05, _done(12)),
+                    _done(12),
                 ),
             ),
             WriteStep(b"\x10", (_info(10, 12),)),
@@ -853,18 +868,25 @@ async def test_delayed_read_reports_progress_before_done(tmp_path: Path) -> None
             WriteStep(b"\x10", (_info(12, 12),)),
         ),
     )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
     task = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([session]),
-            _staging_store(tmp_path, _capture_root(tmp_path)),
-            replace(_options(), progress=report),
-        )
+        run_opportunistic_collector(Provider([session]), store, replace(_options(), progress=report))
     )
 
-    await asyncio.wait_for(reported.wait(), 1)
-    assert progress[-1].records_completed > 0
-    assert not task.done()
-    await task
+    try:
+        await asyncio.wait_for(reported.wait(), 1)
+        await asyncio.wait_for(done_waiting.wait(), 1)
+        assert progress[-1].records_completed > 0
+        assert not task.done()
+    finally:
+        release_done.set()
+        await _finish_task(task)
+
+    result = await task
+    assert isinstance(result, CollectionResult)
+    assert result.packet_count == 2
+    assert isinstance(result.seal, DurableSqliteSeal)
+    assert _sealed_records(store, result.seal) == _records(10, 2)
     assert progress[-1].records_completed == progress[-1].records_total == 2
 
 

@@ -660,7 +660,7 @@ class StateDB(_Operations):
         connection: sqlite3.Connection | None = None
         try:
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
-            timeout_ms = _READ_BUSY_TIMEOUT_MS if read_only else _BUSY_TIMEOUT_MS
+            timeout_ms = _READ_BUSY_TIMEOUT_MS if self.read_only else _BUSY_TIMEOUT_MS
             connection = _guarded_connect(uri, self, timeout_ms=timeout_ms)
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")

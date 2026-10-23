@@ -165,12 +165,15 @@ def test_write_owner_rejects_a_new_or_preexisting_second_connection(tmp_path: Pa
 
 
 def test_read_connections_wait_longer_than_writer_connections(tmp_path: Path) -> None:
-    db = StateDB(tmp_path / "state.sqlite3")
+    path = tmp_path / "state.sqlite3"
+    db = StateDB(path)
 
     with closing(db.open_connection(read_only=True)) as reader:
-        assert reader.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
+        assert reader.execute("PRAGMA busy_timeout").fetchone()[0] == 5_000
     with closing(db.open_connection()) as writer:
         assert writer.execute("PRAGMA busy_timeout").fetchone()[0] == 5_000
+    with closing(StateDB(path, read_only=True).open_connection(read_only=True)) as reader:
+        assert reader.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
 
 
 def test_external_shared_reader_allows_admission_but_delays_commit(tmp_path: Path) -> None:

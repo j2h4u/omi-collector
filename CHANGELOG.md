@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.7](https://github.com/j2h4u/omi-collector/compare/v0.19.6...v0.19.7) (2026-10-27)
+
+
+### Fixes
+
+* stop idle cleanup from rehashing ready audio ([#297](https://github.com/j2h4u/omi-collector/issues/297)) ([c3758c6](https://github.com/j2h4u/omi-collector/commit/c3758c69dd1537449791ad9bb02659cc9fca05b9))
+
 ## [0.19.6](https://github.com/j2h4u/omi-collector/compare/v0.19.5...v0.19.6) (2026-10-23)
 
 

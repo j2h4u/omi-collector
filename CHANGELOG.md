@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.8](https://github.com/j2h4u/omi-collector/compare/v0.19.7...v0.19.8) (2026-10-27)
+
+
+### Maintenance
+
+* **deps-dev:** bump ruff from 0.17.1 to 0.17.2 in the python-minor-patch group ([#295](https://github.com/j2h4u/omi-collector/issues/295)) ([a4c4aba](https://github.com/j2h4u/omi-collector/commit/a4c4abac6658e8cd03c6001dd34812ba3174b699))
+* **deps:** bump the github-actions group with 5 updates ([#296](https://github.com/j2h4u/omi-collector/issues/296)) ([37c68fe](https://github.com/j2h4u/omi-collector/commit/37c68fec7d982aa2377f18bed884bbc6c7c5102f))
+
 ## [0.19.7](https://github.com/j2h4u/omi-collector/compare/v0.19.6...v0.19.7) (2026-10-27)
 
 

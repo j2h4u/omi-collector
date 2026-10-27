@@ -19,6 +19,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     SqlitePublicationSource,
     finalize_public_audio_v2,
     publication_contract_state,
+    retire_one_covered_typed_source,
 )
 from omi_collector.capture.application.storage_fault import (
     FatalInternalAudioStorageError,
@@ -197,7 +198,7 @@ def test_v2_transaction_failures_reconcile_through_publication_api(
             )
         if remaining == 0:
             break
-        finalize_public_audio_v2(store, (), ready, _options())
+        assert retire_one_covered_typed_source(store, 128)
 
     with closing(database.open_connection(read_only=True)) as connection:
         assert (
@@ -263,7 +264,7 @@ def test_v2_ready_custody_failure_reconciles_and_publishes_unique_suffix(
             )
         if remaining == 0:
             break
-        finalize_public_audio_v2(store, (), ready, _options(12))
+        assert retire_one_covered_typed_source(store, 128)
     with closing(database.open_connection(read_only=True)) as connection:
         assert (
             cast(

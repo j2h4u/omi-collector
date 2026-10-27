@@ -31,6 +31,9 @@ def test_unit_runs_as_rendered_owner_with_read_only_selected_code() -> None:
     assert "ExecStartPre=+/" not in unit
     assert "ExecStartPre=/usr/local/sbin/omi-collector-bluetooth-ready" in unit
     assert "Requires=bluetooth.service" in unit and "After=bluetooth.service" in unit
+    assert "Restart=always" in unit
+    assert "RestartPreventExitStatus=78" in unit
+    assert "SuccessExitStatus=143" in unit
     assert "AmbientCapabilities=CAP_NET_RAW" in unit
     assert "ProtectHome=read-only" in unit
     assert ".local/share/omi-collector" not in unit.split("ReadWritePaths=", 1)[1]

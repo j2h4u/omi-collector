@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from threading import Event
 from time import monotonic
 from typing import Protocol
@@ -22,6 +23,7 @@ from ..domain.ring_protocol import RECORD_SIZE
 from .ports import (
     AttemptDescriptorShape,
     CaptureRuntimePort,
+    PublicationOutcomeShape,
     RecoveryShape,
     StagingPort,
 )
@@ -58,6 +60,64 @@ class PendingStartupState:
     disposition: RecoveryDisposition = "empty"
 
 
+_CLEANUP_INTERVAL_SECONDS = 3600.0
+_CLEANUP_WINDOW_SECONDS = 600.0
+
+
+class _CleanupPhase(Enum):
+    WAITING = "waiting"
+    PUBLICATION = "publication"
+    ACK = "ack"
+    RAW = "raw"
+    EXPIRY = "expiry"
+    VACUUM = "vacuum"
+
+
+class _CleanupEvent(Enum):
+    WAKE = "wake"
+    ADVANCE = "advance"
+    DEFER = "defer"
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupState:
+    phase: _CleanupPhase
+    due_at: float
+    deadline: float = 0.0
+
+
+def _next_cleanup_due(due_at: float, now: float) -> float:
+    elapsed_windows = max(0, int((now - due_at) // _CLEANUP_INTERVAL_SECONDS))
+    return due_at + (elapsed_windows + 1) * _CLEANUP_INTERVAL_SECONDS
+
+
+def _cleanup_transition(state: _CleanupState, event: _CleanupEvent, now: float) -> _CleanupState:
+    """Keep the ordered physical cleanup lifecycle within one hourly window."""
+    if not isinstance(state.phase, _CleanupPhase):
+        raise ValueError("unknown cleanup phase")
+    if not isinstance(event, _CleanupEvent):
+        raise ValueError("unknown cleanup event")
+    if event is _CleanupEvent.DEFER:
+        if state.phase is _CleanupPhase.WAITING:
+            return state
+        return _CleanupState(_CleanupPhase.WAITING, _next_cleanup_due(state.due_at, now))
+    if event is _CleanupEvent.WAKE:
+        if state.phase is _CleanupPhase.WAITING and now >= state.due_at:
+            return _CleanupState(_CleanupPhase.PUBLICATION, state.due_at, now + _CLEANUP_WINDOW_SECONDS)
+        return state
+    next_phase = {
+        _CleanupPhase.PUBLICATION: _CleanupPhase.ACK,
+        _CleanupPhase.ACK: _CleanupPhase.RAW,
+        _CleanupPhase.RAW: _CleanupPhase.EXPIRY,
+        _CleanupPhase.EXPIRY: _CleanupPhase.VACUUM,
+    }.get(state.phase)
+    if state.phase is _CleanupPhase.WAITING:
+        raise ValueError("cleanup cannot advance before its hourly wake")
+    if next_phase is None:
+        return _CleanupState(_CleanupPhase.WAITING, _next_cleanup_due(state.due_at, now))
+    return _CleanupState(next_phase, state.due_at, state.deadline)
+
+
 class QuarantineMaintenance:
     """Own restart evidence, quarantine salvage, and presence coordination."""
 
@@ -76,11 +136,12 @@ class QuarantineMaintenance:
         self._startup_state: PendingStartupState | None = None
         self._startup_state_bound = False
         self._maintenance_not_before = 0.0
+        self._cleanup_state = _CleanupState(_CleanupPhase.WAITING, monotonic() + _CLEANUP_INTERVAL_SECONDS)
         self._quarantine_retry_not_before = 0.0
         self._quarantine_retry_number = 0
         self._publication_retry_handle: asyncio.TimerHandle | None = None
-        self._publication_retry_task: asyncio.Task[None] | None = None
-        self._publication_effect_tasks: set[asyncio.Task[object]] = set()
+        self._publication_retry_task: asyncio.Task[PublicationOutcomeShape] | None = None
+        self._background_effect_tasks: set[asyncio.Task[object]] = set()
         self._publication_fatal: FatalInternalAudioStorageError | None = None
         self._publication_fatal_event = asyncio.Event()
 
@@ -140,14 +201,14 @@ class QuarantineMaintenance:
         self._startup_state = None
         self._startup_state_bound = False
 
-    async def _recover_and_publish(self) -> None:
+    async def _recover_and_publish(self) -> PublicationOutcomeShape:
         self._raise_publication_fatal()
         task = asyncio.create_task(joined_to_thread(self._staging.recover_and_publish))
-        self._publication_effect_tasks.add(task)
+        self._background_effect_tasks.add(task)
         try:
             outcome = await join_owned(task)
         finally:
-            self._publication_effect_tasks.discard(task)
+            self._background_effect_tasks.discard(task)
         state = getattr(outcome, "state", None)
         if state == "published":
             await joined_to_thread(self._runtime.debug_event, "ready_publication_published")
@@ -167,6 +228,7 @@ class QuarantineMaintenance:
         # The reducer owns that retry even when the publication result is published.
         if self._staging.publication_retry_schedule() is not None:
             self._arm_publication_timer()
+        return outcome
 
     async def ensure_publication_ready(self) -> None:
         """Run one bounded local recovery attempt without blocking BLE forever."""
@@ -194,10 +256,10 @@ class QuarantineMaintenance:
             self._publication_retry_handle.cancel()
             self._publication_retry_handle = None
 
-    async def _cancel_and_join_publication_tasks(self, task: asyncio.Task[None] | None) -> None:
+    async def _cancel_and_join_publication_tasks(self, task: asyncio.Task[object] | None) -> None:
         if task is not None and not task.done():
             task.cancel()
-        active = tuple(self._publication_effect_tasks)
+        active = tuple(self._background_effect_tasks)
         for effect in active:
             effect.cancel()
         if task is not None or active:
@@ -221,7 +283,7 @@ class QuarantineMaintenance:
         self._publication_retry_task = task
         task.add_done_callback(self._consume_publication_retry)
 
-    def _consume_publication_retry(self, task: asyncio.Task[None]) -> None:
+    def _consume_publication_retry(self, task: asyncio.Task[PublicationOutcomeShape]) -> None:
         if self._publication_retry_task is task:
             self._publication_retry_task = None
         try:
@@ -267,20 +329,91 @@ class QuarantineMaintenance:
         """Run one cooperative terminal sweep and quarantine salvage pass."""
         if not self._maintenance_due(should_defer):
             return
-        await self._recover_and_publish()
-        while self._staging.publication_followup_due() and not should_defer():
-            await self._recover_and_publish()
+        if self._cleanup_state.phase is not _CleanupPhase.WAITING:
+            self._defer_cleanup_window()
+        self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.WAKE, monotonic())
+        outcome = await self._recover_and_publish()
+        while self._staging.publication_followup_due() and not self._cleanup_should_defer(should_defer):
+            outcome = await self._recover_and_publish()
+        if should_defer():
+            self._defer_cleanup_window()
+            return
+        if self._cleanup_state.phase is _CleanupPhase.PUBLICATION:
+            if getattr(outcome, "state", None) in {"blocked", "transient"} or self._cleanup_should_defer(should_defer):
+                self._defer_cleanup_window()
+            else:
+                self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.ADVANCE, monotonic())
+                await self._run_cleanup_window(should_defer)
         if should_defer():
             return
         await self._refresh_utc_projection()
         if should_defer():
             return
-        await self._sweep_terminal_quarantine(should_defer)
-        if should_defer():
-            return
         if not self._salvage_due(should_defer):
             return
         await self._salvage_quarantine(should_defer)
+
+    def _cleanup_should_defer(self, should_defer: Callable[[], bool]) -> bool:
+        return (
+            should_defer()
+            or self._staging.publication_maintenance_interrupted()
+            or (self._cleanup_state.phase is not _CleanupPhase.WAITING and monotonic() >= self._cleanup_state.deadline)
+        )
+
+    def _defer_cleanup_window(self) -> None:
+        if self._cleanup_state.phase is not _CleanupPhase.WAITING:
+            self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.DEFER, monotonic())
+
+    async def _owned_cleanup_effect[T](self, effect: Callable[..., T], should_defer: Callable[[], bool]) -> T:
+        task = asyncio.create_task(joined_to_thread(effect, should_defer=should_defer))
+        self._background_effect_tasks.add(task)
+        try:
+            return await join_owned(task)
+        finally:
+            self._background_effect_tasks.discard(task)
+
+    async def _run_cleanup_window(self, should_defer: Callable[[], bool]) -> None:
+        def deferred() -> bool:
+            return self._cleanup_should_defer(should_defer)
+
+        while self._cleanup_state.phase is not _CleanupPhase.WAITING:
+            if deferred():
+                self._defer_cleanup_window()
+                return
+            try:
+                completed = await self._run_cleanup_phase(deferred)
+            except FatalInternalAudioStorageError:
+                raise
+            except Exception as error:  # noqa: BLE001 - preserve cleanup debt and retry next window
+                self._runtime.debug_exception("hourly_cleanup_failed", error)
+                self._defer_cleanup_window()
+                return
+            if not completed:
+                self._defer_cleanup_window()
+                return
+            if deferred():
+                self._defer_cleanup_window()
+                return
+            self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.ADVANCE, monotonic())
+
+    async def _run_cleanup_phase(self, should_defer: Callable[[], bool]) -> bool:
+        phase = self._cleanup_state.phase
+        if phase is _CleanupPhase.ACK:
+            await self._owned_cleanup_effect(self._staging.retire_acknowledged_ready, should_defer)
+        elif phase is _CleanupPhase.RAW:
+            while not should_defer():
+                progressed = await self._owned_cleanup_effect(self._staging.retire_covered_raw_page, should_defer)
+                if not progressed:
+                    break
+                await asyncio.sleep(0)
+        elif phase is _CleanupPhase.EXPIRY:
+            return await self._sweep_terminal_quarantine(should_defer)
+        elif phase is _CleanupPhase.VACUUM:
+            outcome = await self._owned_cleanup_effect(self._staging.compact_after_cleanup, should_defer)
+            if outcome is not None and outcome.reason != "compaction_done":
+                self._runtime.debug_event("hourly_compaction_deferred", reason=outcome.reason)
+                return False
+        return True
 
     def _maintenance_due(self, should_defer: Callable[[], bool]) -> bool:
         if should_defer():
@@ -304,24 +437,22 @@ class QuarantineMaintenance:
         except Exception as error:  # noqa: BLE001 - projection is retryable idle metadata
             self._runtime.debug_exception("utc_projection_refresh_failed", error)
 
-    async def _sweep_terminal_quarantine(self, should_defer: Callable[[], bool]) -> None:
+    async def _sweep_terminal_quarantine(self, should_defer: Callable[[], bool]) -> bool:
         while not should_defer():
             try:
-                result = await joined_to_thread(
-                    self._staging.sweep_terminal_quarantine,
-                    should_defer=should_defer,
-                )
+                result = await self._owned_cleanup_effect(self._staging.sweep_terminal_quarantine, should_defer)
             except FatalInternalAudioStorageError:
                 raise
             except Exception as error:  # noqa: BLE001 - expiry failures preserve evidence
                 if not self._runtime.is_device_busy_error(error):
                     self._runtime.debug_exception("terminal_quarantine_sweep_failed", error)
-                return
+                return False
             for source_id in result.removed_source_ids:
                 self._runtime.debug_event("terminal_quarantine_deleted", source=source_id)
             if not result.progressed:
-                return
+                return True
             await asyncio.sleep(0)
+        return False
 
     async def _salvage_quarantine(self, should_defer: Callable[[], bool]) -> None:
         try:
@@ -375,9 +506,9 @@ class QuarantineMaintenance:
                     self._raise_publication_fatal()
                     if presence_task in done:
                         wake = presence_task.result()
-                        await self._prepare_presence_wake(wake)
                         permit_returned = True
                         defer_requested.set()
+                        await self._prepare_presence_wake(wake)
                         return wake
                     maintenance_task = asyncio.create_task(self.run_once(defer_requested.is_set))
                     continue
@@ -388,11 +519,11 @@ class QuarantineMaintenance:
                 self._raise_publication_fatal()
                 if presence_task in done:
                     wake = presence_task.result()
+                    permit_returned = True
+                    defer_requested.set()
                     # A scanner wake is not permission to open BLE while local
                     # clock publication is still retrying.
                     await self._prepare_presence_wake(wake)
-                    permit_returned = True
-                    defer_requested.set()
                     await join_owned(maintenance_task)
                     return wake
                 maintenance_task.result()

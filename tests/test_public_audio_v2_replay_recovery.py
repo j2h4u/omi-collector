@@ -17,6 +17,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     ReadyBundleError,
     SqlitePublicationSource,
     finalize_public_audio_v2,
+    retire_one_covered_typed_source,
     source_lineage,
 )
 from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
@@ -146,6 +147,15 @@ def test_exact_below_threshold_replay_coverage_reconciles_and_retires(
     with closing(database.open_connection(read_only=True)) as connection:
         assert connection.execute("SELECT count(*) FROM publication_cohort").fetchone()[0] == 0
         assert (
+            connection.execute("SELECT count(*) FROM capture_record WHERE source_id=?", (replay_id,)).fetchone()[0] == 1
+        )
+    for _ in range(6):
+        if _source_state(database, replay_id) is None:
+            break
+        assert retire_one_covered_typed_source(store, 128)
+    assert _source_state(database, replay_id) is None
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert (
             connection.execute("SELECT count(*) FROM capture_record WHERE source_id=?", (replay_id,)).fetchone()[0] == 0
         )
 
@@ -273,6 +283,8 @@ def test_multi_page_private_retirement_reconciles_cursor_and_finishes_gc(
     source = _source(store, source_id, 20, tuple(_record(100 + index, index + 1) for index in range(3)))
     outcome = finalize_public_audio_v2(store, (source,), ready, _options(23, page_limit=1))
     assert len(outcome.published) == 1
+    assert _source_state(database, source_id) == ("retiring", "attempt", None, 3, 0)
+    assert retire_one_covered_typed_source(store, 1)
     assert _source_state(database, source_id) == ("retiring", "attempt", None, 3, 1)
 
     original_transaction = store.publication_transaction
@@ -282,7 +294,7 @@ def test_multi_page_private_retirement_reconciles_cursor_and_finishes_gc(
         _one_statement("DELETE FROM capture_record"),
         after_commit=after_commit,
     )
-    finalize_public_audio_v2(store, (), ready, _options(23, page_limit=1))
+    assert retire_one_covered_typed_source(store, 1)
 
     assert fired
     assert _source_state(database, source_id) == ("retiring", "attempt", None, 3, 2)
@@ -291,7 +303,7 @@ def test_multi_page_private_retirement_reconciles_cursor_and_finishes_gc(
 
     monkeypatch.setattr(store, "publication_transaction", original_transaction)
     for _ in range(3):
-        finalize_public_audio_v2(store, (), ready, _options(23, page_limit=1))
+        retire_one_covered_typed_source(store, 1)
     assert _source_state(database, source_id) is None
     with closing(database.open_connection(read_only=True)) as connection:
         assert (

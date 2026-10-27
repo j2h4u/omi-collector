@@ -128,8 +128,7 @@ def test_inflight_source_change_cannot_settle_the_old_revision(tmp_path: Path, m
     admitted_sources = _patch_finalize_to_add_exact_source(monkeypatch, raw)
 
     outcome = store.recover_and_publish()
-    assert store.publication_followup_due()
-    store.recover_and_publish()
+    assert not store.publication_followup_due()
 
     assert admitted_sources and "b" * 32 not in admitted_sources[0]
     assert any("b" * 32 in sources for sources in admitted_sources[1:])
@@ -248,7 +247,8 @@ def test_checkpoint_access_denial_is_diagnostic_and_ack_retry_self_heals(
     assert diagnostics[0]["errno"] == errno.EACCES
     assert diagnostics[0]["path"] == str(checkpoint)
     assert outcomes[1].state is ReadyOutcomeState.WAITING
-    assert outcomes[1].reason == "ack_retired"
+    assert published.path.exists()
+    assert store.retire_acknowledged_ready(should_defer=lambda: False) == 1
     assert not published.path.exists()
     assert store.publication_retry_schedule() is None
 
@@ -439,7 +439,7 @@ async def _exercise_shutdown(scenario: _ShutdownScenario) -> None:
         closed = await asyncio.gather(closing, return_exceptions=True)
         assert isinstance(closed[0], asyncio.CancelledError)
         await asyncio.gather(background, return_exceptions=True)
-        assert maintenance._publication_retry_task is None and not maintenance._publication_effect_tasks
+        assert maintenance._publication_retry_task is None and not store.publication_wake_admitted()
         assert maintenance._publication_retry_handle is None and calls == [1]
         assert len(tuple(ready_root.iterdir())) == 1
         closed_counts = tuple(counts)

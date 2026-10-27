@@ -217,10 +217,11 @@ def test_sigkill_restart_retains_audio_and_compaction_debt(tmp_path: Path, phase
     reopened = StateDB(database_path)
     _assert_live_audio(reopened, source_id, record, retained_tail)
     assert ready_file.read_bytes() == ready_bytes
-    assert pending_compaction_generation(reopened) == 0
+    assert pending_compaction_generation(reopened) is (0 if phase == "during" else None)
+    assert reopened.get(StateKind.COMPACTION, "current") == {"generation": 0, "pending": True}
     if phase == "after":
         assert database_path.stat().st_size < before
-    assert vacuum_pending(reopened, 0, threading.Event()) == "done"
+    assert vacuum_pending(reopened, 0, threading.Event()) == ("done" if phase == "during" else "parked")
     assert database_path.stat().st_size < before
     _assert_live_audio(StateDB(database_path), source_id, record, retained_tail)
     assert ready_file.read_bytes() == ready_bytes
@@ -278,6 +279,8 @@ class _VacuumConnection:
             return _Result((json.dumps({"generation": 5, "pending": True}),))
         if sql.startswith("SELECT 1 FROM capture_source"):
             return _Result(None)
+        if sql == "PRAGMA freelist_count":
+            return _Result((1,))
         if sql == "VACUUM":
             if self.signal:
                 self.interrupt.set()
@@ -293,7 +296,7 @@ class _VacuumConnection:
     (
         (sqlite3.SQLITE_BUSY, "deferred", False),
         (sqlite3.SQLITE_LOCKED, "deferred", False),
-        (sqlite3.SQLITE_FULL, "deferred", False),
+        (sqlite3.SQLITE_FULL, "parked", False),
         (sqlite3.SQLITE_INTERRUPT, "deferred", False),
         (sqlite3.SQLITE_IOERR, None, True),
         (sqlite3.SQLITE_CORRUPT, None, True),
@@ -330,9 +333,43 @@ def test_vacuum_interrupt_with_capture_intent_yields(tmp_path: Path, monkeypatch
     assert connection.closed
 
 
-@pytest.mark.parametrize("code", (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_FULL))
-def test_retryable_vacuum_errors_defer_compaction(code: int) -> None:
-    assert compaction_failure_outcome(_InjectedSqliteError(code), threading.Event()) == "deferred"
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    ((sqlite3.SQLITE_BUSY, "deferred"), (sqlite3.SQLITE_LOCKED, "deferred"), (sqlite3.SQLITE_FULL, "parked")),
+)
+def test_retryable_vacuum_errors_defer_or_park_compaction(code: int, expected: str) -> None:
+    assert compaction_failure_outcome(_InjectedSqliteError(code), threading.Event()) == expected
+
+
+def test_pending_compaction_requires_freelist_and_vacuum_obeys_cooperative_budget(tmp_path: Path) -> None:
+    state_db = StateDB(tmp_path / "state.sqlite3")
+    state_db.put(StateKind.COMPACTION, "current", {"generation": 4, "pending": True})
+    assert pending_compaction_generation(state_db) is None
+    assert vacuum_pending(state_db, 4, threading.Event()) == "parked"
+
+    _create_freelist(state_db)
+    state_db.put(StateKind.COMPACTION, "current", {"generation": 5, "pending": True})
+    assert pending_compaction_generation(state_db) == 5
+    assert vacuum_pending(state_db, 5, threading.Event(), should_defer=lambda: True) == "deferred"
+
+
+def test_cooperative_progress_interrupt_is_reported_as_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_db = StateDB(tmp_path / "state.sqlite3")
+    state_db.put(StateKind.COMPACTION, "current", {"generation": 5, "pending": True})
+    interrupt = threading.Event()
+    connection = _VacuumConnection(_InjectedSqliteError(sqlite3.SQLITE_INTERRUPT), interrupt, signal=False)
+    monkeypatch.setattr(StateDB, "open_connection", lambda _self: connection)
+    calls = 0
+
+    def should_defer() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls >= 3
+
+    assert vacuum_pending(state_db, 5, interrupt, should_defer) == "interrupted"
+    assert connection.closed
 
 
 @pytest.mark.parametrize("code", (sqlite3.SQLITE_IOERR, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB))
@@ -349,16 +386,16 @@ def test_unsignalled_sqlite_interrupt_defers_but_capture_interrupt_yields() -> N
     assert compaction_failure_outcome(error, interrupt) == "interrupted"
 
 
-def test_marker_clear_full_error_retains_debt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sqlite_full_parks_without_writing_compaction_debt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state_db = StateDB(tmp_path / "state.sqlite3")
-    state_db.put(StateKind.COMPACTION, "current", {"generation": 4, "pending": True})
+    state_db.put(StateKind.COMPACTION, "current", {"generation": 5, "pending": True})
 
-    def fail_clear(_self: StateDB):
-        raise _InjectedSqliteError(sqlite3.SQLITE_FULL)
-
-    monkeypatch.setattr(StateDB, "transaction", fail_clear)
-    assert vacuum_pending(state_db, 4, threading.Event()) == "deferred"
-    assert state_db.get(StateKind.COMPACTION, "current") == {"generation": 4, "pending": True}
+    connection = _VacuumConnection(_InjectedSqliteError(sqlite3.SQLITE_FULL), threading.Event(), signal=False)
+    monkeypatch.setattr(StateDB, "open_connection", lambda _self: connection)
+    assert vacuum_pending(state_db, 5, threading.Event()) == "parked"
+    assert connection.closed
+    monkeypatch.undo()
+    assert StateDB(state_db.path).get(StateKind.COMPACTION, "current") == {"generation": 5, "pending": True}
 
 
 def test_malformed_json_marker_fails_closed_in_probe_and_vacuum(tmp_path: Path) -> None:

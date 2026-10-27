@@ -7,7 +7,6 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
-from dataclasses import replace
 from functools import partial
 from logging import getLogger
 from pathlib import Path
@@ -26,7 +25,6 @@ from ..domain.ready_machine import (
     Compacting,
     CompactionDue,
     CompactionFinished,
-    CompactionProbeFailed,
     Finished,
     InputChanged,
     PublicationAction,
@@ -71,9 +69,11 @@ from .ready_bundles import (
     SqlitePublicationSource,
     _typed_source_admissions,
     acknowledged_public_audio_v2,
+    acknowledged_public_audio_v2_needs_retirement,
     finalize_public_audio_v2,
     resume_retired_public_audio_v2,
     retire_acknowledged_public_audio_v2,
+    retire_one_covered_typed_source,
     source_revision,
 )
 from .sqlite_compaction import compaction_failure_outcome, pending_compaction_generation, vacuum_pending
@@ -171,6 +171,8 @@ class StagingStore:
         self._publication_state = PublicationState()
         self._ready_custody_cache: ReadyCustodyCache | None = None
         self._compaction_interrupt = Event()
+        self._compaction_parked: tuple[int, int] | None = None
+        self._retired_recovery_done = False
 
     @classmethod
     def from_paths(
@@ -192,6 +194,8 @@ class StagingStore:
         store._publication_state = PublicationState()
         store._ready_custody_cache = None
         store._compaction_interrupt = Event()
+        store._compaction_parked = None
+        store._retired_recovery_done = False
         return store
 
     @property
@@ -233,7 +237,12 @@ class StagingStore:
             return state.work.outcome
         return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_active")
 
-    def _execute_publication_command(self, command: PublicationCommand, held_lease: DeviceLock | None) -> ReadyOutcome:
+    def _execute_publication_command(
+        self,
+        command: PublicationCommand,
+        held_lease: DeviceLock | None,
+        should_defer: Callable[[], bool] = _never_defer,
+    ) -> ReadyOutcome:
         while command.action is PublicationAction.CHECK_INPUT:
             probe_error: OSError | TransientInternalAudioStorageError | None = None
             try:
@@ -254,10 +263,15 @@ class StagingStore:
             outcome, revision = self._run_publication_effect(command.token, held_lease)
             return self._finish_publication(command, revision, outcome, held_lease)
         if command.action is PublicationAction.COMPACT:
-            return self._run_compaction(command, held_lease)
+            return self._run_compaction(command, held_lease, should_defer)
         return self._publication_outcome(command)
 
-    def _run_compaction(self, command: PublicationCommand, held_lease: DeviceLock | None) -> ReadyOutcome:
+    def _run_compaction(
+        self,
+        command: PublicationCommand,
+        held_lease: DeviceLock | None,
+        should_defer: Callable[[], bool],
+    ) -> ReadyOutcome:
         assert command.token is not None
         with self._publication_lock:
             work = self._publication_state.work
@@ -271,10 +285,12 @@ class StagingStore:
         try:
             if held_lease is None:
                 with self.device_lock(operation="ready_compaction"):
-                    result = vacuum_pending(self._state_db, work.debt_generation, self._compaction_interrupt)
+                    result = vacuum_pending(
+                        self._state_db, work.debt_generation, self._compaction_interrupt, should_defer
+                    )
             else:
                 self._filesystem.require_device_lock(held_lease)
-                result = vacuum_pending(self._state_db, work.debt_generation, self._compaction_interrupt)
+                result = vacuum_pending(self._state_db, work.debt_generation, self._compaction_interrupt, should_defer)
         except FatalInternalAudioStorageError:
             raise
         except DeviceAlreadyRunningError as error:
@@ -283,6 +299,10 @@ class StagingStore:
         except (OSError, sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as error:
             _debug_publication_failure(error, phase="ready_compaction")
             result = compaction_failure_outcome(error, self._compaction_interrupt)
+        if result == "parked":
+            self._compaction_parked = (work.debt_generation, self._available_compaction_space())
+        elif result == "done":
+            self._compaction_parked = None
         outcome = ReadyOutcome(
             ReadyOutcomeState.TRANSIENT if result == "deferred" else ReadyOutcomeState.WAITING,
             reason=f"compaction_{result}",
@@ -292,7 +312,7 @@ class StagingStore:
                 work.token,
                 work.debt_generation,
                 work.revision,
-                PublicationResult.TRANSIENT if result == "deferred" else PublicationResult.SETTLED,
+                PublicationResult.SETTLED,
                 monotonic(),
                 self._config.retry.rapid_backoff,
             )
@@ -300,7 +320,7 @@ class StagingStore:
         if next_command.action is PublicationAction.ARM:
             return self._publication_outcome(next_command)
         if next_command.action is PublicationAction.CHECK_INPUT:
-            return self._execute_publication_command(next_command, held_lease)
+            return self._execute_publication_command(next_command, held_lease, should_defer)
         return outcome
 
     def _run_publication_effect(self, token: int, held_lease: DeviceLock | None) -> tuple[ReadyOutcome, object]:
@@ -370,26 +390,20 @@ class StagingStore:
             Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff)
         )
         if next_command.action is PublicationAction.CHECK_INPUT:
-            if outcome.retirement_pending:
-                return outcome
             checked = self._execute_publication_command(next_command, held_lease)
             if outcome.state is ReadyOutcomeState.PUBLISHED and checked.state is ReadyOutcomeState.WAITING:
                 return outcome
             return checked
         if next_command.action is PublicationAction.ARM:
             return self._publication_outcome(next_command)
-        if (
-            next_command.action is PublicationAction.NONE
-            and not outcome.retirement_pending
-            and outcome.state not in {ReadyOutcomeState.BLOCKED, ReadyOutcomeState.TRANSIENT}
-            and not self._compaction_interrupt.is_set()
-        ):
-            compacted = self._compact_after_publication(revision, held_lease)
-            if compacted is not None:
-                return compacted
         return outcome
 
-    def _compact_after_publication(self, revision: object, held_lease: DeviceLock | None) -> ReadyOutcome | None:
+    def _compact_after_publication(
+        self,
+        revision: object,
+        held_lease: DeviceLock | None,
+        should_defer: Callable[[], bool],
+    ) -> ReadyOutcome | None:
         try:
             generation = pending_compaction_generation(self._state_db)
         except FatalInternalAudioStorageError:
@@ -399,24 +413,32 @@ class StagingStore:
             result = compaction_failure_outcome(error, self._compaction_interrupt)
             if result == "interrupted":
                 return None
-            self._publication_event(CompactionProbeFailed(revision, monotonic(), self._config.retry.rapid_backoff))
+            state = ReadyOutcomeState.WAITING if result == "parked" else ReadyOutcomeState.TRANSIENT
+            return ReadyOutcome(state, reason=f"compaction_{result}")
+        if generation is None or self._compaction_interrupt.is_set() or should_defer():
             return None
-        if generation is None or self._compaction_interrupt.is_set():
-            return None
+        if self._compaction_parked is not None and self._compaction_parked[0] == generation:
+            available = self._available_compaction_space()
+            required_release = max(self._state_db.path.stat().st_size, 1)
+            if available < self._compaction_parked[1] + required_release:
+                return ReadyOutcome(ReadyOutcomeState.WAITING, reason="compaction_parked")
         compact = self._publication_event(CompactionDue(revision, generation))
         if compact.action is PublicationAction.COMPACT:
-            result = self._execute_publication_command(compact, held_lease)
-            with self._publication_lock:
-                work = self._publication_state.work
-            # Surface a nested publication failure without replacing an already
-            # published result with the separate maintenance outcome.
-            if (
-                result.state in {ReadyOutcomeState.BLOCKED, ReadyOutcomeState.TRANSIENT}
-                and isinstance(work, (Settled, RetryWait))
-                and isinstance(work.outcome, ReadyOutcome)
-            ):
-                return result
+            return self._execute_publication_command(compact, held_lease, should_defer)
         return None
+
+    def _available_compaction_space(self) -> int:
+        try:
+            stat = os.statvfs(self._state_db.path.parent)
+        except OSError:
+            return -1
+        return stat.f_bavail * stat.f_frsize
+
+    def compact_after_cleanup(self, *, should_defer: Callable[[], bool]) -> ReadyOutcome | None:
+        """Attempt one due compaction after the scheduled cleanup phases."""
+        if self._publication_root is None or should_defer():
+            return None
+        return self._compact_after_publication(self._publication_revision(), None, should_defer)
 
     def _publication_revision(self) -> object:
         if self._publication_root is None:
@@ -458,6 +480,10 @@ class StagingStore:
     def publication_capture_intent(self) -> None:
         """Interrupt compaction before readiness or a pending presence join."""
         self._compaction_interrupt.set()
+
+    def publication_maintenance_interrupted(self) -> bool:
+        """Expose capture intent to cooperative maintenance effects."""
+        return self._compaction_interrupt.is_set()
 
     def publication_quiesced(self) -> None:
         self._publication_event(Quiesced())
@@ -780,8 +806,11 @@ class StagingStore:
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
         clock_state = self._publication_clock_state()
-        resume_retired_public_audio_v2(publication_root, self._state_db)
         acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+        acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
+        if not self._retired_recovery_done:
+            resume_retired_public_audio_v2(publication_root, self._state_db)
+            self._retired_recovery_done = True
         closures = ready_closures.coalesce(self._state_db)
         closure = closures[-1] if closures else None
         frontier = None if closure is None else closure.next_sequence
@@ -814,12 +843,53 @@ class StagingStore:
             outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
         if closure is not None and not outcome.remaining_at_frontier:
             ready_closures.remove(self._state_db, closure)
-        retired = retire_acknowledged_public_audio_v2(
-            publication_root, self._state_db, checkpoint_path, acknowledged=acknowledged
-        )
-        if retired and outcome.state is ReadyOutcomeState.WAITING:
-            outcome = replace(outcome, reason="ack_retired")
         return outcome
+
+    def retire_acknowledged_ready(self, *, should_defer: Callable[[], bool]) -> int:
+        """Retire a validated ACK group in the scheduled maintenance window."""
+        publication_root = self._publication_root
+        if publication_root is None or should_defer():
+            return 0
+        checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
+        with self.device_lock(operation="ready_ack_retirement"):
+            acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+            needs_retirement = acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
+            if not self._retired_recovery_done:
+                resume_retired_public_audio_v2(publication_root, self._state_db)
+                self._retired_recovery_done = True
+            if not needs_retirement or should_defer():
+                return 0
+            try:
+                retired = retire_acknowledged_public_audio_v2(
+                    publication_root,
+                    self._state_db,
+                    checkpoint_path,
+                    custody_cache=self._ready_custody_cache,
+                    should_defer=should_defer,
+                )
+            except BaseException:
+                self._retired_recovery_done = False
+                raise
+            if retired:
+                self._ready_custody_cache = None
+            return len(retired)
+
+    def retire_covered_raw_page(self, *, should_defer: Callable[[], bool]) -> bool:
+        """Delete at most one fully covered typed raw page in scheduled cleanup."""
+        if should_defer():
+            return False
+        with (
+            self.device_lock(operation="ready_raw_retirement"),
+            InternalAudioStore(
+                self._state_db,
+                chunk_limit=self._config.writer.chunk_records,
+            ) as audio_store,
+        ):
+            return retire_one_covered_typed_source(
+                audio_store,
+                self._config.writer.chunk_records,
+                should_defer,
+            )
 
     @property
     def capture_root(self) -> Path:

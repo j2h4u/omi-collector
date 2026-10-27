@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 from struct import pack
 from threading import Event, Thread
+from typing import cast
 
 import pytest
 
@@ -15,7 +16,11 @@ from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutc
 from omi_collector.capture.adapters.ready_closures import ReadyClosure
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_writer import StagingWriter
-from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
+from omi_collector.capture.application.quarantine_maintenance import (
+    QuarantineMaintenance,
+    _CleanupPhase,
+    _CleanupState,
+)
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, RetryConfig
 from staging_test_factory import StagingStore, attempt_source, closure_payload
@@ -50,6 +55,23 @@ def _seal_writer(store: StagingStore, start: int = 100) -> StagingWriter:
     writer.append_chunk(0, memoryview(_record(start)))
     writer.seal(DoneNotification(0, start + 1))
     return writer
+
+
+def _retire_published_source(store: StagingStore, attempt_id: str) -> None:
+    assert store.retire_covered_raw_page(should_defer=lambda: False)
+    source = attempt_source(store, attempt_id)
+    assert source is not None
+    with closing(store.state_db.open_connection(read_only=True)) as connection, store.state_db.access(connection):
+        row = cast(
+            tuple[int, int] | None,
+            connection.execute(
+                "SELECT retirement_cursor, committed_count FROM capture_source WHERE source_id=?", (attempt_id,)
+            ).fetchone(),
+        )
+        assert row is not None and tuple(row) == (1, 1)
+    assert store.retire_covered_raw_page(should_defer=lambda: False)
+    assert attempt_source(store, attempt_id) is None
+    assert not store.retire_covered_raw_page(should_defer=lambda: False)
 
 
 def test_fresh_store_without_publication_boundary_is_a_noop(tmp_path: Path) -> None:
@@ -146,10 +168,8 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     published = store.publish_ready()
     source = attempt_source(store, attempt_id)
     assert published.state is ReadyOutcomeState.PUBLISHED
-    assert published.retirement_pending
     assert source is not None and source.lifecycle == "retiring"
-    assert store.publish_ready().retirement_pending
-    assert attempt_source(store, attempt_id) is None
+    _retire_published_source(store, attempt_id)
 
 
 def test_child_task_publishes_after_writer_releases(tmp_path: Path) -> None:
@@ -231,12 +251,12 @@ def test_failed_sealed_publication_retains_capture_for_retry(tmp_path: Path, mon
     published = writer.publish_ready()
     source = attempt_source(store, writer.attempt_id)
     assert published.state is ReadyOutcomeState.PUBLISHED
-    assert published.retirement_pending
     assert source is not None and source.lifecycle == "retiring"
     assert any(path.is_dir() and (path / "manifest.json").exists() for path in (tmp_path / "ready").iterdir())
-    assert writer.publish_ready().retirement_pending
-    assert attempt_source(store, writer.attempt_id) is None
+    assert writer.publish_ready().state is ReadyOutcomeState.WAITING
+    attempt_id = writer.attempt_id
     writer.close()
+    _retire_published_source(store, attempt_id)
 
 
 def test_writer_seal_keeps_draft_until_closed_visit(tmp_path: Path) -> None:
@@ -258,10 +278,9 @@ def test_writer_seal_keeps_draft_until_closed_visit(tmp_path: Path) -> None:
     published = store.publish_ready()
     source = attempt_source(store, attempt_id)
     assert published.state is ReadyOutcomeState.PUBLISHED
-    assert published.retirement_pending
     assert source is not None and source.lifecycle == "retiring"
-    assert store.publish_ready().retirement_pending
-    assert attempt_source(store, attempt_id) is None
+    assert store.publish_ready().state is ReadyOutcomeState.WAITING
+    _retire_published_source(store, attempt_id)
 
 
 def test_writer_seal_does_not_report_false_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -313,24 +332,35 @@ def test_publication_owner_rejects_concurrent_projection(tmp_path: Path, monkeyp
     assert errors == []
 
 
-def test_compaction_reuses_publication_lease(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cleanup_compaction_owns_lease_and_publication_does_not_compact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = _store(tmp_path)
     store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.pending_compaction_generation", lambda _db: 1)
     seen: list[DeviceLock | None] = []
 
-    def vacuum(_state_db: object, _generation: int, _interrupt: Event) -> str:
-        seen.append(store._filesystem._active_lease)
+    def vacuum(_state_db: object, _generation: int, _interrupt: Event, _should_defer: Callable[[], bool]) -> str:
+        lease = store._filesystem._active_lease
+        assert lease is not None
+        lease.require_active()
+        seen.append(lease)
         return "done"
 
     monkeypatch.setattr("omi_collector.capture.adapters.staging_store.vacuum_pending", vacuum)
     with store.device_lock(operation="test_compaction") as lease:
         assert store.publish_ready(lease).state is ReadyOutcomeState.WAITING
-        assert seen == [lease]
+        assert seen == []
+    store.compact_after_cleanup(should_defer=lambda: False)
+    assert len(seen) == 1
+    with store.device_lock():
+        pass
 
 
 def test_capture_interrupts_and_joins_compaction_before_visit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
     store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.pending_compaction_generation", lambda _db: 1)
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
     entered = Event()
     release = Event()
@@ -338,7 +368,7 @@ def test_capture_interrupts_and_joins_compaction_before_visit(tmp_path: Path, mo
     visit_started = Event()
     original_visit = store.begin_ready_visit
 
-    def vacuum(_state_db: object, _generation: int, interrupt: Event) -> str:
+    def vacuum(_state_db: object, _generation: int, interrupt: Event, _should_defer: Callable[[], bool]) -> str:
         entered.set()
         assert interrupt.wait(5)
         assert release.wait(5)
@@ -353,7 +383,8 @@ def test_capture_interrupts_and_joins_compaction_before_visit(tmp_path: Path, mo
     monkeypatch.setattr(store, "begin_ready_visit", begin_visit)
 
     async def scenario() -> None:
-        maintenance.schedule_publication_retry()
+        maintenance._cleanup_state = _CleanupState(_CleanupPhase.WAITING, 0)
+        cleanup = asyncio.create_task(maintenance.run_once(lambda: False))
         assert await asyncio.to_thread(entered.wait, 5)
         capture = asyncio.create_task(maintenance.enter_capture_priority())
         try:
@@ -372,22 +403,26 @@ def test_capture_interrupts_and_joins_compaction_before_visit(tmp_path: Path, mo
             assert not visit_started.is_set()
         finally:
             release.set()
+            await asyncio.gather(cleanup, return_exceptions=True)
             await maintenance.close()
 
     asyncio.run(scenario())
 
 
-def test_deferred_compaction_retries_without_new_publication_input(
+def test_deferred_compaction_waits_until_next_hour_without_new_publication_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path, retry_backoff=0.05)
     store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.pending_compaction_generation", lambda _db: 1)
+    now = [100.0]
+    monkeypatch.setattr("omi_collector.capture.application.quarantine_maintenance.monotonic", lambda: now[0])
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
     first = Event()
     retried = Event()
     calls = 0
 
-    def vacuum(_state_db: object, generation: int, _interrupt: Event) -> str:
+    def vacuum(_state_db: object, generation: int, _interrupt: Event, _should_defer: Callable[[], bool]) -> str:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -402,10 +437,16 @@ def test_deferred_compaction_retries_without_new_publication_input(
 
     async def scenario() -> None:
         try:
-            await maintenance.ensure_publication_ready()
+            now[0] = 3700.0
+            await maintenance.run_once(lambda: False)
             assert first.is_set()
-            assert store.publication_retry_schedule() is not None
-            assert await asyncio.to_thread(retried.wait, 5)
+            assert store.publication_retry_schedule() is None
+            now[0] = 3730.0
+            await maintenance.run_once(lambda: False)
+            assert calls == 1 and not retried.is_set()
+            now[0] = 7300.0
+            await maintenance.run_once(lambda: False)
+            assert retried.is_set()
             assert calls == 2
             assert store.publication_retry_schedule() is None
         finally:
@@ -420,11 +461,12 @@ def test_input_change_during_compaction_runs_followup_publication(
 ) -> None:
     store = _store(tmp_path)
     store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": True})
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.pending_compaction_generation", lambda _db: 1)
     entered = Event()
     release = Event()
     publications = 0
     errors: list[BaseException] = []
-    results: list[ReadyOutcome] = []
+    results: list[ReadyOutcome | None] = []
     revision = ["r1"]
 
     def publication() -> ReadyOutcome:
@@ -433,7 +475,7 @@ def test_input_change_during_compaction_runs_followup_publication(
         state = ReadyOutcomeState.WAITING if publications == 1 else followup_state
         return ReadyOutcome(state, reason="followup" if publications > 1 else "idle")
 
-    def vacuum(_state_db: object, _generation: int, _interrupt: Event) -> str:
+    def vacuum(_state_db: object, _generation: int, _interrupt: Event, _should_defer: Callable[[], bool]) -> str:
         entered.set()
         assert release.wait(5)
         store.state_db.put(StateKind.COMPACTION, "current", {"generation": 1, "pending": False})
@@ -445,10 +487,11 @@ def test_input_change_during_compaction_runs_followup_publication(
 
     def publish() -> None:
         try:
-            results.append(store.publish_ready())
+            results.append(store.compact_after_cleanup(should_defer=lambda: False))
         except BaseException as error:  # noqa: BLE001 - propagate worker failure to the main assertion
             errors.append(error)
 
+    assert store.publish_ready().state is ReadyOutcomeState.WAITING
     thread = Thread(target=publish)
     thread.start()
     try:
@@ -460,7 +503,10 @@ def test_input_change_during_compaction_runs_followup_publication(
         assert not thread.is_alive()
         assert errors == []
         assert publications == 2
-        assert len(results) == 1 and results[0].state is followup_state
+        assert len(results) == 1
+        assert store.publish_ready().state is followup_state
+        if followup_state is ReadyOutcomeState.BLOCKED:
+            assert results[0] is not None and results[0].state is followup_state
     finally:
         release.set()
         thread.join(timeout=5)

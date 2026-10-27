@@ -300,9 +300,32 @@ def test_opaque_quarantine_sources_are_not_salvaged_and_expire_after_terminal_re
         store.mark_quarantine_unprocessable(source_id, "opaque evidence cannot be authenticated")
         now += 999_999_999
         assert store.sweep_terminal_quarantine().removed_source_ids == ()
+        publication_generation = store.state_db.get_generation()
         now += 1
         assert store.sweep_terminal_quarantine().removed_source_ids == (source_id,)
+        assert store.state_db.get_generation() == publication_generation
+        debt = store.state_db.get(StateKind.COMPACTION, "current")
+        assert debt is not None and debt["pending"] is True
         assert attempt_source(store, source_id) is None
+    finally:
+        attempt.close()
+
+
+def test_v2_stage_reference_protects_quarantine_canonical_rows(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store)
+    try:
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        with closing(store.state_db.open_connection()) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "INSERT INTO ready_v2_stage_range(stage_id,range_ordinal,source_id,start_ordinal,record_count,"
+                "sequence_start,next_sequence,raw_sha256) VALUES (?,?,?,?,?,?,?,?)",
+                ("f" * 64, 0, source_id, 0, 1, (100).to_bytes(8, "big"), (101).to_bytes(8, "big"), "a" * 64),
+            )
+            connection.commit()
+            assert quarantine_module._canonical_references(connection, source_id) == (False, True)
+            assert "ready_v2_stage_range" in quarantine_module._canonical_delete_eligible_sql()
     finally:
         attempt.close()
 

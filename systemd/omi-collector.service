@@ -15,6 +15,7 @@ ExecStartPre=/usr/local/sbin/omi-collector-bluetooth-ready
 ExecStart=@OMI_COLLECTOR_HOME@/.local/share/omi-collector/current/bin/omi-collector service --config /srv/pipelines/omi/config.toml
 Restart=always
 RestartPreventExitStatus=78
+SuccessExitStatus=143
 RestartSec=5s
 RestartSteps=5
 RestartMaxDelaySec=5min

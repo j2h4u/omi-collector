@@ -10,7 +10,7 @@ import os
 import sqlite3
 import stat
 from bisect import bisect_right
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import date
@@ -95,6 +95,10 @@ class ReadyBundleError(RuntimeError):
     """A draft cannot be safely finalized into a ready bundle."""
 
 
+class _ReadyMaintenanceDeferredError(Exception):
+    """Cooperative capture preemption before an ACK retirement marker."""
+
+
 class ReadyDurabilityFatalError(FatalInternalAudioStorageError):
     """A READY durability failure could not be recorded safely."""
 
@@ -144,7 +148,6 @@ class ReadyOutcome:
     retry_after_seconds: float | None = None
     stats: ReadyPublicationStats | None = None
     custody_cache: ReadyCustodyCache | None = None
-    retirement_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +467,14 @@ def acknowledged_public_audio_v2(checkpoint_path: Path) -> tuple[tuple[str, str]
         raise ReadyBundleError("public audio v2 checkpoint is invalid") from error
 
 
+def acknowledged_public_audio_v2_needs_retirement(state_db: StateDB, acknowledged: tuple[tuple[str, str], ...]) -> bool:
+    """Validate the full ACK batch and report whether any artifact is still ready."""
+    if not acknowledged:
+        return False
+    entries = cast(dict[str, object], _read_ledger(state_db)["bundles"])
+    return _require_v2_acknowledgement_metadata(entries, acknowledged)
+
+
 def resume_retired_public_audio_v2(ready_root: Path, state_db: StateDB) -> None:
     """Finish filesystem removal for v2 retirements already committed in SQLite."""
     _prepare_directory(ready_root)
@@ -478,24 +489,28 @@ def retire_acknowledged_public_audio_v2(
     state_db: StateDB,
     checkpoint_path: Path,
     *,
-    acknowledged: tuple[tuple[str, str], ...] | None = None,
+    custody_cache: ReadyCustodyCache | None = None,
+    should_defer: Callable[[], bool] | None = None,
 ) -> tuple[ReadyBundleResult, ...]:
-    """Retire v2 artifacts only after the full ACK batch authenticates."""
-    if acknowledged is None:
-        acknowledged = acknowledged_public_audio_v2(checkpoint_path)
-    if not acknowledged:
+    """Retire only ready v2 artifacts after the full ACK batch authenticates."""
+    checkpoint_revision = source_revision(checkpoint_path)
+    acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+    entries = _preflight_v2_ack_retirement(ready_root, state_db, acknowledged, custody_cache, should_defer)
+    if entries is None:
         return ()
-    resume_retired_public_audio_v2(ready_root, state_db)
-    cache = _v2_ready_custody(ready_root, state_db)
-    ledger = _read_ledger(state_db)
-    entries = cast(dict[str, object], ledger["bundles"])
-    _require_v2_acknowledgements(entries, cache, acknowledged)
+    if (
+        source_revision(checkpoint_path) != checkpoint_revision
+        or acknowledged_public_audio_v2(checkpoint_path) != acknowledged
+    ):
+        raise ReadyBundleError("public audio v2 acknowledgement changed before retirement")
+    if should_defer is not None and should_defer():
+        return ()
     retired: list[ReadyBundleResult] = []
-    for artifact_id, audio_sha256 in acknowledged:
-        entry = cast(dict[str, object], entries[artifact_id])
-        if entry["state"] == "ready":
-            entry = _record_v2_retirement(state_db, artifact_id, entry)
-            entries[artifact_id] = entry
+    for artifact_id, _ in acknowledged:
+        entry = entries[artifact_id]
+        if entry["state"] == "retired":
+            continue
+        entry = _record_v2_retirement(state_db, artifact_id, entry)
         path = ready_root / artifact_id
         _remove_retired_v2(path)
         retired.append(
@@ -507,9 +522,34 @@ def retire_acknowledged_public_audio_v2(
                 cast(str, entry["records_sha256"]),
             )
         )
-        if entry["audio_sha256"] != audio_sha256:
-            raise ReadyBundleError("public audio v2 acknowledgement changed during retirement")
+        if should_defer is not None and should_defer():
+            break
     return tuple(retired)
+
+
+def _preflight_v2_ack_retirement(
+    ready_root: Path,
+    state_db: StateDB,
+    acknowledged: tuple[tuple[str, str], ...],
+    custody_cache: ReadyCustodyCache | None,
+    should_defer: Callable[[], bool] | None,
+) -> dict[str, dict[str, object]] | None:
+    if not acknowledged:
+        return None
+    ledger = _read_ledger(state_db)
+    entries = cast(dict[str, object], ledger["bundles"])
+    needs_retirement = _require_v2_acknowledgement_metadata(entries, acknowledged)
+    if not needs_retirement:
+        return None
+    if should_defer is not None and should_defer():
+        return None
+    resume_retired_public_audio_v2(ready_root, state_db)
+    try:
+        cache = _v2_ready_custody(ready_root, state_db, custody_cache, should_defer)
+    except _ReadyMaintenanceDeferredError:
+        return None
+    _require_v2_acknowledgements(cache.custody.entries, cache, acknowledged)
+    return cache.custody.entries
 
 
 def _require_v2_acknowledgements(
@@ -517,7 +557,22 @@ def _require_v2_acknowledgements(
     cache: ReadyCustodyCache,
     acknowledged: tuple[tuple[str, str], ...],
 ) -> None:
+    _require_v2_acknowledgement_metadata(entries, acknowledged)
+    for artifact_id, _ in acknowledged:
+        entry = cast(dict[str, object], entries[artifact_id])
+        if entry["state"] == "ready" and artifact_id not in cache.custody.proofs:
+            raise ReadyDurabilityFatalError("public audio v2 acknowledgement has no active replay proof")
+
+
+def _require_v2_acknowledgement_metadata(
+    entries: Mapping[str, object], acknowledged: tuple[tuple[str, str], ...]
+) -> bool:
+    needs_retirement = False
+    seen: set[str] = set()
     for artifact_id, audio_sha256 in acknowledged:
+        if artifact_id in seen:
+            raise ReadyBundleError("public audio v2 acknowledgement has a duplicate artifact")
+        seen.add(artifact_id)
         entry = entries.get(artifact_id)
         if (
             not isinstance(entry, dict)
@@ -526,8 +581,8 @@ def _require_v2_acknowledgements(
             or entry.get("state") not in {"ready", "retired"}
         ):
             raise ReadyBundleError("public audio v2 acknowledgement is not a published artifact")
-        if entry["state"] == "ready" and artifact_id not in cache.custody.proofs:
-            raise ReadyDurabilityFatalError("public audio v2 acknowledgement has no active replay proof")
+        needs_retirement |= entry["state"] == "ready"
+    return needs_retirement
 
 
 def _record_v2_retirement(state_db: StateDB, artifact_id: str, entry: dict[str, object]) -> dict[str, object]:
@@ -537,9 +592,10 @@ def _record_v2_retirement(state_db: StateDB, artifact_id: str, entry: dict[str, 
         with state_db.transaction() as transaction:
             if transaction.get(StateKind.READY_PUBLICATION, artifact_id) != entry:
                 raise ReadyBundleError("public audio v2 custody changed before retirement")
-            transaction.put(StateKind.READY_PUBLICATION, artifact_id, updated)
+            transaction.put_retired_ready_publication(artifact_id, updated)
             if not transaction.delete_active_replay_proof(artifact_id):
                 raise ReadyDurabilityFatalError("public audio v2 ACK found no active replay proof")
+            mark_retirement_compaction_pending(transaction)
     except (OSError, StateDBError) as error:
         raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("public audio v2 retirement could not be recorded") from error
@@ -971,12 +1027,17 @@ def _insert_replay_proof_pages(
     )
 
 
-def _digest(path: Path) -> str:
+def _digest(path: Path, should_defer: Callable[[], bool] | None = None) -> str:
     if path.is_symlink() or not path.is_file():
         raise ReadyBundleError("ready records are not a regular file")
     digest = sha256()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        while True:
+            if should_defer is not None and should_defer():
+                raise _ReadyMaintenanceDeferredError
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -1289,9 +1350,7 @@ def finalize_public_audio_v2(
 ) -> ReadyOutcome:
     """Publish or resume one v2 cohort under the durable v2 contract."""
     with audio_store.publication_reader():
-        outcome = _finalize_public_audio_v2(audio_store, sources, ready_root, options)
-        retirement_pending = _retire_one_typed_source(audio_store, options.page_limit)
-        return replace(outcome, retirement_pending=retirement_pending)
+        return _finalize_public_audio_v2(audio_store, sources, ready_root, options)
 
 
 def _finalize_public_audio_v2(
@@ -3472,7 +3531,9 @@ def _advance_v2_commit_cohort(connection: sqlite3.Connection, proposal: _V2Commi
         raise ReadyBundleError(message)
 
 
-def _read_v2_ready_source(path: Path, entry: Mapping[str, object]) -> _ReadySource:
+def _read_v2_ready_source(
+    path: Path, entry: Mapping[str, object], should_defer: Callable[[], bool] | None = None
+) -> _ReadySource:
     if (
         path.is_symlink()
         or not path.is_dir()
@@ -3488,7 +3549,9 @@ def _read_v2_ready_source(path: Path, entry: Mapping[str, object]) -> _ReadySour
     if any(item.is_symlink() or not item.is_file() for item in (audio, manifest)):
         raise ReadyBundleError("v2 ready artifact is unsafe")
     _require_v2_operator_access(path)
-    if _digest(audio) != entry["audio_sha256"] or _digest(manifest) != entry["manifest_sha256"]:
+    audio_digest = _digest(audio) if should_defer is None else _digest(audio, should_defer)
+    manifest_digest = _digest(manifest) if should_defer is None else _digest(manifest, should_defer)
+    if audio_digest != entry["audio_sha256"] or manifest_digest != entry["manifest_sha256"]:
         raise ReadyBundleError("v2 ready artifact digest conflicts with its ledger")
     manifest_value = _read_json(manifest)
     if not isinstance(manifest_value, dict) or manifest_value.get("format") != "omi-audio-v2":
@@ -3608,7 +3671,10 @@ def _parse_v2_active_proof_row(row: tuple[object, ...], artifact_id: str) -> _V2
 
 
 def _v2_ready_custody(
-    ready_root: Path, state_db: StateDB, previous: ReadyCustodyCache | None = None
+    ready_root: Path,
+    state_db: StateDB,
+    previous: ReadyCustodyCache | None = None,
+    should_defer: Callable[[], bool] | None = None,
 ) -> ReadyCustodyCache:
     ledger = _read_ledger(state_db)
     entries = {
@@ -3629,7 +3695,9 @@ def _v2_ready_custody(
     paths = tuple(sorted(_visible_children(ready_root), key=lambda item: item.name))
     if {path.name for path in paths} != active_ids:
         raise ReadyBundleError("v2 ready files do not match the active publication ledger")
-    active = tuple(sorted((_read_v2_ready_source(path, entries[path.name]) for path in paths), key=_ready_start))
+    active = tuple(
+        sorted((_read_v2_ready_source(path, entries[path.name], should_defer) for path in paths), key=_ready_start)
+    )
     source_by_id = {source.result.bundle_id: source for source in active}
     rows = {cast(str, row[0]): row for row in _v2_replay_proof_rows(state_db)}
     if set(rows) != active_ids:
@@ -4453,7 +4521,16 @@ def _apply_typed_coverage(connection: sqlite3.Connection, coverage: tuple[_Sourc
             raise ReadyBundleError("typed source changed before coverage commit")
 
 
-def _retire_one_typed_source(audio_store: InternalAudioStore, page_limit: int) -> bool:
+def retire_one_covered_typed_source(
+    audio_store: InternalAudioStore,
+    page_limit: int,
+    should_defer: Callable[[], bool] | None = None,
+) -> bool:
+    """Retire at most one covered raw page in a maintenance window."""
+    if type(page_limit) is not int or not 0 < page_limit <= _TYPED_PAGE_MAX:
+        raise ValueError("typed retirement page limit is invalid")
+    if should_defer is not None and should_defer():
+        return False
     try:
         with (
             closing(audio_store.state_db.open_connection(read_only=True)) as connection,
@@ -4474,7 +4551,7 @@ def _retire_one_typed_source(audio_store: InternalAudioStore, page_limit: int) -
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
         raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed retirement state is unreadable") from error
-    if row is None:
+    if row is None or (should_defer is not None and should_defer()):
         return False
     source_id, committed_count, committed_digest, coverage_digest, old_cursor = row
     if (
@@ -4506,8 +4583,6 @@ def _advance_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
             if not result.progressed:
                 if actual != old_cursor:
                     _typed_fail_stop(audio_store, "typed retirement reported invalid stalled progress")
-                return False
-            if actual == old_cursor == committed_count:
                 return False
             if actual != proposed:
                 _typed_fail_stop(audio_store, "typed retirement advanced an unexpected cursor")
@@ -4618,7 +4693,6 @@ def _retire_typed_source_once(audio_store: InternalAudioStore, step: _Retirement
                 (StateKind.PACKET_SUMMARY.value, step.source_id),
             )
             proposed = None
-        state.mark_publication_changed()
     return _RetirementResult(proposed, True)
 
 

@@ -159,6 +159,12 @@ class StateTransaction(_Operations):
         super().put(kind, item_id, payload)
         self._publication_changed |= self._connection.total_changes != before and _is_publication_input(kind)
 
+    def put_retired_ready_publication(self, item_id: str, payload: dict[str, object]) -> None:
+        """Record a completed ACK without treating physical retirement as new input."""
+        if payload.get("state") != "retired":
+            raise StateDBError("ready publication retirement state is invalid")
+        super().put(StateKind.READY_PUBLICATION, item_id, payload)
+
     def delete(self, kind: StateKind, item_id: str) -> bool:
         deleted = super().delete(kind, item_id)
         self._publication_changed |= deleted and _is_publication_input(kind)
@@ -174,7 +180,7 @@ class StateTransaction(_Operations):
         self._publication_changed = True
 
     def delete_active_replay_proof(self, bundle_id: str) -> bool:
-        """Delete one active proof and its pages in this ledger transaction."""
+        """Delete the ACKed proof without waking the publication scheduler."""
 
         try:
             cursor = self._connection.execute(
@@ -186,7 +192,6 @@ class StateTransaction(_Operations):
             deleted = cursor.rowcount == 1
         finally:
             cursor.close()
-        self._publication_changed |= deleted
         return deleted
 
     def payload_bytes(self, kind: StateKind, *, row_overhead: int = 0) -> int:

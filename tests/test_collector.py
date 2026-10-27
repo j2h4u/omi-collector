@@ -899,44 +899,63 @@ def test_read_control_write_timeout_stops_and_reports_counters() -> None:
     asyncio.run(scenario())
 
 
-def test_read_begin_storage_wait_outlives_ble_deadline() -> None:
+def test_read_begin_storage_wait_outlives_ble_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         record = _record(1)
         session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
         writer = PendingReadBeginWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)))
-        for _ in range(20):
-            if writer.read_begin_future is not None:
-                break
-            await asyncio.sleep(0)
-        assert writer.read_begin_future is not None
-        await asyncio.sleep(0.03)
-        assert not pending.done()
-        writer.read_begin_future.set_result(None)
-        result = await asyncio.wait_for(pending, 1)
-        assert result.received_bytes == 2 * RECORD_SIZE
-        assert session.writes == [encode_read_command(10, 2)]
+        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(10.0)))
+        try:
+            async with asyncio.timeout(5):
+                while session.consumed < 4:
+                    await asyncio.sleep(0)
+            await asyncio.sleep(0.001)
+            assert writer.read_begin_future is not None
+            loop = asyncio.get_running_loop()
+            clock = loop.time
+            monkeypatch.setattr(loop, "time", lambda: clock() + 20.0)
+            await asyncio.sleep(0.001)
+            assert not pending.done()
+            writer.read_begin_future.set_result(None)
+            result = await asyncio.wait_for(pending, 5)
+            assert result.received_bytes == 2 * RECORD_SIZE
+            assert session.writes == [encode_read_command(10, 2)]
+        finally:
+            if writer.read_begin_future is not None and not writer.read_begin_future.done():
+                writer.read_begin_future.set_result(None)
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
     asyncio.run(scenario())
 
 
-def test_writer_barrier_storage_wait_outlives_ble_deadline() -> None:
+def test_writer_barrier_storage_wait_outlives_ble_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         record = _record(1)
         session = BurstSession((_begin(10, 2), _data(record), _data(record), _done(12)))
         writer = PendingBarrierWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
 
-        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(0.02)))
-        await asyncio.wait_for(writer.barrier_started.wait(), 1)
-        await asyncio.sleep(0.03)
-        assert not pending.done()
-        writer.release_barrier.set()
-        result = await asyncio.wait_for(pending, 1)
-        assert result.received_bytes == 2 * RECORD_SIZE
-        assert session.writes == [encode_read_command(10, 2)]
+        pending = asyncio.create_task(read_leg(session, arena, writer, 10, 2, ReadLegOptions(10.0)))
+        try:
+            await asyncio.wait_for(writer.barrier_started.wait(), 5)
+            loop = asyncio.get_running_loop()
+            clock = loop.time
+            monkeypatch.setattr(loop, "time", lambda: clock() + 20.0)
+            await asyncio.sleep(0.001)
+            assert not pending.done()
+            writer.release_barrier.set()
+            result = await asyncio.wait_for(pending, 5)
+            assert result.received_bytes == 2 * RECORD_SIZE
+            assert session.writes == [encode_read_command(10, 2)]
+        finally:
+            writer.release_barrier.set()
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
     asyncio.run(scenario())
 

@@ -204,9 +204,11 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
     published = restarted.recover_and_publish()
     source = attempt_source(restarted, attempt_id)
     assert published.state == "published"
-    assert published.retirement_pending
     assert source is not None and source.lifecycle == "retiring"
-    assert restarted.recover_and_publish().retirement_pending
+    assert restarted.retire_covered_raw_page(should_defer=lambda: False)
+    assert attempt_source(restarted, attempt_id) is not None
+    while restarted.retire_covered_raw_page(should_defer=lambda: False):
+        pass
     assert attempt_source(restarted, attempt_id) is None
 
 

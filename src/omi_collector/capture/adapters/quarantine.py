@@ -46,6 +46,7 @@ from .internal_audio_store import (
     InternalAudioStoreError,
     authenticate_capture_source,
 )
+from .sqlite_compaction import mark_retirement_compaction_pending
 from .staging_contract import (
     AttemptDescriptor,
     AttemptStateError,
@@ -733,6 +734,8 @@ def _typed_sweep_terminal_quarantine(
             changes_before = connection.total_changes
             _classify_standalone_typed_evidence(filesystem, connection, now)
             _classify_one_typed_opaque(filesystem, connection, now)
+            classification_changed = connection.total_changes != changes_before
+            expiry_changes_before = connection.total_changes
             remaining = chunk_limit
             if not should_defer():
                 source = _next_expired_typed_source(connection, now)
@@ -743,10 +746,14 @@ def _typed_sweep_terminal_quarantine(
                         removed.append(source)
             if remaining and not should_defer():
                 _sweep_one_expired_standalone(connection, now, remaining)
+            expired_rows_removed = connection.total_changes != expiry_changes_before
             progressed = connection.total_changes != changes_before
-            if progressed:
+            if classification_changed or expired_rows_removed:
                 state = StateTransaction(connection)
-                state.mark_publication_changed()
+                if classification_changed:
+                    state.mark_publication_changed()
+                if expired_rows_removed:
+                    mark_retirement_compaction_pending(state)
                 state.finish()
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise_if_sqlite_storage_fault(error)
@@ -783,7 +790,8 @@ def _canonical_delete_eligible_sql() -> str:
     return (
         _expired_typed_source_sql() + " AND lifecycle = 'blocked' AND quarantine_disposition = 'unprocessable' "
         "AND NOT EXISTS (SELECT 1 FROM publication_cohort_member m WHERE m.source_id = capture_source.source_id) "
-        "AND NOT EXISTS (SELECT 1 FROM ready_stage_range r WHERE r.source_id = capture_source.source_id)"
+        "AND NOT EXISTS (SELECT 1 FROM ready_stage_range r WHERE r.source_id = capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM ready_v2_stage_range r WHERE r.source_id = capture_source.source_id)"
     )
 
 
@@ -857,8 +865,9 @@ def _canonical_references(connection: sqlite3.Connection, source_id: str) -> tup
         _db_one(
             connection.execute(
                 "SELECT EXISTS (SELECT 1 FROM publication_cohort_member WHERE source_id = ?), "
-                "EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?)",
-                (source_id, source_id),
+                "EXISTS (SELECT 1 FROM ready_stage_range WHERE source_id = ?) OR "
+                "EXISTS (SELECT 1 FROM ready_v2_stage_range WHERE source_id = ?)",
+                (source_id, source_id, source_id),
             )
         ),
     )

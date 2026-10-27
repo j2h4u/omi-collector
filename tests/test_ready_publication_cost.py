@@ -60,15 +60,16 @@ class _HeldReadyOutput:
         return self.stream.fileno()
 
 
-def _add_source(store: StagingStore, start: int, count: int) -> bytes:
+def _add_source(store: StagingStore, start: int, count: int) -> tuple[str, bytes]:
     raw = b"".join(_record(sequence) for sequence in range(start, start + count))
     attempt = store.prepare_streaming_attempt(start, count)
     attempt.prepare_leg(start, count)
     attempt.record_read_begin(ReadBeginNotification(start, count))
     attempt.accept_chunk(start, raw)
     attempt.seal(DoneNotification(0, start + count))
+    attempt_id = attempt.attempt_id
     attempt.close()
-    return raw
+    return attempt_id, raw
 
 
 def _add_quarantine_residue(store: StagingStore, source_id: str) -> None:
@@ -147,7 +148,7 @@ def test_retirement_reuses_authenticated_custody_and_keeps_immediate_progress(
 ) -> None:
     record_count = 1_024
     store = _store(tmp_path, threshold=0.02)
-    _add_source(store, 100, record_count)
+    source_id, _raw = _add_source(store, 100, record_count)
     store.append_ready_closure(100 + record_count, "drained")
     page_calls = 0
     connection_calls = 0
@@ -170,8 +171,8 @@ def test_retirement_reuses_authenticated_custody_and_keeps_immediate_progress(
     published = store.recover_and_publish()
 
     assert published.state is ReadyOutcomeState.PUBLISHED
-    assert published.retirement_pending
-    assert page_calls >= 3 * (record_count // 128)
+    assert attempt_source(store, source_id) is not None
+    assert page_calls >= record_count // 128
     assert connection_calls < page_calls
     (bundle,) = published.published
     output = bundle.path / "audio.ogg"
@@ -179,15 +180,18 @@ def test_retirement_reuses_authenticated_custody_and_keeps_immediate_progress(
     identity = output.stat().st_ino, output.stat().st_mtime_ns
     audio_digest = sha256(output.read_bytes()).hexdigest()
 
-    followups = 0
-    while store.publication_followup_due():
-        followups += 1
-        assert followups <= 10
-        store.recover_and_publish()
-        assert sha256(output.read_bytes()).hexdigest() == audio_digest
-        assert (output.stat().st_ino, output.stat().st_mtime_ns) == identity
-
-    assert followups == 9
+    assert not store.publication_followup_due()
+    assert sha256(output.read_bytes()).hexdigest() == audio_digest
+    assert (output.stat().st_ino, output.stat().st_mtime_ns) == identity
+    retirements = 0
+    while store.retire_covered_raw_page(should_defer=lambda: False):
+        retirements += 1
+        assert retirements <= 10
+    assert retirements == 9
+    assert _source_canonical_custody(store, source_id) == (0, 0, 0)
+    assert output.exists()
+    assert sha256(output.read_bytes()).hexdigest() == audio_digest
+    assert (output.stat().st_ino, output.stat().st_mtime_ns) == identity
     with closing(store.state_db.open_connection(read_only=True)) as connection:
         proof = cast(
             tuple[str, int] | None,
@@ -242,39 +246,36 @@ def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
         published = store.recover_and_publish()
 
         assert published.state is ReadyOutcomeState.PUBLISHED
-        assert published.retirement_pending
-        assert store.publication_followup_due()
+        assert store.retire_covered_raw_page(should_defer=lambda: False)
         generation = store.state_db.get_generation()
 
         stalled = store.recover_and_publish()
 
-        assert not stalled.retirement_pending
-        assert not store.publication_followup_due()
+        assert stalled.state is ReadyOutcomeState.WAITING
         assert store.state_db.get_generation() == generation
         retained = attempt_source(store, source_id)
         with closing(store.state_db.open_connection(read_only=True)) as connection:
-            retirement_cursor = cast(
-                tuple[object] | None,
+            retirement_state = cast(
+                tuple[object, int] | None,
                 connection.execute(
-                    "SELECT retirement_cursor FROM capture_source WHERE source_id=?", (source_id,)
+                    "SELECT retirement_cursor,(SELECT count(*) FROM publication_cohort_member WHERE source_id=?) "
+                    "FROM capture_source WHERE source_id=?",
+                    (source_id, source_id),
                 ).fetchone(),
             )
         assert retained is not None and retained.lifecycle == "retiring"
-        assert retirement_cursor is not None and retirement_cursor[0] == 1
+        assert retirement_state is not None and tuple(retirement_state) == (1, 0)
 
         now += 1_000_000_000
         assert store.sweep_terminal_quarantine().removed_source_ids == ()
-        assert store.state_db.get_generation() > generation
-        assert store.publication_followup_due()
-
-        resumed = store.recover_and_publish()
-
-        assert resumed.retirement_pending
+        assert store.state_db.get_generation() == generation
+        assert attempt_source(store, source_id) is not None
+        assert _source_canonical_custody(store, source_id) == (1, 0, 0)
+        retirements = 0
+        while store.retire_covered_raw_page(should_defer=lambda: False):
+            retirements += 1
+            assert retirements <= 3
         assert attempt_source(store, source_id) is None
-        assert store.publication_followup_due()
-        settled = store.recover_and_publish()
-        assert not settled.retirement_pending
-        assert not store.publication_followup_due()
     finally:
         attempt.close()
 
@@ -340,15 +341,19 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
         assert _source_canonical_custody(store, source_id) == (1, 1, 1)
 
         monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original_materialize)
-        published = store.recover_and_publish()
+        restarted = StagingStore.from_paths(
+            bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config
+        )
+        published = restarted.recover_and_publish()
 
         assert published.state is ReadyOutcomeState.PUBLISHED
         _assert_v2_artifact(published.published[0])
-        for _ in range(4):
-            if not store.publication_followup_due():
-                break
-            store.recover_and_publish()
-        assert attempt_source(store, source_id) is None
+        assert attempt_source(restarted, source_id) is not None
+        retirements = 0
+        while restarted.retire_covered_raw_page(should_defer=lambda: False):
+            retirements += 1
+            assert retirements <= 3
+        assert attempt_source(restarted, source_id) is None
     finally:
         attempt.close()
 
@@ -480,7 +485,8 @@ def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart
         store.append_ready_closure(102, "drained")
         published = store.recover_and_publish()
         assert published.state is ReadyOutcomeState.PUBLISHED
-        assert published.retirement_pending
+        assert store.retire_covered_raw_page(should_defer=lambda: False)
+        assert attempt_source(store, source_id) is not None
         assert _source_canonical_custody(store, source_id)[:2] == (1, 1)
         assert _source_residue(store, source_id) == (1, 1, 1)
 
@@ -494,12 +500,10 @@ def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart
                 break
         assert _source_residue(restarted, source_id) == (0, 0, 0)
         assert _source_canonical_custody(restarted, source_id)[:2] == (1, 1)
-        assert restarted.publication_followup_due()
-        for _ in range(8):
-            restarted.recover_and_publish()
-            if attempt_source(restarted, source_id) is None:
-                break
+        retirements = 0
+        while restarted.retire_covered_raw_page(should_defer=lambda: False):
+            retirements += 1
+            assert retirements <= 3
         assert attempt_source(restarted, source_id) is None
-        assert not restarted.recover_and_publish().retirement_pending
     finally:
         attempt.close()

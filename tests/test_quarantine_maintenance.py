@@ -15,6 +15,7 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters import quarantine
+from omi_collector.capture.adapters import staging_store as staging_store_module
 from omi_collector.capture.adapters.collector_state_db import _GuardedConnection
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
@@ -25,6 +26,10 @@ from omi_collector.capture.application.presence import PresencePolicy, PresenceW
 from omi_collector.capture.application.quarantine_maintenance import (
     PendingStartupState,
     QuarantineMaintenance,
+    _cleanup_transition,
+    _CleanupEvent,
+    _CleanupPhase,
+    _CleanupState,
 )
 from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
@@ -347,7 +352,6 @@ def test_deferred_maintenance_is_retried_without_touching_quarantine(tmp_path: P
     methods = (
         "recover_and_publish",
         "refresh_utc_projection",
-        "sweep_terminal_quarantine",
         "quarantined_attempts",
     )
     originals = {name: cast(Callable[..., object], getattr(store, name)) for name in methods}
@@ -377,7 +381,6 @@ def test_maintenance_runs_again_at_exact_configured_monotonic_boundary(
     methods = (
         "recover_and_publish",
         "refresh_utc_projection",
-        "sweep_terminal_quarantine",
         "quarantined_attempts",
     )
     for name in methods:
@@ -399,6 +402,176 @@ def test_maintenance_runs_again_at_exact_configured_monotonic_boundary(
     now = 110.0
     _run(maintenance.run_once(lambda: False))
     assert calls == list(methods) * 2
+
+
+def test_hourly_cleanup_orders_phases_and_ordinary_ticks_skip_physical_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    calls: list[str] = []
+
+    def record(name: str, result: object) -> Callable[..., object]:
+        def effect(*_args: object, **_kwargs: object) -> object:
+            calls.append(name)
+            return result
+
+        return effect
+
+    monkeypatch.setattr(store, "retire_acknowledged_ready", record("ack", 0))
+    monkeypatch.setattr(store, "retire_covered_raw_page", record("raw", False))
+    monkeypatch.setattr(store, "sweep_terminal_quarantine", record("expiry", SweepResult((), False)))
+    monkeypatch.setattr(store, "compact_after_cleanup", record("vacuum", None))
+    _run(maintenance.run_once(lambda: False))
+    assert calls == []
+
+    maintenance._maintenance_not_before = 0
+    maintenance._cleanup_state = _CleanupState(_CleanupPhase.WAITING, 0)
+    _run(maintenance.run_once(lambda: False))
+    assert calls == ["ack", "raw", "expiry", "vacuum"]
+    assert maintenance._cleanup_state.phase is _CleanupPhase.WAITING
+
+
+def test_hourly_cleanup_yields_after_one_raw_page_on_capture_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    capture_intent = threading.Event()
+    calls: list[str] = []
+
+    def raw_page(*, should_defer: Callable[[], bool]) -> bool:
+        assert not should_defer()
+        calls.append("raw")
+        capture_intent.set()
+        return True
+
+    monkeypatch.setattr(store, "retire_acknowledged_ready", lambda **_kwargs: 0)
+    monkeypatch.setattr(store, "retire_covered_raw_page", raw_page)
+    monkeypatch.setattr(store, "sweep_terminal_quarantine", lambda **_kwargs: pytest.fail("expiry after capture"))
+    maintenance._cleanup_state = _CleanupState(_CleanupPhase.WAITING, 0)
+    _run(maintenance.run_once(capture_intent.is_set))
+    assert calls == ["raw"]
+    assert maintenance._cleanup_state.phase is _CleanupPhase.WAITING
+
+
+@pytest.mark.parametrize("phase", tuple(_CleanupPhase))
+@pytest.mark.parametrize("event", tuple(_CleanupEvent))
+def test_hourly_cleanup_transition_covers_every_phase_event(phase: _CleanupPhase, event: _CleanupEvent) -> None:
+    state = _CleanupState(phase, 100.0, 150.0)
+    if phase is _CleanupPhase.WAITING and event is _CleanupEvent.ADVANCE:
+        with pytest.raises(ValueError, match="cannot advance"):
+            _cleanup_transition(state, event, 120.0)
+        return
+    result = _cleanup_transition(state, event, 120.0)
+    if event is _CleanupEvent.WAKE:
+        expected = _CleanupState(_CleanupPhase.PUBLICATION, 100.0, 720.0) if phase is _CleanupPhase.WAITING else state
+    elif event is _CleanupEvent.DEFER:
+        expected = state if phase is _CleanupPhase.WAITING else _CleanupState(_CleanupPhase.WAITING, 3700.0)
+    else:
+        next_phase = {
+            _CleanupPhase.PUBLICATION: _CleanupPhase.ACK,
+            _CleanupPhase.ACK: _CleanupPhase.RAW,
+            _CleanupPhase.RAW: _CleanupPhase.EXPIRY,
+            _CleanupPhase.EXPIRY: _CleanupPhase.VACUUM,
+        }.get(phase)
+        expected = (
+            _CleanupState(next_phase, 100.0, 150.0) if next_phase else _CleanupState(_CleanupPhase.WAITING, 3700.0)
+        )
+    assert result == expected
+
+
+def test_hourly_cleanup_wakes_at_due_and_rejects_unknown_state_or_event() -> None:
+    waiting = _CleanupState(_CleanupPhase.WAITING, 100.0)
+    assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 99.999) == waiting
+    assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 100.0) == _CleanupState(
+        _CleanupPhase.PUBLICATION, 100.0, 700.0
+    )
+    with pytest.raises(ValueError, match="unknown cleanup event"):
+        _cleanup_transition(waiting, cast(_CleanupEvent, "invalid"), 100.0)
+    with pytest.raises(ValueError, match="unknown cleanup phase"):
+        _cleanup_transition(_CleanupState(cast(_CleanupPhase, "invalid"), 100.0), _CleanupEvent.WAKE, 100.0)
+
+
+@pytest.mark.parametrize("event", (_CleanupEvent.DEFER, _CleanupEvent.ADVANCE))
+def test_overdue_hourly_window_coalesces_to_next_future_epoch(event: _CleanupEvent) -> None:
+    phase = _CleanupPhase.VACUUM if event is _CleanupEvent.ADVANCE else _CleanupPhase.RAW
+    overdue = _CleanupState(phase, 100.0, 10_600.0)
+    assert _cleanup_transition(overdue, event, 10_001.0) == _CleanupState(_CleanupPhase.WAITING, 10_900.0)
+
+
+def test_unchanged_full_compaction_debt_parks_until_relevant_generation_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _publication_store(tmp_path)
+    store.recover_and_publish()
+    generation = [5]
+    available_space = [1_000_000]
+    calls: list[int] = []
+    monkeypatch.setattr(staging_store_module, "pending_compaction_generation", lambda _database: generation[0])
+    monkeypatch.setattr(store, "_available_compaction_space", lambda: available_space[0])
+
+    def full_vacuum(_database: object, debt_generation: int, _interrupt: object, _defer: object) -> str:
+        calls.append(debt_generation)
+        return "parked"
+
+    monkeypatch.setattr(staging_store_module, "vacuum_pending", full_vacuum)
+    first = store.compact_after_cleanup(should_defer=lambda: False)
+    second = store.compact_after_cleanup(should_defer=lambda: False)
+    assert first is not None and first.reason == "compaction_parked"
+    assert second is not None and second.reason == "compaction_parked"
+    assert calls == [5]
+    required_release = max(store.state_db.path.stat().st_size, 1)
+    available_space[0] += required_release - 1
+    still_parked = store.compact_after_cleanup(should_defer=lambda: False)
+    assert still_parked is not None and still_parked.reason == "compaction_parked"
+    assert calls == [5]
+    available_space[0] += 1
+    released = store.compact_after_cleanup(should_defer=lambda: False)
+    assert released is not None and released.reason == "compaction_parked"
+    assert calls == [5, 5]
+    generation[0] = 6
+    changed = store.compact_after_cleanup(should_defer=lambda: False)
+    assert changed is not None and changed.reason == "compaction_parked"
+    assert calls == [5, 5, 6]
+
+
+def test_busy_compaction_reports_deferred_without_publication_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _publication_store(tmp_path)
+    store.recover_and_publish()
+    monkeypatch.setattr(staging_store_module, "pending_compaction_generation", lambda _database: 7)
+    calls = 0
+
+    def busy_vacuum(_database: object, _generation: int, _interrupt: object, _defer: object) -> str:
+        nonlocal calls
+        calls += 1
+        return "deferred"
+
+    monkeypatch.setattr(staging_store_module, "vacuum_pending", busy_vacuum)
+    first = store.compact_after_cleanup(should_defer=lambda: False)
+    assert first is not None and first.reason == "compaction_deferred"
+    assert store.publication_retry_schedule() is None
+    second = store.compact_after_cleanup(should_defer=lambda: False)
+    assert second is not None and second.reason == "compaction_deferred"
+    assert calls == 2
+
+
+def test_hourly_owner_reports_unfinished_compaction_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    runtime = OpportunisticRuntime()
+    events: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(runtime, "debug_event", lambda event, **fields: events.append((event, fields.get("reason"))))
+    monkeypatch.setattr(
+        store,
+        "compact_after_cleanup",
+        lambda **_kwargs: ReadyOutcome(ReadyOutcomeState.WAITING, reason="compaction_parked"),
+    )
+    maintenance = QuarantineMaintenance(store, None, runtime)
+    maintenance._cleanup_state = _CleanupState(_CleanupPhase.VACUUM, 0, float("inf"))
+    assert _run(maintenance._run_cleanup_phase(lambda: False)) is False
+    assert events == [("hourly_compaction_deferred", "compaction_parked")]
 
 
 def test_writer_lock_defers_terminal_sweeps_without_reporting_failures(
@@ -689,24 +862,34 @@ def test_presence_idle_interval_cancellation_does_not_wait_for_interval(tmp_path
 
 def test_transient_clock_publication_does_not_gate_startup_and_arms_retry(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
         config = CollectorConfig(retry=RetryConfig(rapid_backoff=(0.02,)))
         store = _publication_store(tmp_path, config=config)
+        now = asyncio.get_running_loop().time()
+        monkeypatch.setattr(staging_store_module, "monotonic", lambda: now)
         attempts: list[int] = []
 
         def recover_and_publish() -> ReadyOutcome:
             attempts.append(1)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="storage_busy_or_io")
 
-        store._recover_and_publish_unlocked = recover_and_publish  # type: ignore[method-assign]
+        monkeypatch.setattr(store, "_recover_and_publish_unlocked", recover_and_publish)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime(), config=config)
-
-        await maintenance.ensure_publication_ready()
-        assert attempts == [1]
-        schedule = store.publication_retry_schedule()
-        assert schedule is not None
-        assert schedule[1] > time.monotonic()
+        armed: list[tuple[int, float] | None] = []
+        monkeypatch.setattr(
+            maintenance, "_arm_publication_timer", lambda: armed.append(store.publication_retry_schedule())
+        )
+        try:
+            await maintenance.ensure_publication_ready()
+            assert attempts == [1]
+            schedule = store.publication_retry_schedule()
+            assert schedule is not None
+            assert schedule[1] == now + config.retry.rapid_backoff[0]
+            assert armed == [schedule]
+        finally:
+            await maintenance.close()
 
     _run(scenario())
 
@@ -998,6 +1181,7 @@ def test_presence_maintenance_cancellation_joins_cooperative_worker(tmp_path: Pa
 
         store.sweep_terminal_quarantine = sweep  # type: ignore[method-assign]
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        maintenance._cleanup_state = _CleanupState(_CleanupPhase.WAITING, 0)
         task = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
         try:
             await asyncio.wait_for(waiter_started.wait(), timeout=5.0)
@@ -1340,6 +1524,7 @@ def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
         store = _store(tmp_path)
         monkeypatch.setattr(store, "sweep_terminal_quarantine", sweep)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        maintenance._cleanup_state = _CleanupState(_CleanupPhase.WAITING, 0)
         presence = Presence()
         owner = asyncio.create_task(maintenance.wait_for_presence_attempt(presence, lambda _: None))
         try:

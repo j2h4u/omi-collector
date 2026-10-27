@@ -32,6 +32,9 @@ def test_compaction_ignores_retirement_blocked_by_active_cohort_member(tmp_path:
                 "admitted_lifecycle,admitted_count,admitted_sha256) VALUES (?,0,?,0,1,'sealed_waiting',1,?)",
                 ("b" * 32, "a" * 32, sha256(raw).hexdigest()),
             )
+            connection.execute("CREATE TABLE reclaimable_fixture(payload BLOB)")
+            connection.execute("INSERT INTO reclaimable_fixture VALUES (zeroblob(65536))")
+            connection.execute("DROP TABLE reclaimable_fixture")
             connection.commit()
 
         with closing(database.open_connection(read_only=True)) as connection:

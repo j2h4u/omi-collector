@@ -649,7 +649,16 @@ def test_staging_store_ack_preserves_multi_page_gc_progress_with_subthreshold_so
     assert published.published, (published.state, published.reason)
     artifact = published.published[0]
     manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
-    assert published.retirement_pending
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        source_state = cast(
+            tuple[str, int, int] | None,
+            connection.execute(
+                "SELECT lifecycle,retirement_cursor,(SELECT count(*) FROM capture_record WHERE source_id=capture_source.source_id) "
+                "FROM capture_source WHERE source_id=?",
+                ("a" * 32,),
+            ).fetchone(),
+        )
+    assert source_state is not None and tuple(source_state) == ("retiring", 0, 129)
     with InternalAudioStore(store.state_db) as audio_store:
         _source(audio_store, "b" * 32, 200, (_zero_record(200),))
     store.append_ready_closure(201, "drained")
@@ -664,28 +673,22 @@ def test_staging_store_ack_preserves_multi_page_gc_progress_with_subthreshold_so
         encoding="utf-8",
     )
 
-    retired = store.recover_and_publish()
-
-    assert retired.state is ReadyOutcomeState.WAITING
-    assert retired.reason == "ack_retired"
-    assert retired.retirement_pending
-    assert store.publication_followup_due()
-    assert not artifact.path.exists()
     with closing(store.state_db.open_connection(read_only=True)) as connection:
-        source_state = ready_bundles._sql_one(
+        member_count = cast(
+            int,
             connection.execute(
-                "SELECT lifecycle,retirement_cursor FROM capture_source WHERE source_id=?",
-                ("a" * 32,),
-            )
+                "SELECT count(*) FROM publication_cohort_member WHERE source_id=?", ("a" * 32,)
+            ).fetchone()[0],
         )
-    assert source_state == ("retiring", 129)
+    assert member_count == 0
 
-    followups = 0
-    while store.publication_followup_due():
-        followups += 1
-        assert followups <= 3
-        store.recover_and_publish()
-    assert followups == 2
+    assert store.retire_acknowledged_ready(should_defer=lambda: False) == 1
+    assert not artifact.path.exists()
+    retirements = 0
+    while store.retire_covered_raw_page(should_defer=lambda: False):
+        retirements += 1
+        assert retirements <= 3
+    assert retirements == 3
     with InternalAudioStore(store.state_db) as audio_store:
         assert audio_store.get_source("a" * 32) is None
         preserved = audio_store.get_source("b" * 32)

@@ -418,7 +418,6 @@ def verify_ready_bundle(outcome: ReadyOutcome, context: PublicationContext) -> d
         "publication_output_bytes": output_bytes,
         "publication_sha256": actual_digest,
         "publication_bundle_count": len(outcome.published),
-        "publication_retirement_pending": outcome.retirement_pending,
     }
 
 
@@ -536,7 +535,6 @@ def publication_metrics(context: BenchmarkContext) -> dict[str, object]:
         "publication_output_bytes": None,
         "publication_sha256": None,
         "publication_bundle_count": None,
-        "publication_retirement_pending": None,
     }
     if context.args.publication:
         empty_metrics.update(

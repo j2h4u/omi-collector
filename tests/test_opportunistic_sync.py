@@ -1806,9 +1806,14 @@ async def test_terminal_retired_sweep_failure_is_structured_and_does_not_stop_co
         record(event, error, **fields)
 
     monkeypatch.setattr(OpportunisticRuntime, "debug_exception", runtime_debug_exception)
-    session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
-
-    result = await run_opportunistic_collector(Provider([session]), store, _options())
+    maintenance = QuarantineMaintenance(store, None, _runtime())
+    maintenance._cleanup_state = replace(maintenance._cleanup_state, due_at=0.0)
+    try:
+        await maintenance.run_once(lambda: False)
+        session = ScriptedRingSession(_status(), (WriteStep(b"\x10", (_info(100, 100),)),))
+        result = await run_opportunistic_collector(Provider([session]), store, _options())
+    finally:
+        await maintenance.close()
 
     assert isinstance(result, NoDataResult)
     assert len(events) == 1

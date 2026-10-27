@@ -7,6 +7,7 @@ import sqlite3
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import closing
+from io import BytesIO
 from pathlib import Path
 from struct import pack
 from typing import cast
@@ -20,16 +21,19 @@ from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
     ReadyBundleError,
     ReadyBundleResult,
+    ReadyCustodyCache,
     ReadyDurabilityFatalError,
     ReadyOutcomeState,
     SqlitePublicationSource,
     _TypedCohort,
     _V2Commit,
     _V2Stage,
+    acknowledged_public_audio_v2_needs_retirement,
     finalize_public_audio_v2,
     publication_contract_state,
     resume_retired_public_audio_v2,
     retire_acknowledged_public_audio_v2,
+    retire_one_covered_typed_source,
 )
 from omi_collector.capture.domain.clock_state import ClockRange, ClockState
 from omi_collector.config import ReadyConfig
@@ -91,6 +95,12 @@ def _checkpoint(root: Path) -> Path:
     return path
 
 
+def _set_acknowledged(checkpoint: Path, acknowledged: tuple[tuple[str, str], ...]) -> None:
+    payload = cast(dict[str, object], json.loads(checkpoint.read_text(encoding="utf-8")))
+    payload["acknowledged"] = [{"id": artifact_id, "audio_sha256": digest} for artifact_id, digest in acknowledged]
+    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _retire_without_removing(
     database: StateDB,
     store: InternalAudioStore,
@@ -99,13 +109,14 @@ def _retire_without_removing(
 ) -> ReadyBundleResult:
     artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
     manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
+    checkpoint = _checkpoint(ready.parent)
+    _set_acknowledged(checkpoint, ((artifact.bundle_id, cast(str, manifest["audio_sha256"])),))
     with monkeypatch.context() as retirement:
         retirement.setattr(ready_bundles, "_remove_retired_v2", lambda _path: None)
         retire_acknowledged_public_audio_v2(
             ready,
             database,
-            _checkpoint(ready.parent),
-            acknowledged=((artifact.bundle_id, cast(str, manifest["audio_sha256"])),),
+            checkpoint,
         )
     return artifact
 
@@ -501,7 +512,10 @@ def test_v2_active_proof_structural_corruption_is_durability_fatal(
 
 @pytest.mark.parametrize("bad_second_ack", ("unknown", "wrong-hash"))
 def test_v2_ack_batch_preflights_both_and_retires_idempotently_after_source_gc(
-    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], bad_second_ack: str
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    bad_second_ack: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
@@ -518,18 +532,206 @@ def test_v2_ack_batch_preflights_both_and_retires_idempotently_after_source_gc(
     )
     valid = tuple((item.bundle_id, digest) for item, digest in zip(artifacts, hashes, strict=True))
     with closing(database.open_connection(read_only=True)) as connection:
-        assert connection.execute("SELECT count(*) FROM capture_record").fetchone()[0] < 2
-    stale_second = ("f" * 32, "0" * 64) if bad_second_ack == "unknown" else (valid[1][0], "0" * 64)
+        assert connection.execute("SELECT count(*) FROM capture_record").fetchone()[0] == 2
+    generation_before_retirement = database.get_generation()
+    assert acknowledged_public_audio_v2_needs_retirement(database, valid)
+    stale_second = ("f" * 64, "0" * 64) if bad_second_ack == "unknown" else (valid[1][0], "0" * 64)
+    _set_acknowledged(checkpoint, (valid[0], stale_second))
     with pytest.raises(ReadyBundleError, match="not a published artifact"):
-        retire_acknowledged_public_audio_v2(ready, database, checkpoint, acknowledged=(valid[0], stale_second))
+        retire_acknowledged_public_audio_v2(ready, database, checkpoint)
     assert all(item.path.is_dir() for item in artifacts)
     assert _counts(database)[2] == 2
+    assert database.get_generation() == generation_before_retirement
 
-    assert len(retire_acknowledged_public_audio_v2(ready, database, checkpoint, acknowledged=valid)) == 2
+    _set_acknowledged(checkpoint, valid)
+    assert len(retire_acknowledged_public_audio_v2(ready, database, checkpoint)) == 2
     assert all(not item.path.exists() for item in artifacts)
     assert _counts(database)[2] == 0
-    assert len(retire_acknowledged_public_audio_v2(ready, database, checkpoint, acknowledged=valid)) == 2
+    assert not acknowledged_public_audio_v2_needs_retirement(database, valid)
+    assert database.get_generation() == generation_before_retirement
+    debt = database.get(StateKind.COMPACTION, "current")
+    assert debt is not None and debt["pending"] is True
+    with monkeypatch.context() as no_op:
+        no_op.setattr(ready_bundles, "_digest", lambda _path: pytest.fail("retired ACK hashed audio"))
+        no_op.setattr(
+            ready_bundles, "resume_retired_public_audio_v2", lambda *_args: pytest.fail("retired ACK touched files")
+        )
+        assert retire_acknowledged_public_audio_v2(ready, database, checkpoint) == ()
+        _set_acknowledged(checkpoint, (valid[0], stale_second))
+        with pytest.raises(ReadyBundleError, match="not a published artifact"):
+            retire_acknowledged_public_audio_v2(ready, database, checkpoint)
     assert _counts(database)[2] == 0
+
+
+def test_v2_ack_yields_between_completed_retirement_groups(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    checkpoint = _checkpoint(tmp_path)
+    clock = ClockState((ClockRange(10, 13, 0.0, 0.0, "confirmed", "test"),))
+    first = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options(clock, 11)).published[0]
+    second = finalize_public_audio_v2(store, (_source(store, "b" * 32, 12),), ready, _options(clock, 13)).published[0]
+    acknowledged = tuple(
+        (artifact.bundle_id, cast(str, json.loads((artifact.path / "manifest.json").read_bytes())["audio_sha256"]))
+        for artifact in (first, second)
+    )
+    _set_acknowledged(checkpoint, acknowledged)
+    deferred = False
+    original_remove = ready_bundles._remove_retired_v2
+
+    def remove_then_defer(path: Path) -> None:
+        nonlocal deferred
+        original_remove(path)
+        deferred = True
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(ready_bundles, "_remove_retired_v2", remove_then_defer)
+        retired = retire_acknowledged_public_audio_v2(ready, database, checkpoint, should_defer=lambda: deferred)
+    assert tuple(result.bundle_id for result in retired) == (first.bundle_id,)
+    assert not first.path.exists() and second.path.is_dir()
+    assert acknowledged_public_audio_v2_needs_retirement(database, acknowledged)
+    assert tuple(result.bundle_id for result in retire_acknowledged_public_audio_v2(ready, database, checkpoint)) == (
+        second.bundle_id,
+    )
+    assert not acknowledged_public_audio_v2_needs_retirement(database, acknowledged)
+
+
+@pytest.mark.parametrize("mutated", ("none", "audio", "manifest", "proof", "ledger"))
+def test_v2_ack_retirement_reuses_only_current_authenticated_custody(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+    mutated: str,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    checkpoint = _checkpoint(tmp_path)
+    artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
+    cached = finalize_public_audio_v2(store, (), ready, _options()).custody_cache
+    assert cached is not None
+    digest = cast(str, json.loads((artifact.path / "manifest.json").read_bytes())["audio_sha256"])
+    acknowledged = ((artifact.bundle_id, digest),)
+    _set_acknowledged(checkpoint, acknowledged)
+    audio = artifact.path / "audio.ogg"
+    if mutated == "audio":
+        content = audio.read_bytes()
+        audio.write_bytes(bytes((content[0] ^ 1,)) + content[1:])
+    elif mutated == "manifest":
+        manifest = artifact.path / "manifest.json"
+        manifest.write_bytes(manifest.read_bytes() + b" ")
+    elif mutated == "proof":
+        with closing(database.open_connection()) as connection:
+            connection.execute(
+                "UPDATE ready_replay_proof SET proof_content_sha256=? WHERE bundle_id=?",
+                ("0" * 64, artifact.bundle_id),
+            )
+            connection.commit()
+    elif mutated == "ledger":
+        entry = database.get(StateKind.READY_PUBLICATION, artifact.bundle_id)
+        assert entry is not None
+        database.put(StateKind.READY_PUBLICATION, artifact.bundle_id, {**entry, "audio_sha256": "0" * 64})
+    if mutated != "none":
+        with pytest.raises((ReadyBundleError, ReadyDurabilityFatalError)):
+            retire_acknowledged_public_audio_v2(ready, database, checkpoint, custody_cache=cached)
+        entry = database.get(StateKind.READY_PUBLICATION, artifact.bundle_id)
+        assert entry is not None and entry["state"] == "ready"
+        assert artifact.path.exists()
+    else:
+        monkeypatch.setattr(ready_bundles, "_digest", lambda _path: pytest.fail("current custody was rehashed"))
+        assert len(retire_acknowledged_public_audio_v2(ready, database, checkpoint, custody_cache=cached)) == 1
+        assert not artifact.path.exists()
+
+
+def test_v2_ack_change_during_custody_check_blocks_first_marker(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    checkpoint = _checkpoint(tmp_path)
+    artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
+    digest = cast(str, json.loads((artifact.path / "manifest.json").read_bytes())["audio_sha256"])
+    acknowledged = ((artifact.bundle_id, digest),)
+    _set_acknowledged(checkpoint, acknowledged)
+    original = ready_bundles._v2_ready_custody
+
+    def change_checkpoint(
+        ready_root: Path,
+        state_db: StateDB,
+        previous: ReadyCustodyCache | None = None,
+        should_defer: Callable[[], bool] | None = None,
+    ) -> ReadyCustodyCache:
+        custody = original(ready_root, state_db, previous, should_defer)
+        _set_acknowledged(checkpoint, ())
+        return custody
+
+    monkeypatch.setattr(ready_bundles, "_v2_ready_custody", change_checkpoint)
+    with pytest.raises(ReadyBundleError, match="changed before retirement"):
+        retire_acknowledged_public_audio_v2(ready, database, checkpoint)
+    entry = database.get(StateKind.READY_PUBLICATION, artifact.bundle_id)
+    assert entry is not None and entry["state"] == "ready"
+    assert artifact.path.exists()
+
+
+def test_v2_ack_retirement_yields_before_first_audio_read(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    checkpoint = _checkpoint(tmp_path)
+    artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
+    digest = cast(str, json.loads((artifact.path / "manifest.json").read_bytes())["audio_sha256"])
+    _set_acknowledged(checkpoint, ((artifact.bundle_id, digest),))
+    checks = 0
+
+    def should_defer() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    assert retire_acknowledged_public_audio_v2(ready, database, checkpoint, should_defer=should_defer) == ()
+    entry = database.get(StateKind.READY_PUBLICATION, artifact.bundle_id)
+    assert entry is not None and entry["state"] == "ready"
+    assert artifact.path.exists()
+
+
+def test_v2_digest_yields_after_first_megabyte() -> None:
+    class CountedStream(BytesIO):
+        bytes_read = 0
+
+        def read(self, size: int | None = -1) -> bytes:
+            chunk = super().read(size)
+            self.bytes_read += len(chunk)
+            return chunk
+
+    class AudioPath:
+        def __init__(self) -> None:
+            self.stream = CountedStream(b"a" * (2 * 1024 * 1024))
+
+        def is_symlink(self) -> bool:
+            return False
+
+        def is_file(self) -> bool:
+            return True
+
+        def open(self, _mode: str) -> CountedStream:
+            return self.stream
+
+    path = AudioPath()
+    checks = 0
+
+    def should_defer() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    with pytest.raises(ready_bundles._ReadyMaintenanceDeferredError):
+        ready_bundles._digest(cast(Path, path), should_defer)
+    assert path.stream.bytes_read == 1024 * 1024
 
 
 def test_v2_retirement_resumes_after_process_loss_between_file_unlinks(
@@ -542,6 +744,7 @@ def test_v2_retirement_resumes_after_process_loss_between_file_unlinks(
     checkpoint = _checkpoint(tmp_path)
     artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
     manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
+    _set_acknowledged(checkpoint, ((artifact.bundle_id, cast(str, manifest["audio_sha256"])),))
     original_unlink = Path.unlink
     interrupted = False
 
@@ -559,7 +762,6 @@ def test_v2_retirement_resumes_after_process_loss_between_file_unlinks(
                 ready,
                 database,
                 checkpoint,
-                acknowledged=((artifact.bundle_id, cast(str, manifest["audio_sha256"])),),
             )
 
     assert interrupted
@@ -625,6 +827,25 @@ def test_v2_retired_resume_rejects_foreign_and_unsafe_entries(
     assert artifact.path.exists()
 
 
+def test_covered_source_retirement_reports_final_deletion_without_waking_publication(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "a" * 32, 10)
+    assert finalize_public_audio_v2(store, (source,), ready, _options()).published
+    generation = database.get_generation()
+
+    assert not retire_one_covered_typed_source(store, 1, should_defer=lambda: True)
+    assert retire_one_covered_typed_source(store, 1)
+    assert database.get_generation() == generation
+    assert store.get_source(source.source_id) is not None
+    assert retire_one_covered_typed_source(store, 1)
+    assert database.get_generation() == generation
+    assert store.get_source(source.source_id) is None
+    assert not retire_one_covered_typed_source(store, 1)
+
+
 def test_v2_ready_retirement_preflight_still_requires_the_full_pair(
     tmp_path: Path,
     audio_store: tuple[StateDB, InternalAudioStore],
@@ -634,13 +855,14 @@ def test_v2_ready_retirement_preflight_still_requires_the_full_pair(
     artifact = finalize_public_audio_v2(store, (_source(store, "a" * 32, 10),), ready, _options()).published[0]
     manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
     (artifact.path / "manifest.json").unlink()
+    checkpoint = _checkpoint(tmp_path)
+    _set_acknowledged(checkpoint, ((artifact.bundle_id, cast(str, manifest["audio_sha256"])),))
 
     with pytest.raises(ReadyBundleError):
         retire_acknowledged_public_audio_v2(
             ready,
             database,
-            _checkpoint(tmp_path),
-            acknowledged=((artifact.bundle_id, cast(str, manifest["audio_sha256"])),),
+            checkpoint,
         )
 
     entry = database.get(StateKind.READY_PUBLICATION, artifact.bundle_id)
@@ -648,7 +870,7 @@ def test_v2_ready_retirement_preflight_still_requires_the_full_pair(
     assert _counts(database)[2] == 1
 
 
-def test_v2_waiting_passes_finish_multi_page_source_gc_after_ack(tmp_path: Path) -> None:
+def test_v2_waiting_preserves_covered_source_until_bounded_maintenance_after_ack(tmp_path: Path) -> None:
     database = StateDB(tmp_path / "collector-state.sqlite3")
     ready = _ready_root(tmp_path)
     checkpoint = _checkpoint(tmp_path)
@@ -656,14 +878,13 @@ def test_v2_waiting_passes_finish_multi_page_source_gc_after_ack(tmp_path: Path)
         published_source = _source(store, "a" * 32, 10, count=3)
         clock = ClockState((ClockRange(10, 21, 0.0, 0.0, "confirmed", "test"),))
         options = PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), clock, 13, True, 1)
-        outcome = finalize_public_audio_v2(store, (published_source,), ready, options)
-        artifact = outcome.published[0]
+        artifact = finalize_public_audio_v2(store, (published_source,), ready, options).published[0]
         manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
+        _set_acknowledged(checkpoint, ((artifact.bundle_id, cast(str, manifest["audio_sha256"])),))
         retire_acknowledged_public_audio_v2(
             ready,
             database,
             checkpoint,
-            acknowledged=((artifact.bundle_id, cast(str, manifest["audio_sha256"])),),
         )
         zero = bytearray(AUDIO_RECORD_SIZE)
         zero[:4] = (200).to_bytes(4, "big")
@@ -683,13 +904,16 @@ def test_v2_waiting_passes_finish_multi_page_source_gc_after_ack(tmp_path: Path)
         waiting_options = PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), clock, 21, True, 1)
 
         waiting = finalize_public_audio_v2(store, (zero_source,), ready, waiting_options)
+        assert store.get_source("a" * 32) is not None
+        generation = database.get_generation()
         for _attempt in range(5):
             if store.get_source("a" * 32) is None:
                 break
-            waiting = finalize_public_audio_v2(store, (zero_source,), ready, waiting_options)
+            assert retire_one_covered_typed_source(store, 1)
 
         assert waiting.state is ReadyOutcomeState.WAITING
         assert store.get_source("a" * 32) is None
+        assert database.get_generation() == generation
         preserved = store.get_source("b" * 32)
         assert preserved is not None and preserved.lifecycle == "sealed_waiting"
         assert len(store.read_record_page("b" * 32, -1, 2)) == 1

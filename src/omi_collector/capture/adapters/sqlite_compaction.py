@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Callable
 from contextlib import closing
 from typing import Literal, cast
 
@@ -13,6 +14,10 @@ from .collector_state_db import StateDB, StateDBError, StateKind, StateTransacti
 
 _KEY = "current"
 _MAX_GENERATION = 2**63 - 1
+
+
+def _never_defer() -> bool:
+    return False
 
 
 def _one(connection: sqlite3.Connection, query: str, parameters: tuple[object, ...] = ()) -> tuple[object, ...] | None:
@@ -78,11 +83,16 @@ def pending_compaction_generation(state_db: StateDB) -> int | None:
             "(SELECT 1 FROM publication_cohort_member WHERE publication_cohort_member.source_id=capture_source.source_id) "
             "LIMIT 1",
         )
+        freelist = _one(connection, "PRAGMA freelist_count")
+        if freelist is None or type(freelist[0]) is not int or freelist[0] < 0:
+            raise StateDBError("SQLite freelist count is invalid")
     assert marker is not None
-    return marker[0] if marker[1] and retiring is None else None
+    return marker[0] if marker[1] and retiring is None and freelist[0] > 0 else None
 
 
-def compaction_failure_outcome(error: BaseException, interrupt: threading.Event) -> Literal["interrupted", "deferred"]:
+def compaction_failure_outcome(
+    error: BaseException, interrupt: threading.Event
+) -> Literal["interrupted", "deferred", "parked"]:
     """Classify retryable SQLite outcomes; unknown storage faults fail closed."""
     code = getattr(error, "sqlite_errorcode", None)
     primary = code & 0xFF if type(code) is int else None
@@ -90,26 +100,33 @@ def compaction_failure_outcome(error: BaseException, interrupt: threading.Event)
         raise FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=code) from error
     if primary == sqlite3.SQLITE_IOERR:
         raise FatalInternalAudioStorageError("SQLite VACUUM outcome is uncertain", sqlite_errorcode=code) from error
-    if primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_FULL, sqlite3.SQLITE_INTERRUPT}:
+    if primary == sqlite3.SQLITE_FULL:
+        return "parked"
+    if primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_INTERRUPT}:
         return "interrupted" if interrupt.is_set() else "deferred"
     raise FatalInternalAudioStorageError("SQLite compaction outcome is uncertain", sqlite_errorcode=code) from error
 
 
 def vacuum_pending(
-    state_db: StateDB, generation: int, interrupt: threading.Event
-) -> Literal["done", "interrupted", "deferred"]:
+    state_db: StateDB,
+    generation: int,
+    interrupt: threading.Event,
+    should_defer: Callable[[], bool] = _never_defer,
+) -> Literal["done", "interrupted", "deferred", "parked"]:
     """Run one cancellable autocommit VACUUM and clear only matching debt."""
     if type(generation) is not int or generation < 0:
         raise ValueError("compaction generation is invalid")
     if interrupt.is_set():
         return "interrupted"
+    if should_defer():
+        return "deferred"
     try:
         connection = state_db.open_connection()
         try:
             with state_db.access(connection):
-                connection.set_progress_handler(lambda: int(interrupt.is_set()), 1000)
+                connection.set_progress_handler(lambda: int(interrupt.is_set() or should_defer()), 1000)
                 try:
-                    preflight = _vacuum_preflight(connection, generation, interrupt)
+                    preflight = _vacuum_preflight(connection, generation, interrupt, should_defer)
                     if preflight != "run":
                         return preflight
                     connection.execute("VACUUM")
@@ -118,7 +135,15 @@ def vacuum_pending(
         finally:
             connection.close()
     except (OSError, ValueError, sqlite3.DatabaseError, StateDBError, TransientInternalAudioStorageError) as error:
-        return compaction_failure_outcome(error, interrupt)
+        code = getattr(error, "sqlite_errorcode", None)
+        return (
+            "interrupted"
+            if type(code) is int
+            and code & 0xFF == sqlite3.SQLITE_INTERRUPT
+            and not interrupt.is_set()
+            and should_defer()
+            else compaction_failure_outcome(error, interrupt)
+        )
     try:
         with state_db.transaction() as transaction:
             current = _marker(transaction.get(StateKind.COMPACTION, _KEY))
@@ -130,8 +155,11 @@ def vacuum_pending(
 
 
 def _vacuum_preflight(
-    connection: sqlite3.Connection, generation: int, interrupt: threading.Event
-) -> Literal["run", "interrupted", "deferred"]:
+    connection: sqlite3.Connection,
+    generation: int,
+    interrupt: threading.Event,
+    should_defer: Callable[[], bool] = _never_defer,
+) -> Literal["run", "interrupted", "deferred", "parked"]:
     if interrupt.is_set():
         return "interrupted"
     marker_row = _one(connection, "SELECT payload FROM state WHERE kind=? AND id=?", (StateKind.COMPACTION.value, _KEY))
@@ -147,4 +175,9 @@ def _vacuum_preflight(
     )
     if retiring is not None:
         return "deferred"
-    return "interrupted" if interrupt.is_set() else "run"
+    if should_defer():
+        return "deferred"
+    freelist = _one(connection, "PRAGMA freelist_count")
+    if freelist is None or type(freelist[0]) is not int:
+        raise StateDBError("SQLite freelist count is invalid")
+    return "parked" if freelist[0] == 0 else "interrupted" if interrupt.is_set() else "run"

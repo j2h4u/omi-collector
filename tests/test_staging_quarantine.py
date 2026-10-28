@@ -231,6 +231,27 @@ def test_terminal_reason_is_distinct_from_original_quarantine_reason(tmp_path: P
     attempt.close()
 
 
+def test_unexpected_quarantine_disposition_is_invalid_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    attempt = _attempt(store, count=1)
+    try:
+        attempt.accept_chunk(100, _record(1))
+        source_id = store.quarantine_attempt_source(attempt.attempt_id)
+        before = _source_row(store, source_id)
+
+        def unknown_disposition(_cursor: sqlite3.Cursor) -> tuple[str, int]:
+            return "future_disposition", 0
+
+        monkeypatch.setattr(quarantine_module, "_db_one", unknown_disposition)
+
+        assert quarantine_module._quarantine_state(store._filesystem, source_id) is QuarantineState.INVALID_EVIDENCE
+        assert _source_row(store, source_id) == before
+    finally:
+        attempt.close()
+
+
 def test_ready_custody_conflict_cannot_be_salvaged_or_terminally_deleted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

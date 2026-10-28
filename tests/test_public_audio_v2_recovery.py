@@ -10,7 +10,7 @@ from contextlib import closing
 from io import BytesIO
 from pathlib import Path
 from struct import pack
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -111,8 +111,17 @@ def _retire_without_removing(
     manifest = cast(dict[str, object], json.loads((artifact.path / "manifest.json").read_bytes()))
     checkpoint = _checkpoint(ready.parent)
     _set_acknowledged(checkpoint, ((artifact.bundle_id, cast(str, manifest["audio_sha256"])),))
+    original_remove = ready_bundles._remove_v2_artifact
+
+    def preserve_retired_artifact(
+        path: Path, label: Literal["retired public audio v2 artifact", "v2 ready stage"]
+    ) -> None:
+        if label == "retired public audio v2 artifact":
+            return
+        original_remove(path, label)
+
     with monkeypatch.context() as retirement:
-        retirement.setattr(ready_bundles, "_remove_retired_v2", lambda _path: None)
+        retirement.setattr(ready_bundles, "_remove_v2_artifact", preserve_retired_artifact)
         retire_acknowledged_public_audio_v2(
             ready,
             database,
@@ -580,15 +589,16 @@ def test_v2_ack_yields_between_completed_retirement_groups(
     )
     _set_acknowledged(checkpoint, acknowledged)
     deferred = False
-    original_remove = ready_bundles._remove_retired_v2
+    original_remove = ready_bundles._remove_v2_artifact
 
-    def remove_then_defer(path: Path) -> None:
+    def remove_then_defer(path: Path, label: Literal["retired public audio v2 artifact", "v2 ready stage"]) -> None:
         nonlocal deferred
-        original_remove(path)
-        deferred = True
+        original_remove(path, label)
+        if label == "retired public audio v2 artifact":
+            deferred = True
 
     with monkeypatch.context() as interruption:
-        interruption.setattr(ready_bundles, "_remove_retired_v2", remove_then_defer)
+        interruption.setattr(ready_bundles, "_remove_v2_artifact", remove_then_defer)
         retired = retire_acknowledged_public_audio_v2(ready, database, checkpoint, should_defer=lambda: deferred)
     assert tuple(result.bundle_id for result in retired) == (first.bundle_id,)
     assert not first.path.exists() and second.path.is_dir()

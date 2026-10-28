@@ -452,8 +452,18 @@ The release gate is:
 just verify
 ```
 
-It runs static and architecture checks, the behavioral test suite, the CRAP
-complexity gate, packaging validation, a Docker build, and a runtime smoke.
+It runs static and architecture checks, the complete behavioral test suite,
+the CRAP complexity gate, the historical suppression-count ceilings, a strict
+audit of locked registry dependencies, packaging validation, and a Docker runtime
+smoke that includes the image build. The pinned Git fork is source-checked by
+repository and commit but is outside PyPI advisory coverage. Coverage is used
+only as CRAP input; there is no standalone coverage threshold. Use `just unit`
+for targeted fast iteration, not as an extra full-verification run.
+
+The production clone scan runs in blocking `just check`. Every accepted finding
+has an individual disposition tied to its detector and content-derived pair
+identity; new or changed findings need review. See
+[Code Clone Review](docs/CODE_CLONES.md).
 
 ## Releases
 
@@ -479,6 +489,8 @@ Published changes are summarized in the [changelog](CHANGELOG.md).
   expectations.
 - [Best practices](docs/BEST_PRACTICES.md) — concise operational and QA
   guidance.
+- [Code clone review](docs/CODE_CLONES.md) — production scan scope and the
+  reviewed exception process.
 - [Local candidate workflow](edge.md) — local checks, host feedback, and
   subsequent GitHub delivery.
 - [Transfer-quality evidence](docs/QUALITY_METRICS.md) — the durable metric

@@ -82,6 +82,95 @@ def _without_runner_defaults(environment: dict[str, str]) -> dict[str, str]:
     return caller_environment
 
 
+def test_campaign_environment_fills_unset_relevant_values() -> None:
+    environment = mutation_campaign._campaign_environment(
+        {
+            "COVERAGE_CORE": "ctrace",
+            "COVERAGE_FILE": "",
+            "PYTEST_ADDOPTS": "",
+            "UV_LINK_MODE": "hardlink",
+            "PATH": "/campaign/bin",
+        }
+    )
+
+    assert set(environment) == set(mutation_campaign.RELEVANT_ENV)
+    assert environment["PATH"] == "/campaign/bin"
+    assert environment["PYTHONHOME"] == ""
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("COVERAGE_CORE", "python"),
+        ("COVERAGE_FILE", "coverage.dat"),
+        ("PYTEST_ADDOPTS", "-q"),
+        ("UV_LINK_MODE", "copy"),
+    ),
+)
+def test_campaign_environment_rejects_invalid_fixed_values(key: str, value: str) -> None:
+    environment = {
+        "COVERAGE_CORE": "ctrace",
+        "COVERAGE_FILE": "",
+        "PYTEST_ADDOPTS": "",
+        "UV_LINK_MODE": "hardlink",
+    }
+    environment[key] = value
+
+    with pytest.raises(ValueError, match=f"campaign environment has invalid values for: {key}"):
+        mutation_campaign._campaign_environment(environment)
+
+
+@pytest.mark.parametrize("identity_kind", ("live", "snapshot"))
+def test_identity_builders_reject_invalid_campaign_environment(
+    campaign_project: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    identity_kind: str,
+) -> None:
+    repo, environment = campaign_project
+    environment["PYTEST_ADDOPTS"] = "-q"
+
+    with monkeypatch.context() as patch:
+        patch.chdir(repo)
+        if identity_kind == "live":
+            patch.setenv("COVERAGE_CORE", "ctrace")
+            patch.setenv("COVERAGE_FILE", "")
+            patch.setenv("PYTEST_ADDOPTS", "-q")
+            patch.setenv("UV_LINK_MODE", "hardlink")
+            with pytest.raises(ValueError, match="campaign environment has invalid values for: PYTEST_ADDOPTS"):
+                mutation_campaign._identity()
+        else:
+            with pytest.raises(ValueError, match="campaign environment has invalid values for: PYTEST_ADDOPTS"):
+                mutation_campaign._snapshot_identity(repo, environment)
+
+
+@pytest.mark.parametrize("payload", ("{", "[]"))
+def test_receipt_readers_reject_malformed_or_non_object_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payload: str,
+) -> None:
+    receipt = tmp_path / "campaign.json"
+    receipt.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(mutation_campaign, "RECEIPT", receipt)
+
+    expected_error = json.JSONDecodeError if payload == "{" else ValueError
+    with pytest.raises(expected_error):
+        mutation_campaign._read_receipt_from(receipt)
+    with pytest.raises(expected_error):
+        mutation_campaign._read_receipt()
+
+
+def test_default_receipt_reader_uses_receipt_path_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "campaign.json"
+    receipt.write_text('{"state": "paused"}', encoding="utf-8")
+    monkeypatch.setattr(mutation_campaign, "RECEIPT", receipt)
+
+    assert mutation_campaign._read_receipt() == {"state": "paused"}
+
+
 def test_prepare_job_tmp_preserves_directory_when_recorded_identity_drifted(tmp_path: Path) -> None:
     job_root = tmp_path / "job"
     scratch = job_root / "tmp"

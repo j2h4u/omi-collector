@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import stat
 from collections.abc import Iterable
@@ -41,78 +40,11 @@ from omi_collector.config import DEFAULT_CONFIG
 from omi_collector.spool_metrics import collect_spool_metrics
 from omi_collector.storage_layout import StorageLayout
 
-_SCHEMA_VERSION = 2
-_SOURCE_REVISION = re.compile(r"[0-9a-f]{12}\Z")
-_LOSS_ID = re.compile(r"[0-9a-f]{64}\Z")
 _OPERATIONAL_ATTENTION = {
     "quality": "quality_metrics_unavailable",
     "publication": "ready_publication_blocked",
     "clock": "clock_correction_blocked",
 }
-_TERMINATION_CLASSES = frozenset({"cancelled", "completed", "fatal_error", "retryable_error", "teardown_interrupted"})
-_ADVERTISEMENT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "event",
-        "recorded_at",
-        "session_id",
-        "advertisement_rssi_dbm",
-        "release_version",
-        "source_revision",
-        "phy_policy",
-    }
-)
-_TRANSFER_FIELDS = frozenset(
-    {
-        "schema_version",
-        "event",
-        "completed_at",
-        "session_id",
-        "outcome",
-        "termination_class",
-        "active_read_elapsed_ms",
-        "requested_record_count",
-        "record_size_bytes",
-        "received_raw_bytes",
-        "submitted_raw_bytes",
-        "written_raw_bytes",
-        "release_version",
-        "source_revision",
-        "firmware_version",
-        "phy_policy",
-        "advertisement_rssi_dbm",
-    }
-)
-_LOSS_FIELDS = frozenset(
-    {
-        "schema_version",
-        "event",
-        "occurred_at",
-        "session_id",
-        "missing_record_count",
-        "missing_raw_bytes",
-        "reason",
-        "release_version",
-        "source_revision",
-        "firmware_version",
-    }
-)
-_KEYED_LOSS_FIELDS = _LOSS_FIELDS | {"loss_id"}
-_CLOCK_CORRECTION_FIELDS = frozenset(
-    {
-        "schema_version",
-        "event",
-        "occurred_at",
-        "session_id",
-        "drift_seconds",
-        "target_epoch",
-        "boundary_sequence_min",
-        "boundary_sequence_max",
-        "release_version",
-        "source_revision",
-        "firmware_version",
-    }
-)
 
 
 class OperatorStatusError(ValueError):
@@ -752,108 +684,52 @@ def _require_regular_file(path: Path, *, max_bytes: int, label: str = "quality j
 
 
 def _decode_quality_event(row: dict[str, object]) -> _QualityEvent:
-    validate_quality_event(row)
-    event = row.get("event")
+    timestamp = validate_quality_event(row)
+    event = cast(str, row["event"])
     if event == "advertisement_observation":
-        return _decode_advertisement(row)
+        return _decode_advertisement(row, timestamp)
     if event == "transfer_session":
-        return _decode_transfer(row)
+        return _decode_transfer(row, timestamp)
     if event == "sequence_loss":
-        return _decode_loss(row)
+        return _decode_loss(row, timestamp)
     if event == "clock_correction":
-        return _decode_clock_correction(row)
-    raise OperatorStatusError("quality journal contains unsupported event")
+        return _decode_clock_correction(row, timestamp)
+    raise AssertionError("validated quality event has an unsupported type")
 
 
-def _decode_advertisement(row: dict[str, object]) -> _QualityEvent:
-    timestamp = _event_header(row, _ADVERTISEMENT_FIELDS, "recorded_at")
-    _require_string(row, "session_id")
-    _require_string(row, "release_version")
-    _require_string(row, "phy_policy")
-    _source_revision(row)
+def _decode_advertisement(row: dict[str, object], timestamp: datetime) -> _QualityEvent:
     return _QualityEvent(
         "advertisement_observation",
         timestamp,
-        advertisement_rssi_dbm=_integer(row, "advertisement_rssi_dbm"),
+        advertisement_rssi_dbm=cast(int, row["advertisement_rssi_dbm"]),
     )
 
 
-def _decode_transfer(row: dict[str, object]) -> _QualityEvent:
-    timestamp = _event_header(row, _TRANSFER_FIELDS, "completed_at")
-    _require_string(row, "session_id")
-    outcome = _require_string(row, "outcome")
-    termination_class = _termination_class(row)
-    _require_string(row, "release_version")
-    _require_string(row, "phy_policy")
-    _source_revision(row)
-    _nullable_string(row, "firmware_version")
-    _optional_integer(row, "advertisement_rssi_dbm")
-    _integer(row, "requested_record_count", minimum=0)
-    _integer(row, "received_raw_bytes", minimum=0)
-    _integer(row, "submitted_raw_bytes", minimum=0)
-    if _integer(row, "record_size_bytes", minimum=1) != RECORD_SIZE:
-        raise OperatorStatusError("transfer event has invalid record_size_bytes")
+def _decode_transfer(row: dict[str, object], timestamp: datetime) -> _QualityEvent:
     return _QualityEvent(
         "transfer_session",
         timestamp,
-        outcome=outcome,
-        termination_class=termination_class,
-        written_raw_bytes=_integer(row, "written_raw_bytes", minimum=0),
-        active_read_elapsed_ms=_integer(row, "active_read_elapsed_ms", minimum=0),
+        outcome=cast(str, row["outcome"]),
+        termination_class=cast(str, row["termination_class"]),
+        written_raw_bytes=cast(int, row["written_raw_bytes"]),
+        active_read_elapsed_ms=cast(int, row["active_read_elapsed_ms"]),
     )
 
 
-def _decode_loss(row: dict[str, object]) -> _QualityEvent:
-    if set(row) == _LOSS_FIELDS:
-        loss_id = None
-        fields = _LOSS_FIELDS
-    elif set(row) == _KEYED_LOSS_FIELDS:
-        loss_id = _require_string(row, "loss_id")
-        if _LOSS_ID.fullmatch(loss_id) is None:
-            raise OperatorStatusError("sequence loss has invalid loss_id")
-        fields = _KEYED_LOSS_FIELDS
-    else:
-        raise OperatorStatusError("quality journal event fields are invalid")
-    timestamp = _event_header(row, fields, "occurred_at")
-    _require_string(row, "session_id")
-    _require_string(row, "reason")
-    _require_string(row, "release_version")
-    _source_revision(row)
-    _nullable_string(row, "firmware_version")
+def _decode_loss(row: dict[str, object], timestamp: datetime) -> _QualityEvent:
     return _QualityEvent(
         "sequence_loss",
         timestamp,
-        missing_record_count=_integer(row, "missing_record_count", minimum=0),
-        missing_raw_bytes=_integer(row, "missing_raw_bytes", minimum=0),
-        reason=_require_string(row, "reason"),
-        loss_id=loss_id,
+        missing_record_count=cast(int, row["missing_record_count"]),
+        missing_raw_bytes=cast(int, row["missing_raw_bytes"]),
+        reason=cast(str, row["reason"]),
+        loss_id=cast(str | None, row.get("loss_id")),
     )
 
 
-def _decode_clock_correction(row: dict[str, object]) -> _QualityEvent:
-    timestamp = _event_header(row, _CLOCK_CORRECTION_FIELDS, "occurred_at")
-    _require_string(row, "session_id")
-    _require_string(row, "release_version")
-    _source_revision(row)
-    _nullable_string(row, "firmware_version")
-    _integer(row, "target_epoch", minimum=0)
-    boundary_min = _integer(row, "boundary_sequence_min", minimum=0)
-    boundary_max = _integer(row, "boundary_sequence_max", minimum=0)
-    if boundary_max < boundary_min:
-        raise OperatorStatusError("clock correction event has invalid sequence boundary")
-    drift = row.get("drift_seconds")
-    if isinstance(drift, bool) or not isinstance(drift, int | float):
-        raise OperatorStatusError("clock correction event has invalid drift_seconds")
+def _decode_clock_correction(row: dict[str, object], timestamp: datetime) -> _QualityEvent:
+    drift = cast(int | float, row["drift_seconds"])
     return _QualityEvent("clock_correction", timestamp, drift_seconds=float(drift))
-
-
-def _event_header(row: dict[str, object], fields: frozenset[str], timestamp_key: str) -> datetime:
-    if set(row) != fields:
-        raise OperatorStatusError("quality journal event fields are invalid")
-    schema_version = row.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != _SCHEMA_VERSION:
-        raise OperatorStatusError("quality journal event schema version is invalid")
-    return _timestamp(row, timestamp_key)
 
 
 def _timestamp(row: dict[str, object], key: str) -> datetime:
@@ -872,45 +748,6 @@ def _require_string(row: dict[str, object], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise OperatorStatusError(f"quality journal event has invalid {key}")
     return value
-
-
-def _nullable_string(row: dict[str, object], key: str) -> str | None:
-    value = row.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value:
-        raise OperatorStatusError(f"quality journal event has invalid {key}")
-    return value
-
-
-def _integer(row: dict[str, object], key: str, *, minimum: int | None = None) -> int:
-    value = row.get(key)
-    if isinstance(value, bool) or not isinstance(value, int) or (minimum is not None and value < minimum):
-        raise OperatorStatusError(f"quality journal event has invalid {key}")
-    return value
-
-
-def _optional_integer(row: dict[str, object], key: str) -> int | None:
-    value = row.get(key)
-    if value is None:
-        return None
-    return _integer(row, key)
-
-
-def _source_revision(row: dict[str, object]) -> str | None:
-    value = row.get("source_revision")
-    if value is None:
-        return None
-    if not isinstance(value, str) or _SOURCE_REVISION.fullmatch(value) is None:
-        raise OperatorStatusError("quality journal event has invalid source_revision")
-    return value
-
-
-def _termination_class(row: dict[str, object]) -> str:
-    value = row.get("termination_class")
-    if value not in _TERMINATION_CLASSES:
-        raise OperatorStatusError("quality journal event has invalid termination_class")
-    return cast(str, value)
 
 
 def _iso(value: datetime | None) -> str | None:

@@ -50,13 +50,7 @@ def _closure_payload(decoded: object) -> dict[str, object]:
     if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
         raise ReadyClosureError("ready closure queue schema is invalid")
     value = cast(dict[str, object], decoded)
-    if set(value) != _FIELDS or value.get("version") != _VERSION:
-        raise ReadyClosureError("ready closure queue schema is invalid")
-    raw_closures = value.get("closures")
-    if not isinstance(raw_closures, list):
-        raise ReadyClosureError("ready closure queue schema is invalid")
-    closures = tuple(_parse_closure(item) for item in raw_closures)
-    _require_ordered(closures)
+    closures = _parse_document(value)
     return {
         "version": _VERSION,
         "closures": [{"next_sequence": item.next_sequence, "reason": item.reason} for item in closures],
@@ -90,8 +84,7 @@ def _parse_document(value: dict[str, object] | None) -> tuple[ReadyClosure, ...]
     if not isinstance(raw_closures, list):
         raise ReadyClosureError("ready closure queue schema is invalid")
     closures = tuple(_parse_closure(item) for item in raw_closures)
-    if any(left.next_sequence > right.next_sequence for left, right in pairwise(closures)):
-        raise ReadyClosureError("ready closure queue is out of order")
+    _require_ordered(closures)
     return closures
 
 

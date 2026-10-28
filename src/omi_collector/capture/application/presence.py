@@ -306,6 +306,14 @@ class PresenceScheduler:
     async def _redeem(self, directive: machine.PresenceDirective) -> PresenceWake | PresenceEnd | None:
         if not isinstance(directive, machine.EndVisit | machine.StopAndBeginAttempt):
             return None
+        await self._stop_scan_or_close()
+        if isinstance(directive, machine.EndVisit):
+            return PresenceEnd(directive.reason)
+        if not isinstance(self._state, machine.Attempting):
+            raise RuntimeError("presence scheduler lost its outstanding attempt permit")
+        return _wake(directive.trigger)
+
+    async def _stop_scan_or_close(self) -> None:
         try:
             await self._stop_scan()
         except asyncio.CancelledError:
@@ -316,11 +324,6 @@ class PresenceScheduler:
             raise
         if isinstance(self._state, machine.Closed):
             raise RuntimeError("presence scheduler is closed")
-        if isinstance(directive, machine.EndVisit):
-            return PresenceEnd(directive.reason)
-        if not isinstance(self._state, machine.Attempting):
-            raise RuntimeError("presence scheduler lost its outstanding attempt permit")
-        return _wake(directive.trigger)
 
     def _apply(self, event: machine.PresenceEvent) -> machine.TransitionResult:
         result = machine.transition(self._state, event, self._machine_policy)
@@ -470,16 +473,7 @@ class PresenceScheduler:
                 return wake
         if not self._should_pause_idle_scan():
             return None
-        try:
-            await self._stop_scan()
-        except asyncio.CancelledError:
-            await self._close_after_stop_failure()
-            raise
-        except Exception:
-            await self._close_after_stop_failure()
-            raise
-        if isinstance(self._state, machine.Closed):
-            raise RuntimeError("presence scheduler is closed")
+        await self._stop_scan_or_close()
         self._scan_cadence = ScanPaused(self._clock() + self._cadence_policy.pause_seconds)
         return None
 

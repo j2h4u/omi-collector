@@ -50,6 +50,57 @@ def test_capture_space_reserve_uses_total_growth_and_one_bounded_journal(
     assert available == 321 * 4096
 
 
+@pytest.mark.parametrize("value, minimum", [(4096, 1), (0, 0)])
+def test_pragma_int_accepts_values_at_minimum_and_closes_cursor(value: int, minimum: int) -> None:
+    class Cursor:
+        closed = False
+
+        def fetchone(self) -> tuple[object]:
+            return (value,)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Connection:
+        cursor = Cursor()
+
+        def execute(self, statement: str) -> Cursor:
+            assert statement == "PRAGMA page_size"
+            return self.cursor
+
+    connection = Connection()
+
+    assert internal_audio_store._pragma_int(cast(sqlite3.Connection, connection), "page_size", minimum=minimum) == value
+    assert connection.cursor.closed
+
+
+@pytest.mark.parametrize(
+    "row, minimum", [(None, 0), ((True,), 0), ((False,), 0), ((3.5,), 0), (("3",), 0), ((0,), 1), ((-1,), 0)]
+)
+def test_pragma_int_rejects_invalid_values_and_closes_cursor(row: tuple[object] | None, minimum: int) -> None:
+    class Cursor:
+        closed = False
+
+        def fetchone(self) -> tuple[object] | None:
+            return row
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Connection:
+        cursor = Cursor()
+
+        def execute(self, statement: str) -> Cursor:
+            assert statement == "PRAGMA freelist_count"
+            return self.cursor
+
+    connection = Connection()
+
+    with pytest.raises(InternalAudioStoreError, match="SQLite freelist_count is invalid"):
+        internal_audio_store._pragma_int(cast(sqlite3.Connection, connection), "freelist_count", minimum=minimum)
+    assert connection.cursor.closed
+
+
 def _record(timestamp: int, fill: int) -> bytes:
     return timestamp.to_bytes(4, "big") + bytes([fill]) * 440
 
@@ -347,6 +398,34 @@ def test_drain_accepts_overlapping_prefix_and_appends_suffix(tmp_path: Path) -> 
             second,
             third,
         )
+
+
+@pytest.mark.parametrize("commit_durable", [True, False], ids=["committed", "rolled-back"])
+def test_replayed_suffix_uses_drain_ambiguity_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, commit_durable: bool
+) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    first, second = _record(21, 21), _record(22, 22)
+    digest = hashlib.sha256(first + second).hexdigest()
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        assert store.commit_drain(source_id, 0, [first], DrainCheckpoint(1)) == 1
+        commit = store._commit
+
+        def ambiguous_commit() -> None:
+            if commit_durable:
+                commit()
+            raise sqlite3.OperationalError("replay suffix commit result is ambiguous")
+
+        monkeypatch.setattr(store, "_commit", ambiguous_commit)
+        if commit_durable:
+            assert store.commit_drain(source_id, 0, [first, second], DrainCheckpoint(1, expected_sha256=digest)) == 2
+        else:
+            with pytest.raises(InternalAudioStoreError, match="ambiguous drain was rolled back"):
+                store.commit_drain(source_id, 0, [first, second], DrainCheckpoint(1, expected_sha256=digest))
+
+        expected = (first, second) if commit_durable else (first,)
+        assert tuple(record.raw_bytes for record in store.read_record_page(source_id, limit=2)) == expected
 
 
 def test_recovery_leg_replays_the_durable_prefix(tmp_path: Path) -> None:

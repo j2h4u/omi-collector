@@ -5,20 +5,27 @@ make a change pass.
 
 - `just check` is the static gate: Ruff, preview complexity/refactor checks,
   production print guard, lock sync, types, imports, workflow lint, dependency
-  hygiene, supply-chain pin checks, compile, dead-code checks, and packaging
-  smoke must pass.
+  hygiene, supply-chain pin checks, suppression budget, clone review, compile,
+  dead-code checks, and packaging smoke must pass.
 - Ruff complexity and unused-argument rules are blocking. Preview complexity
   rules that are not covered by Ruff prefixes are checked explicitly, but
   Ruff complexity is only an auxiliary lint signal.
 - `just crap-check` is the authoritative radon-backed CRAP threshold gate for
   every function. Coverage influences acceptance only through this CRAP score;
   there is no separate coverage floor.
-- `just unit` must pass for behavior changes.
+- `just unit` is the targeted fast behavior lane; full verification already
+  includes the complete suite through `just crap-check`.
+- `just check` includes clone detection for maintained Python under `src/` and
+  `scripts/`; review individual dispositions as described in
+  [CODE_CLONES.md](docs/CODE_CLONES.md).
 - `just runtime-smoke` must pass for Docker runtime changes.
-- `just docker-build` must pass because the service runs in Docker; it includes
-  Dockerfile and Compose static validation before image build.
+- `just verify` is the full local gate: `check`, `crap-check` (the complete
+  pytest suite, coverage input, and CRAP threshold), dependency audit, and
+  `runtime-smoke` (Dockerfile and Compose validation, image build, and runtime
+  checks). Do not rerun `unit` or `docker-build` separately as part of full
+  verification; use them for focused checks.
 - Iterate with targeted local checks. Before a local candidate install, all
-  applicable local tests and linters must pass, including the gates above.
+  applicable local tests and linters must pass through `just verify`.
   Reuse prior results only for byte-identical relevant inputs with targeted
   checks covering any isolated change. A frozen, committed branch candidate
   may be installed for live feedback through a reviewed transactional entry

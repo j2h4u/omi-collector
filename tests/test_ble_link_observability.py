@@ -4,13 +4,16 @@ import errno
 import logging
 import multiprocessing
 import queue
+import socket
 import sys
 import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Protocol, cast
 
 import pytest
@@ -470,10 +473,12 @@ class _FakeSocket:
         self.sent: list[bytes] = []
         self.closed = False
         self.options: list[tuple[int, int, bytes]] = []
-        self.file_descriptor = 37
+        self._reader_socket, self._signal_socket = socket.socketpair()
+        self._reader_socket.setblocking(False)
+        self._packets: queue.Queue[bytes] = queue.Queue()
 
     def fileno(self) -> int:
-        return self.file_descriptor
+        return self._reader_socket.fileno()
 
     def bind(self, _address: tuple[int, int]) -> None:
         raise AssertionError("HCI observer must use native libc bind")
@@ -485,7 +490,18 @@ class _FakeSocket:
         self.options.append((level, option, value))
 
     def recv(self, _size: int) -> bytes:
-        raise BlockingIOError
+        try:
+            packet = self._packets.get_nowait()
+        except queue.Empty as error:
+            with suppress(BlockingIOError):
+                self._reader_socket.recv(65536)
+            raise BlockingIOError from error
+        self._reader_socket.recv(1)
+        return packet
+
+    def feed(self, packet: bytes) -> None:
+        self._packets.put_nowait(packet)
+        self._signal_socket.send(b"\x00")
 
     def send(self, payload: bytes) -> int:
         self.sent.append(payload)
@@ -493,6 +509,8 @@ class _FakeSocket:
 
     def close(self) -> None:
         self.closed = True
+        self._reader_socket.close()
+        self._signal_socket.close()
 
 
 class _FailingSendSocket(_FakeSocket):
@@ -504,16 +522,11 @@ class _FailingSendSocket(_FakeSocket):
 class _QueueShutdownSocket(_FakeSocket):
     def __init__(self) -> None:
         super().__init__()
-        self.packets: queue.Queue[bytes] = queue.Queue()
         self.extra_packet_returned = threading.Event()
         self.connect_commands_sent = threading.Event()
-        self.close_called = threading.Event()
 
-    def recv(self, _size: int) -> bytes:
-        try:
-            packet = self.packets.get(timeout=0.005)
-        except queue.Empty as error:
-            raise BlockingIOError from error
+    def recv(self, size: int) -> bytes:
+        packet = super().recv(size)
         if packet == b"\x04\xff\x00":
             self.extra_packet_returned.set()
         return packet
@@ -524,34 +537,24 @@ class _QueueShutdownSocket(_FakeSocket):
             self.connect_commands_sent.set()
         return len(payload)
 
-    def close(self) -> None:
-        super().close()
-        self.close_called.set()
-
 
 def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
     class ModeAwareSocket(_FakeSocket):
         def __init__(self) -> None:
             super().__init__()
-            self.blocking = False
             self.receive_entered = threading.Event()
-            self.release_receive = threading.Event()
 
         def setblocking(self, flag: bool) -> None:
-            self.blocking = flag
+            self._reader_socket.setblocking(flag)
 
         def recv(self, _size: int) -> bytes:
             self.receive_entered.set()
-            if self.blocking:
-                self.release_receive.wait()
-                return b""
-            raise BlockingIOError
+            return super().recv(_size)
 
     fake = ModeAwareSocket()
     diagnostics: list[str] = []
     config = replace(
         DEFAULT_CONFIG.ble,
-        observer_poll_seconds=0.001,
         observer_join_timeout_seconds=0.03,
     )
     observer = BleLinkObserver(
@@ -565,16 +568,17 @@ def test_observer_close_stops_idle_reader_before_shutdown_deadline() -> None:
     async def scenario() -> None:
         await observer.start()
         reader = observer._reader
+        processor = observer._processor
         try:
-            assert reader is not None
-            assert await asyncio.to_thread(fake.receive_entered.wait, 1.0)
+            assert reader is not None and processor is not None
             await asyncio.wait_for(observer.close(), timeout=1.0)
-            assert not reader.is_alive()
+            await asyncio.to_thread(processor.join, 1.0)
+            assert not reader.is_alive() and not processor.is_alive()
+            assert not fake.receive_entered.is_set()
             assert "ble_link_observer_reader_timeout" not in diagnostics
         finally:
             with suppress(Exception):
                 await asyncio.wait_for(observer.close(), timeout=1.0)
-            fake.release_receive.set()
             if reader is not None:
                 await asyncio.to_thread(reader.join, 1.0)
                 assert not reader.is_alive()
@@ -590,7 +594,8 @@ class _RestartLifecycleSocket(_FakeSocket):
         self.packet_returned = threading.Event()
         self._late_packet = late_packet
         self._stall_first_receive = stall_first_receive
-        self._packets: queue.Queue[bytes] = queue.Queue()
+        if stall_first_receive:
+            self.feed(b"wake")
 
     def recv(self, _size: int) -> bytes:
         self.receive_entered.set()
@@ -599,17 +604,12 @@ class _RestartLifecycleSocket(_FakeSocket):
             # This barrier models a reader delayed across the bounded close deadline.
             self.release_receive.wait()
             if self._late_packet is not None:
+                self._reader_socket.recv(1)
                 self.packet_returned.set()
                 return self._late_packet
-        try:
-            packet = self._packets.get_nowait()
-        except queue.Empty as error:
-            raise BlockingIOError from error
+        packet = super().recv(_size)
         self.packet_returned.set()
         return packet
-
-    def feed(self, packet: bytes) -> None:
-        self._packets.put_nowait(packet)
 
 
 def test_hci_filter_uses_exact_linux_filter_abi() -> None:
@@ -726,7 +726,7 @@ def test_observer_sends_read_phy_tracks_transition_and_finishes_once() -> None:
     native_bind_calls: list[tuple[int, int, int, int]] = []
     records: list[dict[str, object]] = []
     clock_value = [10.0]
-    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001)
+    config = DEFAULT_CONFIG.ble
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
         adapter="hci3",
@@ -742,10 +742,12 @@ def test_observer_sends_read_phy_tracks_transition_and_finishes_once() -> None:
         workers = observer._reader, observer._processor
         assert observer._reader is not None and observer._reader.daemon
         assert observer._processor is not None and observer._processor.daemon
-        assert native_bind_calls == [(37, 31, 3, 0)]
+        assert native_bind_calls == [(fake.fileno(), 31, 3, 0)]
         assert fake.options == [(0, 2, hci_filter_bytes())]
         # This scenario drives packets and the fake clock synchronously.
         observer._stop.set()
+        observer._wake_reader()
+        observer._queue.put(None)
         for worker in workers:
             assert worker is not None
             worker.join(1)
@@ -968,6 +970,7 @@ def test_observer_receive_failure_degrades_and_warns_without_stopping_collection
         def __init__(self) -> None:
             super().__init__()
             self.receive_attempted = threading.Event()
+            self.feed(b"ready")
 
         def recv(self, _size: int) -> bytes:
             self.receive_attempted.set()
@@ -1040,7 +1043,6 @@ def test_observer_restart_refuses_a_live_reader_after_bounded_close() -> None:
     workers: list[threading.Thread] = []
     config = replace(
         DEFAULT_CONFIG.ble,
-        observer_poll_seconds=0.001,
         observer_join_timeout_seconds=0.03,
     )
 
@@ -1098,7 +1100,6 @@ def test_observer_restart_drops_late_packet_from_previous_session() -> None:
     records: list[dict[str, object]] = []
     config = replace(
         DEFAULT_CONFIG.ble,
-        observer_poll_seconds=0.001,
         observer_join_timeout_seconds=0.03,
     )
 
@@ -1159,7 +1160,7 @@ def test_observer_restart_drops_late_packet_from_previous_session() -> None:
 def test_observer_shutdown_drains_queued_disconnect_before_finalizing() -> None:
     fake = _FakeSocket()
     records: list[dict[str, object]] = []
-    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001)
+    config = DEFAULT_CONFIG.ble
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
         socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
@@ -1175,18 +1176,7 @@ def test_observer_shutdown_drains_queued_disconnect_before_finalizing() -> None:
 
 
 def test_reader_delivers_hci_timeline_to_terminal_callback() -> None:
-    class ReceivingSocket(_FakeSocket):
-        def __init__(self) -> None:
-            super().__init__()
-            self.received: queue.Queue[bytes] = queue.Queue()
-
-        def recv(self, _size: int) -> bytes:
-            try:
-                return self.received.get_nowait()
-            except queue.Empty as error:
-                raise BlockingIOError from error
-
-    fake = ReceivingSocket()
+    fake = _FakeSocket()
     callback_received = threading.Event()
     records: list[dict[str, object]] = []
 
@@ -1194,7 +1184,7 @@ def test_reader_delivers_hci_timeline_to_terminal_callback() -> None:
         records.append(record)
         callback_received.set()
 
-    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001)
+    config = DEFAULT_CONFIG.ble
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
         socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
@@ -1206,8 +1196,8 @@ def test_reader_delivers_hci_timeline_to_terminal_callback() -> None:
     async def scenario() -> None:
         await observer.start()
         try:
-            fake.received.put(_connect())
-            fake.received.put(_packet(0x05, b"\x00\x42\x00\x13"))
+            fake.feed(_connect())
+            fake.feed(_packet(0x05, b"\x00\x42\x00\x13"))
             assert await asyncio.to_thread(callback_received.wait, 1.0)
             assert len(records) == 1
             assert records[0]["disconnect_reason_hex"] == "0x13"
@@ -1225,6 +1215,7 @@ def test_reader_failure_does_not_end_active_physical_session() -> None:
             self.failure_raised = threading.Event()
             self.connection_commands_sent = threading.Event()
             self._first_receive = True
+            self.feed(b"ready")
 
         def recv(self, _size: int) -> bytes:
             if self._first_receive:
@@ -1269,11 +1260,12 @@ def test_reader_failure_does_not_end_active_physical_session() -> None:
     assert fake.closed
 
 
-def test_rssi_worker_polls_at_thirty_seconds_and_not_before_each_deadline() -> None:
+def test_rssi_worker_waits_for_thirty_second_deadline_without_empty_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     class PollingSocket(_FakeSocket):
         def __init__(self) -> None:
             super().__init__()
             self.rssi_requests = 0
+            self.first_rssi_request = threading.Event()
             self.second_rssi_request = threading.Event()
             self.third_rssi_request = threading.Event()
 
@@ -1281,37 +1273,45 @@ def test_rssi_worker_polls_at_thirty_seconds_and_not_before_each_deadline() -> N
             self.sent.append(payload)
             if payload[1:3] == b"\x05\x14":
                 self.rssi_requests += 1
-                if self.rssi_requests == 2:
+                if self.rssi_requests == 1:
+                    self.first_rssi_request.set()
+                elif self.rssi_requests == 2:
                     self.second_rssi_request.set()
                 elif self.rssi_requests == 3:
                     self.third_rssi_request.set()
             return len(payload)
 
     fake = PollingSocket()
-    clock_value = [0.0]
-    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.002)
+    monkeypatch.setattr(ble_link_observability, "_RSSI_POLL_SECONDS", 0.08)
+    poll_calls = 0
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
         socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
         native_bind=lambda *_args: None,
-        config=config,
-        clock=lambda: clock_value[0],
     )
+    poll_rssi = observer._poll_rssi
+
+    def record_poll() -> None:
+        nonlocal poll_calls
+        poll_calls += 1
+        poll_rssi()
+
+    observer._poll_rssi = record_poll
 
     async def scenario() -> None:
         await observer.start()
         try:
-            observer.handle_packet(_connect())
+            fake.feed(_connect())
+            assert await asyncio.to_thread(fake.first_rssi_request.wait, 1.0)
             assert fake.rssi_requests == 1
-            clock_value[0] = 29.999
             await asyncio.sleep(0.03)
             assert fake.rssi_requests == 1
-            clock_value[0] = 30.0
+            assert poll_calls == 1
             assert await asyncio.to_thread(fake.second_rssi_request.wait, 1.0)
             assert fake.rssi_requests == 2
-            clock_value[0] = 59.999
             await asyncio.sleep(0.03)
             assert fake.rssi_requests == 2
+            assert poll_calls == 2
             assert not fake.third_rssi_request.is_set()
         finally:
             await asyncio.wait_for(observer.close(), timeout=1.0)
@@ -1320,77 +1320,200 @@ def test_rssi_worker_polls_at_thirty_seconds_and_not_before_each_deadline() -> N
     assert fake.closed
 
 
-def test_observer_shutdown_deadline_does_not_block_loop_on_full_queue_and_stalled_callback() -> None:
-    fake = _FakeSocket()
-    callback_entered = threading.Event()
-    callback_release = threading.Event()
-    close_returned = threading.Event()
-    records: list[dict[str, object]] = []
-    config = replace(
-        DEFAULT_CONFIG.ble,
-        observer_queue_max_packets=1,
-        observer_poll_seconds=0.001,
-        observer_join_timeout_seconds=0.03,
-    )
+class _FullQueueShutdownProbe:
+    def __init__(self, fake: _FakeSocket) -> None:
+        self.config = replace(
+            DEFAULT_CONFIG.ble,
+            observer_queue_max_packets=1,
+            observer_join_timeout_seconds=0.03,
+        )
+        self.callback_entered = threading.Event()
+        self.callback_release = threading.Event()
+        self.close_returned = threading.Event()
+        self.watchdog_fired = threading.Event()
+        self.shutdown_put_entered = threading.Event()
+        self.shutdown_put_release = threading.Event()
+        self.records: list[dict[str, object]] = []
+        self.join_calls: list[tuple[threading.Thread, int, float | None]] = []
+        self.put_calls: list[tuple[int, bool, float | None]] = []
+        self.original_join = threading.Thread.join
+        self.original_put = queue.Queue.put
+        self.observer = BleLinkObserver(
+            "01:02:03:04:05:06",
+            socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+            native_bind=lambda *_args: None,
+            config=self.config,
+            terminal_callback=self.terminal_callback,
+            clock=lambda: 0.0,
+        )
+        self.reader: threading.Thread | None = None
+        self.processor: threading.Thread | None = None
+        self.loop_thread_id: int | None = None
+        self.watchdog = threading.Thread(target=self.rescue_deadlock, daemon=True)
 
-    def terminal_callback(record: dict[str, object]) -> None:
-        records.append(record)
-        callback_entered.set()
-        callback_release.wait()
+    def terminal_callback(self, record: dict[str, object]) -> None:
+        self.records.append(record)
+        self.callback_entered.set()
+        self.callback_release.wait()
 
-    observer = BleLinkObserver(
-        "01:02:03:04:05:06",
-        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
-        native_bind=lambda *_args: None,
-        config=config,
-        terminal_callback=terminal_callback,
-        clock=lambda: 0.0,
-    )
-    watchdog = threading.Thread(target=lambda: _release_after_timeout(close_returned, callback_release), daemon=True)
-    watchdog.start()
+    def record_worker_join(self, worker: threading.Thread, timeout: float | None = None) -> None:
+        if (
+            worker is self.observer._reader or worker is self.observer._processor
+        ) and not self.callback_release.is_set():
+            self.join_calls.append((worker, threading.get_ident(), timeout))
+        self.original_join(worker, timeout)
 
-    async def scenario() -> tuple[threading.Thread, float]:
-        await observer.start()
-        observer.handle_packet(_connect())
-        observer._queue.put(_packet(0x05, b"\x00\x42\x00\x13"))
-        assert callback_entered.wait(timeout=1)
-        observer._queue.put(b"queued behind blocked callback")
-        processor = observer._processor
-        assert processor is not None
-        loop_progressed = asyncio.Event()
-        asyncio.get_running_loop().call_later(0.001, loop_progressed.set)
-        close_task = asyncio.create_task(observer.close())
-        await asyncio.wait_for(loop_progressed.wait(), timeout=0.05)
+    def record_shutdown_put(
+        self,
+        work_queue: queue.Queue[bytes | None],
+        item: bytes | None,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
+        if work_queue is self.observer._queue and item is None and block and timeout is not None:
+            self.put_calls.append((threading.get_ident(), block, timeout))
+            self.shutdown_put_entered.set()
+            self.shutdown_put_release.wait()
+        self.original_put(work_queue, item, block, timeout)
+
+    def rescue_deadlock(self) -> None:
+        if self.callback_entered.wait(timeout=2.0) and not self.close_returned.wait(timeout=2.0):
+            self.callback_release.set()
+            self.shutdown_put_release.set()
+            self.watchdog_fired.set()
+
+    async def close_with_full_queue(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        await self.observer.start()
+        self.observer.handle_packet(_connect())
+        self.observer._queue.put(_packet(0x05, b"\x00\x42\x00\x13"))
+        assert await asyncio.to_thread(self.callback_entered.wait, 1.0)
+        self.observer._queue.put(b"queued behind blocked callback")
+        self.processor = self.observer._processor
+        self.reader = self.observer._reader
+        assert self.processor is not None and self.reader is not None
+        monkeypatch.setattr(self.reader, "join", partial(self.record_worker_join, self.reader))
+        monkeypatch.setattr(self.processor, "join", partial(self.record_worker_join, self.processor))
+        monkeypatch.setattr(
+            self.observer._queue,
+            "put",
+            partial(self.record_shutdown_put, self.observer._queue),
+        )
+        self.loop_thread_id = threading.get_ident()
+        close_task = asyncio.create_task(self.observer.close())
+        assert await asyncio.to_thread(self.shutdown_put_entered.wait, 1.0)
+        assert self.callback_entered.is_set() and not self.callback_release.is_set()
+        assert self.observer._queue.full()
         assert not close_task.done()
-        started = time.monotonic()
+        assert len(self.put_calls) == 1
+        put_thread_id, put_blocking, put_timeout = self.put_calls[0]
+        assert put_thread_id != self.loop_thread_id and put_blocking
+        assert put_timeout is not None and 0 < put_timeout <= self.config.observer_join_timeout_seconds
+        self.shutdown_put_release.set()
         await close_task
-        await observer.start()
-        assert observer._processor is processor
-        return processor, time.monotonic() - started
+        await self.observer.start()
+        assert self.observer._processor is self.processor
+        self.close_returned.set()
 
+    def release_and_join(self) -> None:
+        self.callback_release.set()
+        self.shutdown_put_release.set()
+        self.close_returned.set()
+        self.watchdog.join(timeout=1)
+        reader = self.reader or self.observer._reader
+        processor = self.processor or self.observer._processor
+        if reader is not None:
+            self.original_join(reader, timeout=1)
+        if processor is not None:
+            self.original_join(processor, timeout=1)
+        asyncio.run(self.observer.close())
+
+
+def test_observer_shutdown_deadline_does_not_block_loop_on_full_queue_and_stalled_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeSocket()
+    probe = _FullQueueShutdownProbe(fake)
+    monkeypatch.setattr(ble_link_observability, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    probe.watchdog.start()
     try:
-        processor, elapsed = asyncio.run(scenario())
-        close_returned.set()
-        assert elapsed < 0.15
+        asyncio.run(probe.close_with_full_queue(monkeypatch))
+        assert probe.reader is not None and probe.processor is not None and probe.loop_thread_id is not None
+        _assert_off_loop_join(
+            probe.join_calls[:1],
+            probe.reader,
+            probe.loop_thread_id,
+            probe.config.observer_join_timeout_seconds,
+        )
+        _assert_off_loop_join(
+            probe.join_calls[1:],
+            probe.processor,
+            probe.loop_thread_id,
+            probe.config.observer_join_timeout_seconds,
+        )
+        assert len(probe.join_calls) == 2
+        assert probe.callback_entered.is_set() and not probe.callback_release.is_set()
+        assert not probe.watchdog_fired.is_set()
     finally:
-        callback_release.set()
-        close_returned.set()
-        watchdog.join(timeout=1)
+        probe.release_and_join()
+    assert not probe.watchdog.is_alive()
+    assert not probe.watchdog_fired.is_set()
+    assert probe.reader is not None and not probe.reader.is_alive()
+    assert probe.processor is not None and not probe.processor.is_alive()
+    assert probe.observer._queue.empty()
+    assert len(probe.records) == 1
+    asyncio.run(probe.observer.close())
+    assert fake.closed
 
-    processor.join(timeout=1)
-    assert not watchdog.is_alive()
-    assert not processor.is_alive()
-    assert len(records) == 1
+
+@dataclass(frozen=True, slots=True)
+class _FinalizerJoinEvidence:
+    callback_entered: threading.Event
+    callback_release: threading.Event
+    close_time_joins: list[tuple[threading.Thread, int, float | None]]
+    watchdog_fired: threading.Event
 
 
-def test_observer_shutdown_finalizer_is_bounded_off_loop_without_processor() -> None:
+def _assert_off_loop_join(
+    join_calls: list[tuple[threading.Thread, int, float | None]],
+    worker: threading.Thread,
+    loop_thread_id: int,
+    maximum_timeout: float,
+) -> None:
+    assert len(join_calls) == 1
+    joined_worker, join_thread_id, join_timeout = join_calls[0]
+    assert joined_worker is worker
+    assert join_thread_id != loop_thread_id
+    assert join_timeout is not None and 0 < join_timeout <= maximum_timeout
+
+
+def _assert_bounded_finalizer_join(
+    finalizer: threading.Thread,
+    loop_thread_id: int,
+    evidence: _FinalizerJoinEvidence,
+    observer: BleLinkObserver,
+) -> None:
+    assert evidence.callback_entered.is_set()
+    assert not evidence.callback_release.is_set()
+    assert finalizer.is_alive()
+    _assert_off_loop_join(
+        evidence.close_time_joins,
+        finalizer,
+        loop_thread_id,
+        observer.config.observer_join_timeout_seconds,
+    )
+    assert not evidence.watchdog_fired.is_set()
+
+
+def test_observer_shutdown_finalizer_is_bounded_off_loop_without_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     callback_entered = threading.Event()
     callback_release = threading.Event()
     close_returned = threading.Event()
+    watchdog_fired = threading.Event()
     records: list[dict[str, object]] = []
     config = replace(
         DEFAULT_CONFIG.ble,
-        observer_poll_seconds=0.001,
         observer_join_timeout_seconds=0.03,
     )
 
@@ -1406,34 +1529,54 @@ def test_observer_shutdown_finalizer_is_bounded_off_loop_without_processor() -> 
         clock=lambda: 0.0,
     )
     observer.handle_packet(_connect())
-    watchdog = threading.Thread(target=lambda: _release_after_timeout(close_returned, callback_release), daemon=True)
+    monkeypatch.setattr(ble_link_observability, "time", SimpleNamespace(monotonic=lambda: 0.0))
+
+    close_time_joins: list[tuple[threading.Thread, int, float | None]] = []
+    evidence = _FinalizerJoinEvidence(callback_entered, callback_release, close_time_joins, watchdog_fired)
+    original_join = threading.Thread.join
+
+    def record_finalizer_join(worker: threading.Thread, timeout: float | None = None) -> None:
+        if worker is observer._shutdown_finalizer and not callback_release.is_set():
+            close_time_joins.append((worker, threading.get_ident(), timeout))
+        original_join(worker, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", record_finalizer_join)
+
+    def rescue_deadlock() -> None:
+        if callback_entered.wait(timeout=2.0) and not close_returned.wait(timeout=2.0):
+            callback_release.set()
+            watchdog_fired.set()
+
+    watchdog = threading.Thread(target=rescue_deadlock, daemon=True)
     watchdog.start()
 
-    async def scenario() -> tuple[threading.Thread, float]:
-        loop_progressed = asyncio.Event()
-        asyncio.get_running_loop().call_later(0.001, loop_progressed.set)
-        close_task = asyncio.create_task(observer.close())
-        await asyncio.wait_for(loop_progressed.wait(), timeout=0.05)
-        assert not close_task.done()
-        started = time.monotonic()
-        await close_task
+    async def scenario() -> tuple[threading.Thread, int]:
+        loop_thread_id = threading.get_ident()
+        await observer.close()
+        close_returned.set()
+        assert await asyncio.to_thread(callback_entered.wait, 2.0)
         finalizer = observer._shutdown_finalizer
         assert finalizer is not None
-        return finalizer, time.monotonic() - started
+        return finalizer, loop_thread_id
 
+    finalizer: threading.Thread | None = None
     try:
-        finalizer, elapsed = asyncio.run(scenario())
-        close_returned.set()
-        assert callback_entered.is_set()
-        assert elapsed < 0.15
+        finalizer, loop_thread_id = asyncio.run(scenario())
+        _assert_bounded_finalizer_join(
+            finalizer,
+            loop_thread_id,
+            evidence,
+            observer,
+        )
     finally:
         callback_release.set()
         close_returned.set()
         watchdog.join(timeout=1)
-
-    finalizer.join(timeout=1)
+        finalizer = finalizer or observer._shutdown_finalizer
+        if finalizer is not None:
+            finalizer.join(timeout=1)
     assert not watchdog.is_alive()
-    assert not finalizer.is_alive()
+    assert finalizer is not None and not finalizer.is_alive()
     assert len(records) == 1
 
 
@@ -1452,6 +1595,10 @@ def _blocked_reader_child(entered: _ProcessSignal, close_returned: _ProcessSigna
     blocked = threading.Event()
 
     class BlockedSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.feed(b"ready")
+
         def recv(self, _size: int) -> bytes:
             entered.set()
             blocked.wait()
@@ -1460,7 +1607,7 @@ def _blocked_reader_child(entered: _ProcessSignal, close_returned: _ProcessSigna
         def close(self) -> None:
             self.closed = True
 
-    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001, observer_join_timeout_seconds=0.02)
+    config = replace(DEFAULT_CONFIG.ble, observer_join_timeout_seconds=0.02)
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
         socket_factory=lambda *_args: BlockedSocket(),  # type: ignore[reportArgumentType]
@@ -1480,16 +1627,9 @@ def _blocked_reader_child(entered: _ProcessSignal, close_returned: _ProcessSigna
 
 def _blocked_parser_child(entered: _ProcessSignal, close_returned: _ProcessSignal, expected_module_path: str) -> None:
     _assert_child_module_path(expected_module_path)
-    packets: queue.Queue[bytes] = queue.Queue()
     blocked = threading.Event()
 
     class PacketSocket(_FakeSocket):
-        def recv(self, _size: int) -> bytes:
-            try:
-                return packets.get(timeout=0.005)
-            except queue.Empty as error:
-                raise BlockingIOError from error
-
         def close(self) -> None:
             self.closed = True
 
@@ -1497,7 +1637,7 @@ def _blocked_parser_child(entered: _ProcessSignal, close_returned: _ProcessSigna
         entered.set()
         blocked.wait()
 
-    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001, observer_join_timeout_seconds=0.02)
+    config = replace(DEFAULT_CONFIG.ble, observer_join_timeout_seconds=0.02)
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
         socket_factory=lambda *_args: PacketSocket(),  # type: ignore[reportArgumentType]
@@ -1508,8 +1648,9 @@ def _blocked_parser_child(entered: _ProcessSignal, close_returned: _ProcessSigna
 
     async def scenario() -> None:
         await observer.start()
-        packets.put(_connect())
-        packets.put(_packet(0x05, b"\x00\x42\x00\x13"))
+        assert isinstance(observer._socket, PacketSocket)
+        observer._socket.feed(_connect())
+        observer._socket.feed(_packet(0x05, b"\x00\x42\x00\x13"))
         if not entered.wait(1.0):
             raise RuntimeError("parser callback did not enter blocked state")
         await observer.close()
@@ -1528,7 +1669,7 @@ def _blocked_finalizer_child(
         entered.set()
         blocked.wait()
 
-    config = replace(DEFAULT_CONFIG.ble, observer_poll_seconds=0.001, observer_join_timeout_seconds=0.02)
+    config = replace(DEFAULT_CONFIG.ble, observer_join_timeout_seconds=0.02)
     observer = BleLinkObserver("01:02:03:04:05:06", config=config, terminal_callback=terminal_callback)
     observer.handle_packet(_connect())
 
@@ -1591,7 +1732,6 @@ def test_close_drains_a_full_public_packet_queue_after_callback_releases(
     config = replace(
         DEFAULT_CONFIG.ble,
         observer_queue_max_packets=1,
-        observer_poll_seconds=0.005,
         observer_join_timeout_seconds=0.5,
     )
 
@@ -1613,15 +1753,19 @@ def test_close_drains_a_full_public_packet_queue_after_callback_releases(
         closing: asyncio.Task[None] | None = None
         try:
             await observer.start()
-            fake.packets.put(_connect())
+            fake.feed(_connect())
             assert await asyncio.to_thread(fake.connect_commands_sent.wait, 1.0)
-            fake.packets.put(_packet(0x05, b"\x00\x42\x00\x13"))
+            fake.feed(_packet(0x05, b"\x00\x42\x00\x13"))
             assert await asyncio.to_thread(callback_entered.wait, 1.0)
-            fake.packets.put(b"\x04\xff\x00")
+            fake.feed(b"\x04\xff\x00")
             assert await asyncio.to_thread(fake.extra_packet_returned.wait, 1.0)
             await asyncio.sleep(0.02)
             closing = asyncio.create_task(observer.close())
-            assert await asyncio.to_thread(fake.close_called.wait, 1.0)
+            reader = observer._reader
+            assert reader is not None
+            await asyncio.to_thread(reader.join, 1.0)
+            assert not reader.is_alive()
+            assert not fake.closed
             await asyncio.sleep(0.04)
             assert not closing.done()
             callback_release.set()
@@ -1658,7 +1802,6 @@ def test_close_does_not_report_processor_stopped_after_racing_queue_drain(
     config = replace(
         DEFAULT_CONFIG.ble,
         observer_queue_max_packets=1,
-        observer_poll_seconds=0.005,
         observer_join_timeout_seconds=0.5,
     )
 
@@ -1686,9 +1829,6 @@ def test_close_does_not_report_processor_stopped_after_racing_queue_drain(
                     super().put_nowait(item)
                 except queue.Full:
                     callback_release.set()
-                    assert observer._processor is not None
-                    observer._processor.join(timeout=1.0)
-                    assert not observer._processor.is_alive()
                     raise
                 return
             super().put_nowait(item)
@@ -1701,15 +1841,14 @@ def test_close_does_not_report_processor_stopped_after_racing_queue_drain(
         closing: asyncio.Task[None] | None = None
         try:
             await observer.start()
-            fake.packets.put(_connect())
+            fake.feed(_connect())
             assert await asyncio.to_thread(fake.connect_commands_sent.wait, 1.0)
-            fake.packets.put(_packet(0x05, b"\x00\x42\x00\x13"))
+            fake.feed(_packet(0x05, b"\x00\x42\x00\x13"))
             assert await asyncio.to_thread(callback_entered.wait, 1.0)
-            fake.packets.put(b"\x04\xff\x00")
+            fake.feed(b"\x04\xff\x00")
             assert await asyncio.to_thread(fake.extra_packet_returned.wait, 1.0)
             assert await asyncio.to_thread(extra_packet_queued.wait, 1.0)
             closing = asyncio.create_task(observer.close())
-            assert await asyncio.to_thread(fake.close_called.wait, 1.0)
             await asyncio.wait_for(closing, timeout=0.4)
         finally:
             callback_release.set()
@@ -1740,6 +1879,7 @@ def test_shutdown_reports_stopped_processor_with_queued_packet(caplog: pytest.Lo
 
     with caplog.at_level(logging.DEBUG, logger=debug_logger.name):
         asyncio.run(observer._enqueue_shutdown_sentinel(processor, time.monotonic() + 1.0))
+        asyncio.run(observer._wait_for_worker(processor, time.monotonic() + 1.0, "unused"))
 
     assert any(
         record.name == debug_logger.name
@@ -1768,6 +1908,90 @@ def test_observer_native_bind_failure_closes_socket() -> None:
 
     assert fake.closed
     assert observer.observer_status == "degraded"
+
+
+def test_observer_socketpair_setup_failure_closes_every_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeSocket()
+    raw_wakeup, raw_writer = socket.socketpair()
+
+    class WakeupSocket:
+        def __init__(self, wrapped: socket.socket, *, fail_setblocking: bool = False) -> None:
+            self.wrapped = wrapped
+            self.fail_setblocking = fail_setblocking
+
+        def fileno(self) -> int:
+            return self.wrapped.fileno()
+
+        def setblocking(self, _flag: bool) -> None:
+            if self.fail_setblocking:
+                raise OSError("wakeup setup failed")
+
+        def close(self) -> None:
+            self.wrapped.close()
+
+    wakeup = WakeupSocket(raw_wakeup, fail_setblocking=True)
+    writer = WakeupSocket(raw_writer)
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+    )
+
+    async def scenario() -> None:
+        # Patch after asyncio has made its own self-pipe sockets.
+        monkeypatch.setattr(ble_link_observability.socket, "socketpair", lambda: (wakeup, writer))
+        await observer.start()
+
+    asyncio.run(scenario())
+
+    assert fake.closed
+    assert fake.fileno() == -1
+    assert wakeup.fileno() == -1
+    assert writer.fileno() == -1
+    assert observer.observer_status == "degraded"
+
+
+def test_observer_unexpected_eof_degrades_and_finalizes_active_session_once() -> None:
+    class EOFSocket(_FakeSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receive_count = 0
+            self.feed(_connect())
+
+        def recv(self, size: int) -> bytes:
+            self.receive_count += 1
+            if self.receive_count == 2:
+                return b""
+            return super().recv(size)
+
+    fake = EOFSocket()
+    records: list[dict[str, object]] = []
+    terminal = threading.Event()
+
+    def record_terminal(record: dict[str, object]) -> None:
+        records.append(record)
+        terminal.set()
+
+    observer = BleLinkObserver(
+        "01:02:03:04:05:06",
+        socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
+        native_bind=lambda *_args: None,
+        terminal_callback=record_terminal,
+    )
+
+    async def scenario() -> None:
+        await observer.start()
+        assert await asyncio.to_thread(terminal.wait, 1.0)
+        assert observer.observer_status == "degraded"
+        await asyncio.wait_for(observer.close(), timeout=1.0)
+
+    asyncio.run(scenario())
+
+    assert len(records) == 1
+    assert records[0]["disconnect_reason_hex"] is None
+    assert records[0]["observer_status"] == "degraded"
+    assert len(fake.sent) == 2
+    assert fake.closed
 
 
 def test_close_observer_waits_for_cleanup_before_propagating_cancellation() -> None:

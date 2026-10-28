@@ -55,6 +55,15 @@ class DurableSqliteSeal:
     raw_sha256: str
 
 
+def _durable_prefix(source: CaptureSource) -> DurablePrefix:
+    return DurablePrefix(
+        source.sequence_start,
+        source.sequence_start + source.committed_count,
+        source.committed_count,
+        source.committed_sha256,
+    )
+
+
 class SqliteAttemptInspection:
     """Read-only startup view that never creates a persistent SQL writer."""
 
@@ -68,13 +77,7 @@ class SqliteAttemptInspection:
 
     @property
     def durable_prefix(self) -> DurablePrefix:
-        source = self._source
-        return DurablePrefix(
-            source.sequence_start,
-            source.sequence_start + source.committed_count,
-            source.committed_count,
-            source.committed_sha256,
-        )
+        return _durable_prefix(self._source)
 
     def recover(self) -> Recovery:
         source = self._source
@@ -126,13 +129,7 @@ class SqliteStagedAttempt:
 
     @property
     def durable_prefix(self) -> DurablePrefix:
-        source = self.source
-        return DurablePrefix(
-            source.sequence_start,
-            source.sequence_start + source.committed_count,
-            source.committed_count,
-            source.committed_sha256,
-        )
+        return _durable_prefix(self.source)
 
     def source_page(self, after_ordinal: int = -1, limit: int = 128) -> AudioSourcePage:
         """Read one bounded, short-lived page for the publication adapter."""

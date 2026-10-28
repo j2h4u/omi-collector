@@ -117,6 +117,7 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
                 connection.execute(
                     "SELECT source_id FROM capture_source "
                     "WHERE source_type = 'quarantine' AND COALESCE(quarantine_opaque, 0) = 0 "
+                    "AND COALESCE(quarantine_disposition, '') NOT IN ('published_prefix', 'unprocessable') "
                     "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " "
                     "ORDER BY source_id"
                 )
@@ -1061,9 +1062,14 @@ def _quarantine_state(filesystem: StagingFilesystem, source_id: str) -> Quaranti
             )
         if row is None or row[1] == 1:
             return QuarantineState.INVALID_EVIDENCE
-        if row[0] in {None, "unclassified"}:
+        disposition = row[0]
+        if disposition in {None, "unclassified"}:
             return QuarantineState.RETRYABLE
-        return QuarantineState.PUBLISHED if row[0] == "published_prefix" else QuarantineState.UNPROCESSABLE
+        if disposition == "published_prefix":
+            return QuarantineState.PUBLISHED
+        if disposition == "unprocessable":
+            return QuarantineState.UNPROCESSABLE
+        return QuarantineState.INVALID_EVIDENCE
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise_if_sqlite_storage_fault(error)
         return QuarantineState.INVALID_EVIDENCE

@@ -19,7 +19,7 @@ from hashlib import sha256
 from itertools import pairwise
 from math import ceil
 from pathlib import Path
-from typing import NoReturn, Protocol, TypeGuard, cast
+from typing import Literal, NoReturn, Protocol, TypeGuard, cast
 
 from ...config import ReadyConfig
 from ..application.storage_fault import TransientInternalAudioStorageError
@@ -481,7 +481,7 @@ def resume_retired_public_audio_v2(ready_root: Path, state_db: StateDB) -> None:
     entries = cast(dict[str, object], _read_ledger(state_db)["bundles"])
     for artifact_id, entry in entries.items():
         if isinstance(entry, dict) and entry.get("format") == "omi-audio-v2" and entry.get("state") == "retired":
-            _remove_retired_v2(ready_root / artifact_id)
+            _remove_v2_artifact(ready_root / artifact_id, "retired public audio v2 artifact")
 
 
 def retire_acknowledged_public_audio_v2(
@@ -512,7 +512,7 @@ def retire_acknowledged_public_audio_v2(
             continue
         entry = _record_v2_retirement(state_db, artifact_id, entry)
         path = ready_root / artifact_id
-        _remove_retired_v2(path)
+        _remove_v2_artifact(path, "retired public audio v2 artifact")
         retired.append(
             ReadyBundleResult(
                 artifact_id,
@@ -602,17 +602,22 @@ def _record_v2_retirement(state_db: StateDB, artifact_id: str, entry: dict[str, 
     return updated
 
 
-def _remove_retired_v2(path: Path) -> None:
+def _remove_v2_artifact(
+    path: Path,
+    label: Literal["retired public audio v2 artifact", "v2 ready stage"],
+) -> None:
     if not os.path.lexists(path):
         return
     if path.is_symlink() or not path.is_dir():
-        raise ReadyBundleError("retired public audio v2 artifact is unsafe")
+        raise ReadyBundleError(f"{label} is unsafe")
     entries = {item.name: item for item in path.iterdir()}
     if not set(entries).issubset({_V2_AUDIO_NAME, _MANIFEST_NAME}):
-        raise ReadyBundleError("retired public audio v2 artifact inventory is invalid")
+        detail = "inventory is invalid" if label == "retired public audio v2 artifact" else "contains an unsafe entry"
+        raise ReadyBundleError(f"{label} {detail}")
     for item in entries.values():
         if item.is_symlink() or not item.is_file():
-            raise ReadyBundleError("retired public audio v2 artifact is unsafe")
+            detail = "is unsafe" if label == "retired public audio v2 artifact" else "contains an unsafe entry"
+            raise ReadyBundleError(f"{label} {detail}")
         item.unlink()
     path.rmdir()
     _sync_directory(path.parent)
@@ -1708,15 +1713,29 @@ def _typed_full_ready_proofs(
     if retired is not None:
         return (retired,)
     _typed_reject_partial_retired_overlap(admission, custody)
-    cursor = admission.snapshot.sequence_start
-    end = cursor + admission.admitted_count
+    start = admission.snapshot.sequence_start
+    end = start + admission.admitted_count
+    cursor, proofs = _typed_ready_traversal(admission, custody, page_limit, start_cursor=start)
+    return proofs if cursor == end else None
+
+
+def _typed_ready_traversal(
+    admission: _TypedAdmission,
+    custody: _TypedReadyCustody,
+    page_limit: int,
+    *,
+    start_cursor: int,
+) -> tuple[int, tuple[tuple[str, dict[str, object]], ...]]:
+    """Prove the contiguous active-custody prefix beginning at an absolute sequence cursor."""
+    cursor = start_cursor
+    end = admission.snapshot.sequence_start + admission.admitted_count
     proofs: list[tuple[str, dict[str, object]]] = []
     for source in custody.active:
         for run_start, run_end, ready_offset in _typed_active_segments(source):
             if run_end <= cursor:
                 continue
             if run_start > cursor:
-                return None
+                return cursor, tuple(proofs)
             overlap_end = min(run_end, end)
             _typed_ready_overlap(
                 admission,
@@ -1729,8 +1748,8 @@ def _typed_full_ready_proofs(
                 proofs.append(proof)
             cursor = overlap_end
             if cursor == end:
-                return tuple(proofs)
-    return None
+                return cursor, tuple(proofs)
+    return cursor, tuple(proofs)
 
 
 def _typed_ready_prefix(
@@ -1742,31 +1761,13 @@ def _typed_ready_prefix(
     if retired is not None:
         return admission.admitted_count, (retired,)
     _typed_reject_partial_retired_overlap(admission, custody)
-    cursor = admission.snapshot.sequence_start + admission.cursor
-    end = admission.snapshot.sequence_start + admission.admitted_count
-    proofs: list[tuple[str, dict[str, object]]] = []
-    for source in custody.active:
-        for run_start, run_end, ready_offset in _typed_active_segments(source):
-            if run_end <= cursor:
-                continue
-            if run_start > cursor:
-                return cursor - admission.snapshot.sequence_start, tuple(proofs)
-            overlap_end = min(run_end, end)
-            _typed_ready_overlap(
-                admission,
-                custody,
-                _ReadyOverlap(source, (cursor, overlap_end), ready_offset + cursor - run_start),
-                page_limit,
-            )
-            proof = (source.result.bundle_id, custody.entries[source.result.bundle_id])
-            if not proofs or proofs[-1][0] != proof[0]:
-                proofs.append(proof)
-            cursor = overlap_end
-            if cursor == end:
-                break
-        if cursor == end:
-            break
-    return cursor - admission.snapshot.sequence_start, tuple(proofs)
+    cursor, proofs = _typed_ready_traversal(
+        admission,
+        custody,
+        page_limit,
+        start_cursor=admission.snapshot.sequence_start + admission.cursor,
+    )
+    return cursor - admission.snapshot.sequence_start, proofs
 
 
 def _require_typed_snapshot(current: CaptureSource, admission: _TypedAdmission) -> None:
@@ -3147,13 +3148,13 @@ def _materialize_v2_stage(stage: _V2Stage, page_limit: int) -> ReadyBundleResult
     destination = stage.path.parent / stage.artifact_id
     if os.path.lexists(destination):
         _require_v2_destination(destination, stage)
-        _discard_v2_stage(stage.path)
+        _remove_v2_artifact(stage.path, "v2 ready stage")
     else:
         if os.path.lexists(stage.path):
             try:
                 _require_v2_destination(stage.path, stage, require_name=False)
             except ReadyBundleError:
-                _discard_v2_stage(stage.path)
+                _remove_v2_artifact(stage.path, "v2 ready stage")
         if not os.path.lexists(stage.path):
             _write_v2_stage(stage, page_limit)
         _require_v2_destination(stage.path, stage, require_name=False)
@@ -3161,7 +3162,7 @@ def _materialize_v2_stage(stage: _V2Stage, page_limit: int) -> ReadyBundleResult
             stage.path.rename(destination)
         except FileExistsError:
             _require_v2_destination(destination, stage)
-            _discard_v2_stage(stage.path)
+            _remove_v2_artifact(stage.path, "v2 ready stage")
         _sync_directory(destination.parent)
     _require_v2_destination(destination, stage)
     return ReadyBundleResult(
@@ -3284,22 +3285,6 @@ def _require_v2_destination(path: Path, stage: _V2Stage, *, require_name: bool =
     _require_v2_operator_access(path)
     if _digest(audio_path) != stage.group.audio.sha256 or _digest(manifest_path) != stage.manifest_sha256:
         raise ReadyBundleError("v2 ready artifact changed")
-
-
-def _discard_v2_stage(path: Path) -> None:
-    if not os.path.lexists(path):
-        return
-    if path.is_symlink() or not path.is_dir():
-        raise ReadyBundleError("v2 ready stage is unsafe")
-    entries = {item.name: item for item in path.iterdir()}
-    if not set(entries) <= {_V2_AUDIO_NAME, _MANIFEST_NAME}:
-        raise ReadyBundleError("v2 ready stage contains an unsafe entry")
-    for item in entries.values():
-        if item.is_symlink() or not item.is_file():
-            raise ReadyBundleError("v2 ready stage contains an unsafe entry")
-        item.unlink()
-    path.rmdir()
-    _sync_directory(path.parent)
 
 
 def _v2_stage_records_sha256(stage: _V2Stage, page_limit: int) -> str:
@@ -3967,13 +3952,17 @@ def _load_active_for_reconciliation(audio_store: InternalAudioStore) -> _TypedCo
 
 
 def _same_typed_cohort(left: _TypedCohort, right: _TypedCohort) -> bool:
+    return _typed_cohort_identity(left) == _typed_cohort_identity(right)
+
+
+def _typed_cohort_identity(cohort: _TypedCohort) -> tuple[object, ...]:
     return (
-        left.cohort_id,
-        left.lifecycle,
-        left.threshold,
-        left.frontier,
-        left.cursor,
-        left.config_digest,
+        cohort.cohort_id,
+        cohort.lifecycle,
+        cohort.threshold,
+        cohort.frontier,
+        cohort.cursor,
+        cohort.config_digest,
         tuple(
             (
                 item.snapshot.source_id,
@@ -3983,25 +3972,7 @@ def _same_typed_cohort(left: _TypedCohort, right: _TypedCohort) -> bool:
                 item.cursor,
                 item.member_ordinal,
             )
-            for item in left.admissions
-        ),
-    ) == (
-        right.cohort_id,
-        right.lifecycle,
-        right.threshold,
-        right.frontier,
-        right.cursor,
-        right.config_digest,
-        tuple(
-            (
-                item.snapshot.source_id,
-                item.admitted_lifecycle,
-                item.admitted_count,
-                item.admitted_sha256,
-                item.cursor,
-                item.member_ordinal,
-            )
-            for item in right.admissions
+            for item in cohort.admissions
         ),
     )
 

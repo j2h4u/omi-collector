@@ -14,17 +14,20 @@ on:
         required: false
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
-  dependency-review:
+  submit-dependency-graphs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout base revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.base-ref || github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: dependency-source
+          persist-credentials: false
 
       - name: Checkout uv dependency submitter
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,19 +46,36 @@ jobs:
         env:
           BASE_REF: refs/heads/${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
-        run: GITHUB_SHA="$(git rev-parse HEAD)" GITHUB_REF="${BASE_REF}" python .dependency-submission/action.py
+        working-directory: dependency-source
+        run: GITHUB_SHA="$(git rev-parse HEAD)" GITHUB_REF="${BASE_REF}" python "$GITHUB_WORKSPACE/.dependency-submission/action.py"
 
       - name: Checkout head revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          clean: false
           ref: ${{ inputs.head-ref || github.event.pull_request.head.sha || github.sha }}
+          path: dependency-source
+          persist-credentials: false
 
       - name: Submit head uv.lock dependency graph
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.event.pull_request.head.ref && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
-        run: GITHUB_SHA="$(git rev-parse HEAD)" GITHUB_REF="${HEAD_REF}" python .dependency-submission/action.py
+        working-directory: dependency-source
+        run: GITHUB_SHA="$(git rev-parse HEAD)" GITHUB_REF="${HEAD_REF}" python "$GITHUB_WORKSPACE/.dependency-submission/action.py"
+
+  dependency-review:
+    needs: submit-dependency-graphs
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Require successful dependency graph submission
+        if: needs.submit-dependency-graphs.result != 'success'
+        run: |
+          echo "::error::dependency graph submission did not succeed"
+          exit 1
 
       - name: Dependency review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0

@@ -41,6 +41,26 @@ actionlint:
 supply-chain-pins:
     uv run python scripts/check_supply_chain_pins.py
 
+# Keep inline suppression counts within their initial historical ceilings.
+suppression-budget:
+    uv run python scripts/check_suppression_budget.py
+
+# Scan production Python and scripts for source clones under the reviewed policy.
+clone-check:
+    uv run --locked python -m scripts.check_clones
+
+# Audit locked registry dependencies; the exact pinned fork is checked by the source guard.
+deps-audit: supply-chain-pins
+    #!/usr/bin/env bash
+    set -euo pipefail
+    requirements="$(mktemp)"
+    trap 'rm -f "$requirements"' EXIT
+    uv export --locked --all-groups \
+        --no-emit-project --no-emit-workspace --no-emit-local \
+        --no-emit-package pytest-gremlins \
+        --no-header --no-annotate --no-editable > "$requirements"
+    uv run pip-audit -r "$requirements" --strict --no-deps --disable-pip
+
 # Check declared Python dependencies against imports.
 deptry:
     uv run deptry src scripts tests --per-rule-ignores DEP004=radon
@@ -67,7 +87,7 @@ fix:
     uv run ruff format --no-preview src scripts tests
 
 # Static quality gate.
-check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck typecheck-tests import-contracts actionlint supply-chain-pins deptry compile dead-code package-smoke
+check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck typecheck-tests import-contracts actionlint supply-chain-pins suppression-budget clone-check deptry compile dead-code package-smoke
 
 # Unit tests.
 unit:
@@ -210,8 +230,8 @@ runtime-smoke: docker-build
         exit 1
     fi
 
-# Full local gate for agents before claiming completion.
-verify: check crap-check runtime-smoke
+# Full local gate: static checks, full-suite CRAP, locked dependency audit, and Docker runtime smoke.
+verify: check crap-check deps-audit runtime-smoke
 
 # Everything the PR and release metadata owe release-please before CI has to say no.
 release-check title="" body="":

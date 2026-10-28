@@ -133,12 +133,7 @@ class ScanDiagnostics:
             self._capture_state = "unavailable"
             sock, self._socket = self._socket, None
             loop, self._loop = self._loop, None
-            if sock is not None:
-                if loop is not None:
-                    with suppress(Exception):
-                        loop.remove_reader(sock.fileno())
-                with suppress(OSError):
-                    sock.close()
+            self._close_capture_socket(sock, loop)
 
     @property
     def generation(self) -> int:
@@ -153,14 +148,19 @@ class ScanDiagnostics:
         self._capture_state = "stopped"
         sock, self._socket = self._socket, None
         loop, self._loop = self._loop, None
-        if sock is not None:
-            if loop is not None:
-                with suppress(Exception):
-                    loop.remove_reader(sock.fileno())
-            with suppress(OSError):
-                sock.close()
+        self._close_capture_socket(sock, loop)
         if self._status == "available":
             self._status = "stopped"
+
+    @staticmethod
+    def _close_capture_socket(sock: _HciSocket | None, loop: asyncio.AbstractEventLoop | None) -> None:
+        if sock is None:
+            return
+        if loop is not None:
+            with suppress(Exception):
+                loop.remove_reader(sock.fileno())
+        with suppress(OSError):
+            sock.close()
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -273,11 +273,7 @@ class ScanDiagnostics:
             if self._socket is sock:
                 self._socket = None
             loop, self._loop = self._loop, None
-            if loop is not None:
-                with suppress(Exception):
-                    loop.remove_reader(sock.fileno())
-            with suppress(OSError):
-                sock.close()
+            self._close_capture_socket(sock, loop)
 
     def _observe(self, packet: bytes) -> None:
         if (

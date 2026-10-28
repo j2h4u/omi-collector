@@ -210,6 +210,8 @@ def make_presence_scheduler(
             arrival_max_gap_seconds=config.presence.arrival_max_gap_seconds,
             rapid_backoff=config.retry.rapid_backoff,
             scan_transition_seconds=config.presence.scan_transition_seconds,
+            scan_active_seconds=config.presence.scan_active_seconds,
+            scan_pause_seconds=config.presence.scan_pause_seconds,
             scan_cancel_grace_min_seconds=config.presence.scan_cancel_grace_min_seconds,
             scan_cancel_grace_max_seconds=config.presence.scan_cancel_grace_max_seconds,
             scan_cancel_grace_fraction=config.presence.scan_cancel_grace_fraction,

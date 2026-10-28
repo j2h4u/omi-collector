@@ -1058,9 +1058,10 @@ async def test_empty_batch_reconciler_keeps_info_for_final_battery_observation(
         operational=lambda event: observations.append(dict(event)),
         config=config,
     )
+    # The 50 ms presence budget is asserted below; this outer timeout only guards against a hang.
     result = await asyncio.wait_for(
         run_opportunistic_collector(Provider([session]), _staging_store(tmp_path, _capture_root(tmp_path)), options),
-        timeout=2.0,
+        timeout=30.0,
     )
 
     assert isinstance(result, NoDataResult)

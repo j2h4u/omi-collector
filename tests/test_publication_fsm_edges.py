@@ -140,6 +140,70 @@ def test_inflight_source_change_cannot_settle_the_old_revision(tmp_path: Path, m
     assert len(tuple((tmp_path / "ready").iterdir())) == 1
 
 
+def test_changed_blocked_revisions_use_one_publication_dispatch_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    calls = [0]
+    publications = [0]
+    held_lease: list[DeviceLock] = []
+
+    def blocked_until_inventory_exhausted() -> ReadyOutcome:
+        held_lease[0].require_active()
+        publications[0] += 1
+        if calls[0] < 1_200:
+            calls[0] += 1
+            return ReadyOutcome(
+                ReadyOutcomeState.BLOCKED,
+                reason="controlled_custody_conflict",
+                remaining_at_frontier=True,
+            )
+        return ReadyOutcome(ReadyOutcomeState.WAITING, reason="controlled_inventory_exhausted")
+
+    monkeypatch.setattr(store, "_publication_revision", lambda: calls[0])
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", blocked_until_inventory_exhausted)
+
+    with store.device_lock(operation="publication_dispatch_regression") as lease:
+        held_lease.append(lease)
+        outcome = store.publish_ready(lease)
+
+    assert calls[0] == 1_200
+    assert publications[0] == 1_201
+    assert outcome.state is ReadyOutcomeState.WAITING
+    assert outcome.reason == "controlled_inventory_exhausted"
+
+
+def test_published_outcome_survives_blocked_followup_ending_in_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    published = ReadyOutcome(ReadyOutcomeState.PUBLISHED, reason="first_publication")
+    effects = iter((published, ReadyOutcome(ReadyOutcomeState.BLOCKED, reason="changed_input")))
+    revisions = iter((0, 1, 1, 2, 2))
+    revision_reads = [0]
+    held_lease: list[DeviceLock] = []
+
+    def changing_revision() -> int:
+        revision_reads[0] += 1
+        if revision_reads[0] == 5:
+            store.publication_capture_begin()
+        return next(revisions)
+
+    def publication_effect() -> ReadyOutcome:
+        held_lease[0].require_active()
+        return next(effects)
+
+    monkeypatch.setattr(store, "_publication_revision", changing_revision)
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", publication_effect)
+
+    with store.device_lock(operation="publication_result_regression") as lease:
+        held_lease.append(lease)
+        outcome = store.publish_ready(lease)
+
+    assert revision_reads[0] == 5
+    assert outcome is published
+
+
 def test_repeated_retry_wakes_keep_the_absolute_deadline_and_one_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

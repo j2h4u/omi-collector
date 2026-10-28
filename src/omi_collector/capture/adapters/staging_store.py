@@ -237,41 +237,55 @@ class StagingStore:
             return state.work.outcome
         return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_active")
 
+    def _check_publication_input(self) -> ReadyOutcome | PublicationCommand:
+        probe_error: OSError | TransientInternalAudioStorageError | None = None
+        try:
+            revision: object = self._publication_revision()
+        except (OSError, TransientInternalAudioStorageError) as error:
+            _debug_publication_failure(error, phase="input_revision")
+            revision = _UNKNOWN_REVISION
+            probe_error = error
+        command = self._publication_event(Wake(revision, monotonic()))
+        if probe_error is not None and command.action is PublicationAction.RUN:
+            return self._finish_publication(
+                command,
+                revision,
+                ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(probe_error)),
+            )
+        return command
+
     def _execute_publication_command(
         self,
         command: PublicationCommand,
         held_lease: DeviceLock | None,
         should_defer: Callable[[], bool] = _never_defer,
     ) -> ReadyOutcome:
-        while command.action is PublicationAction.CHECK_INPUT:
-            probe_error: OSError | TransientInternalAudioStorageError | None = None
-            try:
-                revision: object = self._publication_revision()
-            except (OSError, TransientInternalAudioStorageError) as error:
-                _debug_publication_failure(error, phase="input_revision")
-                revision = _UNKNOWN_REVISION
-                probe_error = error
-            command = self._publication_event(Wake(revision, monotonic()))
-            if probe_error is not None and command.action is PublicationAction.RUN:
-                return self._finish_publication(
-                    command,
-                    revision,
-                    ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(probe_error)),
-                )
-        if command.action is PublicationAction.RUN:
-            assert command.token is not None
-            outcome, revision = self._run_publication_effect(command.token, held_lease)
-            return self._finish_publication(command, revision, outcome, held_lease)
-        if command.action is PublicationAction.COMPACT:
-            return self._run_compaction(command, held_lease, should_defer)
-        return self._publication_outcome(command)
+        latest_published: ReadyOutcome | None = None
+        result: ReadyOutcome | PublicationCommand = command
+        while isinstance(result, PublicationCommand):
+            command = result
+            if command.action is PublicationAction.CHECK_INPUT:
+                result = self._check_publication_input()
+            elif command.action is PublicationAction.RUN:
+                assert command.token is not None
+                outcome, revision = self._run_publication_effect(command.token, held_lease)
+                if outcome.state is ReadyOutcomeState.PUBLISHED:
+                    latest_published = outcome
+                result = self._finish_publication(command, revision, outcome)
+            elif command.action is PublicationAction.COMPACT:
+                result = self._run_compaction(command, held_lease, should_defer)
+            else:
+                result = self._publication_outcome(command)
+        if result.state is ReadyOutcomeState.WAITING and latest_published is not None:
+            return latest_published
+        return result
 
     def _run_compaction(
         self,
         command: PublicationCommand,
         held_lease: DeviceLock | None,
         should_defer: Callable[[], bool],
-    ) -> ReadyOutcome:
+    ) -> ReadyOutcome | PublicationCommand:
         assert command.token is not None
         with self._publication_lock:
             work = self._publication_state.work
@@ -320,7 +334,7 @@ class StagingStore:
         if next_command.action is PublicationAction.ARM:
             return self._publication_outcome(next_command)
         if next_command.action is PublicationAction.CHECK_INPUT:
-            return self._execute_publication_command(next_command, held_lease, should_defer)
+            return next_command
         return outcome
 
     def _run_publication_effect(self, token: int, held_lease: DeviceLock | None) -> tuple[ReadyOutcome, object]:
@@ -380,8 +394,7 @@ class StagingStore:
         command: PublicationCommand,
         revision: object,
         outcome: ReadyOutcome,
-        held_lease: DeviceLock | None = None,
-    ) -> ReadyOutcome:
+    ) -> ReadyOutcome | PublicationCommand:
         assert command.token is not None
         result = (
             PublicationResult.TRANSIENT if outcome.state is ReadyOutcomeState.TRANSIENT else PublicationResult.SETTLED
@@ -390,10 +403,7 @@ class StagingStore:
             Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff)
         )
         if next_command.action is PublicationAction.CHECK_INPUT:
-            checked = self._execute_publication_command(next_command, held_lease)
-            if outcome.state is ReadyOutcomeState.PUBLISHED and checked.state is ReadyOutcomeState.WAITING:
-                return outcome
-            return checked
+            return next_command
         if next_command.action is PublicationAction.ARM:
             return self._publication_outcome(next_command)
         return outcome

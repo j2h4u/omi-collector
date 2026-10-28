@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn, cast
@@ -37,6 +38,13 @@ class _FakeBus:
 
 class _FakeHciWorker:
     adapter = "hci0"
+    generation = 1
+
+    def __init__(self) -> None:
+        self.healthy_generations: list[int] = []
+        self.probe_generations: list[int] = []
+        self.ended_generations: list[int] = []
+        self.snapshot_generations: list[int] = []
 
     async def start(self) -> None:
         return None
@@ -44,7 +52,18 @@ class _FakeHciWorker:
     async def stop(self) -> None:
         return None
 
+    def healthy(self, generation: int) -> None:
+        self.healthy_generations.append(generation)
+
+    async def probe(self, generation: int) -> bool:
+        self.probe_generations.append(generation)
+        return True
+
+    def end_probe(self, generation: int) -> None:
+        self.ended_generations.append(generation)
+
     def snapshot(self) -> dict[str, object]:
+        self.snapshot_generations.append(self.generation)
         return {"status": "available", "counts": {"legacy_advertising": 3}}
 
 
@@ -57,6 +76,9 @@ class _Diagnostics:
         self.snapshots += 1
         return {"generation": generation, "hci": {"status": "degraded"}}
 
+    def healthy(self, _generation: int) -> None:
+        return None
+
 
 def _context(generation: int) -> ScanIncidentContext:
     return ScanIncidentContext(
@@ -67,6 +89,12 @@ def _context(generation: int) -> ScanIncidentContext:
         last_callback_age_seconds=None,
         threshold_seconds=180.0,
     )
+
+
+async def _wait_for_hci_probe(worker: HciScanDiagnostics) -> None:
+    async with asyncio.timeout(1.0):
+        while worker._probe_count == 0:
+            await asyncio.sleep(0)
 
 
 def test_incident_is_snapshotted_before_write_and_survives_reopen(tmp_path: Path) -> None:
@@ -169,11 +197,13 @@ def test_facade_reads_selected_bluez_adapter_and_scopes_device_count(monkeypatch
     }
     bus = _FakeBus(SimpleNamespace(message_type=SimpleNamespace(name="METHOD_RETURN"), body=[objects]))
     monkeypatch.setattr(store_module, "MessageBus", lambda **_kwargs: bus)
-    facade = store_module.ScanDiagnosticsFacade("hci0", worker=cast(HciScanDiagnostics, _FakeHciWorker()))
+    worker = _FakeHciWorker()
+    facade = store_module.ScanDiagnosticsFacade("hci0", worker=cast(HciScanDiagnostics, worker))
 
     async def run() -> dict[str, object]:
-        await facade.prepare(4)
-        return await facade.snapshot(4)
+        await facade.prepare(0)
+        facade.healthy(0)
+        return await facade.snapshot(0)
 
     result = asyncio.run(run())
 
@@ -185,6 +215,152 @@ def test_facade_reads_selected_bluez_adapter_and_scopes_device_count(monkeypatch
         "failure": None,
     }
     assert bus.disconnected
+    assert worker.healthy_generations == [1]
+    assert worker.probe_generations == worker.ended_generations == [1]
+
+
+def test_facade_close_wakes_probe_and_cancel_releases_probe_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BlockingWorker(_FakeHciWorker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generation = 0
+            self.probe_started: dict[int, asyncio.Event] = {}
+            self.probe_released: dict[int, asyncio.Event] = {}
+            self.active_probes = 0
+
+        async def start(self) -> None:
+            self.generation += 1
+
+        async def stop(self) -> None:
+            old_generation = self.generation
+            self.generation += 1
+            self.active_probes = 0
+            self.probe_released.setdefault(old_generation, asyncio.Event()).set()
+
+        async def probe(self, generation: int) -> bool:
+            self.probe_generations.append(generation)
+            self.active_probes += 1
+            self.probe_started.setdefault(generation, asyncio.Event()).set()
+            await self.probe_released.setdefault(generation, asyncio.Event()).wait()
+            return generation == self.generation
+
+        def end_probe(self, generation: int) -> None:
+            if generation == self.generation:
+                self.active_probes -= 1
+            self.ended_generations.append(generation)
+
+    async def bluez(_adapter: str) -> dict[str, object]:
+        return store_module._unavailable()
+
+    monkeypatch.setattr(store_module, "_bluez_snapshot", bluez)
+    worker = BlockingWorker()
+    facade = store_module.ScanDiagnosticsFacade("hci0", worker=cast(HciScanDiagnostics, worker))
+
+    async def run() -> None:
+        await facade.prepare(0)
+        snapshot = asyncio.create_task(facade.snapshot(0))
+        await worker.probe_started.setdefault(1, asyncio.Event()).wait()
+        await facade.close(0)
+        await facade.prepare(1)
+        new_snapshot = asyncio.create_task(facade.snapshot(1))
+        await worker.probe_started.setdefault(3, asyncio.Event()).wait()
+        result = await snapshot
+        assert result["hci"]["failure"] == "generation_unavailable"  # type: ignore[index]
+        assert result["bluez"]["available"] is False  # type: ignore[index]
+        assert worker.ended_generations == [1]
+        assert worker.snapshot_generations == []
+        assert worker.active_probes == 1
+
+        worker.probe_released[3].set()
+        await new_snapshot
+        assert worker.active_probes == 0
+        await facade.close(1)
+
+        await facade.prepare(3)
+        cancelled = asyncio.create_task(facade.snapshot(3))
+        await worker.probe_started.setdefault(5, asyncio.Event()).wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert worker.ended_generations == [1, 3, 5]
+        assert worker.active_probes == 0
+        await facade.close(3)
+
+    asyncio.run(run())
+
+
+def test_real_facade_replaces_worker_epoch_on_new_generation_without_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RawSocket:
+        def __init__(self) -> None:
+            self.read_fd, self.write_fd = os.pipe()
+            os.set_blocking(self.read_fd, False)
+            self.filter = bytes(16)
+            self.closed = False
+
+        def fileno(self) -> int:
+            return self.read_fd
+
+        def setblocking(self, flag: bool) -> None:
+            assert flag is False
+
+        def setsockopt(self, _level: int, _option: int, value: bytes) -> None:
+            self.filter = value
+
+        def getsockopt(self, _level: int, _option: int, _size: int) -> bytes:
+            return self.filter
+
+        def recv(self, _size: int) -> bytes:
+            raise BlockingIOError
+
+        def close(self) -> None:
+            self.closed = True
+            os.close(self.read_fd)
+            os.close(self.write_fd)
+
+    async def bluez(_adapter: str) -> dict[str, object]:
+        bluez_calls.append(True)
+        return store_module._unavailable()
+
+    sockets = [RawSocket(), RawSocket()]
+    bluez_calls: list[bool] = []
+    worker = HciScanDiagnostics(
+        "hci0",
+        socket_factory=lambda *_args: sockets.pop(0),
+        native_bind=lambda *_args: None,
+    )
+    facade = store_module.ScanDiagnosticsFacade("hci0", worker=worker)
+    monkeypatch.setattr(store_module, "_bluez_snapshot", bluez)
+    monkeypatch.setattr("omi_collector.capture.adapters.ble_scan_diagnostics._PROBE_SECONDS", 10.0)
+
+    async def run() -> None:
+        await facade.prepare(0)
+        old_epoch = worker.generation
+        old_snapshot = asyncio.create_task(facade.snapshot(0))
+        await _wait_for_hci_probe(worker)
+
+        facade.healthy(0)
+        await facade.prepare(1)
+        new_epoch = worker.generation
+        assert new_epoch != old_epoch
+        new_snapshot = asyncio.create_task(facade.snapshot(1))
+        await _wait_for_hci_probe(worker)
+        await facade.prepare(1)
+        assert worker.generation == new_epoch
+
+        stale = await old_snapshot
+        assert stale["hci"]["failure"] == "generation_unavailable"  # type: ignore[index]
+        assert bluez_calls == []
+        assert worker._probe_count == 1
+        assert worker.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+        new_snapshot.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await new_snapshot
+        assert worker._probe_count == 0
+        await facade.close(1)
+
+    asyncio.run(run())
 
 
 def test_bluez_dbus_error_is_an_explicit_unavailable_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:

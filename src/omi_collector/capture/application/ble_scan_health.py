@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
 from typing import Literal, Protocol
@@ -40,6 +41,8 @@ class ScanDiagnostics(Protocol):
     async def close(self, generation: int) -> None: ...
 
     async def snapshot(self, generation: int) -> dict[str, object]: ...
+
+    def healthy(self, generation: int) -> None: ...
 
 
 class ScanIncidentSink(Protocol):
@@ -173,6 +176,8 @@ class ScanHealthMonitor:
             return False
         self._callback_count += 1
         self._last_callback_at = at
+        with suppress(Exception):
+            self._diagnostics.healthy(generation)
         if self._incident_active or self._incident_state_unknown or self._open_context is not None:
             if self._resolution_pending:
                 return False

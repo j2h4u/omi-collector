@@ -146,24 +146,47 @@ class ScanDiagnosticsFacade:
     def __init__(self, adapter: str, *, worker: HciScanDiagnostics | None = None) -> None:
         self._worker = worker or HciScanDiagnostics(adapter)
         self._generation: int | None = None
+        self._worker_generation: int | None = None
 
     async def prepare(self, generation: int) -> None:
+        if self._generation is not None and self._generation != generation:
+            self._generation = None
+            self._worker_generation = None
+            await self._worker.stop()
         self._generation = generation
         await self._worker.start()
+        self._worker_generation = self._worker.generation
 
     async def close(self, generation: int) -> None:
         if self._generation != generation:
             return
-        await self._worker.stop()
         self._generation = None
+        self._worker_generation = None
+        await self._worker.stop()
+
+    def healthy(self, generation: int) -> None:
+        if self._generation == generation:
+            worker_generation = self._worker_generation
+            if worker_generation is not None:
+                self._worker.healthy(worker_generation)
 
     async def snapshot(self, generation: int) -> dict[str, object]:
         if self._generation != generation:
             return {"hci": {"available": False, "failure": "generation_unavailable"}, "bluez": _unavailable()}
+        worker_generation = self._worker_generation
+        if worker_generation is None:
+            return {"hci": {"available": False, "failure": "generation_unavailable"}, "bluez": _unavailable()}
         try:
+            available = await self._worker.probe(worker_generation)
+            if self._generation != generation or self._worker.generation != worker_generation:
+                return {"hci": {"available": False, "failure": "generation_unavailable"}, "bluez": _unavailable()}
             hci = self._worker.snapshot()
+            if not available:
+                hci.update({"available": False, "radio_evidence_available": False})
         except Exception as error:  # noqa: BLE001 - diagnostic availability cannot affect collection
             hci = {"available": False, "status": "degraded", "failure": type(error).__name__}
+        finally:
+            self._worker.end_probe(worker_generation)
         try:
             bluez = await asyncio.wait_for(_bluez_snapshot(self._worker.adapter), timeout=10.0)
         except TimeoutError:
@@ -172,6 +195,8 @@ class ScanDiagnosticsFacade:
             raise
         except Exception as error:  # noqa: BLE001 - diagnostic availability cannot affect collection
             bluez = _unavailable(type(error).__name__)
+        if self._generation != generation:
+            return {"hci": {"available": False, "failure": "generation_unavailable"}, "bluez": _unavailable()}
         return {"hci": hci, "bluez": bluez}
 
 

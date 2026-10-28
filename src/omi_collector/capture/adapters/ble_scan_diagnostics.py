@@ -31,6 +31,7 @@ _EXTENDED_REPORT_HEADER_BYTES = 24
 _COMMAND_STATUS_BYTES = 4
 _SCAN_OPCODES = {0x200B, 0x200C, 0x2041, 0x2042}
 _MAX_DRAIN_PACKETS = 128
+_PROBE_SECONDS = 3.0
 
 
 class _HciSocket(Protocol):
@@ -47,9 +48,9 @@ class _HciSocket(Protocol):
     def close(self) -> None: ...
 
 
-def _hci_scan_filter() -> bytes:
+def _hci_scan_filter(*, include_le_meta: bool) -> bytes:
     event_mask_low = (1 << _COMMAND_COMPLETE) | (1 << _COMMAND_STATUS) | (1 << _HARDWARE_ERROR)
-    event_mask_high = 1 << (_LE_META - 32)
+    event_mask_high = (1 << (_LE_META - 32)) if include_le_meta else 0
     return struct.pack("<IIIH2x", 1 << _HCI_EVENT_PACKET, event_mask_low, event_mask_high, 0)
 
 
@@ -90,6 +91,10 @@ class ScanDiagnostics:
         self._status = "not_started"
         self._failure: str | None = None
         self._filter_readback: dict[str, object] = {"available": False, "le_meta_enabled": None}
+        self._capture_state = "unavailable"
+        self._quiet_attempted = False
+        self._probe_count = 0
+        self._probe_wakeup: asyncio.Event | None = None
 
     async def start(self) -> None:
         if self._socket is not None:
@@ -103,7 +108,7 @@ class ScanDiagnostics:
             try:
                 self._native_bind(sock.fileno(), _AF_BLUETOOTH, _hci_adapter_index(self.adapter), _HCI_CHANNEL_RAW)
                 sock.setblocking(False)
-                sock.setsockopt(0, _HCI_FILTER, _hci_scan_filter())
+                sock.setsockopt(0, _HCI_FILTER, _hci_scan_filter(include_le_meta=True))
                 self._filter_readback = self._read_filter(sock)
             except BaseException:
                 with suppress(BaseException):
@@ -114,6 +119,10 @@ class ScanDiagnostics:
             self._status = "available"
             loop = asyncio.get_running_loop()
             self._loop = loop
+            self._probe_wakeup = asyncio.Event()
+            self._quiet_attempted = False
+            self._probe_count = 0
+            self._capture_state = "full" if self._filter_readback.get("le_meta_enabled") else "unavailable"
             generation = self._generation
             loop.add_reader(sock.fileno(), self._read_events, generation, sock)
         except asyncio.CancelledError:
@@ -121,6 +130,7 @@ class ScanDiagnostics:
         except Exception as error:  # noqa: BLE001 - diagnostic access must never interrupt collection
             self._status = "degraded"
             self._failure = self._failure_name(error)
+            self._capture_state = "unavailable"
             sock, self._socket = self._socket, None
             loop, self._loop = self._loop, None
             if sock is not None:
@@ -130,8 +140,17 @@ class ScanDiagnostics:
                 with suppress(OSError):
                     sock.close()
 
+    @property
+    def generation(self) -> int:
+        return self._generation
+
     async def stop(self) -> None:
         self._generation += 1
+        if self._probe_wakeup is not None:
+            self._probe_wakeup.set()
+        self._probe_wakeup = None
+        self._probe_count = 0
+        self._capture_state = "stopped"
         sock, self._socket = self._socket, None
         loop, self._loop = self._loop, None
         if sock is not None:
@@ -151,10 +170,89 @@ class ScanDiagnostics:
             "started_monotonic": self._started_monotonic,
             "failure": self._failure,
             "filter": dict(self._filter_readback),
+            "capture": {"mode": self._capture_mode, "counts_scope": "advertising_capture_windows"},
             "counts": dict(self._counts),
             "last_monotonic": dict(self._last),
             "scan_commands": {f"0x{opcode:04x}": dict(value) for opcode, value in self._command_status.items()},
         }
+
+    @property
+    def _capture_mode(self) -> str:
+        return "full" if self._capture_state in ("probing", "probe_recovered") else self._capture_state
+
+    def healthy(self, generation: int) -> None:
+        """Narrow raw capture once after a valid current-generation callback."""
+        if generation != self._generation or self._socket is None:
+            return
+        if self._probe_count:
+            self._capture_state = "probe_recovered"
+            self._quiet_attempted = True
+            return
+        if self._quiet_attempted:
+            return
+        self._quiet_attempted = True
+        self._narrow_filter()
+
+    def _narrow_filter(self) -> None:
+        if self._socket is None or self._capture_state == "unavailable":
+            return
+        try:
+            self._socket.setsockopt(0, _HCI_FILTER, _hci_scan_filter(include_le_meta=False))
+            self._filter_readback = self._read_filter(self._socket)
+            self._capture_state = (
+                "unavailable"
+                if not self._filter_readback.get("available")
+                else "full"
+                if self._filter_readback.get("le_meta_enabled")
+                else "quiet"
+            )
+        except Exception as error:  # noqa: BLE001 - failed narrowing keeps full passive capture
+            self._filter_readback["narrow_failure"] = self._failure_name(error)
+            self._capture_state = "full"
+
+    async def probe(self, generation: int) -> bool:
+        """Widen capture for a bounded observation window; return whether it was available."""
+        if generation != self._generation or self._socket is None:
+            return False
+        sock = self._socket
+        if self._probe_count == 0:
+            self._capture_state = "probing"
+            self._quiet_attempted = False
+        self._probe_count += 1
+        try:
+            sock.setsockopt(0, _HCI_FILTER, _hci_scan_filter(include_le_meta=True))
+            self._filter_readback = self._read_filter(sock)
+            if not self._filter_readback.get("available") or not self._filter_readback.get("le_meta_enabled"):
+                raise OSError("LE Meta filter readback unavailable")
+            if self._capture_state != "probe_recovered":
+                self._capture_state = "probing"
+        except Exception as error:  # noqa: BLE001 - unavailable evidence must never look like radio silence
+            self._capture_state = "unavailable"
+            self._filter_readback.update(
+                {"available": False, "radio_evidence_unavailable": True, "widen_failure": self._failure_name(error)}
+            )
+            return False
+        wakeup = self._probe_wakeup
+        if wakeup is not None:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(wakeup.wait(), timeout=_PROBE_SECONDS)
+        return (
+            generation == self._generation
+            and self._socket is sock
+            and self._capture_state != "unavailable"
+            and self._filter_readback.get("available") is True
+            and self._filter_readback.get("le_meta_enabled") is True
+        )
+
+    def end_probe(self, generation: int) -> None:
+        if generation != self._generation or self._socket is None or self._probe_count == 0:
+            return
+        self._probe_count -= 1
+        if self._probe_count == 0 and self._capture_state != "unavailable":
+            if self._capture_state == "probe_recovered":
+                self._narrow_filter()
+            else:
+                self._capture_state = "full"
 
     def _read_events(self, generation: int, sock: _HciSocket) -> None:
         try:
@@ -169,6 +267,9 @@ class ScanDiagnostics:
         except Exception as error:  # noqa: BLE001 - diagnostic access must never interrupt collection
             self._status = "degraded"
             self._failure = self._failure_name(error)
+            self._capture_state = "unavailable"
+            if self._probe_wakeup is not None:
+                self._probe_wakeup.set()
             if self._socket is sock:
                 self._socket = None
             loop, self._loop = self._loop, None

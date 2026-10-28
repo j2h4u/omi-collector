@@ -56,6 +56,16 @@ from ..domain.public_audio_v2 import (
     project_public_timeline,
 )
 from ..domain.publication_contract import ContractMode
+from ..domain.publication_recovery import (
+    CohortFact,
+    CommitEvidence,
+    CommitExpectation,
+    MemberCursor,
+    ProofFact,
+    SourceExpectation,
+    StageCustody,
+    classify_commit,
+)
 from ..domain.replay_proof import (
     NormalizationMode,
     NormalizationRun,
@@ -3392,40 +3402,37 @@ def _inspect_v2_commit(audio_store: InternalAudioStore, proposal: _V2Commit, des
         raise_if_sqlite_corrupt(error)
         return "third"
     source_states = tuple(_typed_source_coverage_state(audio_store, item.source_id) for item in proposal.coverage)
-    proposed_sources = all(state == item.proposed for state, item in zip(source_states, proposal.coverage, strict=True))
-    old_sources = all(state == item.old for state, item in zip(source_states, proposal.coverage, strict=True))
-    proposed_cohort = (
-        cohort_row is None
-        if proposal.all_complete
-        else cohort_row == ("accepted", cohort.cursor + 1)
-        and member_rows == tuple((item.member_ordinal, item.new_cursor) for item in proposal.progress)
+    stage_custody = (
+        StageCustody.ABSENT
+        if stage_row is None
+        else StageCustody.OWNED
+        if stage_row == (stage.group_identity, str(stage.path), stage.owner_token, None)
+        else StageCustody.CONFLICTING
     )
-    if all(
-        (
-            entry == proposal.entry,
-            frontier == _v2_frontier_payload(stage.group.final_frontier),
-            stage_row is None,
-            proof == ("active", stage.stage_id, stage.owner_token),
-            proposed_cohort,
-            proposed_sources,
-        )
-    ):
-        return "proposed"
-    old_members = tuple((item.member_ordinal, item.old_cursor) for item in proposal.progress)
-    if all(
-        (
-            entry is None,
-            frontier
-            == (None if stage.group.initial_frontier is None else _v2_frontier_payload(stage.group.initial_frontier)),
-            cohort_row == ("staging", cohort.cursor),
-            stage_row == (stage.group_identity, str(stage.path), stage.owner_token, None),
-            proof == ("staging", stage.stage_id, stage.owner_token),
-            member_rows == old_members,
-            old_sources,
-        )
-    ):
-        return "old"
-    return "third"
+    evidence = CommitEvidence(
+        entry=entry,
+        frontier=frontier,
+        cohort=None if cohort_row is None else CohortFact(cast(str, cohort_row[0]), cast(int, cohort_row[1])),
+        members=tuple(MemberCursor(cast(int, row[0]), cast(int, row[1])) for row in member_rows),
+        proof=None if proof is None else ProofFact(cast(str, proof[0]), cast(str, proof[1]), cast(str, proof[2])),
+        stage=stage_custody,
+        sources=source_states,
+    )
+    expectation = CommitExpectation(
+        entry=proposal.entry,
+        old_frontier=(
+            None if stage.group.initial_frontier is None else _v2_frontier_payload(stage.group.initial_frontier)
+        ),
+        proposed_frontier=_v2_frontier_payload(stage.group.final_frontier),
+        old_cohort_cursor=cohort.cursor,
+        complete=proposal.all_complete,
+        old_members=tuple(MemberCursor(item.member_ordinal, item.old_cursor) for item in proposal.progress),
+        proposed_members=tuple(MemberCursor(item.member_ordinal, item.new_cursor) for item in proposal.progress),
+        stage_id=stage.stage_id,
+        owner=stage.owner_token,
+        sources=tuple(SourceExpectation(item.old, item.proposed) for item in proposal.coverage),
+    )
+    return classify_commit(evidence, expectation)
 
 
 def _commit_v2_stage_once(audio_store: InternalAudioStore, proposal: _V2Commit) -> None:

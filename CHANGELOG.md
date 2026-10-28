@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.10](https://github.com/j2h4u/omi-collector/compare/v0.19.9...v0.19.10) (2026-10-28)
+
+
+### Fixes
+
+* persist redacted stacks for unexpected publication failures ([91943cf](https://github.com/j2h4u/omi-collector/commit/91943cf6fe559eb22901ae01e01f15371d6b06b6))
+
+
+### CI
+
+* revalidate release metadata when pull requests are edited ([91943cf](https://github.com/j2h4u/omi-collector/commit/91943cf6fe559eb22901ae01e01f15371d6b06b6))
+
 ## [0.19.9](https://github.com/j2h4u/omi-collector/compare/v0.19.8...v0.19.9) (2026-10-28)
 
 

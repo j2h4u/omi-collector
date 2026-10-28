@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import gc
 import logging
+import subprocess
+import sys
 import weakref
 from collections.abc import Callable
 from itertools import pairwise
@@ -109,6 +111,58 @@ def test_attempt_writer_failure_event_is_logged_at_error(caplog: pytest.LogCaptu
     assert any(record.levelno == logging.ERROR for record in caplog.records)
     assert "OSError" in caplog.text
     assert "private message" not in caplog.text
+
+
+def test_recursion_exception_reaches_default_stderr_without_debug_telemetry() -> None:
+    script = """\
+import logging
+from pathlib import Path
+from omi_collector.capture.adapters.debug_logging import configure_debug_logging, debug_event, debug_exception
+
+logger = configure_debug_logging(Path('.'))
+assert not logging.getLogger().handlers
+assert not logging.getLogger('omi_collector.debug').handlers
+try:
+    raise RuntimeError('private-publication-message')
+except RuntimeError:
+    logger.exception(
+        'diagnostic',
+        extra={
+            'debug_event': 'ready_publication_failure',
+            'debug_fields': {'phase': 'publication_effect'},
+        },
+    )
+try:
+    raise RecursionError('private-recursion-message')
+except RecursionError as error:
+    try:
+        raise RuntimeError('private-wrapper-message') from error
+    except RuntimeError as wrapped:
+        debug_exception('sync_progress', wrapped)
+debug_event('ble_link_rssi_observed', rssi_dbm=-68)
+debug_exception('session_error', RuntimeError('private-handled-error'), phase='operation')
+"""
+    filename = Path(__file__).parents[1] / "src/omi_collector/diagnostic_probe.py"
+    result = subprocess.run(
+        [sys.executable, "-c", f"exec(compile({script!r}, {str(filename)!r}, 'exec'))"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert "ready_publication_failure: RuntimeError at " in result.stderr
+    assert "sync_progress: RuntimeError at " in result.stderr
+    assert " <- RecursionError at " in result.stderr
+    assert "diagnostic_probe.py:" in result.stderr
+    assert '"phase":"publication_effect"' in result.stderr
+    assert "private-publication-message" not in result.stderr
+    assert "private-recursion-message" not in result.stderr
+    assert "private-wrapper-message" not in result.stderr
+    assert "private-handled-error" not in result.stderr
+    assert "ble_link_rssi_observed" not in result.stderr
+    assert "session_error" not in result.stderr
+    assert result.stdout == ""
 
 
 def test_safe_exception_summary_resolves_current_symlink_frame_paths(

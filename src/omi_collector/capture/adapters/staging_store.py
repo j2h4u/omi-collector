@@ -8,7 +8,6 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from functools import partial
-from logging import getLogger
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic
@@ -48,7 +47,7 @@ from . import quarantine, ready_closures
 from .attempts import SqliteAttemptInspection, SqliteStagedAttempt
 from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction, raise_if_sqlite_storage_fault
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
-from .debug_logging import debug_event, debug_exception
+from .debug_logging import configure_debug_logging, debug_event
 from .internal_audio_store import (
     AUDIO_RECORD_SIZE,
     CaptureSource,
@@ -98,7 +97,6 @@ from .staging_filesystem import (
     _never_defer,
 )
 
-_LOGGER = getLogger(__name__)
 _UNKNOWN_REVISION = object()
 _PUBLICATION_ERROR_PATH_LIMIT = 256
 
@@ -370,12 +368,14 @@ class StagingStore:
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), running.revision
         except Exception as error:
             if not isinstance(error, ReadyBundleError):
-                debug_exception(
-                    "ready_publication_failure",
-                    error,
-                    phase=phase,
+                logger = configure_debug_logging(self._state_db.path.parent)
+                logger.exception(
+                    "diagnostic",
+                    extra={
+                        "debug_event": "ready_publication_failure",
+                        "debug_fields": {"phase": phase},
+                    },
                 )
-                _LOGGER.exception("ready publication failed unexpectedly", exc_info=Exception("details redacted"))
             try:
                 revision = self._publication_revision()
             except (OSError, TransientInternalAudioStorageError) as revision_error:

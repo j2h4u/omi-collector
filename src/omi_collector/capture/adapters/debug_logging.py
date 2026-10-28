@@ -309,6 +309,7 @@ type LoggedExceptionInfo = tuple[type[BaseException], BaseException, TracebackTy
 @dataclass(frozen=True, slots=True)
 class _SafeTraceback:
     text: str
+    contains_recursion: bool = False
 
 
 class _RedactingDebugFilter(logging.Filter):
@@ -318,11 +319,16 @@ class _RedactingDebugFilter(logging.Filter):
         event = _journal_code(getattr(record, "debug_event", None))
         fields = _journal_fields(getattr(record, "debug_fields", {}))
         safe_traceback = getattr(record, "debug_traceback", None)
+        if not isinstance(safe_traceback, _SafeTraceback) and record.exc_info is not None:
+            with suppress(Exception):
+                safe_traceback = _exception_summary(cast(LoggedExceptionInfo, record.exc_info))
         detail = safe_traceback.text if isinstance(safe_traceback, _SafeTraceback) else ""
         rendered_fields = json.dumps(fields, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         record.msg = f"{event}: {detail} fields={rendered_fields}"
         record.args = ()
         record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
         return True
 
 
@@ -392,9 +398,11 @@ def _emit_debug_event(
     _install_filter(target)
     del message  # Caller text is untrusted, even when common credential patterns are redacted.
     journal_fields = _journal_fields(fields)
-    safe_traceback = _exception_summary(_exception_info(exc_info)) if exc_info else None
+    exception_info = _exception_info(exc_info) if exc_info else None
+    safe_traceback = _exception_summary(exception_info) if exception_info is not None else None
     with suppress(Exception):
-        log = target.error if event == "attempt_writer_failed" else target.debug
+        is_recursion = safe_traceback is not None and safe_traceback.contains_recursion
+        log = target.error if event == "attempt_writer_failed" or is_recursion else target.debug
         log(
             "diagnostic",
             extra={
@@ -615,14 +623,17 @@ def _exception_summary(exc_info: LoggedExceptionInfo) -> _SafeTraceback:
     error_type, error, traceback_ = exc_info
     summaries: list[str] = []
     seen: set[int] = set()
+    contains_recursion = False
     while error is not None and len(summaries) < DEFAULT_CONFIG.observability.max_error_chain_entries:
         if id(error) in seen:
             break
         seen.add(id(error))
-        summaries.append(_single_exception_summary(type(error), error.__traceback__).text)
+        summary = _single_exception_summary(type(error), error.__traceback__)
+        summaries.append(summary.text)
+        contains_recursion |= summary.contains_recursion
         error = error.__cause__ or (error.__context__ if not error.__suppress_context__ else None)
     if summaries:
-        return _SafeTraceback(" <- ".join(summaries))
+        return _SafeTraceback(" <- ".join(summaries), contains_recursion)
     return _single_exception_summary(error_type, traceback_)
 
 
@@ -639,7 +650,10 @@ def _single_exception_summary(
             except OSError, RuntimeError, ValueError:
                 source = "<external>"
             frames.append(f"{source}:{frame.lineno}")
-    return _SafeTraceback(f"{name} at {' <- '.join(frames) if frames else '<no stack>'}")
+    return _SafeTraceback(
+        f"{name} at {' <- '.join(frames) if frames else '<no stack>'}",
+        error_type is not None and issubclass(error_type, RecursionError),
+    )
 
 
 def safe_exception_summary(error: BaseException) -> str:

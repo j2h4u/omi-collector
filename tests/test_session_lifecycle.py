@@ -19,16 +19,18 @@ from omi_collector import cli as operator_cli
 from omi_collector.capture.adapters import ready_closures
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 from omi_collector.capture.adapters.collector_guard import collector_guard
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.phy_guard import CommandResult, ScopedPhyGuard
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_store import StagingStore
+from omi_collector.capture.application import session_lifecycle
 from omi_collector.capture.application.collector import (
     AdvanceUncertainError,
     CollectorTimeoutError,
     NoDataResult,
+    RingAcknowledgementError,
     TransferCounters,
     TransferInterruptedError,
     TransferTimeouts,
@@ -67,6 +69,7 @@ from omi_collector.capture.application.session_lifecycle import (
     SessionLifecycleCallbacks,
     SessionLifecycleRun,
     SessionPhaseState,
+    StorageNotReadySessionError,
     bounded,
     exit_context,
     presence_attempt_outcome,
@@ -1483,6 +1486,156 @@ def test_storage_not_ready_delay_saturates_after_configured_backoff() -> None:
         backoff[-1],
         backoff[-1],
     ]
+
+
+def test_info_persists_storage_fault_before_retry_and_awaits_successful_info(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, object]] = []
+    replies: list[RingInfo | Exception] = [
+        RingAcknowledgementError(9, command="INFO"),
+        RingInfo(10, 13, 10000, 0, RECORD_SIZE),
+    ]
+
+    async def ring_info(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    async def skip_sleep(_sleep: object, _delay: float) -> None:
+        return None
+
+    async def observe_storage(observed_at: str) -> None:
+        events.append(("storage", observed_at))
+
+    async def observe_info(info: RingInfo, observed_at: str) -> None:
+        events.append(("info", (info.unread_packets, observed_at)))
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=_phy_test_connected,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE)),
+        observe_public_info=observe_info,
+        observe_storage_unavailable=observe_storage,
+    )
+    options = replace(OpportunisticOptions(TransferTimeouts(1, 1)), host_time=lambda: 1.0)
+    lifecycle = SessionLifecycle(
+        SessionLifecycleRun(
+            provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
+            options=options,
+            runtime=OpportunisticRuntime(),
+            callbacks=callbacks,
+        )
+    )
+    monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", ring_info)
+    monkeypatch.setattr(session_lifecycle, "sleep", skip_sleep)
+
+    info = _run(lifecycle._info(cast(RingSession, object())))
+
+    assert info == RingInfo(10, 13, 10000, 0, RECORD_SIZE)
+    assert [event[0] for event in events] == ["storage", "info"]
+    assert events[0][1] == cast(tuple[int, str], events[1][1])[1]
+
+
+def test_only_known_read_and_advance_wrappers_find_storage_ack() -> None:
+    acknowledgement = RingAcknowledgementError(9, command="READ")
+    wrappers = (
+        TransferInterruptedError("read interrupted", TransferCounters(0, 0, 0), cause=acknowledgement),
+        AdvanceUncertainError("advance uncertain"),
+        StorageNotReadySessionError("storage not ready"),
+    )
+    wrappers[1].__cause__ = acknowledgement
+    wrappers[2].__cause__ = acknowledgement
+
+    assert all(session_lifecycle._storage_not_ready_ack(error) is acknowledgement for error in wrappers)
+    assert session_lifecycle._storage_not_ready_ack(RuntimeError("status 9")) is None
+
+
+def _storage_fault_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, callback_error: BaseException
+) -> tuple[SessionLifecycle, AbstractAsyncContextManager[RingSession], list[str], dict[str, object]]:
+    events: list[str] = []
+    teardown: dict[str, object] = {}
+
+    class Context:
+        async def __aenter__(self) -> RingSession:
+            events.append("enter")
+            return cast(RingSession, object())
+
+        async def __aexit__(self, error_type: object, error: object, _traceback: object) -> None:
+            events.append("exit")
+            teardown["error_type"] = error_type
+            teardown["error"] = error
+
+    async def ring_info(_session: RingSession, *, timeout: float) -> RingInfo:
+        del timeout
+        return RingInfo(10, 11, 10000, 0, RECORD_SIZE)
+
+    async def interrupted_read(
+        _session: RingSession, _info: RingInfo | None, _reader: InfoReader, _phase: SessionPhaseState
+    ) -> tuple[str | None, RingInfo | None]:
+        acknowledgement = RingAcknowledgementError(9, command="READ")
+        raise TransferInterruptedError("read interrupted", TransferCounters(0, 0, 0), cause=acknowledgement)
+
+    async def fail_storage_persistence(_observed_at: str) -> None:
+        events.append("persist")
+        raise callback_error
+
+    callbacks = SessionLifecycleCallbacks(
+        before_direct_attempt=_noop,
+        wait_presence_attempt=_wait,
+        connected_step=interrupted_read,
+        post_session_checkpoint=_noop,
+        completed_batch_query=lambda: 0,
+        drained_result=lambda: NoDataResult(RingInfo(10, 10, 10000, 0, RECORD_SIZE)),
+        observe_storage_unavailable=fail_storage_persistence,
+    )
+    monkeypatch.setattr(
+        "omi_collector.capture.application.collector.ring_info",
+        ring_info,
+    )
+    lifecycle = SessionLifecycle(
+        SessionLifecycleRun(
+            provider=lambda _candidate: cast(AbstractAsyncContextManager[RingSession], object()),
+            options=OpportunisticOptions(TransferTimeouts(1, 1)),
+            runtime=OpportunisticRuntime(),
+            callbacks=callbacks,
+        )
+    )
+    return lifecycle, Context(), events, teardown
+
+
+def test_storage_fault_persistence_error_still_tears_down_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistence_error = StateDBError("state database write failed")
+    lifecycle, context, events, teardown = _storage_fault_lifecycle(monkeypatch, persistence_error)
+
+    with pytest.raises(StateDBError) as raised:
+        _run(lifecycle.run_session(context))
+
+    assert raised.value is persistence_error
+    assert events == ["enter", "persist", "exit"]
+    assert teardown["error_type"] is TransferInterruptedError
+    assert isinstance(teardown["error"], TransferInterruptedError)
+
+
+def test_storage_fault_persistence_cancellation_still_tears_down_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancellation = asyncio.CancelledError("storage incident write cancelled")
+    lifecycle, context, events, teardown = _storage_fault_lifecycle(monkeypatch, cancellation)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        _run(lifecycle.run_session(context))
+
+    assert raised.value is cancellation
+    assert events == ["enter", "persist", "exit"]
+    assert teardown["error_type"] is TransferInterruptedError
+    assert isinstance(teardown["error"], TransferInterruptedError)
 
 
 @pytest.mark.parametrize(

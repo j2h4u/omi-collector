@@ -14,7 +14,7 @@ from dbus_fast.aio import MessageBus
 from ..application.ble_scan_health import ScanIncidentContext
 from ..application.owned_work import joined_to_thread
 from .ble_scan_diagnostics import ScanDiagnostics as HciScanDiagnostics
-from .collector_state_db import StateDB, StateKind
+from .collector_state_db import StateDB, StateKind, StateTransaction
 
 _OPEN = "open"
 _HISTORY = "history"
@@ -113,7 +113,7 @@ class BleScanIncidentStore:
         return True
 
 
-def read_ble_scan_incident(state_db: StateDB) -> dict[str, object] | None:
+def read_ble_scan_incident(state_db: StateDB | StateTransaction) -> dict[str, object] | None:
     """Return the bounded current-or-latest incident metadata for projections."""
     incident = state_db.get(StateKind.BLE_SCAN_INCIDENT, _OPEN)
     if incident is not None:

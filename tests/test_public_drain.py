@@ -5,12 +5,13 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind, StateTransaction
 from omi_collector.capture.adapters.public_drain import AcceptedDrainCustody, PublicDrainProjection
 from omi_collector.capture.domain.ring_protocol import RingInfo
 
@@ -24,11 +25,12 @@ def test_projection_starts_unknown_and_private_pending_token_is_never_exported(t
 
     projection.publish_snapshot()
     assert json.loads(projection.path.read_text(encoding="utf-8")) == {
-        "version": 2,
+        "version": 3,
         "ring": None,
         "last_drain": None,
         "battery": None,
         "bluetooth": None,
+        "storage": None,
     }
     projection.update_observations(ring=(3, _NOW), battery=(81, _NOW))
     projection.arm_pending("source-a", 10)
@@ -43,11 +45,12 @@ def test_projection_starts_unknown_and_private_pending_token_is_never_exported(t
     exported = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
     private = projection._state_db.get(StateKind.PENDANT_DRAIN, "current")
     assert exported == {
-        "version": 2,
+        "version": 3,
         "ring": {"unread_packets": 3, "observed_at": _NOW},
         "last_drain": None,
         "battery": {"percent": 81, "observed_at": _NOW},
         "bluetooth": None,
+        "storage": None,
     }
     assert private is not None and isinstance(private["pending_event_id"], str)
     assert "pending_event_id" not in exported
@@ -72,7 +75,7 @@ def test_projection_exports_only_bounded_bluetooth_incident_summary(tmp_path: Pa
     )
     projection.publish_snapshot()
     opened = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
-    assert opened["version"] == 2
+    assert opened["version"] == 3
     assert opened["bluetooth"] == {
         "incident_id": "incident-1",
         "status": "open",
@@ -82,7 +85,6 @@ def test_projection_exports_only_bounded_bluetooth_incident_summary(tmp_path: Pa
     }
     assert "private_context" not in projection.path.read_text(encoding="utf-8")
     assert "diagnostics" not in projection.path.read_text(encoding="utf-8")
-
     db.delete(StateKind.BLE_SCAN_INCIDENT, "open")
     db.put(
         StateKind.BLE_SCAN_INCIDENT,
@@ -108,6 +110,116 @@ def test_projection_exports_only_bounded_bluetooth_incident_summary(tmp_path: Pa
         "detected_at": _NOW,
         "resolved_at": "2026-10-17T12:05:00+00:00",
     }
+
+
+def test_storage_incident_is_stable_until_info_and_reopens_with_new_identity(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    projection = PublicDrainProjection(db, tmp_path / "public" / "pendant-drain.json")
+    projection.update_observations(ring=(4, _NOW), battery=(75, _NOW))
+
+    projection.record_storage_unavailable(_NOW)
+    opened = db.get(StateKind.PENDANT_STORAGE_INCIDENT, "current")
+    drain = db.get(StateKind.PENDANT_DRAIN, "current")
+    assert opened is not None and drain is not None
+    incident_id = opened["incident_id"]
+    assert opened == {
+        "version": 1,
+        "incident_id": incident_id,
+        "status": "open",
+        "detected_at": _NOW,
+        "resolved_at": None,
+    }
+    assert drain["ring"] is None and drain["battery"] == {"percent": 75, "observed_at": _NOW}
+    projection.record_storage_unavailable("2026-10-17T12:01:00+00:00")
+    assert db.get(StateKind.PENDANT_STORAGE_INCIDENT, "current") == opened
+    projection.path.parent.mkdir(mode=0o2750)
+    projection.path.parent.chmod(0o2750)
+    restarted = PublicDrainProjection(StateDB(tmp_path / "state.sqlite3"), projection.path)
+    restarted.publish_snapshot()
+    restarted_public = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
+    assert cast(dict[str, object], restarted_public["storage"])["incident_id"] == incident_id
+
+    projection.record_info(3, "2026-10-17T12:02:00+00:00")
+    resolved = db.get(StateKind.PENDANT_STORAGE_INCIDENT, "current")
+    assert resolved == {**opened, "status": "resolved", "resolved_at": "2026-10-17T12:02:00+00:00"}
+    projection.publish_snapshot()
+    assert json.loads(projection.path.read_text(encoding="utf-8"))["storage"] == {
+        "incident_id": incident_id,
+        "status": "resolved",
+        "detected_at": _NOW,
+        "resolved_at": "2026-10-17T12:02:00+00:00",
+    }
+
+    projection.record_storage_unavailable("2026-10-17T12:03:00+00:00")
+    reopened = db.get(StateKind.PENDANT_STORAGE_INCIDENT, "current")
+    assert reopened is not None and reopened["incident_id"] != incident_id
+    assert reopened["detected_at"] == "2026-10-17T12:03:00+00:00"
+
+
+def test_storage_incident_projection_is_small_and_strict(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    projection = PublicDrainProjection(db, tmp_path / "public" / "pendant-drain.json")
+    projection.record_storage_unavailable(_NOW)
+    projection.path.parent.mkdir(mode=0o2750)
+    projection.path.parent.chmod(0o2750)
+    projection.publish_snapshot()
+    public = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
+    storage = cast(dict[str, object], public["storage"])
+    assert storage == {
+        "incident_id": db.get(StateKind.PENDANT_STORAGE_INCIDENT, "current")["incident_id"],  # type: ignore[index]
+        "status": "open",
+        "detected_at": _NOW,
+        "resolved_at": None,
+    }
+    assert set(public) == {"version", "ring", "last_drain", "battery", "bluetooth", "storage"}
+    assert "reason" not in storage
+    db.put(StateKind.PENDANT_STORAGE_INCIDENT, "current", {"version": 1, "incident_id": "bad"})
+    with pytest.raises(ValueError, match="schema"):
+        projection.publish_snapshot()
+
+
+def test_projection_reads_one_consistent_state_snapshot_during_fault_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    db = StateDB(path)
+    writer = PublicDrainProjection(StateDB(path), tmp_path / "unused" / "drain.json")
+    projection = PublicDrainProjection(db, tmp_path / "public" / "drain.json")
+    projection.update_observations(ring=(2, _NOW))
+    projection.path.parent.mkdir(mode=0o2750)
+    projection.path.parent.chmod(0o2750)
+    original_get = StateTransaction.get
+    writer_done = threading.Event()
+    writer_errors: list[Exception] = []
+    triggered = False
+
+    def open_fault() -> None:
+        try:
+            writer.record_storage_unavailable("2026-10-17T12:01:00+00:00")
+        except Exception as error:  # noqa: BLE001 - surface the worker failure below
+            writer_errors.append(error)
+        finally:
+            writer_done.set()
+
+    def interleave(transaction: StateTransaction, kind: StateKind, item_id: str) -> dict[str, object] | None:
+        nonlocal triggered
+        value = original_get(transaction, kind, item_id)
+        if kind is StateKind.PENDANT_DRAIN and not triggered:
+            triggered = True
+            threading.Thread(target=open_fault).start()
+        if kind is StateKind.PENDANT_STORAGE_INCIDENT:
+            assert not writer_done.is_set()
+        return value
+
+    monkeypatch.setattr(StateTransaction, "get", interleave)
+    projection.publish_snapshot()
+    assert writer_done.wait(timeout=10)
+    assert not writer_errors
+
+    public = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
+    assert public["ring"] == {"unread_packets": 2, "observed_at": _NOW}
+    assert public["storage"] is None
+    assert writer._state_db.get(StateKind.PENDANT_STORAGE_INCIDENT, "current")["status"] == "open"  # type: ignore[index]
 
 
 def test_completion_requires_zero_info_and_frontier_and_preserves_identity_without_token(tmp_path: Path) -> None:

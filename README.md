@@ -171,6 +171,14 @@ observations with no gap of 10 seconds or more before GATT opens. To tune it,
 set both optional flat keys `presence_arrival_stability_seconds` and
 `presence_arrival_max_gap_seconds`; they are omitted from the example because
 the defaults are suitable for most installations.
+Idle searching uses 5-second scan windows and 10-second pauses only after that
+scanner generation receives any-device radio activity and no fresh target
+candidate is present. If the first window has no callback, the same scan remains
+continuous, allowing the existing 180-second scan-fault deadline to fire. A fresh
+matching candidate keeps scanning continuous through the existing 30-second
+stability and 10-second maximum-gap admission rule. Cadence timings live in the
+frozen `PresenceConfig` dataclass. The 10-second pause leaves transition margin
+within the roughly 20-second additional-discovery budget.
 The optional flat key `scan_silence_seconds` defaults to `180` positive
 seconds and sets the all-device receive-fault threshold; pendant absence does
 not count as a scan fault.

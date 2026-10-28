@@ -731,6 +731,8 @@ def test_presence_and_retry_policies_share_one_config_instance(
             max_drain_cooldown_seconds=901.0,
             arrival_stability_seconds=31.0,
             arrival_max_gap_seconds=9.0,
+            scan_active_seconds=4.0,
+            scan_pause_seconds=9.0,
             scan_cancel_grace_min_seconds=0.02,
             scan_cancel_grace_max_seconds=0.03,
             scan_cancel_grace_fraction=0.5,
@@ -761,6 +763,8 @@ def test_presence_and_retry_policies_share_one_config_instance(
     assert presence.policy.scan_recheck_seconds == config.presence.scan_recheck_seconds
     assert presence.policy.arrival_stability_seconds == config.presence.arrival_stability_seconds
     assert presence.policy.arrival_max_gap_seconds == config.presence.arrival_max_gap_seconds
+    assert presence.policy.scan_active_seconds == config.presence.scan_active_seconds
+    assert presence.policy.scan_pause_seconds == config.presence.scan_pause_seconds
     assert presence.policy.scan_cancel_grace_min_seconds == config.presence.scan_cancel_grace_min_seconds
     assert presence.policy.scan_cancel_grace_max_seconds == config.presence.scan_cancel_grace_max_seconds
     assert presence.policy.scan_cancel_grace_fraction == config.presence.scan_cancel_grace_fraction

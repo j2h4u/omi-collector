@@ -19,6 +19,16 @@ from typing import Literal, Protocol, cast
 from ...config import DEFAULT_CONFIG
 from . import presence_machine as machine
 from .ble_scan_health import ScanHealthMonitor, ScanRadioActivity
+from .scan_cadence import (
+    ScanActive,
+    ScanCadencePolicy,
+    ScanPaused,
+    ScanReady,
+    ScanStarting,
+    can_pause,
+    record_radio_activity,
+    scan_deadline,
+)
 
 # Hard safety cap after the short transition timeout; this is not a BlueZ limit.
 _SCAN_STOP_RECOVERY_SECONDS = 30.0
@@ -57,6 +67,8 @@ class PresencePolicy:
     arrival_max_gap_seconds: float = DEFAULT_CONFIG.presence.arrival_max_gap_seconds
     rapid_backoff: tuple[float, ...] = DEFAULT_CONFIG.retry.rapid_backoff
     scan_transition_seconds: float = DEFAULT_CONFIG.presence.scan_transition_seconds
+    scan_active_seconds: float = DEFAULT_CONFIG.presence.scan_active_seconds
+    scan_pause_seconds: float = DEFAULT_CONFIG.presence.scan_pause_seconds
     scan_cancel_grace_min_seconds: float = DEFAULT_CONFIG.presence.scan_cancel_grace_min_seconds
     scan_cancel_grace_max_seconds: float = DEFAULT_CONFIG.presence.scan_cancel_grace_max_seconds
     scan_cancel_grace_fraction: float = DEFAULT_CONFIG.presence.scan_cancel_grace_fraction
@@ -71,6 +83,8 @@ class PresencePolicy:
                 self.arrival_stability_seconds,
                 self.arrival_max_gap_seconds,
                 self.scan_transition_seconds,
+                self.scan_active_seconds,
+                self.scan_pause_seconds,
                 self.scan_cancel_grace_min_seconds,
                 self.scan_cancel_grace_max_seconds,
             )
@@ -135,6 +149,8 @@ class PresenceScheduler:
         self._observer = observer
         self._scan_health = scan_health
         self._policy = policy or PresencePolicy()
+        self._cadence_policy = ScanCadencePolicy(self._policy.scan_active_seconds, self._policy.scan_pause_seconds)
+        self._scan_cadence = ScanReady()
         self._machine_policy = self._policy.machine_policy()
         self._clock = clock
         self._sleep = sleep
@@ -206,28 +222,34 @@ class PresenceScheduler:
 
     async def _wait_for_attempt(self) -> PresenceWake | PresenceEnd:
         while True:
-            if isinstance(self._state, machine.Closed):
-                raise RuntimeError("presence scheduler is closed")
-            await self._start_scan()
-            await self._flush_scan_recovery()
-            if isinstance(self._state, machine.Closed):
-                raise RuntimeError("presence scheduler is closed")
-            advertisement = self._next_advertisement()
-            if advertisement is not None:
-                wake = await self._handle_advertisement(advertisement)
-                if wake is not None:
-                    return wake
-                continue
-            deadline = machine.armed_deadline(_waiting_state(self._state))
-            if self._clock() >= deadline:
-                wake = await self._handle_timer(deadline)
-                if wake is not None:
-                    return wake
-                continue
-            wake = await self._wait_until_event(deadline)
+            wake = await self._wait_for_attempt_step()
             if wake is not None:
                 return wake
+
+    async def _wait_for_attempt_step(self) -> PresenceWake | PresenceEnd | None:
+        if isinstance(self._state, machine.Closed):
+            raise RuntimeError("presence scheduler is closed")
+        if await self._wait_out_scan_pause():
+            return None
+        await self._start_scan()
+        await self._flush_scan_recovery()
+        if isinstance(self._state, machine.Closed):
+            raise RuntimeError("presence scheduler is closed")
+        advertisement = self._next_advertisement()
+        if advertisement is not None:
+            wake = await self._handle_advertisement(advertisement)
+            if wake is not None:
+                return wake
+            return None
+        if self._should_pause_idle_scan():
+            return await self._pause_idle_scan()
+        deadline = machine.armed_deadline(_waiting_state(self._state))
+        if self._clock() >= deadline:
+            return await self._handle_timer(deadline)
+        wake = await self._wait_until_event(deadline)
+        if wake is None:
             await self._flush_scan_recovery()
+        return wake
 
     async def _flush_scan_recovery(self) -> None:
         if self._scan_health is not None:
@@ -236,19 +258,28 @@ class PresenceScheduler:
     async def _wait_until_event(self, deadline: float) -> PresenceWake | PresenceEnd | None:
         self._changed.clear()
         advertisement_task = asyncio.create_task(self._advertisements.get())
-        scan_deadline = self._scan_health.next_deadline if self._scan_health is not None else None
-        wake_deadline = min(deadline, scan_deadline) if scan_deadline is not None else deadline
+        health_deadline = self._scan_health.next_deadline if self._scan_health is not None else None
+        wake_deadline = min(deadline, health_deadline) if health_deadline is not None else deadline
+        if isinstance(self._state, machine.Searching) and not isinstance(self._scan_cadence, ScanPaused):
+            candidate_expiry = _candidate_expiry(self._state, self._policy.arrival_max_gap_seconds)
+            fresh_candidate = candidate_expiry is not None and self._clock() < candidate_expiry
+            if fresh_candidate and candidate_expiry is not None:
+                wake_deadline = min(wake_deadline, candidate_expiry)
+            else:
+                cadence_deadline = scan_deadline(self._scan_cadence, self._cadence_policy)
+                if cadence_deadline is not None:
+                    wake_deadline = min(wake_deadline, cadence_deadline)
         timer_task = asyncio.create_task(self._sleep_until(wake_deadline))
         changed_task = asyncio.create_task(self._changed.wait())
         try:
             done, _ = await asyncio.wait(
                 {advertisement_task, timer_task, changed_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if changed_task in done:
-                return None
             if advertisement_task in done:
                 _, advertisement = advertisement_task.result()
                 return await self._handle_advertisement(advertisement)
+            if changed_task in done:
+                return None
             await _cancel_task(advertisement_task)
             advertisement = self._next_advertisement()
             if advertisement is not None:
@@ -309,6 +340,7 @@ class PresenceScheduler:
         generation = self._next_scanner_generation
         self._next_scanner_generation += 1
         self._active_scanner_generation = generation
+        self._scan_cadence = ScanStarting(generation)
         try:
             if self._scan_health is not None:
                 await self._scan_health.prepare(generation)
@@ -319,6 +351,7 @@ class PresenceScheduler:
             )
         except asyncio.CancelledError:
             self._active_scanner_generation = None
+            self._scan_cadence = ScanReady()
             self._discard_advertisements()
             self._interrupt_presence()
             try:
@@ -330,6 +363,7 @@ class PresenceScheduler:
         except PresenceScanTransitionError as error:
             await self._record_scan_start_failure(generation, error)
             self._active_scanner_generation = None
+            self._scan_cadence = ScanReady()
             self._force_stop_required = True
             self._discard_advertisements()
             self._close_state()
@@ -338,6 +372,7 @@ class PresenceScheduler:
         except Exception as error:  # noqa: BLE001 - a normal scanner-start refusal is soft
             await self._record_scan_start_failure(generation, error)
             self._active_scanner_generation = None
+            self._scan_cadence = ScanReady()
             self._discard_advertisements()
             self._interrupt_presence()
             await self._best_effort_stop_locked(force=True)
@@ -347,6 +382,8 @@ class PresenceScheduler:
             return False
         if self._scan_health is not None:
             self._scan_health.scan_started(generation, self._clock())
+        saw_radio_activity = isinstance(self._scan_cadence, ScanStarting) and self._scan_cadence.saw_radio_activity
+        self._scan_cadence = ScanActive(generation, self._clock(), saw_radio_activity)
         return True
 
     async def _record_scan_start_failure(self, generation: int, error: Exception) -> None:
@@ -362,6 +399,7 @@ class PresenceScheduler:
             return
         generation = self._active_scanner_generation
         self._active_scanner_generation = None
+        self._scan_cadence = ScanReady()
         self._discard_advertisements()
         if self._scan_health is not None and generation is not None:
             self._scan_health.scan_stopping(generation)
@@ -412,8 +450,59 @@ class PresenceScheduler:
     def _receive_scan_radio_activity(self, generation: int, observed_at: float) -> None:
         if generation != self._active_scanner_generation or isinstance(self._state, machine.Closed):
             return
-        if self._scan_health is not None and self._scan_health.radio_activity(generation, observed_at):
+        cadence_update = record_radio_activity(self._scan_cadence, generation)
+        first_activity = cadence_update is not None
+        if cadence_update is not None:
+            self._scan_cadence = cadence_update
+        health_wakeup = (
+            self._scan_health.radio_activity(generation, observed_at) if self._scan_health is not None else False
+        )
+        if first_activity or health_wakeup:
             self._changed.set()
+
+    async def _pause_idle_scan(self) -> PresenceWake | PresenceEnd | None:
+        # Let callbacks already queued at the active-window boundary enter the generation queue.
+        await asyncio.sleep(0)
+        advertisement = self._next_advertisement()
+        if advertisement is not None:
+            wake = await self._handle_advertisement(advertisement)
+            if wake is not None:
+                return wake
+        if not self._should_pause_idle_scan():
+            return None
+        try:
+            await self._stop_scan()
+        except asyncio.CancelledError:
+            await self._close_after_stop_failure()
+            raise
+        except Exception:
+            await self._close_after_stop_failure()
+            raise
+        if isinstance(self._state, machine.Closed):
+            raise RuntimeError("presence scheduler is closed")
+        self._scan_cadence = ScanPaused(self._clock() + self._cadence_policy.pause_seconds)
+        return None
+
+    def _should_pause_idle_scan(self) -> bool:
+        now = self._clock()
+        return can_pause(
+            self._scan_cadence,
+            now=now,
+            searching=isinstance(self._state, machine.Searching),
+            fresh_candidate=_has_fresh_candidate(self._state, now, self._policy.arrival_max_gap_seconds),
+            policy=self._cadence_policy,
+        )
+
+    async def _wait_out_scan_pause(self) -> bool:
+        if not isinstance(self._scan_cadence, ScanPaused):
+            return False
+        pause_until = self._scan_cadence.until
+        if self._clock() >= pause_until or not isinstance(self._state, machine.Searching):
+            self._scan_cadence = ScanReady()
+            return False
+        deadline = min(pause_until, machine.armed_deadline(_waiting_state(self._state)))
+        await self._wait_until_event(deadline)
+        return True
 
     def _buffer_advertisement(self, generation: int, advertisement: machine.Advertisement) -> None:
         if generation != self._active_scanner_generation or isinstance(self._state, machine.Closed):
@@ -516,6 +605,17 @@ def _waiting_state(state: machine.PresenceState) -> machine.WaitingState:
     if isinstance(state, machine.Attempting | machine.Closed):
         raise RuntimeError("presence scheduler has no waiting deadline")
     return state
+
+
+def _candidate_expiry(state: machine.PresenceState, max_gap_seconds: float) -> float | None:
+    if isinstance(state, machine.Searching) and state.advertisement is not None:
+        return state.advertisement.observed_at + max_gap_seconds
+    return None
+
+
+def _has_fresh_candidate(state: machine.PresenceState, now: float, max_gap_seconds: float) -> bool:
+    expiry = _candidate_expiry(state, max_gap_seconds)
+    return expiry is not None and now < expiry
 
 
 def _wake(trigger: machine.AttemptTrigger) -> PresenceWake:

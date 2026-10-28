@@ -75,6 +75,10 @@ class PresenceConfig:
     arrival_max_gap_seconds: float = 10.0
     scan_silence_seconds: float = 180.0
     scan_transition_seconds: float = 2.0
+    # For deliberate long visits, 5s windows amortize transitions. A 10s pause leaves
+    # transition margin within about 20s of added discovery delay.
+    scan_active_seconds: float = 5.0
+    scan_pause_seconds: float = 10.0
     max_scan_recheck_seconds: float = 300.0
     max_drain_cooldown_seconds: float = 900.0
     scan_cancel_grace_min_seconds: float = 0.01
@@ -90,6 +94,8 @@ class PresenceConfig:
             ("arrival_max_gap_seconds", self.arrival_max_gap_seconds),
             ("scan_silence_seconds", self.scan_silence_seconds),
             ("scan_transition_seconds", self.scan_transition_seconds),
+            ("scan_active_seconds", self.scan_active_seconds),
+            ("scan_pause_seconds", self.scan_pause_seconds),
             ("max_scan_recheck_seconds", self.max_scan_recheck_seconds),
             ("max_drain_cooldown_seconds", self.max_drain_cooldown_seconds),
         ):

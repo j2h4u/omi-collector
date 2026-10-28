@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from struct import pack
 from threading import Event
+from time import monotonic
 
 import pytest
 
+from omi_collector.capture.adapters import staging_store as staging_store_module
 from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
@@ -48,12 +50,31 @@ def _add_source(store: StagingStore, start: int, count: int = 1) -> None:
     attempt.close()
 
 
+def _hold_loop_timers(
+    loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[tuple[float, Callable[..., None], tuple[object, ...]]], list[asyncio.TimerHandle]]:
+    call_at = loop.call_at
+    timers: list[tuple[float, Callable[..., None], tuple[object, ...]]] = []
+    handles: list[asyncio.TimerHandle] = []
+
+    def hold_timer(when: float, callback: Callable[..., None], *args: object) -> asyncio.TimerHandle:
+        timers.append((when, callback, args))
+        handle = call_at(loop.time() + 3600, lambda: None)
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(loop, "call_at", hold_timer)
+    return timers, handles
+
+
 def test_transient_deadline_is_one_timer_and_no_immediate_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path, threshold=0.04, backoff=0.08)
     _add_source(store, 100)
     store.append_ready_closure(101, "drained")
+    now = [monotonic()]
+    monkeypatch.setattr(staging_store_module, "monotonic", lambda: now[0])
     original_lock = store.device_lock
     attempts = 0
     retry_finished = Event()
@@ -83,10 +104,20 @@ def test_transient_deadline_is_one_timer_and_no_immediate_retry(
     maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
 
     async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        timers, held_handles = _hold_loop_timers(loop, monkeypatch)
         await maintenance.ensure_publication_ready()
         assert attempts == 1
+        assert len(timers) == 1
+        deadline, fire_timer, timer_args = timers[0]
+        assert deadline == scheduled[1]
+        assert deadline > now[0]
+        now[0] = deadline
+        fire_timer(*timer_args)
         assert await asyncio.to_thread(retry_finished.wait, 5)
         await maintenance.close()
+        for handle in held_handles:
+            handle.cancel()
         assert attempts == 2
         assert not tuple((tmp_path / "ready").iterdir())
 

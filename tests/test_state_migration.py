@@ -583,7 +583,7 @@ def test_optional_journal_disappearance_does_not_mask_canonical_access(
     real_open = os.open
     seen: list[Path] = []
 
-    def open_with_disappearing_journal(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+    def open_with_disappearing_journal(path: str | os.PathLike[str], flags: int, mode: int = 0o600) -> int:
         if Path(path) == journal:
             seen.append(journal)
             raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(journal))
@@ -603,7 +603,7 @@ def test_optional_journal_access_error_is_not_ignored(
     journal = tmp_path / "collector.sqlite3-journal"
     real_open = os.open
 
-    def open_with_journal_error(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+    def open_with_journal_error(path: str | os.PathLike[str], flags: int, mode: int = 0o600) -> int:
         if Path(path) == journal:
             raise OSError(error_number, os.strerror(error_number), str(journal))
         return real_open(path, flags, mode)

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.11](https://github.com/j2h4u/omi-collector/compare/v0.19.10...v0.19.11) (2026-10-28)
+
+
+### Performance
+
+* avoid duplicate radio diagnostics during healthy scans ([52c7073](https://github.com/j2h4u/omi-collector/commit/52c7073a42cff4ced3d5fe99f2db309daf9f18d8))
+
+
+### Tests
+
+* allow slow SQLite in battery finalization guard ([52c7073](https://github.com/j2h4u/omi-collector/commit/52c7073a42cff4ced3d5fe99f2db309daf9f18d8))
+
 ## [0.19.10](https://github.com/j2h4u/omi-collector/compare/v0.19.9...v0.19.10) (2026-10-28)
 
 

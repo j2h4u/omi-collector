@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.19.9](https://github.com/j2h4u/omi-collector/compare/v0.19.8...v0.19.9) (2026-10-28)
+
+
+### Fixes
+
+* iterate publication followups without growing the stack ([f8d6f72](https://github.com/j2h4u/omi-collector/commit/f8d6f72cc4b5c79b8008a4a9d45807945715ecea))
+
+
+### Tests
+
+* restrict migration open-wrapper default permissions ([f8d6f72](https://github.com/j2h4u/omi-collector/commit/f8d6f72cc4b5c79b8008a4a9d45807945715ecea))
+* synchronize observation close cancellation explicitly ([f8d6f72](https://github.com/j2h4u/omi-collector/commit/f8d6f72cc4b5c79b8008a4a9d45807945715ecea))
+
 ## [0.19.8](https://github.com/j2h4u/omi-collector/compare/v0.19.7...v0.19.8) (2026-10-27)
 
 

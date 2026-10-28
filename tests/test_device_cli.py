@@ -930,6 +930,13 @@ def test_download_metrics_are_finite_for_no_data_and_zero_duration() -> None:
     }
 
 
+def test_sync_no_data_rendering_matches_collect_metrics_projection() -> None:
+    result = device_cli.collector.NoDataResult(RingInfo(10, 10, 100, 0, RECORD_SIZE))
+    metrics = device_cli.download_metrics(result, 0.0)
+
+    assert device_cli.render_sync(result, metrics) == device_cli.render_collect(result, metrics)
+
+
 def test_download_metrics_count_records_and_remaining_work() -> None:
     info = RingInfo(10, 15, 100, 0, RECORD_SIZE)
     result = CollectionResult(info, 2, object())

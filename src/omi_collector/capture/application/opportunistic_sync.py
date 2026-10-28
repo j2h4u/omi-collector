@@ -126,17 +126,7 @@ class _PublicDrainCoordinator:
         self.wake.set()
 
     async def before_closure(self) -> None:
-        async with self._db_lock:
-            battery = self._battery
-            if battery is None:
-                return
-            try:
-                await joined_to_thread(self.port.update_observations, battery=battery)
-            except Exception as error:  # noqa: BLE001 - public observations are best effort
-                self._log(error, "observation")
-            else:
-                if self._battery == battery:
-                    self._battery = None
+        await self._flush_observations()
 
     async def publish_after_closure(self) -> None:
         self.wake.set()

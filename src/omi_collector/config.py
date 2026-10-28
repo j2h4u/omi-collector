@@ -204,7 +204,6 @@ class BleConfig:
     adapter_name: str = "hci0"
     observer_queue_max_packets: int = 128
     observer_receive_bytes: int = 260
-    observer_poll_seconds: float = 0.02
     observer_join_timeout_seconds: float = 0.5
     observer_max_phy_transitions: int = 8
     observer_max_phy_update_outcomes: int = 8
@@ -217,7 +216,6 @@ class BleConfig:
             ("preflight_settle_seconds", self.preflight_settle_seconds),
             ("cancelled_disconnect_timeout_seconds", self.cancelled_disconnect_timeout_seconds),
             ("att_mtu_query_timeout_seconds", self.att_mtu_query_timeout_seconds),
-            ("observer_poll_seconds", self.observer_poll_seconds),
             ("observer_join_timeout_seconds", self.observer_join_timeout_seconds),
         ):
             _require_positive_float(value, name)

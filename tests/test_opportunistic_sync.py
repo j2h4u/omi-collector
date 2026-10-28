@@ -229,6 +229,29 @@ def _attempt_source(store: StagingStore, source_id: str) -> CaptureSource | None
     return storage_call(lambda: read_capture_source(store.state_db, source_id))
 
 
+def _quarantine_disposition(store: StagingStore, source_id: str) -> str | None:
+    def read() -> str | None:
+        with (
+            closing(store.state_db.open_connection(read_only=True)) as connection,
+            store.state_db.access(connection),
+            closing(
+                connection.execute(
+                    "SELECT quarantine_disposition FROM capture_source WHERE source_id = ?",
+                    (source_id,),
+                )
+            ) as cursor,
+        ):
+            row = cast(tuple[object] | None, cursor.fetchone())
+        return None if row is None or row[0] is None else str(row[0])
+
+    return storage_call(read)
+
+
+def _only_source_id(source_ids: list[str]) -> str:
+    assert len(source_ids) == 1
+    return source_ids[0]
+
+
 def _sealed_records(store: StagingStore, seal: DurableSqliteSeal) -> bytes:
     return _source_records(store, seal.source_id)
 
@@ -3686,6 +3709,7 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
     tmp_path: Path, case: str, read: int, write: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ordering: list[str] = []
+    quarantined_source_ids: list[str] = []
     original_close = StagingWriter.close
     original_quarantine = StagingStore.quarantine_attempt_source
 
@@ -3695,6 +3719,7 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
 
     def quarantine_source(store: StagingStore, attempt_id: str) -> str:
         ordering.append("quarantine")
+        quarantined_source_ids.append(attempt_id)
         return original_quarantine(store, attempt_id)
 
     monkeypatch.setattr(StagingWriter, "close", close)
@@ -3738,9 +3763,7 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
     assert second.writes[0] == b"\x10"
     if case == "gap":
         assert second.writes == [b"\x10", b"\x10"]
-        quarantined = store.quarantined_attempts()
-        assert len(quarantined) == 1
-        source_id = quarantined[0]
+        source_id = _only_source_id(quarantined_source_ids)
         source = _attempt_source(store, source_id)
         assert source is not None
         assert (source.source_type, source.lifecycle, source.committed_count) == ("quarantine", "blocked", 0)
@@ -3765,10 +3788,10 @@ async def test_reconnect_discontinuities_quarantine_source_without_metadata(
         with store.device_lock():
             pass
     else:
-        quarantined = store.quarantined_attempts()
-        assert len(quarantined) == 1
-        source = _attempt_source(store, quarantined[0])
+        source_id = _only_source_id(quarantined_source_ids)
+        source = _attempt_source(store, source_id)
         assert source is not None and source.source_type == "quarantine"
+        assert _quarantine_disposition(store, source_id) == "unprocessable"
         assert ordering.index("close") < ordering.index("quarantine")
 
 

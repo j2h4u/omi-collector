@@ -1,10 +1,12 @@
 # Local candidate workflow
 
-Use targeted tests and linters during short development iterations. Before
-installing a candidate on the host, all applicable local tests and linters must
-pass. The five project gates remain mandatory; prior results may be reused only
-for byte-identical relevant inputs, with targeted checks for any isolated later
-change.
+Use targeted tests and linters during short development iterations. The full
+local contract is `just verify`: static checks, the complete pytest suite with
+the CRAP threshold, the locked dependency audit, and the Docker runtime smoke
+(which includes the image build). Do not rerun the standalone unit or Docker
+build recipes as part of that full gate. Before installing a candidate on the
+host, `just verify` must pass; prior results may be reused only for byte-identical
+relevant inputs, with targeted checks for any isolated later change.
 
 Install an exact committed branch candidate through a reviewed transactional
 entry point that retains the service-stop, migration, rollback, and storage

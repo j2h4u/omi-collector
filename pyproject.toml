@@ -36,6 +36,7 @@ addopts = [
 ]
 xfail_strict = true
 markers = [
+    "integration: tests that cross process, service, container, or network boundaries",
     "slow: tests that are too slow for the default unit gate",
 ]
 
@@ -133,6 +134,18 @@ include_external_packages = true
 [tool.deptry]
 known_first_party = ["omi_collector", "scripts"]
 
+[tool.omi_collector.suppressions]
+paths = ["src", "scripts", "tests", "pyproject.toml", "Justfile", ".github/workflows"]
+
+# Initial historical count ceilings; review new/changed inline suppressions per PR.
+# Lower these ceilings when suppressions are removed. Native TOML ignores are not counted.
+[tool.omi_collector.suppressions.baseline]
+noqa = 114
+type_ignore = 190
+pyright = 0
+pylint = 0
+ruff = 0
+
 [[tool.importlinter.contracts]]
 id = "core-independent-from-cli"
 name = "Core stays independent from CLI"
@@ -176,12 +189,15 @@ dev = [
     "basedpyright>=1.39.8",
     "deptry>=0.25.1",
     "import-linter>=2.12",
+    "jscpd==5.4.1",
+    "pip-audit>=2.10.1",
     "pytest>=9.1.1",
     "pytest-cov>=7",
     "pytest-crap>=0.3.0",
     "pytest-gremlins",
     "pytest-timeout>=2.4,<2.5",
     "pytest-xdist>=3.8.0",
+    "pyscn==1.33.0",
     "radon>=6.0.1",
     "ruff>=0.15.18",
     "vulture>=2.16",

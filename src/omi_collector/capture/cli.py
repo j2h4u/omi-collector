@@ -589,21 +589,15 @@ def render_collect(result: collector.CollectResult, metrics: DownloadMetrics | N
 def render_sync(result: collector.CollectResult, metrics: DownloadMetrics) -> str:
     """Render sync receipt metadata and finite end-to-end transfer metrics."""
     if isinstance(result, collector.NoDataResult):
-        payload: dict[str, object] = {
-            "read_sequence": result.info.read_sequence,
-            "status": "no_data",
-            "unread_packets": result.info.unread_packets,
-            "write_sequence": result.info.write_sequence,
-        }
-    else:
-        payload = {
-            "advance_confirmed": result.advance_confirmed,
-            "next_sequence": result.next_sequence,
-            "record_count": result.packet_count,
-            "start_sequence": result.info.read_sequence,
-            "status": "synced",
-        }
-        payload.update(_custody_fields(result))
+        return render_collect(result, metrics)
+    payload = {
+        "advance_confirmed": result.advance_confirmed,
+        "next_sequence": result.next_sequence,
+        "record_count": result.packet_count,
+        "start_sequence": result.info.read_sequence,
+        "status": "synced",
+    }
+    payload.update(_custody_fields(result))
     payload.update(metrics.as_dict())
     return _json(payload)
 

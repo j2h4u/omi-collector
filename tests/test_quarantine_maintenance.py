@@ -680,6 +680,33 @@ def test_run_once_admits_two_real_sources_into_sql_and_runs_normal_recovery(
     _run(scenario())
 
 
+def test_salvage_skips_retained_terminal_sources_but_keeps_actionable_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    published, unprocessable, actionable = _quarantine_sources(store, (1, 1, 1))
+    store.admit_quarantined_prefix(published)
+    store.mark_quarantine_unprocessable(unprocessable, "test terminal evidence")
+    terminal_before = {source: _source_snapshot(store, source) for source in (published, unprocessable)}
+    classified: list[str] = []
+    original_classify = quarantine._quarantine_state
+
+    def record_classification(filesystem: quarantine.StagingFilesystem, source_id: str) -> quarantine.QuarantineState:
+        classified.append(source_id)
+        return original_classify(filesystem, source_id)
+
+    monkeypatch.setattr(quarantine, "_quarantine_state", record_classification)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    try:
+        _run(maintenance._salvage_quarantine(lambda: False))
+    finally:
+        _run(maintenance.close())
+
+    assert classified == [actionable]
+    assert store.quarantined_attempts() == ()
+    assert {source: _source_snapshot(store, source) for source in terminal_before} == terminal_before
+
+
 def test_integrity_hold_preserves_source_and_next_maintenance_pass_admits_other_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

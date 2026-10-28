@@ -498,10 +498,11 @@ def test_release_job_timeout_exceeds_its_merge_poll_window() -> None:
 
 
 def test_release_prs_keep_the_complete_ci_gate() -> None:
-    for job in ("quality:", "test:", "runtime-smoke:"):
+    for job in ("quality:", "test:", "deps-audit:", "runtime-smoke:"):
         assert f"  {job}" in _CI_WORKFLOW
-    assert "needs: [pr-release-contract, quality, test, runtime-smoke]" in _CI_WORKFLOW
+    assert "needs: [changes, pr-release-contract, quality, test, deps-audit, runtime-smoke]" in _CI_WORKFLOW
     assert "run: just crap-check" in _CI_WORKFLOW
+    assert "run: just deps-audit" in _CI_WORKFLOW
     assert "run: just runtime-smoke" in _CI_WORKFLOW
     assert "  crap:" not in _CI_WORKFLOW
     assert "  docker-build:" not in _CI_WORKFLOW

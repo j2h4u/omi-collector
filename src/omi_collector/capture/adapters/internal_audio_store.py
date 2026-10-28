@@ -116,8 +116,8 @@ def capture_space_requirement(state_db: StateDB, record_count: int, chunk_record
         raise ValueError("chunk records must be within the typed writer bound")
     try:
         with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
-            page_size = _pragma_positive_int(connection, "page_size")
-            freelist_count = _pragma_nonnegative_int(connection, "freelist_count")
+            page_size = _pragma_int(connection, "page_size")
+            freelist_count = _pragma_int(connection, "freelist_count", minimum=0)
         reusable_bytes = freelist_count * page_size
         database_growth = max(0, record_count * _CAPTURE_DB_BYTES_PER_RECORD - reusable_bytes)
         transaction_records = min(record_count, chunk_records)
@@ -132,18 +132,10 @@ def capture_space_requirement(state_db: StateDB, record_count: int, chunk_record
     return database_growth + journal_bytes, available
 
 
-def _pragma_positive_int(connection: sqlite3.Connection, name: str) -> int:
+def _pragma_int(connection: sqlite3.Connection, name: str, *, minimum: int = 1) -> int:
     with closing(connection.execute(f"PRAGMA {name}")) as cursor:
         row = cast(tuple[object] | None, cursor.fetchone())
-    if row is None or type(row[0]) is not int or row[0] <= 0:
-        raise InternalAudioStoreError(f"SQLite {name} is invalid")
-    return cast(int, row[0])
-
-
-def _pragma_nonnegative_int(connection: sqlite3.Connection, name: str) -> int:
-    with closing(connection.execute(f"PRAGMA {name}")) as cursor:
-        row = cast(tuple[object] | None, cursor.fetchone())
-    if row is None or type(row[0]) is not int or row[0] < 0:
+    if row is None or type(row[0]) is not int or row[0] < minimum:
         raise InternalAudioStoreError(f"SQLite {name} is invalid")
     return cast(int, row[0])
 
@@ -967,7 +959,7 @@ class InternalAudioStore:
             if desired_tail != previous_tail:
                 self._commit_replay_tail(source, previous_tail, desired_tail)
             return source.committed_count
-        return self._append_replay(source, suffix, expected_sha256, tail)
+        return self._append_drain(source, source.committed_count, suffix, expected_sha256, tail)
 
     def _prefix_digest(self, source_id: str, count: int) -> str:
         source_id = _source_id(source_id)
@@ -1021,57 +1013,6 @@ class InternalAudioStore:
                 previous,
                 error,
             )
-
-    def _append_replay(
-        self,
-        source: CaptureSource,
-        suffix: tuple[bytes, ...],
-        expected_sha256: str | None,
-        tail: CaptureTail | None,
-    ) -> int:
-        new_count = source.committed_count + len(suffix)
-        if new_count > MAX_PROTOCOL_UINT32 or source.sequence_start + new_count > source.sequence_limit:
-            raise InternalAudioStoreError("drain exceeds source range")
-        parsed = tuple(
-            _parse_record(source.source_id, source.committed_count + index, raw) for index, raw in enumerate(suffix)
-        )
-        digest_state = self._digest_state(source)
-        proposed_digest = digest_state.copy()
-        for record in parsed:
-            proposed_digest.update(record.raw_bytes)
-        digest = proposed_digest.hexdigest()
-        if expected_sha256 is not None and digest != expected_sha256:
-            raise InternalAudioStoreError("drain digest does not match exact source rows")
-        previous_tail = self._read_tail(source.source_id)
-        desired_tail = self._resolve_tail(source, previous_tail, tail, new_count, parsed)
-        connection = self._require_connection()
-        try:
-            self._start_write(connection)
-            self._recheck_source(connection, source)
-            self._recheck_tail(connection, source.source_id, previous_tail)
-            connection.executemany(
-                "INSERT INTO capture_record(source_id, ordinal, device_timestamp, payload) VALUES (?, ?, ?, ?)",
-                ((record.source_id, record.ordinal, record.device_timestamp, record.payload) for record in parsed),
-            )
-            connection.execute(
-                "UPDATE capture_source SET committed_count = ?, committed_sha256 = ? WHERE source_id = ?",
-                (new_count, digest, source.source_id),
-            )
-            self._write_tail(connection, source.source_id, desired_tail, previous_tail)
-            self._commit()
-            self._publish_digest(source.source_id, new_count, digest, proposed_digest)
-        except InternalAudioStoreError:
-            self._rollback()
-            raise
-        except sqlite3.IntegrityError as error:
-            self._rollback()
-            raise InternalAudioStoreError("drain violates source constraints") from error
-        except sqlite3.DatabaseError as error:
-            self._rollback_after_error(error)
-            return self._recover_ambiguous(
-                source, source.committed_count, parsed, new_count, digest, desired_tail, previous_tail, error
-            )
-        return new_count
 
     def _digest_state(self, source: CaptureSource) -> _HashState:
         key = (source.source_id, source.committed_count, source.committed_sha256)

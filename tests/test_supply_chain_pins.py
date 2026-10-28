@@ -2,7 +2,28 @@ from pathlib import Path
 
 import pytest
 import scripts.check_supply_chain_pins as supply_chain_pins
-from scripts.check_supply_chain_pins import _check_action_refs, _check_container_refs
+from scripts.check_supply_chain_pins import _check_action_refs, _check_container_refs, _check_locked_python_sources
+
+FORK_SHA = "d5c4d18d9b7b08d588e42e9ea92a9773f182df60"
+FORK_URL = f"https://github.com/j2h4u/pytest-gremlins?rev={FORK_SHA}#{FORK_SHA}"
+
+
+def _write_python_source_fixture(root: Path, extra_package: str = "") -> None:
+    root.joinpath("pyproject.toml").write_text(
+        '[project]\nname = "fixture_project"\nversion = "9.8.7"\ndependencies = []\n',
+        encoding="utf-8",
+    )
+    root.joinpath("uv.lock").write_text(
+        'version = 1\nrevision = 5\nrequires-python = ">=3.14"\n\n'
+        '[[package]]\nname = "fixture-project"\nversion = "9.8.7"\n'
+        'source = { editable = "." }\n\n'
+        '[[package]]\nname = "coverage"\nversion = "7.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n\n'
+        '[[package]]\nname = "pytest-gremlins"\nversion = "1.9.0"\n'
+        f'source = {{ git = "{FORK_URL}" }}\n'
+        f"{extra_package}",
+        encoding="utf-8",
+    )
 
 
 def test_workflows_require_full_commit_shas(tmp_path: Path) -> None:
@@ -137,6 +158,7 @@ def test_main_reports_combined_check_result(
 def test_main_accepts_missing_workflows_and_docker_inputs(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
+    _write_python_source_fixture(tmp_path)
     script_dir = tmp_path / "scripts"
     script_dir.mkdir()
     monkeypatch.setattr(supply_chain_pins, "__file__", str(script_dir / "check_supply_chain_pins.py"))
@@ -145,3 +167,48 @@ def test_main_accepts_missing_workflows_and_docker_inputs(
     captured = capsys.readouterr()
     assert captured.out == "Supply-chain pin check passed\n"
     assert captured.err == ""
+
+
+def test_python_sources_accept_only_reviewed_fork_and_dynamic_project_root(tmp_path: Path) -> None:
+    _write_python_source_fixture(tmp_path)
+
+    assert _check_locked_python_sources(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (FORK_URL, FORK_URL.replace("j2h4u/pytest-gremlins", "someone/pytest-gremlins")),
+        (FORK_URL, FORK_URL.replace(FORK_SHA, "0" * 40)),
+        ('version = "1.9.0"', 'version = "1.9.1"'),
+    ],
+)
+def test_python_sources_reject_changed_fork_identity(tmp_path: Path, old: str, new: str) -> None:
+    _write_python_source_fixture(tmp_path)
+    lock = tmp_path / "uv.lock"
+    lock.write_text(lock.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    assert _check_locked_python_sources(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "extra_package",
+    [
+        '[[package]]\nname = "another-fork"\nversion = "1.0"\nsource = { git = "https://github.com/other/fork?rev=abc#abc" }\n',
+        '[[package]]\nname = "local-package"\nversion = "1.0"\nsource = { editable = "../local-package" }\n',
+        '[[package]]\nname = "pytest-gremlins"\nversion = "1.9.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+    ],
+)
+def test_python_sources_reject_additional_or_unreviewed_package_source(tmp_path: Path, extra_package: str) -> None:
+    _write_python_source_fixture(tmp_path, extra_package)
+
+    assert _check_locked_python_sources(tmp_path)
+
+
+def test_python_sources_reject_missing_reviewed_fork(tmp_path: Path) -> None:
+    _write_python_source_fixture(tmp_path)
+    lock = tmp_path / "uv.lock"
+    text = lock.read_text(encoding="utf-8")
+    lock.write_text(text[: text.index('[[package]]\nname = "pytest-gremlins"')], encoding="utf-8")
+
+    assert any("exactly the reviewed fork tuple" in error for error in _check_locked_python_sources(tmp_path))

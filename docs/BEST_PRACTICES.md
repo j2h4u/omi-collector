@@ -9,20 +9,26 @@ outside its boundary.
 
 Use `uv` and keep `uv.lock` synchronized. The required gates are:
 
-- `just check` — static, type, import, dependency, workflow, compile, and
-  packaging checks;
+- `just check` — static, type, import, dependency, workflow, suppression-budget,
+  compile, dead-code, and packaging checks;
 - `just crap-check` — the full pytest suite, including slow tests, and the
   authoritative radon-backed CRAP threshold for every function;
-- `just unit` — fast behavior tests without slow tests for local iteration;
-- `just docker-build` — Dockerfile, Compose, and image validation;
-- `just runtime-smoke` — a bounded installed-CLI container smoke;
-- `just verify` — the complete local contract when a local full run is needed.
+- `just deps-audit` — a strict vulnerability audit of the locked registry
+  dependencies;
+- `just unit` — fast behavior checks without slow tests for local iteration;
+- `just docker-build` — Dockerfile, Compose, and image validation for focused
+  checks;
+- `just runtime-smoke` — a bounded installed-CLI container smoke that includes
+  Dockerfile and Compose validation and builds its image;
+- `just verify` — the full local contract: `check`, `crap-check`,
+  `deps-audit`, and `runtime-smoke`.
 
 Do not weaken or locally suppress a gate. Use targeted checks while iterating.
-Before a local candidate install, all applicable local tests and linters must
-pass. Complete the five gates above or reuse retained results only when their
-relevant inputs are byte-identical and targeted checks cover an isolated later
-change. Freeze and commit the exact candidate. A reviewed transactional entry
+Before a local candidate install, `just verify` must pass. Do not rerun `unit`
+or `docker-build` as separate gates after `crap-check` and `runtime-smoke` have
+already covered them. Reuse retained results only when their relevant inputs
+are byte-identical and targeted checks cover an isolated later change. Freeze
+and commit the exact candidate. A reviewed transactional entry
 point may install it for live feedback while preserving production stop,
 migration, rollback, and storage-integrity safeguards. Record it as a host
 candidate, not a released version. Remote CI, PR, security, merge, and release
@@ -31,12 +37,49 @@ the accepted change and pass the existing remote gates before protected-main
 merge; the GitHub release can follow in the background. See [edge.md](../edge.md)
 for the short workflow sequence.
 
+The suppression budget caps inline `noqa` and `type: ignore` counts at their
+initial historical ceilings (114 and 190); the other tracked categories start
+at zero. These are count ceilings, not a claim that every existing suppression
+was individually reviewed, and the counter cannot detect a removal balanced by
+a new suppression. Review each new or changed inline suppression in its PR and
+lower the ceilings as suppressions are removed. Native TOML ignore lists are
+not counted and must be reviewed as ordinary configuration changes. Do not add
+a suppression to make a gate pass; justify the specific exception in review.
+
+CI classifies docs-only changes explicitly and keeps the `ci` aggregate present
+as the required merge signal. It skips expensive code and runtime jobs only for
+documentation changes; scheduled and manual runs still exercise the full
+workflow. Keep workflow, lockfile, and runtime configuration changes in the
+code path rather than using workflow-level `paths-ignore`. Checkouts that do
+not need authenticated Git operations disable persisted credentials.
+
+Use [Code Clone Review](CODE_CLONES.md) for the collector-owned clone scope,
+tool settings, and semantic/API review. `just check` runs clone detection as a
+blocking gate. Every accepted finding has its own disposition tied to its
+detector and content-derived pair identity; new or changed findings require
+review.
+
 Unit, coverage, and CRAP pytest commands yield to foreground work with the
 Linux idle CPU scheduler, nice 19, and idle I/O priority. Coverage and CRAP
 recipes use pytest-xdist with automatic workers; their count can be limited
 with `PYTEST_XDIST_AUTO_NUM_WORKERS`. The canonical `just unit` command is
 bounded to 600 seconds and runs without slow tests, with the same optional
 worker cap. Keep the tests and assertions intact.
+
+## Dependency Auditing
+
+Run `just deps-audit` locally and in CI before claiming dependency readiness.
+It exports the locked dependency groups to a temporary requirements file and
+runs strict `pip-audit`; the temporary file is removed on exit. The recipe
+depends on `supply-chain-pins`, which restricts the one reviewed VCS dependency
+to its exact repository, version, and commit. The audit covers the registry
+packages in the lock. The pinned `pytest-gremlins` fork is checked by its
+source-provenance guard; PyPI advisories do not establish that fork's source
+or independently audit changes in its Git content.
+
+Dependency review checks PR deltas, and dependency submission keeps the
+repository dependency graph synchronized with `uv.lock`. Those GitHub features
+complement the locked local audit; they do not replace it.
 
 For full QA on a slow disk, put only temporary test scratch in a short,
 task-owned `TMPDIR` on tmpfs; keep logs and receipts on persistent storage.

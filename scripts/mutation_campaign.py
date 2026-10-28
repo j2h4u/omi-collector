@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -125,15 +125,20 @@ def _git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def _identity() -> dict[str, object]:
-    dirty = _git("status", "--porcelain", "--untracked-files=all")
-    if dirty:
-        raise ValueError("campaign inputs must be clean and committed")
-    env = {key: os.environ.get(key, "") for key in RELEVANT_ENV}
+def _campaign_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    env = {key: environment.get(key, "") for key in RELEVANT_ENV}
     expected = {"COVERAGE_CORE": "ctrace", "COVERAGE_FILE": "", "PYTEST_ADDOPTS": "", "UV_LINK_MODE": "hardlink"}
     invalid = [key for key, value in expected.items() if env[key] != value]
     if invalid:
         raise ValueError("campaign environment has invalid values for: " + ", ".join(invalid))
+    return env
+
+
+def _identity() -> dict[str, object]:
+    dirty = _git("status", "--porcelain", "--untracked-files=all")
+    if dirty:
+        raise ValueError("campaign inputs must be clean and committed")
+    env = _campaign_environment(os.environ)
     try:
         gremlins = distribution("pytest-gremlins")
         gremlins_version = gremlins.version
@@ -159,12 +164,7 @@ def _identity() -> dict[str, object]:
 
 
 def _read_receipt() -> dict[str, object] | None:
-    if not RECEIPT.is_file():
-        return None
-    value = cast(object, json.loads(RECEIPT.read_text(encoding="utf-8")))
-    if not isinstance(value, dict):
-        raise ValueError("campaign receipt is not an object")
-    return cast(dict[str, object], value)
+    return _read_receipt_from(RECEIPT)
 
 
 def _write_receipt(receipt: dict[str, object]) -> None:
@@ -1523,11 +1523,7 @@ def _snapshot_identity(checkout: Path, environment: dict[str, str]) -> dict[str,
     ).stdout
     if dirty:
         raise ValueError("the frozen mutation snapshot has tracked or untracked changes")
-    env = {key: environment.get(key, "") for key in RELEVANT_ENV}
-    expected = {"COVERAGE_CORE": "ctrace", "COVERAGE_FILE": "", "PYTEST_ADDOPTS": "", "UV_LINK_MODE": "hardlink"}
-    invalid = [key for key, value in expected.items() if env[key] != value]
-    if invalid:
-        raise ValueError("campaign environment has invalid values for: " + ", ".join(invalid))
+    env = _campaign_environment(environment)
     digest = _tracked_inputs_digest(checkout)
     lock = (checkout / "uv.lock").read_bytes()
     project = (checkout / "pyproject.toml").read_bytes()

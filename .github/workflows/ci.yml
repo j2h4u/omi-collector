@@ -55,6 +55,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: classify
+        name: Classify changed files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "schedule" ] || [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            base="${PR_BASE_SHA}"
+            head="${PR_HEAD_SHA}"
+          else
+            base="${BEFORE_SHA}"
+            head="${HEAD_SHA}"
+            if [[ "${base}" =~ ^0+$ ]]; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if [[ ! "${base}" =~ ^[0-9a-fA-F]{40,64}$ || ! "${head}" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+            echo "::error::cannot classify changes without valid base and head commits"
+            exit 1
+          fi
+          git diff --name-only --no-renames -z "${base}" "${head}" -- > changed-files.bin
+          if [ ! -s changed-files.bin ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          code=false
+          while IFS= read -r -d '' path; do
+            case "${path}" in
+              .planning/*|docs/*|README.md|AGENTS.md|LICENSE|CHANGELOG.md|*.md) ;;
+              *) code=true; break ;;
+            esac
+          done < changed-files.bin
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+
   pr-release-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -136,10 +194,14 @@ jobs:
             | uv run python -m scripts.validate_release_notes --body-file - --commit-count "${count}" --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}"
 
   quality:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -160,10 +222,14 @@ jobs:
         run: just check
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -183,11 +249,43 @@ jobs:
       - name: Full test and CRAP gates
         run: just crap-check
 
+  deps-audit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        with:
+          tool: just
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Audit locked dependencies
+        run: just deps-audit
+
   runtime-smoke:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
@@ -200,11 +298,15 @@ jobs:
   ci:
     if: always()
     runs-on: ubuntu-latest
-    needs: [pr-release-contract, quality, test, runtime-smoke]
+    needs: [changes, pr-release-contract, quality, test, deps-audit, runtime-smoke]
     steps:
       - name: Check required jobs
         run: |
           if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || \
              [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.code }}" = "true" ] && \
+             [ "${{ contains(needs.*.result, 'skipped') }}" = "true" ]; then
             exit 1
           fi

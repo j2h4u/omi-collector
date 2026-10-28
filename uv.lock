@@ -306,7 +306,7 @@ wheels = [
 
 [[package]]
 name = "omi-collector"
-version = "0.19.11"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "bleak" },

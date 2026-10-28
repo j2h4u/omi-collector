@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.0.0](https://github.com/j2h4u/omi-collector/compare/v0.19.11...v1.0.0) (2026-10-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* expose persistent pendant storage failure episodes ([#308](https://github.com/j2h4u/omi-collector/issues/308))
+
+### Features
+
+* expose persistent pendant storage failure episodes ([#308](https://github.com/j2h4u/omi-collector/issues/308)) ([b25e584](https://github.com/j2h4u/omi-collector/commit/b25e584894c720221446b785ab60e187d0fd4cad))
+
+
+### Performance
+
+* pause idle pendant discovery between scan windows ([0c2670f](https://github.com/j2h4u/omi-collector/commit/0c2670f77257a64df051b71e77bbf85b86195ab1))
+
+
+### Tests
+
+* control publication retry clock under slow I/O ([0c2670f](https://github.com/j2h4u/omi-collector/commit/0c2670f77257a64df051b71e77bbf85b86195ab1))
+
 ## [0.19.11](https://github.com/j2h4u/omi-collector/compare/v0.19.10...v0.19.11) (2026-10-28)
 
 

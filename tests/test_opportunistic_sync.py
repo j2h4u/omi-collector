@@ -1194,7 +1194,8 @@ async def test_observation_close_cancellation_does_not_mask_primary_failure(
 async def test_cancellation_during_observation_close_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    close_started = threading.Event()
+    close_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
     release_close = threading.Event()
 
     class BlockingObservationWriter:
@@ -1205,8 +1206,8 @@ async def test_cancellation_during_observation_close_propagates(
             return None
 
         def close(self) -> None:
-            close_started.set()
-            release_close.wait(2)
+            loop.call_soon_threadsafe(close_started.set)
+            release_close.wait()
 
     def make_blocking_observation_writer(
         _runtime_instance: OpportunisticRuntime,
@@ -1223,13 +1224,16 @@ async def test_cancellation_during_observation_close_propagates(
     )
 
     try:
-        assert await asyncio.to_thread(close_started.wait, 1)
+        await asyncio.wait_for(close_started.wait(), timeout=5.0)
         task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
         release_close.set()
         with pytest.raises(asyncio.CancelledError):
             await task
     finally:
         release_close.set()
+        await _finish_task(task, cancel=True)
 
 
 @_async_test

@@ -5,6 +5,9 @@ import struct
 from collections import deque
 from contextlib import suppress
 
+import pytest
+
+import omi_collector.capture.adapters.ble_scan_diagnostics as diagnostics_module
 from omi_collector.capture.adapters.ble_scan_diagnostics import ScanDiagnostics
 
 
@@ -27,6 +30,9 @@ class _Socket:
         self.packets: deque[bytes] = deque()
         self.closed = False
         self.options: list[tuple[int, int, bytes]] = []
+        self.fail_option: int | None = None
+        self.fail_readback = False
+        self.strip_le_meta = not le_meta_enabled
         high_mask = 1 << 30 if le_meta_enabled else 0
         self.readback = struct.pack("<IIIH2x", 0, 0, high_mask, 0)
 
@@ -38,8 +44,16 @@ class _Socket:
 
     def setsockopt(self, level: int, option: int, value: bytes) -> None:
         self.options.append((level, option, value))
+        if self.fail_option == len(self.options):
+            raise OSError("injected filter failure")
+        _, _, high, _ = struct.unpack("<IIIH2x", value)
+        self.readback = struct.pack(
+            "<IIIH2x", 1 << 4, (1 << 14) | (1 << 15) | (1 << 16), 0 if self.strip_le_meta else high, 0
+        )
 
     def getsockopt(self, _level: int, _option: int, _size: int) -> bytes:
+        if self.fail_readback:
+            raise OSError("injected readback failure")
         return self.readback
 
     def recv(self, _size: int) -> bytes:
@@ -121,10 +135,19 @@ def test_start_reads_effective_event_filter_and_stop_closes_socket() -> None:
         assert observer.snapshot()["counts"]["legacy_advertising"] == 1  # type: ignore[index]
         assert len(sock.options) == 1
         assert sock.options[0][2] == struct.pack("<IIIH2x", 1 << 4, (1 << 14) | (1 << 15) | (1 << 16), 1 << 30, 0)
+        observer.healthy(1)
+        observer.healthy(1)
+        assert len(sock.options) == 2
+        assert sock.options[-1][2] == struct.pack("<IIIH2x", 1 << 4, (1 << 14) | (1 << 15) | (1 << 16), 0, 0)
+        assert observer.snapshot()["capture"] == {
+            "mode": "quiet",
+            "counts_scope": "advertising_capture_windows",
+        }
 
         await observer.stop()
         assert sock.closed
         assert observer.snapshot()["status"] == "stopped"
+        assert observer.snapshot()["capture"]["mode"] == "stopped"  # type: ignore[index]
         assert not asyncio.get_running_loop().remove_reader(read_fd)
 
         next_read_fd, next_write_fd = os.pipe()
@@ -154,6 +177,123 @@ def test_kernel_stripped_le_meta_filter_is_reported() -> None:
     asyncio.run(run())
 
 
+def test_probe_holds_full_filter_until_all_probes_finish_and_close_wakes_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(diagnostics_module, "_PROBE_SECONDS", 10.0)
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        sock = _Socket(read_fd, write_fd)
+        observer = ScanDiagnostics("hci0", socket_factory=lambda *_args: sock, native_bind=lambda *_args: None)
+        await observer.start()
+        observer.healthy(1)
+        one = asyncio.create_task(observer.probe(1))
+        two = asyncio.create_task(observer.probe(1))
+        await asyncio.sleep(0)
+        assert observer.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+        observer.healthy(1)
+        assert len(sock.options) == 4
+        one.cancel()
+        await asyncio.gather(one, return_exceptions=True)
+        observer.end_probe(1)
+        assert observer.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+        await observer.stop()
+        assert await two is False
+        observer.end_probe(1)
+        assert sock.closed
+
+    asyncio.run(run())
+
+
+def test_filter_errors_fail_open_and_mark_unavailable_radio_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(diagnostics_module, "_PROBE_SECONDS", 0.01)
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        sock = _Socket(read_fd, write_fd)
+        observer = ScanDiagnostics("hci0", socket_factory=lambda *_args: sock, native_bind=lambda *_args: None)
+        await observer.start()
+        sock.fail_option = 2
+        observer.healthy(1)
+        assert observer.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+        sock.fail_option = 3
+        assert await observer.probe(1) is False
+        assert observer.snapshot()["capture"]["mode"] == "unavailable"  # type: ignore[index]
+        observer.end_probe(1)
+        sock.fail_option = None
+        assert await observer.probe(1)
+        observer.end_probe(1)
+        assert observer.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+        await observer.stop()
+
+    asyncio.run(run())
+
+
+def test_unreadable_quiet_filter_readback_is_not_reported_as_full() -> None:
+    async def run() -> None:
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        sock = _Socket(read_fd, write_fd)
+        observer = ScanDiagnostics("hci0", socket_factory=lambda *_args: sock, native_bind=lambda *_args: None)
+        await observer.start()
+        sock.fail_readback = True
+        observer.healthy(1)
+        assert observer.snapshot()["capture"]["mode"] == "unavailable"  # type: ignore[index]
+        await observer.stop()
+
+    asyncio.run(run())
+
+
+def test_probe_requires_fresh_recovery_and_snapshots_before_restoring_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(diagnostics_module, "_PROBE_SECONDS", 0.01)
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        sock = _Socket(read_fd, write_fd)
+        observer = ScanDiagnostics("hci0", socket_factory=lambda *_args: sock, native_bind=lambda *_args: None)
+        await observer.start()
+        observer.healthy(1)
+
+        assert await observer.probe(1)
+        assert observer.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+        observer.end_probe(1)
+        assert observer.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+
+        recovery = asyncio.create_task(observer.probe(1))
+        await asyncio.sleep(0)
+        observer.healthy(1)
+        assert await recovery
+        assert observer.snapshot()["capture"]["mode"] == "full"  # type: ignore[index]
+        observer.end_probe(1)
+        assert observer.snapshot()["capture"]["mode"] == "quiet"  # type: ignore[index]
+        await observer.stop()
+
+    asyncio.run(run())
+
+
+def test_nested_widen_failure_invalidates_other_probe_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(diagnostics_module, "_PROBE_SECONDS", 10.0)
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        sock = _Socket(read_fd, write_fd)
+        observer = ScanDiagnostics("hci0", socket_factory=lambda *_args: sock, native_bind=lambda *_args: None)
+        await observer.start()
+        first = asyncio.create_task(observer.probe(1))
+        await asyncio.sleep(0)
+        sock.fail_option = 3
+        assert await observer.probe(1) is False
+        observer.end_probe(1)
+        observer._probe_wakeup.set()  # type: ignore[union-attr]
+        assert await first is False
+        assert observer.snapshot()["capture"]["mode"] == "unavailable"  # type: ignore[index]
+        observer.end_probe(1)
+        await observer.stop()
+
+    asyncio.run(run())
+
+
 def test_missing_cap_net_raw_degrades_without_raising() -> None:
     async def run() -> None:
         observer = ScanDiagnostics(
@@ -163,6 +303,7 @@ def test_missing_cap_net_raw_degrades_without_raising() -> None:
         await observer.start()
         assert observer.snapshot()["status"] == "degraded"
         assert observer.snapshot()["failure"] == "cap_net_raw_unavailable"
+        assert observer.snapshot()["capture"]["mode"] == "unavailable"  # type: ignore[index]
         await observer.stop()
 
     asyncio.run(run())

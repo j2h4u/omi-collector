@@ -15,6 +15,7 @@ from omi_collector.config import PresenceConfig
 class FakeDiagnostics:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events = events if events is not None else []
+        self.healthy_generations: list[int] = []
 
     async def prepare(self, generation: int) -> None:
         self.events.append(f"prepare:{generation}")
@@ -24,6 +25,9 @@ class FakeDiagnostics:
 
     async def snapshot(self, generation: int) -> dict[str, object]:
         return {"generation": generation}
+
+    def healthy(self, generation: int) -> None:
+        self.healthy_generations.append(generation)
 
 
 class FakeSink:
@@ -234,6 +238,7 @@ def test_radio_activity_resets_deadline_and_recovers_prior_incident_once() -> No
         assert monitor.next_deadline == 7.0
         assert not monitor.radio_activity(3, 2.5)
         assert monitor._callback_count == 2
+        assert diagnostics.healthy_generations == [4, 4]
 
     asyncio.run(scenario())
 

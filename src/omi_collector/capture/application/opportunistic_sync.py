@@ -97,7 +97,6 @@ class _PublicDrainCoordinator:
         self.runtime = runtime
         self.wake = asyncio.Event()
         self._db_lock = asyncio.Lock()
-        self._ring: tuple[int, str] | None = None
         self._battery: tuple[int, str] | None = None
         self._stopping = False
         self._task: asyncio.Task[None] | None = None
@@ -111,9 +110,16 @@ class _PublicDrainCoordinator:
     def _wake_on_loop(self) -> None:
         self._loop.call_soon_threadsafe(self.wake.set)
 
-    def observe_info(self, info: RingInfo, observed_at: str) -> None:
-        self._ring = (info.unread_packets, observed_at)
-        self.wake.set()
+    async def observe_info(self, info: RingInfo, observed_at: str) -> None:
+        await join_owned(self._record_durable_observation(self.port.record_info, info.unread_packets, observed_at))
+
+    async def observe_storage_unavailable(self, observed_at: str) -> None:
+        await join_owned(self._record_durable_observation(self.port.record_storage_unavailable, observed_at))
+
+    async def _record_durable_observation(self, operation: Callable[..., None], *args: object) -> None:
+        async with self._db_lock:
+            await joined_to_thread(operation, *args)
+            self.port.wake()
 
     def observe_battery(self, percent: int, observed_at: str) -> None:
         self._battery = (percent, observed_at)
@@ -121,23 +127,18 @@ class _PublicDrainCoordinator:
 
     async def before_closure(self) -> None:
         async with self._db_lock:
-            ring, battery = None, self._battery
-            self._ring = None
-            if ring is None and battery is None:
+            battery = self._battery
+            if battery is None:
                 return
             try:
-                await joined_to_thread(self.port.update_observations, ring=ring, battery=battery)
+                await joined_to_thread(self.port.update_observations, battery=battery)
             except Exception as error:  # noqa: BLE001 - public observations are best effort
-                self._ring = None
                 self._log(error, "observation")
             else:
-                if self._ring == ring:
-                    self._ring = None
                 if self._battery == battery:
                     self._battery = None
 
     async def publish_after_closure(self) -> None:
-        self._ring = None
         self.wake.set()
 
     async def close(self) -> None:
@@ -169,16 +170,14 @@ class _PublicDrainCoordinator:
 
     async def _flush_observations(self) -> None:
         async with self._db_lock:
-            ring, battery = self._ring, self._battery
-            if ring is None and battery is None:
+            battery = self._battery
+            if battery is None:
                 return
             try:
-                await joined_to_thread(self.port.update_observations, ring=ring, battery=battery)
+                await joined_to_thread(self.port.update_observations, battery=battery)
             except Exception as error:  # noqa: BLE001 - public observations are best effort
                 self._log(error, "observation")
                 return
-            if self._ring == ring:
-                self._ring = None
             if self._battery == battery:
                 self._battery = None
 
@@ -417,6 +416,9 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
         observe_info=observe_info,
         observe_public_info=run.public_drain.observe_info if run.public_drain is not None else None,
         observe_public_battery=run.public_drain.observe_battery if run.public_drain is not None else None,
+        observe_storage_unavailable=(
+            run.public_drain.observe_storage_unavailable if run.public_drain is not None else None
+        ),
         close_verified_drain=partial(_close_verified_drain, run, reconciler) if run.public_drain is not None else None,
         close_visit=close_visit,
         load_recovery=load_recovery,

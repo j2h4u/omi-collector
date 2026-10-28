@@ -48,6 +48,7 @@ class StateKind(StrEnum):
     PUBLICATION_CONTRACT = "publication_contract"
     PUBLICATION_V2_FRONTIER = "publication_v2_frontier"
     PACKET_SUMMARY = "packet_summary"
+    PENDANT_STORAGE_INCIDENT = "pendant_storage_incident"
 
 
 class StateDBError(RuntimeError):

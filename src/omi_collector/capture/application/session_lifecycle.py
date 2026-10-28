@@ -216,6 +216,7 @@ class SessionLifecycleCallbacks:
     exit_capture_priority: Callable[[], Awaitable[None]] | None = None
     observe_public_info: Callable[[RingInfo, str], object] | None = None
     observe_public_battery: Callable[[int, str], object] | None = None
+    observe_storage_unavailable: Callable[[str], object] | None = None
     close_verified_drain: Callable[[RingInfo, str], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
@@ -621,6 +622,8 @@ class SessionLifecycle:
         self, error: Exception, execution: _SessionExecution, phase: SessionPhaseState
     ) -> None:
         try:
+            if _storage_not_ready_ack(error) is not None:
+                await self._record_storage_unavailable()
             execution.outcome = await recoverable_session_outcome(
                 execution.session, phase.value, error, self.run.options, self.run.runtime
             )
@@ -749,7 +752,7 @@ class SessionLifecycle:
                     info_operation,
                     self.run.options.timeouts.info,
                 )
-                self._observe_public_info(info)
+                await self._observe_public_info(info)
                 if self.run.callbacks.observe_info is not None:
                     try:
                         result = self.run.callbacks.observe_info(info)
@@ -768,6 +771,7 @@ class SessionLifecycle:
             except collector.RingAcknowledgementError as error:
                 if error.status != STATUS_STORAGE_NOT_READY:
                     raise
+                await self._record_storage_unavailable()
                 self._storage_not_ready_responses += 1
                 if self._storage_not_ready_responses >= self.run.options.config.retry.max_storage_not_ready_responses:
                     raise StorageNotReadySessionError(
@@ -777,14 +781,25 @@ class SessionLifecycle:
                 await report_activity(self.run.options.activity, "storage_wait", delay)
                 await sleep(self.run.options.sleep, delay)
 
-    def _observe_public_info(self, info: RingInfo) -> None:
+    async def _observe_public_info(self, info: RingInfo) -> None:
         callback = self.run.callbacks.observe_public_info
         if callback is not None or self.run.callbacks.close_verified_drain is not None:
             observed_at = utc_timestamp(self.run.options.host_time())
             self._last_info_observed_at = observed_at
             if callback is None:
                 return
-            callback(info, observed_at)
+            result = callback(info, observed_at)
+            if inspect.isawaitable(result):
+                await result
+
+    async def _record_storage_unavailable(self) -> None:
+        callback = self.run.callbacks.observe_storage_unavailable
+        if callback is None:
+            return
+        observed_at = utc_timestamp(self.run.options.host_time())
+        result = callback(observed_at)
+        if inspect.isawaitable(result):
+            await result
 
     async def _collect_telemetry(
         self, session: RingSession, info: RingInfo, phase: SessionPhaseState
@@ -1064,6 +1079,21 @@ def _wake_is_fresh(wake: PresenceWake, now: float, max_gap: float) -> bool:
 
 def _retryable_for_runtime(error: BaseException, runtime: CaptureRuntimePort) -> bool:
     return _retryable(error, is_device_busy=runtime.is_device_busy_error)
+
+
+def _storage_not_ready_ack(error: BaseException) -> collector.RingAcknowledgementError | None:
+    while True:
+        if isinstance(error, collector.RingAcknowledgementError):
+            return error if error.status == STATUS_STORAGE_NOT_READY else None
+        if not isinstance(
+            error,
+            (collector.TransferInterruptedError, collector.AdvanceUncertainError, StorageNotReadySessionError),
+        ):
+            return None
+        cause = error.__cause__
+        if cause is None:
+            return None
+        error = cause
 
 
 def _retryable(

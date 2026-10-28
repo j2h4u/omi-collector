@@ -34,6 +34,7 @@ from omi_collector.capture.adapters.internal_audio_store import (
     read_capture_source,
 )
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
+from omi_collector.capture.adapters.public_drain import PublicDrainProjection
 from omi_collector.capture.adapters.publication import SealResult
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics, read_quality_events
 from omi_collector.capture.adapters.quarantine import QuarantineSalvageDeferredError, SweepResult
@@ -76,6 +77,7 @@ from omi_collector.capture.application.opportunistic_sync import (
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
 )
+from omi_collector.capture.application.owned_work import joined_to_thread
 from omi_collector.capture.application.ports import (
     BatchWriterPort,
     CaptureRuntimePort,
@@ -431,56 +433,110 @@ def _options(
     )
 
 
+class _RecordingPublicDrainPort:
+    def __init__(self) -> None:
+        self.snapshot: dict[str, object] = {
+            "ring": None,
+            "battery": None,
+            "last_drain": {"event_id": "stable", "completed_at": "earlier"},
+        }
+        self.wake_callback: Callable[[], None] | None = None
+
+    def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
+        self.wake_callback = callback
+
+    def update_observations(
+        self,
+        *,
+        ring: tuple[int, str] | None = None,
+        battery: tuple[int, str] | None = None,
+    ) -> None:
+        if ring is not None:
+            self.snapshot["ring"] = ring
+        if battery is not None:
+            self.snapshot["battery"] = battery
+
+    def record_info(self, unread_packets: int, observed_at: str) -> None:
+        self.snapshot["ring"] = (unread_packets, observed_at)
+
+    def record_storage_unavailable(self, observed_at: str) -> None:
+        self.snapshot["ring"] = None
+        self.snapshot["storage"] = observed_at
+
+    def wake(self) -> None:
+        assert self.wake_callback is not None
+        self.wake_callback()
+
+    def publish_snapshot(self) -> None:
+        if self.wake_callback is not None:
+            self.wake_callback()
+
+    def arm_pending(self, source_id: str, durable_next_sequence: int) -> None:
+        del source_id, durable_next_sequence
+        raise AssertionError("shutdown test does not arm a drain")
+
+
 @_async_test
 async def test_public_drain_coordinator_flushes_latest_samples_when_closed() -> None:
-    class PublicDrain:
-        def __init__(self) -> None:
-            self.snapshot: dict[str, object] = {
-                "ring": None,
-                "battery": None,
-                "last_drain": {"event_id": "stable", "completed_at": "earlier"},
-            }
-            self.wake_callback: Callable[[], None] | None = None
-
-        def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
-            self.wake_callback = callback
-
-        def update_observations(
-            self,
-            *,
-            ring: tuple[int, str] | None = None,
-            battery: tuple[int, str] | None = None,
-        ) -> None:
-            if ring is not None:
-                self.snapshot["ring"] = ring
-            if battery is not None:
-                self.snapshot["battery"] = battery
-
-        def publish_snapshot(self) -> None:
-            if self.wake_callback is not None:
-                self.wake_callback()
-
-        def arm_pending(self, source_id: str, durable_next_sequence: int) -> None:
-            del source_id, durable_next_sequence
-            raise AssertionError("shutdown test does not arm a drain")
-
-    public_drain = PublicDrain()
+    public_drain = _RecordingPublicDrainPort()
     coordinator = _PublicDrainCoordinator(
         public_drain,
         cast(CaptureRuntimePort, SimpleNamespace(debug_exception=lambda *_args, **_kwargs: None)),
     )
     coordinator.start()
-    coordinator.observe_info(RingInfo(8, 11, 10000, 0, RECORD_SIZE), "ring-now")
+    await coordinator.observe_info(RingInfo(8, 11, 10000, 0, RECORD_SIZE), "ring-now")
+    await coordinator.observe_storage_unavailable("fault-now")
     coordinator.observe_battery(63, "battery-now")
 
     await coordinator.close()
 
     assert public_drain.snapshot == {
-        "ring": (3, "ring-now"),
+        "ring": None,
         "battery": (63, "battery-now"),
         "last_drain": {"event_id": "stable", "completed_at": "earlier"},
+        "storage": "fault-now",
     }
     assert public_drain.wake_callback is None
+
+
+@_async_test
+async def test_cancellation_joins_locked_storage_fault_and_info_commits(tmp_path: Path) -> None:
+    db = await joined_to_thread(StateDB, tmp_path / "state.sqlite3")
+    projection = PublicDrainProjection(db, tmp_path / "public" / "drain.json")
+    coordinator = _PublicDrainCoordinator(
+        projection,
+        cast(CaptureRuntimePort, SimpleNamespace(debug_exception=lambda *_args, **_kwargs: None)),
+    )
+
+    await coordinator._db_lock.acquire()
+    fault_at = "2026-10-17T12:01:00+00:00"
+    fault = asyncio.create_task(coordinator.observe_storage_unavailable(fault_at))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    fault.cancel()
+    coordinator._db_lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await fault
+    incident = await joined_to_thread(db.get, StateKind.PENDANT_STORAGE_INCIDENT, "current")
+    row = await joined_to_thread(db.get, StateKind.PENDANT_DRAIN, "current")
+    assert incident is not None and incident["status"] == "open"
+    assert row is not None and row["ring"] is None
+
+    await coordinator._db_lock.acquire()
+    info_at = "2026-10-17T12:02:00+00:00"
+    recovery = asyncio.create_task(coordinator.observe_info(RingInfo(10, 13, 10000, 0, RECORD_SIZE), info_at))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    recovery.cancel()
+    coordinator._db_lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+    resolved = await joined_to_thread(db.get, StateKind.PENDANT_STORAGE_INCIDENT, "current")
+    row = await joined_to_thread(db.get, StateKind.PENDANT_DRAIN, "current")
+    assert resolved is not None and resolved["status"] == "resolved"
+    assert resolved["resolved_at"] == info_at
+    assert row is not None and row["ring"] == {"unread_packets": 3, "observed_at": info_at}
+    await coordinator.close()
 
 
 class _BlockingSealTarget:
@@ -3581,11 +3637,16 @@ async def test_storage_not_ready_read_ack_reconnects_and_continues_collection(tm
             WriteStep(b"\x10", (_info(10, 11),)),
             WriteStep(encode_advance_command(11), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(11, 11),)),
+            WriteStep(b"\x10", (_info(11, 11),)),
         ),
     )
 
+    staging = _staging_store(tmp_path, _capture_root(tmp_path))
+    staging.public_drain.path.parent.mkdir(parents=True, exist_ok=True)
     result = await run_opportunistic_collector(
-        Provider([first, recovered]), _staging_store(tmp_path, _capture_root(tmp_path)), _options()
+        Provider([first, recovered]),
+        staging,
+        replace(_options(), public_drain=staging.public_drain),
     )
 
     assert isinstance(result, CollectionResult)
@@ -3597,7 +3658,12 @@ async def test_storage_not_ready_read_ack_reconnects_and_continues_collection(tm
         b"\x10",
         encode_advance_command(11),
         b"\x10",
+        b"\x10",
     ]
+    incident = storage_call(lambda: staging.state_db.get(StateKind.PENDANT_STORAGE_INCIDENT, "current"))
+    drain = storage_call(lambda: staging.state_db.get(StateKind.PENDANT_DRAIN, "current"))
+    assert incident is not None and incident["status"] == "resolved"
+    assert drain is not None and drain["ring"]["unread_packets"] == 0  # type: ignore[index]
 
 
 def test_session_retry_outcome_only_storage_not_ready_ack_is_retryable() -> None:

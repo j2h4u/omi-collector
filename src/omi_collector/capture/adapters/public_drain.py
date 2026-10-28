@@ -21,7 +21,9 @@ from omi_collector.capture.domain.ring_protocol import RingInfo
 
 _ROW_ID = "current"
 _VERSION = 1
-_PUBLIC_VERSION = 2
+_PUBLIC_VERSION = 3
+_STORAGE_INCIDENT_ID = "current"
+_STORAGE_INCIDENT_VERSION = 1
 _ROW_FIELDS = frozenset(
     {"version", "ring", "last_drain", "battery", "pending_event_id", "pending_source_id", "pending_frontier"}
 )
@@ -75,8 +77,11 @@ class PublicDrainProjection:
                 except FileNotFoundError:
                     continue
             self._stale_files_scanned = True
-        row = self._state_db.get(StateKind.PENDANT_DRAIN, _ROW_ID)
-        public = _public_row(row, read_ble_scan_incident(self._state_db))
+        with self._state_db.transaction() as transaction:
+            row = transaction.get(StateKind.PENDANT_DRAIN, _ROW_ID)
+            bluetooth_incident = read_ble_scan_incident(transaction)
+            storage_incident = transaction.get(StateKind.PENDANT_STORAGE_INCIDENT, _STORAGE_INCIDENT_ID)
+        public = _public_row(row, bluetooth_incident, storage_incident)
         encoded = (json.dumps(public, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         if not self._needs_sync and _matches_public_file(self.path, encoded, parent_stat.st_gid):
             return
@@ -114,6 +119,42 @@ class PublicDrainProjection:
                 row["ring"] = {"unread_packets": ring[0], "observed_at": ring[1]}
             if battery is not None:
                 row["battery"] = {"percent": battery[0], "observed_at": battery[1]}
+            transaction.put(StateKind.PENDANT_DRAIN, _ROW_ID, row)
+
+    def record_info(self, unread_packets: int, observed_at: str) -> None:
+        """Commit a fresh INFO and resolve storage failure as one durable observation."""
+        _validate_ring((unread_packets, observed_at))
+        with self._state_db.transaction() as transaction:
+            row = _row_or_empty(transaction.get(StateKind.PENDANT_DRAIN, _ROW_ID))
+            row["ring"] = {"unread_packets": unread_packets, "observed_at": observed_at}
+            incident = transaction.get(StateKind.PENDANT_STORAGE_INCIDENT, _STORAGE_INCIDENT_ID)
+            if incident is not None:
+                incident = _validate_storage_incident(incident)
+                if incident["status"] == "open":
+                    incident["status"] = "resolved"
+                    incident["resolved_at"] = observed_at
+                    transaction.put(StateKind.PENDANT_STORAGE_INCIDENT, _STORAGE_INCIDENT_ID, incident)
+            transaction.put(StateKind.PENDANT_DRAIN, _ROW_ID, row)
+
+    def record_storage_unavailable(self, observed_at: str) -> None:
+        """Open or retain the current explicit pendant-storage incident and clear stale INFO."""
+        _validate_timestamp(observed_at)
+        with self._state_db.transaction() as transaction:
+            row = _row_or_empty(transaction.get(StateKind.PENDANT_DRAIN, _ROW_ID))
+            row["ring"] = None
+            incident = transaction.get(StateKind.PENDANT_STORAGE_INCIDENT, _STORAGE_INCIDENT_ID)
+            if incident is None or _validate_storage_incident(incident)["status"] == "resolved":
+                transaction.put(
+                    StateKind.PENDANT_STORAGE_INCIDENT,
+                    _STORAGE_INCIDENT_ID,
+                    {
+                        "version": _STORAGE_INCIDENT_VERSION,
+                        "incident_id": str(uuid4()),
+                        "status": "open",
+                        "detected_at": observed_at,
+                        "resolved_at": None,
+                    },
+                )
             transaction.put(StateKind.PENDANT_DRAIN, _ROW_ID, row)
 
     def arm_pending(self, source_id: str, durable_next_sequence: int) -> None:
@@ -184,10 +225,22 @@ class PublicDrainProjection:
         tx.put(StateKind.PENDANT_DRAIN, _ROW_ID, row)
 
 
-def _public_row(row: dict[str, object] | None, incident: dict[str, object] | None) -> dict[str, object]:
+def _public_row(
+    row: dict[str, object] | None,
+    incident: dict[str, object] | None,
+    storage_incident: dict[str, object] | None,
+) -> dict[str, object]:
     bluetooth = _public_incident(incident)
+    storage = _public_storage_incident(storage_incident)
     if row is None:
-        return {"version": _PUBLIC_VERSION, "ring": None, "last_drain": None, "battery": None, "bluetooth": bluetooth}
+        return {
+            "version": _PUBLIC_VERSION,
+            "ring": None,
+            "last_drain": None,
+            "battery": None,
+            "bluetooth": bluetooth,
+            "storage": storage,
+        }
     validated = _validate_row(row)
     return {
         "version": _PUBLIC_VERSION,
@@ -195,7 +248,36 @@ def _public_row(row: dict[str, object] | None, incident: dict[str, object] | Non
         "last_drain": validated["last_drain"],
         "battery": validated["battery"],
         "bluetooth": bluetooth,
+        "storage": storage,
     }
+
+
+def _public_storage_incident(incident: dict[str, object] | None) -> dict[str, object] | None:
+    if incident is None:
+        return None
+    validated = _validate_storage_incident(incident)
+    return {
+        "incident_id": validated["incident_id"],
+        "status": validated["status"],
+        "detected_at": validated["detected_at"],
+        "resolved_at": validated["resolved_at"],
+    }
+
+
+def _validate_storage_incident(incident: dict[str, object]) -> dict[str, object]:
+    if set(incident) != {"version", "incident_id", "status", "detected_at", "resolved_at"}:
+        raise ValueError("pendant storage incident schema is invalid")
+    if type(incident["version"]) is not int or incident["version"] != _STORAGE_INCIDENT_VERSION:
+        raise ValueError("pendant storage incident schema is invalid")
+    if not isinstance(incident["incident_id"], str) or not incident["incident_id"].strip():
+        raise ValueError("pendant storage incident identity is invalid")
+    _validate_timestamp(cast(str, incident["detected_at"]))
+    if incident["status"] == "open" and incident["resolved_at"] is None:
+        return incident
+    if incident["status"] == "resolved":
+        _validate_timestamp(cast(str, incident["resolved_at"]))
+        return incident
+    raise ValueError("pendant storage incident status is invalid")
 
 
 def _public_incident(incident: dict[str, object] | None) -> dict[str, object] | None:

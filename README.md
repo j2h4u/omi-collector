@@ -241,16 +241,17 @@ their custody boundaries.
 For a notification consumer, Collector publishes the small atomic snapshot
 `collector/public/pendant-drain.json` beside the private state database. Mount
 only `collector/public` read-only; the consumer does not need SQLite, READY,
-or service-control access. Consumers must accept both version 1 and version 2
-before version 2 is deployed. The version-2 document has exactly five fields:
+or service-control access. Consumers must accept version 3 before version 3 is
+deployed. The version-3 document has exactly six fields:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "ring": {"observed_at": "2026-10-17T12:00:00+00:00", "unread_packets": 0},
   "last_drain": {"event_id": "example-stable-id", "completed_at": "2026-10-17T12:00:00+00:00"},
   "battery": {"percent": 85, "observed_at": "2026-10-17T11:59:59+00:00"},
-  "bluetooth": null
+  "bluetooth": null,
+  "storage": null
 }
 ```
 
@@ -264,6 +265,10 @@ fault. Pendant absence is normal; GATT work and intentional scan pauses are
 excluded. The initial behavior records bounded evidence and does not restart
 the scanner automatically. A resolved incident remains visible as the latest
 summary until another incident replaces it.
+`storage` is `null` until an explicit pendant storage-not-ready acknowledgement.
+It contains only the stable incident ID, open/resolved
+status, detection time, and optional resolution time. A later valid `INFO`
+resolves the same incident; reconnects and other errors do not clear it.
 Observation timestamps are when
 the device was read, not when the JSON was generated. `last_drain` records a
 confirmed empty ring after durable host storage; its ID survives restarts and

@@ -3502,12 +3502,16 @@ def _publish_v2_commit_ledger(state: StateTransaction, proposal: _V2Commit) -> N
 def _advance_v2_commit_members(connection: sqlite3.Connection, proposal: _V2Commit) -> None:
     cohort = proposal.cohort
     for item in proposal.progress:
-        changed = connection.execute(
-            "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
-            (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
-        )
-        if changed.rowcount != 1:
+        if not _advance_cohort_member_cursor(connection, cohort.cohort_id, item):
             raise ReadyBundleError("v2 cohort member changed before final commit")
+
+
+def _advance_cohort_member_cursor(connection: sqlite3.Connection, cohort_id: str, item: _MemberProgress) -> bool:
+    changed = connection.execute(
+        "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
+        (item.new_cursor, cohort_id, item.member_ordinal, item.old_cursor),
+    )
+    return changed.rowcount == 1
 
 
 def _finish_v2_commit(connection: sqlite3.Connection, proposal: _V2Commit) -> None:
@@ -4163,11 +4167,7 @@ def _advance_typed_custody_members(connection: sqlite3.Connection, commit: _Cust
     for item in commit.progress:
         if item.new_cursor == item.old_cursor:
             continue
-        updated = connection.execute(
-            "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
-            (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
-        )
-        if updated.rowcount != 1:
+        if not _advance_cohort_member_cursor(connection, cohort.cohort_id, item):
             raise ReadyBundleError("typed cohort member changed before custody commit")
 
 

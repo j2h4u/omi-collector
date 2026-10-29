@@ -34,6 +34,23 @@ CONTRACT_CASES = [
     for forbidden in contract["forbidden_modules"]
     for mode in ("direct", "indirect")
 ]
+POLICY_WITNESSES = (
+    ("core-independent-from-cli", "omi_collector.core", ("omi_collector.cli",)),
+    (
+        "capture-domain-independent-from-outer-layers",
+        "omi_collector.capture.domain",
+        (
+            "omi_collector.capture.application",
+            "omi_collector.capture.adapters",
+            "omi_collector.capture.cli",
+        ),
+    ),
+    (
+        "capture-application-uses-ports",
+        "omi_collector.capture.application",
+        ("omi_collector.capture.adapters", "bleak", "dbus_fast"),
+    ),
+)
 
 
 @pytest.fixture
@@ -88,6 +105,26 @@ def test_empty_configured_packages_pass(import_project: Path) -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert all(contract["name"] in result.stdout for contract in contracts)
+
+
+@pytest.mark.parametrize(
+    ("contract_id", "source", "forbidden"),
+    POLICY_WITNESSES,
+    ids=[contract_id for contract_id, _, _ in POLICY_WITNESSES],
+)
+def test_required_import_policy_witnesses_remain_configured(
+    contract_id: str,
+    source: str,
+    forbidden: tuple[str, ...],
+) -> None:
+    contract = next(
+        (contract for contract in configured_contracts() if contract["id"] == contract_id),
+        None,
+    )
+
+    assert contract is not None, f"missing import contract {contract_id}"
+    assert source in contract["source_modules"]
+    assert set(forbidden) <= set(contract["forbidden_modules"])
 
 
 def test_configured_contracts_accept_lawful_adapter_port_import(import_project: Path) -> None:

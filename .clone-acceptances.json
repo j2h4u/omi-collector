@@ -992,9 +992,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "95ce28b5df6fcdb25237d701beb4e21e871efce513c8d59468adb460b113755c",
+      "identity": "7604f602a6cb822db20f280b75656b243a54e842cee52e9a810190d493315a5d",
       "count": 1,
-      "reason": "Commit, custody, conflict and retirement reconcilers each compare operation-specific old/proposed/third states, retry once and fail-stop differently. Shared error classification and fail-stop are already helpers; a generic retry callback would hide distinct durable witnesses and result contracts. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4059-4070 ~ src/omi_collector/capture/adapters/ready_bundles.py:4565-4576."
+      "reason": "Custody reconciliation compares durable cohort and source-coverage proposals and returns the proposed cohort or completion. Retirement reconciliation compares source identity/cursor and compaction debt, validates stalled/progressed results, and returns a progress boolean; their caught exception sets also differ. Shared two-attempt syntax is not a common operation: error classification and fail-stop already use shared helpers. Keep operation-specific recovery contracts instead of callback-driven retry machinery. Independent Astra review and public-API custody/retirement rollback and lost-response tests cover the distinction. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4123-4135 ~ src/omi_collector/capture/adapters/ready_bundles.py:4641-4653."
     },
     {
       "detector": "jscpd",

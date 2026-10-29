@@ -2557,14 +2557,18 @@ def _require_v2_stage_space(audio_store: InternalAudioStore, ready_root: Path, g
         raise ReadyBundleError("v2 publication space reserve could not be inspected") from error
 
 
-def _create_v2_stage(
-    audio_store: InternalAudioStore,
-    ready_root: Path,
-    cohort: _TypedCohort,
-    group: _V2PreparedGroup,
-    page_limit: int,
-) -> _V2Stage:
-    _require_v2_stage_space(audio_store, ready_root, group)
+@dataclass(frozen=True, slots=True)
+class _V2StageProof:
+    descriptor: bytes
+    descriptor_sha256: str
+    packed_runs: bytes
+    records_sha256: str
+    page_index: bytes
+    scratch: sqlite3.Connection
+
+
+@contextmanager
+def _prepare_v2_stage_proof(group: _V2PreparedGroup, page_limit: int) -> Iterator[_V2StageProof]:
     descriptor = _v2_descriptor(group)
     descriptor_sha256 = sha256(descriptor).hexdigest()
     runs = _v2_normalization_runs(group, page_limit)
@@ -2576,10 +2580,30 @@ def _create_v2_stage(
             records_digest.update(record)
             yield record
 
-    with (
-        _proof_page_scratch(normalized_records(), record_count=group.facts.record_count) as (page_index, scratch),
-        audio_store.publication_transaction() as (state, connection),
-    ):
+    with _proof_page_scratch(normalized_records(), record_count=group.facts.record_count) as (page_index, scratch):
+        yield _V2StageProof(descriptor, descriptor_sha256, packed_runs, records_digest.hexdigest(), page_index, scratch)
+
+
+def _create_v2_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _V2PreparedGroup,
+    page_limit: int,
+) -> _V2Stage:
+    _require_v2_stage_space(audio_store, ready_root, group)
+    with _prepare_v2_stage_proof(group, page_limit) as proof:
+        return _reserve_v2_stage(audio_store, ready_root, cohort, group, proof)
+
+
+def _reserve_v2_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _V2PreparedGroup,
+    proof: _V2StageProof,
+) -> _V2Stage:
+    with audio_store.publication_transaction() as (state, connection):
         contract = _parse_publication_contract(state.get(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID))
         if contract.next_public_order == _UINT64_MAX:
             raise ReadyBundleError("v2 publication order is exhausted")
@@ -2599,7 +2623,7 @@ def _create_v2_stage(
             stage_nonce=nonce,
             order=order,
             config_sha256=group.config_sha256,
-            descriptor_sha256=descriptor_sha256,
+            descriptor_sha256=proof.descriptor_sha256,
         )
         identity = f"{cohort.cohort_id}:{cohort.cursor}:{artifact_id}"
         stage_id = sha256(identity.encode()).hexdigest()
@@ -2625,8 +2649,8 @@ def _create_v2_stage(
                 encode_uint64(order),
                 artifact_id,
                 group.config_sha256,
-                descriptor,
-                descriptor_sha256,
+                proof.descriptor,
+                proof.descriptor_sha256,
                 group.audio.sha256,
                 manifest_sha256,
                 group.facts.record_count,
@@ -2664,24 +2688,24 @@ def _create_v2_stage(
                 stage_id,
                 stage_id,
                 group.facts.record_count,
-                records_digest.hexdigest(),
+                proof.records_sha256,
                 manifest_sha256,
-                page_index,
-                packed_runs,
-                descriptor,
+                proof.page_index,
+                proof.packed_runs,
+                proof.descriptor,
                 _v2_proof_content_sha256(
                     _V2ProofContent(
                         artifact_id,
                         order,
                         group.audio.sha256,
                         manifest_sha256,
-                        records_digest.hexdigest(),
+                        proof.records_sha256,
                         group.facts.record_count,
                         group.audio.packet_count,
                         group.projection_sha256,
-                        page_index,
-                        packed_runs,
-                        descriptor,
+                        proof.page_index,
+                        proof.packed_runs,
+                        proof.descriptor,
                     )
                 ),
                 encode_uint64(order),
@@ -2689,7 +2713,7 @@ def _create_v2_stage(
                 group.audio.packet_count,
             ),
         )
-        _insert_replay_proof_pages(connection, artifact_id, scratch)
+        _insert_replay_proof_pages(connection, artifact_id, proof.scratch)
         changed = connection.execute(
             "UPDATE publication_cohort SET lifecycle='staging' WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
             (cohort.cohort_id, cohort.cursor),
@@ -2709,8 +2733,8 @@ def _create_v2_stage(
         artifact_id,
         order,
         nonce,
-        descriptor,
-        descriptor_sha256,
+        proof.descriptor,
+        proof.descriptor_sha256,
         manifest,
         manifest_sha256,
         group,

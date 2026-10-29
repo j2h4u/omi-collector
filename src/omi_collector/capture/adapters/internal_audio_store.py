@@ -1080,41 +1080,9 @@ class InternalAudioStore:
         try:
             self._start_write(connection)
             self._recheck_source(connection, source)
-            row = _fetchone(
-                connection.execute(
-                    "SELECT COALESCE(MAX(chunk_ordinal), -1) FROM capture_conflict WHERE source_id = ?",
-                    (source.source_id,),
-                )
-            )
-            if row is None:
-                raise InternalAudioStoreError("conflict evidence ordinal is unavailable")
-            ordinal = _int_value(_value(row, 0)) + 1
-            if ordinal > MAX_PROTOCOL_UINT32:
-                raise InternalAudioStoreError("conflict evidence ordinal is exhausted")
-            canonical_row = _fetchone(
-                connection.execute(
-                    "SELECT EXISTS(SELECT 1 FROM capture_record WHERE source_id = ?)",
-                    (source.source_id,),
-                )
-            )
-            if canonical_row is None:
-                raise InternalAudioStoreError("canonical record presence is unavailable")
-            canonical_value = _int_value(_value(canonical_row, 0))
-            if canonical_value not in {0, 1}:
-                raise InternalAudioStoreError("canonical record presence is invalid")
-            has_canonical_records = bool(canonical_value)
-            now = time.time_ns()
-            classification = quarantine_transition(
-                QuarantineDisposition.UNCLASSIFIED,
-                QuarantineOpened(source.committed_count, has_canonical_records),
-            )
-            if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
-                raise InternalAudioStoreError(classification.reason)
-            assert classification.next_disposition is not None
-            unprocessable = classification.next_disposition is QuarantineDisposition.UNPROCESSABLE
-            block_reason = (
-                "source_authentication_mismatch" if source.committed_count == 0 and has_canonical_records else reason
-            )
+            ordinal = self._next_replay_conflict_ordinal(connection, source.source_id)
+            block_reason, disposition, now = self._replay_conflict_disposition(connection, source, reason)
+            unprocessable = disposition is QuarantineDisposition.UNPROCESSABLE
             connection.execute(
                 "INSERT INTO capture_conflict(source_id, chunk_ordinal, leg_generation, "
                 "absolute_byte_offset, reason, bytes) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1136,7 +1104,7 @@ class InternalAudioStore:
                 "WHERE source_id = ?",
                 (
                     block_reason,
-                    classification.next_disposition.value,
+                    disposition.value,
                     "quarantine contains no committed records" if unprocessable else None,
                     str(now) if unprocessable else None,
                     str(now + self._terminal_retention_ns) if unprocessable else None,
@@ -1151,6 +1119,48 @@ class InternalAudioStore:
             self._rollback_after_error(error)
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("replay conflict could not be retained") from error
+
+    def _next_replay_conflict_ordinal(self, connection: sqlite3.Connection, source_id: str) -> int:
+        row = _fetchone(
+            connection.execute(
+                "SELECT COALESCE(MAX(chunk_ordinal), -1) FROM capture_conflict WHERE source_id = ?",
+                (source_id,),
+            )
+        )
+        if row is None:
+            raise InternalAudioStoreError("conflict evidence ordinal is unavailable")
+        ordinal = _int_value(_value(row, 0)) + 1
+        if ordinal > MAX_PROTOCOL_UINT32:
+            raise InternalAudioStoreError("conflict evidence ordinal is exhausted")
+        return ordinal
+
+    def _replay_conflict_disposition(
+        self, connection: sqlite3.Connection, source: CaptureSource, reason: str
+    ) -> tuple[str, QuarantineDisposition, int]:
+        canonical_row = _fetchone(
+            connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM capture_record WHERE source_id = ?)",
+                (source.source_id,),
+            )
+        )
+        if canonical_row is None:
+            raise InternalAudioStoreError("canonical record presence is unavailable")
+        canonical_value = _int_value(_value(canonical_row, 0))
+        if canonical_value not in {0, 1}:
+            raise InternalAudioStoreError("canonical record presence is invalid")
+        has_canonical_records = bool(canonical_value)
+        now = time.time_ns()
+        classification = quarantine_transition(
+            QuarantineDisposition.UNCLASSIFIED,
+            QuarantineOpened(source.committed_count, has_canonical_records),
+        )
+        if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
+            raise InternalAudioStoreError(classification.reason)
+        assert classification.next_disposition is not None
+        block_reason = (
+            "source_authentication_mismatch" if source.committed_count == 0 and has_canonical_records else reason
+        )
+        return block_reason, classification.next_disposition, now
 
     def _resolve_tail(
         self,
@@ -1248,11 +1258,9 @@ class InternalAudioStore:
     ) -> int:
         self._discard_digest(source.source_id)
         try:
-            self._reopen()
-            current = self.get_source(source.source_id)
-            actual_tail = self._read_tail(source.source_id)
-            proposed_rows = self.read_record_page(source.source_id, expected - 1, len(records)) if records else ()
-            authenticated = self._digest_state(current) if current is not None else None
+            current, actual_tail, proposed_rows, authenticated = self._inspect_ambiguous_drain(
+                source, expected, records
+            )
         except (
             sqlite3.DatabaseError,
             StateDBError,
@@ -1276,6 +1284,16 @@ class InternalAudioStore:
             raise InternalAudioStoreError("ambiguous drain was rolled back") from error
         self._fail_stop("ambiguous drain commit could not be reconciled")
         raise AssertionError("fail-stop must raise")
+
+    def _inspect_ambiguous_drain(
+        self, source: CaptureSource, expected: int, records: tuple[CaptureRecord, ...]
+    ) -> tuple[CaptureSource | None, CaptureTail | None, tuple[CaptureRecord, ...], _HashState | None]:
+        self._reopen()
+        current = self.get_source(source.source_id)
+        actual_tail = self._read_tail(source.source_id)
+        proposed_rows = self.read_record_page(source.source_id, expected - 1, len(records)) if records else ()
+        authenticated = self._digest_state(current) if current is not None else None
+        return current, actual_tail, proposed_rows, authenticated
 
     def _recover_create(self, request: _CreateRequest, error: sqlite3.DatabaseError) -> CaptureSource:
         try:

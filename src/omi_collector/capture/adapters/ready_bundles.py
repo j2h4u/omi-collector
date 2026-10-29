@@ -3460,41 +3460,60 @@ def _inspect_v2_commit(audio_store: InternalAudioStore, proposal: _V2Commit, des
 
 
 def _commit_v2_stage_once(audio_store: InternalAudioStore, proposal: _V2Commit) -> None:
-    cohort, stage = proposal.cohort, proposal.stage
+    stage = proposal.stage
     with audio_store.publication_transaction() as (state, connection):
         _require_v2_commit_ownership(state, connection, proposal)
-        activated = connection.execute(
-            "UPDATE ready_replay_proof SET lifecycle='active' WHERE bundle_id=? AND lifecycle='staging' "
-            "AND stage_id=? AND owner_token=?",
-            (stage.artifact_id, stage.stage_id, stage.owner_token),
-        )
-        if activated.rowcount != 1:
-            raise ReadyDurabilityFatalError("v2 private replay proof activation changed")
-        state.put(StateKind.READY_PUBLICATION, stage.artifact_id, proposal.entry)
-        frontier_payload = state.get(StateKind.READY_PUBLICATION, "frontier")
-        if frontier_payload is None:
-            old_frontier = 0
-        elif set(frontier_payload) == {"value"} and type(frontier_payload["value"]) is int:
-            old_frontier = cast(int, frontier_payload["value"])
-        else:
-            raise ReadyBundleError("ready publication frontier is invalid")
-        state.put(
-            StateKind.READY_PUBLICATION,
-            "frontier",
-            {"value": max(old_frontier, stage.group.facts.next_sequence)},
-        )
-        state.put(StateKind.PUBLICATION_V2_FRONTIER, "current", _v2_frontier_payload(stage.group.final_frontier))
-        for item in proposal.progress:
-            changed = connection.execute(
-                "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
-                (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
-            )
-            if changed.rowcount != 1:
-                raise ReadyBundleError("v2 cohort member changed before final commit")
+        _activate_v2_commit_proof(connection, stage)
+        _publish_v2_commit_ledger(state, proposal)
+        _advance_v2_commit_members(connection, proposal)
         _apply_typed_coverage(connection, proposal.coverage)
-        connection.execute("DELETE FROM ready_v2_output_stage WHERE stage_id=?", (stage.stage_id,))
-        _advance_v2_commit_cohort(connection, proposal)
+        _finish_v2_commit(connection, proposal)
         state.mark_publication_changed()
+
+
+def _activate_v2_commit_proof(connection: sqlite3.Connection, stage: _V2Stage) -> None:
+    activated = connection.execute(
+        "UPDATE ready_replay_proof SET lifecycle='active' WHERE bundle_id=? AND lifecycle='staging' "
+        "AND stage_id=? AND owner_token=?",
+        (stage.artifact_id, stage.stage_id, stage.owner_token),
+    )
+    if activated.rowcount != 1:
+        raise ReadyDurabilityFatalError("v2 private replay proof activation changed")
+
+
+def _publish_v2_commit_ledger(state: StateTransaction, proposal: _V2Commit) -> None:
+    stage = proposal.stage
+    state.put(StateKind.READY_PUBLICATION, stage.artifact_id, proposal.entry)
+    frontier_payload = state.get(StateKind.READY_PUBLICATION, "frontier")
+    if frontier_payload is None:
+        old_frontier = 0
+    elif set(frontier_payload) == {"value"} and type(frontier_payload["value"]) is int:
+        old_frontier = cast(int, frontier_payload["value"])
+    else:
+        raise ReadyBundleError("ready publication frontier is invalid")
+    state.put(
+        StateKind.READY_PUBLICATION,
+        "frontier",
+        {"value": max(old_frontier, stage.group.facts.next_sequence)},
+    )
+    state.put(StateKind.PUBLICATION_V2_FRONTIER, "current", _v2_frontier_payload(stage.group.final_frontier))
+
+
+def _advance_v2_commit_members(connection: sqlite3.Connection, proposal: _V2Commit) -> None:
+    cohort = proposal.cohort
+    for item in proposal.progress:
+        changed = connection.execute(
+            "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
+            (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
+        )
+        if changed.rowcount != 1:
+            raise ReadyBundleError("v2 cohort member changed before final commit")
+
+
+def _finish_v2_commit(connection: sqlite3.Connection, proposal: _V2Commit) -> None:
+    stage = proposal.stage
+    connection.execute("DELETE FROM ready_v2_output_stage WHERE stage_id=?", (stage.stage_id,))
+    _advance_v2_commit_cohort(connection, proposal)
 
 
 def _require_v2_commit_ownership(
@@ -3916,50 +3935,7 @@ def _create_typed_cohort(
     )
     for attempt in range(2):
         try:
-            with audio_store.publication_transaction() as (state, connection):
-                _require_cohort_decision(
-                    CohortPhase.UNQUALIFIED,
-                    QualifiedDrained(),
-                    CohortAction.ACCEPT,
-                    CohortPhase.ACCEPTED,
-                )
-                active = _sql_all(
-                    connection.execute(
-                        "SELECT cohort_id FROM publication_cohort WHERE lifecycle IN ('accepted','staging','complete')"
-                    )
-                )
-                if active:
-                    raise ReadyBundleError("another typed publication cohort is active")
-                connection.execute(
-                    "INSERT INTO publication_cohort(cohort_id,lifecycle,accepted_permit,drained_threshold,"
-                    "config_digest,closure_frontier,cursor,accepted_time) "
-                    "VALUES (?, 'accepted', ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                    (
-                        cohort_id,
-                        cohort_id,
-                        threshold,
-                        config_digest,
-                        None if frontier is None else encode_uint64(frontier),
-                    ),
-                )
-                connection.executemany(
-                    "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,"
-                    "slice_count,admitted_lifecycle,admitted_count,admitted_sha256,cursor) "
-                    "VALUES (?, ?, ?, 0, ?, ?, ?, ?, 0)",
-                    (
-                        (
-                            cohort_id,
-                            index,
-                            item.snapshot.source_id,
-                            item.admitted_count,
-                            item.admitted_lifecycle,
-                            item.admitted_count,
-                            item.admitted_sha256,
-                        )
-                        for index, item in enumerate(admissions)
-                    ),
-                )
-                state.mark_publication_changed()
+            _accept_typed_cohort_once(audio_store, proposed, admissions)
             return proposed
         except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
             raise_if_sqlite_corrupt(error)
@@ -3973,6 +3949,59 @@ def _create_typed_cohort(
                 raise ReadyBundleError("typed cohort acceptance was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed cohort acceptance has a third state")
     raise AssertionError("unreachable")
+
+
+def _accept_typed_cohort_once(
+    audio_store: InternalAudioStore, proposed: _TypedCohort, admissions: tuple[_TypedAdmission, ...]
+) -> None:
+    cohort_id = proposed.cohort_id
+    threshold = proposed.threshold
+    frontier = proposed.frontier
+    config_digest = proposed.config_digest
+    with audio_store.publication_transaction() as (state, connection):
+        _require_cohort_decision(
+            CohortPhase.UNQUALIFIED,
+            QualifiedDrained(),
+            CohortAction.ACCEPT,
+            CohortPhase.ACCEPTED,
+        )
+        active = _sql_all(
+            connection.execute(
+                "SELECT cohort_id FROM publication_cohort WHERE lifecycle IN ('accepted','staging','complete')"
+            )
+        )
+        if active:
+            raise ReadyBundleError("another typed publication cohort is active")
+        connection.execute(
+            "INSERT INTO publication_cohort(cohort_id,lifecycle,accepted_permit,drained_threshold,"
+            "config_digest,closure_frontier,cursor,accepted_time) "
+            "VALUES (?, 'accepted', ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (
+                cohort_id,
+                cohort_id,
+                threshold,
+                config_digest,
+                None if frontier is None else encode_uint64(frontier),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,"
+            "slice_count,admitted_lifecycle,admitted_count,admitted_sha256,cursor) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, 0)",
+            (
+                (
+                    cohort_id,
+                    index,
+                    item.snapshot.source_id,
+                    item.admitted_count,
+                    item.admitted_lifecycle,
+                    item.admitted_count,
+                    item.admitted_sha256,
+                )
+                for index, item in enumerate(admissions)
+            ),
+        )
+        state.mark_publication_changed()
 
 
 def _load_active_for_reconciliation(audio_store: InternalAudioStore) -> _TypedCohort | None:
@@ -4098,49 +4127,65 @@ def _commit_typed_ready_custody(audio_store: InternalAudioStore, commit: _Custod
 
 
 def _commit_typed_ready_custody_once(audio_store: InternalAudioStore, commit: _CustodyCommit) -> None:
-    cohort = commit.cohort
     with audio_store.publication_transaction() as (state, connection):
-        next_phase = CohortPhase.COMPLETE if commit.all_complete else CohortPhase.ACCEPTED
-        _require_cohort_decision(
-            CohortPhase.ACCEPTED,
-            ExistingReadyCustody(
-                proved_progress=any(item.new_cursor > item.old_cursor for item in commit.progress),
-                cohort_complete=commit.all_complete,
-            ),
-            CohortAction.COMMIT,
-            next_phase,
-        )
-        if any(state.get(StateKind.READY_PUBLICATION, key) != entry for key, entry in commit.proofs.items()):
-            raise ReadyBundleError("typed ready custody changed before cursor commit")
-        row = _sql_one(
-            connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,))
-        )
-        if row is None or tuple(row) != ("accepted", cohort.cursor):
-            raise ReadyBundleError("typed cohort changed before custody commit")
-        for item in commit.progress:
-            if item.new_cursor == item.old_cursor:
-                continue
-            updated = connection.execute(
-                "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
-                (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
-            )
-            if updated.rowcount != 1:
-                raise ReadyBundleError("typed cohort member changed before custody commit")
+        _require_typed_custody_commit_ownership(state, connection, commit)
+        _advance_typed_custody_members(connection, commit)
         _apply_typed_coverage(connection, commit.coverage)
-        if commit.all_complete:
-            _require_cohort_decision(
-                CohortPhase.COMPLETE,
-                CompleteRetire(),
-                CohortAction.RETIRE,
-                None,
-            )
-            deleted = connection.execute(
-                "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
-                (cohort.cohort_id, cohort.cursor),
-            )
-            if deleted.rowcount != 1:
-                raise ReadyBundleError("typed replay cohort completion changed")
+        _finish_typed_custody_cohort(connection, commit)
         state.mark_publication_changed()
+
+
+def _require_typed_custody_commit_ownership(
+    state: StateTransaction, connection: sqlite3.Connection, commit: _CustodyCommit
+) -> None:
+    cohort = commit.cohort
+    next_phase = CohortPhase.COMPLETE if commit.all_complete else CohortPhase.ACCEPTED
+    _require_cohort_decision(
+        CohortPhase.ACCEPTED,
+        ExistingReadyCustody(
+            proved_progress=any(item.new_cursor > item.old_cursor for item in commit.progress),
+            cohort_complete=commit.all_complete,
+        ),
+        CohortAction.COMMIT,
+        next_phase,
+    )
+    if any(state.get(StateKind.READY_PUBLICATION, key) != entry for key, entry in commit.proofs.items()):
+        raise ReadyBundleError("typed ready custody changed before cursor commit")
+    row = _sql_one(
+        connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,))
+    )
+    if row is None or tuple(row) != ("accepted", cohort.cursor):
+        raise ReadyBundleError("typed cohort changed before custody commit")
+
+
+def _advance_typed_custody_members(connection: sqlite3.Connection, commit: _CustodyCommit) -> None:
+    cohort = commit.cohort
+    for item in commit.progress:
+        if item.new_cursor == item.old_cursor:
+            continue
+        updated = connection.execute(
+            "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
+            (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
+        )
+        if updated.rowcount != 1:
+            raise ReadyBundleError("typed cohort member changed before custody commit")
+
+
+def _finish_typed_custody_cohort(connection: sqlite3.Connection, commit: _CustodyCommit) -> None:
+    cohort = commit.cohort
+    if commit.all_complete:
+        _require_cohort_decision(
+            CohortPhase.COMPLETE,
+            CompleteRetire(),
+            CohortAction.RETIRE,
+            None,
+        )
+        deleted = connection.execute(
+            "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
+            (cohort.cohort_id, cohort.cursor),
+        )
+        if deleted.rowcount != 1:
+            raise ReadyBundleError("typed replay cohort completion changed")
 
 
 def _inspect_typed_ready_custody(audio_store: InternalAudioStore, commit: _CustodyCommit) -> str:

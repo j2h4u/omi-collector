@@ -1,0 +1,101 @@
+# Coarse dependency boundaries complement the named import-linter contracts.
+# Public interfaces can be refined later; adapters currently use more than ports.
+source_roots = ["src"]
+root_module = "forbid"
+exact = true
+forbid_circular_dependencies = true
+ignore_type_checking_imports = false
+
+[[modules]]
+path = "omi_collector.capture.domain"
+depends_on = []
+
+[[modules]]
+path = "omi_collector.capture.application"
+depends_on = [
+    "omi_collector.capture.domain",
+    "omi_collector.config",
+]
+
+[[modules]]
+path = "omi_collector.capture.adapters"
+depends_on = [
+    "omi_collector.capture.application",
+    "omi_collector.capture.domain",
+    "omi_collector.config",
+]
+
+[[modules]]
+path = "omi_collector.capture.cli"
+depends_on = [
+    "omi_collector.capture.adapters",
+    "omi_collector.capture.application",
+    "omi_collector.capture.domain",
+    "omi_collector.config",
+    "omi_collector.core",
+]
+
+[[modules]]
+path = "omi_collector.cli"
+depends_on = [
+    "omi_collector.capture.adapters",
+    "omi_collector.capture.application",
+    "omi_collector.capture.cli",
+    "omi_collector.capture.domain",
+    "omi_collector.config",
+    "omi_collector.core",
+    "omi_collector.internal_audio_migration",
+    "omi_collector.operator_status",
+    "omi_collector.spool_metrics",
+    "omi_collector.state_migration",
+    "omi_collector.storage_layout",
+]
+
+[[modules]]
+path = "omi_collector.config"
+depends_on = []
+
+[[modules]]
+path = "omi_collector.core"
+depends_on = []
+
+[[modules]]
+path = "omi_collector.internal_audio_migration"
+depends_on = [
+    "omi_collector.capture.adapters",
+    "omi_collector.state_migration",
+    "omi_collector.storage_layout",
+]
+
+[[modules]]
+path = "omi_collector.operator_status"
+depends_on = [
+    "omi_collector.capture.adapters",
+    "omi_collector.capture.application",
+    "omi_collector.capture.domain",
+    "omi_collector.config",
+    "omi_collector.spool_metrics",
+    "omi_collector.state_migration",
+    "omi_collector.storage_layout",
+]
+
+[[modules]]
+path = "omi_collector.spool_metrics"
+depends_on = [
+    "omi_collector.capture.adapters",
+    "omi_collector.capture.domain",
+]
+
+[[modules]]
+path = "omi_collector.state_migration"
+depends_on = [
+    "omi_collector.capture.adapters",
+    "omi_collector.capture.domain",
+    "omi_collector.storage_layout",
+]
+
+[[modules]]
+path = "omi_collector.storage_layout"
+depends_on = [
+    "omi_collector.config",
+]

@@ -123,3 +123,56 @@ def test_main_rejects_uncovered_simple_function_at_threshold_below_its_crap_scor
     assert capsys.readouterr().out == (
         "CRAP gate failed: 1 function(s) exceed 1.50\n  example.py::simple:1 CRAP 2.00, complexity 1, coverage 0.0%\n"
     )
+
+
+@pytest.mark.parametrize("failure", ["missing_file", "missing_function", "empty", "invalid_root", "unmatched"])
+def test_incomplete_inventory_fails_closed(tmp_path: Path, capsys: pytest.CaptureFixture[str], failure: str) -> None:
+    source_root = tmp_path / "src"
+    source = _write_source(source_root, "example.py", "def simple():\n    return 1\n")
+    files: dict[Path, dict[str, tuple[int, int]]] = {source: {"simple": (1, 1)}}
+    if failure == "missing_file":
+        files = {}
+    elif failure == "missing_function":
+        files[source] = {}
+    elif failure == "empty":
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        files[source] = {}
+    elif failure == "invalid_root":
+        source_root = tmp_path / "missing"
+    else:
+        files[source]["stale"] = (1, 1)
+    report = _write_report(tmp_path / "coverage.json", files)
+
+    assert main(["--coverage", str(report), "--src", str(source_root)]) == 1
+    assert "CRAP gate failed:" in capsys.readouterr().out
+
+
+def test_single_source_file_uses_file_name(tmp_path: Path) -> None:
+    source = _write_source(tmp_path, "example.py", "def simple():\n    return 1\n")
+    report = _write_report(tmp_path / "coverage.json", {source: {"simple": (1, 1)}})
+    [metric] = _function_metrics_from_report(_load_coverage_report(report), source)
+    assert metric.key == "example.py::simple"
+
+
+@pytest.mark.parametrize(
+    "file_data",
+    [
+        None,
+        {},
+        {"functions": {"simple": {}}},
+        {"functions": {"simple": {"summary": {"covered_lines": 0}}}},
+        {"functions": {"simple": {"summary": {"covered_lines": 0, "num_statements": -1}}}},
+        {"functions": {"simple": {"summary": {"covered_lines": -1, "num_statements": 1}}}},
+        {"functions": {"simple": {"summary": {"covered_lines": 2, "num_statements": 1}}}},
+        {"functions": {"simple": {"summary": {"covered_lines": True, "num_statements": 1}}}},
+        {"functions": {"simple": {"summary": {"covered_lines": 0, "num_statements": True}}}},
+    ],
+)
+def test_invalid_coverage_data_fails_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], file_data: object
+) -> None:
+    source = _write_source(tmp_path / "src", "example.py", "def simple():\n    return 1\n")
+    report = tmp_path / "coverage.json"
+    report.write_text(json.dumps({"files": {str(source): file_data}}), encoding="utf-8")
+    assert main(["--coverage", str(report), "--src", str(source.parent)]) == 1
+    assert "CRAP gate failed:" in capsys.readouterr().out

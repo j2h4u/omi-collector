@@ -1,11 +1,14 @@
 import argparse
+import ast
 import json
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypedDict, TypeGuard, cast
+from typing import Protocol, TypedDict, cast
 
-from radon.complexity import cc_visit
+from coverage import Coverage, CoverageException
+from radon.complexity import cc_visit_ast
 
 DEFAULT_THRESHOLD = 30.0
 DEFAULT_SOURCE_ROOT = Path("src/omi_collector")
@@ -35,15 +38,6 @@ class _RadonBlock(Protocol):
     complexity: int
 
 
-class _RadonFunctionBlock(_RadonBlock, Protocol):
-    closures: Sequence[_RadonFunctionBlock]
-
-
-class _RadonClassBlock(_RadonBlock, Protocol):
-    inner_classes: Sequence[_RadonClassBlock]
-    methods: Sequence[_RadonFunctionBlock]
-
-
 class _GateArgs(Protocol):
     coverage: Path
     src: Path
@@ -59,8 +53,8 @@ class FunctionMetric:
     crap: float
 
 
-RadonVisit = Callable[[str], Sequence[_RadonBlock]]
-_CC_VISIT: RadonVisit = cast(RadonVisit, cc_visit)
+RadonVisit = Callable[[ast.AST], Sequence[_RadonBlock]]
+_CC_VISIT: RadonVisit = cast(RadonVisit, cc_visit_ast)
 
 
 def _round_metric(value: float) -> float:
@@ -80,46 +74,67 @@ def _expect_str(value: object, context: str) -> str:
 
 
 def _expect_int(value: object, context: str) -> int:
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(context)
     return value
 
 
-def _is_class_block(block: _RadonBlock) -> TypeGuard[_RadonClassBlock]:
-    return hasattr(block, "methods") and hasattr(block, "inner_classes")
+type _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
 
 
-def _qualname_from_block(block: _RadonBlock, prefix: tuple[str, ...] = ()) -> list[tuple[str, _RadonBlock]]:
-    if _is_class_block(block):
-        return _class_member_qualnames(block, prefix)
-
-    function_block = cast(_RadonFunctionBlock, block)
-    qualname = ".".join((*prefix, function_block.name))
-    items: list[tuple[str, _RadonBlock]] = [(qualname, function_block)]
-    for closure in function_block.closures:
-        items.extend(_qualname_from_block(closure, (*prefix, function_block.name)))
+def _function_blocks(node: ast.AST, prefix: tuple[str, ...] = ()) -> list[tuple[str, _FunctionNode, _RadonBlock]]:
+    items: list[tuple[str, _FunctionNode, _RadonBlock]] = []
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        prefix = (*prefix, node.name)
+        if not isinstance(node, ast.ClassDef):
+            # Radon's enclosing-function visitor drops local classes; visit each function directly.
+            items.append((".".join(prefix), node, _CC_VISIT(node)[0]))
+    for child in ast.iter_child_nodes(node):
+        items.extend(_function_blocks(child, prefix))
     return items
 
 
-def _class_member_qualnames(block: _RadonClassBlock, prefix: tuple[str, ...]) -> list[tuple[str, _RadonBlock]]:
-    class_prefix = (*prefix, block.name)
-    items: list[tuple[str, _RadonBlock]] = []
-    for inner_class in block.inner_classes:
-        items.extend(_qualname_from_block(inner_class, class_prefix))
-    for method in block.methods:
-        items.extend(_qualname_from_block(method, class_prefix))
-    return items
+def _coverage_lines(file_data: dict[str, object], field: str) -> set[int]:
+    value = file_data.get(field)
+    if not isinstance(value, list):
+        raise ValueError(f"coverage data has no {field} array for colliding function names")
+    lines = {_expect_int(line, f"coverage {field} contains an invalid line") for line in value}
+    if any(line <= 0 for line in lines):
+        raise ValueError(f"coverage {field} contains an invalid line")
+    return lines
 
 
-def _qualnames_from_blocks(blocks: Sequence[_RadonBlock]) -> list[tuple[str, _RadonBlock]]:
-    items: list[tuple[str, _RadonBlock]] = []
-    for block in blocks:
-        items.extend(_qualname_from_block(block))
-    return items
+def _body_lines(node: _FunctionNode) -> set[int]:
+    end_line = node.body[-1].end_lineno
+    if end_line is None:
+        raise ValueError("function body has no end line")
+    return set(range(node.body[0].lineno, end_line + 1))
+
+
+def _positional_coverage(
+    node: _FunctionNode, file_data: dict[str, object], source_statements: set[int]
+) -> _CoverageFunctionEntry:
+    lines = _body_lines(node)
+    # Nested bodies belong to their own functions, including methods of local classes.
+    for child in ast.walk(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child is not node:
+            lines -= _body_lines(child)
+    excluded = _coverage_lines(file_data, "excluded_lines")
+    executed = _coverage_lines(file_data, "executed_lines")
+    missing = _coverage_lines(file_data, "missing_lines")
+    if executed & missing:
+        raise ValueError("coverage executed and missing lines overlap")
+    if source_statements & lines - (excluded | executed | missing):
+        raise ValueError(f"coverage report is missing source lines for function at line {node.lineno}")
+    lines -= excluded
+    covered = lines & executed
+    statements = covered | (lines & missing)
+    return {"summary": {"covered_lines": len(covered), "num_statements": len(statements)}}
 
 
 def _load_coverage_report(path: Path) -> _CoverageReport:
-    raw_report = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    raw_report = _expect_dict(raw, "coverage report is not an object")
     return cast(
         _CoverageReport,
         {"files": _expect_dict(raw_report.get("files"), "coverage report does not contain an object at 'files'")},
@@ -129,50 +144,91 @@ def _load_coverage_report(path: Path) -> _CoverageReport:
 def _function_metrics_from_report(coverage_report: _CoverageReport, source_root: Path) -> list[FunctionMetric]:
     source_root = source_root.resolve()
     metrics: list[FunctionMetric] = []
-    for raw_path, file_data in coverage_report["files"].items():
-        file_metrics = _function_metrics_from_file(raw_path, file_data, source_root)
+    coverage_files = {
+        Path(_expect_str(raw_path, "coverage report file path is invalid")).resolve(): file_data
+        for raw_path, file_data in coverage_report["files"].items()
+    }
+    for file_path in _source_files(source_root):
+        file_data = coverage_files.get(file_path)
+        if file_data is None:
+            raise ValueError(f"coverage report is missing source file {file_path.relative_to(source_root)}")
+        file_metrics = _function_metrics_from_file(file_path, file_data, source_root)
         metrics.extend(file_metrics)
+    if not metrics:
+        raise ValueError(f"no function metrics found under {source_root}")
     return metrics
 
 
+def _source_files(source_root: Path) -> Iterable[Path]:
+    if source_root.is_file():
+        yield source_root.resolve()
+        return
+    for path in sorted(source_root.rglob("*.py")):
+        yield path.resolve()
+
+
 def _function_metrics_from_file(
-    raw_path: str,
+    file_path: Path,
     file_data: _CoverageFileEntry,
     source_root: Path,
 ) -> list[FunctionMetric]:
-    raw_path = _expect_str(raw_path, "coverage report file path is invalid")
-    file_path = Path(raw_path).resolve()
-    if source_root not in file_path.parents and file_path != source_root:
-        return []
-
-    relative_path = file_path.relative_to(source_root).as_posix()
+    relative_path = file_path.name if file_path == source_root else file_path.relative_to(source_root).as_posix()
     source_text = file_path.read_text(encoding="utf-8")
-    return [
-        metric
-        for qualname, block in _qualnames_from_blocks(_CC_VISIT(source_text))
-        if (metric := _metric_for_function(relative_path, qualname, block, file_data["functions"])) is not None
-    ]
+    file_object = _expect_dict(file_data, f"coverage data for {relative_path} is invalid")
+    functions = _expect_dict(file_object.get("functions"), f"coverage data for {relative_path} has no functions object")
+    metrics: list[FunctionMetric] = []
+    missing: list[str] = []
+    blocks = _function_blocks(ast.parse(source_text))
+    counts = Counter(qualname for qualname, _, _ in blocks)
+    source_statements: set[int] = set()
+    if any(count > 1 for count in counts.values()):
+        analysis = Coverage(data_file=None, config_file=False)
+        try:
+            source_statements = set(analysis.analysis2(str(file_path))[1])
+        finally:
+            analysis.get_data().close(force=True)
+    for qualname, node, block in blocks:
+        coverage_entry = functions.get(qualname)
+        if coverage_entry is None:
+            missing.append(f"{relative_path}::{qualname}")
+            continue
+        metric = _metric_for_function(relative_path, qualname, block, coverage_entry)
+        if counts[qualname] > 1:
+            metric = _metric_for_function(
+                relative_path, qualname, block, _positional_coverage(node, file_object, source_statements)
+            )
+        metrics.append(metric)
+    if missing:
+        raise ValueError("coverage report is missing function metrics: " + ", ".join(missing))
+    unmatched = functions.keys() - counts.keys() - {""}
+    if unmatched:
+        raise ValueError(
+            f"coverage report has unmatched function metrics for {relative_path}: {', '.join(sorted(unmatched))}"
+        )
+    return metrics
 
 
 def _metric_for_function(
     relative_path: str,
     qualname: str,
     block: _RadonBlock,
-    functions: dict[str, _CoverageFunctionEntry],
-) -> FunctionMetric | None:
-    if qualname not in functions:
-        return None
-
-    summary = functions[qualname]["summary"]
+    function_data: object,
+) -> FunctionMetric:
+    summary = _expect_dict(
+        _expect_dict(function_data, f"coverage data for {relative_path}::{qualname} is invalid").get("summary"),
+        f"coverage data for {relative_path}::{qualname} has no summary object",
+    )
     num_statements = _expect_int(
-        summary["num_statements"],
+        summary.get("num_statements"),
         f"coverage summary for {relative_path}::{qualname} has invalid num_statements",
     )
     covered_lines = _expect_int(
-        summary["covered_lines"],
+        summary.get("covered_lines"),
         f"coverage summary for {relative_path}::{qualname} has invalid covered_lines",
     )
-    coverage_fraction = 1.0 if num_statements <= 0 else covered_lines / num_statements
+    if not 0 <= covered_lines <= num_statements:
+        raise ValueError(f"coverage summary for {relative_path}::{qualname} has invalid line counts")
+    coverage_fraction = 1.0 if num_statements == 0 else covered_lines / num_statements
     crap = (block.complexity**2) * ((1 - coverage_fraction) ** 3) + block.complexity
     return FunctionMetric(
         key=f"{relative_path}::{qualname}",
@@ -205,7 +261,11 @@ def _parse_args(argv: list[str] | None) -> _GateArgs:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    metrics = _function_metrics_from_report(_load_coverage_report(args.coverage), args.src)
+    try:
+        metrics = _function_metrics_from_report(_load_coverage_report(args.coverage), args.src)
+    except (CoverageException, OSError, ValueError) as exc:
+        print(f"CRAP gate failed: {exc}")
+        return 1
     offenders = [metric for metric in metrics if metric.crap > args.threshold]
     if offenders:
         print(f"CRAP gate failed: {len(offenders)} function(s) exceed {args.threshold:.2f}")

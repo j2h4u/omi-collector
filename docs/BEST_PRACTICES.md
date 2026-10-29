@@ -11,6 +11,9 @@ Use `uv` and keep `uv.lock` synchronized. The required gates are:
 
 - `just check` — static, type, import, dependency, workflow, suppression-budget,
   compile, dead-code, and packaging checks;
+- `just import-contracts` — named architectural prohibitions through import-linter;
+- `just module-boundaries` — declared module dependencies and unused permissions
+  through Tach; both architecture checks are included in `just check`;
 - `just crap-check` — the full pytest suite, including slow tests, and the
   authoritative radon-backed CRAP threshold for every function;
 - `just deps-audit` — a strict vulnerability audit of the locked registry
@@ -24,6 +27,10 @@ Use `uv` and keep `uv.lock` synchronized. The required gates are:
   `deps-audit`, and `runtime-smoke`.
 
 Do not weaken or locally suppress a gate. Use targeted checks while iterating.
+Keep Tach's pytest plugin disabled: architecture checks run explicitly and must
+not change test selection. Use plain `tach check`; Tach 0.35.3 skips its unused
+dependency check with JSON output. These module checks do not establish semantic
+layers within functions or the correctness of transactions and cancellation.
 Before a local candidate install, `just verify` must pass. Do not rerun `unit`
 or `docker-build` as separate gates after `crap-check` and `runtime-smoke` have
 already covered them. Reuse retained results only when their relevant inputs

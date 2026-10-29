@@ -4649,98 +4649,115 @@ def _advance_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
 
 
 def _retire_typed_source_once(audio_store: InternalAudioStore, step: _RetirementStep) -> _RetirementResult:
-    proposed: int | None = step.old_cursor
     with audio_store.publication_transaction() as (state, connection):
-        source = _sql_one(
+        _require_typed_retirement_snapshot(connection, step)
+        prefix_result = _retire_typed_record_prefix(state, connection, step)
+        if prefix_result is not None:
+            return prefix_result
+        return _finish_typed_retirement(connection, step)
+
+
+def _require_typed_retirement_snapshot(connection: sqlite3.Connection, step: _RetirementStep) -> None:
+    source = _sql_one(
+        connection.execute(
+            "SELECT lifecycle,committed_count,committed_sha256,coverage_digest,retirement_cursor "
+            "FROM capture_source WHERE source_id=?",
+            (step.source_id,),
+        )
+    )
+    if source is None or tuple(source) != (
+        "retiring",
+        step.committed_count,
+        step.coverage_digest,
+        step.coverage_digest,
+        step.old_cursor,
+    ):
+        raise ReadyBundleError("typed retirement source changed")
+
+
+def _retire_typed_record_prefix(
+    state: StateTransaction, connection: sqlite3.Connection, step: _RetirementStep
+) -> _RetirementResult | None:
+    ordinals = tuple(
+        cast(int, row[0])
+        for row in _sql_all(
             connection.execute(
-                "SELECT lifecycle,committed_count,committed_sha256,coverage_digest,retirement_cursor "
-                "FROM capture_source WHERE source_id=?",
-                (step.source_id,),
+                "SELECT ordinal FROM capture_record WHERE source_id=? AND ordinal>=? ORDER BY ordinal LIMIT ?",
+                (step.source_id, step.old_cursor, step.page_limit),
             )
         )
-        if source is None or tuple(source) != (
-            "retiring",
-            step.committed_count,
-            step.coverage_digest,
-            step.coverage_digest,
-            step.old_cursor,
-        ):
-            raise ReadyBundleError("typed retirement source changed")
-        ordinals = tuple(
-            cast(int, row[0])
-            for row in _sql_all(
-                connection.execute(
-                    "SELECT ordinal FROM capture_record WHERE source_id=? AND ordinal>=? ORDER BY ordinal LIMIT ?",
-                    (step.source_id, step.old_cursor, step.page_limit),
-                )
-            )
+    )
+    retired_residue = _sql_one(
+        connection.execute(
+            "SELECT count(*) FROM capture_record WHERE source_id=? AND ordinal<?",
+            (step.source_id, step.old_cursor),
         )
-        retired_residue = _sql_one(
-            connection.execute(
-                "SELECT count(*) FROM capture_record WHERE source_id=? AND ordinal<?",
-                (step.source_id, step.old_cursor),
-            )
-        )
-        if retired_residue is None or retired_residue[0] != 0:
-            raise ReadyBundleError("typed retirement cursor does not match retained rows")
-        if ordinals:
-            _require_audio_decision(
-                AudioPhase.RETIRING,
-                RetirementStepEvent(),
-                AudioAction.RETIRE,
-                AudioPhase.RETIRING,
-            )
-            if ordinals != tuple(range(step.old_cursor, step.old_cursor + len(ordinals))):
-                raise ReadyBundleError("typed retirement rows are not contiguous")
-            proposed = step.old_cursor + len(ordinals)
-            mark_retirement_compaction_pending(state)
-            deleted_records = connection.execute(
-                "DELETE FROM capture_record WHERE source_id=? AND ordinal>=? AND ordinal<?",
-                (step.source_id, step.old_cursor, proposed),
-            )
-            if deleted_records.rowcount != len(ordinals):
-                raise ReadyBundleError("typed retirement rows changed before removal")
-            changed = connection.execute(
-                "UPDATE capture_source SET retirement_cursor=? "
-                "WHERE source_id=? AND lifecycle='retiring' AND retirement_cursor=?",
-                (proposed, step.source_id, step.old_cursor),
-            )
-            if changed.rowcount != 1:
-                raise ReadyBundleError("typed retirement cursor changed")
-        else:
-            if step.old_cursor != step.committed_count:
-                raise ReadyBundleError("typed retirement rows ended before coverage")
-            residue = _sql_one(
-                connection.execute(
-                    "SELECT "
-                    "(SELECT count(*) FROM capture_tail WHERE source_id=?),"
-                    "(SELECT count(*) FROM capture_conflict WHERE source_id=?),"
-                    "(SELECT count(*) FROM capture_evidence WHERE source_id=?),"
-                    "(SELECT count(*) FROM publication_cohort_member WHERE source_id=?)",
-                    (step.source_id, step.source_id, step.source_id, step.source_id),
-                )
-            )
-            if residue is None or tuple(residue) != (0, 0, 0, 0):
-                return _RetirementResult(step.old_cursor, False)
-            _require_audio_decision(
-                AudioPhase.RETIRING,
-                RetirementStepEvent(final=True),
-                AudioAction.RETIRE,
-                None,
-            )
-            deleted = connection.execute(
-                "DELETE FROM capture_source WHERE source_id=? AND lifecycle='retiring' "
-                "AND retirement_cursor=? AND coverage_digest=?",
-                (step.source_id, step.old_cursor, step.coverage_digest),
-            )
-            if deleted.rowcount != 1:
-                raise ReadyBundleError("typed retirement source changed before removal")
-            connection.execute(
-                "DELETE FROM state WHERE kind=? AND id=?",
-                (StateKind.PACKET_SUMMARY.value, step.source_id),
-            )
-            proposed = None
+    )
+    if retired_residue is None or retired_residue[0] != 0:
+        raise ReadyBundleError("typed retirement cursor does not match retained rows")
+    if not ordinals:
+        if step.old_cursor != step.committed_count:
+            raise ReadyBundleError("typed retirement rows ended before coverage")
+        return None
+    _require_audio_decision(
+        AudioPhase.RETIRING,
+        RetirementStepEvent(),
+        AudioAction.RETIRE,
+        AudioPhase.RETIRING,
+    )
+    if ordinals != tuple(range(step.old_cursor, step.old_cursor + len(ordinals))):
+        raise ReadyBundleError("typed retirement rows are not contiguous")
+    proposed = step.old_cursor + len(ordinals)
+    if proposed != min(step.committed_count, step.old_cursor + step.page_limit):
+        raise ReadyBundleError("typed retirement page does not match its bounded prefix")
+    mark_retirement_compaction_pending(state)
+    deleted_records = connection.execute(
+        "DELETE FROM capture_record WHERE source_id=? AND ordinal>=? AND ordinal<?",
+        (step.source_id, step.old_cursor, proposed),
+    )
+    if deleted_records.rowcount != len(ordinals):
+        raise ReadyBundleError("typed retirement rows changed before removal")
+    changed = connection.execute(
+        "UPDATE capture_source SET retirement_cursor=? "
+        "WHERE source_id=? AND lifecycle='retiring' AND retirement_cursor=?",
+        (proposed, step.source_id, step.old_cursor),
+    )
+    if changed.rowcount != 1:
+        raise ReadyBundleError("typed retirement cursor changed")
     return _RetirementResult(proposed, True)
+
+
+def _finish_typed_retirement(connection: sqlite3.Connection, step: _RetirementStep) -> _RetirementResult:
+    residue = _sql_one(
+        connection.execute(
+            "SELECT "
+            "(SELECT count(*) FROM capture_tail WHERE source_id=?),"
+            "(SELECT count(*) FROM capture_conflict WHERE source_id=?),"
+            "(SELECT count(*) FROM capture_evidence WHERE source_id=?),"
+            "(SELECT count(*) FROM publication_cohort_member WHERE source_id=?)",
+            (step.source_id, step.source_id, step.source_id, step.source_id),
+        )
+    )
+    if residue is None or tuple(residue) != (0, 0, 0, 0):
+        return _RetirementResult(step.old_cursor, False)
+    _require_audio_decision(
+        AudioPhase.RETIRING,
+        RetirementStepEvent(final=True),
+        AudioAction.RETIRE,
+        None,
+    )
+    deleted = connection.execute(
+        "DELETE FROM capture_source WHERE source_id=? AND lifecycle='retiring' "
+        "AND retirement_cursor=? AND coverage_digest=?",
+        (step.source_id, step.old_cursor, step.coverage_digest),
+    )
+    if deleted.rowcount != 1:
+        raise ReadyBundleError("typed retirement source changed before removal")
+    connection.execute(
+        "DELETE FROM state WHERE kind=? AND id=?",
+        (StateKind.PACKET_SUMMARY.value, step.source_id),
+    )
+    return _RetirementResult(None, True)
 
 
 def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _RetirementStep, proposed: int | None) -> str:

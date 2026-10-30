@@ -1838,7 +1838,7 @@ def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                 await waiting_for_advertisement.wait()
 
-            _emit_pair(stale_callback, stale_candidate, now, 0.2, 0.22)
+            await asyncio.to_thread(stale_callback, PresenceAdvertisement(stale_candidate, -80))
             _emit_at(current_callback, fresh_candidate, now, 0.3)
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                 second_wake = await second

@@ -414,13 +414,12 @@ class SessionLifecycle:
         if previous is None:
             return None
         if isinstance(previous, Interrupted):
-            outcome: AttemptOutcome = (
-                ConnectedInterruption(previous.durable_progress)
-                if previous.connected
-                else NotConnected(previous.durable_progress)
+            outcome_name: Literal["connected_interrupted", "retry"] = (
+                "connected_interrupted" if previous.connected else "retry"
             )
+            outcome = presence_attempt_outcome(outcome_name, previous.durable_progress)
         else:
-            outcome = CandidateUnavailable()
+            outcome = presence_attempt_outcome("candidate_unavailable", False)
         return await presence.attempt_finished(outcome)
 
     async def _run_one_attempt(self, with_presence: bool) -> str:

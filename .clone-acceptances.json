@@ -254,12 +254,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "272350125cd10d2a07d3e75b61fd60981e7d682d0acab874048860578a0a8e63",
-      "count": 1,
-      "reason": "These are explicit imports of different state-machine/protocol vocabularies into storage and orchestration modules. They express dependencies, not duplicated executable behavior. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:17-34 ~ src/omi_collector/capture/adapters/staging_store.py:18-35."
-    },
-    {
-      "detector": "jscpd",
       "identity": "27d14ba7ae91b33432bb9631dc80d3d309b24e31ec0c333cca73947f9c689fe7",
       "count": 1,
       "reason": "The reported models and as_dict methods encode separate PHY outcomes, connection parameters, loss facts, lock context, quality events and status/lifetime aggregates. Explicit schema keys and units are public contracts; do not combine them because normalized field assignments look alike. Reviewed pair: src/omi_collector/capture/application/quality_metrics.py:128-138 ~ src/omi_collector/capture/application/quality_metrics.py:160-170."
@@ -287,12 +281,6 @@
       "identity": "2bb48d237e927b79ec9039d4f4b8d964a65dfd363772e8a10ef28065a83538c5",
       "count": 1,
       "reason": "Prefix terminalization and unprocessable marking update different source types/lifecycles/dispositions with different conditional-update safety guards. Their similar durable SQL/error structure is not interchangeable terminal authority. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:638-652 ~ src/omi_collector/capture/adapters/quarantine.py:702-716."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "2dd2894cb1e75c680aa9be337266f1661d224eb22ca5a6ed70ab4d62f43fc376",
-      "count": 1,
-      "reason": "These are imports of separate internal audio/cohort/quarantine state and evidence types. Import lists must continue to expose real module dependencies. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:10-32 ~ src/omi_collector/capture/adapters/ready_bundles.py:25-46."
     },
     {
       "detector": "jscpd",
@@ -923,6 +911,12 @@
       "identity": "8e8a12607ca708ef236a3133f6256f8400898158db26f2c037b5db9c154a72ab",
       "count": 1,
       "reason": "The windows are export lists, logging-field allowlists, metric field schemas and status category constants. Identifier/literal normalization makes different declarative vocabularies look alike; runtime policy membership remains module-specific. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:402-436 ~ src/omi_collector/capture/adapters/debug_logging.py:44-78."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "8fcb1faa48eba0f90bae64169a41421c09d2c7b29e703a347b097672c56ea6ce",
+      "count": 1,
+      "reason": "These normalized import declarations list different domain and state vocabularies used by their respective consumers. They share no executable behavior or API to extract. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:17-32 ~ src/omi_collector/capture/adapters/staging_store.py:18-33."
     },
     {
       "detector": "jscpd",

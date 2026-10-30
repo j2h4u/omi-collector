@@ -2270,6 +2270,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "9d9d5d86d7ea6b1c22adca009c1218c6f0a0bf3477052935ae76ce9c3590559d",
+      "count": 1,
+      "reason": "Clock observation accepts a missing payload as empty state and writes only when the serialized state changes; uncertainty marking requires an existing intent and always persists its validated transition. StateDB already owns transaction, get and put; a generic callback would hide these distinct policies. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:36-48 ~ src/omi_collector/capture/adapters/clock_state_store.py:59-67."
+    },
+    {
+      "detector": "pyscn",
       "identity": "9f32e969d96c75c5eeadf1404824731d626e88bc7027fc59a85abc868f245cc4",
       "count": 1,
       "reason": "Active v2 proof rows are query projections with stage/owner/order fields; proof content is a frozen hash payload. Matching field declarations do not mean the records have the same role or lifetime. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1232-1244 ~ src/omi_collector/capture/adapters/ready_bundles.py:319-330."
@@ -2561,6 +2567,12 @@
       "identity": "f4f72c701d53f62097391d0269de0c06f8dcef2174eb956fb74b1227d075cfaf",
       "count": 1,
       "reason": "Legacy clock correction evidence and typed publication admission snapshots represent different eras, field schemas and ownership. Similar optional/default annotation shape is incidental. Reviewed pair: src/omi_collector/capture/adapters/legacy_clock_import.py:95-106 ~ src/omi_collector/capture/adapters/ready_bundles.py:1104-1113."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "f8c6a633d9b0120dc0b53fbab77679141f39eebe57f85137a815b1e1f76f9c26",
+      "count": 1,
+      "reason": "Clock observation accepts a missing payload as empty state and writes only when the serialized state changes; prepared-intent cancellation requires an existing intent and always persists its validated transition. StateDB already owns transaction, get and put; a generic callback would hide these distinct policies. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:26-48 ~ src/omi_collector/capture/adapters/clock_state_store.py:69-76."
     }
   ]
 }

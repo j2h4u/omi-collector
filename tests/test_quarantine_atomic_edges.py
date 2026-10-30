@@ -45,9 +45,7 @@ def test_admission_rejects_changed_snapshot_after_authentication(
     def authenticate_then_change(state_db: StateDB, source: str, *, page_limit: int) -> CaptureSource:
         authenticated = authenticate(state_db, source, page_limit=page_limit)
         with closing(store.state_db.open_connection()) as connection:
-            connection.execute(
-                "UPDATE capture_source SET committed_count = 2 WHERE source_id = ?", (source_id,)
-            )
+            connection.execute("UPDATE capture_source SET committed_count = 2 WHERE source_id = ?", (source_id,))
             connection.commit()
         return authenticated
 
@@ -79,9 +77,7 @@ def test_sweep_commit_failure_rolls_back_expiry_and_compaction_debt(
     store.mark_quarantine_unprocessable(source_id, "expired quarantine evidence")
     store.state_db.put(StateKind.COMPACTION, "current", {"generation": 7, "pending": False})
     with closing(store.state_db.open_connection()) as connection:
-        connection.execute(
-            "UPDATE capture_source SET retention_deadline = '0' WHERE source_id = ?", (source_id,)
-        )
+        connection.execute("UPDATE capture_source SET retention_deadline = '0' WHERE source_id = ?", (source_id,))
         connection.commit()
     debt_before = store.state_db.get(StateKind.COMPACTION, "current")
     commit = collector_state_db._GuardedConnection.commit

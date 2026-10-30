@@ -827,15 +827,16 @@ def _sync(
             operational_status=operational_status,
             staging=staging,
         )
-        presence = _capture_cli().make_presence_scheduler(
+        capture_cli = _capture_cli()
+        presence = capture_cli.make_presence_scheduler(
             loaded.pendant.address,
-            _capture_cli().SUPPORTED_ADAPTER,
+            capture_cli.SUPPORTED_ADAPTER,
             config=loaded.config,
             staging=staging,
         )
-        sync_operation = _capture_cli().sync(
+        sync_operation = capture_cli.sync(
             loaded.pendant.address,
-            _capture_cli().SUPPORTED_ADAPTER,
+            capture_cli.SUPPORTED_ADAPTER,
             staging,
             report_progress,
             force_1m=force_1m,
@@ -854,8 +855,8 @@ def _sync(
         if operational_status is not None:
             sync_operation = _supervise_operational_status(sync_operation, operational_status)
         result = _run_device_operation(sync_operation, stop_intent=stop_intent)
-        metrics = _capture_cli().download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
-        typer.echo(_capture_cli().render_sync(cast(object, result), metrics))
+        metrics = capture_cli.download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
+        typer.echo(capture_cli.render_sync(cast(object, result), metrics))
     except Exception as error:
         debug_exception("sync_command_failed", error, logger=debug_logger)
         raise

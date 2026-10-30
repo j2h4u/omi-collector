@@ -78,9 +78,13 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
     root = config_path.absolute().parent
     if os.path.lexists(root) and root.is_symlink():
         raise StorageLayoutError("config parent must not be a symlink")
+    return OperatorConfig(config_path.absolute(), PendantConfig(address), _storage_layout(root), runtime_config)
+
+
+def _storage_layout(root: Path) -> StorageLayout:
+    """Derive the fixed private and publication paths beneath one storage root."""
     collector_root = root / "collector"
-    publication_root = root / "ready"
-    layout = StorageLayout(
+    return StorageLayout(
         root=root,
         collector=CollectorLayout(
             root=collector_root,
@@ -91,9 +95,8 @@ def load_operator_config(path: Path = DEFAULT_CONFIG_PATH) -> OperatorConfig:
             debug_log=collector_root / "debug.jsonl",
         ),
         draft=root / "draft",
-        publication=PublicationLayout(root=publication_root),
+        publication=PublicationLayout(root=root / "ready"),
     )
-    return OperatorConfig(config_path.absolute(), PendantConfig(address), layout, runtime_config)
 
 
 def _parse_settings(document: dict[str, object]) -> tuple[str, CollectorConfig]:

@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
 from struct import pack
+from typing import cast
 
 from fakes import ScriptedRingSession, WriteStep
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
@@ -50,10 +51,9 @@ def test_interrupted_visits_publish_one_complete_ordered_bundle_after_drain(tmp_
         ready = tmp_path / "ready"
         ready.mkdir(mode=0o2750)
         ready.chmod(0o2750)
-        draft = tmp_path / "draft"
-        draft.mkdir()
+        (tmp_path / "draft").mkdir()
         config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.12))
-        bootstrap = StagingStore(tmp_path / "spool", draft, config=config)
+        bootstrap = StagingStore(tmp_path / "spool", tmp_path / "draft", config=config)
         store = StagingStore.from_paths(
             bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config
         )
@@ -125,7 +125,7 @@ def test_interrupted_visits_publish_one_complete_ordered_bundle_after_drain(tmp_
         outcome = await asyncio.to_thread(store.recover_and_publish)
         artifacts = tuple(ready.glob("*/manifest.json"))
         assert len(artifacts) == 1, outcome
-        manifest = json.loads(artifacts[0].read_text())
+        manifest = cast(dict[str, object], json.loads(artifacts[0].read_text()))
         audio = (artifacts[0].parent / "audio.ogg").read_bytes()
         assert manifest["format"] == "omi-audio-v2"
         assert manifest["id"] == artifacts[0].parent.name

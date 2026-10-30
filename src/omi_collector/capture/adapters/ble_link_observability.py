@@ -1194,7 +1194,10 @@ class BleLinkObserver:
             self._next_rssi_poll_at = None
         if active is None:
             return
-        self._report_link_status(active.link_id, "disconnected")
+        if reason is None:
+            self._report_link_status(active.link_id, "unavailable", reason="observer_stopped")
+        else:
+            self._report_link_status(active.link_id, "disconnected", reason=f"0x{reason:02x}")
         elapsed = max(0.0, self._clock() - active.started)
         record = BleLinkSessionRecord(
             self.address,
@@ -1246,6 +1249,9 @@ class BleLinkObserver:
         source: str | None = None,
         reason: str | None = None,
     ) -> None:
+        reason_name = (
+            _disconnect_reason_name(int(reason, 16)) if state == "disconnected" and reason is not None else None
+        )
         debug_event(
             "ble_link_status",
             logger=self._debug_logger,
@@ -1257,6 +1263,7 @@ class BleLinkObserver:
             rx_phy=phy.rx_phy if phy else None,
             source=source,
             reason=reason,
+            disconnect_reason_name=reason_name,
         )
 
     def _warn_once(self) -> None:

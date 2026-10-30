@@ -604,7 +604,8 @@ def _validate_sync_progress(fields: Mapping[str, object]) -> None:
 
 
 def _validate_ble_link_status(fields: Mapping[str, object]) -> None:
-    if set(fields) != {"invocation_id", "link_id", "state", "phy_policy", "tx_phy", "rx_phy", "source", "reason"}:
+    required = {"invocation_id", "link_id", "state", "phy_policy", "tx_phy", "rx_phy", "source", "reason"}
+    if set(fields) not in (required, required | {"disconnect_reason_name"}):
         raise ValueError("BLE link status fields are invalid")
     for key in ("invocation_id", "link_id"):
         identity = fields[key]
@@ -622,9 +623,21 @@ def _validate_ble_link_status(fields: Mapping[str, object]) -> None:
     reason = fields["reason"]
     if reason is not None and (
         not isinstance(reason, str)
-        or not (reason in {"observer_degraded", "unknown_phy"} or re.fullmatch(r"0x[0-9a-f]{2}", reason))
+        or not (
+            reason in {"observer_degraded", "observer_stopped", "unknown_phy"} or re.fullmatch(r"0x[0-9a-f]{2}", reason)
+        )
     ):
         raise ValueError("BLE link reason is invalid")
+    if fields.get("disconnect_reason_name") not in (
+        None,
+        "supervision_timeout",
+        "remote_user_terminated",
+        "remote_low_resources",
+        "remote_power_off",
+        "local_host_terminated",
+        "unknown",
+    ):
+        raise ValueError("BLE link disconnect reason name is invalid")
     if fields["state"] == "observed" and (
         fields["tx_phy"] is None or fields["rx_phy"] is None or fields["source"] is None
     ):
@@ -668,7 +681,7 @@ def _validate_runtime_projection(value: Mapping[str, object]) -> None:
 
 
 def _validate_ble_link_projection(value: object) -> None:
-    if not isinstance(value, dict) or set(value) != {
+    required = {
         "invocation_id",
         "link_id",
         "state",
@@ -679,7 +692,8 @@ def _validate_ble_link_projection(value: object) -> None:
         "reason",
         "state_at",
         "last_observed_phy",
-    }:
+    }
+    if not isinstance(value, dict) or set(value) not in (required, required | {"disconnect_reason_name"}):
         raise ValueError("BLE link projection fields are invalid")
     _validate_ble_link_status(
         {key: item for key, item in value.items() if key not in {"state_at", "last_observed_phy"}}
@@ -826,10 +840,13 @@ def _journal_value(value: object, field_name: str) -> object:
 
 def _runtime_fields(event: str, fields: Mapping[str, object]) -> dict[str, object]:
     if event == "ble_link_status":
-        return {
+        result = {
             key: fields.get(key)
             for key in ("invocation_id", "link_id", "state", "phy_policy", "tx_phy", "rx_phy", "source", "reason")
         }
+        if "disconnect_reason_name" in fields:
+            result["disconnect_reason_name"] = fields["disconnect_reason_name"]
+        return result
     if event == "ble_link_rssi_observed":
         if "rssi_dbm" not in fields:
             return {}

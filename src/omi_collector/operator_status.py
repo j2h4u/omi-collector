@@ -365,17 +365,36 @@ def _project_runtime_status(
         "connection_rssi_observed_at": _iso(datetime.fromisoformat(rssi_at)) if isinstance(rssi_at, str) else None,
         "firmware": observed.get("firmware"),
         "last_error": _runtime_error(error),
+        "last_link_observation": _last_link_observation(link, now),
         "last_observed_phy": history,
         "link_observation_state": {
             "state": {"connected": "pending", "disconnected": "not_connected"}.get(link_state, link_state),
             "observed_at": link.get("state_at") if identity.invocation_id is not None else None,
             "reason": link.get("reason") if identity.invocation_id is not None else None,
+            **(
+                {"disconnect_reason_name": link["disconnect_reason_name"]}
+                if identity.invocation_id is not None and link.get("disconnect_reason_name") is not None
+                else {}
+            ),
         },
         "operational_status": operational_status,
         "state": "transferring" if active else state,
         "updated_at": _iso(latest[0]) if latest else None,
         "updated_age_seconds": max(0, int((now - latest[0]).total_seconds())) if latest else None,
         "transfer": _active_transfer(current) if active else None,
+    }
+
+
+def _last_link_observation(link: dict[str, object], now: datetime) -> dict[str, object] | None:
+    timestamp = link.get("state_at")
+    if not isinstance(timestamp, str):
+        return None
+    return {
+        "state": link.get("state"),
+        "reason": link.get("reason"),
+        "disconnect_reason_name": link.get("disconnect_reason_name"),
+        "observed_at": timestamp,
+        "age_seconds": max(0, int((now - datetime.fromisoformat(timestamp)).total_seconds())),
     }
 
 

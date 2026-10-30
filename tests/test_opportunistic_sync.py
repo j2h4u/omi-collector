@@ -3196,6 +3196,7 @@ async def test_default_preflight_skips_cached_status_without_telemetry(tmp_path:
 @_async_test
 async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storage_deadline(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = CollectorConfig(
         retry=RetryConfig(presence_preflight_budget_seconds=0.001),
@@ -3208,7 +3209,6 @@ async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storag
         async def read_status(self) -> RingStatus:
             order.append("status")
             try:
-                await asyncio.sleep(config.telemetry.optional_operation_timeout_seconds * 0.75)
                 return self._status
             finally:
                 cancellation.append("status")
@@ -3232,10 +3232,21 @@ async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storag
     async def emit(_event: Mapping[str, object]) -> None:
         await asyncio.sleep(0.01)
 
-    result = await asyncio.wait_for(
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    pending_attempts = store.pending_attempts
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed_pending_attempts() -> tuple[AttemptDescriptor, ...]:
+        entered.set()
+        release.wait()
+        return pending_attempts()
+
+    monkeypatch.setattr(store, "pending_attempts", delayed_pending_attempts)
+    collection = asyncio.create_task(
         run_opportunistic_collector(
             Provider([session]),
-            _staging_store(tmp_path, _capture_root(tmp_path)),
+            store,
             OpportunisticOptions(
                 TransferTimeouts(info=30.0, transfer=600.0),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
@@ -3243,9 +3254,21 @@ async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storag
                 host_clock_synchronized=lambda _timeout: False,
                 config=config,
             ),
-        ),
-        timeout=0.5,
+        )
     )
+    try:
+        try:
+            assert await asyncio.to_thread(entered.wait, 30)
+            await asyncio.sleep(0.01)
+            assert not collection.done()
+        finally:
+            release.set()
+        result = await asyncio.wait_for(collection, timeout=30)
+    finally:
+        release.set()
+        if not collection.done():
+            collection.cancel()
+        await asyncio.gather(collection, return_exceptions=True)
 
     assert isinstance(result, NoDataResult)
     assert order[:3] == ["info", "optional", "status"]

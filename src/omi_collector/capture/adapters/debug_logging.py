@@ -415,9 +415,25 @@ def _emit_debug_event(
     sink = getattr(target, _RUNTIME_SINK_ATTRIBUTE, None)
     if isinstance(sink, weakref.WeakMethod):
         sink = sink()
-    if callable(sink) and event in {"sync_progress", "ble_link_rssi_observed"}:
+    if event == "ble_link_status":
+        safe = _runtime_fields(event, fields)
         with suppress(Exception):
-            sink(event, _runtime_fields(event, fields), datetime.now(UTC).isoformat(timespec="microseconds"))
+            _validate_runtime_event({"event": event, "fields": safe, "timestamp": datetime.now(UTC).isoformat()})
+            logging.getLogger("omi_collector.ble_link_status").info(
+                "BLE link observation %s",
+                json.dumps({k: v for k, v in safe.items() if k not in {"link_id", "invocation_id"}}, sort_keys=True),
+            )
+    if callable(sink) and event in {"sync_progress", "ble_link_rssi_observed", "ble_link_status"}:
+        try:
+            accepted = sink(event, _runtime_fields(event, fields), datetime.now(UTC).isoformat(timespec="microseconds"))
+        except Exception:  # noqa: BLE001 - diagnostics cannot interrupt capture
+            accepted = False
+        if event == "ble_link_status" and not accepted:
+            with suppress(Exception):
+                logging.getLogger("omi_collector.ble_link_status").warning("BLE link status projection missed")
+    elif event == "ble_link_status":
+        with suppress(Exception):
+            logging.getLogger("omi_collector.ble_link_status").warning("BLE link status projection unavailable")
 
 
 def debug_exception(
@@ -469,27 +485,52 @@ def merge_runtime_status(
         "updated_at": None,
     }
     if event == "sync_progress":
-        progress = cast(dict[str, object], fields["progress"])
-        if _is_newer(timestamp, current.get("updated_at")):
-            current["progress"] = progress
-            current["updated_at"] = timestamp
-        if progress.get("event") == "pendant_observation" and _is_newer(timestamp, current.get("observation_at")):
-            current["observation"] = progress
-            current["observation_at"] = timestamp
-            battery = progress.get("battery_percent")
-            if isinstance(battery, int) and not isinstance(battery, bool):
-                current["battery_observation"] = progress
-                current["battery_observed_at"] = timestamp
-        if progress.get("status") == "session_error" and _is_newer(timestamp, current.get("last_error_at")):
-            current["last_error"] = progress
-            current["last_error_at"] = timestamp
+        _merge_sync_progress(current, fields, timestamp)
     elif event == "ble_link_rssi_observed":
         rssi = fields["rssi_dbm"]
         if isinstance(rssi, int) and _is_newer(timestamp, current.get("connection_rssi_observed_at")):
             current["connection_rssi_dbm"] = rssi
             current["connection_rssi_observed_at"] = timestamp
+    elif event == "ble_link_status":
+        _merge_ble_link_status(current, fields, timestamp)
     _validate_runtime_projection(current)
     return current
+
+
+def _merge_sync_progress(current: dict[str, object], fields: Mapping[str, object], timestamp: str) -> None:
+    progress = cast(dict[str, object], fields["progress"])
+    if _is_newer(timestamp, current.get("updated_at")):
+        current["progress"] = progress
+        current["updated_at"] = timestamp
+    if progress.get("event") == "pendant_observation" and _is_newer(timestamp, current.get("observation_at")):
+        current["observation"] = progress
+        current["observation_at"] = timestamp
+        battery = progress.get("battery_percent")
+        if isinstance(battery, int) and not isinstance(battery, bool):
+            current["battery_observation"] = progress
+            current["battery_observed_at"] = timestamp
+    if progress.get("status") == "session_error" and _is_newer(timestamp, current.get("last_error_at")):
+        current["last_error"] = progress
+        current["last_error_at"] = timestamp
+
+
+def _merge_ble_link_status(current: dict[str, object], fields: Mapping[str, object], timestamp: str) -> None:
+    previous = current.get("ble_link_status")
+    previous = previous if isinstance(previous, dict) else {}
+    same = previous.get("link_id") == fields.get("link_id") and previous.get("invocation_id") == fields.get(
+        "invocation_id"
+    )
+    degraded = (
+        fields["state"] == "unavailable"
+        and fields["link_id"] is None
+        and (not previous or previous.get("invocation_id") == fields["invocation_id"])
+    )
+    if _is_newer(timestamp, previous.get("state_at")) and (fields["state"] == "connected" or same or degraded):
+        history = previous.get("last_observed_phy")
+        if fields["state"] == "observed":
+            history = {key: fields[key] for key in ("tx_phy", "rx_phy", "source", "phy_policy")}
+            history["observed_at"] = timestamp
+        current["ble_link_status"] = {**fields, "state_at": timestamp, "last_observed_phy": history}
 
 
 def write_runtime_status_event(state_db: StateDB, event: str, fields: Mapping[str, object], timestamp: str) -> None:
@@ -538,22 +579,56 @@ def _validate_runtime_event(value: Mapping[str, object]) -> None:
     event = value.get("event")
     fields = cast(Mapping[str, object], value["fields"])
     if event == "sync_progress":
-        progress = fields.get("progress")
-        if not isinstance(progress, dict) or not isinstance(progress.get("status"), str):
-            raise ValueError("runtime progress event is invalid")
-        if progress.get("event") is not None and not isinstance(progress["event"], str):
-            raise ValueError("runtime progress observation is invalid")
-        battery = progress.get("battery_percent")
-        if battery is not None and (isinstance(battery, bool) or not isinstance(battery, int)):
-            raise ValueError("runtime battery observation is invalid")
-        if progress.get("firmware") is not None and not isinstance(progress["firmware"], str):
-            raise ValueError("runtime firmware observation is invalid")
+        _validate_sync_progress(fields)
     elif event == "ble_link_rssi_observed":
         rssi = fields.get("rssi_dbm")
         if "rssi_dbm" not in fields or isinstance(rssi, bool) or (rssi is not None and not isinstance(rssi, int)):
             raise ValueError("runtime RSSI event is invalid")
+    elif event == "ble_link_status":
+        _validate_ble_link_status(fields)
     else:
         raise ValueError("runtime status event type is unsupported")
+
+
+def _validate_sync_progress(fields: Mapping[str, object]) -> None:
+    progress = fields.get("progress")
+    if not isinstance(progress, dict) or not isinstance(progress.get("status"), str):
+        raise ValueError("runtime progress event is invalid")
+    if progress.get("event") is not None and not isinstance(progress["event"], str):
+        raise ValueError("runtime progress observation is invalid")
+    battery = progress.get("battery_percent")
+    if battery is not None and (isinstance(battery, bool) or not isinstance(battery, int)):
+        raise ValueError("runtime battery observation is invalid")
+    if progress.get("firmware") is not None and not isinstance(progress["firmware"], str):
+        raise ValueError("runtime firmware observation is invalid")
+
+
+def _validate_ble_link_status(fields: Mapping[str, object]) -> None:
+    if set(fields) != {"invocation_id", "link_id", "state", "phy_policy", "tx_phy", "rx_phy", "source", "reason"}:
+        raise ValueError("BLE link status fields are invalid")
+    for key in ("invocation_id", "link_id"):
+        identity = fields[key]
+        if identity is not None and (not isinstance(identity, str) or not _INVOCATION_ID.fullmatch(identity)):
+            raise ValueError("BLE link identity is invalid")
+    if fields["state"] not in ("connected", "observed", "disconnected", "unavailable") or fields["phy_policy"] not in (
+        "auto",
+        "force_1m",
+    ):
+        raise ValueError("BLE link state is invalid")
+    if any(fields[key] not in (None, "1M", "2M", "coded") for key in ("tx_phy", "rx_phy")):
+        raise ValueError("BLE link PHY is invalid")
+    if fields["source"] not in (None, "read_phy", "phy_update"):
+        raise ValueError("BLE link source is invalid")
+    reason = fields["reason"]
+    if reason is not None and (
+        not isinstance(reason, str)
+        or not (reason in {"observer_degraded", "unknown_phy"} or re.fullmatch(r"0x[0-9a-f]{2}", reason))
+    ):
+        raise ValueError("BLE link reason is invalid")
+    if fields["state"] == "observed" and (
+        fields["tx_phy"] is None or fields["rx_phy"] is None or fields["source"] is None
+    ):
+        raise ValueError("BLE link observation is incomplete")
 
 
 def _validate_runtime_projection(value: Mapping[str, object]) -> None:
@@ -569,8 +644,10 @@ def _validate_runtime_projection(value: Mapping[str, object]) -> None:
         "progress",
         "updated_at",
     }
-    if set(value) != expected:
+    if set(value) not in (expected, expected | {"ble_link_status"}):
         raise ValueError("runtime status projection fields are invalid")
+    if "ble_link_status" in value:
+        _validate_ble_link_projection(value["ble_link_status"])
     for name in (
         "updated_at",
         "observation_at",
@@ -588,6 +665,43 @@ def _validate_runtime_projection(value: Mapping[str, object]) -> None:
         item = value[name]
         if item is not None and not isinstance(item, dict):
             raise ValueError(f"runtime status projection has invalid {name}")
+
+
+def _validate_ble_link_projection(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "invocation_id",
+        "link_id",
+        "state",
+        "phy_policy",
+        "tx_phy",
+        "rx_phy",
+        "source",
+        "reason",
+        "state_at",
+        "last_observed_phy",
+    }:
+        raise ValueError("BLE link projection fields are invalid")
+    _validate_ble_link_status(
+        {key: item for key, item in value.items() if key not in {"state_at", "last_observed_phy"}}
+    )
+    if _parse_timestamp(value["state_at"]) is None:
+        raise ValueError("BLE link projection timestamp is invalid")
+    history = value["last_observed_phy"]
+    if history is None:
+        return
+    if not isinstance(history, dict) or set(history) != {"tx_phy", "rx_phy", "source", "phy_policy", "observed_at"}:
+        raise ValueError("BLE link history fields are invalid")
+    _validate_ble_link_status(
+        {
+            "invocation_id": None,
+            "link_id": None,
+            "state": "observed",
+            "reason": None,
+            **{key: item for key, item in history.items() if key != "observed_at"},
+        }
+    )
+    if _parse_timestamp(history["observed_at"]) is None:
+        raise ValueError("BLE link history timestamp is invalid")
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -711,6 +825,11 @@ def _journal_value(value: object, field_name: str) -> object:
 
 
 def _runtime_fields(event: str, fields: Mapping[str, object]) -> dict[str, object]:
+    if event == "ble_link_status":
+        return {
+            key: fields.get(key)
+            for key in ("invocation_id", "link_id", "state", "phy_policy", "tx_phy", "rx_phy", "source", "reason")
+        }
     if event == "ble_link_rssi_observed":
         if "rssi_dbm" not in fields:
             return {}

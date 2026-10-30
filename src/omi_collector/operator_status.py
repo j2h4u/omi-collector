@@ -336,6 +336,18 @@ def _project_runtime_status(
     rssi = projection.get("connection_rssi_dbm")
     rssi_at = projection.get("connection_rssi_observed_at")
     state = current.get("status", "unknown")
+    link = projection.get("ble_link_status")
+    link = link if isinstance(link, dict) else {}
+    if identity.invocation_id is not None and link.get("invocation_id") != identity.invocation_id:
+        link = {}
+    history = link.get("last_observed_phy")
+    history = dict(history) if isinstance(history, dict) else None
+    if history is not None and isinstance(history.get("observed_at"), str):
+        measured = datetime.fromisoformat(history["observed_at"])
+        history["age_seconds"] = max(0, int((now - measured).total_seconds()))
+    link_state = link.get("state")
+    if identity.invocation_id is None or not isinstance(link_state, str):
+        link_state = "unknown"
     active = (
         state == "progress"
         and identity.invocation_id is not None
@@ -353,6 +365,12 @@ def _project_runtime_status(
         "connection_rssi_observed_at": _iso(datetime.fromisoformat(rssi_at)) if isinstance(rssi_at, str) else None,
         "firmware": observed.get("firmware"),
         "last_error": _runtime_error(error),
+        "last_observed_phy": history,
+        "link_observation_state": {
+            "state": {"connected": "pending", "disconnected": "not_connected"}.get(link_state, link_state),
+            "observed_at": link.get("state_at") if identity.invocation_id is not None else None,
+            "reason": link.get("reason") if identity.invocation_id is not None else None,
+        },
         "operational_status": operational_status,
         "state": "transferring" if active else state,
         "updated_at": _iso(latest[0]) if latest else None,

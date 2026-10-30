@@ -551,6 +551,8 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "connection_rssi_observed_at": None,
         "firmware": None,
         "last_error": None,
+        "last_observed_phy": None,
+        "link_observation_state": {"state": "unknown", "observed_at": None, "reason": None},
         "operational_status": {"clock": "unknown", "publication": "unknown", "quality": "unknown"},
         "state": "unknown",
         "transfer": None,

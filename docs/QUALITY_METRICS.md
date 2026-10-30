@@ -117,6 +117,9 @@ practices](BEST_PRACTICES.md#status-and-logs) for operational guidance.
 
 Use `journalctl -u omi-collector.service` for the operational timeline. The
 service's INFO stream omits routine `storage_wait` polling and detailed
-`ble_link_session` records; run a diagnostic sync with `--log-level DEBUG` when
-those records are needed. Detailed diagnostics go to the system journal; there
-is no rotating debug JSONL state file.
+`ble_link_session` records. It reports observed TX and RX PHY and their source
+separately from the requested policy. Device status shows the last observed PHY
+with its age; this historical sample does not establish the current connection.
+Run a diagnostic sync with `--log-level DEBUG` when detailed session records are
+needed. Detailed diagnostics go to the system journal; there is no rotating
+debug JSONL state file.

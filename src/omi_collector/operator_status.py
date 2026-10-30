@@ -319,6 +319,13 @@ def _runtime_status(
     db: StateDB, now: datetime, operational_status: dict[str, str], identity: OperationalIdentity
 ) -> dict[str, object]:
     projection = read_runtime_status(db) or {}
+    return _project_runtime_status(projection, now, operational_status, identity)
+
+
+def _project_runtime_status(
+    projection: dict[str, object], now: datetime, operational_status: dict[str, str], identity: OperationalIdentity
+) -> dict[str, object]:
+    """Derive the operator view from one already-read runtime snapshot."""
     latest = _dated_projection(projection, "progress", "updated_at")
     observation = _dated_projection(projection, "observation", "observation_at")
     battery_observation = _dated_projection(projection, "battery_observation", "battery_observed_at")

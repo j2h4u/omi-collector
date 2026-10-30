@@ -414,12 +414,13 @@ class SessionLifecycle:
         if previous is None:
             return None
         if isinstance(previous, Interrupted):
-            outcome_name: Literal["connected_interrupted", "retry"] = (
-                "connected_interrupted" if previous.connected else "retry"
+            outcome: AttemptOutcome = (
+                ConnectedInterruption(previous.durable_progress)
+                if previous.connected
+                else NotConnected(previous.durable_progress)
             )
-            outcome = presence_attempt_outcome(outcome_name, previous.durable_progress)
         else:
-            outcome = presence_attempt_outcome("candidate_unavailable", False)
+            outcome = CandidateUnavailable()
         return await presence.attempt_finished(outcome)
 
     async def _run_one_attempt(self, with_presence: bool) -> str:
@@ -1051,19 +1052,6 @@ def session_retry_outcome(
     if isinstance(error, CandidateUnavailableError):
         return "candidate_unavailable"
     return "connected_interrupted" if connected else "retry"
-
-
-def presence_attempt_outcome(outcome: str, durable_progress: bool) -> AttemptOutcome:
-    """Translate completed lifecycle work into the scheduler's closed outcome union."""
-    if outcome in {"drained", "collected"}:
-        return CleanDrain()
-    if outcome == "candidate_unavailable":
-        return CandidateUnavailable()
-    if outcome == "connected_interrupted":
-        return ConnectedInterruption(durable_progress)
-    if outcome == "retry":
-        return NotConnected(durable_progress)
-    raise RuntimeError(f"unknown lifecycle attempt outcome: {outcome}")
 
 
 def _visit_recovery_end(end: PresenceEnd) -> RecoveryEnded:

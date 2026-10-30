@@ -49,7 +49,7 @@ from omi_collector.capture.adapters.staging_contract import (
 )
 from omi_collector.capture.adapters.staging_filesystem import StagingIO
 from omi_collector.capture.adapters.staging_writer import StagingWriter
-from omi_collector.capture.application import batch_reconciliation, session_lifecycle
+from omi_collector.capture.application import batch_reconciliation, operational_telemetry, session_lifecycle
 from omi_collector.capture.application.batch_reconciliation import (
     BatchReconciler,
     BatchUnavailableError,
@@ -3275,6 +3275,159 @@ async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storag
     assert "optional" in order
     assert cancellation.count("status") == 1
     assert cancellation.count("optional") >= 1
+
+
+@_async_test
+async def test_status_read_can_outlast_preflight_budget_and_preserve_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    order: list[str] = []
+    observations: list[Mapping[str, object]] = []
+    operation_timeouts: list[float] = []
+
+    class DelayedStatusSession(ScriptedRingSession):
+        async def read_status(self) -> RingStatus:
+            order.append("status started")
+            started.set()
+            await release.wait()
+            order.append("status completed")
+            return self._status
+
+        async def write_control(self, payload: bytes) -> None:
+            order.append(payload.hex())
+            await super().write_control(payload)
+
+    bounded_optional = operational_telemetry._bounded_optional
+
+    async def record_timeout(awaitable: Awaitable[T], timeout: float) -> T:
+        if getattr(awaitable, "__qualname__", "").endswith("DelayedStatusSession.read_status"):
+            operation_timeouts.append(timeout)
+        return await bounded_optional(awaitable, timeout)
+
+    monkeypatch.setattr(operational_telemetry, "_bounded_optional", record_timeout)
+    session = DelayedStatusSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_advance_command(11), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(11, 11),)),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    config = CollectorConfig(
+        retry=RetryConfig(presence_preflight_budget_seconds=0.001),
+        telemetry=TelemetryConfig(optional_operation_timeout_seconds=5.0),
+    )
+    task = asyncio.create_task(
+        run_opportunistic_collector(
+            Provider([session]),
+            store,
+            replace(
+                _options(),
+                operational=observations.append,
+                host_clock_synchronized=lambda _timeout: False,
+                config=config,
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=30)
+        await asyncio.sleep(0.01)
+        assert not task.done()
+        assert order == ["10", "status started"]
+        release.set()
+        result = await asyncio.wait_for(task, timeout=30)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert operation_timeouts == [5.0]
+    assert order == [
+        "10",
+        "status started",
+        "status completed",
+        encode_read_command(10, 1).hex(),
+        "10",
+        encode_advance_command(11).hex(),
+        "10",
+    ]
+    assert any(event.get("used_bytes") == session._status.used_bytes for event in observations)
+    assert isinstance(result, CollectionResult)
+    assert isinstance(result.seal, DurableSqliteSeal)
+    assert _sealed_records(store, result.seal) == _record(10)
+
+
+@_async_test
+async def test_status_timeout_cancels_read_and_preserves_audio(tmp_path: Path) -> None:
+    order: list[str] = []
+    cancelled = False
+
+    class HangingStatusSession(ScriptedRingSession):
+        async def read_status(self) -> RingStatus:
+            nonlocal cancelled
+            order.append("status started")
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled = True
+                order.append("status cancelled")
+                raise
+            raise AssertionError("hanging status read unexpectedly completed")
+
+        async def read_optional_characteristic(self, uuid: str) -> bytes | None:
+            del uuid
+            return None
+
+        async def write_control(self, payload: bytes) -> None:
+            order.append(payload.hex())
+            await super().write_control(payload)
+
+    session = HangingStatusSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_advance_command(11), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(11, 11),)),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    config = CollectorConfig(telemetry=TelemetryConfig(optional_operation_timeout_seconds=0.02))
+    result = await asyncio.wait_for(
+        run_opportunistic_collector(
+            Provider([session]),
+            store,
+            replace(
+                _options(),
+                operational=lambda _event: None,
+                host_clock_synchronized=lambda _timeout: False,
+                config=config,
+            ),
+        ),
+        timeout=30,
+    )
+
+    assert cancelled
+    assert order == [
+        "10",
+        "status started",
+        "status cancelled",
+        encode_read_command(10, 1).hex(),
+        "10",
+        encode_advance_command(11).hex(),
+        "10",
+    ]
+    assert isinstance(result, CollectionResult)
+    assert result.next_sequence == 11
+    assert isinstance(result.seal, DurableSqliteSeal)
+    assert _sealed_records(store, result.seal) == _record(10)
 
 
 @_async_test

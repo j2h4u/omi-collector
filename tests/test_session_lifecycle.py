@@ -72,7 +72,6 @@ from omi_collector.capture.application.session_lifecycle import (
     StorageNotReadySessionError,
     bounded,
     exit_context,
-    presence_attempt_outcome,
     recoverable_session_outcome,
     report_session_error,
     session_retry_outcome,
@@ -1440,24 +1439,6 @@ def test_presence_outcome_follows_gatt_teardown_and_checkpoint(monkeypatch: pyte
     assert events == ["connected", "teardown", "checkpoint", "outcome"]
 
 
-@pytest.mark.parametrize(
-    ("outcome", "durable_progress", "expected_type"),
-    [
-        ("drained", False, CleanDrain),
-        ("collected", True, CleanDrain),
-        ("retry", False, NotConnected),
-        ("connected_interrupted", True, ConnectedInterruption),
-        ("candidate_unavailable", False, CandidateUnavailable),
-    ],
-)
-def test_presence_outcomes_are_canonical(outcome: str, durable_progress: bool, expected_type: type[object]) -> None:
-    result = presence_attempt_outcome(outcome, durable_progress)
-
-    assert isinstance(result, expected_type)
-    if isinstance(result, (NotConnected, ConnectedInterruption)):
-        assert result.durable_progress is durable_progress
-
-
 @pytest.mark.parametrize("timeout", (0.0, -0.5))
 def test_bounded_rejects_nonpositive_timeout_without_consuming_futures(timeout: float) -> None:
     async def scenario() -> None:
@@ -2366,8 +2347,10 @@ def test_provider_candidate_unavailable_is_reported_and_next_wake_can_complete(
     assert presence.outcomes == [CandidateUnavailable(), CleanDrain()]
 
 
+@pytest.mark.parametrize("connected_progress", (False, True))
 def test_presence_reports_disconnected_and_connected_interruption_kinds_in_order(
     monkeypatch: pytest.MonkeyPatch,
+    connected_progress: bool,
 ) -> None:
     presence = _ScriptedPresence(
         [
@@ -2403,7 +2386,7 @@ def test_presence_reports_disconnected_and_connected_interruption_kinds_in_order
         wait_presence_attempt=presence.wait_for_attempt,
         connected_step=connected_step,
         post_session_checkpoint=_noop,
-        completed_batch_query=lambda: 0,
+        completed_batch_query=lambda: int(connected_progress and connected_calls > 0),
         drained_result=lambda: NoDataResult(RingInfo(10, 10, 100, 0, 512)),
     )
     run = SessionLifecycleRun(
@@ -2425,4 +2408,4 @@ def test_presence_reports_disconnected_and_connected_interruption_kinds_in_order
     monkeypatch.setattr("omi_collector.capture.application.collector.ring_info", info_reader)
     _run(SessionLifecycle(run).run_with_presence())
 
-    assert presence.outcomes == [NotConnected(False), ConnectedInterruption(False), CleanDrain()]
+    assert presence.outcomes == [NotConnected(False), ConnectedInterruption(connected_progress), CleanDrain()]

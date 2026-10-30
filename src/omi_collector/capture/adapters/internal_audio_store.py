@@ -28,11 +28,10 @@ from ..domain.internal_audio_machine import (
     PrepareLeg,
     QuarantineAction,
     QuarantineDisposition,
-    QuarantineOpened,
     ReadBegin,
-    quarantine_transition,
     transition,
 )
+from ..domain.quarantine_disposition import classify_conflict
 from .clock_segments import ClockSegmentMap
 from .collector_state_db import (
     StateDB,
@@ -1150,17 +1149,12 @@ class InternalAudioStore:
             raise InternalAudioStoreError("canonical record presence is invalid")
         has_canonical_records = bool(canonical_value)
         now = time.time_ns()
-        classification = quarantine_transition(
-            QuarantineDisposition.UNCLASSIFIED,
-            QuarantineOpened(source.committed_count, has_canonical_records),
-        )
+        conflict = classify_conflict(source.committed_count, has_canonical_records, reason)
+        classification = conflict.classification
         if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
             raise InternalAudioStoreError(classification.reason)
         assert classification.next_disposition is not None
-        block_reason = (
-            "source_authentication_mismatch" if source.committed_count == 0 and has_canonical_records else reason
-        )
-        return block_reason, classification.next_disposition, now
+        return conflict.block_reason, classification.next_disposition, now
 
     def _resolve_tail(
         self,

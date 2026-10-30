@@ -20,7 +20,6 @@ from ..domain.internal_audio_machine import (
     MarkUnprocessable,
     QuarantineAction,
     QuarantineDisposition,
-    QuarantineOpened,
     ResidualExpiry,
     SourceIntegrityHold,
     TerminalPrefix,
@@ -29,6 +28,7 @@ from ..domain.internal_audio_machine import (
 from ..domain.internal_audio_machine import (
     transition as audio_transition,
 )
+from ..domain.quarantine_disposition import classify_conflict
 from ..domain.quarantine_machine import (
     QuarantineState,
 )
@@ -205,16 +205,14 @@ def _typed_quarantine_row(
     if type(row[0]) is not int:
         raise AttemptStateError("typed attempt committed count is invalid")
     has_records = bool(row[1])
-    classification = quarantine_transition(
-        QuarantineDisposition.UNCLASSIFIED, QuarantineOpened(cast(int, row[0]), has_records)
-    )
+    conflict = classify_conflict(cast(int, row[0]), has_records, reason)
+    classification = conflict.classification
     if classification.action not in {QuarantineAction.KEEP, QuarantineAction.MARK_UNPROCESSABLE}:
         raise AttemptStateError(classification.reason)
     assert classification.next_disposition is not None
     terminal = classification.action is QuarantineAction.MARK_UNPROCESSABLE
     now = _wall_clock_ns() if terminal else None
     deadline = None if now is None else now + _seconds_to_nanoseconds(retention_seconds)
-    block_reason = "source_authentication_mismatch" if row[0] == 0 and has_records else reason
     cursor = connection.execute(
         "UPDATE capture_source SET source_type = 'quarantine', lifecycle = ?, "
         "block_reason = ?, quarantine_disposition = ?, quarantine_opaque = 0, "
@@ -224,7 +222,7 @@ def _typed_quarantine_row(
         "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
         (
             decision.next_phase.value,
-            block_reason,
+            conflict.block_reason,
             classification.next_disposition.value,
             "quarantine contains no canonical records" if terminal else None,
             str(now) if now is not None else None,

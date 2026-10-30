@@ -86,6 +86,13 @@ def _emit_at(callback: Callable[[object], object], candidate: object, now: list[
     callback(PresenceAdvertisement(candidate, -72))
 
 
+async def _loop_fence() -> None:
+    loop = asyncio.get_running_loop()
+    fence = loop.create_future()
+    loop.call_soon(fence.set_result, None)
+    await fence
+
+
 def _after_loop_turns(turns: int, callback: Callable[[], None]) -> None:
     loop = asyncio.get_running_loop()
 
@@ -1796,10 +1803,7 @@ def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None
         class TwoGenerationObserver(FakeObserver):
             async def start(self, callback: Callable[[object], object]) -> None:
                 await super().start(callback)
-                if len(self.callbacks) == 1:
-                    first_scan_started.set()
-                elif len(self.callbacks) == 2:
-                    second_scan_started.set()
+                (first_scan_started if len(self.callbacks) == 1 else second_scan_started).set()
 
         async def wait_for_ads(_delay: float) -> None:
             waiting_for_advertisement.set()
@@ -1821,8 +1825,7 @@ def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None
             _emit_pair(stale_callback, first_candidate, now, 0.0, 0.02)
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                 first_wake = await first
-            assert isinstance(first_wake, PresenceWake)
-            assert first_wake.candidate is first_candidate
+            assert isinstance(first_wake, PresenceWake) and first_wake.candidate is first_candidate
             assert await scheduler.attempt_finished(CandidateUnavailable()) is None
 
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
@@ -1833,18 +1836,20 @@ def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None
                 await waiting_for_advertisement.wait()
 
             current_callback = observer.callbacks[1]
-            _emit_at(current_callback, fresh_candidate, now, 0.1)
             waiting_for_advertisement.clear()
+            _emit_at(current_callback, fresh_candidate, now, 0.1)
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                 await waiting_for_advertisement.wait()
 
-            await asyncio.to_thread(stale_callback, PresenceAdvertisement(stale_candidate, -80))
+            await asyncio.to_thread(_emit_pair, stale_callback, stale_candidate, now, 0.2, 0.22)
+            await _loop_fence()
+            assert not second.done()
+
             _emit_at(current_callback, fresh_candidate, now, 0.3)
             async with asyncio.timeout(_READINESS_TIMEOUT_SECONDS):
                 second_wake = await second
 
-            assert isinstance(second_wake, PresenceWake)
-            assert second_wake.candidate is fresh_candidate
+            assert isinstance(second_wake, PresenceWake) and second_wake.candidate is fresh_candidate
         finally:
             for task in (first, second):
                 if task is not None and not task.done():

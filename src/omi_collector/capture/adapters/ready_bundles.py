@@ -24,6 +24,7 @@ from typing import Literal, NoReturn, Protocol, TypeGuard, cast
 from ...config import ReadyConfig
 from ..application.storage_fault import TransientInternalAudioStorageError
 from ..domain.clock_state import ClockState, ClockStateError
+from ..domain.coverage_decision import CoverageDecisionError, decide_coverage
 from ..domain.internal_audio_machine import (
     QUARANTINE_CUSTODY_HOLD_REASONS,
     AudioAction,
@@ -4286,30 +4287,16 @@ def _typed_coverage_proposal(connection: sqlite3.Connection, admission: _TypedAd
     old = tuple(row)
     _require_typed_coverage_source(old, admission)
     proposed = list(old)
-    full = admission.admitted_count == admission.snapshot.committed_count
-    if not full and admission.admitted_lifecycle != "blocked":
-        raise ReadyBundleError("only a certified blocked prefix may retain uncovered source rows")
-    _require_audio_decision(
-        AudioPhase(cast(str, old[0])),
-        ReadyCustody(
-            certified_quarantine_prefix=admission.admitted_lifecycle == "blocked",
-        ),
-        AudioAction.RETIRE,
-        AudioPhase.COVERED,
-    )
-    proposed[0] = "covered"
+    try:
+        phase, retirement_cursor = decide_coverage(
+            cast(str, old[0]), admission.admitted_count, admission.snapshot.committed_count
+        )
+    except CoverageDecisionError as error:
+        raise ReadyBundleError(str(error)) from None
+    proposed[0] = phase.value
     proposed[8] = encode_uint64(admission.snapshot.sequence_start + admission.admitted_count)
     proposed[10] = admission.admitted_sha256
-    proposed[11] = None
-    if full:
-        _require_audio_decision(
-            AudioPhase.COVERED,
-            BeginRetirement(),
-            AudioAction.RETIRE,
-            AudioPhase.RETIRING,
-        )
-        proposed[0] = "retiring"
-        proposed[11] = 0
+    proposed[11] = retirement_cursor
     return _SourceCoverage(admission.snapshot.source_id, old, tuple(proposed))
 
 

@@ -126,3 +126,45 @@ def test_full_quality_queue_warns_and_keeps_last_observation(
         cast(dict[str, object], cast(dict[str, object], projection["ble_link_status"])["last_observed_phy"])["tx_phy"]
         == "1M"
     )
+
+
+def test_service_logging_in_fresh_process_emits_one_sanitized_observation() -> None:
+    import json
+    import subprocess
+    import sys
+
+    code = r"""
+import logging
+from omi_collector.cli import _ble_link_logging
+from omi_collector.capture.adapters.debug_logging import debug_event
+
+logger = logging.getLogger("omi_collector.ble_link_status")
+original = (logger.level, logger.propagate, tuple(logger.handlers))
+try:
+    with _ble_link_logging():
+        with _ble_link_logging():
+            debug_event("ble_link_status", invocation_id="1" * 32, link_id="2" * 32,
+                        state="observed", phy_policy="auto", tx_phy="1M", rx_phy="1M",
+                        source="read_phy", reason=None)
+            logging.getLogger("omi_collector.capture").debug("private debug message")
+        raise RuntimeError("cleanup test")
+except RuntimeError:
+    pass
+assert (logger.level, logger.propagate, tuple(logger.handlers)) == original
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=10)
+    lines = [line for line in result.stderr.splitlines() if line.startswith("BLE link observation ")]
+    assert len(lines) == 1
+    payload = cast(dict[str, object], json.loads(lines[0].removeprefix("BLE link observation ")))
+    assert (payload["tx_phy"], payload["rx_phy"], payload["phy_policy"], payload["source"]) == (
+        "1M",
+        "1M",
+        "auto",
+        "read_phy",
+    )
+    assert "1" * 32 not in result.stderr
+    assert "2" * 32 not in result.stderr
+    assert "01:02:03:04:05:06" not in result.stderr
+    assert "0x42" not in result.stderr
+    assert "private debug message" not in result.stderr
+    assert result.stdout == ""

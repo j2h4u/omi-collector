@@ -797,6 +797,28 @@ def device_sync(
         _sync(loaded, staging, force_1m=force_1m, log_level=log_level)
 
 
+@contextmanager
+def _ble_link_logging() -> Iterator[None]:
+    """Route sanitized link observations to the service journal during sync."""
+    logger = logging.getLogger("omi_collector.ble_link_status")
+    if any(handler.name == "omi_collector.ble_link_status" for handler in logger.handlers):
+        yield
+        return
+    old_level, old_propagate = logger.level, logger.propagate
+    handler = logging.StreamHandler()
+    handler.name = "omi_collector.ble_link_status"
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logger.propagate = old_propagate
+        handler.close()
+
+
 def _sync(
     loaded: OperatorConfig,
     staging: StagingStore,
@@ -818,50 +840,51 @@ def _sync(
     )
 
     debug_logger = configure_debug_logging(loaded.storage.collector.root)
-    try:
-        if stop_intent is not None:
-            stop_intent.check()
-        report_progress = SyncProgressReporter(
-            log_level,
-            debug_logger=debug_logger,
-            operational_status=operational_status,
-            staging=staging,
-        )
-        capture_cli = _capture_cli()
-        presence = capture_cli.make_presence_scheduler(
-            loaded.pendant.address,
-            capture_cli.SUPPORTED_ADAPTER,
-            config=loaded.config,
-            staging=staging,
-        )
-        sync_operation = capture_cli.sync(
-            loaded.pendant.address,
-            capture_cli.SUPPORTED_ADAPTER,
-            staging,
-            report_progress,
-            force_1m=force_1m,
-            presence=presence,
-            config=loaded.config,
-            link_terminal_callback=report_progress.report_ble_link,
-            debug_logger=debug_logger,
-            operational_quality_signal=(
-                _quality_status_callback(operational_status) if operational_status is not None else None
-            ),
-            record_publication=(
-                operational_status.record_publication_outcome if operational_status is not None else None
-            ),
-            **({"stop_intent": stop_intent} if stop_intent is not None else {}),
-        )
-        if operational_status is not None:
-            sync_operation = _supervise_operational_status(sync_operation, operational_status)
-        result = _run_device_operation(sync_operation, stop_intent=stop_intent)
-        metrics = capture_cli.download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
-        typer.echo(capture_cli.render_sync(cast(object, result), metrics))
-    except Exception as error:
-        debug_exception("sync_command_failed", error, logger=debug_logger)
-        raise
-    finally:
-        close_debug_logging(debug_logger)
+    with _ble_link_logging():
+        try:
+            if stop_intent is not None:
+                stop_intent.check()
+            report_progress = SyncProgressReporter(
+                log_level,
+                debug_logger=debug_logger,
+                operational_status=operational_status,
+                staging=staging,
+            )
+            capture_cli = _capture_cli()
+            presence = capture_cli.make_presence_scheduler(
+                loaded.pendant.address,
+                capture_cli.SUPPORTED_ADAPTER,
+                config=loaded.config,
+                staging=staging,
+            )
+            sync_operation = capture_cli.sync(
+                loaded.pendant.address,
+                capture_cli.SUPPORTED_ADAPTER,
+                staging,
+                report_progress,
+                force_1m=force_1m,
+                presence=presence,
+                config=loaded.config,
+                link_terminal_callback=report_progress.report_ble_link,
+                debug_logger=debug_logger,
+                operational_quality_signal=(
+                    _quality_status_callback(operational_status) if operational_status is not None else None
+                ),
+                record_publication=(
+                    operational_status.record_publication_outcome if operational_status is not None else None
+                ),
+                **({"stop_intent": stop_intent} if stop_intent is not None else {}),
+            )
+            if operational_status is not None:
+                sync_operation = _supervise_operational_status(sync_operation, operational_status)
+            result = _run_device_operation(sync_operation, stop_intent=stop_intent)
+            metrics = capture_cli.download_metrics(cast(object, result), max(0.0, time.monotonic() - started))
+            typer.echo(capture_cli.render_sync(cast(object, result), metrics))
+        except Exception as error:
+            debug_exception("sync_command_failed", error, logger=debug_logger)
+            raise
+        finally:
+            close_debug_logging(debug_logger)
 
 
 def _quality_status_callback(

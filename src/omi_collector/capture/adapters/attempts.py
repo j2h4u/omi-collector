@@ -192,46 +192,54 @@ class SqliteStagedAttempt:
             expected = offset + position // AUDIO_RECORD_SIZE
             chunk_end = position + len(chunk)
             following = partial if chunk_end == len(payload) else b""
-            try:
-                source = self.source
-                record_count = len(chunk) // AUDIO_RECORD_SIZE
-                checkpoint_tail = (
-                    CaptureTail(
-                        source.current_leg_generation,
-                        expected + record_count,
-                        (expected + record_count) * AUDIO_RECORD_SIZE + len(following),
-                        (expected + record_count) * AUDIO_RECORD_SIZE,
-                        following,
-                    )
-                    if following
-                    else None
-                )
-                self._audio_store.commit_drain(
-                    self.attempt_id,
-                    expected,
-                    (chunk[index : index + AUDIO_RECORD_SIZE] for index in range(0, len(chunk), AUDIO_RECORD_SIZE)),
-                    DrainCheckpoint(source.current_leg_generation, checkpoint_tail),
-                )
-            except InternalAudioStoreError as error:
-                raise RecordAcceptanceError(str(error)) from error
+            self._commit_record_chunk(expected, chunk, following)
         if not payload:
-            try:
-                source = self.source
-                checkpoint_tail = CaptureTail(
-                    source.current_leg_generation,
-                    offset,
-                    offset * AUDIO_RECORD_SIZE + len(partial),
-                    offset * AUDIO_RECORD_SIZE,
-                    partial,
-                )
-                self._audio_store.commit_tail(
-                    self.attempt_id,
-                    offset,
-                    DrainCheckpoint(source.current_leg_generation, checkpoint_tail),
-                )
-            except InternalAudioStoreError as error:
-                raise RecordAcceptanceError(str(error)) from error
+            self._commit_partial_tail(offset, partial)
         self._refresh_descriptor()
+
+    def _commit_record_chunk(self, expected: int, chunk: bytes, following: bytes) -> None:
+        """Commit one bounded record page with its final partial tail, if any."""
+        try:
+            source = self.source
+            record_count = len(chunk) // AUDIO_RECORD_SIZE
+            checkpoint_tail = (
+                CaptureTail(
+                    source.current_leg_generation,
+                    expected + record_count,
+                    (expected + record_count) * AUDIO_RECORD_SIZE + len(following),
+                    (expected + record_count) * AUDIO_RECORD_SIZE,
+                    following,
+                )
+                if following
+                else None
+            )
+            self._audio_store.commit_drain(
+                self.attempt_id,
+                expected,
+                (chunk[index : index + AUDIO_RECORD_SIZE] for index in range(0, len(chunk), AUDIO_RECORD_SIZE)),
+                DrainCheckpoint(source.current_leg_generation, checkpoint_tail),
+            )
+        except InternalAudioStoreError as error:
+            raise RecordAcceptanceError(str(error)) from error
+
+    def _commit_partial_tail(self, offset: int, partial: bytes) -> None:
+        """Commit a drain that contains only the bounded partial record tail."""
+        try:
+            source = self.source
+            checkpoint_tail = CaptureTail(
+                source.current_leg_generation,
+                offset,
+                offset * AUDIO_RECORD_SIZE + len(partial),
+                offset * AUDIO_RECORD_SIZE,
+                partial,
+            )
+            self._audio_store.commit_tail(
+                self.attempt_id,
+                offset,
+                DrainCheckpoint(source.current_leg_generation, checkpoint_tail),
+            )
+        except InternalAudioStoreError as error:
+            raise RecordAcceptanceError(str(error)) from error
 
     def checkpoint(self) -> DurablePrefix:
         self._require_open()

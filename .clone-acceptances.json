@@ -86,6 +86,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "048d18427579ed016ad70e82f5455dd3b307a09cc32e245622da476c4e9fe5c4",
+      "count": 1,
+      "reason": "DurabilityConfig validates disk headroom, overhead fraction and I/O chunk size; TelemetryConfig validates observation timeouts. These are separate configuration contracts and already share primitive validators. Reviewed pair: src/omi_collector/config.py:174-186 ~ src/omi_collector/config.py:267-279."
+    },
+    {
+      "detector": "jscpd",
       "identity": "05247e2206e25a7e8d9dc44696980a731fa3b167002e709cc7f002ee77a4c4f2",
       "count": 1,
       "reason": "BenchmarkContext, CaptureSource, quarantine admission snapshots and v2 proof/stage/resume records carry different owners, persisted schemas and custody lifetimes. Field-name normalization erases those distinctions; preserve these explicit record types. Reviewed pair: scripts/bench_omic16_internal_sqlite.py:82-98 ~ src/omi_collector/capture/adapters/ready_bundles.py:1212-1228."
@@ -320,6 +326,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "3331e53207754f02e5595afcbdb2c6ed912a1749861b7ffab76b9969b1bf88ca",
+      "count": 1,
+      "reason": "DebugLogConfig validates logger identity and diagnostic storage settings, while QualityMetricsConfig controls separate quality evidence history and queue defaults. They already share primitive validation. Reviewed pair: src/omi_collector/config.py:270-297 ~ src/omi_collector/config.py:296-322."
+    },
+    {
+      "detector": "jscpd",
       "identity": "334273164fac34199830adb0581dc4a4783c000a9bbb80fb628e796f4f0cac76",
       "count": 1,
       "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:334-344 ~ src/omi_collector/config.py:346-356."
@@ -407,12 +419,6 @@
       "identity": "3f3aa66461d9f1517eae84f325d1ebd349e843bb999726774a2e53c4a4433829",
       "count": 1,
       "reason": "Audio state handlers enforce different admissible source phases and event guards for data, barriers, terminalization, conflict, custody and retirement. Their result construction is shared through AudioDecision; preserve the explicit independent transition rules. Reviewed pair: src/omi_collector/capture/domain/internal_audio_machine.py:189-196 ~ src/omi_collector/capture/domain/internal_audio_machine.py:257-264."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "3fabb1a0b91ad78181b3788e7970817b4c0f49436283b744f8e6d52e71aab490",
-      "count": 1,
-      "reason": "HCI event parsers read different byte offsets, status/handle layouts and minimum lengths (connection, update, parameter request, data length, disconnect). Keep per-opcode decoding and malformed diagnostics; integer endian conversion is already a platform operation. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:475-480 ~ src/omi_collector/capture/adapters/ble_link_observability.py:535-540."
     },
     {
       "detector": "jscpd",
@@ -776,6 +782,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "765a4110dfbf816f2514323101c4a700df65900422c13a5445faf7d7cc4777bb",
+      "count": 1,
+      "reason": "HCI data-length change and remote connection parameter request read little-endian words but use different handle masking, field meanings, event types and length/error handling. Preserve their event-specific decoding. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:477-482 ~ src/omi_collector/capture/adapters/ble_link_observability.py:537-542."
+    },
+    {
+      "detector": "jscpd",
       "identity": "772a7562ac29f5ef4c1e57acb00d47b25da2c6f59c08baf5a57730a8855c924a",
       "count": 1,
       "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:502-508 ~ src/omi_collector/cli.py:678-686."
@@ -827,12 +839,6 @@
       "identity": "7fcc360d4f1a78f4178fc9b8eda1c04ec9f34781cfe4b3965276b912c43bba24",
       "count": 1,
       "reason": "The windows overlap one operational-status transition/enum declaration. Distinct state/event values are not duplicate executable functions. Reviewed pair: src/omi_collector/capture/domain/operational_status_machine.py:37-50 ~ src/omi_collector/capture/domain/operational_status_machine.py:38-51."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "82a8e71eb154fd3b1a96fde90b35161f6600d1a975c4ac70287cb55e84b2ca87",
-      "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:174-186 ~ src/omi_collector/config.py:267-279."
     },
     {
       "detector": "jscpd",
@@ -1367,12 +1373,6 @@
       "identity": "ccc51a79c94522033e13418ea3a666532928a01d9888d9467d80562aa7c4acc6",
       "count": 1,
       "reason": "Prepare-leg, READ_BEGIN and interruption are distinct durable FSM mutations with different SQL predicates, state transitions and durability diagnostics. Their shared rollback/storage-fault handling already calls common helpers; do not replace them with a generic transaction effect. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:639-645 ~ src/omi_collector/capture/adapters/internal_audio_store.py:690-696."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "cd660daafac31cd09996a06b155fcc0078116b7e8db40e3900a0a95ae982cc88",
-      "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:270-297 ~ src/omi_collector/config.py:296-322."
     },
     {
       "detector": "jscpd",
@@ -2054,6 +2054,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "5f4a4668b1aa0ab8de4e11c23c3b0f862458f5ce103d793b7496f2829b1676ab",
+      "count": 1,
+      "reason": "DebugLogConfig validates logger identity and diagnostic storage settings, while QualityMetricsConfig controls separate quality evidence history and queue defaults. They already share primitive validation. Reviewed pair: src/omi_collector/config.py:276-298 ~ src/omi_collector/config.py:302-322."
+    },
+    {
+      "detector": "pyscn",
       "identity": "5f6860cf9a8ad8aceab8e81165ac47e53f00a7bf29cfcd357bc5abb498c39a86",
       "count": 1,
       "reason": "Initialization and journal recovery have different eligibility checks, effects and public error sets. CLI boilerplate does not establish one migration operation. Reviewed pair: src/omi_collector/cli.py:467-502 ~ src/omi_collector/cli.py:551-583."
@@ -2249,12 +2255,6 @@
       "identity": "9c14ac35ee3d167e5824d208da2a8731289e12594a5670b109853df8931e3ae7",
       "count": 1,
       "reason": "Replay-proof and public-audio schema upgrades validate different historical versions, install different DDL and preserve outer transaction ownership. Common validators already centralize structure. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:1068-1078 ~ src/omi_collector/capture/adapters/collector_state_db.py:1081-1092."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "9c7b1a984dc66267a20e468a3159fd85ae55c483db59e7af680422a7b29bd0d9",
-      "count": 1,
-      "reason": "DebugLogConfig and QualityMetricsConfig expose different history/record-size/rotation policies and limits. Existing primitive config validators are shared; keep independent field constraints and public configuration types. Reviewed pair: src/omi_collector/config.py:276-298 ~ src/omi_collector/config.py:302-322."
     },
     {
       "detector": "pyscn",
@@ -2543,12 +2543,6 @@
       "identity": "efcadd272270eae6544c81347c1372c2d751fdcdf906d000bdc86a493dbd9673",
       "count": 1,
       "reason": "Empty-install validation rejects any retained data across private/public roots; completed-cutover validation specifically requires old private audio gone while validating public readiness separately. Preserve different path sets and migration authority. Reviewed pair: src/omi_collector/internal_audio_migration.py:246-258 ~ src/omi_collector/state_migration.py:317-325."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "f0e548863fe565dab7c1e4340064e16a28c8a42cde92e9064e6c0e7aa061ed5c",
-      "count": 1,
-      "reason": "HCI data-length change and remote connection parameter request both contain little-endian words but have different field meanings, handle masking and event types. Preserve per-opcode decoding. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:470-480 ~ src/omi_collector/capture/adapters/ble_link_observability.py:528-540."
     },
     {
       "detector": "pyscn",

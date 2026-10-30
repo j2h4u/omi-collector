@@ -625,12 +625,12 @@ async def run(context: BenchmarkContext) -> None:
 
 
 def main() -> None:
+    args = parse_args()
     os.nice(19)
     ionice = shutil.which("ionice")
     if ionice is None:
         raise RuntimeError("ionice is required to run the capacity replay at idle I/O priority")
     subprocess.run((ionice, "-c", "3", "-p", str(os.getpid())), check=True, capture_output=True)
-    args = parse_args()
     started = time.perf_counter()
     deadline = time.monotonic() + args.max_seconds
     config = (

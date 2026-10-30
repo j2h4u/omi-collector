@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
-from ..domain.clock_state import ClockAnchor, ClockIntent, ClockRange, ClockState
+from ..domain.clock_state import ClockIntent, ClockRange, ClockState
 from ..domain.ring_protocol import RingInfo
 from .clock_segments import ClockSegmentMap
 from .collector_state_db import StateDB, StateKind
@@ -38,31 +36,13 @@ class ClockStateStore:
         with self.db.transaction() as tx:
             payload = tx.get(StateKind.CLOCK, _CLOCK_ID)
             state = ClockState.from_payload(payload) if payload is not None else ClockState()
-            anchor = state.anchor
-            read_sequence, write_sequence = info.read_sequence, info.write_sequence
-            if anchor is None and read_sequence < write_sequence:
-                state = state.add_range(ClockRange(read_sequence, write_sequence, None, None, "unknown", source_id))
-            elif anchor is not None and write_sequence > anchor.sequence_frontier:
-                continuous = state.intent is None and abs(offset_seconds - anchor.offset_seconds) <= tolerance_seconds
-                state = state.add_range(
-                    ClockRange(
-                        anchor.sequence_frontier,
-                        write_sequence,
-                        anchor.offset_seconds if continuous else None,
-                        anchor.uncertainty_seconds + abs(offset_seconds - anchor.offset_seconds)
-                        if continuous
-                        else None,
-                        "approximate" if continuous else "unknown",
-                        anchor.source_id,
-                    )
-                )
-            next_anchor = ClockAnchor(write_sequence, offset_seconds, uncertainty_seconds, "approximate", source_id)
-            if anchor != next_anchor and (
-                anchor is None
-                or write_sequence != anchor.sequence_frontier
-                or abs(offset_seconds - anchor.offset_seconds) > tolerance_seconds
-            ):
-                state = replace(state, anchor=next_anchor)
+            state = state.observe(
+                info,
+                offset_seconds=offset_seconds,
+                uncertainty_seconds=uncertainty_seconds,
+                source_id=source_id,
+                tolerance_seconds=tolerance_seconds,
+            )
             if state.to_payload() != payload:
                 tx.put(StateKind.CLOCK, _CLOCK_ID, state.to_payload())
             return state

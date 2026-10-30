@@ -6,6 +6,8 @@ import math
 from dataclasses import asdict, dataclass, replace
 from typing import cast
 
+from .ring_protocol import RingInfo
+
 _SCHEMA_VERSION = 1
 _CONFIDENCE = frozenset({"confirmed", "approximate", "unknown"})
 _ANCHOR_CONFIDENCE = frozenset({"confirmed", "approximate"})
@@ -179,6 +181,42 @@ class ClockState:
             else:
                 merged.append(item)
         return ClockState(tuple(merged), self.intent, self.anchor)
+
+    def observe(
+        self,
+        info: RingInfo,
+        *,
+        offset_seconds: float,
+        uncertainty_seconds: float,
+        source_id: str,
+        tolerance_seconds: float,
+    ) -> ClockState:
+        """Calculate the next clock state from one trusted observation."""
+        state = self
+        anchor = state.anchor
+        read_sequence, write_sequence = info.read_sequence, info.write_sequence
+        if anchor is None and read_sequence < write_sequence:
+            state = state.add_range(ClockRange(read_sequence, write_sequence, None, None, "unknown", source_id))
+        elif anchor is not None and write_sequence > anchor.sequence_frontier:
+            continuous = state.intent is None and abs(offset_seconds - anchor.offset_seconds) <= tolerance_seconds
+            state = state.add_range(
+                ClockRange(
+                    anchor.sequence_frontier,
+                    write_sequence,
+                    anchor.offset_seconds if continuous else None,
+                    anchor.uncertainty_seconds + abs(offset_seconds - anchor.offset_seconds) if continuous else None,
+                    "approximate" if continuous else "unknown",
+                    anchor.source_id,
+                )
+            )
+        next_anchor = ClockAnchor(write_sequence, offset_seconds, uncertainty_seconds, "approximate", source_id)
+        if anchor != next_anchor and (
+            anchor is None
+            or write_sequence != anchor.sequence_frontier
+            or abs(offset_seconds - anchor.offset_seconds) > tolerance_seconds
+        ):
+            state = replace(state, anchor=next_anchor)
+        return state
 
     def to_payload(self) -> dict[str, object]:
         return {

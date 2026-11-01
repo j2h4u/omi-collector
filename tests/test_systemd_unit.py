@@ -300,8 +300,10 @@ def test_release_helper_fails_when_successful_deploy_cannot_clean_worktree(tmp_p
     (fake_bin / "git").write_text(
         "#!/usr/bin/env bash\n"
         'case "$3" in\n'
-        "status|fetch|show-ref|merge-base) exit 0 ;;\n"
-        "rev-list) printf '%040d\\n' 0 ;;\n"
+        "status|fetch|merge-base) exit 0 ;;\n"
+        "show-ref) exit 1 ;;\n"
+        "ls-remote) printf '%040d\\trefs/tags/v1.2.3\\n' 0 ;;\n"
+        "rev-parse) printf '%040d\\n' 0 ;;\n"
         'worktree) if [[ "$4" == add ]]; then mkdir -p "$6/scripts"; printf \'#!/usr/bin/env bash\\necho deployed\\n\' > "$6/scripts/deploy-systemd-service.sh"; chmod +x "$6/scripts/deploy-systemd-service.sh"; else exit 1; fi ;;\n'
         "*) exit 2 ;;\nesac\n",
         encoding="utf-8",

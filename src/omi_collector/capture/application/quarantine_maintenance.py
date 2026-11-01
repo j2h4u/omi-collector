@@ -531,24 +531,48 @@ class QuarantineMaintenance:
         except BaseException as error:
             primary = error
             defer_requested.set()
-            try:
-                await join_owned(
-                    self._join_presence_tasks(
-                        presence, presence_task, maintenance_task, permit_returned=permit_returned
-                    )
-                )
-            except BaseException:
-                if isinstance(error, asyncio.CancelledError):
-                    raise error from None
-                raise
+            await self._join_after_presence_error(presence, presence_task, maintenance_task, permit_returned, error)
             raise
         finally:
-            fatal_task.cancel()
-            await asyncio.gather(fatal_task, return_exceptions=True)
+            await self._join_fatal_wait(fatal_task, primary)
             # ``wait`` returns with one task complete, but always consume the
             # other result too. This keeps task identity scoped to this call.
             if primary is None and maintenance_task is not None:
                 await asyncio.gather(presence_task, maintenance_task, return_exceptions=True)
+
+    async def _join_after_presence_error(
+        self,
+        presence: PresenceWaiterPort,
+        presence_task: asyncio.Task[PresenceWake | PresenceEnd],
+        maintenance_task: asyncio.Task[None] | None,
+        permit_returned: bool,
+        error: BaseException,
+    ) -> None:
+        if isinstance(error, FatalInternalAudioStorageError):
+            self.record_storage_fatal(error)
+        try:
+            await join_owned(
+                self._join_presence_tasks(presence, presence_task, maintenance_task, permit_returned=permit_returned)
+            )
+        except BaseException as cleanup_error:
+            if isinstance(error, FatalInternalAudioStorageError):
+                raise error from None
+            self._raise_publication_fatal()
+            if isinstance(error, asyncio.CancelledError) and not isinstance(
+                cleanup_error, FatalInternalAudioStorageError
+            ):
+                raise error from None
+            raise
+
+    async def _join_fatal_wait(self, fatal_task: asyncio.Task[bool], primary: BaseException | None) -> None:
+        fatal_task.cancel()
+        try:
+            await join_owned(asyncio.gather(fatal_task, return_exceptions=True))
+        except asyncio.CancelledError:
+            if isinstance(primary, FatalInternalAudioStorageError):
+                raise primary from None
+            self._raise_publication_fatal()
+            raise
 
     async def _prepare_presence_wake(self, wake: PresenceWake | PresenceEnd) -> None:
         if isinstance(wake, PresenceWake):

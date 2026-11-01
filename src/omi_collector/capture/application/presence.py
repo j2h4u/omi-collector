@@ -29,6 +29,7 @@ from .scan_cadence import (
     record_radio_activity,
     scan_deadline,
 )
+from .storage_fault import FatalInternalAudioStorageError
 
 # Hard safety cap after the short transition timeout; this is not a BlueZ limit.
 _SCAN_STOP_RECOVERY_SECONDS = 30.0
@@ -352,33 +353,20 @@ class PresenceScheduler:
                 policy=self._policy,
                 operation="start",
             )
-        except asyncio.CancelledError:
-            self._active_scanner_generation = None
-            self._scan_cadence = ScanReady()
-            self._discard_advertisements()
-            self._interrupt_presence()
-            try:
-                await self._best_effort_stop_locked(force=True)
-            finally:
-                if self._scan_health is not None:
-                    await self._scan_health.scan_stopped(generation)
+        except asyncio.CancelledError, FatalInternalAudioStorageError:
+            await self._cleanup_interrupted_start(generation)
             raise
         except PresenceScanTransitionError as error:
-            await self._record_scan_start_failure(generation, error)
-            self._active_scanner_generation = None
-            self._scan_cadence = ScanReady()
-            self._force_stop_required = True
-            self._discard_advertisements()
-            self._close_state()
-            await self._best_effort_stop_locked(force=True)
+            try:
+                await self._record_scan_start_failure(generation, error)
+            finally:
+                await self._cleanup_failed_start(hard=True)
             raise
         except Exception as error:  # noqa: BLE001 - a normal scanner-start refusal is soft
-            await self._record_scan_start_failure(generation, error)
-            self._active_scanner_generation = None
-            self._scan_cadence = ScanReady()
-            self._discard_advertisements()
-            self._interrupt_presence()
-            await self._best_effort_stop_locked(force=True)
+            try:
+                await self._record_scan_start_failure(generation, error)
+            finally:
+                await self._cleanup_failed_start(hard=False)
             return False
         if isinstance(self._state, machine.Closed):
             await self._best_effort_stop_locked(force=True)
@@ -388,6 +376,24 @@ class PresenceScheduler:
         saw_radio_activity = isinstance(self._scan_cadence, ScanStarting) and self._scan_cadence.saw_radio_activity
         self._scan_cadence = ScanActive(generation, self._clock(), saw_radio_activity)
         return True
+
+    async def _cleanup_failed_start(self, *, hard: bool) -> None:
+        self._active_scanner_generation = None
+        self._scan_cadence = ScanReady()
+        self._discard_advertisements()
+        if hard:
+            self._force_stop_required = True
+            self._close_state()
+        else:
+            self._interrupt_presence()
+        await self._best_effort_stop_locked(force=True)
+
+    async def _cleanup_interrupted_start(self, generation: int) -> None:
+        try:
+            await self._cleanup_failed_start(hard=False)
+        finally:
+            if self._scan_health is not None:
+                await self._scan_health.scan_stopped(generation)
 
     async def _record_scan_start_failure(self, generation: int, error: Exception) -> None:
         if self._scan_health is not None:
@@ -525,6 +531,9 @@ class PresenceScheduler:
             self._interrupt_presence()
         except asyncio.CancelledError:
             await self._close_after_stop_failure()
+        except FatalInternalAudioStorageError:
+            await self._close_after_stop_failure()
+            raise
         except Exception:  # noqa: BLE001 - cancelled waiting must leave no live scanner
             await self._close_after_stop_failure()
 
@@ -546,6 +555,8 @@ class PresenceScheduler:
             await self._stop_scan_locked(force=force)
         except asyncio.CancelledError:
             return
+        except FatalInternalAudioStorageError:
+            raise
         except Exception:  # noqa: BLE001 - close is intentionally best effort
             return
 

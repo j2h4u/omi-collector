@@ -259,6 +259,61 @@ def test_auxiliary_writer_fatal_wakes_idle_presence_owner(tmp_path: Path) -> Non
     _run(scenario())
 
 
+@pytest.mark.parametrize("cleanup_fatal", [False, True])
+def test_presence_fatal_precedes_cleanup_failure_and_repeated_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, cleanup_fatal: bool
+) -> None:
+    async def scenario() -> None:
+        first = FatalInternalAudioStorageError("first storage failure")
+        later = FatalInternalAudioStorageError("later storage failure") if cleanup_fatal else OSError("cleanup failed")
+        started = asyncio.Event()
+        failed = asyncio.Event()
+        release = asyncio.Event()
+        closed = asyncio.Event()
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
+
+        async def failing_maintenance(*_args: object) -> None:
+            started.set()
+            await release.wait()
+            raise later
+
+        monkeypatch.setattr(maintenance, "_prepare_and_run", failing_maintenance)
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                try:
+                    await started.wait()
+                    failed.set()
+                    raise first
+                finally:
+                    closed.set()
+
+            async def close(self) -> None:
+                closed.set()
+
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
+        try:
+            await asyncio.wait_for(failed.wait(), 2)
+            while maintenance._publication_fatal is None:
+                await asyncio.sleep(0)
+            owner.cancel()
+            owner.cancel()
+            await asyncio.sleep(0)
+            assert not owner.done()
+            release.set()
+            with pytest.raises(FatalInternalAudioStorageError) as raised:
+                await asyncio.wait_for(owner, 2)
+            assert raised.value is first
+            assert closed.is_set()
+        finally:
+            release.set()
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
 def test_multiple_pending_partials_are_quarantined_without_losing_raw_records(tmp_path: Path) -> None:
     store = _store(tmp_path)
     expected_records = {

@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 
+import pytest
+
 from omi_collector.capture.application.ble_scan_health import (
     ScanHealthMonitor,
     ScanIncidentContext,
     ScanRadioActivity,
 )
 from omi_collector.capture.application.presence import PresencePolicy, PresenceScheduler
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.config import PresenceConfig
 
 
@@ -61,6 +64,128 @@ class FakeObserver:
 
     async def stop(self) -> None:
         self.events.append("stop")
+
+
+@pytest.mark.parametrize("operation", ["active", "open", "resolve"])
+def test_canonical_storage_fatal_escapes_scan_health(operation: str) -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("corrupt state", sqlite_errorcode=11)
+
+        class FatalSink(FakeSink):
+            async def active(self) -> bool:
+                if operation == "active":
+                    raise fatal
+                return operation == "resolve"
+
+            async def open(self, context: ScanIncidentContext) -> None:
+                del context
+                raise fatal
+
+            async def resolve(self, generation: int, reason: str) -> None:
+                del generation, reason
+                raise fatal
+
+        monitor = ScanHealthMonitor(FatalSink(), FakeDiagnostics(), 1.0, clock=lambda: 0.0)
+        if operation == "active":
+            with pytest.raises(FatalInternalAudioStorageError) as raised:
+                await monitor.prepare(1)
+        else:
+            await monitor.prepare(1)
+            monitor.scan_started(1, 0.0)
+            with pytest.raises(FatalInternalAudioStorageError) as raised:
+                if operation == "open":
+                    await monitor.check_deadline(1.0)
+                else:
+                    assert monitor.radio_activity(1, 0.0)
+                    await monitor.flush_recovery()
+        assert raised.value is fatal
+
+    asyncio.run(scenario())
+
+
+def test_scheduler_closes_scanner_when_incident_open_is_fatal() -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("corrupt state", sqlite_errorcode=11)
+        events: list[str] = []
+
+        class FatalSink(FakeSink):
+            async def open(self, context: ScanIncidentContext) -> None:
+                del context
+                raise fatal
+
+        class RefusingObserver(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                del callback
+                raise OSError("scan refused")
+
+        monitor = ScanHealthMonitor(FatalSink(), FakeDiagnostics(events), 1.0)
+        scheduler = PresenceScheduler(RefusingObserver(events), scan_health=monitor)
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await scheduler.wait_for_attempt()
+        assert raised.value is fatal
+        assert events == ["prepare:0", "close:0", "stop"]
+
+    asyncio.run(scenario())
+
+
+def test_scheduler_closes_scanner_when_incident_lookup_is_fatal() -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("corrupt state", sqlite_errorcode=11)
+        events: list[str] = []
+
+        class FatalSink(FakeSink):
+            async def active(self) -> bool:
+                raise fatal
+
+        scheduler = PresenceScheduler(
+            FakeObserver(events), scan_health=ScanHealthMonitor(FatalSink(), FakeDiagnostics(events), 1.0)
+        )
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await scheduler.wait_for_attempt()
+        assert raised.value is fatal
+        assert events == ["stop"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["open", "resolve"])
+def test_fatal_incident_persistence_is_not_retried_during_close(operation: str) -> None:
+    async def scenario() -> None:
+        first = FatalInternalAudioStorageError("first", sqlite_errorcode=11)
+        later = FatalInternalAudioStorageError("later", sqlite_errorcode=11)
+        calls = 0
+
+        class FatalSink(FakeSink):
+            async def active(self) -> bool:
+                return operation == "resolve"
+
+            async def open(self, context: ScanIncidentContext) -> None:
+                del context
+                nonlocal calls
+                calls += 1
+                raise first if calls == 1 else later
+
+            async def resolve(self, generation: int, reason: str) -> None:
+                del generation, reason
+                nonlocal calls
+                calls += 1
+                raise first if calls == 1 else later
+
+        monitor = ScanHealthMonitor(FatalSink(), FakeDiagnostics(), 1.0, clock=lambda: 0.0)
+        await monitor.prepare(1)
+        monitor.scan_started(1, 0.0)
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            if operation == "open":
+                await monitor.check_deadline(1.0)
+            else:
+                assert monitor.radio_activity(1, 0.0)
+                await monitor.flush_recovery()
+        await monitor.scan_stopped(1)
+        await monitor.flush_recovery()
+        assert raised.value is first
+        assert calls == 1
+
+    asyncio.run(scenario())
 
 
 def test_presence_config_defaults_and_validates_scan_silence_threshold() -> None:

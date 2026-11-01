@@ -562,6 +562,7 @@ def _consume_read_begin(payload: bytes, state: _IngestState, writer: IngestWrite
 
 
 def _consume_data(payload: bytes, state: _IngestState, arena: TransferArena, writer: IngestWriter) -> None:
+    previous_records = arena.received_records
     arena.append(parse_data_notification(payload))
     complete_bytes = arena.complete_records * RECORD_SIZE
     tail = arena.partial_tail()
@@ -571,7 +572,7 @@ def _consume_data(payload: bytes, state: _IngestState, arena: TransferArena, wri
     # The terminal 100% snapshot is published only after DONE validates the
     # complete transfer.  An in-flight DATA notification must not look like a
     # completed read to progress consumers.
-    if arena.received_records < arena.total_records:
+    if previous_records < arena.received_records < arena.total_records:
         _publish_progress(state, arena)
 
 

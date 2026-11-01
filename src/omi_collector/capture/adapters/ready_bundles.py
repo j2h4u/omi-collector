@@ -96,7 +96,7 @@ from .internal_audio_store import (
     decode_uint64,
     encode_uint64,
 )
-from .public_time_facts import FrozenTimePredecessor, freeze_public_time
+from .public_time_facts import FrozenTimePredecessor, PublicTimeProjection
 from .sqlite_compaction import mark_retirement_compaction_pending
 from .staging_contract import FatalInternalAudioStorageError
 from .v2_audio import V2AudioDigest, hash_v2_audio, write_v2_audio
@@ -1599,7 +1599,8 @@ def _replay_proof_rows(state_db: StateDB) -> tuple[tuple[object, ...], ...]:
             return _sql_all(
                 connection.execute(
                     "SELECT bundle_id,lifecycle,stage_id,owner_token,record_count,records_sha256,manifest_sha256,"
-                    "page_index,normalization_runs,immutable_metadata,proof_content_sha256 "
+                    "page_index,normalization_runs,immutable_metadata,proof_content_sha256,public_order,"
+                    "audio_sha256,packet_count,format "
                     "FROM ready_replay_proof ORDER BY bundle_id"
                 )
             )
@@ -2301,13 +2302,18 @@ def _prepare_v2_group(
     raw_digest = sha256()
 
     def packets() -> Iterator[bytes]:
-        for _sequence, record in _v2_physical_records(slices, page_limit):
-            raw_digest.update(record.raw_bytes)
-            try:
-                layout = inspect_mono_20ms_record(record.raw_bytes)
-            except ValueError as error:
-                raise ReadyBundleError("v2 source contains invalid mono 20 ms Opus") from error
-            yield from layout.packets
+        for item in slices:
+            slice_digest = sha256()
+            for record in _typed_records(item.admission, item.start_ordinal, item.record_count, page_limit):
+                raw_digest.update(record.raw_bytes)
+                slice_digest.update(record.raw_bytes)
+                try:
+                    layout = inspect_mono_20ms_record(record.raw_bytes)
+                except ValueError as error:
+                    raise ReadyBundleError("v2 source contains invalid mono 20 ms Opus") from error
+                yield from layout.packets
+            if slice_digest.hexdigest() != item.raw_sha256:
+                raise ReadyBundleError("v2 source slice changed during publication")
 
     try:
         audio = hash_v2_audio(packets())
@@ -2384,6 +2390,7 @@ def _v2_projected_records(
     initial_frontier: _V2Frontier | None,
 ) -> Iterator[tuple[int, CaptureRecord, RecordAudioLayout, FrozenRecordProjection, _V2Frontier]]:
     previous = initial_frontier
+    clock_projection = PublicTimeProjection.from_state(clock_state)
     for sequence, record in _v2_physical_records(slices, page_limit):
         try:
             layout = inspect_mono_20ms_record(record.raw_bytes)
@@ -2391,8 +2398,7 @@ def _v2_projected_records(
             raise ReadyBundleError("v2 source contains invalid mono 20 ms Opus") from error
         adjacent = previous is not None and previous.sequence + 1 == sequence
         predecessor = FrozenTimePredecessor(previous.sequence, previous.time) if adjacent and previous else None
-        time = freeze_public_time(
-            clock_state,
+        time = clock_projection.freeze(
             sequence=sequence,
             raw_timestamp=record.device_timestamp,
             predecessor=predecessor,
@@ -3110,18 +3116,27 @@ def _resume_v2_cohort(
     current: _TypedCohort | None = cohort
     custody_cache = context.custody_cache
     prepared_slices = context.prepared_slices
+    groups: Iterator[tuple[_TypedSlice, ...]] | None = None
     while current is not None:
         _require_typed_admissions_current(audio_store, current.admissions)
         if current.lifecycle == "staging":
             stage = _load_v2_stage(audio_store, context.ready_root, current, context.page_limit)
+            custody_cache = _v2_ready_custody(
+                context.ready_root, audio_store.state_db, custody_cache, pending=stage.artifact_id
+            )
         elif current.lifecycle == "accepted":
             custody_cache = _v2_ready_custody(context.ready_root, audio_store.state_db, custody_cache)
-            slices = _accepted_typed_slices(
-                audio_store, current, context.page_limit, custody_cache.custody, prepared_slices
-            )
-            prepared_slices = None
+            if groups is None:
+                slices = _accepted_typed_slices(
+                    audio_store, current, context.page_limit, custody_cache.custody, prepared_slices
+                )
+                prepared_slices = None
+                groups = iter(_v2_physical_groups(slices, context.page_limit))
+            custody_cache = _v2_ready_custody(context.ready_root, audio_store.state_db, custody_cache)
             try:
-                current = _advance_typed_ready_custody(audio_store, current, custody_cache.custody, context.page_limit)
+                current = _advance_typed_ready_custody(
+                    audio_store, current, custody_cache, context.ready_root, context.page_limit
+                )
             except _TypedAdmissionConflictError as error:
                 _typed_fail_stop(
                     audio_store,
@@ -3129,14 +3144,11 @@ def _resume_v2_cohort(
                 )
             if current is None:
                 break
-            slices = _rebind_typed_slices(slices, current.admissions)
-            if not slices:
+            next_group = next(groups, ())
+            if not next_group:
                 _typed_fail_stop(audio_store, "accepted v2 cohort has no unique source slices")
-            groups = _v2_physical_groups(slices, context.page_limit)
-            if not groups:
-                raise ReadyBundleError("accepted v2 cohort has no audio packets")
             group = _prepare_v2_group(
-                groups[0],
+                _rebind_typed_slices(next_group, current.admissions),
                 context.page_limit,
                 context.clock_state,
                 _v2_frontier(audio_store.state_db),
@@ -3144,13 +3156,37 @@ def _resume_v2_cohort(
             stage = _ensure_v2_stage(audio_store, context.ready_root, current, group, context.page_limit)
         else:
             raise ReadyBundleError("v2 publication cohort lifecycle is invalid")
-        result = _materialize_v2_stage_with_failure_latch(audio_store, current, stage, context.page_limit)
-        _commit_v2_stage(audio_store, current, stage, result, context.page_limit)
+        result, custody_cache = _publish_v2_stage(audio_store, current, stage, context, custody_cache)
         published.append(result)
         current = _load_active_typed_cohort(audio_store)
         if current is not None and current.cohort_id != cohort.cohort_id:
             _typed_fail_stop(audio_store, "v2 publication cohort changed during resume")
-    return published, custody_cache
+    return published, _final_v2_custody(context.ready_root, audio_store.state_db, custody_cache)
+
+
+def _final_v2_custody(
+    ready_root: Path, state_db: StateDB, custody_cache: ReadyCustodyCache | None
+) -> ReadyCustodyCache | None:
+    if custody_cache is None:
+        return None
+    return _v2_ready_custody(ready_root, state_db, custody_cache)
+
+
+def _publish_v2_stage(
+    audio_store: InternalAudioStore,
+    cohort: _TypedCohort,
+    stage: _V2Stage,
+    context: _V2ResumeContext,
+    custody_cache: ReadyCustodyCache | None,
+) -> tuple[ReadyBundleResult, ReadyCustodyCache | None]:
+    result = _materialize_v2_stage_with_failure_latch(audio_store, cohort, stage, context.page_limit)
+    reusable = custody_cache
+    if reusable is not None:
+        _require_v2_prior_custody(context.ready_root, audio_store.state_db, reusable, stage)
+    _commit_v2_stage(audio_store, cohort, stage, result, context.page_limit)
+    if reusable is not None:
+        reusable = _extend_v2_custody(context.ready_root, audio_store.state_db, reusable, stage, result)
+    return result, reusable
 
 
 def _ensure_v2_stage(
@@ -3710,11 +3746,95 @@ def _parse_v2_active_proof_row(row: tuple[object, ...], artifact_id: str) -> _V2
     )
 
 
+def _require_v2_prior_custody(
+    ready_root: Path, state_db: StateDB, previous: ReadyCustodyCache, stage: _V2Stage
+) -> None:
+    revision = source_revision(ready_root)
+    ignored = (str(stage.path), str(ready_root / stage.artifact_id))
+
+    def prior_paths(value: SourceRevision) -> SourceRevision:
+        return tuple(
+            entry
+            for entry in value
+            if entry[0] != str(ready_root)
+            and not any(entry[0] == path or entry[0].startswith(path + os.sep) for path in ignored)
+        )
+
+    root = next((entry for entry in revision if entry[0] == str(ready_root)), None)
+    old_root = next((entry for entry in previous.revision if entry[0] == str(ready_root)), None)
+    root_identity = None if root is None else root[:4]
+    old_root_identity = None if old_root is None else old_root[:4]
+    entries = cast(dict[str, object], _read_ledger(state_db)["bundles"])
+    old_entries = {
+        key: value
+        for key, value in entries.items()
+        if key != stage.artifact_id
+        and isinstance(value, dict)
+        and (value.get("format") == "omi-audio-v2" or value.get("state") == "retired")
+    }
+    proof_rows = tuple(row for row in _replay_proof_rows(state_db) if row[0] != stage.artifact_id)
+    previous_proofs = tuple(row for row in previous.proof_revision if row[0] != stage.artifact_id)
+    if (
+        root_identity is None
+        or root_identity != old_root_identity
+        or prior_paths(revision) != prior_paths(previous.revision)
+        or old_entries != previous.custody.entries
+        or proof_rows != previous_proofs
+    ):
+        raise ReadyBundleError("v2 ready custody changed during publication")
+
+
+def _extend_v2_custody(
+    ready_root: Path,
+    state_db: StateDB,
+    previous: ReadyCustodyCache,
+    stage: _V2Stage,
+    result: ReadyBundleResult,
+) -> ReadyCustodyCache:
+    _require_v2_prior_custody(ready_root, state_db, previous, stage)
+    revision = source_revision(ready_root)
+    all_entries = cast(dict[str, dict[str, object]], _read_ledger(state_db)["bundles"])
+    entries = {
+        key: value
+        for key, value in all_entries.items()
+        if value.get("format") == "omi-audio-v2" or value.get("state") == "retired"
+    }
+    entry = entries.get(stage.artifact_id)
+    if entry is None or entry != _v2_ledger_entry(stage, result.records_sha256):
+        raise ReadyBundleError("v2 committed ledger entry changed")
+    source = _read_v2_ready_source(result.path, entry)
+    rows = {cast(str, row[0]): row for row in _v2_replay_proof_rows(state_db)}
+    if stage.artifact_id not in rows:
+        raise ReadyDurabilityFatalError("v2 committed replay proof is missing")
+    try:
+        proof = _v2_active_proof(rows[stage.artifact_id], source, entry)
+    except (ReadyBundleError, ValueError, TypeError, IndexError) as error:
+        raise ReadyDurabilityFatalError("v2 committed replay proof is corrupt") from error
+    _require_v2_prior_custody(ready_root, state_db, previous, stage)
+    proof_revision = _replay_proof_rows(state_db)
+    if (
+        revision != source_revision(ready_root)
+        or next((row for row in proof_revision if row[0] == stage.artifact_id), None)
+        != (*rows[stage.artifact_id], "omi-audio-v2")
+        or state_db.get(StateKind.READY_PUBLICATION, stage.artifact_id) != entry
+    ):
+        raise ReadyBundleError("v2 ready custody changed during authentication")
+    custody = _TypedReadyCustody(
+        state_db,
+        tuple(sorted((*previous.custody.active, source), key=_ready_start)),
+        entries,
+        {**previous.custody.proofs, stage.artifact_id: proof},
+    )
+    return ReadyCustodyCache(revision, proof_revision, custody)
+
+
 def _v2_ready_custody(
     ready_root: Path,
     state_db: StateDB,
     previous: ReadyCustodyCache | None = None,
     should_defer: Callable[[], bool] | None = None,
+    *,
+    pending: str | None = None,
 ) -> ReadyCustodyCache:
     ledger = _read_ledger(state_db)
     entries = {
@@ -3732,7 +3852,9 @@ def _v2_ready_custody(
     ):
         return previous
     active_ids = {bundle_id for bundle_id, entry in entries.items() if entry["state"] == "ready"}
-    paths = tuple(sorted(_visible_children(ready_root), key=lambda item: item.name))
+    paths = tuple(
+        sorted((path for path in _visible_children(ready_root) if path.name != pending), key=lambda p: p.name)
+    )
     if {path.name for path in paths} != active_ids:
         raise ReadyBundleError("v2 ready files do not match the active publication ledger")
     active = tuple(
@@ -4063,10 +4185,11 @@ def _accepted_typed_slices(
 def _advance_typed_ready_custody(
     audio_store: InternalAudioStore,
     cohort: _TypedCohort,
-    custody: _TypedReadyCustody,
+    custody_cache: ReadyCustodyCache,
+    ready_root: Path,
     page_limit: int,
 ) -> _TypedCohort | None:
-    progress, proofs = _typed_ready_progress(cohort, custody, page_limit)
+    progress, proofs = _typed_ready_progress(cohort, custody_cache.custody, page_limit)
     _require_typed_admissions_current(audio_store, cohort.admissions)
     if all(item.new_cursor == item.old_cursor for item in progress):
         return cohort
@@ -4088,6 +4211,8 @@ def _advance_typed_ready_custody(
             for item, admission in zip(progress, cohort.admissions, strict=True)
         ),
     )
+    if _v2_ready_custody(ready_root, audio_store.state_db, custody_cache) is not custody_cache:
+        raise ReadyBundleError("v2 ready custody changed before coverage commit")
     return _commit_typed_ready_custody(audio_store, commit)
 
 

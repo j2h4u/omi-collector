@@ -300,9 +300,9 @@ obsolete release directories are pruned only after a successful deployment.
 
 ### Release Tag Deployment
 
-`scripts/dev-deploy-release.sh` fetches and validates a published release tag
-in the current checkout, refuses local changes or an unexpected origin, and
-then invokes the transactional deployer. Run it as the operator:
+`scripts/dev-deploy-release.sh` verifies the selected tag against `origin`,
+rejects local changes and conflicting local tags, and deploys the fetched
+commit if it is reachable from the fetched `origin/main`. Run it as the operator:
 
 ```bash
 scripts/dev-deploy-release.sh v0.3.0

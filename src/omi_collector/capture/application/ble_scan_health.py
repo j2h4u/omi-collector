@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Literal, Protocol
 
+from .storage_fault import FatalInternalAudioStorageError
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -78,6 +80,7 @@ class ScanHealthMonitor:
         self._threshold = float(threshold_seconds)
         self._clock = clock
         self._initialized = False
+        self._storage_fatal: FatalInternalAudioStorageError | None = None
         self._incident_state_unknown = False
         self._incident_active = False
         self._incident_generation: int | None = None
@@ -106,8 +109,13 @@ class ScanHealthMonitor:
         """Read persisted incident state once, retrying if storage is unavailable."""
         if self._initialized:
             return
+        if self._storage_fatal is not None:
+            raise self._storage_fatal
         try:
             self._incident_active = await self._sink.active()
+        except FatalInternalAudioStorageError as error:
+            self._storage_fatal = error
+            raise
         except Exception as error:  # noqa: BLE001 - persistence availability cannot disable runtime detection
             self._incident_state_unknown = True
             _LOGGER.warning("BLE scan incident state lookup failed (%s)", type(error).__name__)
@@ -233,6 +241,8 @@ class ScanHealthMonitor:
         self._failure_latched = True
 
     async def _attempt_persistence(self) -> None:
+        if self._storage_fatal is not None:
+            return
         try:
             if self._open_context is not None:
                 await self._sink.open(self._open_context)
@@ -251,6 +261,9 @@ class ScanHealthMonitor:
                     self._failure_latched = False
                     self._retry_at = None
                     self._retry_delay = 1.0
+        except FatalInternalAudioStorageError as error:
+            self._storage_fatal = error
+            raise
         except Exception as error:  # noqa: BLE001 - persistence failures stay pending for bounded retry
             self._retry_at = self._clock() + self._retry_delay
             _LOGGER.warning(

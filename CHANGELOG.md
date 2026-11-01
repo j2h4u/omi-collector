@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.5](https://github.com/j2h4u/omi-collector/compare/v1.1.4...v1.1.5) (2026-11-01)
+
+
+### Refactoring
+
+* strengthen quality checks and SQLite initialization ([#322](https://github.com/j2h4u/omi-collector/issues/322)) ([661bc4a](https://github.com/j2h4u/omi-collector/commit/661bc4a73ab33006bfa30556d4a078bb9418067e))
+
 ## [1.1.4](https://github.com/j2h4u/omi-collector/compare/v1.1.3...v1.1.4) (2026-11-01)
 
 

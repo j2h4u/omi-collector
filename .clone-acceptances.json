@@ -1058,12 +1058,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "9c6969256de7a33021701e24e50392a268d34bad4fa29afa5be41b551bfa5ed6",
-      "count": 1,
-      "reason": "Disconnect reason-name and reason-class maps expose different outputs: exact remote reason versus grouped operational class. Their None guard and dictionary syntax are small local projections; merging maps would couple two explicit taxonomies. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:1227-1239 ~ src/omi_collector/capture/adapters/ble_link_observability.py:1239-1251."
-    },
-    {
-      "detector": "jscpd",
       "identity": "9d0831881065d8226705b201f7692ec40d9d581206e1beb78075ef6fea41bf47",
       "count": 1,
       "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:502-508 ~ src/omi_collector/cli.py:659-667."
@@ -1085,6 +1079,12 @@
       "identity": "9f1c655f840b058640ee35d8ae7f31bb81c5b0542559adb2777743b1155ca1fd",
       "count": 1,
       "reason": "Firmware observation accessors delegate to immutable RingInfo, whereas StagingStore exposes owned filesystem/database resources. They have different callers and no duplicated computation beyond property return syntax. Reviewed pair: src/omi_collector/capture/adapters/firmware_observations.py:48-61 ~ src/omi_collector/capture/adapters/staging_store.py:904-917."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "9f4b0615a326254fae8db7cf1c8bc5e53c280a0595010c63ad8363b65d2415c4",
+      "count": 1,
+      "reason": "The disconnect reason name reports specific HCI reasons including 0x3e, while the disconnect class groups reasons for operational reporting and keeps 0x3e unknown. They serve distinct outputs and fallback semantics despite similar lookup syntax. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:1272-1283 ~ src/omi_collector/capture/adapters/ble_link_observability.py:1285-1296."
     },
     {
       "detector": "jscpd",
@@ -1790,12 +1790,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "09a5044d5c61dab66bcdf2a9cc8b6a325faf12f2e81c545a9fb8e1d660786e7c",
-      "count": 1,
-      "reason": "Exact disconnect reason names and operational reason classes are different projections; retain separate lookup values and fallback semantics. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:1230-1239 ~ src/omi_collector/capture/adapters/ble_link_observability.py:1242-1251."
-    },
-    {
-      "detector": "pyscn",
       "identity": "0d26177795a63ca78de5236ac01686c08927e9b1a7b19d044547c86d44717ee0",
       "count": 1,
       "reason": "Conflict-disposition proposal and cached draft frontier aggregation return different evidence models from different source filters. They share only StateDB mechanics. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4345-4353 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
@@ -1937,6 +1931,12 @@
       "identity": "3793b964064b1f639e2dd5a1baab68712afb9741f953db8c4b9011218ef37afe",
       "count": 1,
       "reason": "Historical v2 and v3 schema validators intentionally bind different source versions and migration diagnostics; both already reuse structural schema validators. Keep explicit version admission boundaries. Reviewed pair: src/omi_collector/state_migration.py:241-254 ~ src/omi_collector/state_migration.py:257-270."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "3807269d69c072eb2618d18ec787fa408de6a78d91df5053828f5c028769a364",
+      "count": 1,
+      "reason": "The disconnect reason name reports specific HCI reasons including 0x3e, while the disconnect class groups reasons for operational reporting and keeps 0x3e unknown. These separate projections have different values and fallback semantics. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:1275-1285 ~ src/omi_collector/capture/adapters/ble_link_observability.py:1288-1297."
     },
     {
       "detector": "pyscn",

@@ -37,7 +37,12 @@ def _view(db: StateDB) -> dict[str, object]:
 
 @pytest.mark.parametrize(
     "case",
-    [(8, "0x08", "supervision_timeout"), (19, "0x13", "remote_user_terminated"), (255, "0xff", "unknown")],
+    [
+        (8, "0x08", "supervision_timeout"),
+        (19, "0x13", "remote_user_terminated"),
+        (62, "0x3e", "connection_failed_to_be_established_or_synchronization_timeout"),
+        (255, "0xff", "unknown"),
+    ],
 )
 def test_disconnect_reason_reaches_log_and_stored_operator_status(
     tmp_path: Path,

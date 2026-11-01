@@ -635,6 +635,7 @@ def _validate_ble_link_status(fields: Mapping[str, object]) -> None:
         "remote_low_resources",
         "remote_power_off",
         "local_host_terminated",
+        "connection_failed_to_be_established_or_synchronization_timeout",
         "unknown",
     ):
         raise ValueError("BLE link disconnect reason name is invalid")

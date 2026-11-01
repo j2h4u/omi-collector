@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.2](https://github.com/j2h4u/omi-collector/compare/v1.1.1...v1.1.2) (2026-11-01)
+
+
+### Fixes
+
+* preserve fatal storage errors during capture and cleanup ([4c583ae](https://github.com/j2h4u/omi-collector/commit/4c583ae567f99e740b4c91a7c1621ba17a0b615c))
+* resolve clock evidence consistently and report capture progress ([4c583ae](https://github.com/j2h4u/omi-collector/commit/4c583ae567f99e740b4c91a7c1621ba17a0b615c))
+* retain publication custody while reducing repeated storage reads ([4c583ae](https://github.com/j2h4u/omi-collector/commit/4c583ae567f99e740b4c91a7c1621ba17a0b615c))
+* verify deployment tag identity before installation ([4c583ae](https://github.com/j2h4u/omi-collector/commit/4c583ae567f99e740b4c91a7c1621ba17a0b615c))
+
+
+### Refactoring
+
+* remove unreachable ready-state transitions ([4c583ae](https://github.com/j2h4u/omi-collector/commit/4c583ae567f99e740b4c91a7c1621ba17a0b615c))
+
 ## [1.1.1](https://github.com/j2h4u/omi-collector/compare/v1.1.0...v1.1.1) (2026-11-01)
 
 

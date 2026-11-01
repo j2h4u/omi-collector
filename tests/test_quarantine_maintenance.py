@@ -314,6 +314,128 @@ def test_presence_fatal_precedes_cleanup_failure_and_repeated_cancellation(
     _run(scenario())
 
 
+@pytest.mark.parametrize("cancel_owner", [False, True])
+@pytest.mark.parametrize("maintenance_fatal", [False, True])
+def test_presence_cleanup_fatal_survives_owner_failure_and_maintenance_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, cancel_owner: bool, maintenance_fatal: bool
+) -> None:
+    async def scenario() -> None:
+        first = FatalInternalAudioStorageError("presence cleanup failed")
+        later = FatalInternalAudioStorageError("later storage failure") if maintenance_fatal else OSError("later")
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release = asyncio.Event()
+        joined = asyncio.Event()
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
+
+        async def failing_maintenance(*_args: object) -> None:
+            started.set()
+            if not cancel_owner:
+                raise OSError("initial maintenance failure")
+            await release.wait()
+            joined.set()
+            raise later
+
+        monkeypatch.setattr(maintenance, "_prepare_and_run", failing_maintenance)
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cleanup_started.set()
+                    await release.wait()
+                    raise first from None
+                raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                raise AssertionError("no permit was returned")
+
+        owner = asyncio.create_task(maintenance.wait_for_presence_attempt(Presence(), lambda _: None))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            if cancel_owner:
+                owner.cancel()
+            await asyncio.wait_for(cleanup_started.wait(), 2)
+            owner.cancel()
+            release.set()
+            with pytest.raises(FatalInternalAudioStorageError) as raised:
+                await asyncio.wait_for(owner, 2)
+            assert raised.value is first
+            assert maintenance._publication_fatal is first
+            assert not cancel_owner or joined.is_set()
+        finally:
+            release.set()
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+            await maintenance.close()
+
+    _run(scenario())
+
+
+def test_presence_close_fatal_survives_maintenance_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("presence close failed")
+        joined = asyncio.Event()
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
+
+        async def failing_maintenance(*_args: object) -> None:
+            joined.set()
+            raise OSError("maintenance failed")
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                raise fatal
+
+        monkeypatch.setattr(maintenance, "_prepare_and_run", failing_maintenance)
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await maintenance.wait_for_presence_attempt(Presence(), lambda _: None)
+        assert joined.is_set()
+        assert raised.value is fatal
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("close_fatal", [False, True])
+def test_maintenance_fatal_precedes_presence_close_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, close_fatal: bool
+) -> None:
+    async def scenario() -> None:
+        fatal = FatalInternalAudioStorageError("maintenance failed")
+        close_error = FatalInternalAudioStorageError("close failed") if close_fatal else OSError("close failed")
+        release = asyncio.Event()
+        closed = asyncio.Event()
+        maintenance = QuarantineMaintenance(_store(tmp_path), None, OpportunisticRuntime())
+
+        async def failing_maintenance(*_args: object) -> None:
+            await release.wait()
+            raise fatal
+
+        async def fail_wake(_wake: object) -> None:
+            release.set()
+            raise OSError("wake failed")
+
+        class Presence:
+            async def wait_for_attempt(self) -> PresenceWake:
+                return PresenceWake("advertisement")
+
+            async def close(self) -> None:
+                closed.set()
+                raise close_error
+
+        monkeypatch.setattr(maintenance, "_prepare_and_run", failing_maintenance)
+        monkeypatch.setattr(maintenance, "_prepare_presence_wake", fail_wake)
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await maintenance.wait_for_presence_attempt(Presence(), lambda _: None)
+        assert closed.is_set()
+        assert raised.value is fatal
+
+    _run(scenario())
+
+
 def test_multiple_pending_partials_are_quarantined_without_losing_raw_records(tmp_path: Path) -> None:
     store = _store(tmp_path)
     expected_records = {

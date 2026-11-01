@@ -555,14 +555,13 @@ class QuarantineMaintenance:
                 self._join_presence_tasks(presence, presence_task, maintenance_task, permit_returned=permit_returned)
             )
         except BaseException as cleanup_error:
-            if isinstance(error, FatalInternalAudioStorageError):
-                raise error from None
             self._raise_publication_fatal()
             if isinstance(error, asyncio.CancelledError) and not isinstance(
                 cleanup_error, FatalInternalAudioStorageError
             ):
                 raise error from None
             raise
+        self._raise_publication_fatal()
 
     async def _join_fatal_wait(self, fatal_task: asyncio.Task[bool], primary: BaseException | None) -> None:
         fatal_task.cancel()
@@ -590,12 +589,22 @@ class QuarantineMaintenance:
         if not presence_task.done():
             presence_task.cancel()
         try:
-            await asyncio.gather(presence_task, return_exceptions=True)
+            (presence_result,) = await asyncio.gather(presence_task, return_exceptions=True)
+            if isinstance(presence_result, FatalInternalAudioStorageError):
+                self.record_storage_fatal(presence_result)
             if maintenance_task is not None:
-                await maintenance_task
+                try:
+                    await maintenance_task
+                except FatalInternalAudioStorageError as error:
+                    self.record_storage_fatal(error)
+                    raise
         finally:
             if permit_returned:
-                await presence.close()
+                try:
+                    await presence.close()
+                except FatalInternalAudioStorageError as error:
+                    self.record_storage_fatal(error)
+                    raise
 
     async def _prepare_and_run(
         self,

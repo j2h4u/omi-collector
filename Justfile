@@ -33,6 +33,10 @@ fmt-check:
 import-contracts:
     uv run lint-imports
 
+# Check declared module dependencies; import-contracts owns named architecture bans.
+module-boundaries:
+    uv run tach check
+
 # Validate GitHub Actions workflow syntax and expressions.
 actionlint:
     uv run actionlint
@@ -63,7 +67,9 @@ deps-audit: supply-chain-pins
 
 # Check declared Python dependencies against imports.
 deptry:
-    uv run deptry src scripts tests --per-rule-ignores DEP004=radon
+    # Production cannot import dev tools; the full-tree pass also checks unused dependencies.
+    uv run deptry src --ignore DEP002
+    uv run deptry src scripts tests --per-rule-ignores 'DEP004=coverage|radon'
 
 # Run the canonical static type checker on production code.
 typecheck:
@@ -87,7 +93,7 @@ fix:
     uv run ruff format --no-preview src scripts tests
 
 # Static quality gate.
-check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck typecheck-tests import-contracts actionlint supply-chain-pins suppression-budget clone-check deptry compile dead-code package-smoke
+check: fmt-check lint preview-complexity-lint print-lint lock-check typecheck typecheck-tests import-contracts module-boundaries actionlint supply-chain-pins suppression-budget clone-check deptry compile dead-code package-smoke
 
 # Unit tests.
 unit:

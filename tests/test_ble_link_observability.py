@@ -1261,58 +1261,51 @@ def test_reader_failure_does_not_end_active_physical_session() -> None:
 
 
 def test_rssi_worker_waits_for_thirty_second_deadline_without_empty_polls(monkeypatch: pytest.MonkeyPatch) -> None:
-    class PollingSocket(_FakeSocket):
-        def __init__(self) -> None:
-            super().__init__()
-            self.rssi_requests = 0
-            self.first_rssi_request = threading.Event()
-            self.second_rssi_request = threading.Event()
-            self.third_rssi_request = threading.Event()
-
-        def send(self, payload: bytes) -> int:
-            self.sent.append(payload)
-            if payload[1:3] == b"\x05\x14":
-                self.rssi_requests += 1
-                if self.rssi_requests == 1:
-                    self.first_rssi_request.set()
-                elif self.rssi_requests == 2:
-                    self.second_rssi_request.set()
-                elif self.rssi_requests == 3:
-                    self.third_rssi_request.set()
-            return len(payload)
-
-    fake = PollingSocket()
-    monkeypatch.setattr(ble_link_observability, "_RSSI_POLL_SECONDS", 0.08)
+    fake = _FakeSocket()
+    clock_value = [10.0]
+    waits: queue.Queue[float | None] = queue.Queue()
     poll_calls = 0
     observer = BleLinkObserver(
         "01:02:03:04:05:06",
         socket_factory=lambda *_args: fake,  # type: ignore[reportArgumentType]
         native_bind=lambda *_args: None,
+        clock=lambda: clock_value[0],
     )
+    original_get = observer._queue.get
     poll_rssi = observer._poll_rssi
+
+    def record_wait(block: bool = True, timeout: float | None = None) -> bytes | None:
+        if block:
+            waits.put(timeout)
+        return original_get(block, timeout)
 
     def record_poll() -> None:
         nonlocal poll_calls
         poll_calls += 1
         poll_rssi()
 
-    observer._poll_rssi = record_poll
+    monkeypatch.setattr(observer._queue, "get", record_wait)
+    monkeypatch.setattr(observer, "_poll_rssi", record_poll)
 
     async def scenario() -> None:
         await observer.start()
         try:
+            assert await asyncio.to_thread(waits.get, True, 1.0) is None
             fake.feed(_connect())
-            assert await asyncio.to_thread(fake.first_rssi_request.wait, 1.0)
-            assert fake.rssi_requests == 1
-            await asyncio.sleep(0.03)
-            assert fake.rssi_requests == 1
+            assert await asyncio.to_thread(waits.get, True, 1.0) == 30.0
+            assert fake.sent == [b"\x01\x30\x20\x02\x42\x00", b"\x01\x05\x14\x02\x42\x00"]
             assert poll_calls == 1
-            assert await asyncio.to_thread(fake.second_rssi_request.wait, 1.0)
-            assert fake.rssi_requests == 2
-            await asyncio.sleep(0.03)
-            assert fake.rssi_requests == 2
+            clock_value[0] = 39.0
+            fake.feed(_packet(0xFF, b""))
+            assert await asyncio.to_thread(waits.get, True, 1.0) == 1.0
+            assert len(fake.sent) == 2
             assert poll_calls == 2
-            assert not fake.third_rssi_request.is_set()
+            clock_value[0] = 40.0
+            fake.feed(_packet(0xFF, b""))
+            assert await asyncio.to_thread(waits.get, True, 1.0) == 30.0
+            assert fake.sent[-1] == b"\x01\x05\x14\x02\x42\x00"
+            assert len(fake.sent) == 3
+            assert poll_calls == 3
         finally:
             await asyncio.wait_for(observer.close(), timeout=1.0)
 

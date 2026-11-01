@@ -29,6 +29,8 @@ timeout_method = "thread"
 tmp_path_retention_policy = "failed"
 tmp_path_retention_count = 1
 addopts = [
+    # Architecture checks run explicitly; preserve full pytest selection.
+    "-p", "no:tach",
     "--strict-config",
     "--strict-markers",
     "-W",
@@ -201,4 +203,6 @@ dev = [
     "radon>=6.0.1",
     "ruff>=0.15.18",
     "vulture>=2.16",
+    "tach>=0.35.0",
+    "coverage>=7.14.3",
 ]

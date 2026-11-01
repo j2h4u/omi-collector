@@ -1054,19 +1054,6 @@ def session_retry_outcome(
     return "connected_interrupted" if connected else "retry"
 
 
-def presence_attempt_outcome(outcome: str, durable_progress: bool) -> AttemptOutcome:
-    """Translate completed lifecycle work into the scheduler's closed outcome union."""
-    if outcome in {"drained", "collected"}:
-        return CleanDrain()
-    if outcome == "candidate_unavailable":
-        return CandidateUnavailable()
-    if outcome == "connected_interrupted":
-        return ConnectedInterruption(durable_progress)
-    if outcome == "retry":
-        return NotConnected(durable_progress)
-    raise RuntimeError(f"unknown lifecycle attempt outcome: {outcome}")
-
-
 def _visit_recovery_end(end: PresenceEnd) -> RecoveryEnded:
     if end.reason not in {"absence", "recovery_exhausted"}:
         raise ValueError(f"unknown presence end reason: {end.reason}")

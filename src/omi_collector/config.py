@@ -274,7 +274,7 @@ class TelemetryConfig:
 
 @dataclass(frozen=True, slots=True)
 class DebugLogConfig:
-    """Persistent, bounded DEBUG diagnostic ring beneath the collector root."""
+    """Configuration for redacted DEBUG diagnostics sent to the system journal."""
 
     file_name: str = "debug.jsonl"
     max_bytes: int = 8 * 1024 * 1024

@@ -162,7 +162,7 @@ class SQLiteQualityMetrics(QualityMetricsPort):
 
     def record_runtime_status(self, event: str, fields: dict[str, object], timestamp: str) -> bool:
         """Queue one current-status update without delaying its BLE callback."""
-        if event not in {"sync_progress", "ble_link_rssi_observed"}:
+        if event not in {"sync_progress", "ble_link_rssi_observed", "ble_link_status"}:
             return False
         value: dict[str, object] = {"event": event, "fields": fields, "timestamp": timestamp}
         try:

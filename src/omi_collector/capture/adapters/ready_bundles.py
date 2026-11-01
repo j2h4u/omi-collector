@@ -24,6 +24,7 @@ from typing import Literal, NoReturn, Protocol, TypeGuard, cast
 from ...config import ReadyConfig
 from ..application.storage_fault import TransientInternalAudioStorageError
 from ..domain.clock_state import ClockState, ClockStateError
+from ..domain.coverage_decision import CoverageDecisionError, decide_coverage
 from ..domain.internal_audio_machine import (
     QUARANTINE_CUSTODY_HOLD_REASONS,
     AudioAction,
@@ -56,6 +57,16 @@ from ..domain.public_audio_v2 import (
     project_public_timeline,
 )
 from ..domain.publication_contract import ContractMode
+from ..domain.publication_recovery import (
+    CohortFact,
+    CommitEvidence,
+    CommitExpectation,
+    MemberCursor,
+    ProofFact,
+    SourceExpectation,
+    StageCustody,
+    classify_commit,
+)
 from ..domain.replay_proof import (
     NormalizationMode,
     NormalizationRun,
@@ -2547,14 +2558,18 @@ def _require_v2_stage_space(audio_store: InternalAudioStore, ready_root: Path, g
         raise ReadyBundleError("v2 publication space reserve could not be inspected") from error
 
 
-def _create_v2_stage(
-    audio_store: InternalAudioStore,
-    ready_root: Path,
-    cohort: _TypedCohort,
-    group: _V2PreparedGroup,
-    page_limit: int,
-) -> _V2Stage:
-    _require_v2_stage_space(audio_store, ready_root, group)
+@dataclass(frozen=True, slots=True)
+class _V2StageProof:
+    descriptor: bytes
+    descriptor_sha256: str
+    packed_runs: bytes
+    records_sha256: str
+    page_index: bytes
+    scratch: sqlite3.Connection
+
+
+@contextmanager
+def _prepare_v2_stage_proof(group: _V2PreparedGroup, page_limit: int) -> Iterator[_V2StageProof]:
     descriptor = _v2_descriptor(group)
     descriptor_sha256 = sha256(descriptor).hexdigest()
     runs = _v2_normalization_runs(group, page_limit)
@@ -2566,10 +2581,30 @@ def _create_v2_stage(
             records_digest.update(record)
             yield record
 
-    with (
-        _proof_page_scratch(normalized_records(), record_count=group.facts.record_count) as (page_index, scratch),
-        audio_store.publication_transaction() as (state, connection),
-    ):
+    with _proof_page_scratch(normalized_records(), record_count=group.facts.record_count) as (page_index, scratch):
+        yield _V2StageProof(descriptor, descriptor_sha256, packed_runs, records_digest.hexdigest(), page_index, scratch)
+
+
+def _create_v2_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _V2PreparedGroup,
+    page_limit: int,
+) -> _V2Stage:
+    _require_v2_stage_space(audio_store, ready_root, group)
+    with _prepare_v2_stage_proof(group, page_limit) as proof:
+        return _reserve_v2_stage(audio_store, ready_root, cohort, group, proof)
+
+
+def _reserve_v2_stage(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    cohort: _TypedCohort,
+    group: _V2PreparedGroup,
+    proof: _V2StageProof,
+) -> _V2Stage:
+    with audio_store.publication_transaction() as (state, connection):
         contract = _parse_publication_contract(state.get(StateKind.PUBLICATION_CONTRACT, _PUBLICATION_CONTRACT_ID))
         if contract.next_public_order == _UINT64_MAX:
             raise ReadyBundleError("v2 publication order is exhausted")
@@ -2589,7 +2624,7 @@ def _create_v2_stage(
             stage_nonce=nonce,
             order=order,
             config_sha256=group.config_sha256,
-            descriptor_sha256=descriptor_sha256,
+            descriptor_sha256=proof.descriptor_sha256,
         )
         identity = f"{cohort.cohort_id}:{cohort.cursor}:{artifact_id}"
         stage_id = sha256(identity.encode()).hexdigest()
@@ -2615,8 +2650,8 @@ def _create_v2_stage(
                 encode_uint64(order),
                 artifact_id,
                 group.config_sha256,
-                descriptor,
-                descriptor_sha256,
+                proof.descriptor,
+                proof.descriptor_sha256,
                 group.audio.sha256,
                 manifest_sha256,
                 group.facts.record_count,
@@ -2654,24 +2689,24 @@ def _create_v2_stage(
                 stage_id,
                 stage_id,
                 group.facts.record_count,
-                records_digest.hexdigest(),
+                proof.records_sha256,
                 manifest_sha256,
-                page_index,
-                packed_runs,
-                descriptor,
+                proof.page_index,
+                proof.packed_runs,
+                proof.descriptor,
                 _v2_proof_content_sha256(
                     _V2ProofContent(
                         artifact_id,
                         order,
                         group.audio.sha256,
                         manifest_sha256,
-                        records_digest.hexdigest(),
+                        proof.records_sha256,
                         group.facts.record_count,
                         group.audio.packet_count,
                         group.projection_sha256,
-                        page_index,
-                        packed_runs,
-                        descriptor,
+                        proof.page_index,
+                        proof.packed_runs,
+                        proof.descriptor,
                     )
                 ),
                 encode_uint64(order),
@@ -2679,7 +2714,7 @@ def _create_v2_stage(
                 group.audio.packet_count,
             ),
         )
-        _insert_replay_proof_pages(connection, artifact_id, scratch)
+        _insert_replay_proof_pages(connection, artifact_id, proof.scratch)
         changed = connection.execute(
             "UPDATE publication_cohort SET lifecycle='staging' WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
             (cohort.cohort_id, cohort.cursor),
@@ -2699,8 +2734,8 @@ def _create_v2_stage(
         artifact_id,
         order,
         nonce,
-        descriptor,
-        descriptor_sha256,
+        proof.descriptor,
+        proof.descriptor_sha256,
         manifest,
         manifest_sha256,
         group,
@@ -3392,78 +3427,98 @@ def _inspect_v2_commit(audio_store: InternalAudioStore, proposal: _V2Commit, des
         raise_if_sqlite_corrupt(error)
         return "third"
     source_states = tuple(_typed_source_coverage_state(audio_store, item.source_id) for item in proposal.coverage)
-    proposed_sources = all(state == item.proposed for state, item in zip(source_states, proposal.coverage, strict=True))
-    old_sources = all(state == item.old for state, item in zip(source_states, proposal.coverage, strict=True))
-    proposed_cohort = (
-        cohort_row is None
-        if proposal.all_complete
-        else cohort_row == ("accepted", cohort.cursor + 1)
-        and member_rows == tuple((item.member_ordinal, item.new_cursor) for item in proposal.progress)
+    stage_custody = (
+        StageCustody.ABSENT
+        if stage_row is None
+        else StageCustody.OWNED
+        if stage_row == (stage.group_identity, str(stage.path), stage.owner_token, None)
+        else StageCustody.CONFLICTING
     )
-    if all(
-        (
-            entry == proposal.entry,
-            frontier == _v2_frontier_payload(stage.group.final_frontier),
-            stage_row is None,
-            proof == ("active", stage.stage_id, stage.owner_token),
-            proposed_cohort,
-            proposed_sources,
-        )
-    ):
-        return "proposed"
-    old_members = tuple((item.member_ordinal, item.old_cursor) for item in proposal.progress)
-    if all(
-        (
-            entry is None,
-            frontier
-            == (None if stage.group.initial_frontier is None else _v2_frontier_payload(stage.group.initial_frontier)),
-            cohort_row == ("staging", cohort.cursor),
-            stage_row == (stage.group_identity, str(stage.path), stage.owner_token, None),
-            proof == ("staging", stage.stage_id, stage.owner_token),
-            member_rows == old_members,
-            old_sources,
-        )
-    ):
-        return "old"
-    return "third"
+    evidence = CommitEvidence(
+        entry=entry,
+        frontier=frontier,
+        cohort=None if cohort_row is None else CohortFact(cast(str, cohort_row[0]), cast(int, cohort_row[1])),
+        members=tuple(MemberCursor(cast(int, row[0]), cast(int, row[1])) for row in member_rows),
+        proof=None if proof is None else ProofFact(cast(str, proof[0]), cast(str, proof[1]), cast(str, proof[2])),
+        stage=stage_custody,
+        sources=source_states,
+    )
+    expectation = CommitExpectation(
+        entry=proposal.entry,
+        old_frontier=(
+            None if stage.group.initial_frontier is None else _v2_frontier_payload(stage.group.initial_frontier)
+        ),
+        proposed_frontier=_v2_frontier_payload(stage.group.final_frontier),
+        old_cohort_cursor=cohort.cursor,
+        complete=proposal.all_complete,
+        old_members=tuple(MemberCursor(item.member_ordinal, item.old_cursor) for item in proposal.progress),
+        proposed_members=tuple(MemberCursor(item.member_ordinal, item.new_cursor) for item in proposal.progress),
+        stage_id=stage.stage_id,
+        owner=stage.owner_token,
+        sources=tuple(SourceExpectation(item.old, item.proposed) for item in proposal.coverage),
+    )
+    return classify_commit(evidence, expectation)
 
 
 def _commit_v2_stage_once(audio_store: InternalAudioStore, proposal: _V2Commit) -> None:
-    cohort, stage = proposal.cohort, proposal.stage
+    stage = proposal.stage
     with audio_store.publication_transaction() as (state, connection):
         _require_v2_commit_ownership(state, connection, proposal)
-        activated = connection.execute(
-            "UPDATE ready_replay_proof SET lifecycle='active' WHERE bundle_id=? AND lifecycle='staging' "
-            "AND stage_id=? AND owner_token=?",
-            (stage.artifact_id, stage.stage_id, stage.owner_token),
-        )
-        if activated.rowcount != 1:
-            raise ReadyDurabilityFatalError("v2 private replay proof activation changed")
-        state.put(StateKind.READY_PUBLICATION, stage.artifact_id, proposal.entry)
-        frontier_payload = state.get(StateKind.READY_PUBLICATION, "frontier")
-        if frontier_payload is None:
-            old_frontier = 0
-        elif set(frontier_payload) == {"value"} and type(frontier_payload["value"]) is int:
-            old_frontier = cast(int, frontier_payload["value"])
-        else:
-            raise ReadyBundleError("ready publication frontier is invalid")
-        state.put(
-            StateKind.READY_PUBLICATION,
-            "frontier",
-            {"value": max(old_frontier, stage.group.facts.next_sequence)},
-        )
-        state.put(StateKind.PUBLICATION_V2_FRONTIER, "current", _v2_frontier_payload(stage.group.final_frontier))
-        for item in proposal.progress:
-            changed = connection.execute(
-                "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
-                (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
-            )
-            if changed.rowcount != 1:
-                raise ReadyBundleError("v2 cohort member changed before final commit")
+        _activate_v2_commit_proof(connection, stage)
+        _publish_v2_commit_ledger(state, proposal)
+        _advance_v2_commit_members(connection, proposal)
         _apply_typed_coverage(connection, proposal.coverage)
-        connection.execute("DELETE FROM ready_v2_output_stage WHERE stage_id=?", (stage.stage_id,))
-        _advance_v2_commit_cohort(connection, proposal)
+        _finish_v2_commit(connection, proposal)
         state.mark_publication_changed()
+
+
+def _activate_v2_commit_proof(connection: sqlite3.Connection, stage: _V2Stage) -> None:
+    activated = connection.execute(
+        "UPDATE ready_replay_proof SET lifecycle='active' WHERE bundle_id=? AND lifecycle='staging' "
+        "AND stage_id=? AND owner_token=?",
+        (stage.artifact_id, stage.stage_id, stage.owner_token),
+    )
+    if activated.rowcount != 1:
+        raise ReadyDurabilityFatalError("v2 private replay proof activation changed")
+
+
+def _publish_v2_commit_ledger(state: StateTransaction, proposal: _V2Commit) -> None:
+    stage = proposal.stage
+    state.put(StateKind.READY_PUBLICATION, stage.artifact_id, proposal.entry)
+    frontier_payload = state.get(StateKind.READY_PUBLICATION, "frontier")
+    if frontier_payload is None:
+        old_frontier = 0
+    elif set(frontier_payload) == {"value"} and type(frontier_payload["value"]) is int:
+        old_frontier = cast(int, frontier_payload["value"])
+    else:
+        raise ReadyBundleError("ready publication frontier is invalid")
+    state.put(
+        StateKind.READY_PUBLICATION,
+        "frontier",
+        {"value": max(old_frontier, stage.group.facts.next_sequence)},
+    )
+    state.put(StateKind.PUBLICATION_V2_FRONTIER, "current", _v2_frontier_payload(stage.group.final_frontier))
+
+
+def _advance_v2_commit_members(connection: sqlite3.Connection, proposal: _V2Commit) -> None:
+    cohort = proposal.cohort
+    for item in proposal.progress:
+        if not _advance_cohort_member_cursor(connection, cohort.cohort_id, item):
+            raise ReadyBundleError("v2 cohort member changed before final commit")
+
+
+def _advance_cohort_member_cursor(connection: sqlite3.Connection, cohort_id: str, item: _MemberProgress) -> bool:
+    changed = connection.execute(
+        "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
+        (item.new_cursor, cohort_id, item.member_ordinal, item.old_cursor),
+    )
+    return changed.rowcount == 1
+
+
+def _finish_v2_commit(connection: sqlite3.Connection, proposal: _V2Commit) -> None:
+    stage = proposal.stage
+    connection.execute("DELETE FROM ready_v2_output_stage WHERE stage_id=?", (stage.stage_id,))
+    _advance_v2_commit_cohort(connection, proposal)
 
 
 def _require_v2_commit_ownership(
@@ -3885,50 +3940,7 @@ def _create_typed_cohort(
     )
     for attempt in range(2):
         try:
-            with audio_store.publication_transaction() as (state, connection):
-                _require_cohort_decision(
-                    CohortPhase.UNQUALIFIED,
-                    QualifiedDrained(),
-                    CohortAction.ACCEPT,
-                    CohortPhase.ACCEPTED,
-                )
-                active = _sql_all(
-                    connection.execute(
-                        "SELECT cohort_id FROM publication_cohort WHERE lifecycle IN ('accepted','staging','complete')"
-                    )
-                )
-                if active:
-                    raise ReadyBundleError("another typed publication cohort is active")
-                connection.execute(
-                    "INSERT INTO publication_cohort(cohort_id,lifecycle,accepted_permit,drained_threshold,"
-                    "config_digest,closure_frontier,cursor,accepted_time) "
-                    "VALUES (?, 'accepted', ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                    (
-                        cohort_id,
-                        cohort_id,
-                        threshold,
-                        config_digest,
-                        None if frontier is None else encode_uint64(frontier),
-                    ),
-                )
-                connection.executemany(
-                    "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,"
-                    "slice_count,admitted_lifecycle,admitted_count,admitted_sha256,cursor) "
-                    "VALUES (?, ?, ?, 0, ?, ?, ?, ?, 0)",
-                    (
-                        (
-                            cohort_id,
-                            index,
-                            item.snapshot.source_id,
-                            item.admitted_count,
-                            item.admitted_lifecycle,
-                            item.admitted_count,
-                            item.admitted_sha256,
-                        )
-                        for index, item in enumerate(admissions)
-                    ),
-                )
-                state.mark_publication_changed()
+            _accept_typed_cohort_once(audio_store, proposed, admissions)
             return proposed
         except (InternalAudioStoreError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
             raise_if_sqlite_corrupt(error)
@@ -3942,6 +3954,59 @@ def _create_typed_cohort(
                 raise ReadyBundleError("typed cohort acceptance was rolled back") from error
             _typed_fail_stop(audio_store, "ambiguous typed cohort acceptance has a third state")
     raise AssertionError("unreachable")
+
+
+def _accept_typed_cohort_once(
+    audio_store: InternalAudioStore, proposed: _TypedCohort, admissions: tuple[_TypedAdmission, ...]
+) -> None:
+    cohort_id = proposed.cohort_id
+    threshold = proposed.threshold
+    frontier = proposed.frontier
+    config_digest = proposed.config_digest
+    with audio_store.publication_transaction() as (state, connection):
+        _require_cohort_decision(
+            CohortPhase.UNQUALIFIED,
+            QualifiedDrained(),
+            CohortAction.ACCEPT,
+            CohortPhase.ACCEPTED,
+        )
+        active = _sql_all(
+            connection.execute(
+                "SELECT cohort_id FROM publication_cohort WHERE lifecycle IN ('accepted','staging','complete')"
+            )
+        )
+        if active:
+            raise ReadyBundleError("another typed publication cohort is active")
+        connection.execute(
+            "INSERT INTO publication_cohort(cohort_id,lifecycle,accepted_permit,drained_threshold,"
+            "config_digest,closure_frontier,cursor,accepted_time) "
+            "VALUES (?, 'accepted', ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (
+                cohort_id,
+                cohort_id,
+                threshold,
+                config_digest,
+                None if frontier is None else encode_uint64(frontier),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO publication_cohort_member(cohort_id,member_ordinal,source_id,slice_start,"
+            "slice_count,admitted_lifecycle,admitted_count,admitted_sha256,cursor) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, 0)",
+            (
+                (
+                    cohort_id,
+                    index,
+                    item.snapshot.source_id,
+                    item.admitted_count,
+                    item.admitted_lifecycle,
+                    item.admitted_count,
+                    item.admitted_sha256,
+                )
+                for index, item in enumerate(admissions)
+            ),
+        )
+        state.mark_publication_changed()
 
 
 def _load_active_for_reconciliation(audio_store: InternalAudioStore) -> _TypedCohort | None:
@@ -4067,49 +4132,61 @@ def _commit_typed_ready_custody(audio_store: InternalAudioStore, commit: _Custod
 
 
 def _commit_typed_ready_custody_once(audio_store: InternalAudioStore, commit: _CustodyCommit) -> None:
-    cohort = commit.cohort
     with audio_store.publication_transaction() as (state, connection):
-        next_phase = CohortPhase.COMPLETE if commit.all_complete else CohortPhase.ACCEPTED
-        _require_cohort_decision(
-            CohortPhase.ACCEPTED,
-            ExistingReadyCustody(
-                proved_progress=any(item.new_cursor > item.old_cursor for item in commit.progress),
-                cohort_complete=commit.all_complete,
-            ),
-            CohortAction.COMMIT,
-            next_phase,
-        )
-        if any(state.get(StateKind.READY_PUBLICATION, key) != entry for key, entry in commit.proofs.items()):
-            raise ReadyBundleError("typed ready custody changed before cursor commit")
-        row = _sql_one(
-            connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,))
-        )
-        if row is None or tuple(row) != ("accepted", cohort.cursor):
-            raise ReadyBundleError("typed cohort changed before custody commit")
-        for item in commit.progress:
-            if item.new_cursor == item.old_cursor:
-                continue
-            updated = connection.execute(
-                "UPDATE publication_cohort_member SET cursor=? WHERE cohort_id=? AND member_ordinal=? AND cursor=?",
-                (item.new_cursor, cohort.cohort_id, item.member_ordinal, item.old_cursor),
-            )
-            if updated.rowcount != 1:
-                raise ReadyBundleError("typed cohort member changed before custody commit")
+        _require_typed_custody_commit_ownership(state, connection, commit)
+        _advance_typed_custody_members(connection, commit)
         _apply_typed_coverage(connection, commit.coverage)
-        if commit.all_complete:
-            _require_cohort_decision(
-                CohortPhase.COMPLETE,
-                CompleteRetire(),
-                CohortAction.RETIRE,
-                None,
-            )
-            deleted = connection.execute(
-                "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
-                (cohort.cohort_id, cohort.cursor),
-            )
-            if deleted.rowcount != 1:
-                raise ReadyBundleError("typed replay cohort completion changed")
+        _finish_typed_custody_cohort(connection, commit)
         state.mark_publication_changed()
+
+
+def _require_typed_custody_commit_ownership(
+    state: StateTransaction, connection: sqlite3.Connection, commit: _CustodyCommit
+) -> None:
+    cohort = commit.cohort
+    next_phase = CohortPhase.COMPLETE if commit.all_complete else CohortPhase.ACCEPTED
+    _require_cohort_decision(
+        CohortPhase.ACCEPTED,
+        ExistingReadyCustody(
+            proved_progress=any(item.new_cursor > item.old_cursor for item in commit.progress),
+            cohort_complete=commit.all_complete,
+        ),
+        CohortAction.COMMIT,
+        next_phase,
+    )
+    if any(state.get(StateKind.READY_PUBLICATION, key) != entry for key, entry in commit.proofs.items()):
+        raise ReadyBundleError("typed ready custody changed before cursor commit")
+    row = _sql_one(
+        connection.execute("SELECT lifecycle,cursor FROM publication_cohort WHERE cohort_id=?", (cohort.cohort_id,))
+    )
+    if row is None or tuple(row) != ("accepted", cohort.cursor):
+        raise ReadyBundleError("typed cohort changed before custody commit")
+
+
+def _advance_typed_custody_members(connection: sqlite3.Connection, commit: _CustodyCommit) -> None:
+    cohort = commit.cohort
+    for item in commit.progress:
+        if item.new_cursor == item.old_cursor:
+            continue
+        if not _advance_cohort_member_cursor(connection, cohort.cohort_id, item):
+            raise ReadyBundleError("typed cohort member changed before custody commit")
+
+
+def _finish_typed_custody_cohort(connection: sqlite3.Connection, commit: _CustodyCommit) -> None:
+    cohort = commit.cohort
+    if commit.all_complete:
+        _require_cohort_decision(
+            CohortPhase.COMPLETE,
+            CompleteRetire(),
+            CohortAction.RETIRE,
+            None,
+        )
+        deleted = connection.execute(
+            "DELETE FROM publication_cohort WHERE cohort_id=? AND lifecycle='accepted' AND cursor=?",
+            (cohort.cohort_id, cohort.cursor),
+        )
+        if deleted.rowcount != 1:
+            raise ReadyBundleError("typed replay cohort completion changed")
 
 
 def _inspect_typed_ready_custody(audio_store: InternalAudioStore, commit: _CustodyCommit) -> str:
@@ -4210,30 +4287,16 @@ def _typed_coverage_proposal(connection: sqlite3.Connection, admission: _TypedAd
     old = tuple(row)
     _require_typed_coverage_source(old, admission)
     proposed = list(old)
-    full = admission.admitted_count == admission.snapshot.committed_count
-    if not full and admission.admitted_lifecycle != "blocked":
-        raise ReadyBundleError("only a certified blocked prefix may retain uncovered source rows")
-    _require_audio_decision(
-        AudioPhase(cast(str, old[0])),
-        ReadyCustody(
-            certified_quarantine_prefix=admission.admitted_lifecycle == "blocked",
-        ),
-        AudioAction.RETIRE,
-        AudioPhase.COVERED,
-    )
-    proposed[0] = "covered"
+    try:
+        phase, retirement_cursor = decide_coverage(
+            cast(str, old[0]), admission.admitted_count, admission.snapshot.committed_count
+        )
+    except CoverageDecisionError as error:
+        raise ReadyBundleError(str(error)) from None
+    proposed[0] = phase.value
     proposed[8] = encode_uint64(admission.snapshot.sequence_start + admission.admitted_count)
     proposed[10] = admission.admitted_sha256
-    proposed[11] = None
-    if full:
-        _require_audio_decision(
-            AudioPhase.COVERED,
-            BeginRetirement(),
-            AudioAction.RETIRE,
-            AudioPhase.RETIRING,
-        )
-        proposed[0] = "retiring"
-        proposed[11] = 0
+    proposed[11] = retirement_cursor
     return _SourceCoverage(admission.snapshot.source_id, old, tuple(proposed))
 
 
@@ -4573,98 +4636,115 @@ def _advance_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
 
 
 def _retire_typed_source_once(audio_store: InternalAudioStore, step: _RetirementStep) -> _RetirementResult:
-    proposed: int | None = step.old_cursor
     with audio_store.publication_transaction() as (state, connection):
-        source = _sql_one(
+        _require_typed_retirement_snapshot(connection, step)
+        prefix_result = _retire_typed_record_prefix(state, connection, step)
+        if prefix_result is not None:
+            return prefix_result
+        return _finish_typed_retirement(connection, step)
+
+
+def _require_typed_retirement_snapshot(connection: sqlite3.Connection, step: _RetirementStep) -> None:
+    source = _sql_one(
+        connection.execute(
+            "SELECT lifecycle,committed_count,committed_sha256,coverage_digest,retirement_cursor "
+            "FROM capture_source WHERE source_id=?",
+            (step.source_id,),
+        )
+    )
+    if source is None or tuple(source) != (
+        "retiring",
+        step.committed_count,
+        step.coverage_digest,
+        step.coverage_digest,
+        step.old_cursor,
+    ):
+        raise ReadyBundleError("typed retirement source changed")
+
+
+def _retire_typed_record_prefix(
+    state: StateTransaction, connection: sqlite3.Connection, step: _RetirementStep
+) -> _RetirementResult | None:
+    ordinals = tuple(
+        cast(int, row[0])
+        for row in _sql_all(
             connection.execute(
-                "SELECT lifecycle,committed_count,committed_sha256,coverage_digest,retirement_cursor "
-                "FROM capture_source WHERE source_id=?",
-                (step.source_id,),
+                "SELECT ordinal FROM capture_record WHERE source_id=? AND ordinal>=? ORDER BY ordinal LIMIT ?",
+                (step.source_id, step.old_cursor, step.page_limit),
             )
         )
-        if source is None or tuple(source) != (
-            "retiring",
-            step.committed_count,
-            step.coverage_digest,
-            step.coverage_digest,
-            step.old_cursor,
-        ):
-            raise ReadyBundleError("typed retirement source changed")
-        ordinals = tuple(
-            cast(int, row[0])
-            for row in _sql_all(
-                connection.execute(
-                    "SELECT ordinal FROM capture_record WHERE source_id=? AND ordinal>=? ORDER BY ordinal LIMIT ?",
-                    (step.source_id, step.old_cursor, step.page_limit),
-                )
-            )
+    )
+    retired_residue = _sql_one(
+        connection.execute(
+            "SELECT count(*) FROM capture_record WHERE source_id=? AND ordinal<?",
+            (step.source_id, step.old_cursor),
         )
-        retired_residue = _sql_one(
-            connection.execute(
-                "SELECT count(*) FROM capture_record WHERE source_id=? AND ordinal<?",
-                (step.source_id, step.old_cursor),
-            )
-        )
-        if retired_residue is None or retired_residue[0] != 0:
-            raise ReadyBundleError("typed retirement cursor does not match retained rows")
-        if ordinals:
-            _require_audio_decision(
-                AudioPhase.RETIRING,
-                RetirementStepEvent(),
-                AudioAction.RETIRE,
-                AudioPhase.RETIRING,
-            )
-            if ordinals != tuple(range(step.old_cursor, step.old_cursor + len(ordinals))):
-                raise ReadyBundleError("typed retirement rows are not contiguous")
-            proposed = step.old_cursor + len(ordinals)
-            mark_retirement_compaction_pending(state)
-            deleted_records = connection.execute(
-                "DELETE FROM capture_record WHERE source_id=? AND ordinal>=? AND ordinal<?",
-                (step.source_id, step.old_cursor, proposed),
-            )
-            if deleted_records.rowcount != len(ordinals):
-                raise ReadyBundleError("typed retirement rows changed before removal")
-            changed = connection.execute(
-                "UPDATE capture_source SET retirement_cursor=? "
-                "WHERE source_id=? AND lifecycle='retiring' AND retirement_cursor=?",
-                (proposed, step.source_id, step.old_cursor),
-            )
-            if changed.rowcount != 1:
-                raise ReadyBundleError("typed retirement cursor changed")
-        else:
-            if step.old_cursor != step.committed_count:
-                raise ReadyBundleError("typed retirement rows ended before coverage")
-            residue = _sql_one(
-                connection.execute(
-                    "SELECT "
-                    "(SELECT count(*) FROM capture_tail WHERE source_id=?),"
-                    "(SELECT count(*) FROM capture_conflict WHERE source_id=?),"
-                    "(SELECT count(*) FROM capture_evidence WHERE source_id=?),"
-                    "(SELECT count(*) FROM publication_cohort_member WHERE source_id=?)",
-                    (step.source_id, step.source_id, step.source_id, step.source_id),
-                )
-            )
-            if residue is None or tuple(residue) != (0, 0, 0, 0):
-                return _RetirementResult(step.old_cursor, False)
-            _require_audio_decision(
-                AudioPhase.RETIRING,
-                RetirementStepEvent(final=True),
-                AudioAction.RETIRE,
-                None,
-            )
-            deleted = connection.execute(
-                "DELETE FROM capture_source WHERE source_id=? AND lifecycle='retiring' "
-                "AND retirement_cursor=? AND coverage_digest=?",
-                (step.source_id, step.old_cursor, step.coverage_digest),
-            )
-            if deleted.rowcount != 1:
-                raise ReadyBundleError("typed retirement source changed before removal")
-            connection.execute(
-                "DELETE FROM state WHERE kind=? AND id=?",
-                (StateKind.PACKET_SUMMARY.value, step.source_id),
-            )
-            proposed = None
+    )
+    if retired_residue is None or retired_residue[0] != 0:
+        raise ReadyBundleError("typed retirement cursor does not match retained rows")
+    if not ordinals:
+        if step.old_cursor != step.committed_count:
+            raise ReadyBundleError("typed retirement rows ended before coverage")
+        return None
+    _require_audio_decision(
+        AudioPhase.RETIRING,
+        RetirementStepEvent(),
+        AudioAction.RETIRE,
+        AudioPhase.RETIRING,
+    )
+    if ordinals != tuple(range(step.old_cursor, step.old_cursor + len(ordinals))):
+        raise ReadyBundleError("typed retirement rows are not contiguous")
+    proposed = step.old_cursor + len(ordinals)
+    if proposed != min(step.committed_count, step.old_cursor + step.page_limit):
+        raise ReadyBundleError("typed retirement page does not match its bounded prefix")
+    mark_retirement_compaction_pending(state)
+    deleted_records = connection.execute(
+        "DELETE FROM capture_record WHERE source_id=? AND ordinal>=? AND ordinal<?",
+        (step.source_id, step.old_cursor, proposed),
+    )
+    if deleted_records.rowcount != len(ordinals):
+        raise ReadyBundleError("typed retirement rows changed before removal")
+    changed = connection.execute(
+        "UPDATE capture_source SET retirement_cursor=? "
+        "WHERE source_id=? AND lifecycle='retiring' AND retirement_cursor=?",
+        (proposed, step.source_id, step.old_cursor),
+    )
+    if changed.rowcount != 1:
+        raise ReadyBundleError("typed retirement cursor changed")
     return _RetirementResult(proposed, True)
+
+
+def _finish_typed_retirement(connection: sqlite3.Connection, step: _RetirementStep) -> _RetirementResult:
+    residue = _sql_one(
+        connection.execute(
+            "SELECT "
+            "(SELECT count(*) FROM capture_tail WHERE source_id=?),"
+            "(SELECT count(*) FROM capture_conflict WHERE source_id=?),"
+            "(SELECT count(*) FROM capture_evidence WHERE source_id=?),"
+            "(SELECT count(*) FROM publication_cohort_member WHERE source_id=?)",
+            (step.source_id, step.source_id, step.source_id, step.source_id),
+        )
+    )
+    if residue is None or tuple(residue) != (0, 0, 0, 0):
+        return _RetirementResult(step.old_cursor, False)
+    _require_audio_decision(
+        AudioPhase.RETIRING,
+        RetirementStepEvent(final=True),
+        AudioAction.RETIRE,
+        None,
+    )
+    deleted = connection.execute(
+        "DELETE FROM capture_source WHERE source_id=? AND lifecycle='retiring' "
+        "AND retirement_cursor=? AND coverage_digest=?",
+        (step.source_id, step.old_cursor, step.coverage_digest),
+    )
+    if deleted.rowcount != 1:
+        raise ReadyBundleError("typed retirement source changed before removal")
+    connection.execute(
+        "DELETE FROM state WHERE kind=? AND id=?",
+        (StateKind.PACKET_SUMMARY.value, step.source_id),
+    )
+    return _RetirementResult(None, True)
 
 
 def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _RetirementStep, proposed: int | None) -> str:

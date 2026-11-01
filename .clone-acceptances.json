@@ -86,6 +86,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "048d18427579ed016ad70e82f5455dd3b307a09cc32e245622da476c4e9fe5c4",
+      "count": 1,
+      "reason": "DurabilityConfig validates disk headroom, overhead fraction and I/O chunk size; TelemetryConfig validates observation timeouts. These are separate configuration contracts and already share primitive validators. Reviewed pair: src/omi_collector/config.py:174-186 ~ src/omi_collector/config.py:267-279."
+    },
+    {
+      "detector": "jscpd",
       "identity": "05247e2206e25a7e8d9dc44696980a731fa3b167002e709cc7f002ee77a4c4f2",
       "count": 1,
       "reason": "BenchmarkContext, CaptureSource, quarantine admission snapshots and v2 proof/stage/resume records carry different owners, persisted schemas and custody lifetimes. Field-name normalization erases those distinctions; preserve these explicit record types. Reviewed pair: scripts/bench_omic16_internal_sqlite.py:82-98 ~ src/omi_collector/capture/adapters/ready_bundles.py:1212-1228."
@@ -254,12 +260,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "272350125cd10d2a07d3e75b61fd60981e7d682d0acab874048860578a0a8e63",
-      "count": 1,
-      "reason": "These are explicit imports of different state-machine/protocol vocabularies into storage and orchestration modules. They express dependencies, not duplicated executable behavior. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:17-34 ~ src/omi_collector/capture/adapters/staging_store.py:18-35."
-    },
-    {
-      "detector": "jscpd",
       "identity": "27d14ba7ae91b33432bb9631dc80d3d309b24e31ec0c333cca73947f9c689fe7",
       "count": 1,
       "reason": "The reported models and as_dict methods encode separate PHY outcomes, connection parameters, loss facts, lock context, quality events and status/lifetime aggregates. Explicit schema keys and units are public contracts; do not combine them because normalized field assignments look alike. Reviewed pair: src/omi_collector/capture/application/quality_metrics.py:128-138 ~ src/omi_collector/capture/application/quality_metrics.py:160-170."
@@ -287,12 +287,6 @@
       "identity": "2bb48d237e927b79ec9039d4f4b8d964a65dfd363772e8a10ef28065a83538c5",
       "count": 1,
       "reason": "Prefix terminalization and unprocessable marking update different source types/lifecycles/dispositions with different conditional-update safety guards. Their similar durable SQL/error structure is not interchangeable terminal authority. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:638-652 ~ src/omi_collector/capture/adapters/quarantine.py:702-716."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "2dd2894cb1e75c680aa9be337266f1661d224eb22ca5a6ed70ab4d62f43fc376",
-      "count": 1,
-      "reason": "These are imports of separate internal audio/cohort/quarantine state and evidence types. Import lists must continue to expose real module dependencies. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:10-32 ~ src/omi_collector/capture/adapters/ready_bundles.py:25-46."
     },
     {
       "detector": "jscpd",
@@ -329,6 +323,12 @@
       "identity": "319bcb90e42095905466a540068595ba08ffb0bc345399cc9851ab6d25e0d73f",
       "count": 1,
       "reason": "BenchmarkContext, CaptureSource, quarantine admission snapshots and v2 proof/stage/resume records carry different owners, persisted schemas and custody lifetimes. Field-name normalization erases those distinctions; preserve these explicit record types. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1138-1151 ~ src/omi_collector/capture/adapters/ready_bundles.py:1195-1208."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "3331e53207754f02e5595afcbdb2c6ed912a1749861b7ffab76b9969b1bf88ca",
+      "count": 1,
+      "reason": "DebugLogConfig validates logger identity and diagnostic storage settings, while QualityMetricsConfig controls separate quality evidence history and queue defaults. They already share primitive validation. Reviewed pair: src/omi_collector/config.py:270-297 ~ src/omi_collector/config.py:296-322."
     },
     {
       "detector": "jscpd",
@@ -419,12 +419,6 @@
       "identity": "3f3aa66461d9f1517eae84f325d1ebd349e843bb999726774a2e53c4a4433829",
       "count": 1,
       "reason": "Audio state handlers enforce different admissible source phases and event guards for data, barriers, terminalization, conflict, custody and retirement. Their result construction is shared through AudioDecision; preserve the explicit independent transition rules. Reviewed pair: src/omi_collector/capture/domain/internal_audio_machine.py:189-196 ~ src/omi_collector/capture/domain/internal_audio_machine.py:257-264."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "3fabb1a0b91ad78181b3788e7970817b4c0f49436283b744f8e6d52e71aab490",
-      "count": 1,
-      "reason": "HCI event parsers read different byte offsets, status/handle layouts and minimum lengths (connection, update, parameter request, data length, disconnect). Keep per-opcode decoding and malformed diagnostics; integer endian conversion is already a platform operation. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:475-480 ~ src/omi_collector/capture/adapters/ble_link_observability.py:535-540."
     },
     {
       "detector": "jscpd",
@@ -788,6 +782,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "765a4110dfbf816f2514323101c4a700df65900422c13a5445faf7d7cc4777bb",
+      "count": 1,
+      "reason": "HCI data-length change and remote connection parameter request read little-endian words but use different handle masking, field meanings, event types and length/error handling. Preserve their event-specific decoding. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:477-482 ~ src/omi_collector/capture/adapters/ble_link_observability.py:537-542."
+    },
+    {
+      "detector": "jscpd",
       "identity": "772a7562ac29f5ef4c1e57acb00d47b25da2c6f59c08baf5a57730a8855c924a",
       "count": 1,
       "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:502-508 ~ src/omi_collector/cli.py:678-686."
@@ -839,12 +839,6 @@
       "identity": "7fcc360d4f1a78f4178fc9b8eda1c04ec9f34781cfe4b3965276b912c43bba24",
       "count": 1,
       "reason": "The windows overlap one operational-status transition/enum declaration. Distinct state/event values are not duplicate executable functions. Reviewed pair: src/omi_collector/capture/domain/operational_status_machine.py:37-50 ~ src/omi_collector/capture/domain/operational_status_machine.py:38-51."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "82a8e71eb154fd3b1a96fde90b35161f6600d1a975c4ac70287cb55e84b2ca87",
-      "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:174-186 ~ src/omi_collector/config.py:267-279."
     },
     {
       "detector": "jscpd",
@@ -926,6 +920,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "8fcb1faa48eba0f90bae64169a41421c09d2c7b29e703a347b097672c56ea6ce",
+      "count": 1,
+      "reason": "These normalized import declarations list different domain and state vocabularies used by their respective consumers. They share no executable behavior or API to extract. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:17-32 ~ src/omi_collector/capture/adapters/staging_store.py:18-33."
+    },
+    {
+      "detector": "jscpd",
       "identity": "9088394e0138ce321188fb8a8e636fef47c18ea1e1ec2ec1d49ab8f27f721b86",
       "count": 1,
       "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:675-685 ~ src/omi_collector/cli.py:689-700."
@@ -992,9 +992,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "95ce28b5df6fcdb25237d701beb4e21e871efce513c8d59468adb460b113755c",
+      "identity": "7604f602a6cb822db20f280b75656b243a54e842cee52e9a810190d493315a5d",
       "count": 1,
-      "reason": "Commit, custody, conflict and retirement reconcilers each compare operation-specific old/proposed/third states, retry once and fail-stop differently. Shared error classification and fail-stop are already helpers; a generic retry callback would hide distinct durable witnesses and result contracts. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4059-4070 ~ src/omi_collector/capture/adapters/ready_bundles.py:4565-4576."
+      "reason": "Custody reconciliation compares durable cohort and source-coverage proposals and returns the proposed cohort or completion. Retirement reconciliation compares source identity/cursor and compaction debt, validates stalled/progressed results, and returns a progress boolean; their caught exception sets also differ. Shared two-attempt syntax is not a common operation: error classification and fail-stop already use shared helpers. Keep operation-specific recovery contracts instead of callback-driven retry machinery. Independent Astra review and public-API custody/retirement rollback and lost-response tests cover the distinction. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4123-4135 ~ src/omi_collector/capture/adapters/ready_bundles.py:4641-4653."
     },
     {
       "detector": "jscpd",
@@ -1373,12 +1373,6 @@
       "identity": "ccc51a79c94522033e13418ea3a666532928a01d9888d9467d80562aa7c4acc6",
       "count": 1,
       "reason": "Prepare-leg, READ_BEGIN and interruption are distinct durable FSM mutations with different SQL predicates, state transitions and durability diagnostics. Their shared rollback/storage-fault handling already calls common helpers; do not replace them with a generic transaction effect. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:639-645 ~ src/omi_collector/capture/adapters/internal_audio_store.py:690-696."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "cd660daafac31cd09996a06b155fcc0078116b7e8db40e3900a0a95ae982cc88",
-      "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:270-297 ~ src/omi_collector/config.py:296-322."
     },
     {
       "detector": "jscpd",
@@ -2060,6 +2054,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "5f4a4668b1aa0ab8de4e11c23c3b0f862458f5ce103d793b7496f2829b1676ab",
+      "count": 1,
+      "reason": "DebugLogConfig validates logger identity and diagnostic storage settings, while QualityMetricsConfig controls separate quality evidence history and queue defaults. They already share primitive validation. Reviewed pair: src/omi_collector/config.py:276-298 ~ src/omi_collector/config.py:302-322."
+    },
+    {
+      "detector": "pyscn",
       "identity": "5f6860cf9a8ad8aceab8e81165ac47e53f00a7bf29cfcd357bc5abb498c39a86",
       "count": 1,
       "reason": "Initialization and journal recovery have different eligibility checks, effects and public error sets. CLI boilerplate does not establish one migration operation. Reviewed pair: src/omi_collector/cli.py:467-502 ~ src/omi_collector/cli.py:551-583."
@@ -2258,15 +2258,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "9c7b1a984dc66267a20e468a3159fd85ae55c483db59e7af680422a7b29bd0d9",
-      "count": 1,
-      "reason": "DebugLogConfig and QualityMetricsConfig expose different history/record-size/rotation policies and limits. Existing primitive config validators are shared; keep independent field constraints and public configuration types. Reviewed pair: src/omi_collector/config.py:276-298 ~ src/omi_collector/config.py:302-322."
-    },
-    {
-      "detector": "pyscn",
       "identity": "9d0d75643849ed278370eaeb96687ade61191992983dbca8882fe2703188a92d",
       "count": 1,
       "reason": "Quarantine hold reconciliation uses authentication evidence; conflict-disposition inspection verifies old/proposed durable source/cohort tuples. Preserve independent witnesses and error handling. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:467-475 ~ src/omi_collector/capture/adapters/ready_bundles.py:4431-4444."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "9d9d5d86d7ea6b1c22adca009c1218c6f0a0bf3477052935ae76ce9c3590559d",
+      "count": 1,
+      "reason": "Clock observation accepts a missing payload as empty state and writes only when the serialized state changes; uncertainty marking requires an existing intent and always persists its validated transition. StateDB already owns transaction, get and put; a generic callback would hide these distinct policies. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:36-48 ~ src/omi_collector/capture/adapters/clock_state_store.py:59-67."
     },
     {
       "detector": "pyscn",
@@ -2546,12 +2546,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "f0e548863fe565dab7c1e4340064e16a28c8a42cde92e9064e6c0e7aa061ed5c",
-      "count": 1,
-      "reason": "HCI data-length change and remote connection parameter request both contain little-endian words but have different field meanings, handle masking and event types. Preserve per-opcode decoding. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:470-480 ~ src/omi_collector/capture/adapters/ble_link_observability.py:528-540."
-    },
-    {
-      "detector": "pyscn",
       "identity": "f2c03903c8a380fc3fa7e155e616d1711982017674054a931815b5dd74c60647",
       "count": 1,
       "reason": "Clock uncertainty marking and completed-range publication are separate intent transitions. Atomic StateDB scope is common infrastructure, not a duplicate clock operation. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:78-87 ~ src/omi_collector/capture/adapters/clock_state_store.py:98-105."
@@ -2561,6 +2555,12 @@
       "identity": "f4f72c701d53f62097391d0269de0c06f8dcef2174eb956fb74b1227d075cfaf",
       "count": 1,
       "reason": "Legacy clock correction evidence and typed publication admission snapshots represent different eras, field schemas and ownership. Similar optional/default annotation shape is incidental. Reviewed pair: src/omi_collector/capture/adapters/legacy_clock_import.py:95-106 ~ src/omi_collector/capture/adapters/ready_bundles.py:1104-1113."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "f8c6a633d9b0120dc0b53fbab77679141f39eebe57f85137a815b1e1f76f9c26",
+      "count": 1,
+      "reason": "Clock observation accepts a missing payload as empty state and writes only when the serialized state changes; prepared-intent cancellation requires an existing intent and always persists its validated transition. StateDB already owns transaction, get and put; a generic callback would hide these distinct policies. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:26-48 ~ src/omi_collector/capture/adapters/clock_state_store.py:69-76."
     }
   ]
 }

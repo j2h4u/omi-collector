@@ -23,6 +23,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol, cast
+from uuid import uuid4
 
 from ...config import DEFAULT_CONFIG, BleConfig
 from .debug_logging import debug_event, debug_exception
@@ -373,6 +374,7 @@ class _ActiveSession:
     initial_connection_parameters: ConnectionParameters
     role: int
     peer_address_type: int
+    link_id: str = ""
     requests: list[ConnectionParameterRequest] | None = None
     updates: list[ConnectionParameterUpdate] | None = None
     tx_phy: str | None = None
@@ -445,7 +447,7 @@ def parse_hci_packet(
     return None
 
 
-def _parse_le_meta(  # noqa: PLR0911
+def _parse_le_meta(
     payload: bytes, packet: bytes, logger: logging.Logger
 ) -> (
     _ConnectEvent
@@ -470,21 +472,21 @@ def _parse_le_meta(  # noqa: PLR0911
     if subevent == _LE_DATA_LENGTH_CHANGE:
         if len(body) != _DATA_LENGTH_CHANGE_BYTES:
             _malformed(packet, "malformed_data_length_change", logger)
-            return None
-        return _DataLengthChangeEvent(
-            int.from_bytes(body[0:2], "little") & 0x0FFF,
-            int.from_bytes(body[2:4], "little"),
-            int.from_bytes(body[4:6], "little"),
-            int.from_bytes(body[6:8], "little"),
-            int.from_bytes(body[8:10], "little"),
-        )
-    if subevent != _LE_PHY_UPDATE_COMPLETE:
-        return None
-    if len(body) < _PHY_UPDATE_BYTES:
-        _malformed(packet, "truncated_phy_update_complete", logger)
-        return None
-    status, handle = body[0], int.from_bytes(body[1:3], "little") & 0x0FFF
-    return _PhyEvent(handle, status, body[3], body[4]) if status == 0 else _PhyEvent(handle, status, None, None)
+        else:
+            return _DataLengthChangeEvent(
+                int.from_bytes(body[0:2], "little") & 0x0FFF,
+                int.from_bytes(body[2:4], "little"),
+                int.from_bytes(body[4:6], "little"),
+                int.from_bytes(body[6:8], "little"),
+                int.from_bytes(body[8:10], "little"),
+            )
+    elif subevent == _LE_PHY_UPDATE_COMPLETE:
+        if len(body) < _PHY_UPDATE_BYTES:
+            _malformed(packet, "truncated_phy_update_complete", logger)
+        else:
+            status, handle = body[0], int.from_bytes(body[1:3], "little") & 0x0FFF
+            return _PhyEvent(handle, status, body[3], body[4]) if status == 0 else _PhyEvent(handle, status, None, None)
+    return None
 
 
 def _parse_connection(body: bytes, packet: bytes, logger: logging.Logger, *, enhanced: bool) -> _ConnectEvent | None:
@@ -992,6 +994,7 @@ class BleLinkObserver:
                 _connection_parameters(event.interval, event.latency, event.supervision_timeout),
                 event.role,
                 event.peer_address_type,
+                link_id=uuid4().hex,
                 requests=[],
                 updates=[],
                 transitions=[],
@@ -1000,6 +1003,8 @@ class BleLinkObserver:
             )
             if self.observer_status == "available":
                 self._warning_emitted = False
+            link_id = self._active.link_id
+        self._report_link_status(link_id, "connected")
         self._request_phy(event.handle)
         self._request_rssi(event.handle)
 
@@ -1115,6 +1120,12 @@ class BleLinkObserver:
             active.initial_phy_snapshot = PhyOutcome(f"0x{event.status:02x}", _hci_status_name(event.status), effective)
             if effective is not None:
                 active.tx_phy, active.rx_phy = effective.tx_phy, effective.rx_phy
+            link_id = active.link_id
+        if effective is not None and effective.tx_phy is not None and effective.rx_phy is not None:
+            self._report_link_status(link_id, "observed", effective, "read_phy")
+        else:
+            reason = f"0x{event.status:02x}" if event.status else "unknown_phy"
+            self._report_link_status(link_id, "unavailable", reason=reason)
 
     def _record_phy_update(self, event: _PhyEvent) -> None:
         effective = (
@@ -1146,6 +1157,7 @@ class BleLinkObserver:
             if active.tx_phy == tx_phy and active.rx_phy == rx_phy:
                 return
             active.tx_phy, active.rx_phy = tx_phy, rx_phy
+            link_id = active.link_id
             transitions = active.transitions
             if transitions is None:
                 return
@@ -1153,6 +1165,8 @@ class BleLinkObserver:
                 transitions.append(PhyTransition(tx_phy, rx_phy))
             else:
                 self._diagnostic("ble_link_transition_overflow")
+        if tx_phy is not None and rx_phy is not None:
+            self._report_link_status(link_id, "observed", effective, "phy_update")
 
     def _record_data_length(self, event: _DataLengthChangeEvent) -> None:
         transition = DataLengthTransition(
@@ -1180,6 +1194,10 @@ class BleLinkObserver:
             self._next_rssi_poll_at = None
         if active is None:
             return
+        if reason is None:
+            self._report_link_status(active.link_id, "unavailable", reason="observer_stopped")
+        else:
+            self._report_link_status(active.link_id, "disconnected", reason=f"0x{reason:02x}")
         elapsed = max(0.0, self._clock() - active.started)
         record = BleLinkSessionRecord(
             self.address,
@@ -1219,7 +1237,34 @@ class BleLinkObserver:
     def _diagnostic_failure(self, event: str, error: BaseException, **fields: object) -> None:
         debug_exception(event, error, logger=self._debug_logger, fields=fields)
         self.observer_status = "degraded"
+        active = self._active
+        self._report_link_status(active.link_id if active else None, "unavailable", reason="observer_degraded")
         self._warn_once()
+
+    def _report_link_status(
+        self,
+        link_id: str | None,
+        state: str,
+        phy: PhyTransition | None = None,
+        source: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        reason_name = (
+            _disconnect_reason_name(int(reason, 16)) if state == "disconnected" and reason is not None else None
+        )
+        debug_event(
+            "ble_link_status",
+            logger=self._debug_logger,
+            invocation_id=os.environ.get("INVOCATION_ID"),
+            link_id=link_id,
+            state=state,
+            phy_policy=self.phy_policy,
+            tx_phy=phy.tx_phy if phy else None,
+            rx_phy=phy.rx_phy if phy else None,
+            source=source,
+            reason=reason,
+            disconnect_reason_name=reason_name,
+        )
 
     def _warn_once(self) -> None:
         if not self._warning_emitted:

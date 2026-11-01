@@ -319,6 +319,13 @@ def _runtime_status(
     db: StateDB, now: datetime, operational_status: dict[str, str], identity: OperationalIdentity
 ) -> dict[str, object]:
     projection = read_runtime_status(db) or {}
+    return _project_runtime_status(projection, now, operational_status, identity)
+
+
+def _project_runtime_status(
+    projection: dict[str, object], now: datetime, operational_status: dict[str, str], identity: OperationalIdentity
+) -> dict[str, object]:
+    """Derive the operator view from one already-read runtime snapshot."""
     latest = _dated_projection(projection, "progress", "updated_at")
     observation = _dated_projection(projection, "observation", "observation_at")
     battery_observation = _dated_projection(projection, "battery_observation", "battery_observed_at")
@@ -329,6 +336,18 @@ def _runtime_status(
     rssi = projection.get("connection_rssi_dbm")
     rssi_at = projection.get("connection_rssi_observed_at")
     state = current.get("status", "unknown")
+    link = projection.get("ble_link_status")
+    link = link if isinstance(link, dict) else {}
+    if identity.invocation_id is not None and link.get("invocation_id") != identity.invocation_id:
+        link = {}
+    history = link.get("last_observed_phy")
+    history = dict(history) if isinstance(history, dict) else None
+    if history is not None and isinstance(history.get("observed_at"), str):
+        measured = datetime.fromisoformat(history["observed_at"])
+        history["age_seconds"] = max(0, int((now - measured).total_seconds()))
+    link_state = link.get("state")
+    if identity.invocation_id is None or not isinstance(link_state, str):
+        link_state = "unknown"
     active = (
         state == "progress"
         and identity.invocation_id is not None
@@ -346,11 +365,36 @@ def _runtime_status(
         "connection_rssi_observed_at": _iso(datetime.fromisoformat(rssi_at)) if isinstance(rssi_at, str) else None,
         "firmware": observed.get("firmware"),
         "last_error": _runtime_error(error),
+        "last_link_observation": _last_link_observation(link, now),
+        "last_observed_phy": history,
+        "link_observation_state": {
+            "state": {"connected": "pending", "disconnected": "not_connected"}.get(link_state, link_state),
+            "observed_at": link.get("state_at") if identity.invocation_id is not None else None,
+            "reason": link.get("reason") if identity.invocation_id is not None else None,
+            **(
+                {"disconnect_reason_name": link["disconnect_reason_name"]}
+                if identity.invocation_id is not None and link.get("disconnect_reason_name") is not None
+                else {}
+            ),
+        },
         "operational_status": operational_status,
         "state": "transferring" if active else state,
         "updated_at": _iso(latest[0]) if latest else None,
         "updated_age_seconds": max(0, int((now - latest[0]).total_seconds())) if latest else None,
         "transfer": _active_transfer(current) if active else None,
+    }
+
+
+def _last_link_observation(link: dict[str, object], now: datetime) -> dict[str, object] | None:
+    timestamp = link.get("state_at")
+    if not isinstance(timestamp, str):
+        return None
+    return {
+        "state": link.get("state"),
+        "reason": link.get("reason"),
+        "disconnect_reason_name": link.get("disconnect_reason_name"),
+        "observed_at": timestamp,
+        "age_seconds": max(0, int((now - datetime.fromisoformat(timestamp)).total_seconds())),
     }
 
 

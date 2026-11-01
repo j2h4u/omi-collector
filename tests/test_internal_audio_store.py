@@ -441,6 +441,26 @@ def test_recovery_leg_replays_the_durable_prefix(tmp_path: Path) -> None:
         assert store.commit_drain(source_id, 0, [raw], DrainCheckpoint(2, expected_sha256=digest)) == 1
 
 
+@pytest.mark.parametrize(("start", "count"), [(9, 1), (10, 3)])
+def test_recovery_leg_outside_source_range_preserves_durable_state(tmp_path: Path, start: int, count: int) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    raw = _record(10, 1)
+    source_id = "a" * 32
+    with InternalAudioStore(db) as store:
+        store.create_source(source_id, "attempt", 10, 12)
+        store.prepare_leg(source_id, 10, 2)
+        store.record_read_begin(source_id, 10, 2)
+        store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1, expected_sha256=hashlib.sha256(raw).hexdigest()))
+        store.interrupt(source_id)
+        before = store.get_source(source_id)
+
+        with pytest.raises(InternalAudioStoreError, match="outside the immutable source range"):
+            store.prepare_leg(source_id, start, count)
+
+        assert store.get_source(source_id) == before
+        assert tuple(record.raw_bytes for record in store.read_record_page(source_id)) == (raw,)
+
+
 def test_mismatched_leg_is_refused_without_source_mutation(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     with InternalAudioStore(db) as store:

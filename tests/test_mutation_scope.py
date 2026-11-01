@@ -116,6 +116,20 @@ def test_status_uses_the_owner_socket_and_returns_live_state(
     assert mutation_scope.control_socket_path(job).stat().st_mode & 0o777 == 0o600
 
 
+def test_receive_request_stops_after_complete_newline_terminated_request() -> None:
+    class OneReadRequest(_RequestBytes):
+        def recv(self, size: int) -> bytes:
+            if self.consumed:
+                raise AssertionError("receiver read again after the complete request")
+            return super().recv(size)
+
+    connection = OneReadRequest(b'{"action":"status"}\n')
+
+    assert mutation_scope._receive_request(cast(socket.socket, connection), time.monotonic() + 1) == {
+        "action": "status"
+    }
+
+
 def test_receive_request_rejects_a_newline_at_the_size_limit() -> None:
     request = b'{"action":"status"}'
     payload = request + b" " * (mutation_scope.MAX_CONTROL_BYTES - len(request) - 1) + b"\n"

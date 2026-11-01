@@ -384,6 +384,7 @@ def test_observer_records_data_length_effective_transitions_with_bound() -> None
         (0x15, "remote_requested", "remote_power_off"),
         (0x16, "local_host", "local_host_terminated"),
         (0x08, "timeout", "supervision_timeout"),
+        (0x3E, "unknown", "connection_failed_to_be_established_or_synchronization_timeout"),
         (0x22, "unknown", "unknown"),
     ],
 )

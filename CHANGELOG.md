@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.1](https://github.com/j2h4u/omi-collector/compare/v1.1.0...v1.1.1) (2026-11-01)
+
+
+### Fixes
+
+* identify BLE connection establishment and synchronization failures ([8d22698](https://github.com/j2h4u/omi-collector/commit/8d226981029e92dbde7e3576a649baa81df51c4d))
+
+
+### Tests
+
+* cover capture recovery boundaries and complete control requests ([8d22698](https://github.com/j2h4u/omi-collector/commit/8d226981029e92dbde7e3576a649baa81df51c4d))
+
 ## [1.1.0](https://github.com/j2h4u/omi-collector/compare/v1.0.1...v1.1.0) (2026-11-01)
 
 

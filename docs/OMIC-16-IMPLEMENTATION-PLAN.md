@@ -1,6 +1,6 @@
 # OMIC-16: internal capture in the existing Collector SQLite
 
-Status: accepted design, implemented and deployed as recorded in the [OMIC-16 acceptance receipt](qa/2026-10-13-omic-16-implementation.md). This frozen plan does not authorize changing the public ready format or the external ACK protocol.
+Status: accepted design, implemented and deployed. This frozen plan does not authorize changing the public ready format or the external ACK protocol. Current behavior is documented in [BEST_PRACTICES.md](BEST_PRACTICES.md) and the [public audio contract](PUBLIC_AUDIO_CONTRACT.md).
 
 ## Goal and observable boundary
 

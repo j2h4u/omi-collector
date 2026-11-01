@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.4](https://github.com/j2h4u/omi-collector/compare/v1.1.3...v1.1.4) (2026-11-01)
+
+
+### Refactoring
+
+* clarify quality metrics and presence handling ([#320](https://github.com/j2h4u/omi-collector/issues/320)) ([6806b71](https://github.com/j2h4u/omi-collector/commit/6806b71b6b2eb1b16a52d6394941fb2a8d33de6e))
+
 ## [1.1.3](https://github.com/j2h4u/omi-collector/compare/v1.1.2...v1.1.3) (2026-11-01)
 
 

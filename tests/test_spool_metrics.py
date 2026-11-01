@@ -113,9 +113,9 @@ def test_empty_spool_has_zero_raw_metrics(tmp_path: Path) -> None:
             "bundle_count": 0,
             "downloaded_records": 0,
             "downloaded_raw_bytes": 0,
-            "lost_records": 0,
-            "lost_raw_bytes": 0,
-            "loss_ratio": 0.0,
+            "unconfirmed_gap_records": 0,
+            "unconfirmed_gap_raw_bytes": 0,
+            "unconfirmed_gap_ratio": 0.0,
         },
         "firmware_lifetime": {
             "observation_count": 0,
@@ -178,8 +178,9 @@ def test_v2_metrics_count_physical_records_and_gaps_without_opening_public_files
     assert metrics.bundle_count == 2
     assert metrics.downloaded_records == 6
     assert metrics.downloaded_raw_bytes == 6 * RECORD_SIZE
-    assert metrics.lost_records == 1
-    assert metrics.lost_raw_bytes == RECORD_SIZE
+    assert metrics.unconfirmed_gap_records == 1
+    assert metrics.unconfirmed_gap_raw_bytes == RECORD_SIZE
+    assert metrics.unconfirmed_gap_ratio == 1 / 7
     assert ledger_reads == 1
 
 
@@ -314,9 +315,9 @@ def test_firmware_observations_are_reported_separately_from_loss(tmp_path: Path)
     assert result.firmware_lifetime.observed_increase == 8
     assert result.firmware_lifetime.regression_count == 0
     assert result.firmware_lifetime.epoch_count == 1
-    assert result.current_window.lost_records == 0
-    assert result.current_window.lost_raw_bytes == 0
-    assert result.current_window.loss_ratio == 0.0
+    assert result.current_window.unconfirmed_gap_records == 0
+    assert result.current_window.unconfirmed_gap_raw_bytes == 0
+    assert result.current_window.unconfirmed_gap_ratio == 0.0
     assert before == after
     assert before[StateKind.CLOCK]
     assert before[StateKind.QUALITY_EVENT]
@@ -336,7 +337,7 @@ def test_firmware_counter_reset_starts_a_new_epoch(tmp_path: Path) -> None:
     assert result.firmware_lifetime.observed_increase == 10
     assert result.firmware_lifetime.regression_count == 2
     assert result.firmware_lifetime.epoch_count == 3
-    assert result.current_window.lost_records == 0
+    assert result.current_window.unconfirmed_gap_records == 0
 
 
 def test_malformed_firmware_observation_chain_fails_closed(tmp_path: Path) -> None:

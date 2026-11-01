@@ -68,20 +68,11 @@ class _CaptureCli(Protocol):
     def render_sync(self, result: object, metrics: object) -> str: ...
 
 
-class _JsonResult(Protocol):
-    def as_dict(self) -> dict[str, object]: ...
-
-
 app = typer.Typer(help="Bounded pendant collection tools.")
 device = typer.Typer(help="Safely inspect and collect bounded Omi ring batches.")
 config = typer.Typer(help="Validate collector configuration.")
 app.add_typer(device, name="device")
 app.add_typer(config, name="config")
-
-# Test seams remain unloaded until their command is selected.  A production
-# import of this module therefore does not pull in Bluetooth code.
-collect_spool_metrics: object | None = None
-collect_operator_status: object | None = None
 
 
 def _systemd_service_status(unit: str = "omi-collector.service") -> dict[str, object]:
@@ -984,15 +975,12 @@ def device_metrics(
         FatalInternalAudioStorageError,
         TransientInternalAudioStorageError,
     )
-    from omi_collector.spool_metrics import SpoolMetricsError
+    from omi_collector.spool_metrics import SpoolMetricsError, collect_spool_metrics
     from omi_collector.state_migration import StateMigrationError, open_runtime_state
 
     try:
         loaded = _load_config(config_path)
-        metrics = collect_spool_metrics
-        if metrics is None:
-            from omi_collector.spool_metrics import collect_spool_metrics as metrics
-        result = cast(Callable[..., object], metrics)(
+        result = collect_spool_metrics(
             loaded.storage.publication.root,
             state_db=open_runtime_state(loaded.storage, read_only=True),
         )
@@ -1002,7 +990,7 @@ def device_metrics(
     except (SpoolMetricsError, StateDBError, StateMigrationError, TransientInternalAudioStorageError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
-    typer.echo(json.dumps(cast(_JsonResult, result).as_dict(), sort_keys=True, separators=(",", ":")))
+    typer.echo(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
 
 
 @device.command("status")
@@ -1018,7 +1006,7 @@ def device_status(
         FatalInternalAudioStorageError,
         TransientInternalAudioStorageError,
     )
-    from omi_collector.operator_status import OperatorStatusError
+    from omi_collector.operator_status import OperatorStatusError, collect_operator_status
 
     try:
         loaded = _load_config(config_path)
@@ -1029,10 +1017,7 @@ def device_status(
             else None
         )
         invocation_id = raw_invocation_id if isinstance(raw_invocation_id, str) else None
-        status = collect_operator_status
-        if status is None:
-            from omi_collector.operator_status import collect_operator_status as status
-        result = cast(Callable[..., dict[str, object]], status)(
+        result = collect_operator_status(
             loaded.storage,
             hours=hours,
             identity=OperationalIdentity(system_host_boot_id(), invocation_id),

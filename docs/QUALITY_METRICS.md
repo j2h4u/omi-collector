@@ -80,15 +80,18 @@ visible published bundles, and a bounded quality window:
 uv run omi-collector device status
 ```
 
-Its top-level `status` is `ok` only when the quality window contains a
+The status document has `schema_version` 3. Its top-level `status` is `ok`
+only when the quality window contains a
 completed transfer, the service is active with operational health `clear`, and
 there is no latest terminal transfer failure. A blocked health state, inactive
 service, or terminal failure produces `attention`; no completed transfer by
 itself is `unknown`, never evidence of healthy operation. Confirmed-loss
 totals remain visible in `quality_window` but do not change the top-level
 status by themselves. `publication` reports the currently visible bundle
-inventory. Its `loss_ratio` estimates unproven sequence holes among those
-visible bundles; it is not the fraction of historically confirmed loss.
+inventory. `unconfirmed_gap_records` counts sequence positions between visible
+bundle ranges; `unconfirmed_gap_raw_bytes` converts that count to raw bytes, and
+`unconfirmed_gap_ratio` divides it by visible records plus that count. These
+gaps can result from bundle retirement and do not establish confirmed loss.
 For v2 publications, `downloaded_records` and `downloaded_raw_bytes` describe
 physical captured-record custody from the ready publication ledger; they are
 not derived from the encoded `audio.ogg` file size or its packet count.

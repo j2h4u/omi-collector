@@ -24,6 +24,7 @@ function cleanup {
 }
 
 declare script_dir='' repo_root='' temporary_root='' checkout='' release_tag='' release_commit=''
+declare remote_tag='' remote_ref='' advertised='' fetched_tag='' local_tag=''
 (( EUID != 0 )) || die 'run as the service owner, without sudo'
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     printf 'Usage: scripts/dev-deploy-release.sh vMAJOR.MINOR.PATCH\n'
@@ -37,17 +38,28 @@ repo_root=$(cd -- "${script_dir}/.." && pwd -P) || die 'cannot resolve repositor
 source_status=$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all) \
     || die 'could not inspect source checkout state'
 [[ -z "$source_status" ]] || die 'refusing release deployment from a dirty source checkout'
-git -C "$repo_root" fetch origin --prune --tags || die 'could not fetch release metadata'
-git -C "$repo_root" show-ref --verify --quiet "refs/tags/${release_tag}" \
-    || die "release tag does not exist: ${release_tag}"
-release_commit=$(git -C "$repo_root" rev-list --max-count=1 "${release_tag}^{commit}") \
-    || die "could not resolve release tag: ${release_tag}"
+remote_ref="refs/tags/${release_tag}"
+advertised=$(git -C "$repo_root" ls-remote --refs origin "$remote_ref") || die 'could not inspect origin tag'
+[[ -n "$advertised" && "$advertised" != *$'\n'* ]] || die "release tag is absent or ambiguous on origin: ${release_tag}"
+IFS=$'\t' read -r remote_tag local_tag <<< "$advertised"
+[[ "$remote_tag" =~ ^[0-9a-f]{40,64}$ && "$local_tag" == "$remote_ref" ]] || die 'invalid origin tag record'
+if git -C "$repo_root" show-ref --verify --quiet "$remote_ref"; then
+    local_tag=$(git -C "$repo_root" rev-parse --verify "$remote_ref") || die 'could not inspect local tag'
+    [[ "$local_tag" == "$remote_tag" ]] || die "local tag conflicts with origin: ${release_tag}"
+fi
+git -C "$repo_root" fetch --no-tags origin "$remote_ref" || die 'could not fetch selected origin tag'
+fetched_tag=$(git -C "$repo_root" rev-parse --verify FETCH_HEAD) || die 'could not inspect fetched tag'
+[[ "$fetched_tag" == "$remote_tag" ]] || die "origin tag changed during fetch: ${release_tag}"
+release_commit=$(git -C "$repo_root" rev-parse --verify 'FETCH_HEAD^{commit}') \
+    || die "could not resolve release tag to a commit: ${release_tag}"
+git -C "$repo_root" fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' \
+    || die 'could not fetch origin main'
 git -C "$repo_root" merge-base --is-ancestor "$release_commit" origin/main \
     || die "release tag is not reachable from origin/main: ${release_tag}"
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/omi-collector-release.XXXXXX") \
     || die 'could not create temporary release worktree directory'
 checkout="${temporary_root}/checkout"
 trap cleanup EXIT
-git -C "$repo_root" worktree add --detach "$checkout" "$release_tag" \
+git -C "$repo_root" worktree add --detach "$checkout" "$release_commit" \
     || die "could not prepare release worktree for ${release_tag}"
 "${checkout}/scripts/deploy-systemd-service.sh" || die "deployment failed for ${release_tag}"

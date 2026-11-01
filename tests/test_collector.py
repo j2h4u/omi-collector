@@ -1256,3 +1256,103 @@ def test_repeated_cancel_during_failed_read_stop_keeps_fatal_cause_and_settles_w
                 await writer.close()
 
     asyncio.run(scenario())
+
+
+def test_fragmented_data_publishes_only_new_complete_records_and_validated_done() -> None:
+    async def scenario() -> None:
+        published: list[tuple[int, bool]] = []
+
+        class RecordingMailbox(ProgressMailbox):
+            def publish(self, event: ProgressEvent, *, terminal: bool = False) -> None:
+                published.append((event.records_completed, terminal))
+                super().publish(event, terminal=terminal)
+
+        record = _record(1)
+        fragments = (record[:100], record[100:300], record[300:])
+        mailbox = RecordingMailbox()
+        writer = FakeWriter()
+        session = BurstSession((_begin(10, 2), *(_data(part) for part in fragments * 2), _done(12)))
+        result = await read_leg(
+            session,
+            TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+            writer,
+            10,
+            2,
+            ReadLegOptions(1, progress_mailbox=mailbox),
+        )
+        assert published == [(1, False), (2, True)]
+        assert mailbox.snapshot.revision == 2
+        assert result.received_bytes == 2 * RECORD_SIZE
+        assert len(writer.published_tails) == 6
+        assert writer.submitted_high_water == 2 * RECORD_SIZE
+
+        invalid = RecordingMailbox()
+        published.clear()
+        session = BurstSession((_begin(10, 2), *(_data(part) for part in fragments * 2), _done(13)))
+        with pytest.raises(TransferInterruptedError):
+            await read_leg(
+                session,
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                FakeWriter(),
+                10,
+                2,
+                ReadLegOptions(1, progress_mailbox=invalid),
+            )
+        assert published == [(1, False)]
+        assert invalid.snapshot.terminal
+        assert invalid.snapshot.event is not None and invalid.snapshot.event.records_completed == 1
+
+    asyncio.run(scenario())
+
+
+def test_fragment_arrivals_keep_read_alive_and_cancellation_does_not_publish_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        monkeypatch.setattr(loop, "time", lambda: clock[0])
+        paused = asyncio.Event()
+
+        class FragmentSession(BurstSession):
+            def notifications(self) -> AsyncIterator[bytes]:
+                async def stream() -> AsyncIterator[bytes]:
+                    yield _begin(10, 2)
+                    record = _record(1)
+                    for part in (record[:100], record[100:200], record[200:300], record[300:]):
+                        clock[0] += 0.6
+                        yield _data(part)
+                    paused.set()
+                    await asyncio.Event().wait()
+
+                return stream()
+
+        mailbox = ProgressMailbox()
+        writer = FakeWriter()
+        task = asyncio.create_task(
+            read_leg(
+                FragmentSession(()),
+                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+                writer,
+                10,
+                2,
+                ReadLegOptions(1, progress_mailbox=mailbox),
+            )
+        )
+        try:
+            await paused.wait()
+            assert not task.done()
+            assert mailbox.snapshot.revision == 1
+            assert mailbox.snapshot.event is not None and mailbox.snapshot.event.records_completed == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert mailbox.snapshot.terminal
+            assert mailbox.snapshot.event is not None and mailbox.snapshot.event.records_completed == 1
+            assert "interrupt" in writer.calls
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())

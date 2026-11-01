@@ -314,12 +314,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "3192941f039f8dba5d9541676504a44cda79c50f45a2b4c426ac7c8b2ca3e18f",
-      "count": 1,
-      "reason": "Legacy active replay-proof rows and public-audio-v2 active proof rows have different SELECT projections, format filters and ordering. Their read-only SQL wrapper is shared mechanism, not evidence that the proof schemas are the same. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1585-1592 ~ src/omi_collector/capture/adapters/ready_bundles.py:3702-3709."
-    },
-    {
-      "detector": "jscpd",
       "identity": "319bcb90e42095905466a540068595ba08ffb0bc345399cc9851ab6d25e0d73f",
       "count": 1,
       "reason": "BenchmarkContext, CaptureSource, quarantine admission snapshots and v2 proof/stage/resume records carry different owners, persisted schemas and custody lifetimes. Field-name normalization erases those distinctions; preserve these explicit record types. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1138-1151 ~ src/omi_collector/capture/adapters/ready_bundles.py:1195-1208."
@@ -1610,6 +1604,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "ed971d9d0539bcc41e4859e10e48a9d6efec09a15729352af3185532f82ecede",
+      "count": 1,
+      "reason": "The proof-root inventory reads all formats and includes format for custody revision and reconciliation; active v2 proof lookup filters by format and lifecycle and has its own result layout and error context. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1596-1613 ~ src/omi_collector/capture/adapters/ready_bundles.py:3878-3894."
+    },
+    {
+      "detector": "jscpd",
       "identity": "eda7e82f2bb9d98893bf1c4872820d48ed36880b30cb23458b2cdc2d67985826",
       "count": 1,
       "reason": "Tail and record row decoders construct different immutable SQL models with different columns and optional hash/UTC fields. Typed value guards are already shared within the store. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:1358-1366 ~ src/omi_collector/capture/adapters/internal_audio_store.py:1565-1575."
@@ -1748,12 +1748,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "037d6fcb22aff3760ab9b04dadebba5655f5889f7bbb1aa26a0b4533b6ea97f9",
-      "count": 1,
-      "reason": "Replay proof inventory and covered-source retirement enumerate different tables/fields/eligibility and raise different context-specific errors. Existing read-only StateDB access owns the shared scope. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1586-1597 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
-    },
-    {
-      "detector": "pyscn",
       "identity": "0423b30fc3e5b7187eedbfddd3f6052a63f6ffb1c12f2c93dafb69994a469466",
       "count": 1,
       "reason": "Commit validation and release-note validation are independent CLI tools with different input modes, parsers and output failures. argparse/exception syntax is platform glue, not a shared release policy algorithm. Reviewed pair: scripts/validate_pr_commits.py:76-102 ~ scripts/validate_release_notes.py:166-194."
@@ -1802,12 +1796,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "0d78e7a0f293131deeb3ff7619e44f2f5889f388db81801e329e523e8db9b731",
-      "count": 1,
-      "reason": "This is another detector window on the same legacy-versus-v2 proof-query pair; their selected proof metadata and format/order requirements remain distinct. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1586-1597 ~ src/omi_collector/capture/adapters/ready_bundles.py:3703-3715."
-    },
-    {
-      "detector": "pyscn",
       "identity": "11bc7d51e49688a6ec629f605a43fd56dc13a4dfb2cf0eaa75de02db99b40ae2",
       "count": 1,
       "reason": "mark_uncertain and cancel_prepared apply different ClockState intent transitions with different operation validation. StateDB transaction mechanics are already shared; preserve explicit effects. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:78-87 ~ src/omi_collector/capture/adapters/clock_state_store.py:89-96."
@@ -1853,6 +1841,12 @@
       "identity": "1b4060ea541f6000741f2a6eeb8c95e57d480b3040b723c832030fe2c46c79b1",
       "count": 1,
       "reason": "Source IDs and SHA-256 digests have different length domains and public diagnostics. Keep these short independent scalar validators rather than creating a configurable identity framework. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:1669-1677 ~ src/omi_collector/capture/adapters/internal_audio_store.py:1680-1688."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "1c026f7ba3747bd822bca4577c10c6c0450c1c284968282ace16dc895f04eb15",
+      "count": 1,
+      "reason": "The proof-root inventory reads all formats and includes format for custody revision and reconciliation; active v2 proof lookup filters by format and lifecycle and has its own result layout and error context. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1597-1609 ~ src/omi_collector/capture/adapters/ready_bundles.py:3879-3891."
     },
     {
       "detector": "pyscn",
@@ -2252,6 +2246,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "9a80e37c03a90214716bdecb4c05d2b90b73023a0db2b89a074da882f8923433",
+      "count": 1,
+      "reason": "Stopping before a visit directive propagates cancellation and stop errors after cleanup; cancelled-wait cleanup suppresses cancellation and ordinary errors but propagates fatal storage errors and interrupts presence on success. Reviewed pair: src/omi_collector/capture/application/presence.py:318-325 ~ src/omi_collector/capture/application/presence.py:529-538."
+    },
+    {
+      "detector": "pyscn",
       "identity": "9c14ac35ee3d167e5824d208da2a8731289e12594a5670b109853df8931e3ae7",
       "count": 1,
       "reason": "Replay-proof and public-audio schema upgrades validate different historical versions, install different DDL and preserve outer transaction ownership. Common validators already centralize structure. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:1068-1078 ~ src/omi_collector/capture/adapters/collector_state_db.py:1081-1092."
@@ -2261,6 +2261,12 @@
       "identity": "9d0d75643849ed278370eaeb96687ade61191992983dbca8882fe2703188a92d",
       "count": 1,
       "reason": "Quarantine hold reconciliation uses authentication evidence; conflict-disposition inspection verifies old/proposed durable source/cohort tuples. Preserve independent witnesses and error handling. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:467-475 ~ src/omi_collector/capture/adapters/ready_bundles.py:4431-4444."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "9d5083e4e0daafadc9e945499d411f68804250575402e1e91a856052ca41a30d",
+      "count": 1,
+      "reason": "A validated single-source lookup returns one source snapshot with source-specific errors; the proof-root inventory reads all proof rows and reports durability failure. Their shared read-only database scope already uses StateDB. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:388-395 ~ src/omi_collector/capture/adapters/ready_bundles.py:1597-1609."
     },
     {
       "detector": "pyscn",
@@ -2384,9 +2390,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "c84bae426362656adfc27d94cb650763cf8fb50ccf124cd3b32c030b1bb9ccc3",
+      "identity": "c993af4ce6f26b53ec88e9b2214183dcb4c207c75c004979923de8bab9121f64",
       "count": 1,
-      "reason": "A specific capture-source read and replay-proof inventory return different SQL schemas and error contracts. Existing StateDB access already owns their common read-only scope. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:389-396 ~ src/omi_collector/capture/adapters/ready_bundles.py:1586-1597."
+      "reason": "The proof-root inventory reads all formats and includes format for custody revision and reconciliation; active v2 proof lookup filters by format and lifecycle and has its own result layout and error context. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1596-1609 ~ src/omi_collector/capture/adapters/ready_bundles.py:3878-3891."
     },
     {
       "detector": "pyscn",
@@ -2423,6 +2429,12 @@
       "identity": "cf5590cf27346c66c5d51924567793ef15ccf2e07d610dc908866f4717f2ebe0",
       "count": 1,
       "reason": "Bleak get_service collection lookup and get_characteristic lookup adapt different library API containers. UUID normalization is already shared; keep the two explicit APIs. Reviewed pair: src/omi_collector/capture/adapters/bleak_transport.py:208-219 ~ src/omi_collector/capture/adapters/bleak_transport.py:222-238."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "d15dd3cf3ee24bbd7e722d53c9c2594bc47e89c10cb1c2026a9ff22fe5df33cf",
+      "count": 1,
+      "reason": "Proof-root inventory reads all proof rows for custody; retirement selects one eligible retiring source with separate exclusion predicates, fields and error handling. Their shared read-only database scope already uses StateDB. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1597-1609 ~ src/omi_collector/capture/adapters/ready_bundles.py:4692-4711."
     },
     {
       "detector": "pyscn",
@@ -2525,12 +2537,6 @@
       "identity": "ee083a18f156b3ec1c1575d896949ad668f12cf47515470278dea8aaf061f061",
       "count": 1,
       "reason": "Retirement source selection and publisher candidate inventory use different lifecycle eligibility and return models. Shared StateDB read mechanics already exist. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4505-4524 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "ee8effe771f08c5ef91bd64b344e77f7ae740923eb6e62ef98a484fe8364bc0c",
-      "count": 1,
-      "reason": "The two replay-proof queries have different format filters, column layouts and ordering for legacy versus public-audio-v2 proof roots. Do not parameterize away those format contracts. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1585-1597 ~ src/omi_collector/capture/adapters/ready_bundles.py:3702-3715."
     },
     {
       "detector": "pyscn",

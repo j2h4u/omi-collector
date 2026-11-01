@@ -49,7 +49,12 @@ from omi_collector.capture.adapters.staging_contract import (
 )
 from omi_collector.capture.adapters.staging_filesystem import StagingIO
 from omi_collector.capture.adapters.staging_writer import StagingWriter
-from omi_collector.capture.application import batch_reconciliation, operational_telemetry, session_lifecycle
+from omi_collector.capture.application import (
+    batch_reconciliation,
+    operational_telemetry,
+    opportunistic_sync,
+    session_lifecycle,
+)
 from omi_collector.capture.application.batch_reconciliation import (
     BatchReconciler,
     BatchUnavailableError,
@@ -73,6 +78,7 @@ from omi_collector.capture.application.operational_telemetry import (
 from omi_collector.capture.application.opportunistic_sync import (
     CollectionPreservedCancelledError,
     _PublicDrainCoordinator,
+    _Run,
 )
 from omi_collector.capture.application.opportunistic_sync import (
     run_opportunistic_collector as _run_opportunistic_collector,
@@ -520,6 +526,137 @@ async def test_public_drain_coordinator_flushes_latest_samples_when_closed() -> 
         "storage": "fault-now",
     }
     assert public_drain.wake_callback is None
+
+
+@pytest.mark.parametrize("operation", ["publish", "observation"])
+@_async_test
+async def test_public_drain_background_fatal_notifies_owner_and_survives_close(operation: str) -> None:
+    fatal = FatalInternalAudioStorageError("corrupt state", sqlite_errorcode=11)
+    notified = asyncio.Event()
+    received: list[FatalInternalAudioStorageError] = []
+
+    class FatalDrain(_RecordingPublicDrainPort):
+        def publish_snapshot(self) -> None:
+            if operation == "publish":
+                raise fatal
+
+        def update_observations(
+            self, *, ring: tuple[int, str] | None = None, battery: tuple[int, str] | None = None
+        ) -> None:
+            del ring, battery
+            raise fatal
+
+    def on_fatal(error: FatalInternalAudioStorageError) -> None:
+        received.append(error)
+        notified.set()
+
+    port = FatalDrain()
+    coordinator = _PublicDrainCoordinator(
+        port, cast(CaptureRuntimePort, SimpleNamespace(debug_exception=lambda *_args, **_kwargs: None)), on_fatal
+    )
+    if operation == "observation":
+        coordinator.observe_battery(50, "now")
+    coordinator.start()
+    async with asyncio.timeout(2):
+        await notified.wait()
+    assert received == [fatal]
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await coordinator.close()
+    assert raised.value is fatal
+    assert port.wake_callback is None
+
+
+@_async_test
+async def test_public_drain_final_export_fatal_is_not_lost_during_shutdown() -> None:
+    fatal = FatalInternalAudioStorageError("corrupt state", sqlite_errorcode=11)
+    first_export = threading.Event()
+    received: list[FatalInternalAudioStorageError] = []
+
+    class FatalFinalDrain(_RecordingPublicDrainPort):
+        def publish_snapshot(self) -> None:
+            if first_export.is_set():
+                raise fatal
+            first_export.set()
+
+    port = FatalFinalDrain()
+    coordinator = _PublicDrainCoordinator(
+        port, cast(CaptureRuntimePort, SimpleNamespace(debug_exception=lambda *_args, **_kwargs: None)), received.append
+    )
+    coordinator.start()
+    await asyncio.to_thread(first_export.wait, 2)
+    assert first_export.is_set()
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await coordinator.close()
+    assert raised.value is fatal
+    assert received == [fatal]
+    assert port.wake_callback is None
+
+
+@pytest.mark.parametrize("later_fatal", [False, True])
+@_async_test
+async def test_primary_fatal_precedes_public_drain_shutdown_failure(tmp_path: Path, *, later_fatal: bool) -> None:
+    first = FatalInternalAudioStorageError("first storage failure", sqlite_errorcode=11)
+    later = (
+        FatalInternalAudioStorageError("later storage failure", sqlite_errorcode=11)
+        if later_fatal
+        else OSError("export failed")
+    )
+    failing = threading.Event()
+
+    class FatalDrain(_RecordingPublicDrainPort):
+        def publish_snapshot(self) -> None:
+            if failing.is_set():
+                raise later
+
+    class FatalSession(ScriptedRingSession):
+        async def write_control(self, payload: bytes) -> None:
+            if payload == b"\x10":
+                failing.set()
+                raise first
+            await super().write_control(payload)
+
+    port = FatalDrain()
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(
+            Provider([FatalSession(_status(), ())]), store, replace(_options(), public_drain=port)
+        )
+    assert raised.value is first
+    assert port.wake_callback is None
+
+
+@pytest.mark.parametrize("first_is_background", [False, True])
+@pytest.mark.parametrize("cleanup_fatal", [False, True])
+@_async_test
+async def test_first_fatal_is_preserved_across_lifecycle_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, first_is_background: bool, cleanup_fatal: bool
+) -> None:
+    first = FatalInternalAudioStorageError("first storage failure", sqlite_errorcode=11)
+    second = FatalInternalAudioStorageError("later storage failure", sqlite_errorcode=11)
+    cleanup_error = second if cleanup_fatal else OSError("export failed")
+    fail_export = threading.Event()
+
+    class FatalDrain(_RecordingPublicDrainPort):
+        def publish_snapshot(self) -> None:
+            if fail_export.is_set():
+                raise cleanup_error
+
+    def make_lifecycle(run: _Run, _reconciler: object) -> object:
+        async def run_direct() -> None:
+            if first_is_background:
+                run.maintenance.record_storage_fatal(first)
+            fail_export.set()
+            raise second if first_is_background else first
+
+        return SimpleNamespace(run_direct=run_direct)
+
+    monkeypatch.setattr(opportunistic_sync, "_make_session_lifecycle", make_lifecycle)
+    port = FatalDrain()
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        await run_opportunistic_collector(Provider([]), store, replace(_options(), public_drain=port))
+    assert raised.value is first
+    assert port.wake_callback is None
 
 
 @_async_test
@@ -4885,6 +5022,136 @@ async def test_background_quality_corruption_stops_active_read_after_preserving_
         assert source.committed_count == 1
         assert _source_records(store, source.source_id) == _record(10)
     finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@_async_test
+async def test_background_public_drain_corruption_stops_active_read_after_preserving_source(tmp_path: Path) -> None:
+    entered = asyncio.Event()
+    fatal = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    fail_export = threading.Event()
+
+    class FatalDrain(_RecordingPublicDrainPort):
+        def publish_snapshot(self) -> None:
+            if fail_export.is_set():
+                raise fatal
+
+    class GatedSession(ScriptedRingSession):
+        async def write_control(self, payload: bytes) -> None:
+            await super().write_control(payload)
+            if payload == encode_read_command(10, 2):
+                entered.set()
+
+    session = GatedSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_record(10)))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    port = FatalDrain()
+    task = asyncio.create_task(
+        run_opportunistic_collector(
+            Provider([session]), store, replace(_options(), public_drain=port, host_time=lambda: 1000.0)
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+
+        async def wait_for_durable_record() -> None:
+            while True:
+                pending = store.pending_attempts()
+                if pending:
+                    source = _attempt_source(store, pending[0].attempt_id)
+                    if source is not None and source.committed_count == 1:
+                        return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_durable_record(), 5)
+        fail_export.set()
+        port.wake()
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await asyncio.wait_for(task, 5)
+        assert raised.value is fatal
+        pending = store.pending_attempts()
+        assert len(pending) == 1
+        source = _attempt_source(store, pending[0].attempt_id)
+        assert source is not None
+        assert _source_records(store, source.source_id) == _record(10)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@_async_test
+async def test_public_drain_fatal_during_seal_joins_and_prevents_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = FatalInternalAudioStorageError("canonical audio database is corrupt", sqlite_errorcode=11)
+    seal_started = threading.Event()
+    release_seal = threading.Event()
+    fail_export = threading.Event()
+    seal = StagingWriter.seal
+
+    def blocking_seal(self: StagingWriter, done: DoneNotification) -> DurableSqliteSeal:
+        seal_started.set()
+        if not release_seal.wait(5):
+            raise TimeoutError("seal not released")
+        return seal(self, done)
+
+    monkeypatch.setattr(StagingWriter, "seal", blocking_seal)
+
+    class FatalDrain(_RecordingPublicDrainPort):
+        def arm_pending(self, source_id: str, durable_next_sequence: int) -> None:
+            del source_id, durable_next_sequence
+
+        def publish_snapshot(self) -> None:
+            if fail_export.is_set():
+                raise first
+
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(10, 11),)),
+            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    port = FatalDrain()
+    task = asyncio.create_task(
+        run_opportunistic_collector(Provider([session]), store, replace(_options(batch_records=1), public_drain=port))
+    )
+    try:
+        seal_seen = await asyncio.to_thread(seal_started.wait, 5)
+        if not seal_seen and task.done():
+            task.result()
+        assert seal_seen
+        fail_export.set()
+        port.wake()
+        async with asyncio.timeout(5):
+            while not task.cancelling():
+                await asyncio.sleep(0)
+        task.cancel()
+        assert not task.done()
+        assert encode_advance_command(11) not in session.writes
+        release_seal.set()
+        with pytest.raises(FatalInternalAudioStorageError) as raised:
+            await asyncio.wait_for(task, 5)
+        assert raised.value is first
+        assert encode_advance_command(11) not in session.writes
+
+        def source_ids() -> list[str]:
+            with closing(store.state_db.open_connection(read_only=True)) as connection:
+                rows = cast(list[tuple[str]], connection.execute("SELECT source_id FROM capture_source").fetchall())
+                return [row[0] for row in rows]
+
+        source_id = _only_source_id(storage_call(source_ids))
+        assert _source_records(store, source_id) == _record(10)
+        assert port.wake_callback is None
+    finally:
+        release_seal.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

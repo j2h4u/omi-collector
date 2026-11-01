@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
@@ -19,6 +19,7 @@ from omi_collector.capture.adapters.internal_audio_store import (
     DrainCheckpoint,
     InternalAudioStore,
 )
+from omi_collector.capture.adapters.public_time_facts import FrozenTimePredecessor, PublicTimeProjection
 from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
     ReadyBundleError,
@@ -29,6 +30,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     retire_acknowledged_public_audio_v2,
 )
 from omi_collector.capture.domain.clock_state import ClockRange, ClockState
+from omi_collector.capture.domain.public_audio_v2 import FrozenPublicTime
 from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig
 from staging_test_factory import StagingStore
@@ -470,6 +472,259 @@ def test_v2_same_cohort_sequence_gap_splits_artifacts_and_marks_second_boundary(
     assert len(outcome.published) == 2
     second_manifest = cast(dict[str, object], json.loads((outcome.published[1].path / "manifest.json").read_bytes()))
     assert second_manifest["boundaries"] == [{"at_packet": 0, "facts": ["source_loss", "time_incomparable"]}]
+
+
+def test_v2_publisher_compiles_clock_once_per_projection_pass(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "a" * 32, 10, tuple(_record(100 + index) for index in range(12)))
+    projection = ready_bundles.PublicTimeProjection
+    original_build = projection.from_state
+    original_freeze = projection.freeze
+    builds = 0
+    freezes = 0
+
+    def build(state: ClockState) -> PublicTimeProjection:
+        nonlocal builds
+        builds += 1
+        return original_build(state)
+
+    def freeze(
+        self: PublicTimeProjection,
+        *,
+        sequence: int,
+        raw_timestamp: int,
+        predecessor: FrozenTimePredecessor | None = None,
+    ) -> FrozenPublicTime:
+        nonlocal freezes
+        freezes += 1
+        return original_freeze(self, sequence=sequence, raw_timestamp=raw_timestamp, predecessor=predecessor)
+
+    monkeypatch.setattr(projection, "from_state", build)
+    monkeypatch.setattr(projection, "freeze", freeze)
+    outcome = finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 22))
+
+    assert len(outcome.published) == 1
+    assert freezes >= 12
+    assert freezes == 12 * builds
+
+
+def test_v2_publisher_plans_physical_groups_once(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _database, store = audio_store
+    ready = _ready_root(tmp_path)
+    sources = tuple(
+        _source(store, character * 32, start, (_record(start),))
+        for character, start in (("a", 10), ("b", 12), ("c", 14))
+    )
+    original = ready_bundles._v2_physical_groups
+    original_digest = ready_bundles._digest
+    original_commit = ready_bundles._commit_v2_stage
+    original_read = InternalAudioStore.read_record_page
+    calls = 0
+    page_reads = 0
+    committed: set[str] = set()
+    authenticated_bytes: dict[str, int] = {}
+
+    def count_groups(
+        slices: tuple[ready_bundles._TypedSlice, ...], page_limit: int
+    ) -> tuple[tuple[ready_bundles._TypedSlice, ...], ...]:
+        nonlocal calls
+        calls += 1
+        return original(slices, page_limit)
+
+    def count_digest(path: Path, should_defer: Callable[[], bool] | None = None) -> str:
+        if path.name == "audio.ogg" and path.parent.name in committed:
+            authenticated_bytes[path.parent.name] = authenticated_bytes.get(path.parent.name, 0) + path.stat().st_size
+        return original_digest(path, should_defer)
+
+    def count_commit(
+        audio_store: InternalAudioStore,
+        cohort: ready_bundles._TypedCohort,
+        stage: ready_bundles._V2Stage,
+        result: ready_bundles.ReadyBundleResult,
+        page_limit: int,
+    ) -> None:
+        original_commit(audio_store, cohort, stage, result, page_limit)
+        committed.add(result.bundle_id)
+
+    def count_read(
+        audio_store: InternalAudioStore, source_id: str, after_ordinal: int = -1, limit: int = 128
+    ) -> tuple[CaptureRecord, ...]:
+        nonlocal page_reads
+        page_reads += 1
+        return original_read(audio_store, source_id, after_ordinal, limit)
+
+    monkeypatch.setattr(ready_bundles, "_v2_physical_groups", count_groups)
+    monkeypatch.setattr(ready_bundles, "_digest", count_digest)
+    monkeypatch.setattr(ready_bundles, "_commit_v2_stage", count_commit)
+    monkeypatch.setattr(InternalAudioStore, "read_record_page", count_read)
+    outcome = finalize_public_audio_v2(store, sources, ready, _options(ClockState(), 15))
+
+    assert len(outcome.published) == 3
+    assert calls == 1
+    assert page_reads <= 60
+    assert authenticated_bytes == {
+        item.bundle_id: (item.path / "audio.ogg").stat().st_size for item in outcome.published
+    }
+
+
+def test_v2_rejects_changed_future_slice_before_its_stage(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    first = _source(store, "a" * 32, 10, (_record(100),))
+    second = _source(store, "b" * 32, 12, (_record(102),))
+    original_commit = ready_bundles._commit_v2_stage
+
+    def commit_then_mutate(
+        audio_store: InternalAudioStore,
+        cohort: ready_bundles._TypedCohort,
+        stage: ready_bundles._V2Stage,
+        result: ready_bundles.ReadyBundleResult,
+        page_limit: int,
+    ) -> None:
+        original_commit(audio_store, cohort, stage, result, page_limit)
+        with closing(database.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_record SET payload=? WHERE source_id=? AND ordinal=0",
+                (_record(102, 9)[4:], "b" * 32),
+            )
+            connection.commit()
+
+    monkeypatch.setattr(ready_bundles, "_commit_v2_stage", commit_then_mutate)
+    with pytest.raises(ReadyBundleError, match="source slice changed"):
+        finalize_public_audio_v2(store, (first, second), ready, _options(ClockState(), 13))
+
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert connection.execute("SELECT count(*) FROM ready_v2_output_stage").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM ready_replay_proof WHERE lifecycle='active'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("public_order", bytes.fromhex("ffffffffffffffff")),
+        ("audio_sha256", "0" * 64),
+        ("packet_count", 2),
+        ("format", "legacy-records-v1"),
+    ),
+)
+def test_v2_rechecks_complete_proof_after_planning(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+    column: str,
+    value: bytes | str | int,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    first = _source(store, "a" * 32, 10, (_record(100),))
+    finalize_public_audio_v2(store, (first,), ready, _options(ClockState(), 11))
+    second = _source(store, "b" * 32, 11, (_record(101),))
+    original = ready_bundles._v2_physical_groups
+
+    def tamper_after_plan(
+        slices: tuple[ready_bundles._TypedSlice, ...], page_limit: int
+    ) -> tuple[tuple[ready_bundles._TypedSlice, ...], ...]:
+        groups = original(slices, page_limit)
+        with closing(database.open_connection()) as connection:
+            if column == "format":
+                connection.execute("PRAGMA ignore_check_constraints=ON")
+            connection.execute(f"UPDATE ready_replay_proof SET {column}=? WHERE lifecycle='active'", (value,))
+            connection.commit()
+        return groups
+
+    monkeypatch.setattr(ready_bundles, "_v2_physical_groups", tamper_after_plan)
+    with pytest.raises((ReadyBundleError, ready_bundles.ReadyDurabilityFatalError)):
+        finalize_public_audio_v2(store, (second,), ready, _options(ClockState(), 12))
+
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert connection.execute("SELECT count(*) FROM ready_v2_output_stage").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT coverage_digest FROM capture_source WHERE source_id=?", ("b" * 32,)).fetchone()[
+                0
+            ]
+            is None
+        )
+
+
+def test_v2_staging_resume_rechecks_old_ready_before_coverage(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    first = _source(store, "a" * 32, 10, (_record(100),))
+    published = finalize_public_audio_v2(store, (first,), ready, _options(ClockState(), 11))
+    second = _source(store, "b" * 32, 11, (_record(101),))
+    original = ready_bundles._materialize_v2_stage_with_failure_latch
+
+    def interrupt(*_args: object, **_kwargs: object) -> ready_bundles.ReadyBundleResult:
+        raise ReadyBundleError("interrupted")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt)
+        with pytest.raises(ReadyBundleError, match="interrupted"):
+            finalize_public_audio_v2(store, (second,), ready, _options(ClockState(), 12))
+
+    def tamper_during_materialization(
+        audio_store: InternalAudioStore,
+        cohort: ready_bundles._TypedCohort,
+        stage: ready_bundles._V2Stage,
+        page_limit: int,
+    ) -> ready_bundles.ReadyBundleResult:
+        result = original(audio_store, cohort, stage, page_limit)
+        old_audio = published.published[0].path / "audio.ogg"
+        old_audio.write_bytes(b"tampered")
+        return result
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", tamper_during_materialization)
+    with pytest.raises(ReadyBundleError, match="custody changed"):
+        finalize_public_audio_v2(store, (second,), ready, _options(ClockState(), 12))
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert (
+            connection.execute("SELECT coverage_digest FROM capture_source WHERE source_id=?", ("b" * 32,)).fetchone()[
+                0
+            ]
+            is None
+        )
+
+
+def test_v2_rechecks_old_ready_after_normalization_before_coverage(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    first = _source(store, "a" * 32, 10, (_record(100),))
+    published = finalize_public_audio_v2(store, (first,), ready, _options(ClockState(), 11))
+    second = _source(store, "b" * 32, 10, (_record(100), _record(101)))
+    original = ready_bundles._accepted_typed_slices
+
+    def tamper_after_normalization(
+        audio_store: InternalAudioStore,
+        cohort: ready_bundles._TypedCohort,
+        page_limit: int,
+        custody: ready_bundles._TypedReadyCustody,
+        prepared_slices: tuple[ready_bundles._TypedSlice, ...] | None,
+    ) -> tuple[ready_bundles._TypedSlice, ...]:
+        slices = original(audio_store, cohort, page_limit, custody, prepared_slices)
+        (published.published[0].path / "audio.ogg").write_bytes(b"tampered")
+        return slices
+
+    monkeypatch.setattr(ready_bundles, "_accepted_typed_slices", tamper_after_normalization)
+    with pytest.raises(ReadyBundleError):
+        finalize_public_audio_v2(store, (second,), ready, _options(ClockState(), 12))
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert (
+            connection.execute("SELECT coverage_digest FROM capture_source WHERE source_id=?", ("b" * 32,)).fetchone()[
+                0
+            ]
+            is None
+        )
 
 
 def test_v2_zero_only_groups_join_packet_artifact_without_losing_custody(

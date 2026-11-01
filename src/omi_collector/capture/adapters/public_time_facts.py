@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
 
-from ..domain.clock_state import ClockRange, ClockState
+from ..domain.clock_state import ClockState
 from ..domain.public_audio_v2 import FrozenPublicTime, Quality
 
 _UINT32_MAX = (1 << 32) - 1
@@ -25,32 +26,53 @@ class FrozenTimePredecessor:
             raise TypeError("predecessor time must be FrozenPublicTime")
 
 
-def freeze_public_time(
-    state: ClockState,
-    *,
-    sequence: int,
-    raw_timestamp: int,
-    predecessor: FrozenTimePredecessor | None = None,
-) -> FrozenPublicTime:
-    """Freeze one label and its causal comparability before publication Prepare."""
-    _uint(sequence, _UINT64_MAX, "sequence")
-    _uint(raw_timestamp, _UINT32_MAX, "raw_timestamp")
-    if not isinstance(state, ClockState):
-        raise TypeError("state must be ClockState")
-    if predecessor is not None and not isinstance(predecessor, FrozenTimePredecessor):
-        raise TypeError("predecessor must be FrozenTimePredecessor")
+@dataclass(frozen=True, slots=True)
+class PublicTimeProjection:
+    """Prepared lookup for one immutable clock evidence snapshot."""
 
-    quality, seconds, uncertainty, membership = _public_label(state, sequence, raw_timestamp)
-    comparable = (
-        predecessor is not None
-        and predecessor.sequence + 1 == sequence
-        and _same_causal_component(state, sequence, membership, predecessor)
-    )
-    return FrozenPublicTime(quality, seconds, uncertainty, membership, comparable)
+    state: ClockState
+    range_starts: tuple[int, ...]
+    components: tuple[tuple[int, int], ...]
+    component_starts: tuple[int, ...]
+
+    @classmethod
+    def from_state(cls, state: ClockState) -> PublicTimeProjection:
+        if not isinstance(state, ClockState):
+            raise TypeError("state must be ClockState")
+        components: list[tuple[int, int]] = []
+        boundaries = _causal_boundaries(state)
+        for start, end in _mapped_intervals(state):
+            if components and components[-1][1] == start and start not in boundaries:
+                components[-1] = (components[-1][0], end)
+            else:
+                components.append((start, end))
+        frozen_components = tuple(components)
+        return cls(
+            state,
+            tuple(item.start_sequence for item in state.ranges),
+            frozen_components,
+            tuple(start for start, _ in frozen_components),
+        )
+
+    def freeze(
+        self, *, sequence: int, raw_timestamp: int, predecessor: FrozenTimePredecessor | None = None
+    ) -> FrozenPublicTime:
+        """Freeze one label and its causal comparability before publication Prepare."""
+        _uint(sequence, _UINT64_MAX, "sequence")
+        _uint(raw_timestamp, _UINT32_MAX, "raw_timestamp")
+        if predecessor is not None and not isinstance(predecessor, FrozenTimePredecessor):
+            raise TypeError("predecessor must be FrozenTimePredecessor")
+        quality, seconds, uncertainty, membership = _public_label(self, sequence, raw_timestamp)
+        comparable = (
+            predecessor is not None
+            and predecessor.sequence + 1 == sequence
+            and _same_causal_component(self, sequence, membership, predecessor)
+        )
+        return FrozenPublicTime(quality, seconds, uncertainty, membership, comparable)
 
 
 def _same_causal_component(
-    state: ClockState,
+    projection: PublicTimeProjection,
     sequence: int,
     membership: str,
     predecessor: FrozenTimePredecessor,
@@ -61,12 +83,14 @@ def _same_causal_component(
     kind = membership.partition(":")[0]
     if kind != "mapped" or previous_membership.partition(":")[0] != kind:
         return False
-    start, end = _mapped_component(state, sequence)
+    start, end = _mapped_component(projection, sequence)
     return start <= predecessor.sequence < end
 
 
-def _public_label(state: ClockState, sequence: int, raw_timestamp: int) -> tuple[Quality, int, float | None, str]:
-    intent = state.intent
+def _public_label(
+    projection: PublicTimeProjection, sequence: int, raw_timestamp: int
+) -> tuple[Quality, int, float | None, str]:
+    intent = projection.state.intent
     if (
         intent is not None
         and intent.phase == "uncertain"
@@ -81,7 +105,10 @@ def _public_label(state: ClockState, sequence: int, raw_timestamp: int) -> tuple
             f"unknown-intent:{intent.write_sequence_before}:{end}:{intent.operation_id}:{sequence}",
         )
 
-    clock_range = _range_for(state.ranges, sequence)
+    index = bisect_right(projection.range_starts, sequence) - 1
+    clock_range = projection.state.ranges[index] if index >= 0 else None
+    if clock_range is not None and sequence >= clock_range.next_sequence:
+        clock_range = None
     if clock_range is None:
         return "unknown", raw_timestamp, None, f"unknown-uncovered:{sequence}"
     if clock_range.offset_seconds is None:
@@ -92,7 +119,7 @@ def _public_label(state: ClockState, sequence: int, raw_timestamp: int) -> tuple
             f"unknown-range:{clock_range.start_sequence}:{clock_range.next_sequence}:{clock_range.source_id}",
         )
 
-    component = _mapped_component(state, sequence)
+    component = _mapped_component(projection, sequence)
     membership = f"mapped:{component[0]}:{component[1]}"
     normalized = math.floor(raw_timestamp + clock_range.offset_seconds + 0.5)
     if not 0 <= normalized <= _UINT32_MAX:
@@ -107,28 +134,12 @@ def _public_label(state: ClockState, sequence: int, raw_timestamp: int) -> tuple
     return quality, normalized, clock_range.uncertainty_seconds, membership
 
 
-def _range_for(ranges: tuple[ClockRange, ...], sequence: int) -> ClockRange | None:
-    return next((item for item in ranges if item.start_sequence <= sequence < item.next_sequence), None)
-
-
-def _mapped_component(state: ClockState, sequence: int) -> tuple[int, int]:
-    intervals = _mapped_intervals(state)
-    causal_boundaries = _causal_boundaries(state)
-    for index, (start, end) in enumerate(intervals):
-        if not start <= sequence < end:
-            continue
-        component_start, component_end = start, end
-        cursor = index - 1
-        while cursor >= 0 and intervals[cursor][1] == component_start and component_start not in causal_boundaries:
-            component_start = intervals[cursor][0]
-            cursor -= 1
-        cursor = index + 1
-        while (
-            cursor < len(intervals) and intervals[cursor][0] == component_end and component_end not in causal_boundaries
-        ):
-            component_end = intervals[cursor][1]
-            cursor += 1
-        return component_start, component_end
+def _mapped_component(projection: PublicTimeProjection, sequence: int) -> tuple[int, int]:
+    index = bisect_right(projection.component_starts, sequence) - 1
+    if index >= 0:
+        start, end = projection.components[index]
+        if sequence < end:
+            return start, end
     raise ValueError("mapped clock range has no effective causal interval")
 
 

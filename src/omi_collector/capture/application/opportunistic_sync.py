@@ -92,7 +92,12 @@ class _BackgroundFatalOwner:
 class _PublicDrainCoordinator:
     """Coalesce public observations and serialize replayable file exports."""
 
-    def __init__(self, port: PublicDrainPort, runtime: CaptureRuntimePort) -> None:
+    def __init__(
+        self,
+        port: PublicDrainPort,
+        runtime: CaptureRuntimePort,
+        fatal_callback: Callable[[FatalInternalAudioStorageError], None] | None = None,
+    ) -> None:
         self.port = port
         self.runtime = runtime
         self.wake = asyncio.Event()
@@ -101,11 +106,20 @@ class _PublicDrainCoordinator:
         self._stopping = False
         self._task: asyncio.Task[None] | None = None
         self._loop = asyncio.get_running_loop()
+        self._fatal_callback = fatal_callback
         self.port.set_wake_callback(self._wake_on_loop)
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
+        self._task.add_done_callback(self._report_failure)
         self.wake.set()
+
+    def _report_failure(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if isinstance(error, FatalInternalAudioStorageError) and self._fatal_callback is not None:
+            self._fatal_callback(error)
 
     def _wake_on_loop(self) -> None:
         self._loop.call_soon_threadsafe(self.wake.set)
@@ -149,12 +163,16 @@ class _PublicDrainCoordinator:
                 await self._flush_observations()
                 try:
                     await joined_to_thread(self.port.publish_snapshot)
+                except FatalInternalAudioStorageError:
+                    raise
                 except Exception as error:  # noqa: BLE001 - final export remains repairable
                     self._log(error, "publish")
                 return
             await self._flush_observations()
             try:
                 await joined_to_thread(self.port.publish_snapshot)
+            except FatalInternalAudioStorageError:
+                raise
             except Exception as error:  # noqa: BLE001 - JSON is a repairable projection
                 self._log(error, "publish")
 
@@ -165,6 +183,8 @@ class _PublicDrainCoordinator:
                 return
             try:
                 await joined_to_thread(self.port.update_observations, battery=battery)
+            except FatalInternalAudioStorageError:
+                raise
             except Exception as error:  # noqa: BLE001 - public observations are best effort
                 self._log(error, "observation")
                 return
@@ -213,7 +233,9 @@ async def run_opportunistic_collector(
         _observation_error_reporter(options, runtime, loop, fatal_owner, relay),
     )
     public_drain = options.public_drain
-    public_coordinator = _PublicDrainCoordinator(public_drain, runtime) if public_drain is not None else None
+    public_coordinator = (
+        _PublicDrainCoordinator(public_drain, runtime, fatal_owner.record) if public_drain is not None else None
+    )
     run = _Run(provider, staging, options, observation_writer, runtime, maintenance, relay, public_coordinator)
     reconciler = BatchReconciler(staging, options, runtime, maintenance.quarantine_attempt_source)
     lifecycle = _make_session_lifecycle(run, reconciler)
@@ -229,17 +251,15 @@ async def run_opportunistic_collector(
     except BaseException as error:
         primary_error = error
         unwinding = True
+        if isinstance(error, FatalInternalAudioStorageError):
+            maintenance.record_storage_fatal(error)
         if isinstance(error, asyncio.CancelledError):
             maintenance._raise_publication_fatal()
             cancelled = True
         raise
     finally:
         fatal_owner.cleanup_started = True
-        try:
-            await _finalize_run(run, reconciler, cancelled=cancelled, unwinding=unwinding, primary_error=primary_error)
-        finally:
-            if public_coordinator is not None:
-                await public_coordinator.close()
+        await _finalize_run(run, reconciler, cancelled=cancelled, unwinding=unwinding, primary_error=primary_error)
 
 
 async def _finalize_run(
@@ -260,19 +280,33 @@ async def _finalize_run(
             return result
         except BaseException as error:  # noqa: BLE001 - cleanup must continue through cancellation
             errors.append(error)
+            if isinstance(error, FatalInternalAudioStorageError):
+                run.maintenance.record_storage_fatal(error)
             return None
 
     preserved_cancel = await _finalize_active(reconciler, cancelled=cancelled, errors=errors)
+    for error in errors:
+        if isinstance(error, FatalInternalAudioStorageError):
+            run.maintenance.record_storage_fatal(error)
     await attempt(lambda: _close_observation_writer(run, unwinding=unwinding or bool(errors)))
     await attempt(run.maintenance.close)
     await attempt(lambda: _close_observation_error_relay(run))
     await attempt(lambda: _close_quality_metrics(run))
     await attempt(lambda: asyncio.sleep(0))
-    try:
-        run.maintenance._raise_publication_fatal()
-    except BaseException as error:  # noqa: BLE001 - preserve fatal publication state
-        errors.append(error)
+    _capture_maintenance_fatal(run.maintenance, errors)
+    if run.public_drain is not None:
+        await attempt(run.public_drain.close)
+    _capture_maintenance_fatal(run.maintenance, errors)
 
+    run.maintenance._raise_publication_fatal()
+    _raise_finalization_error(primary_error, preserved_cancel, errors)
+
+
+def _raise_finalization_error(
+    primary_error: BaseException | None,
+    preserved_cancel: CollectionPreservedCancelledError | None,
+    errors: list[BaseException],
+) -> None:
     fatal_errors = [error for error in (primary_error, *errors) if isinstance(error, FatalInternalAudioStorageError)]
     if fatal_errors:
         raise fatal_errors[0]
@@ -284,6 +318,14 @@ async def _finalize_run(
         raise preserved_cancel
     if errors:
         raise errors[0]
+
+
+def _capture_maintenance_fatal(maintenance: QuarantineMaintenance, errors: list[BaseException]) -> None:
+    try:
+        maintenance._raise_publication_fatal()
+    except FatalInternalAudioStorageError as error:
+        if not any(previous is error for previous in errors):
+            errors.append(error)
 
 
 async def _finalize_active(

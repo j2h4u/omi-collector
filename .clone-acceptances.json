@@ -98,9 +98,21 @@
     },
     {
       "detector": "jscpd",
+      "identity": "064b43694b470c3d73180387ac677213aaef190643c6dec750d10324c2f1aef6",
+      "count": 1,
+      "reason": "An advertisement event records one session RSSI while spool metrics aggregate visible bundles with a different schema and lifecycle. Reviewed pair: src/omi_collector/capture/application/quality_metrics.py:63-77 ~ src/omi_collector/spool_metrics.py:39-53."
+    },
+    {
+      "detector": "jscpd",
       "identity": "06607216da6b1b4c76ee4d9ec9f3656469c33d75dbec82b6c01a3552e3e540b4",
       "count": 1,
       "reason": "Source-v2 and source-v3 migration validators bind different historical schema versions and diagnostics; the current-runtime validator additionally rejects upgrade-needed/unsupported versions and validates publication mode. Shared _validate_schema/_validate_audio_schema already own structural invariants; preserve explicit historical admission contracts. Reviewed pair: src/omi_collector/state_migration.py:237-257 ~ src/omi_collector/state_migration.py:253-273."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "06a1d3c7523bd5215fef0d8bf9fd6ec55fa0d92f9cb6d9414208605d8bd44e6b",
+      "count": 1,
+      "reason": "Visible spool window and firmware lifetime serialization describe different periods and units with explicit public JSON keys. Reviewed pair: src/omi_collector/spool_metrics.py:38-53 ~ src/omi_collector/spool_metrics.py:60-75."
     },
     {
       "detector": "jscpd",
@@ -290,6 +302,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "2c5e9f0fe3254c094fa7b6bcbefe59c9587ccb67222e7691ebaaea7a5cd8f062",
+      "count": 1,
+      "reason": "Device info requires confirmation and GATT communication while metrics reads the local ledger; similar CLI signatures have different effects. Reviewed pair: src/omi_collector/cli.py:715-724 ~ src/omi_collector/cli.py:993-1000."
+    },
+    {
+      "detector": "jscpd",
       "identity": "2e49409cb1e3dd0ab54143f88a60ccc5903972039cd04d6566b39c81830838df",
       "count": 1,
       "reason": "Cohort and audio decision guards use different FSM types, allowed events and action enums. They share result-check syntax while retaining distinct state authority and errors; genericizing would erase useful type separation. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1330-1341 ~ src/omi_collector/capture/adapters/ready_bundles.py:1341-1352."
@@ -311,6 +329,12 @@
       "identity": "3061ed04e50cbe65a6b33dd80203f96c54dd576dd9167e13b388252edc9d1a39",
       "count": 1,
       "reason": "Codec integer/byte/short bounds and runtime configuration finite/positive constraints belong to separate APIs. Preserve codec-local validation and exact bit-width checks; importing generic runtime configuration into the encoder would couple unrelated boundaries for a three-line guard. Reviewed pair: src/omi_collector/capture/adapters/ogg_opus.py:69-80 ~ src/omi_collector/capture/adapters/ogg_opus.py:74-85."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "307131c8bd37a2026c750842ea8485539800875c583bb7bfc3574da6e13ae599",
+      "count": 1,
+      "reason": "Spool window and firmware lifetime as_dict methods expose independent public field sets whose semantics differ. Reviewed pair: src/omi_collector/spool_metrics.py:36-45 ~ src/omi_collector/spool_metrics.py:59-67."
     },
     {
       "detector": "jscpd",
@@ -497,12 +521,6 @@
       "identity": "4a181afc1d7d306eac81efb4667ad6bb24fc2509a39720066abd733d0fe143d2",
       "count": 1,
       "reason": "Checkpoint and interrupt deliberately admit different command types through the existing _admit and join_owned mechanisms. Their small asynchronous adapters are not duplicated writer execution; target effects and final state differ. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:413-418 ~ src/omi_collector/capture/adapters/attempt_writer.py:424-429."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "4a6de7a2b6621c43a0f922ff872ac2c21c1f3b7f5c28666309a68129b31fc2de",
-      "count": 1,
-      "reason": "The reported models and as_dict methods encode separate PHY outcomes, connection parameters, loss facts, lock context, quality events and status/lifetime aggregates. Explicit schema keys and units are public contracts; do not combine them because normalized field assignments look alike. Reviewed pair: src/omi_collector/spool_metrics.py:38-53 ~ src/omi_collector/spool_metrics.py:60-75."
     },
     {
       "detector": "jscpd",
@@ -776,6 +794,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "7604f602a6cb822db20f280b75656b243a54e842cee52e9a810190d493315a5d",
+      "count": 1,
+      "reason": "Custody reconciliation compares durable cohort and source-coverage proposals and returns the proposed cohort or completion. Retirement reconciliation compares source identity/cursor and compaction debt, validates stalled/progressed results, and returns a progress boolean; their caught exception sets also differ. Shared two-attempt syntax is not a common operation: error classification and fail-stop already use shared helpers. Keep operation-specific recovery contracts instead of callback-driven retry machinery. Independent Astra review and public-API custody/retirement rollback and lost-response tests cover the distinction. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4123-4135 ~ src/omi_collector/capture/adapters/ready_bundles.py:4641-4653."
+    },
+    {
+      "detector": "jscpd",
       "identity": "765a4110dfbf816f2514323101c4a700df65900422c13a5445faf7d7cc4777bb",
       "count": 1,
       "reason": "HCI data-length change and remote connection parameter request read little-endian words but use different handle masking, field meanings, event types and length/error handling. Preserve their event-specific decoding. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:477-482 ~ src/omi_collector/capture/adapters/ble_link_observability.py:537-542."
@@ -797,12 +821,6 @@
       "identity": "790bef738ac18097ec157c1804381f906b9f84f9f388d1a788566cbde619e484",
       "count": 1,
       "reason": "The windows overlap the single writer-command dispatcher. Shared data draining is already _drain_data; checkpoint, interrupt and seal intentionally call different target effects. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:650-656 ~ src/omi_collector/capture/adapters/attempt_writer.py:653-659."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "7b4ccd13a3779440d26fc0d25c822850a70bb9d52e138d087da0fad5d741df40",
-      "count": 1,
-      "reason": "The reported models and as_dict methods encode separate PHY outcomes, connection parameters, loss facts, lock context, quality events and status/lifetime aggregates. Explicit schema keys and units are public contracts; do not combine them because normalized field assignments look alike. Reviewed pair: src/omi_collector/spool_metrics.py:36-45 ~ src/omi_collector/spool_metrics.py:59-67."
     },
     {
       "detector": "jscpd",
@@ -833,6 +851,12 @@
       "identity": "7fcc360d4f1a78f4178fc9b8eda1c04ec9f34781cfe4b3965276b912c43bba24",
       "count": 1,
       "reason": "The windows overlap one operational-status transition/enum declaration. Distinct state/event values are not duplicate executable functions. Reviewed pair: src/omi_collector/capture/domain/operational_status_machine.py:37-50 ~ src/omi_collector/capture/domain/operational_status_machine.py:38-51."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "82be9b67e0c157ade810dc75973bf8625eeda6fce12d0d2e7f16ef432ca566ec",
+      "count": 1,
+      "reason": "Init-state migrates the database under a process guard while metrics reads state; their lazy imports reflect separate safety boundaries. Reviewed pair: src/omi_collector/cli.py:459-468 ~ src/omi_collector/cli.py:970-979."
     },
     {
       "detector": "jscpd",
@@ -986,12 +1010,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "7604f602a6cb822db20f280b75656b243a54e842cee52e9a810190d493315a5d",
-      "count": 1,
-      "reason": "Custody reconciliation compares durable cohort and source-coverage proposals and returns the proposed cohort or completion. Retirement reconciliation compares source identity/cursor and compaction debt, validates stalled/progressed results, and returns a progress boolean; their caught exception sets also differ. Shared two-attempt syntax is not a common operation: error classification and fail-stop already use shared helpers. Keep operation-specific recovery contracts instead of callback-driven retry machinery. Independent Astra review and public-API custody/retirement rollback and lost-response tests cover the distinction. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4123-4135 ~ src/omi_collector/capture/adapters/ready_bundles.py:4641-4653."
-    },
-    {
-      "detector": "jscpd",
       "identity": "994c342fb22410743d967845d2de1e4ac10720b2d5d260be0aae2da232d1d6b3",
       "count": 1,
       "reason": "Audio state handlers enforce different admissible source phases and event guards for data, barriers, terminalization, conflict, custody and retirement. Their result construction is shared through AudioDecision; preserve the explicit independent transition rules. Reviewed pair: src/omi_collector/capture/domain/internal_audio_machine.py:199-206 ~ src/omi_collector/capture/domain/internal_audio_machine.py:300-307."
@@ -1088,12 +1106,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "a155b616627a50ae5ce0821de3bad8ae197d60080701797380c3fceeca5cb914",
-      "count": 1,
-      "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:468-476 ~ src/omi_collector/cli.py:955-963."
-    },
-    {
-      "detector": "jscpd",
       "identity": "a191ded53c8bb270519baf97303f332a914a5bf8e1208fadb97a09e4487c6c8b",
       "count": 1,
       "reason": "The windows overlap one StagingPort interface listing independent publication lifetime capabilities. Method declarations are not duplicate implementations. Reviewed pair: src/omi_collector/capture/application/ports.py:297-309 ~ src/omi_collector/capture/application/ports.py:299-311."
@@ -1130,9 +1142,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "a61f8448e995f28b77ae67bf42f9dfb2c0654a7f24dfb393353702b1c085e4a8",
+      "identity": "a5bdf713ff879ac543552d097bbd270ac2a6fe3174daf69d0d67979d12128f92",
       "count": 1,
-      "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:724-733 ~ src/omi_collector/cli.py:981-988."
+      "reason": "Writer lifecycle states and presence directives have independent semantics and distinct roles in dispatch. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:39-53 ~ src/omi_collector/capture/application/presence_machine.py:194-208."
     },
     {
       "detector": "jscpd",
@@ -1400,12 +1412,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "d1aa17b2ead06b634722a5953ef82f2a9f8c81c0db6ff4ed5f4fea46c747fa0e",
-      "count": 1,
-      "reason": "The reported models and as_dict methods encode separate PHY outcomes, connection parameters, loss facts, lock context, quality events and status/lifetime aggregates. Explicit schema keys and units are public contracts; do not combine them because normalized field assignments look alike. Reviewed pair: src/omi_collector/capture/application/quality_metrics.py:63-77 ~ src/omi_collector/spool_metrics.py:39-53."
-    },
-    {
-      "detector": "jscpd",
       "identity": "d2a0a01c427f271e003cf5fe43a667c753d6cf2fe36e095686193fa60aeb66d1",
       "count": 1,
       "reason": "Protocol method declarations and CLI port stubs specify distinct capabilities, signatures and return types. They have no duplicated executable implementation; consumers use separate structural interfaces. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:84-90 ~ src/omi_collector/capture/application/quality_metrics.py:181-187."
@@ -1622,6 +1628,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "f27702ff3e583f01394fc65bf6e51f358113100e1c73496632ceabeca86fbf7a",
+      "count": 1,
+      "reason": "Attempt writer completion and failure events and presence scanning directives belong to separate state machines and their types drive distinct dispatch. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:128-147 ~ src/omi_collector/capture/application/presence_machine.py:194-213."
+    },
+    {
+      "detector": "jscpd",
       "identity": "f28c7315ff4c597355dbf652d90bf0f61587fbaba38dcacb22be6d8aba5a8b7b",
       "count": 1,
       "reason": "Writer properties expose lock-protected submitted/written counters, whereas arena properties expose immutable snapshot geometry and receive/leg watermarks. Existing aliases already delegate; normalization matches trivial accessors with different units and synchronization. Reviewed pair: src/omi_collector/capture/domain/transfer_arena.py:113-133 ~ src/omi_collector/capture/domain/transfer_arena.py:118-138."
@@ -1679,12 +1691,6 @@
       "identity": "f8768e074bde0d36f3feb41a91a166ec3d7b96522c5f18d2458f353aee20fc7c",
       "count": 1,
       "reason": "CLI staging composition, guarded state access and status reporting translate different exception sets into the established fatal78/transient1 exit contract at separate entry points. Small explicit handlers preserve error context and lazy imports; no configurable error wrapper is warranted. Reviewed pair: src/omi_collector/cli.py:1016-1021 ~ src/omi_collector/cli.py:169-174."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "f8912353cc4aa7795a556364f53e9324c6fa29e960767eccc17941481be5c323",
-      "count": 1,
-      "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:133-147 ~ src/omi_collector/capture/application/presence_machine.py:201-215."
     },
     {
       "detector": "jscpd",
@@ -2000,12 +2006,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "5123883186c18e425ca0709183a9effb94812cd38386ffd8b4dfdcfc5511578c",
-      "count": 1,
-      "reason": "Spool-window metrics describe active/retained byte/count observations; firmware-lifetime metrics describe device epochs/dropped records. Dataclass/serialization shape preserves distinct units and periods. Reviewed pair: src/omi_collector/spool_metrics.py:26-45 ~ src/omi_collector/spool_metrics.py:49-67."
-    },
-    {
-      "detector": "pyscn",
       "identity": "55aa666f07a8d13aa3345ac26e7755ccc94f19186e3b167d657f9ad90f8b7622",
       "count": 1,
       "reason": "Effective connection parameters and remote requested parameter ranges have different field meanings and units. Their immutable models/serializers must remain distinct HCI contracts. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:186-198 ~ src/omi_collector/capture/adapters/ble_link_observability.py:202-216."
@@ -2084,6 +2084,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "6207abad3664db618ba4f98290a9a6d45b068dce8ab3367d27f0889b7cd0bc32",
+      "count": 1,
+      "reason": "SpoolWindowMetrics describes visible records and unproven gaps while FirmwareLifetimeMetrics describes lifetime firmware counters; their dataclasses and periods differ. Reviewed pair: src/omi_collector/spool_metrics.py:26-45 ~ src/omi_collector/spool_metrics.py:49-67."
+    },
+    {
+      "detector": "pyscn",
       "identity": "621e2128830139eadbbf8b72870a2c95dde84888867a5d0778d3108fbf84425f",
       "count": 1,
       "reason": "Prepare-leg and READ_BEGIN bind different staged device intents and update different source columns under conditional durable transitions. Keep their distinct state/effect boundaries. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:666-687 ~ src/omi_collector/capture/adapters/internal_audio_store.py:712-723."
@@ -2099,6 +2105,12 @@
       "identity": "66a6102a4d7d16398db0211cc6a251d6ec23caa9cf4d899955d5bf73e3d6b825",
       "count": 1,
       "reason": "Coverage-state inspection compares old/proposed covered checkpoint state; retirement selection finds an actionable source. Shared SQL scope is mechanism, not one state decision. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4297-4312 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "681fcee61bf02e2d1285fca9e91a135fd7351587e98b6d4ab5626e24b66e8242",
+      "count": 1,
+      "reason": "AdvertisementMetric describes one BLE scan event while SpoolWindowMetrics aggregates current files; fields and lifecycles are independent. Reviewed pair: src/omi_collector/capture/application/quality_metrics.py:49-69 ~ src/omi_collector/spool_metrics.py:26-45."
     },
     {
       "detector": "pyscn",
@@ -2219,12 +2231,6 @@
       "identity": "8d93416789538553ada9706cd259fd5de3ee39caf221b5f8ef8d30ed33c28ba6",
       "count": 1,
       "reason": "pending_attempts enforces restart attempt uniqueness; _typed_publication_source_ids enumerates publisher admission/resume candidates. Different lifecycle queries and scheduler authorities share only existing connection mechanics. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "93b760ab3a0f2225bcd92f5e48e346077b7e1c50cde396174e9888a05a0a80ad",
-      "count": 1,
-      "reason": "Journal recovery mutates stopped-service state; metrics reads metadata and reports counts. Different guarded effects/error sets/CLI schemas must remain explicit. Reviewed pair: src/omi_collector/cli.py:551-583 ~ src/omi_collector/cli.py:953-981."
     },
     {
       "detector": "pyscn",
@@ -2399,12 +2405,6 @@
       "identity": "ca35a5425c7654b33f9de820c44aec220d54a735fea9cc8b087d078f48312843",
       "count": 1,
       "reason": "Replay coverage confirms one admitted source checkpoint; cached draft frontier aggregates unpublished durable prefixes. Their different evidence semantics are not a shared algorithm. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4265-4273 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "cc2c09b612adb18ddce4adf8b8544fb1794e83fbba822d5bedaccb7d308c8bb2",
-      "count": 1,
-      "reason": "Advertisement events describe one session RSSI observation; spool-window metrics summarize a period of storage state. Their dict/dataclass shapes encode unrelated units and event scopes. Reviewed pair: src/omi_collector/capture/application/quality_metrics.py:49-69 ~ src/omi_collector/spool_metrics.py:26-45."
     },
     {
       "detector": "pyscn",

@@ -70,7 +70,7 @@ POLICY = PresenceMachinePolicy(
         (ConnectedInterruption, 1, "durable_progress"),
         (AttemptFinished, 2, "at"),
         (Shutdown, 1, "at"),
-        (Observe, 1, "until"),
+        (Observe, 0, "unused"),
         (StopAndBeginAttempt, 1, "trigger"),
         (Stop, 0, "unused"),
         (NoOperation, 0, "unused"),
@@ -111,7 +111,7 @@ def test_search_advertisement_requires_stable_repeated_visibility() -> None:
 
     assert stale.state is state
     assert isinstance(stale.directive, NoOperation)
-    assert waiting.directive == Observe(100.0)
+    assert waiting.directive == Observe()
     assert released.directive == StopAndBeginAttempt(AdvertisementTrigger(stable))
 
 
@@ -137,7 +137,7 @@ def test_scanner_interruption_clears_unfinished_arrival() -> None:
     interrupted = transition(observed.state, ScannerInterrupted(at=2.0), POLICY)
 
     assert interrupted.state == Searching(timer_epoch=0, scan_recheck_at=100.0)
-    assert interrupted.directive == Observe(100.0)
+    assert interrupted.directive == Observe()
 
 
 def test_resume_interrupted_visit_arms_absence_without_erasing_arrival() -> None:
@@ -148,7 +148,7 @@ def test_resume_interrupted_visit_arms_absence_without_erasing_arrival() -> None
 
     assert resumed == type(resumed)(
         RetryWaiting(3, None, 100.0, 0, advertisement, 9.0, 30.0),
-        Observe(30.0),
+        Observe(),
     )
 
 
@@ -205,7 +205,7 @@ def test_queued_stale_observation_requires_a_new_stable_encounter() -> None:
     released = transition(waiting.state, AdvertisementObserved(stable, processed_at=25.0), POLICY)
 
     assert observed.state == state
-    assert waiting.directive == Observe(100.0)
+    assert waiting.directive == Observe()
     assert released.directive == StopAndBeginAttempt(AdvertisementTrigger(stable))
 
 
@@ -217,10 +217,10 @@ def test_cooldown_continuous_advertising_waits_for_post_cooldown_encounter() -> 
     assert isinstance(refreshed.state, CoolingDown)
     quiet = transition(refreshed.state, _timer(refreshed.state, 50.0), POLICY)
 
-    assert refreshed.directive == Observe(50.0)
+    assert refreshed.directive == Observe()
     assert isinstance(quiet.state, Searching)
     assert quiet.state.timer_epoch == 5
-    assert quiet.directive == Observe(150.0)
+    assert quiet.directive == Observe()
     assert drained_cooldown_remaining_seconds(quiet.state, at=55.0) == 0.0
     first_after_cooldown = _advertisement(60.0)
     stable_after_cooldown = _advertisement(65.0)
@@ -238,7 +238,7 @@ def test_cooldown_ad_at_exact_boundary_starts_a_fresh_stability_window() -> None
     assert isinstance(refreshed.state, CoolingDown)
     assert refreshed.state.advertisement is at_boundary
     assert refreshed.state.arrival_started_at == 50.0
-    assert refreshed.directive == Observe(50.0)
+    assert refreshed.directive == Observe()
 
     stable = _advertisement(55.0)
     released = transition(refreshed.state, AdvertisementObserved(stable), POLICY)
@@ -264,11 +264,11 @@ def test_retry_advertisement_begins_a_fresh_encounter_after_backoff() -> None:
     assert isinstance(refreshed.state, RetryWaiting)
     assert refreshed.state.retry_index == 3
     assert refreshed.state.retry_at == 20.0
-    assert refreshed.directive == Observe(20.0)
+    assert refreshed.directive == Observe()
     assert isinstance(restarted.state, RetryWaiting)
     assert restarted.state.advertisement is absent_advertisement
     assert restarted.state.arrival_started_at == 20.0
-    assert restarted.directive == Observe(20.0)
+    assert restarted.directive == Observe()
 
 
 def test_fresh_retry_advertisements_refresh_absence_and_reject_old_timer() -> None:
@@ -290,7 +290,7 @@ def test_fresh_retry_advertisements_refresh_absence_and_reject_old_timer() -> No
     )
 
     assert refreshed.state.absence_at == 25.0
-    assert refreshed.directive == Observe(25.0)
+    assert refreshed.directive == Observe()
     assert stale.state is refreshed.state and isinstance(stale.directive, NoOperation)
 
 
@@ -322,7 +322,7 @@ def test_retry_backoff_returns_to_scanning_with_retained_recheck() -> None:
 
     assert result == type(result)(
         RetryWaiting(5, None, 100.0, 1, None),
-        Observe(100.0),
+        Observe(),
     )
 
 
@@ -331,7 +331,7 @@ def test_search_timer_at_its_exact_deadline_advances_epoch_and_recheck() -> None
 
     result = transition(state, TimerFired(at=100.0, deadline=100.0, timer_epoch=4), POLICY)
 
-    assert result == type(result)(Searching(timer_epoch=5, scan_recheck_at=200.0), Observe(200.0))
+    assert result == type(result)(Searching(timer_epoch=5, scan_recheck_at=200.0), Observe())
 
 
 def test_early_cooldown_timer_with_matching_deadline_keeps_cooling_down() -> None:
@@ -340,7 +340,7 @@ def test_early_cooldown_timer_with_matching_deadline_keeps_cooling_down() -> Non
     result = transition(state, TimerFired(at=49.0, deadline=50.0, timer_epoch=4), POLICY)
 
     assert result.state is state
-    assert result.directive == Observe(50.0)
+    assert result.directive == Observe()
 
 
 def test_scan_recheck_before_retry_preserves_retry_deadline() -> None:
@@ -355,7 +355,7 @@ def test_scan_recheck_before_retry_preserves_retry_deadline() -> None:
 
     result = transition(state, TimerFired(at=10.0, deadline=10.0, timer_epoch=4), POLICY)
 
-    assert result == type(result)(RetryWaiting(5, 30.0, 110.0, 1, None, None, 200.0), Observe(30.0))
+    assert result == type(result)(RetryWaiting(5, 30.0, 110.0, 1, None, None, 200.0), Observe())
 
 
 def test_equal_retry_and_scan_deadlines_clear_retry_and_recheck_from_callback() -> None:
@@ -370,7 +370,7 @@ def test_equal_retry_and_scan_deadlines_clear_retry_and_recheck_from_callback() 
 
     result = transition(state, TimerFired(at=10.0, deadline=10.0, timer_epoch=4), POLICY)
 
-    assert result == type(result)(RetryWaiting(5, None, 110.0, 1, None, None, 200.0), Observe(110.0))
+    assert result == type(result)(RetryWaiting(5, None, 110.0, 1, None, None, 200.0), Observe())
 
 
 @pytest.mark.parametrize(("at", "expected_recheck"), [(10.0, 110.0), (11.0, 111.0)])
@@ -386,9 +386,7 @@ def test_retry_without_a_retry_deadline_rechecks_at_or_after_scan_deadline(at: f
 
     result = transition(state, TimerFired(at=at, deadline=10.0, timer_epoch=4), POLICY)
 
-    assert result == type(result)(
-        RetryWaiting(5, None, expected_recheck, 1, None, None, 200.0), Observe(expected_recheck)
-    )
+    assert result == type(result)(RetryWaiting(5, None, expected_recheck, 1, None, None, 200.0), Observe())
 
 
 def test_duplicate_advertisement_timestamp_restarts_arrival_stability_window() -> None:
@@ -404,7 +402,7 @@ def test_duplicate_advertisement_timestamp_restarts_arrival_stability_window() -
 
     assert isinstance(state, Searching)
     assert state.arrival_started_at == 4.0
-    assert result is not None and result.directive == Observe(100.0)
+    assert result is not None and result.directive == Observe()
 
     stable = _advertisement(9.0)
     released = transition(state, AdvertisementObserved(stable), POLICY)
@@ -443,7 +441,7 @@ def test_late_search_timer_refreshes_the_recheck_from_callback_time() -> None:
 
     result = transition(state, TimerFired(at=101.0, deadline=100.0, timer_epoch=4), POLICY)
 
-    assert result == type(result)(Searching(5, 201.0), Observe(201.0))
+    assert result == type(result)(Searching(5, 201.0), Observe())
 
 
 def test_late_cooldown_timer_returns_to_searching_from_callback_time() -> None:
@@ -451,7 +449,7 @@ def test_late_cooldown_timer_returns_to_searching_from_callback_time() -> None:
 
     result = transition(state, TimerFired(at=51.0, deadline=50.0, timer_epoch=6), POLICY)
 
-    assert result == type(result)(Searching(7, 151.0), Observe(151.0))
+    assert result == type(result)(Searching(7, 151.0), Observe())
 
 
 def test_late_retry_absence_timer_ends_visit_without_a_permit() -> None:
@@ -478,7 +476,7 @@ def test_delayed_search_observations_within_gap_retain_the_trigger_candidate() -
     waiting = transition(state, AdvertisementObserved(first, processed_at=2.0), POLICY)
     released = transition(waiting.state, AdvertisementObserved(second, processed_at=7.0), POLICY)
 
-    assert waiting.directive == Observe(100.0)
+    assert waiting.directive == Observe()
     assert isinstance(released.directive, StopAndBeginAttempt)
     assert isinstance(released.directive.trigger, AdvertisementTrigger)
     assert released.directive.trigger.advertisement is second
@@ -501,6 +499,8 @@ def test_deadline_projection_and_noop_transition_do_not_mutate_waiting_state() -
 @pytest.mark.parametrize(
     "state",
     (
+        Searching(timer_epoch=3, scan_recheck_at=100.0),
+        CoolingDown(timer_epoch=3, cooldown_at=50.0, recheck_at=100.0, advertisement=None),
         RetryWaiting(
             timer_epoch=3,
             retry_at=50.0,
@@ -510,7 +510,7 @@ def test_deadline_projection_and_noop_transition_do_not_mutate_waiting_state() -
         ),
     ),
 )
-def test_shutdown_closes_each_waiting_state(state: CoolingDown | RetryWaiting) -> None:
+def test_shutdown_closes_each_waiting_state(state: Searching | CoolingDown | RetryWaiting) -> None:
     result = transition(state, Shutdown(at=20.0), POLICY)
 
     assert result == type(result)(Closed(), Stop())
@@ -524,7 +524,7 @@ def test_clean_drain_anchors_fifteen_minute_cooldown() -> None:
 
     assert result == type(result)(
         CoolingDown(3, 80.0, 80.0, None),
-        Observe(80.0),
+        Observe(),
     )
 
 
@@ -547,7 +547,7 @@ def test_retry_outcomes_schedule_backoff_and_durable_progress_resets_it() -> Non
         POLICY,
     )
 
-    assert interrupted == type(interrupted)(RetryWaiting(4, 14.0, 110.0, 2, None, None, 20.0), Observe(14.0))
+    assert interrupted == type(interrupted)(RetryWaiting(4, 14.0, 110.0, 2, None, None, 20.0), Observe())
     assert isinstance(interrupted.state, RetryWaiting)
     exhausted = transition(
         Attempting(RapidRetryTrigger(_advertisement(14.0)), interrupted.state),
@@ -555,7 +555,7 @@ def test_retry_outcomes_schedule_backoff_and_durable_progress_resets_it() -> Non
         POLICY,
     )
     assert exhausted == type(exhausted)(Searching(5, 114.0), EndVisit("recovery_exhausted"))
-    assert after_progress == type(after_progress)(RetryWaiting(4, 12.0, 110.0, 0, None, None, 20.0), Observe(12.0))
+    assert after_progress == type(after_progress)(RetryWaiting(4, 12.0, 110.0, 0, None, None, 20.0), Observe())
 
 
 def test_durable_progress_resets_exhaustion_counter_for_next_failure() -> None:
@@ -592,7 +592,7 @@ def test_not_connected_requires_a_fresh_candidate_after_backoff() -> None:
     assert isinstance(retry.state, RetryWaiting)
     assert retry.state.advertisement is None
     assert retry.state.retry_at == 17.0
-    assert unavailable == type(unavailable)(Searching(1, 115.0), Observe(115.0))
+    assert unavailable == type(unavailable)(Searching(1, 115.0), Observe())
 
 
 def test_not_connected_without_fresh_evidence_still_waits_for_backoff() -> None:
@@ -600,7 +600,7 @@ def test_not_connected_without_fresh_evidence_still_waits_for_backoff() -> None:
 
     result = transition(attempting, AttemptFinished(15.0, NotConnected(durable_progress=False)), POLICY)
 
-    assert result == type(result)(RetryWaiting(4, 17.0, 115.0, 1, None, None, 25.0), Observe(17.0))
+    assert result == type(result)(RetryWaiting(4, 17.0, 115.0, 1, None, None, 25.0), Observe())
 
 
 def test_attempting_blocks_late_timer_and_advertisement_until_one_outcome() -> None:

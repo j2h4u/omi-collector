@@ -193,9 +193,7 @@ _PRESENCE_EVENT_TYPES = (
 
 @dataclass(frozen=True, slots=True)
 class Observe:
-    """Continue observation until the supplied absolute monotonic deadline."""
-
-    until: float
+    """Continue observation using the deadline in the waiting state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,7 +519,7 @@ def _begin(waiting: WaitingState, trigger: AttemptTrigger) -> TransitionResult:
 
 
 def _observe(state: WaitingState) -> TransitionResult:
-    return TransitionResult(state, Observe(armed_deadline(state)))
+    return TransitionResult(state, Observe())
 
 
 def _admit_advertisement(

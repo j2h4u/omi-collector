@@ -18,7 +18,7 @@ from typing import Never, cast
 import pytest
 from typer.testing import CliRunner
 
-from omi_collector import cli
+from omi_collector import cli, operator_status, spool_metrics
 from omi_collector.capture import cli as device_cli
 from omi_collector.capture.adapters.clock_state_store import ClockStateStore
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind
@@ -657,7 +657,7 @@ def test_device_status_only_flags_a_confirmed_inactive_service(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(cli, "collect_operator_status", lambda *_args, **_kwargs: {"status": "ok"})
+    monkeypatch.setattr(operator_status, "collect_operator_status", lambda *_args, **_kwargs: {"status": "ok"})
     service_statuses = (
         ({"available": False, "error": "OSError", "unit": "omi-collector.service"}, "ok"),
         ({"available": True, "active_state": "inactive", "unit": "omi-collector.service"}, "attention"),
@@ -696,7 +696,7 @@ def test_device_status_fetches_systemd_invocation_before_collecting_snapshot(
         return {"status": "unknown"}
 
     monkeypatch.setattr(cli, "_systemd_service_status", service_status)
-    monkeypatch.setattr(cli, "collect_operator_status", collect)
+    monkeypatch.setattr(operator_status, "collect_operator_status", collect)
 
     result = CliRunner().invoke(app, ["device", "status", "--config", str(_layout(tmp_path))])
 
@@ -1049,7 +1049,7 @@ def test_device_metrics_failure_is_reported_on_stderr(monkeypatch: pytest.Monkey
     def failed(*_args: object, **_kwargs: object) -> object:
         raise SpoolMetricsError("manifest is malformed")
 
-    monkeypatch.setattr(cli, "collect_spool_metrics", failed)
+    monkeypatch.setattr(spool_metrics, "collect_spool_metrics", failed)
     result = CliRunner().invoke(app, ["device", "metrics", "--config", str(config_path)])
 
     assert result.exit_code == 1
@@ -1068,7 +1068,7 @@ def test_device_metrics_reads_publication_metadata(monkeypatch: pytest.MonkeyPat
         assert state_db.read_only
         return Metrics()
 
-    monkeypatch.setattr(cli, "collect_spool_metrics", collect)
+    monkeypatch.setattr(spool_metrics, "collect_spool_metrics", collect)
 
     result = CliRunner().invoke(app, ["device", "metrics", "--config", str(config_path)])
 
@@ -1080,7 +1080,7 @@ def test_device_status_failure_is_reported_on_stderr(monkeypatch: pytest.MonkeyP
     def failed(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise OperatorStatusError("status evidence is malformed")
 
-    monkeypatch.setattr(cli, "collect_operator_status", failed)
+    monkeypatch.setattr(operator_status, "collect_operator_status", failed)
     result = CliRunner().invoke(app, ["device", "status", "--config", str(_layout(tmp_path))])
 
     assert result.exit_code == 1

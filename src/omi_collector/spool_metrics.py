@@ -29,9 +29,9 @@ class SpoolWindowMetrics:
     bundle_count: int
     downloaded_records: int
     downloaded_raw_bytes: int
-    lost_records: int
-    lost_raw_bytes: int
-    loss_ratio: float
+    unconfirmed_gap_records: int
+    unconfirmed_gap_raw_bytes: int
+    unconfirmed_gap_ratio: float
 
     def as_dict(self) -> dict[str, object]:
         """Return collection metrics for one named scope."""
@@ -39,9 +39,9 @@ class SpoolWindowMetrics:
             "bundle_count": self.bundle_count,
             "downloaded_records": self.downloaded_records,
             "downloaded_raw_bytes": self.downloaded_raw_bytes,
-            "lost_records": self.lost_records,
-            "lost_raw_bytes": self.lost_raw_bytes,
-            "loss_ratio": self.loss_ratio,
+            "unconfirmed_gap_records": self.unconfirmed_gap_records,
+            "unconfirmed_gap_raw_bytes": self.unconfirmed_gap_raw_bytes,
+            "unconfirmed_gap_ratio": self.unconfirmed_gap_ratio,
         }
 
 

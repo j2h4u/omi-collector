@@ -560,7 +560,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "updated_age_seconds": None,
         "updated_at": None,
     }
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     assert result["publication"] == _spool().current_window.as_dict()
     assert result["quality_window"] == {
         "advertisements": 1,
@@ -719,11 +719,16 @@ def test_status_is_ok_only_after_a_completed_transfer_and_all_current_dimensions
             )
         ],
     )
-    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    spool = SpoolMetrics(SpoolWindowMetrics(2, 30, 13_320, 10, 4_440, 0.25), _spool().firmware_lifetime)
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: spool)
 
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC), identity=identity)
 
     assert result["status"] == "ok"
+    publication = cast(dict[str, object], result["publication"])
+    quality = cast(dict[str, object], result["quality_window"])
+    assert publication["unconfirmed_gap_records"] == 10
+    assert quality["confirmed_lost_records"] == 0
 
 
 def test_debug_log_history_cannot_override_current_snapshot_state(
@@ -1268,7 +1273,7 @@ def test_status_keeps_first_quality_observation_at_equal_timestamps(
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
     quality = cast(dict[str, object], result["quality_window"])
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     assert quality["advertisements"] == 2
     assert quality["last_advertisement_rssi_dbm"] == -81
     assert quality["last_transfer_outcome"] == "first-outcome"

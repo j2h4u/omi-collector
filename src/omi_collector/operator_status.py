@@ -225,7 +225,7 @@ def collect_operator_status(
         "custody_holds": custody_holds,
         "ble_scan_incident": ble_scan_incident,
         "runtime": runtime,
-        "schema_version": 2,
+        "schema_version": 3,
         "status": window_status,
         "window_hours": hours,
     }

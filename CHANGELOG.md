@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.3](https://github.com/j2h4u/omi-collector/compare/v1.1.2...v1.1.3) (2026-11-01)
+
+
+### Fixes
+
+* preserve fatal errors during quarantine cleanup ([#317](https://github.com/j2h4u/omi-collector/issues/317)) ([322f067](https://github.com/j2h4u/omi-collector/commit/322f0671c9d7d110ed1a7a3720751845094b707a))
+
+
+### Documentation
+
+* remove completed SQLite planning reviews ([465de07](https://github.com/j2h4u/omi-collector/commit/465de07ea6b9b7da6c4fdfed72aecfc54d243746))
+* remove completed storage audit and plan ([465de07](https://github.com/j2h4u/omi-collector/commit/465de07ea6b9b7da6c4fdfed72aecfc54d243746))
+* remove obsolete migration reports ([465de07](https://github.com/j2h4u/omi-collector/commit/465de07ea6b9b7da6c4fdfed72aecfc54d243746))
+* remove superseded audit trackers ([465de07](https://github.com/j2h4u/omi-collector/commit/465de07ea6b9b7da6c4fdfed72aecfc54d243746))
+
 ## [1.1.2](https://github.com/j2h4u/omi-collector/compare/v1.1.1...v1.1.2) (2026-11-01)
 
 

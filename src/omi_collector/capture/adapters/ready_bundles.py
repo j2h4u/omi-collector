@@ -3762,6 +3762,8 @@ def _require_v2_prior_custody(
 
     root = next((entry for entry in revision if entry[0] == str(ready_root)), None)
     old_root = next((entry for entry in previous.revision if entry[0] == str(ready_root)), None)
+    root_identity = None if root is None else root[:4]
+    old_root_identity = None if old_root is None else old_root[:4]
     entries = cast(dict[str, object], _read_ledger(state_db)["bundles"])
     old_entries = {
         key: value
@@ -3773,9 +3775,8 @@ def _require_v2_prior_custody(
     proof_rows = tuple(row for row in _replay_proof_rows(state_db) if row[0] != stage.artifact_id)
     previous_proofs = tuple(row for row in previous.proof_revision if row[0] != stage.artifact_id)
     if (
-        root is None
-        or old_root is None
-        or root[:4] != old_root[:4]
+        root_identity is None
+        or root_identity != old_root_identity
         or prior_paths(revision) != prior_paths(previous.revision)
         or old_entries != previous.custody.entries
         or proof_rows != previous_proofs

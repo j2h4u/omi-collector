@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/j2h4u/omi-collector/compare/v1.0.0...v1.0.1) (2026-10-28)
+
+
+### Fixes
+
+* reduce background work and enforce template QA ([#309](https://github.com/j2h4u/omi-collector/issues/309)) ([3fea8cb](https://github.com/j2h4u/omi-collector/commit/3fea8cb61848aafb612315bcaf5c599bbcfb9c3b))
+
 ## [1.0.0](https://github.com/j2h4u/omi-collector/compare/v0.19.11...v1.0.0) (2026-10-28)
 
 

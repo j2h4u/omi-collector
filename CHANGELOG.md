@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.1.0](https://github.com/j2h4u/omi-collector/compare/v1.0.1...v1.1.0) (2026-11-01)
+
+
+### Features
+
+* report observed BLE PHY and disconnect reasons in logs and status ([7509e9f](https://github.com/j2h4u/omi-collector/commit/7509e9fc24af6ebb174e0f4b0c7af3664cc81f4b))
+
+
+### Fixes
+
+* preserve atomic capture custody and bounded retirement ([7509e9f](https://github.com/j2h4u/omi-collector/commit/7509e9fc24af6ebb174e0f4b0c7af3664cc81f4b))
+
+
+### CI
+
+* enforce module boundaries and validate CRAP input ([7509e9f](https://github.com/j2h4u/omi-collector/commit/7509e9fc24af6ebb174e0f4b0c7af3664cc81f4b))
+
+
+### Refactoring
+
+* separate capture recovery decisions from storage and publication effects ([7509e9f](https://github.com/j2h4u/omi-collector/commit/7509e9fc24af6ebb174e0f4b0c7af3664cc81f4b))
+
 ## [1.0.1](https://github.com/j2h4u/omi-collector/compare/v1.0.0...v1.0.1) (2026-10-28)
 
 

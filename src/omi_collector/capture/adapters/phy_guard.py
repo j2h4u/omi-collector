@@ -195,7 +195,7 @@ class ScopedPhyGuard(AbstractAsyncContextManager["ScopedPhyGuard"]):
         return result
 
     def _write_marker(self, snapshot: tuple[str, ...]) -> None:
-        payload = {
+        payload: dict[str, object] = {
             "adapter": self.adapter,
             "selected_phys": list(snapshot),
             "version": _MARKER_VERSION,
@@ -257,7 +257,7 @@ def _parse_db_marker(marker: dict[str, object], adapter: str) -> tuple[str, ...]
     selected = marker.get("selected_phys")
     if marker.get("adapter") != adapter or not isinstance(selected, list):
         raise PhyStateError("PHY recovery marker is malformed")
-    if not all(isinstance(token, str) for token in selected):
+    if not all(isinstance(token, str) for token in cast(list[object], selected)):
         raise PhyStateError("PHY recovery marker is malformed")
     snapshot = tuple(cast(list[str], selected))
     _validate_phys(snapshot)

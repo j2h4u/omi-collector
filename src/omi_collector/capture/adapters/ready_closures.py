@@ -47,7 +47,7 @@ def _read_legacy_document(path: Path) -> object | None:
 
 
 def _closure_payload(decoded: object) -> dict[str, object]:
-    if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
+    if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in cast(dict[object, object], decoded)):
         raise ReadyClosureError("ready closure queue schema is invalid")
     value = cast(dict[str, object], decoded)
     closures = _parse_document(value)
@@ -83,7 +83,7 @@ def _parse_document(value: dict[str, object] | None) -> tuple[ReadyClosure, ...]
     raw_closures = value.get("closures")
     if not isinstance(raw_closures, list):
         raise ReadyClosureError("ready closure queue schema is invalid")
-    closures = tuple(_parse_closure(item) for item in raw_closures)
+    closures = tuple(_parse_closure(item) for item in cast(list[object], raw_closures))
     _require_ordered(closures)
     return closures
 
@@ -148,9 +148,10 @@ def remove(db: StateDB, closure: ReadyClosure) -> None:
 
 
 def _parse_closure(value: object) -> ReadyClosure:
-    if not isinstance(value, dict) or set(value) != _CLOSURE_FIELDS:
+    if not isinstance(value, dict) or set(cast(dict[object, object], value)) != _CLOSURE_FIELDS:
         raise ReadyClosureError("ready closure entry schema is invalid")
-    return _make_closure(value["next_sequence"], value["reason"])
+    document = cast(dict[str, object], value)
+    return _make_closure(document["next_sequence"], document["reason"])
 
 
 def _make_closure(next_sequence: object, reason: object) -> ReadyClosure:

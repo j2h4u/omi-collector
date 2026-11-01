@@ -37,6 +37,8 @@ from omi_collector.capture.application.operational_telemetry import system_host_
 from omi_collector.capture.domain.internal_audio_machine import QUARANTINE_CUSTODY_HOLD_REASONS
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE
 from omi_collector.config import DEFAULT_CONFIG
+from omi_collector.json_type_guards import is_dict as _is_dict
+from omi_collector.json_type_guards import is_list as _is_list
 from omi_collector.spool_metrics import collect_spool_metrics
 from omi_collector.storage_layout import StorageLayout
 
@@ -234,10 +236,10 @@ def collect_operator_status(
 def _ble_scan_incident_summary(db: StateDB) -> dict[str, object]:
     incident = db.get(StateKind.BLE_SCAN_INCIDENT, "open")
     history = db.get(StateKind.BLE_SCAN_INCIDENT, "history")
-    entries = history.get("entries", []) if history is not None else []
-    if not isinstance(entries, list):
+    entries: object = history.get("entries", []) if history is not None else []
+    if not _is_list(entries):
         raise OperatorStatusError("BLE scan incident history is invalid")
-    latest = entries[-1] if entries and isinstance(entries[-1], dict) else {}
+    latest = entries[-1] if entries and _is_dict(entries[-1]) else {}
     public_incident = read_ble_scan_incident(db)
     if incident is None:
         return {
@@ -247,11 +249,11 @@ def _ble_scan_incident_summary(db: StateDB) -> dict[str, object]:
             "last_resolved_at": latest.get("resolved_at"),
         }
     context = incident.get("context")
-    if not isinstance(context, dict):
+    if not _is_dict(context):
         raise OperatorStatusError("BLE scan incident context is invalid")
     diagnostics = incident.get("diagnostics")
-    bluez = diagnostics.get("bluez") if isinstance(diagnostics, dict) else None
-    hci = diagnostics.get("hci") if isinstance(diagnostics, dict) else None
+    bluez = diagnostics.get("bluez") if _is_dict(diagnostics) else None
+    hci = diagnostics.get("hci") if _is_dict(diagnostics) else None
     return {
         "active": True,
         **(public_incident or {}),
@@ -271,7 +273,7 @@ def _ble_scan_incident_summary(db: StateDB) -> dict[str, object]:
 
 
 def _incident_diag_summary(value: object, keys: tuple[str, ...]) -> dict[str, object]:
-    if not isinstance(value, dict):
+    if not _is_dict(value):
         return {"available": False}
     result: dict[str, object] = {"available": value.get("available", value.get("status") == "available") is True}
     for key in keys:
@@ -280,7 +282,7 @@ def _incident_diag_summary(value: object, keys: tuple[str, ...]) -> dict[str, ob
             result[key] = item if type(item) is bool else None
         elif key == "devices_count":
             result[key] = item if type(item) is int and item >= 0 else None
-        elif key == "counts" and isinstance(item, dict):
+        elif key == "counts" and _is_dict(item):
             result[key] = {
                 name: count if type(count) is int and count >= 0 else None
                 for name in ("legacy_advertising", "extended_advertising", "hardware_error", "malformed")
@@ -337,14 +339,14 @@ def _project_runtime_status(
     rssi_at = projection.get("connection_rssi_observed_at")
     state = current.get("status", "unknown")
     link = projection.get("ble_link_status")
-    link = link if isinstance(link, dict) else {}
+    link = link if _is_dict(link) else {}
     if identity.invocation_id is not None and link.get("invocation_id") != identity.invocation_id:
         link = {}
     history = link.get("last_observed_phy")
-    history = dict(history) if isinstance(history, dict) else None
-    if history is not None and isinstance(history.get("observed_at"), str):
-        measured = datetime.fromisoformat(history["observed_at"])
-        history["age_seconds"] = max(0, int((now - measured).total_seconds()))
+    history = dict(history) if _is_dict(history) else None
+    observed_at = history.get("observed_at") if history is not None else None
+    if history is not None and isinstance(observed_at, str):
+        history["age_seconds"] = max(0, int((now - datetime.fromisoformat(observed_at)).total_seconds()))
     link_state = link.get("state")
     if identity.invocation_id is None or not isinstance(link_state, str):
         link_state = "unknown"
@@ -385,7 +387,7 @@ def _project_runtime_status(
     }
 
 
-def _last_link_observation(link: dict[str, object], now: datetime) -> dict[str, object] | None:
+def _last_link_observation(link: dict[object, object], now: datetime) -> dict[str, object] | None:
     timestamp = link.get("state_at")
     if not isinstance(timestamp, str):
         return None
@@ -403,7 +405,7 @@ def _dated_projection(
 ) -> tuple[datetime, dict[str, object]] | None:
     value = projection.get(value_key)
     timestamp = projection.get(time_key)
-    if not isinstance(value, dict) or not isinstance(timestamp, str):
+    if not _is_dict(value) or not isinstance(timestamp, str):
         return None
     return datetime.fromisoformat(timestamp), cast(dict[str, object], value)
 
@@ -412,7 +414,7 @@ def _decode_connection_rssi(row: dict[str, object]) -> tuple[datetime, int] | No
     if row.get("event") != "ble_link_rssi_observed":
         return None
     fields = row.get("fields")
-    if not isinstance(fields, dict):
+    if not _is_dict(fields):
         raise OperatorStatusError("debug RSSI observation has invalid fields")
     value = fields.get("rssi_dbm")
     if value is None:
@@ -461,7 +463,7 @@ def _debug_rows(path: Path) -> list[dict[str, object]]:
             value = cast(object, json.loads(line))
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise OperatorStatusError(f"debug journal contains malformed JSON: {path.name}") from error
-        if not isinstance(value, dict):
+        if not _is_dict(value):
             raise OperatorStatusError(f"debug journal record is not an object: {path.name}")
         rows.append(cast(dict[str, object], value))
     return rows
@@ -472,10 +474,10 @@ def _decode_sync_progress(row: dict[str, object]) -> tuple[datetime, dict[str, o
         return None
     timestamp = _timestamp(row, "timestamp")
     fields = row.get("fields")
-    if not isinstance(fields, dict):
+    if not _is_dict(fields):
         raise OperatorStatusError("debug sync progress has invalid fields")
     progress = fields.get("progress")
-    if not isinstance(progress, dict):
+    if not _is_dict(progress):
         raise OperatorStatusError("debug sync progress has invalid progress")
     return timestamp, cast(dict[str, object], progress)
 
@@ -692,7 +694,7 @@ def _decode_quality_row(line: bytes, path: Path) -> dict[str, object]:
         value = cast(object, json.loads(line))
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise OperatorStatusError(f"quality journal contains malformed JSON: {path.name}") from error
-    if not isinstance(value, dict):
+    if not _is_dict(value):
         raise OperatorStatusError(f"quality journal record is not an object: {path.name}")
     return cast(dict[str, object], value)
 

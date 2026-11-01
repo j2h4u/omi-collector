@@ -463,10 +463,16 @@ def _parse_le_meta(
     subevent, body = payload[0], payload[1:]
     if subevent in (_LE_CONNECTION_COMPLETE, _LE_ENHANCED_CONNECTION_COMPLETE):
         return _parse_connection(body, packet, logger, enhanced=subevent == _LE_ENHANCED_CONNECTION_COMPLETE)
-    parameter_parser = {
+    parameter_parsers: dict[
+        int,
+        Callable[
+            [bytes, bytes, logging.Logger], _ConnectionParameterUpdateEvent | _ConnectionParameterRequestEvent | None
+        ],
+    ] = {
         _LE_CONNECTION_UPDATE_COMPLETE: _parse_connection_update,
         _LE_REMOTE_CONNECTION_PARAMETER_REQUEST: _parse_connection_parameter_request,
-    }.get(subevent)
+    }
+    parameter_parser = parameter_parsers.get(subevent)
     if parameter_parser is not None:
         return parameter_parser(body, packet, logger)
     if subevent == _LE_DATA_LENGTH_CHANGE:

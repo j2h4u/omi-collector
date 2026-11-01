@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, cast
 
 from ...config import DEFAULT_CONFIG, CollectorConfig, FirmwareObservationConfig
 from ..application.storage_fault import FatalInternalAudioStorageError
@@ -94,6 +94,8 @@ def _decode(document: Mapping[str, object]) -> FirmwareObservation:
     metrics = document.get("metrics")
     if not isinstance(latest, dict) or not isinstance(metrics, dict):
         raise FirmwareObservationError("device state sections are invalid")
+    latest = cast(dict[str, object], latest)
+    metrics = cast(dict[str, object], metrics)
     if set(latest) != {"read_sequence", "write_sequence", "capacity_packets", "dropped_packets", "packet_size"}:
         raise FirmwareObservationError("latest firmware state is invalid")
     if set(metrics) != {"observation_count", "initial", "observed_increase", "regression_count"}:
@@ -160,7 +162,7 @@ class FirmwareObservationStore:
                         increase,
                         regressions,
                     )
-                document = {
+                payload: dict[str, object] = {
                     "schema_version": _SCHEMA_VERSION,
                     "latest": {
                         "read_sequence": state.read_sequence,
@@ -176,7 +178,7 @@ class FirmwareObservationStore:
                         "regression_count": state.regression_count,
                     },
                 }
-                transaction.put(StateKind.FIRMWARE, "latest", document)
+                transaction.put(StateKind.FIRMWARE, "latest", payload)
                 return True
         except StateDBError as error:
             raise FirmwareObservationError("firmware observation database write failed") from error

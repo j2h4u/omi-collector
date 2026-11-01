@@ -342,23 +342,26 @@ def _validate_row(row: dict[str, object]) -> dict[str, object]:
 def _validate_public_values(row: dict[str, object]) -> None:
     ring = row["ring"]
     if ring is not None:
-        if not isinstance(ring, dict) or set(ring) != {"unread_packets", "observed_at"}:
+        if not isinstance(ring, dict) or set(cast(dict[object, object], ring)) != {"unread_packets", "observed_at"}:
             raise ValueError("pendant ring observation is invalid")
+        ring = cast(dict[object, object], ring)
         unread = ring["unread_packets"]
         if type(unread) is not int or unread < 0:
             raise ValueError("pendant unread packet count is invalid")
         _validate_timestamp(cast(str, ring["observed_at"]))
     drain = row["last_drain"]
     if drain is not None:
-        if not isinstance(drain, dict) or set(drain) != {"event_id", "completed_at"}:
+        if not isinstance(drain, dict) or set(cast(dict[object, object], drain)) != {"event_id", "completed_at"}:
             raise ValueError("pendant drain completion is invalid")
+        drain = cast(dict[object, object], drain)
         if not isinstance(drain["event_id"], str) or not drain["event_id"].strip():
             raise ValueError("pendant drain event ID is invalid")
         _validate_timestamp(cast(str, drain["completed_at"]))
     battery = row["battery"]
     if battery is not None:
-        if not isinstance(battery, dict) or set(battery) != {"percent", "observed_at"}:
+        if not isinstance(battery, dict) or set(cast(dict[object, object], battery)) != {"percent", "observed_at"}:
             raise ValueError("pendant battery observation is invalid")
+        battery = cast(dict[object, object], battery)
         percent = battery["percent"]
         if type(percent) is not int or not 0 <= percent <= _MAX_BATTERY_PERCENT:
             raise ValueError("pendant battery percentage is invalid")
@@ -418,7 +421,7 @@ def _safe_stale_file(candidate: os.stat_result, parent_gid: int) -> bool:
 
 
 def _stale_files(path: Path, parent_gid: int) -> list[Path]:
-    stale_files = []
+    stale_files: list[Path] = []
     prefix = f".{path.name}."
     for candidate in path.parent.iterdir():
         if not candidate.name.startswith(prefix) or not _TEMPORARY_SUFFIX.fullmatch(candidate.name[len(prefix) :]):

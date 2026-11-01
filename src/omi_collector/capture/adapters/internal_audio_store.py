@@ -1625,9 +1625,9 @@ def _fetchall(cursor: sqlite3.Cursor) -> list[sqlite3.Row]:
         result = cast(object, cursor.fetchall())
     finally:
         cursor.close()
-    if not isinstance(result, list) or any(not isinstance(row, sqlite3.Row) for row in result):
+    if not isinstance(result, list) or any(not isinstance(row, sqlite3.Row) for row in cast(list[object], result)):
         raise InternalAudioStoreError("audio database returned invalid rows")
-    return result
+    return cast(list[sqlite3.Row], result)
 
 
 def _value(row: sqlite3.Row, column: int | str) -> object:

@@ -167,7 +167,11 @@ def _read_observation(path: Path) -> ClockObservation:
     try:
         raw = path.read_bytes()
         value = cast(object, json.loads(raw.decode("utf-8")))
-        if not isinstance(value, dict) or raw != _canonical_observation(value) or set(value) != _OBSERVATION_FIELDS:
+        if (
+            not isinstance(value, dict)
+            or raw != _canonical_observation(cast(dict[str, object], value))
+            or set(cast(dict[object, object], value)) != _OBSERVATION_FIELDS
+        ):
             raise ValueError("clock observation JSON is not canonical")
         row = ClockObservation(**cast(dict[str, object], value))
         if path.stem != row.observation_id:
@@ -259,10 +263,11 @@ def _read_correction(path: Path) -> ClockCorrection:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
         if (
             not isinstance(value, dict)
-            or set(value) != _CORRECTION_FIELDS
-            or value.get("version") != _CORRECTION_VERSION
+            or set(cast(dict[object, object], value)) != _CORRECTION_FIELDS
+            or cast(dict[str, object], value).get("version") != _CORRECTION_VERSION
         ):
             raise ValueError("clock correction schema is invalid")
+        value = cast(dict[str, object], value)
         correction = ClockCorrection(
             _integer(value, "version"),
             _text(value, "operation_id"),
@@ -310,8 +315,9 @@ def _read_memberships(root: Path) -> tuple[ClockMembership, ...]:
 def _read_membership(path: Path) -> ClockMembership:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        if not isinstance(value, dict) or set(value) != _MEMBERSHIP_FIELDS:
+        if not isinstance(value, dict) or set(cast(dict[object, object], value)) != _MEMBERSHIP_FIELDS:
             raise ValueError("clock membership schema is invalid")
+        value = cast(dict[str, object], value)
         row = ClockMembership(
             _text(value, "observation_id"),
             _text(value, "session_id"),

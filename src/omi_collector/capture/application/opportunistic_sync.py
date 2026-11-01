@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
+from typing import cast
 
 from ..domain.ring_protocol import RingInfo
 from . import collector
@@ -276,7 +277,7 @@ async def _finalize_run(
         try:
             result = operation()
             if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
-                return await result
+                return await cast(Awaitable[object], result)
             return result
         except BaseException as error:  # noqa: BLE001 - cleanup must continue through cancellation
             errors.append(error)
@@ -386,7 +387,12 @@ def _bind_metrics_fatal(
 ) -> None:
     register = getattr(options.quality_metrics, "set_fatal_callback", None)
     if callable(register):
-        register(lambda error: loop.call_soon_threadsafe(callback, error))
+
+        def notify(error: FatalInternalAudioStorageError) -> None:
+            loop.call_soon_threadsafe(callback, error)
+
+        typed_register = cast(Callable[[Callable[[FatalInternalAudioStorageError], None]], object], register)
+        typed_register(notify)
 
 
 def _validate_composition(staging: object, runtime: object) -> None:

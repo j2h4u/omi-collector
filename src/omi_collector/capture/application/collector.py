@@ -709,9 +709,9 @@ def _leg_counters(arena: TransferArena, writer: IngestWriter, baselines: _LegBas
 def _enqueue_read_begin(writer: IngestWriter, notice: ReadBeginNotification) -> asyncio.Future[object]:
     result = writer.submit_read_begin(notice)
     if isinstance(result, asyncio.Future):
-        return result
+        return cast(asyncio.Future[object], result)
     if isinstance(result, Awaitable):
-        return asyncio.ensure_future(result)
+        return asyncio.ensure_future(cast(Awaitable[object], result))
     completed: asyncio.Future[object] = asyncio.get_running_loop().create_future()
     completed.set_result(result)
     return completed

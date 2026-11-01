@@ -918,7 +918,7 @@ def _quality_aware_operational_emitter(
     """Copy only the already-collected firmware dimension into session evidence."""
 
     def emit(event: Mapping[str, object]) -> object:
-        emitted_event = event
+        emitted_event: Mapping[str, object] = event
         if quality is not None and event.get("event") == "pendant_observation":
             firmware = event.get("firmware")
             if isinstance(firmware, str):
@@ -1245,7 +1245,7 @@ def _lock_context(error: BaseException) -> Mapping[str, object] | None:
     if not callable(serializer):
         return None
     result = cast(Callable[[], object], serializer)()
-    return result if isinstance(result, Mapping) else None
+    return cast(Mapping[str, object], result) if isinstance(result, Mapping) else None
 
 
 def sanitize_error_message(error: BaseException) -> str:

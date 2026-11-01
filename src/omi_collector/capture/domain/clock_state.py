@@ -109,6 +109,73 @@ class ClockAnchor:
             raise ClockStateError("clock anchor is invalid")
 
 
+def _fields(value: dict[object, object], required: set[str], optional: frozenset[str] | set[str] = frozenset()) -> None:
+    if not required <= value.keys() or value.keys() - required - optional:
+        raise ValueError("clock state fields are invalid")
+
+
+def _int_field(value: object) -> int:
+    if not isinstance(value, int):
+        raise ValueError("clock state integer is invalid")
+    return value
+
+
+def _number_field(value: object) -> float:
+    if not isinstance(value, (int, float)):
+        raise ValueError("clock state number is invalid")
+    return value
+
+
+def _text_field(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("clock state text is invalid")
+    return value
+
+
+def _parse_range(value: dict[object, object]) -> ClockRange:
+    _fields(
+        value, {"start_sequence", "next_sequence", "offset_seconds", "uncertainty_seconds", "confidence", "source_id"}
+    )
+    offset, uncertainty = value["offset_seconds"], value["uncertainty_seconds"]
+    return ClockRange(
+        _int_field(value["start_sequence"]),
+        _int_field(value["next_sequence"]),
+        None if offset is None else _number_field(offset),
+        None if uncertainty is None else _number_field(uncertainty),
+        _text_field(value["confidence"]),
+        _text_field(value["source_id"]),
+    )
+
+
+def _parse_intent(value: dict[object, object]) -> ClockIntent:
+    _fields(
+        value,
+        {"operation_id", "phase", "observed_epoch", "target_epoch", "host_midpoint", "write_sequence_before"},
+        {"write_sequence_after"},
+    )
+    after = value.get("write_sequence_after")
+    return ClockIntent(
+        _text_field(value["operation_id"]),
+        _text_field(value["phase"]),
+        _int_field(value["observed_epoch"]),
+        _int_field(value["target_epoch"]),
+        _number_field(value["host_midpoint"]),
+        _int_field(value["write_sequence_before"]),
+        None if after is None else _int_field(after),
+    )
+
+
+def _parse_anchor(value: dict[object, object]) -> ClockAnchor:
+    _fields(value, {"sequence_frontier", "offset_seconds", "uncertainty_seconds", "confidence", "source_id"})
+    return ClockAnchor(
+        _int_field(value["sequence_frontier"]),
+        _number_field(value["offset_seconds"]),
+        _number_field(value["uncertainty_seconds"]),
+        _text_field(value["confidence"]),
+        _text_field(value["source_id"]),
+    )
+
+
 def _valid_anchor_frontier(value: object) -> bool:
     return type(value) is int and value >= 0
 
@@ -242,11 +309,14 @@ class ClockState:
         ):
             raise ClockStateError("clock state payload is invalid")
         try:
-            ranges = tuple(ClockRange(**value) for value in values if isinstance(value, dict))
+            values = cast(list[object], values)
+            ranges = tuple(
+                _parse_range(cast(dict[object, object], value)) for value in values if isinstance(value, dict)
+            )
             if len(ranges) != len(values):
                 raise ClockStateError("clock state range is invalid")
-            intent = ClockIntent(**intent_value) if isinstance(intent_value, dict) else None
-            anchor = ClockAnchor(**anchor_value) if isinstance(anchor_value, dict) else None
+            intent = _parse_intent(cast(dict[object, object], intent_value)) if isinstance(intent_value, dict) else None
+            anchor = _parse_anchor(cast(dict[object, object], anchor_value)) if isinstance(anchor_value, dict) else None
             return cls(ranges, intent, anchor)
         except (TypeError, ValueError) as error:
             raise ClockStateError("clock state payload is invalid") from error

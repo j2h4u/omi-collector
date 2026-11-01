@@ -735,7 +735,7 @@ def _decode(payload: str) -> dict[str, object]:
         value = cast(object, json.loads(payload, object_pairs_hook=_unique_keys))
     except (json.JSONDecodeError, TypeError, ValueError) as error:
         raise StateDBError("state payload is malformed") from error
-    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in cast(dict[object, object], value)):
         raise StateDBError("state payload is not an object")
     return cast(dict[str, object], value)
 
@@ -767,7 +767,7 @@ def _fetchall(cursor: sqlite3.Cursor) -> list[sqlite3.Row]:
     if not isinstance(result, list):
         raise StateDBError("state database returned invalid rows")
     rows: list[sqlite3.Row] = []
-    for row in result:
+    for row in cast(list[object], result):
         if not isinstance(row, sqlite3.Row):
             raise StateDBError("state database returned an invalid row")
         rows.append(row)
@@ -1123,7 +1123,7 @@ def _upgrade_replay_proof_root(connection: sqlite3.Connection) -> None:
 
 
 def _validate_audio_schema(connection: sqlite3.Connection, *, version: int = _SCHEMA_VERSION) -> None:
-    schemas = {
+    schemas: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {
         _LEGACY_SCHEMA_VERSION: (_V2_AUDIO_TABLES, _V2_AUDIO_DDL),
         _PREVIOUS_SCHEMA_VERSION: (_V3_AUDIO_TABLES, _V3_AUDIO_DDL),
         _SCHEMA_VERSION: (_AUDIO_TABLES, _AUDIO_DDL),

@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 _HEX_256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _UINT32_MAX: Final = 0xFFFFFFFF
@@ -159,7 +159,7 @@ def canonical_manifest(*, artifact_id: str, order: int, audio_sha256: str, proje
     _uint(projection.packet_count, _UINT64_MAX, "packet_count", positive=True)
     timeline = _manifest_timeline(projection)
     boundaries = _manifest_boundaries(projection)
-    result = {
+    result: dict[str, object] = {
         "format": "omi-audio-v2",
         "id": artifact_id,
         "order": order,
@@ -233,16 +233,17 @@ def parse_v2_acknowledged(value: object) -> tuple[tuple[str, str], ...]:
     """Parse acknowledgement entries while ignoring consumer-owned root fields."""
     if not isinstance(value, Mapping):
         raise ValueError("checkpoint must be a mapping")
-    acknowledged = value.get("acknowledged")
+    acknowledged = cast(Mapping[object, object], value).get("acknowledged")
     if not isinstance(acknowledged, list):
         raise ValueError("acknowledged must be a list")
     result: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for entry in acknowledged:
-        if not isinstance(entry, Mapping) or set(entry) != {"id", "audio_sha256"}:
+    for entry in cast(list[object], acknowledged):
+        if not isinstance(entry, Mapping) or set(cast(Mapping[object, object], entry)) != {"id", "audio_sha256"}:
             raise ValueError("acknowledgement entries must contain exactly id and audio_sha256")
-        artifact_id = _digest(entry["id"], "id")
-        audio_digest = _digest(entry["audio_sha256"], "audio_sha256")
+        fields = cast(Mapping[object, object], entry)
+        artifact_id = _digest(fields["id"], "id")
+        audio_digest = _digest(fields["audio_sha256"], "audio_sha256")
         if artifact_id in seen:
             raise ValueError("duplicate acknowledgement id")
         seen.add(artifact_id)

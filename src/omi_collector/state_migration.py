@@ -106,7 +106,9 @@ def _validate_v2_only_publication(connection: sqlite3.Connection) -> None:
     except (json.JSONDecodeError, TypeError) as error:
         raise StateMigrationError("Collector publication contract is invalid") from error
     try:
-        parsed_contract = _parse_publication_contract(contract if isinstance(contract, dict) else None)
+        parsed_contract = _parse_publication_contract(
+            cast(dict[str, object], contract) if isinstance(contract, dict) else None
+        )
     except ReadyBundleError as error:
         raise InternalAudioCutoverRequiredError(
             "Collector publication contract must be v2 before this release"
@@ -145,7 +147,11 @@ def _validate_v2_only_publication(connection: sqlite3.Connection) -> None:
     except (json.JSONDecodeError, TypeError) as error:
         raise StateMigrationError("Collector publication ledger is invalid") from error
     if any(
-        not isinstance(entry, dict) or (entry.get("format") != "omi-audio-v2" and entry.get("state") != "retired")
+        not isinstance(entry, dict)
+        or (
+            cast(dict[str, object], entry).get("format") != "omi-audio-v2"
+            and cast(dict[str, object], entry).get("state") != "retired"
+        )
         for entry in entries
     ):
         raise InternalAudioCutoverRequiredError("active legacy publication must retire before this release")

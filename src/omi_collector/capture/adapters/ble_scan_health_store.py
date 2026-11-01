@@ -11,6 +11,9 @@ from uuid import uuid4
 from dbus_fast import BusType, Message
 from dbus_fast.aio import MessageBus
 
+from omi_collector.json_type_guards import is_dict as _is_dict
+from omi_collector.json_type_guards import is_list as _is_list
+
 from ..application.ble_scan_health import ScanIncidentContext
 from ..application.owned_work import joined_to_thread
 from .ble_scan_diagnostics import ScanDiagnostics as HciScanDiagnostics
@@ -46,6 +49,7 @@ class BleScanIncidentStore:
         # Take the passive, bounded snapshot before entering SQLite's write transaction.
         if self._pending_open is None:
             detected_at = _now()
+            snapshot: dict[str, object]
             try:
                 snapshot = await self._diagnostics.snapshot(context.generation)
             except asyncio.CancelledError:
@@ -87,10 +91,10 @@ class BleScanIncidentStore:
             if incident is None:
                 return False
             history = transaction.get(StateKind.BLE_SCAN_INCIDENT, _HISTORY)
-            entries = history.get("entries", []) if history is not None else []
-            if not isinstance(entries, list):
+            entries: object = history.get("entries", []) if history is not None else []
+            if not _is_list(entries):
                 entries = []
-            entries = [entry for entry in entries if isinstance(entry, dict)]
+            entries = [entry for entry in entries if _is_dict(entry)]
             context = incident.get("context")
             entries.append(
                 {
@@ -99,7 +103,7 @@ class BleScanIncidentStore:
                     "resolved_at": _now(),
                     "context": incident.get("context"),
                     "diagnostics": incident.get("diagnostics"),
-                    "reason": context.get("reason") if isinstance(context, dict) else None,
+                    "reason": context.get("reason") if _is_dict(context) else None,
                     "resolution": reason,
                     "generation": generation,
                 }
@@ -121,20 +125,20 @@ def read_ble_scan_incident(state_db: StateDB | StateTransaction) -> dict[str, ob
         return {
             "incident_id": incident.get("incident_id"),
             "status": "open",
-            "reason": context.get("reason") if isinstance(context, dict) else None,
+            "reason": context.get("reason") if _is_dict(context) else None,
             "detected_at": incident.get("detected_at"),
             "resolved_at": None,
         }
     history = state_db.get(StateKind.BLE_SCAN_INCIDENT, _HISTORY)
     entries = history.get("entries") if history is not None else None
-    if not isinstance(entries, list) or not entries or not isinstance(entries[-1], dict):
+    if not _is_list(entries) or not entries or not _is_dict(entries[-1]):
         return None
     latest = entries[-1]
     context = latest.get("context")
     return {
         "incident_id": latest.get("incident_id"),
         "status": "resolved",
-        "reason": context.get("reason") if isinstance(context, dict) else latest.get("reason"),
+        "reason": context.get("reason") if _is_dict(context) else latest.get("reason"),
         "detected_at": latest.get("detected_at"),
         "resolved_at": latest.get("resolved_at"),
     }
@@ -176,6 +180,7 @@ class ScanDiagnosticsFacade:
         worker_generation = self._worker_generation
         if worker_generation is None:
             return {"hci": {"available": False, "failure": "generation_unavailable"}, "bluez": _unavailable()}
+        hci: dict[str, object]
         try:
             available = await self._worker.probe(worker_generation)
             if self._generation != generation or self._worker.generation != worker_generation:

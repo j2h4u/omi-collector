@@ -217,7 +217,7 @@ def _verified_boundaries(
 
 
 def _overlay(segments: list[ClockSegment], incoming: ClockSegment) -> list[ClockSegment]:
-    output = []
+    output: list[ClockSegment] = []
     for item in segments:
         if item.next_sequence <= incoming.start_sequence or item.start_sequence >= incoming.next_sequence:
             output.append(item)

@@ -284,6 +284,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "281e73462587e7d0fefb707c4c497f228173db744ffdf96cb5b6cc907073b059",
+      "count": 1,
+      "reason": "Service and characteristic lookups use distinct Bleak getters and containers despite shared UUID normalization. Reviewed pair: src/omi_collector/capture/adapters/bleak_transport.py:208-223 ~ src/omi_collector/capture/adapters/bleak_transport.py:226-242."
+    },
+    {
+      "detector": "jscpd",
       "identity": "28455d1933a46eb7696ddc41a424e998d335fea402d319218eb9095f2e0707e5",
       "count": 1,
       "reason": "Constructed, preparing, prepared, reading and finalizing handlers admit different event sets and return different rejection/state outcomes. Common Admit/Ignore construction already uses shared result types; preserve the state-specific transition tables. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:324-332 ~ src/omi_collector/capture/adapters/attempt_writer_machine.py:344-352."
@@ -335,6 +341,12 @@
       "identity": "307131c8bd37a2026c750842ea8485539800875c583bb7bfc3574da6e13ae599",
       "count": 1,
       "reason": "Spool window and firmware lifetime as_dict methods expose independent public field sets whose semantics differ. Reviewed pair: src/omi_collector/spool_metrics.py:36-45 ~ src/omi_collector/spool_metrics.py:59-67."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "30f51ec24c70afcebd71bc1a26d994751e505aa1fd3fc5f88ecd63940fadfd4e",
+      "count": 1,
+      "reason": "Legacy correction and membership parse different exact schemas with distinct field validity and error contracts. Reviewed pair: src/omi_collector/capture/adapters/legacy_clock_import.py:268-275 ~ src/omi_collector/capture/adapters/legacy_clock_import.py:318-325."
     },
     {
       "detector": "jscpd",
@@ -437,6 +449,12 @@
       "identity": "3f3aa66461d9f1517eae84f325d1ebd349e843bb999726774a2e53c4a4433829",
       "count": 1,
       "reason": "Audio state handlers enforce different admissible source phases and event guards for data, barriers, terminalization, conflict, custody and retirement. Their result construction is shared through AudioDecision; preserve the explicit independent transition rules. Reviewed pair: src/omi_collector/capture/domain/internal_audio_machine.py:189-196 ~ src/omi_collector/capture/domain/internal_audio_machine.py:257-264."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "3fdc89ec0848875a0deb9b5ebb743ce1a4b507d72d92158ffc590689566485e7",
+      "count": 1,
+      "reason": "Drain identifier and battery percentage validate distinct required keys and ranges; timestamp validation is already shared. Reviewed pair: src/omi_collector/capture/adapters/public_drain.py:349-356 ~ src/omi_collector/capture/adapters/public_drain.py:357-364."
     },
     {
       "detector": "jscpd",
@@ -563,6 +581,12 @@
       "identity": "4edd50e9730b14fbd881da73dcc8006494a7166853e0a6f024d253dbb9c7a23d",
       "count": 1,
       "reason": "HCI event parsers read different byte offsets, status/handle layouts and minimum lengths (connection, update, parameter request, data length, disconnect). Keep per-opcode decoding and malformed diagnostics; integer endian conversion is already a platform operation. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:514-521 ~ src/omi_collector/capture/adapters/ble_link_observability.py:543-547."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "4f1f1f8839cfe648789852f473b2d1b964c9c6458894a5069384c83c35c53c6b",
+      "count": 1,
+      "reason": "Concrete dict and list guards and abstract mapping and sequence guards accept different runtime values and narrow distinct types. Reviewed pair: src/omi_collector/json_type_guards.py:19-24 ~ src/omi_collector/json_type_guards.py:7-12."
     },
     {
       "detector": "jscpd",
@@ -704,12 +728,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "66c470328a44c8a343a7fb7f93c0ad3813dd421b8aa4748667ada02605988814",
-      "count": 1,
-      "reason": "Public ring, drain and battery JSON members have different exact field sets, numeric ranges and identifier/timestamp rules. Shared timestamp validation is already reused; keep their distinct externally visible schemas. Reviewed pair: src/omi_collector/capture/adapters/public_drain.py:348-354 ~ src/omi_collector/capture/adapters/public_drain.py:355-361."
-    },
-    {
-      "detector": "jscpd",
       "identity": "675ec104d0d3f80576c55fe572e437374bb0029827e5bdc534847b46b85f827e",
       "count": 1,
       "reason": "One presence policy binds distinct scan/cancellation defaults. Overlapping field declarations are not multiple policy implementations. Reviewed pair: src/omi_collector/capture/application/presence.py:68-73 ~ src/omi_collector/capture/application/presence.py:69-74."
@@ -833,12 +851,6 @@
       "identity": "7d2ea76833f57e7383d7ab2fff7efab2dc9ffcc2fbbcdd938c40bd6c59ec1843",
       "count": 1,
       "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/domain/internal_audio_machine.py:337-358 ~ src/omi_collector/capture/domain/quarantine_machine.py:31-51."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "7e28c84c11eb8d3e24e262914e921daaf29c199744cf819dfbbff2139e88032e",
-      "count": 1,
-      "reason": "Public ring, drain and battery JSON members have different exact field sets, numeric ranges and identifier/timestamp rules. Shared timestamp validation is already reused; keep their distinct externally visible schemas. Reviewed pair: src/omi_collector/capture/adapters/public_drain.py:343-348 ~ src/omi_collector/capture/adapters/public_drain.py:358-363."
     },
     {
       "detector": "jscpd",
@@ -995,12 +1007,6 @@
       "identity": "9498a2d2513ebcafde26174051eb5b5f979c982a5731a0f0d6dd64587e776ee9",
       "count": 1,
       "reason": "Prepare-leg, READ_BEGIN and interruption are distinct durable FSM mutations with different SQL predicates, state transitions and durability diagnostics. Their shared rollback/storage-fault handling already calls common helpers; do not replace them with a generic transaction effect. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:683-690 ~ src/omi_collector/capture/adapters/internal_audio_store.py:745-754."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "94c5e165db8057308ba70285ea28296935ba52e9cfd39b07ef374a27f4caf482",
-      "count": 1,
-      "reason": "Bleak service collections and service characteristic collections expose different get_service/get_characteristic and iterable locations. Both already share UUID normalization; retain the two explicit library API adapters without a reflective collection abstraction. Reviewed pair: src/omi_collector/capture/adapters/bleak_transport.py:208-219 ~ src/omi_collector/capture/adapters/bleak_transport.py:222-238."
     },
     {
       "detector": "jscpd",
@@ -1172,12 +1178,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "ac4c8f14857531e104a2c15e8f8aef586636a3c4c52211d386b3a14bde51f3e8",
-      "count": 1,
-      "reason": "StateDB and InternalAudioStore consume cursors under different row/error contracts (StateDBError versus InternalAudioStoreError). Cursor closing is required at both module boundaries; importing private row helpers or widening their contracts is not justified by this short guard. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:752-767 ~ src/omi_collector/capture/adapters/internal_audio_store.py:1601-1616."
-    },
-    {
-      "detector": "jscpd",
       "identity": "ac85a975caa1cbaf9e363f53b22628dd0ca1e27a4ebc46a6dcdcf275203fea1d",
       "count": 1,
       "reason": "Both modules use a six-line cursor-consumption idiom accepting sqlite.Row or tuple results, while stricter StateDB/audio helpers enforce different errors. Sharing a new generic cursor module or importing unrelated staging/quarantine internals adds coupling beyond this small resource-closing idiom. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:64-78 ~ src/omi_collector/capture/adapters/staging_store.py:133-147."
@@ -1340,12 +1340,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "c7ee60a0390bb2084c372e6bedc176a6635c3b7789fe530974abc20439ba5bad",
-      "count": 1,
-      "reason": "Bleak service collections and service characteristic collections expose different get_service/get_characteristic and iterable locations. Both already share UUID normalization; retain the two explicit library API adapters without a reflective collection abstraction. Reviewed pair: src/omi_collector/capture/adapters/bleak_transport.py:205-216 ~ src/omi_collector/capture/adapters/bleak_transport.py:219-230."
-    },
-    {
-      "detector": "jscpd",
       "identity": "c859eb2b1931e13767d50e7ae1e912e84ce42906a9a79173840e54e13f2f5aa1",
       "count": 1,
       "reason": "BenchmarkContext, CaptureSource, quarantine admission snapshots and v2 proof/stage/resume records carry different owners, persisted schemas and custody lifetimes. Field-name normalization erases those distinctions; preserve these explicit record types. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1191-1208 ~ src/omi_collector/capture/adapters/ready_bundles.py:1207-1224."
@@ -1409,6 +1403,18 @@
       "identity": "d05bfac9a1fcb231ffa57eff1e9c8bd7df9613cb51d90b90cf1b30777811cc4a",
       "count": 1,
       "reason": "One progress serializer conditionally exposes different error/reason/duration fields. The overlapping windows do not establish a second serializer. Reviewed pair: src/omi_collector/capture/cli.py:125-132 ~ src/omi_collector/capture/cli.py:127-134."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "d0ab6903c1dbf7d410b1c19fabe6ab8c19396569bf7d9a3d16aeca4a2fcf82b4",
+      "count": 1,
+      "reason": "Overlapping standard import blocks are declarations, not a repeated operation. Reviewed pair: scripts/bench_omic16_internal_sqlite.py:20-26 ~ scripts/bench_omic16_internal_sqlite.py:25-30."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "d13a2e4c8425e9506fe252113d10548c26fc9fd9b581b796f7c07d724c4b9634",
+      "count": 1,
+      "reason": "StateDB and InternalAudioStore close SQLite cursors and validate errors in distinct error domains. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:752-767 ~ src/omi_collector/capture/adapters/internal_audio_store.py:1613-1628."
     },
     {
       "detector": "jscpd",
@@ -1607,6 +1613,12 @@
       "identity": "ec8b1d5e6f5c521a1e27038af967f589a9367a658d483ce9b224ec0f89e30252",
       "count": 1,
       "reason": "The reported models and as_dict methods encode separate PHY outcomes, connection parameters, loss facts, lock context, quality events and status/lifetime aggregates. Explicit schema keys and units are public contracts; do not combine them because normalized field assignments look alike. Reviewed pair: src/omi_collector/capture/application/quality_metrics.py:162-171 ~ src/omi_collector/operator_status.py:83-92."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "ecb94ccb9e6778b2275e1210b68361437c1dbbe961cfbc73a2912f867b7a420a",
+      "count": 1,
+      "reason": "Service and characteristic lookups have distinct Bleak container and getter contracts. Reviewed pair: src/omi_collector/capture/adapters/bleak_transport.py:205-216 ~ src/omi_collector/capture/adapters/bleak_transport.py:223-234."
     },
     {
       "detector": "jscpd",
@@ -1814,12 +1826,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "16adeec1755a11d1505be424314a1ad24e55d64997373271bce00a5671b79750",
-      "count": 1,
-      "reason": "Raw debug RSSI decoding validates an optional signed numeric observation; sync-progress decoding validates a nested progress mapping. They share timestamp/object checks but expose different event schemas and missing-value rules. Reviewed pair: src/omi_collector/operator_status.py:367-378 ~ src/omi_collector/operator_status.py:426-436."
-    },
-    {
-      "detector": "pyscn",
       "identity": "181ccaa3948f48188e16be4fb5473811d1a94bdbd594fa4dfb36befdf5ed6255",
       "count": 1,
       "reason": "Hash and physical-write paths each count their own one-pass packet iterator while invoking different existing Ogg operations. The four-line local counter must follow each independently consumed stream; a mutable counting-wrapper abstraction would add more state than it removes. Reviewed pair: src/omi_collector/capture/adapters/v2_audio.py:32-36 ~ src/omi_collector/capture/adapters/v2_audio.py:50-54."
@@ -1853,6 +1859,12 @@
       "identity": "1c026f7ba3747bd822bca4577c10c6c0450c1c284968282ace16dc895f04eb15",
       "count": 1,
       "reason": "The proof-root inventory reads all formats and includes format for custody revision and reconciliation; active v2 proof lookup filters by format and lifecycle and has its own result layout and error context. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1597-1609 ~ src/omi_collector/capture/adapters/ready_bundles.py:3879-3891."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "1ed058179deb8003521996801da831b0ab61bb6ffa3cfd68c80634167a6b6ce8",
+      "count": 1,
+      "reason": "Collect and sync renderers expose distinct status, advance, and no-data behavior. Reviewed pair: src/omi_collector/capture/cli.py:565-586 ~ src/omi_collector/capture/cli.py:589-602."
     },
     {
       "detector": "pyscn",
@@ -1913,6 +1925,12 @@
       "identity": "2f0389232eb9a83d62b9e897adc5f08fac17642a965468112ca1bb48e778e7ed",
       "count": 1,
       "reason": "Durability latch checking and post-error conflict-disposition inspection have different stored keys, witnesses and comparison results. Keep fail-closed read logic at each transaction boundary. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:3233-3248 ~ src/omi_collector/capture/adapters/ready_bundles.py:4431-4444."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "3092273cf7e921f043051310ce58f9bd134e8b125ecdf2672e2d414dd571d0c1",
+      "count": 1,
+      "reason": "Ring unread count and battery percentage validate different fields and ranges; timestamp handling is shared. Reviewed pair: src/omi_collector/capture/adapters/public_drain.py:344-351 ~ src/omi_collector/capture/adapters/public_drain.py:361-368."
     },
     {
       "detector": "pyscn",
@@ -2006,6 +2024,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "5256022fe7b2e68ab9991763dfdd26ed132cff48cdd2fd00e392981897b4b6e6",
+      "count": 1,
+      "reason": "Gap endpoints validate ordered gaps while source lineage validates hashes and physical coverage. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:769-779 ~ src/omi_collector/capture/adapters/ready_bundles.py:806-816."
+    },
+    {
+      "detector": "pyscn",
       "identity": "55aa666f07a8d13aa3345ac26e7755ccc94f19186e3b167d657f9ad90f8b7622",
       "count": 1,
       "reason": "Effective connection parameters and remote requested parameter ranges have different field meanings and units. Their immutable models/serializers must remain distinct HCI contracts. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:186-198 ~ src/omi_collector/capture/adapters/ble_link_observability.py:202-216."
@@ -2021,6 +2045,12 @@
       "identity": "564f6e146538f541ed3034d28bb1050cb5edc4746de12d70898447b7b7e0ecaf",
       "count": 1,
       "reason": "Historical v2 validator admits an upgrade source; current-runtime validator rejects upgrade-required versions, validates public-mode policy and has different fatal categories. Common structural validators are already reused. Reviewed pair: src/omi_collector/state_migration.py:241-254 ~ src/omi_collector/state_migration.py:73-93."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "5a85e0bc545d0a3a4fa25acf46794d942eb0786878dcbae479f1cbd5e0a6a4fb",
+      "count": 1,
+      "reason": "Service and characteristic queries use distinct Bleak getters and container types despite similar UUID matching. Reviewed pair: src/omi_collector/capture/adapters/bleak_transport.py:208-223 ~ src/omi_collector/capture/adapters/bleak_transport.py:226-242."
     },
     {
       "detector": "pyscn",
@@ -2228,6 +2258,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "8cb2b64fe4ad92cd8becc04eec04e158e1e155c45435b652343236985c7f0761",
+      "count": 1,
+      "reason": "Optional numeric debug RSSI and nested sync progress use different schemas and missing-value behavior. Reviewed pair: src/omi_collector/operator_status.py:413-424 ~ src/omi_collector/operator_status.py:472-482."
+    },
+    {
+      "detector": "pyscn",
       "identity": "8d93416789538553ada9706cd259fd5de3ee39caf221b5f8ef8d30ed33c28ba6",
       "count": 1,
       "reason": "pending_attempts enforces restart attempt uniqueness; _typed_publication_source_ids enumerates publisher admission/resume candidates. Different lifecycle queries and scheduler authorities share only existing connection mechanics. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
@@ -2423,12 +2459,6 @@
       "identity": "cece9b7a0c8b4e3ecda087a522ca1185eb65f2704c4d34ea670f8c218409de87",
       "count": 1,
       "reason": "Device lock context and firmware lifetime metrics have unrelated ownership, units and public keys. Their short immutable record serializers are not duplicated domain behavior. Reviewed pair: src/omi_collector/capture/adapters/staging_contract.py:35-55 ~ src/omi_collector/spool_metrics.py:49-67."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "cf5590cf27346c66c5d51924567793ef15ccf2e07d610dc908866f4717f2ebe0",
-      "count": 1,
-      "reason": "Bleak get_service collection lookup and get_characteristic lookup adapt different library API containers. UUID normalization is already shared; keep the two explicit APIs. Reviewed pair: src/omi_collector/capture/adapters/bleak_transport.py:208-219 ~ src/omi_collector/capture/adapters/bleak_transport.py:222-238."
     },
     {
       "detector": "pyscn",

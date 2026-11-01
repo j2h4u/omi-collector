@@ -21,6 +21,11 @@ from math import ceil
 from pathlib import Path
 from typing import Literal, NoReturn, Protocol, TypeGuard, cast
 
+from omi_collector.json_type_guards import is_dict as _is_dict
+from omi_collector.json_type_guards import is_list as _is_list
+from omi_collector.json_type_guards import is_mapping as _is_mapping
+from omi_collector.json_type_guards import is_tuple as _is_tuple
+
 from ...config import ReadyConfig
 from ..application.storage_fault import TransientInternalAudioStorageError
 from ..domain.clock_state import ClockState, ClockStateError
@@ -363,7 +368,7 @@ def _validate_utc(value: object) -> None:
 
 
 def _validate_utc_mapping(value: object) -> None:
-    if not isinstance(value, dict):
+    if not _is_dict(value):
         raise ReadyBundleError("ready manifest UTC mapping is invalid")
     if set(value) not in (
         {"observation_id", "offset_seconds", "uncertainty_seconds"},
@@ -446,7 +451,7 @@ def _ledger_entry(
     }
 
 
-def _valid_publication_dates(entry: Mapping[str, object]) -> bool:
+def _valid_publication_dates(entry: Mapping[str, object] | Mapping[object, object]) -> bool:
     if not _PUBLICATION_DATE_FIELDS.intersection(entry):
         return True
     if not _PUBLICATION_DATE_FIELDS.issubset(entry):
@@ -491,7 +496,7 @@ def resume_retired_public_audio_v2(ready_root: Path, state_db: StateDB) -> None:
     _prepare_directory(ready_root)
     entries = cast(dict[str, object], _read_ledger(state_db)["bundles"])
     for artifact_id, entry in entries.items():
-        if isinstance(entry, dict) and entry.get("format") == "omi-audio-v2" and entry.get("state") == "retired":
+        if _is_dict(entry) and entry.get("format") == "omi-audio-v2" and entry.get("state") == "retired":
             _remove_v2_artifact(ready_root / artifact_id, "retired public audio v2 artifact")
 
 
@@ -586,7 +591,7 @@ def _require_v2_acknowledgement_metadata(
         seen.add(artifact_id)
         entry = entries.get(artifact_id)
         if (
-            not isinstance(entry, dict)
+            not _is_dict(entry)
             or entry.get("format") != "omi-audio-v2"
             or entry.get("audio_sha256") != audio_sha256
             or entry.get("state") not in {"ready", "retired"}
@@ -635,13 +640,13 @@ def _remove_v2_artifact(
 
 
 def _entry_next_sequence(entry: object) -> int:
-    if not isinstance(entry, dict):
+    if not _is_dict(entry):
         raise ReadyBundleError("ready publication ledger is invalid")
     return _nonnegative_int(entry["next_sequence"])
 
 
 def _entry_count(entry: object) -> int:
-    if not isinstance(entry, dict):
+    if not _is_dict(entry):
         raise ReadyBundleError("ready publication ledger is invalid")
     return (
         _entry_next_sequence(entry)
@@ -674,7 +679,7 @@ def _read_ledger(state_db: StateDB) -> dict[str, object]:
 
 
 def _validate_ledger_values(bundles: object, frontier: object) -> None:
-    if not isinstance(bundles, dict):
+    if not _is_dict(bundles):
         raise ReadyBundleError("ready publication ledger is invalid")
     if isinstance(frontier, bool) or not isinstance(frontier, int) or frontier < 0:
         raise ReadyBundleError("ready publication ledger is invalid")
@@ -687,7 +692,7 @@ def _validate_ledger_entries(bundles: Mapping[str, object]) -> None:
 
 
 def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
-    if not isinstance(bundle_id, str) or not isinstance(entry, dict):
+    if not isinstance(bundle_id, str) or not _is_dict(entry):
         return False
     if not _is_sha256(bundle_id) or not _is_sha256(entry.get("records_sha256")):
         return False
@@ -715,7 +720,9 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
     )
 
 
-def _valid_v2_ledger_entry(_bundle_id: str, entry: Mapping[str, object], start: object, end: object) -> bool:
+def _valid_v2_ledger_entry(
+    _bundle_id: str, entry: Mapping[str, object] | Mapping[object, object], start: object, end: object
+) -> bool:
     valid = all(
         (
             set(entry) == _V2_LEDGER_FIELDS | ({"gaps"} if "gaps" in entry else set()),
@@ -749,21 +756,25 @@ def _valid_v2_ledger_entry(_bundle_id: str, entry: Mapping[str, object], start: 
     return _parse_sources(entry.get("sources"), facts) is not None
 
 
-def _parse_ledger_gaps(entry: Mapping[str, object], start: int, end: int) -> tuple[tuple[int, int], ...] | None:
+def _parse_ledger_gaps(
+    entry: Mapping[str, object] | Mapping[object, object], start: int, end: int
+) -> tuple[tuple[int, int], ...] | None:
     if "gaps" not in entry:
         return ()
     value = entry["gaps"]
-    if not isinstance(value, list) or not value:
+    if not _is_list(value) or not value:
         return None
     gaps: list[tuple[int, int]] = []
     cursor = start
     for item in value:
-        if not isinstance(item, list) or len(item) != _GAP_ENDPOINT_COUNT:
+        if not _is_list(item) or len(item) != _GAP_ENDPOINT_COUNT:
             return None
         left, right = item
-        if not _valid_range(left, right) or left <= cursor or right >= end:
+        if not _valid_range(left, right):
             return None
         assert isinstance(left, int) and isinstance(right, int)
+        if left <= cursor or right >= end:
+            return None
         gaps.append((left, right))
         cursor = right
     return tuple(gaps)
@@ -788,12 +799,12 @@ def source_lineage(entry: Mapping[str, object]) -> tuple[SourceLineage, ...]:
 
 
 def _parse_sources(value: object, facts: _BundleFacts) -> tuple[SourceLineage, ...] | None:
-    if not isinstance(value, list) or not value:
+    if not _is_list(value) or not value:
         return None
     sources: list[SourceLineage] = []
     previous_end: int | None = None
     for item in value:
-        if not isinstance(item, dict) or set(item) != _LEDGER_SOURCE_FIELDS:
+        if not _is_dict(item) or set(item) != _LEDGER_SOURCE_FIELDS:
             return None
         start, end, digest = item.get("start_sequence"), item.get("next_sequence"), item.get("raw_sha256")
         if not _valid_range(start, end) or not _is_sha256(digest):
@@ -823,7 +834,7 @@ def _sources_cover_runs(sources: tuple[SourceLineage, ...], facts: _BundleFacts)
     return run_index == len(runs) - 1 and cursor == runs[-1][1]
 
 
-def _entry_gaps(entry: Mapping[str, object]) -> tuple[tuple[int, int], ...]:
+def _entry_gaps(entry: Mapping[str, object] | Mapping[object, object]) -> tuple[tuple[int, int], ...]:
     start, end = entry["start_sequence"], entry["next_sequence"]
     assert isinstance(start, int) and isinstance(end, int)
     gaps = _parse_ledger_gaps(entry, start, end)
@@ -953,7 +964,7 @@ def _migration_ledger(connection: sqlite3.Connection) -> dict[str, object]:
                 raise ValueError("ledger row type")
             value = cast(object, json.loads(payload))
             if item_id == "frontier":
-                if not isinstance(value, dict) or set(value) != {"value"}:
+                if not _is_dict(value) or set(value) != {"value"}:
                     raise ValueError("frontier")
                 frontier = value["value"]
             else:
@@ -1019,7 +1030,7 @@ def _stream_sql_rows(cursor: sqlite3.Cursor) -> Iterator[tuple[object, ...]]:
     try:
         while True:
             raw_batch = cast(object, cursor.fetchmany(_TYPED_PAGE_MAX))
-            if not isinstance(raw_batch, list):
+            if not _is_list(raw_batch):
                 raise ReadyBundleError("SQLite row stream returned an invalid batch")
             if not raw_batch:
                 return
@@ -1579,7 +1590,7 @@ def _typed_records(
         page_source = getattr(page, "source", None)
         page_after = getattr(page, "after_ordinal", None)
         records = getattr(page, "records", None)
-        if not isinstance(page_source, CaptureSource) or page_after != cursor or not isinstance(records, tuple):
+        if not isinstance(page_source, CaptureSource) or page_after != cursor or not _is_tuple(records):
             raise ReadyBundleError("typed source page is invalid")
         _require_typed_snapshot(page_source, admission)
         if not records or len(records) > requested:
@@ -2153,7 +2164,7 @@ def _persist_typed_packet_summaries(audio_store: InternalAudioStore, fresh_slice
 
 def _valid_packet_summary(payload: object, admission: _TypedAdmission) -> TypeGuard[dict[str, object]]:
     return (
-        isinstance(payload, dict)
+        _is_dict(payload)
         and set(payload)
         == {
             "schema_version",
@@ -2239,13 +2250,13 @@ def _v2_frontier(state_db: StateDB) -> _V2Frontier | None:
     return _v2_frontier_from_payload(payload)
 
 
-def _v2_frontier_from_payload(payload: Mapping[str, object]) -> _V2Frontier:
+def _v2_frontier_from_payload(payload: Mapping[str, object] | Mapping[object, object]) -> _V2Frontier:
     if set(payload) != {"version", "sequence", "time", "pending_overflow_size"} or payload["version"] != 1:
         raise ReadyBundleError("v2 publication frontier is invalid")
     sequence = payload["sequence"]
     time_value = payload["time"]
     pending = payload["pending_overflow_size"]
-    valid_time = isinstance(time_value, Mapping) and set(time_value) == {
+    valid_time = _is_mapping(time_value) and set(time_value) == {
         "quality",
         "seconds",
         "utc_uncertainty_seconds",
@@ -2421,6 +2432,17 @@ def _v2_projected_records(
 
 def _v2_descriptor(group: _V2PreparedGroup) -> bytes:
     initial = None if group.initial_frontier is None else _v2_frontier_payload(group.initial_frontier)
+    sources: list[dict[str, object]] = [
+        {
+            "source_id": item.admission.snapshot.source_id,
+            "start_ordinal": item.start_ordinal,
+            "record_count": item.record_count,
+            "sequence_start": item.start_sequence,
+            "next_sequence": item.next_sequence,
+            "raw_sha256": item.raw_sha256,
+        }
+        for item in group.slices
+    ]
     return _canonical(
         {
             "format": "omi-audio-v2-private-descriptor-v1",
@@ -2434,17 +2456,7 @@ def _v2_descriptor(group: _V2PreparedGroup) -> bytes:
                 "raw_sha256": group.facts.raw_sha256,
                 "gaps": [list(item) for item in group.facts.gaps],
             },
-            "sources": [
-                {
-                    "source_id": item.admission.snapshot.source_id,
-                    "start_ordinal": item.start_ordinal,
-                    "record_count": item.record_count,
-                    "sequence_start": item.start_sequence,
-                    "next_sequence": item.next_sequence,
-                    "raw_sha256": item.raw_sha256,
-                }
-                for item in group.slices
-            ],
+            "sources": sources,
             "record_projection_sha256": group.projection_sha256,
             "initial_frontier": initial,
             "final_frontier": _v2_frontier_payload(group.final_frontier),
@@ -2756,7 +2768,7 @@ def _v2_descriptor_basis(
         value = cast(object, json.loads(descriptor))
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
         raise ReadyBundleError("v2 stage descriptor is invalid") from error
-    if not isinstance(value, dict) or _canonical(value) != descriptor:
+    if not _is_dict(value) or _canonical(value) != descriptor:
         raise ReadyBundleError("v2 stage descriptor is invalid")
     if (
         set(value)
@@ -2779,12 +2791,12 @@ def _v2_descriptor_basis(
     final_value = value.get("final_frontier")
     clock_value = value.get("clock_state")
     projection_sha256 = value.get("record_projection_sha256")
-    if initial_value is not None and not isinstance(initial_value, Mapping):
+    if initial_value is not None and not _is_mapping(initial_value):
         raise ReadyBundleError("v2 stage descriptor frontier is invalid")
-    if not isinstance(final_value, Mapping) or not isinstance(clock_value, dict) or not _is_sha256(projection_sha256):
+    if not _is_mapping(final_value) or not _is_dict(clock_value) or not _is_sha256(projection_sha256):
         raise ReadyBundleError("v2 stage descriptor frontier is invalid")
     try:
-        clock_state = ClockState.from_payload(clock_value)
+        clock_state = ClockState.from_payload(cast(dict[str, object], clock_value))
     except ClockStateError as error:
         raise ReadyBundleError("v2 stage clock basis is invalid") from error
     initial = None if initial_value is None else _v2_frontier_from_payload(initial_value)
@@ -3630,7 +3642,7 @@ def _read_v2_ready_source(
     if audio_digest != entry["audio_sha256"] or manifest_digest != entry["manifest_sha256"]:
         raise ReadyBundleError("v2 ready artifact digest conflicts with its ledger")
     manifest_value = _read_json(manifest)
-    if not isinstance(manifest_value, dict) or manifest_value.get("format") != "omi-audio-v2":
+    if not _is_dict(manifest_value) or manifest_value.get("format") != "omi-audio-v2":
         raise ReadyBundleError("v2 ready manifest is invalid")
     if (
         manifest_value.get("id") != path.name
@@ -3769,7 +3781,7 @@ def _require_v2_prior_custody(
         key: value
         for key, value in entries.items()
         if key != stage.artifact_id
-        and isinstance(value, dict)
+        and _is_dict(value)
         and (value.get("format") == "omi-audio-v2" or value.get("state") == "retired")
     }
     proof_rows = tuple(row for row in _replay_proof_rows(state_db) if row[0] != stage.artifact_id)
@@ -3840,7 +3852,7 @@ def _v2_ready_custody(
     entries = {
         bundle_id: cast(dict[str, object], entry)
         for bundle_id, entry in cast(dict[str, object], ledger["bundles"]).items()
-        if isinstance(entry, dict) and (entry.get("format") == "omi-audio-v2" or entry.get("state") == "retired")
+        if _is_dict(entry) and (entry.get("format") == "omi-audio-v2" or entry.get("state") == "retired")
     }
     revision = source_revision(ready_root)
     proof_revision = _replay_proof_rows(state_db)
@@ -4890,7 +4902,7 @@ def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
                     "SELECT payload FROM state WHERE kind=? AND id=?", (StateKind.COMPACTION.value, "current")
                 )
             )
-            marker_payload = json.loads(cast(str, marker[0])) if marker is not None else None
+            marker_payload: object = json.loads(cast(str, marker[0])) if marker is not None else None
     except (OSError, ValueError, StateDBError, sqlite3.DatabaseError, TransientInternalAudioStorageError) as error:
         raise_if_sqlite_corrupt(error)
         _typed_fail_stop(audio_store, f"ambiguous typed retirement could not be inspected: {error}")
@@ -4903,7 +4915,7 @@ def _inspect_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
         step.coverage_digest,
     ):
         if row[4] == proposed:
-            return "proposed" if isinstance(marker_payload, dict) and marker_payload.get("pending") is True else "third"
+            return "proposed" if _is_dict(marker_payload) and marker_payload.get("pending") is True else "third"
         if row[4] == step.old_cursor:
             return "old"
     return "third"

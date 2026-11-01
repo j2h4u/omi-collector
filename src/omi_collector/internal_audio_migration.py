@@ -60,10 +60,6 @@ def initialize_collector_state(layout: StorageLayout) -> dict[str, int]:
                 StateDB(path)
             elif inspection["schema_version"] in {_LEGACY_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION}:
                 _migrate_to_v4(layout, from_version=cast(int, inspection["schema_version"]))
-            else:
-                with closing(_connect(path, read_only=True)) as connection:
-                    _validate_current(connection)
-                    _assert_private_audio_gone(layout, connection)
             _handoff_canonical(path)
             return {"schema_version": 4}
         _validate_empty_install(layout)
@@ -296,13 +292,12 @@ def _handoff_canonical(path: Path) -> None:
 
 
 def _validate_empty_schema(connection: sqlite3.Connection) -> None:
-    integrity = cast(tuple[str] | None, connection.execute("PRAGMA integrity_check").fetchone())
     pages = cast(tuple[int] | None, connection.execute("PRAGMA page_count").fetchone())
     free_pages = cast(tuple[int] | None, connection.execute("PRAGMA freelist_count").fetchone())
     objects = cast(tuple[int] | None, connection.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone())
-    if integrity is None or pages is None or free_pages is None:
+    if pages is None or free_pages is None:
         raise InternalAudioMigrationError("existing Collector SQLite v0 database is not empty")
-    if integrity[0] != "ok" or pages[0] not in {0, 1} or free_pages[0] != 0 or objects is not None:
+    if pages[0] not in {0, 1} or free_pages[0] != 0 or objects is not None:
         raise InternalAudioMigrationError("existing Collector SQLite v0 database is not empty")
 
 

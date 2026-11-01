@@ -176,7 +176,7 @@ class OperationalStatusStore:
             loop.call_soon_threadsafe(_set_failure, future, error)
 
     def _persist(self, states: dict[OperationalDimension, OperationalState]) -> None:
-        document = {
+        document: dict[str, object] = {
             "boot_id": self.identity.boot_id,
             "invocation_id": self.identity.invocation_id,
             "schema_version": 1,
@@ -284,6 +284,7 @@ def _validate_snapshot_state_keys(document: dict[str, object]) -> None:
     states = document["states"]
     if not isinstance(states, dict):
         raise ValueError("snapshot states must be an object")
+    states = cast(dict[str, object], states)
     if set(states) != {name.value for name in _DIMENSIONS}:
         raise ValueError("snapshot state dimensions are invalid")
 
@@ -291,6 +292,7 @@ def _validate_snapshot_state_keys(document: dict[str, object]) -> None:
 def _decode_snapshot_states(document: object) -> dict[OperationalDimension, OperationalState]:
     if not isinstance(document, dict):
         raise ValueError("snapshot states must be an object")
+    document = cast(dict[str, object], document)
     decoded: dict[OperationalDimension, OperationalState] = {}
     for dimension in _DIMENSIONS:
         value = document[dimension.value]

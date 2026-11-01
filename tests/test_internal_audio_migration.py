@@ -17,6 +17,7 @@ from omi_collector.capture.adapters.collector_state_db import (
     StateDB,
     StateKind,
 )
+from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.internal_audio_migration import (
     InternalAudioMigrationError,
     initialize_collector_state,
@@ -368,6 +369,43 @@ def test_interrupted_empty_database_initializes_in_place(tmp_path: Path) -> None
     assert inspect_collector_state(layout) == {"schema_version": 0, "status": "state_compatible"}
     assert initialize_collector_state(layout) == {"schema_version": 4}
     assert path.stat().st_ino == identity
+
+
+@pytest.mark.parametrize("version", [0, 4])
+def test_existing_database_integrity_is_checked_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: int
+) -> None:
+    layout = _layout(tmp_path)
+    if version == 0:
+        layout.collector.root.mkdir()
+        with closing(sqlite3.connect(layout.collector.state_db)):
+            pass
+    else:
+        StateDB(layout.collector.state_db)
+    statements: list[str] = []
+    connect = sqlite3.connect
+
+    def traced_connect(database: str, *, uri: bool, timeout: float, isolation_level: None) -> sqlite3.Connection:
+        connection = connect(database, uri=uri, timeout=timeout, isolation_level=isolation_level)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    if version == 0:
+        assert inspect_collector_state(layout)["status"] == "state_compatible"
+    else:
+        assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert statements.count("PRAGMA integrity_check") == 1
+
+
+def test_corrupt_database_is_refused(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    layout.collector.root.mkdir()
+    layout.collector.state_db.write_bytes(b"not a SQLite database")
+    with pytest.raises(FatalInternalAudioStorageError):
+        inspect_collector_state(layout)
+    with pytest.raises(FatalInternalAudioStorageError):
+        initialize_collector_state(layout)
 
 
 def test_unknown_existing_v0_database_is_refused_unchanged(tmp_path: Path) -> None:

@@ -137,7 +137,7 @@ def _read_artifacts(root: Path, ledger_entries: dict[str, object] | None) -> tup
 
 
 def _is_v2_ledger_entry(value: object) -> TypeGuard[dict[str, object]]:
-    return isinstance(value, dict) and value.get("format") == "omi-audio-v2"
+    return isinstance(value, dict) and cast(dict[object, object], value).get("format") == "omi-audio-v2"
 
 
 def _read_v2_artifact(path: Path, entry: dict[str, object]) -> _BundleMeasurement:

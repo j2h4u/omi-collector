@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from omi_collector.capture.adapters.clock_segments import ClockSegmentMap
@@ -151,3 +153,54 @@ def test_uncertain_intent_hides_existing_mappings_across_its_write_window() -> N
 def test_invalid_range_is_rejected(item: tuple[object, ...]) -> None:
     with pytest.raises(ClockStateError):
         ClockRange(*item)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("range", "start_sequence", True),
+        ("range", "offset_seconds", float("nan")),
+        ("range", "uncertainty_seconds", float("inf")),
+        ("intent", "observed_epoch", True),
+        ("intent", "host_midpoint", float("nan")),
+        ("anchor", "sequence_frontier", True),
+        ("anchor", "offset_seconds", float("inf")),
+    ],
+)
+def test_clock_state_payload_rejects_invalid_field_values(section: str, field: str, value: object) -> None:
+    state = ClockState(
+        (_range(1, 2, 1.0),),
+        ClockIntent("operation", "prepared", 1, 2, 3.0, 4),
+        ClockAnchor(4, 1.0, 0.5, "confirmed", "clock"),
+    )
+    payload = state.to_payload()
+    ranges = payload["ranges"]
+    assert isinstance(ranges, list)
+    entry = cast(list[object], ranges)[0] if section == "range" else payload[section]
+    assert isinstance(entry, dict)
+    entry = cast(dict[object, object], entry)
+    entry[field] = value
+    with pytest.raises(ClockStateError):
+        ClockState.from_payload(payload)
+
+
+@pytest.mark.parametrize("section", ["range", "intent", "anchor"])
+@pytest.mark.parametrize("missing", [True, False])
+def test_clock_state_payload_rejects_missing_or_extra_fields(section: str, missing: bool) -> None:
+    state = ClockState(
+        (_range(1, 2, 1.0),),
+        ClockIntent("operation", "prepared", 1, 2, 3.0, 4),
+        ClockAnchor(4, 1.0, 0.5, "confirmed", "clock"),
+    )
+    payload = state.to_payload()
+    ranges = payload["ranges"]
+    assert isinstance(ranges, list)
+    entry = cast(list[object], ranges)[0] if section == "range" else payload[section]
+    assert isinstance(entry, dict)
+    entry = cast(dict[object, object], entry)
+    if missing:
+        del entry[next(iter(entry))]
+    else:
+        entry["extra"] = 1
+    with pytest.raises(ClockStateError):
+        ClockState.from_payload(payload)

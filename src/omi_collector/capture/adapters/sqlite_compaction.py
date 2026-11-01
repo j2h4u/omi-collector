@@ -37,6 +37,7 @@ def _marker(value: object) -> tuple[int, bool] | None:
         return None
     if not isinstance(value, dict):
         raise StateDBError("compaction marker is invalid")
+    value = cast(dict[str, object], value)
     generation, pending = value.get("generation"), value.get("pending")
     if type(generation) is not int or generation < 0 or type(pending) is not bool:
         raise StateDBError("compaction marker is invalid")

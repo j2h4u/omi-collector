@@ -128,7 +128,7 @@ class ConfirmedLossLedger:
             raw_facts = ledger["losses"]
             if not isinstance(raw_facts, list):
                 raise ValueError
-            facts = tuple(_decode_fact(cast(object, raw)) for raw in raw_facts)
+            facts = tuple(_decode_fact(cast(object, raw)) for raw in cast(list[object], raw_facts))
             if len({fact.loss_id for fact in facts}) != len(facts):
                 raise ValueError
             return facts
@@ -136,7 +136,7 @@ class ConfirmedLossLedger:
             raise ConfirmedLossError("confirmed-loss ledger is malformed") from error
 
     def _write_ledger(self, facts: tuple[ConfirmedLossFact, ...], transaction: StateTransaction) -> None:
-        document = {"schema_version": _SCHEMA_VERSION, "losses": [fact.as_dict() for fact in facts]}
+        document: dict[str, object] = {"schema_version": _SCHEMA_VERSION, "losses": [fact.as_dict() for fact in facts]}
         if len(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()) > _MAX_LEDGER_BYTES:
             raise ConfirmedLossError("confirmed-loss ledger reached its configured size limit")
         transaction.put(StateKind.CONFIRMED_LOSS, "ledger", document)

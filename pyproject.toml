@@ -77,6 +77,7 @@ select = [
     "G",
     "N818",
     "ARG",
+    "S",
     "C90",
     "PLR09",
     "PLR17",
@@ -89,7 +90,62 @@ ignore = ["ISC001"]
     "DTZ",
     "PERF401",
     "PLR2004",
+    "S101", # pytest assertions are executable test expectations.
 ]
+# Reviewed local subprocesses, test fixtures, controlled SQL and fail-safe diagnostics.
+"scripts/bench_omic16_internal_sqlite.py" = ["S101", "S108", "S603"]
+"scripts/check_packaging_smoke.py" = ["S603"]
+"scripts/clone_tools.py" = ["S603"]
+"scripts/docker_qa_entrypoint.py" = ["S603", "S606", "S607"]
+"scripts/mutation_campaign.py" = ["S101", "S105", "S603", "S607"]
+"scripts/mutation_scope.py" = ["S108", "S607"]
+"scripts/validate_pr_commits.py" = ["S603"]
+"src/omi_collector/capture/adapters/internal_audio_store.py" = ["S101", "S608"]
+"src/omi_collector/capture/adapters/quality_metrics.py" = ["S112"]
+"src/omi_collector/capture/adapters/quarantine.py" = ["S101", "S608"]
+"src/omi_collector/capture/adapters/staging_store.py" = ["S101", "S608"]
+"src/omi_collector/capture/application/operational_telemetry.py" = ["S101", "S607"]
+"src/omi_collector/cli.py" = ["S101", "S110", "S603"]
+"src/omi_collector/capture/adapters/attempt_writer.py" = ["S101"]
+"src/omi_collector/capture/adapters/ble_link_observability.py" = ["S101"]
+"src/omi_collector/capture/adapters/operational_status.py" = ["S101"]
+"src/omi_collector/capture/adapters/ready_bundles.py" = ["S101"]
+"src/omi_collector/capture/adapters/sqlite_compaction.py" = ["S101"]
+"src/omi_collector/capture/adapters/staging_writer.py" = ["S101"]
+"src/omi_collector/capture/application/batch_reconciliation.py" = ["S101"]
+"src/omi_collector/capture/application/collector.py" = ["S101"]
+"src/omi_collector/capture/application/opportunistic_sync.py" = ["S101"]
+"src/omi_collector/capture/application/session_lifecycle.py" = ["S101"]
+"src/omi_collector/capture/domain/internal_audio_machine.py" = ["S101"]
+"tests/test_architecture_contracts.py" = ["S603", "S607"]
+"tests/test_ble_phy_reporting.py" = ["S603"]
+"tests/test_cli.py" = ["S603"]
+"tests/test_collector_state_db.py" = ["S603"]
+"tests/test_crap_local_classes.py" = ["S102"]
+"tests/test_debug_logging.py" = ["S102", "S105", "S108", "S603"]
+"tests/test_device_cli.py" = ["S603"]
+"tests/test_import_contracts.py" = ["S603"]
+"tests/test_import_isolation.py" = ["S603"]
+"tests/test_internal_audio_migration.py" = ["S603", "S608"]
+"tests/test_internal_audio_projection.py" = ["S608"]
+"tests/test_internal_audio_store.py" = ["S608"]
+"tests/test_mutation_campaign.py" = ["S105", "S603", "S607"]
+"tests/test_mutation_cli_recipes.py" = ["S603"]
+"tests/test_mutation_integration.py" = ["S607"]
+"tests/test_mutation_scope.py" = ["S105", "S603", "S608"]
+"tests/test_ogg_opus.py" = ["S603"]
+"tests/test_pr_commit_validation.py" = ["S603", "S607"]
+"tests/test_public_audio_v2_integration.py" = ["S608"]
+"tests/test_public_audio_v2_permissions.py" = ["S608"]
+"tests/test_public_drain.py" = ["S603"]
+"tests/test_publication_recovery.py" = ["S106"]
+"tests/test_release_tag_identity.py" = ["S603", "S607"]
+"tests/test_runtime_smoke.py" = ["S607"]
+"tests/test_slow_disk_force_exit.py" = ["S603"]
+"tests/test_sqlite_compaction.py" = ["S603"]
+"tests/test_staging_contract.py" = ["S603"]
+"tests/test_staging_quarantine.py" = ["S608"]
+"tests/test_systemd_unit.py" = ["S603", "S607"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -111,6 +167,15 @@ reportUnannotatedClassAttribute = "none"
 reportUnusedCallResult = "none"
 reportImplicitStringConcatenation = "none"
 reportPrivateUsage = "none"
+
+[[tool.pyright.executionEnvironments]]
+root = "src"
+reportUnknownVariableType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownMemberType = "error"
+reportUnknownParameterType = "error"
+reportUnknownLambdaType = "error"
+reportMissingTypeArgument = "error"
 
 [tool.vulture]
 paths = ["src/omi_collector", "scripts", "tests"]

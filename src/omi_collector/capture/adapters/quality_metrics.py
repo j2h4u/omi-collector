@@ -473,7 +473,7 @@ def _event_schema(row: Mapping[str, object], event: object) -> tuple[frozenset[s
     if event == "transfer_session":
         return _TRANSFER_FIELDS, "completed_at"
     if event == "sequence_loss":
-        return _LOSS_FIELDS | ({"loss_id"} if "loss_id" in row else set()), "occurred_at"
+        return _LOSS_FIELDS | ({"loss_id"} if "loss_id" in row else set[str]()), "occurred_at"
     if event == "clock_correction":
         return _CLOCK_FIELDS, "occurred_at"
     raise ValueError("quality event type is unsupported")
@@ -533,9 +533,9 @@ def source_revision_from_release_metadata(path: Path | None = None) -> str | Non
         return None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("release metadata is unreadable or malformed") from error
-    if not isinstance(value, dict) or set(value) != {"source_revision"}:
+    if not isinstance(value, dict) or set(cast(dict[object, object], value)) != {"source_revision"}:
         raise ValueError("release metadata schema is invalid")
-    revision = value["source_revision"]
+    revision = cast(dict[object, object], value)["source_revision"]
     if not isinstance(revision, str):
         raise ValueError("release source revision is invalid")
     _validate_source_revision(revision)

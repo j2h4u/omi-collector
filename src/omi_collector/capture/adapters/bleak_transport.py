@@ -213,7 +213,11 @@ def _find_service(services: object, expected_uuid: str) -> object | None:
             service = getter(expected_uuid)
         if service is not None:
             return service
-    candidates = services.values() if isinstance(services, Mapping) else cast(Iterable[object], services)
+    candidates = (
+        cast(Mapping[object, object], services).values()
+        if isinstance(services, Mapping)
+        else cast(Iterable[object], services)
+    )
     return next(
         (candidate for candidate in candidates if _normal_uuid(getattr(candidate, "uuid", "")) == expected_uuid), None
     )
@@ -229,7 +233,7 @@ def _find_characteristic(service: object, expected_uuid: str) -> object | None:
             return characteristic
     characteristics = getattr(service, "characteristics", ())
     if isinstance(characteristics, Mapping):
-        candidates = characteristics.values()
+        candidates = cast(Mapping[object, object], characteristics).values()
     else:
         candidates = cast(Iterable[object], characteristics)
     return next(
@@ -768,7 +772,7 @@ def _att_mtu_query_seam(
             raise LookupError("BlueZ D-Bus bus is unavailable")
         if isinstance(obj, (str, bytes, bytearray)) or not isinstance(obj, Sequence) or not obj:
             raise TypeError("BlueZ characteristic object is malformed")
-        path = obj[0]
+        path = cast(Sequence[object], obj)[0]
         if not isinstance(path, str) or not path:
             raise TypeError("BlueZ characteristic object path is malformed")
     except Exception:  # noqa: BLE001 - a diagnostic seam must never affect collection
@@ -804,7 +808,7 @@ def _decode_bluez_att_mtu_reply(reply: object, logger: logging.Logger | None) ->
         _att_mtu_query_failure("malformed_reply_signature", logger)
     else:
         body = getattr(reply, "body", None)
-        if not isinstance(body, list) or len(body) != 1 or not isinstance(body[0], Variant):
+        if not isinstance(body, list) or len(cast(list[object], body)) != 1 or not isinstance(body[0], Variant):
             _att_mtu_query_failure("malformed_reply_body", logger)
         else:
             value = body[0]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Literal
@@ -276,7 +277,7 @@ def _failed_before_teardown(event: EffectFailed, *, has_session: bool) -> Sessio
     return SessionState(SessionCommand.CHECKPOINT, outcome=event.retry_outcome)
 
 
-_HANDLERS = {
+_HANDLERS: dict[tuple[SessionCommand, type[SessionEvent]], Callable[[SessionState, SessionEvent], SessionState]] = {
     (SessionCommand.CONNECT, Connected): _connect,
     (SessionCommand.CONNECT, EffectFailed): _connect,
     (SessionCommand.CONNECT, CancellationObserved): _connect,

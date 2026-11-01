@@ -8,7 +8,7 @@ import re
 import sys
 import traceback
 import weakref
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +18,9 @@ from types import TracebackType
 from typing import cast
 
 from omi_collector.capture.application import collector
+from omi_collector.json_type_guards import is_dict as _is_dict
+from omi_collector.json_type_guards import is_mapping as _is_mapping
+from omi_collector.json_type_guards import is_sequence as _is_sequence
 
 from ...config import DEFAULT_CONFIG, DebugLogConfig
 from .collector_state_db import StateDB, StateKind
@@ -412,9 +415,9 @@ def _emit_debug_event(
             },
             exc_info=None,
         )
-    sink = getattr(target, _RUNTIME_SINK_ATTRIBUTE, None)
+    sink: object = getattr(target, _RUNTIME_SINK_ATTRIBUTE, None)
     if isinstance(sink, weakref.WeakMethod):
-        sink = sink()
+        sink = cast(weakref.ReferenceType[object], sink)()
     if event == "ble_link_status":
         safe = _runtime_fields(event, fields)
         with suppress(Exception):
@@ -425,7 +428,10 @@ def _emit_debug_event(
             )
     if callable(sink) and event in {"sync_progress", "ble_link_rssi_observed", "ble_link_status"}:
         try:
-            accepted = sink(event, _runtime_fields(event, fields), datetime.now(UTC).isoformat(timespec="microseconds"))
+            runtime_sink = cast(Callable[[str, dict[str, object], str], object], sink)
+            accepted = runtime_sink(
+                event, _runtime_fields(event, fields), datetime.now(UTC).isoformat(timespec="microseconds")
+            )
         except Exception:  # noqa: BLE001 - diagnostics cannot interrupt capture
             accepted = False
         if event == "ble_link_status" and not accepted:
@@ -461,7 +467,7 @@ def read_runtime_status(state_db: StateDB) -> dict[str, object] | None:
 def merge_runtime_status(
     current: dict[str, object] | None,
     event: str,
-    fields: Mapping[str, object],
+    fields: Mapping[str, object] | Mapping[object, object],
     timestamp: str,
 ) -> dict[str, object] | None:
     """Merge one validated current-status callback, independently by observation time."""
@@ -469,8 +475,8 @@ def merge_runtime_status(
     if parsed is None:
         raise ValueError("runtime status event timestamp is invalid")
     _validate_runtime_event({"event": event, "fields": dict(fields), "timestamp": timestamp})
-    fields = _runtime_fields(event, fields)
-    if event == "ble_link_rssi_observed" and fields["rssi_dbm"] is None:
+    projected_fields = _runtime_fields(event, fields)
+    if event == "ble_link_rssi_observed" and projected_fields["rssi_dbm"] is None:
         return current
     current = current or {
         "battery_observation": None,
@@ -485,14 +491,14 @@ def merge_runtime_status(
         "updated_at": None,
     }
     if event == "sync_progress":
-        _merge_sync_progress(current, fields, timestamp)
+        _merge_sync_progress(current, projected_fields, timestamp)
     elif event == "ble_link_rssi_observed":
-        rssi = fields["rssi_dbm"]
+        rssi = projected_fields["rssi_dbm"]
         if isinstance(rssi, int) and _is_newer(timestamp, current.get("connection_rssi_observed_at")):
             current["connection_rssi_dbm"] = rssi
             current["connection_rssi_observed_at"] = timestamp
     elif event == "ble_link_status":
-        _merge_ble_link_status(current, fields, timestamp)
+        _merge_ble_link_status(current, projected_fields, timestamp)
     _validate_runtime_projection(current)
     return current
 
@@ -516,7 +522,7 @@ def _merge_sync_progress(current: dict[str, object], fields: Mapping[str, object
 
 def _merge_ble_link_status(current: dict[str, object], fields: Mapping[str, object], timestamp: str) -> None:
     previous = current.get("ble_link_status")
-    previous = previous if isinstance(previous, dict) else {}
+    previous = previous if _is_dict(previous) else {}
     same = previous.get("link_id") == fields.get("link_id") and previous.get("invocation_id") == fields.get(
         "invocation_id"
     )
@@ -559,7 +565,7 @@ def legacy_runtime_projection(rows: Iterable[Mapping[str, object]]) -> dict[str,
             continue
         timestamp = row.get("timestamp")
         fields = row.get("fields")
-        if not isinstance(timestamp, str) or not isinstance(fields, dict):
+        if not isinstance(timestamp, str) or not _is_dict(fields):
             raise ValueError("legacy debug status row is invalid")
         projection = merge_runtime_status(projection, cast(str, event), fields, timestamp)
     return projection
@@ -592,7 +598,7 @@ def _validate_runtime_event(value: Mapping[str, object]) -> None:
 
 def _validate_sync_progress(fields: Mapping[str, object]) -> None:
     progress = fields.get("progress")
-    if not isinstance(progress, dict) or not isinstance(progress.get("status"), str):
+    if not _is_dict(progress) or not isinstance(progress.get("status"), str):
         raise ValueError("runtime progress event is invalid")
     if progress.get("event") is not None and not isinstance(progress["event"], str):
         raise ValueError("runtime progress observation is invalid")
@@ -603,7 +609,7 @@ def _validate_sync_progress(fields: Mapping[str, object]) -> None:
         raise ValueError("runtime firmware observation is invalid")
 
 
-def _validate_ble_link_status(fields: Mapping[str, object]) -> None:
+def _validate_ble_link_status(fields: Mapping[str, object] | Mapping[object, object]) -> None:
     required = {"invocation_id", "link_id", "state", "phy_policy", "tx_phy", "rx_phy", "source", "reason"}
     if set(fields) not in (required, required | {"disconnect_reason_name"}):
         raise ValueError("BLE link status fields are invalid")
@@ -677,7 +683,7 @@ def _validate_runtime_projection(value: Mapping[str, object]) -> None:
         raise ValueError("runtime status projection has invalid connection RSSI")
     for name in ("progress", "observation", "battery_observation", "last_error"):
         item = value[name]
-        if item is not None and not isinstance(item, dict):
+        if item is not None and not _is_dict(item):
             raise ValueError(f"runtime status projection has invalid {name}")
 
 
@@ -694,7 +700,7 @@ def _validate_ble_link_projection(value: object) -> None:
         "state_at",
         "last_observed_phy",
     }
-    if not isinstance(value, dict) or set(value) not in (required, required | {"disconnect_reason_name"}):
+    if not _is_dict(value) or set(value) not in (required, required | {"disconnect_reason_name"}):
         raise ValueError("BLE link projection fields are invalid")
     _validate_ble_link_status(
         {key: item for key, item in value.items() if key not in {"state_at", "last_observed_phy"}}
@@ -704,7 +710,7 @@ def _validate_ble_link_projection(value: object) -> None:
     history = value["last_observed_phy"]
     if history is None:
         return
-    if not isinstance(history, dict) or set(history) != {"tx_phy", "rx_phy", "source", "phy_policy", "observed_at"}:
+    if not _is_dict(history) or set(history) != {"tx_phy", "rx_phy", "source", "phy_policy", "observed_at"}:
         raise ValueError("BLE link history fields are invalid")
     _validate_ble_link_status(
         {
@@ -802,7 +808,7 @@ def _journal_code(value: object) -> str:
 
 
 def _journal_fields(fields: object) -> dict[str, object]:
-    if not isinstance(fields, Mapping):
+    if not _is_mapping(fields):
         return {}
     try:
         return {
@@ -823,9 +829,9 @@ def _journal_value(value: object, field_name: str) -> object:
         result = int(value)
     elif isinstance(value, float):
         result = float(value) if isfinite(value) else None
-    elif isinstance(value, Mapping):
+    elif _is_mapping(value):
         result = _journal_fields(value)
-    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+    elif _is_sequence(value) and not isinstance(value, str | bytes):
         result = [_journal_value(item, field_name) for item in value]
     elif isinstance(value, str) and field_name in _JOURNAL_TEXT_FIELDS:
         result = _journal_code(value)
@@ -839,7 +845,7 @@ def _journal_value(value: object, field_name: str) -> object:
     return result
 
 
-def _runtime_fields(event: str, fields: Mapping[str, object]) -> dict[str, object]:
+def _runtime_fields(event: str, fields: Mapping[str, object] | Mapping[object, object]) -> dict[str, object]:
     if event == "ble_link_status":
         result = {
             key: fields.get(key)
@@ -854,9 +860,9 @@ def _runtime_fields(event: str, fields: Mapping[str, object]) -> dict[str, objec
         rssi = fields.get("rssi_dbm")
         return {"rssi_dbm": rssi} if rssi is None or (isinstance(rssi, int) and not isinstance(rssi, bool)) else {}
     progress = fields.get("progress")
-    if event != "sync_progress" or not isinstance(progress, Mapping):
+    if event != "sync_progress" or not _is_mapping(progress):
         return {}
-    safe_progress: dict[str, object] = {}
+    safe_progress: dict[object, object] = {}
     for name, value in progress.items():
         projected = _runtime_progress_value(name, value)
         if projected is not None:

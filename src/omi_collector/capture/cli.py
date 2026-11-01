@@ -590,7 +590,7 @@ def render_sync(result: collector.CollectResult, metrics: DownloadMetrics) -> st
     """Render sync receipt metadata and finite end-to-end transfer metrics."""
     if isinstance(result, collector.NoDataResult):
         return render_collect(result, metrics)
-    payload = {
+    payload: dict[str, object] = {
         "advance_confirmed": result.advance_confirmed,
         "next_sequence": result.next_sequence,
         "record_count": result.packet_count,
@@ -643,9 +643,9 @@ def _bundle_manifest(bundle_path: Path) -> dict[str, object]:
         loaded = cast(object, json.loads((bundle_path / "manifest.json").read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError("sealed bundle metadata could not be read") from error
-    if not isinstance(loaded, dict) or not isinstance(loaded.get("raw_sha256"), str):
+    if not isinstance(loaded, dict) or not isinstance(cast(dict[object, object], loaded).get("raw_sha256"), str):
         raise RuntimeError("sealed bundle metadata is malformed")
-    return loaded
+    return cast(dict[str, object], loaded)
 
 
 def _json(payload: dict[str, object]) -> str:

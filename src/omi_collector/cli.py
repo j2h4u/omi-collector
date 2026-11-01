@@ -272,7 +272,7 @@ class SyncProgressReporter:
         staging: StagingStore | None = None,
     ) -> None:
         self.level = level
-        self._emit = emit or (lambda line: typer.echo(line, err=True))
+        self._emit: Callable[[str], object] = emit or (lambda line: typer.echo(line, err=True))
         self._debug_logger = debug_logger
         self._operational_status = operational_status
         self._staging = staging

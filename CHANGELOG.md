@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.8](https://github.com/j2h4u/omi-collector/compare/v1.1.7...v1.1.8) (2026-11-06)
+
+
+### Fixes
+
+* align quality gates with updated development tools ([a04831f](https://github.com/j2h4u/omi-collector/commit/a04831f326a5bfb12d2a9f6df81f2f0bf509fcd1))
+
+
+### Maintenance
+
+* **deps-dev:** update development dependencies ([a04831f](https://github.com/j2h4u/omi-collector/commit/a04831f326a5bfb12d2a9f6df81f2f0bf509fcd1))
+
 ## [1.1.7](https://github.com/j2h4u/omi-collector/compare/v1.1.6...v1.1.7) (2026-11-06)
 
 

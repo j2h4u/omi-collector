@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.7](https://github.com/j2h4u/omi-collector/compare/v1.1.6...v1.1.7) (2026-11-06)
+
+
+### Documentation
+
+* define daily GitHub maintenance workflow ([#329](https://github.com/j2h4u/omi-collector/issues/329)) ([3928863](https://github.com/j2h4u/omi-collector/commit/3928863e6bae03fb024e336dc433c661982555f5))
+
 ## [1.1.6](https://github.com/j2h4u/omi-collector/compare/v1.1.5...v1.1.6) (2026-11-06)
 
 

@@ -268,6 +268,83 @@ def test_packet_during_scan_start_resolves_persisted_incident() -> None:
     asyncio.run(scenario())
 
 
+def test_persisted_incident_does_not_hide_new_scan_silence(caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        sink = FakeSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 180.0, clock=lambda: now[0])
+        await monitor.prepare(2)
+        monitor.scan_started(2)
+        assert monitor.next_deadline == 180.0
+        now[0] = 180.0
+        assert await monitor.check_deadline()
+        assert not await monitor.check_deadline()
+        assert len(sink.opened) == 1
+        assert sink.opened[0].reason == "scan_silence"
+        assert caplog.text.count("BLE scan scan_silence") == 1
+        assert not monitor.radio_activity(1, now[0])
+        assert sink.resolved == []
+        assert monitor.radio_activity(2, now[0])
+        await monitor.flush_recovery()
+        assert sink.resolved == [(2, "advertisements_resumed")]
+        assert monitor.next_deadline == 360.0
+
+    asyncio.run(scenario())
+
+
+def test_new_start_failure_is_logged_with_existing_incident(caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        sink = FakeSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 180.0)
+        await monitor.prepare(1)
+        await monitor.scan_start_failed(1, RuntimeError("Operation already in progress"))
+        await monitor.prepare(2)
+        await monitor.scan_start_failed(2, RuntimeError("Operation already in progress"))
+        assert len(sink.opened) == 2
+        assert caplog.text.count("RuntimeError: Operation already in progress") == 2
+
+    asyncio.run(scenario())
+
+
+def test_refused_scan_waits_for_recheck_with_existing_incident(caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        sleeping = asyncio.Event()
+        delays: list[float] = []
+
+        class RefusingObserver(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                raise RuntimeError("Operation already in progress")
+
+        async def sleep(delay: float) -> None:
+            delays.append(delay)
+            sleeping.set()
+            await asyncio.Future()
+
+        observer = RefusingObserver()
+        monitor = ScanHealthMonitor(FakeSink(active=True), FakeDiagnostics(), 180.0, clock=lambda: 0.0)
+        scheduler = PresenceScheduler(
+            observer,
+            policy=PresencePolicy(scan_recheck_seconds=300.0),
+            scan_health=monitor,
+            clock=lambda: 0.0,
+            sleep=sleep,
+        )
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            async with asyncio.timeout(1.0):
+                await sleeping.wait()
+            assert delays == [300.0]
+            assert observer.events == ["start", "stop"]
+            assert "Operation already in progress" in caplog.text
+        finally:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await scheduler.close()
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_scan_start_closes_passive_diagnostics_after_stop_attempt() -> None:
     async def scenario() -> None:
         events: list[str] = []

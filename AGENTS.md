@@ -61,3 +61,20 @@ make a change pass.
 
 Fix code until the gates pass. If a gate is wrong, change the gate deliberately
 and explain why in the same change.
+
+## GitHub maintenance during ongoing work
+
+On the first substantive project work of each local day, run the full existing
+GitHub Sweep for `j2h4u/omi-collector`. At coherent work-cluster boundaries,
+check the latest sweep receipt in the conversation or handoff; if its date is
+unknown or stale, run a fresh sweep. Use the sweep as the complete baseline and
+query GitHub further only for a concrete coverage gap or actionable finding.
+
+Treat safe Dependabot and other open PRs as active maintenance: review their
+changes and current gates, resolve issues, and merge when safe without routine
+approval. Record actionable failures in WorkGraph and resolve or delegate them;
+do not merely list them. After push or PR/merge completion, and before claiming
+there is no work, reconcile current GitHub PRs, security findings and comments
+with WorkGraph, the checkout and applicable gates. Include the sweep check time
+and unresolved actionable items in the handoff. A daily check alone does not
+require the full test suite; real changes follow the existing verification gates.

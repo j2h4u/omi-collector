@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.6](https://github.com/j2h4u/omi-collector/compare/v1.1.5...v1.1.6) (2026-11-06)
+
+
+### Fixes
+
+* report recurring BLE scan failures ([#327](https://github.com/j2h4u/omi-collector/issues/327)) ([d9bf0c1](https://github.com/j2h4u/omi-collector/commit/d9bf0c1f78fa9c3ca99c06a46cdfc8bdd452fd55))
+
+
+### Maintenance
+
+* **deps:** bump python from `a2b82f3` to `cd89c30` in the docker-images group ([#324](https://github.com/j2h4u/omi-collector/issues/324)) ([5913590](https://github.com/j2h4u/omi-collector/commit/59135906b4d96b1b642b121a4a9b1e1d8795dadd))
+
 ## [1.1.5](https://github.com/j2h4u/omi-collector/compare/v1.1.4...v1.1.5) (2026-11-01)
 
 

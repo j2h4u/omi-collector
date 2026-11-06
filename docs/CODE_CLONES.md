@@ -8,7 +8,7 @@ the ordinary scan.
 ## Tools And Review
 
 The locked development environment provides two complementary detectors:
-PySCN 1.33.0 with Type 1–4 analysis and jscpd 5.4.1 for normalized token and
+PySCN 1.33.1 with Type 1–4 analysis and jscpd 5.4.2 for normalized token and
 near-miss matches. `scripts/clone_tools.py` owns their effective settings and
 validates complete reports; `scripts/check_clones.py` stages the explicit
 source scope and checks the findings against `.clone-acceptances.json`.

@@ -19,7 +19,7 @@ MAX_SOURCE_BYTES = 1_048_576
 TIMEOUT_SECONDS = 360
 POLICY: dict[str, object] = {
     "pyscn": {
-        "version": "1.33.0",
+        "version": "1.33.1",
         "min_lines": 8,
         "min_nodes": 20,
         "max_edit_distance": 50,
@@ -47,7 +47,7 @@ POLICY: dict[str, object] = {
         "exclude_patterns": ["**/*.pyc"],
     },
     "jscpd": {
-        "version": "5.4.1",
+        "version": "5.4.2",
         "minTokens": 50,
         "minLines": 5,
         "maxLines": 1_000_000,
@@ -166,7 +166,7 @@ def _no_errors(report: dict[str, object]) -> None:
 
 def parse_pyscn(report: dict[str, object], staged: Path, sources: dict[str, str]) -> list[CloneFinding]:
     _require(
-        report["schema_version"] == PYSCN_SCHEMA_VERSION and report["version"] == "1.33.0",
+        report["schema_version"] == PYSCN_SCHEMA_VERSION and report["version"] == "1.33.1",
         "Unsupported PySCN report version",
     )
     _no_errors(report)
@@ -222,7 +222,7 @@ def _run(arguments: list[str], cwd: Path) -> str:
 
 def _binaries(staged: Path) -> dict[str, str]:
     binaries: dict[str, str] = {}
-    for name, expected in (("pyscn", "pyscn version 1.33.0"), ("jscpd", "jscpd 5.4.1")):
+    for name, expected in (("pyscn", "pyscn version 1.33.1"), ("jscpd", "jscpd 5.4.2")):
         binary = shutil.which(name)
         _require(binary is not None, f"Missing locked tool: {name}")
         binaries[name] = cast("str", binary)

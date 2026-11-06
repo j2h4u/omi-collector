@@ -174,7 +174,9 @@ def test_excluded_function_remains_in_inventory(tmp_path: Path) -> None:
     assert {metric.key for metric in metrics} == {"worker.py::excluded", "worker.py::included"}
 
 
-def test_coverage_omitting_function_in_else_fails_closed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_function_in_else_is_measured_and_missing_coverage_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     source_root, report = _real_coverage(
         tmp_path,
         """
@@ -185,6 +187,13 @@ def test_coverage_omitting_function_in_else_fails_closed(tmp_path: Path, capsys:
                 return 1
         """,
     )
+    coverage_report = _load_coverage_report(report)
+    assert {metric.key for metric in _function_metrics_from_report(coverage_report, source_root)} == {
+        "worker.py::conditional"
+    }
+    functions = next(iter(coverage_report["files"].values()))["functions"]
+    del functions["conditional"]
+    report.write_text(json.dumps(coverage_report), encoding="utf-8")
     assert crap_gate_main(["--coverage", str(report), "--src", str(source_root)]) == 1
     assert "missing function metrics: worker.py::conditional" in capsys.readouterr().out
 

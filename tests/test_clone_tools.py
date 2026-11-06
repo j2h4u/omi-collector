@@ -41,7 +41,7 @@ def jscpd_report() -> dict[str, object]:
 def pyscn_report() -> dict[str, object]:
     return {
         "schema_version": 2,
-        "version": "1.33.0",
+        "version": "1.33.1",
         "clone": {
             "success": True,
             "clones": [],

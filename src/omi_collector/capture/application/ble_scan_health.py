@@ -100,7 +100,7 @@ class ScanHealthMonitor:
         """Return the next retry or active scan's all-device silence deadline."""
         if self._retry_at is not None:
             return self._retry_at
-        if self._failure_latched or self._incident_active or self._started_at is None:
+        if self._failure_latched or self._started_at is None:
             return None
         baseline = self._last_callback_at if self._last_callback_at is not None else self._started_at
         return max(self._started_at, baseline) + self._threshold
@@ -130,6 +130,8 @@ class ScanHealthMonitor:
     async def prepare(self, generation: int) -> None:
         """Start passive capture before asking Bleak to start scanning."""
         await self.initialize()
+        if self._open_context is None:
+            self._failure_latched = False
         self._generation = generation
         self._started_at = None
         self._active_seconds = 0.0
@@ -154,6 +156,7 @@ class ScanHealthMonitor:
     async def scan_start_failed(self, generation: int, error: Exception) -> None:
         if generation != self._generation:
             return
+        _LOGGER.warning("BLE scan start failed (generation %d): %s: %s", generation, type(error).__name__, error)
         self._start_open(generation, "scan_start_failed", error)
         try:
             await self._attempt_persistence()
@@ -171,6 +174,7 @@ class ScanHealthMonitor:
     async def scan_stop_failed(self, generation: int, error: Exception) -> None:
         if generation != self._generation:
             return
+        _LOGGER.warning("BLE scan stop failed (generation %d): %s: %s", generation, type(error).__name__, error)
         if not self._failure_latched:
             self._start_open(generation, "scan_stop_failed", error)
         try:
@@ -225,6 +229,8 @@ class ScanHealthMonitor:
     ) -> None:
         if self._failure_latched:
             return
+        if reason == "scan_silence":
+            _LOGGER.warning("BLE scan %s (generation %d)", reason, generation)
         now = self._clock()
         active_seconds = max(0.0, now - self._started_at) if self._started_at is not None else self._active_seconds
         age = None if self._last_callback_at is None else max(0.0, now - self._last_callback_at)

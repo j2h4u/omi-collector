@@ -265,7 +265,9 @@ class OpportunisticRuntime(CaptureRuntimePort):
             return "deferred"
         if isinstance(error, QuarantinePublishError):
             return "deferred"
-        if isinstance(error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError, TransientInternalAudioStorageError)):
+        if isinstance(
+            error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError, TransientInternalAudioStorageError)
+        ):
             return "deferred"
         if isinstance(error, (OSError, QuarantineSourceRetryableError)):
             return "retryable"

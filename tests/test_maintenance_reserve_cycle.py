@@ -17,7 +17,9 @@ from staging_test_factory import StagingStore
 from test_public_audio_v2_integration import _checkpoint, _ready_root, _record, _source
 
 
-def test_ack_retirement_releases_reserve_for_waiting_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ack_retirement_releases_reserve_for_waiting_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02))
     draft = tmp_path / "draft"
     draft.mkdir()
@@ -27,7 +29,7 @@ def test_ack_retirement_releases_reserve_for_waiting_publication(tmp_path: Path,
     with InternalAudioStore(store.state_db) as audio:
         _source(audio, "a" * 32, 10, (_record(100),))
     store.append_ready_closure(11, "drained")
-    first, = store.recover_and_publish().published
+    (first,) = store.recover_and_publish().published
     manifest = json.loads((first.path / "manifest.json").read_text())
     _checkpoint(tmp_path, [{"id": first.bundle_id, "audio_sha256": manifest["audio_sha256"]}])
     with InternalAudioStore(store.state_db) as audio:

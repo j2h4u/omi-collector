@@ -683,9 +683,7 @@ def test_hourly_cleanup_transition_covers_every_phase_event(phase: _CleanupPhase
 def test_hourly_cleanup_wakes_at_due_and_rejects_unknown_state_or_event() -> None:
     waiting = _CleanupState(_CleanupPhase.WAITING, 100.0)
     assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 99.999) == waiting
-    assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 100.0) == _CleanupState(
-        _CleanupPhase.ACK, 100.0, 700.0
-    )
+    assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 100.0) == _CleanupState(_CleanupPhase.ACK, 100.0, 700.0)
     with pytest.raises(ValueError, match="unknown cleanup event"):
         _cleanup_transition(waiting, cast(_CleanupEvent, "invalid"), 100.0)
     with pytest.raises(ValueError, match="unknown cleanup phase"):

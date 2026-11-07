@@ -490,9 +490,9 @@ class QuarantineMaintenance:
             if result is _SalvageResult.RETRY and not failed:
                 failed = True
                 backoff = self._config.retry.quarantine_publish_backoff_seconds
-                self._quarantine_retry_not_before = monotonic() + backoff[
-                    min(self._quarantine_retry_number, len(backoff) - 1)
-                ]
+                self._quarantine_retry_not_before = (
+                    monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
+                )
                 self._quarantine_retry_number += 1
         if not failed:
             self._quarantine_retry_number = 0

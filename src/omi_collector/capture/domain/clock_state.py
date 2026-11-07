@@ -219,9 +219,12 @@ class ClockState:
         if self.anchor is not None and not isinstance(self.anchor, ClockAnchor):
             raise ClockStateError("clock anchor is invalid")
         if not isinstance(self.causal_uncertainty, tuple) or any(
-            not isinstance(item, tuple) or len(item) != 2
-            or type(item[0]) is not int or type(item[1]) is not int
-            or item[0] < 0 or item[1] < item[0]
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or type(item[0]) is not int
+            or type(item[1]) is not int
+            or item[0] < 0
+            or item[1] < item[0]
             for item in self.causal_uncertainty
         ):
             raise ClockStateError("clock causal uncertainty is invalid")
@@ -307,7 +310,11 @@ class ClockState:
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> ClockState:
         required = {"schema_version", "ranges", "intent", "anchor"}
-        if not isinstance(payload, dict) or not required <= set(payload) or set(payload) - required - {"causal_uncertainty"}:
+        if (
+            not isinstance(payload, dict)
+            or not required <= set(payload)
+            or set(payload) - required - {"causal_uncertainty"}
+        ):
             raise ClockStateError("clock state payload is invalid")
         if type(payload["schema_version"]) is not int or payload["schema_version"] != _SCHEMA_VERSION:
             raise ClockStateError("clock state schema is unsupported")
@@ -388,7 +395,9 @@ class ClockState:
         return replace(
             completed,
             intent=None,
-            causal_uncertainty=tuple(sorted({*completed.causal_uncertainty, (self.intent.write_sequence_before, boundary)})),
+            causal_uncertainty=tuple(
+                sorted({*completed.causal_uncertainty, (self.intent.write_sequence_before, boundary)})
+            ),
         )
 
 

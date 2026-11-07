@@ -60,9 +60,7 @@ class ClockStateStore:
 
     def mark_uncertain(self, operation_id: str, *, write_sequence_after: int | None = None) -> ClockState:
         with self.db.transaction() as tx:
-            state = _load_current(tx).mark_uncertain(
-                operation_id, write_sequence_after=write_sequence_after
-            )
+            state = _load_current(tx).mark_uncertain(operation_id, write_sequence_after=write_sequence_after)
             tx.put(StateKind.CLOCK, _CLOCK_ID, state.to_payload())
             return state
 
@@ -91,7 +89,5 @@ def _load_current(tx: StateTransaction) -> ClockState:
 
 
 def _annotate_unknown(state: ClockState) -> ClockState:
-    uncertain = tuple(
-        (item.start_sequence, item.next_sequence) for item in state.ranges if item.offset_seconds is None
-    )
+    uncertain = tuple((item.start_sequence, item.next_sequence) for item in state.ranges if item.offset_seconds is None)
     return replace(state, causal_uncertainty=tuple(sorted({*state.causal_uncertainty, *uncertain})))

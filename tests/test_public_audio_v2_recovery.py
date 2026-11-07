@@ -962,29 +962,33 @@ def test_legacy_unknown_stage_and_replay_survive_current_clock_upgrade(
             "SELECT immutable_metadata,proof_content_sha256,records_sha256 FROM ready_replay_proof"
         ).fetchone()
     assert stage is not None and proof is not None
-    artifact_id, descriptor, descriptor_sha, audio_sha, manifest_sha = stage
-    assert hashlib.sha256(descriptor).hexdigest() == descriptor_sha
-    frozen_projection_sha = ready_bundles._v2_descriptor_basis(descriptor)[3]
+    assert hashlib.sha256(stage[1]).hexdigest() == stage[2]
+    frozen_projection_sha = ready_bundles._v2_descriptor_basis(stage[1])[3]
 
     clock = ClockStateStore(database)
     clock.prepare(ClockIntent("new", "prepared", 100, 200, 0.0, 12))
     assert clock.state().causal_uncertainty == ((10, 12),)
     monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original)
-    result = finalize_public_audio_v2(store, (source,), ready, _options(clock.state(), 12))
-    artifact = result.published[0]
+    artifact = finalize_public_audio_v2(store, (source,), ready, _options(clock.state(), 12)).published[0]
     audio = (artifact.path / "audio.ogg").read_bytes()
     manifest = (artifact.path / "manifest.json").read_bytes()
-    assert artifact.bundle_id == artifact_id
-    assert hashlib.sha256(audio).hexdigest() == audio_sha
-    assert hashlib.sha256(manifest).hexdigest() == manifest_sha
+    assert artifact.bundle_id == stage[0]
+    assert hashlib.sha256(audio).hexdigest() == stage[3]
+    assert hashlib.sha256(manifest).hexdigest() == stage[4]
     with closing(database.open_connection(read_only=True)) as connection:
-        active_proof = connection.execute(
-            "SELECT immutable_metadata,proof_content_sha256,records_sha256 FROM ready_replay_proof"
-        ).fetchone()
-    assert active_proof == proof
-    assert ready_bundles._v2_descriptor_basis(descriptor)[3] == frozen_projection_sha
+        assert (
+            connection.execute(
+                "SELECT immutable_metadata,proof_content_sha256,records_sha256 FROM ready_replay_proof"
+            ).fetchone()
+            == proof
+        )
+    assert ready_bundles._v2_descriptor_basis(stage[1])[3] == frozen_projection_sha
 
-    replay = _source(store, "b" * 32, 10, 2)
-    assert finalize_public_audio_v2(store, (replay,), ready, _options(clock.state(), 12)).published == ()
+    assert (
+        finalize_public_audio_v2(
+            store, (_source(store, "b" * 32, 10, 2),), ready, _options(clock.state(), 12)
+        ).published
+        == ()
+    )
     assert (artifact.path / "audio.ogg").read_bytes() == audio
     assert (artifact.path / "manifest.json").read_bytes() == manifest

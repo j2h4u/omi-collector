@@ -197,6 +197,16 @@ def _valid_anchor_identity(confidence: object, source_id: object) -> bool:
     )
 
 
+def _valid_causal_interval(item: object) -> bool:
+    if not isinstance(item, tuple):
+        return False
+    match item:
+        case (start, end):
+            return type(start) is int and type(end) is int and 0 <= start <= end
+        case _:
+            return False
+
+
 @dataclass(frozen=True, slots=True)
 class ClockState:
     ranges: tuple[ClockRange, ...] = ()
@@ -219,13 +229,7 @@ class ClockState:
         if self.anchor is not None and not isinstance(self.anchor, ClockAnchor):
             raise ClockStateError("clock anchor is invalid")
         if not isinstance(self.causal_uncertainty, tuple) or any(
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or type(item[0]) is not int
-            or type(item[1]) is not int
-            or item[0] < 0
-            or item[1] < item[0]
-            for item in self.causal_uncertainty
+            not _valid_causal_interval(item) for item in self.causal_uncertainty
         ):
             raise ClockStateError("clock causal uncertainty is invalid")
 
@@ -337,11 +341,10 @@ class ClockState:
             intent = _parse_intent(cast(dict[object, object], intent_value)) if isinstance(intent_value, dict) else None
             anchor = _parse_anchor(cast(dict[object, object], anchor_value)) if isinstance(anchor_value, dict) else None
             uncertainty = payload.get("causal_uncertainty", [])
-            if not isinstance(uncertainty, list) or any(
-                not isinstance(item, list) or len(item) != 2 for item in uncertainty
-            ):
+            if not isinstance(uncertainty, list) or any(not isinstance(item, list) for item in uncertainty):
                 raise ClockStateError("clock causal uncertainty is invalid")
-            return cls(ranges, intent, anchor, tuple((item[0], item[1]) for item in uncertainty))
+            intervals = cast(tuple[tuple[int, int], ...], tuple(tuple(item) for item in uncertainty))
+            return cls(ranges, intent, anchor, intervals)
         except (TypeError, ValueError) as error:
             raise ClockStateError("clock state payload is invalid") from error
 

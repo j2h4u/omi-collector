@@ -1,8 +1,10 @@
 """Bounded cleanup ordering contract checked against its runtime transition.
 
 Run: uv run --no-sync pytest -q tests/test_fsm_cleanup_model.py --hypothesis-show-statistics
-A cycle starts waiting, wakes into ACK, then publication, raw, expiry, vacuum,
-and waiting. Advance while waiting is invalid; defer ends a running cycle.
+A cycle starts waiting, wakes into ACK, then a publication attempt, raw,
+expiry, vacuum, and waiting. A transient publication does not prohibit
+independently authorized reclamation; blocked publication and capture defer it.
+Advance while waiting is invalid; defer ends a running cycle.
 Generated event sequences compare the runtime phase to an independent ordered
 obligation list; each example resets both. Time advances by two cleanup intervals
 per event, so every wake is due and every next cycle can eventually start. The
@@ -91,3 +93,105 @@ def test_bounded_cleanup_reachability_and_guards() -> None:
     assert admitted.phase is _CleanupPhase.ACK
     assert admitted.deadline > 10.0
     assert _cleanup_transition(initial, _CleanupEvent.DEFER, 10.0) == initial
+
+
+def test_publication_attempt_outcomes_preserve_cleanup_obligations() -> None:
+    visited: set[tuple[str, str]] = set()
+    for outcome in ("published", "waiting", "transient", "blocked", "capture"):
+        state = _CleanupState(_CleanupPhase.PUBLICATION, 0.0, 600.0)
+        action = _CleanupEvent.DEFER if outcome in {"blocked", "capture"} else _CleanupEvent.ADVANCE
+        state = _cleanup_transition(state, action, 1.0)
+        visited.add((outcome, state.phase.value))
+    assert visited == {
+        ("published", "raw"),
+        ("waiting", "raw"),
+        ("transient", "raw"),
+        ("blocked", "waiting"),
+        ("capture", "waiting"),
+    }
+
+
+@pytest.mark.parametrize("boundary", ("none", "change", "capture", "shutdown"))
+@pytest.mark.parametrize("timer_at", (5.0, 15.0))
+def test_retry_compaction_boundary_traces(boundary: str, timer_at: float) -> None:
+    """The publication deadline survives an independent quiet compaction."""
+    _check_retry_compaction_trace(boundary, timer_at)
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    st.lists(
+        st.tuples(
+            st.sampled_from(("none", "change", "capture", "shutdown")),
+            st.floats(min_value=0, max_value=20, allow_nan=False, allow_infinity=False),
+        ),
+        min_size=1,
+        max_size=8,
+    )
+)
+def test_generated_retry_compaction_boundaries(traces: list[tuple[str, float]]) -> None:
+    for boundary, timer_at in traces:
+        _check_retry_compaction_trace(boundary, timer_at)
+
+
+def _check_retry_compaction_trace(boundary: str, timer_at: float) -> None:
+    from typing import cast
+
+    from omi_collector.capture.domain.ready_machine import (
+        CaptureBegin,
+        CaptureEnd,
+        CompactionDue,
+        CompactionFinished,
+        InputChanged,
+        PublicationAction,
+        PublicationEvent,
+        PublicationMode,
+        PublicationResult,
+        PublicationState,
+        Quiesced,
+        RetryWait,
+        Shutdown,
+        TimerFired,
+        Wake,
+        publication_transition,
+    )
+
+    retry = RetryWait("old", "transient", 10.0, 1)
+    state, command = publication_transition(PublicationState(work=retry), CompactionDue("new", 7))
+    assert command.action is PublicationAction.COMPACT and command.token is not None
+    with pytest.raises(ValueError):
+        publication_transition(state, cast(PublicationEvent, object()))
+    token = command.token
+    for stale in (CompactionFinished(token + 1, 7, "new", PublicationResult.SETTLED, 1.0),):
+        unchanged, command = publication_transition(state, stale)
+        assert unchanged == state and command.action is PublicationAction.NONE
+    invalid_debt, command = publication_transition(
+        state, CompactionFinished(token, 8, "new", PublicationResult.SETTLED, 1.0)
+    )
+    assert invalid_debt.needs_check and command.action is PublicationAction.CHECK_INPUT
+    state, command = publication_transition(state, TimerFired(0, 10.0, timer_at))
+    assert command.action is PublicationAction.NONE
+    if boundary == "change":
+        state, _ = publication_transition(state, InputChanged())
+    elif boundary == "capture":
+        state, command = publication_transition(state, CaptureBegin())
+        assert command.action is PublicationAction.CANCEL_AND_JOIN
+    elif boundary == "shutdown":
+        state, command = publication_transition(state, Shutdown())
+        assert command.action is PublicationAction.CANCEL_AND_JOIN
+    state, command = publication_transition(state, CompactionFinished(token, 7, "new", PublicationResult.SETTLED, 16.0))
+    if boundary == "none":
+        assert state.work == retry and command.action is PublicationAction.ARM and command.deadline == 10.0
+        _, early = publication_transition(state, Wake("old", 9.0))
+        assert early.action is PublicationAction.ARM
+        _, due = publication_transition(state, Wake("old", 10.0))
+        assert due.action is PublicationAction.RUN
+    elif boundary == "change":
+        assert command.action is PublicationAction.CHECK_INPUT
+    else:
+        assert command.action is PublicationAction.NONE
+        state, _ = publication_transition(state, Quiesced())
+        state, command = publication_transition(state, CaptureEnd())
+        assert state.mode is (PublicationMode.AVAILABLE if boundary == "capture" else PublicationMode.CLOSED)
+        assert command.action is (PublicationAction.CHECK_INPUT if boundary == "capture" else PublicationAction.NONE)
+    event(f"{boundary}:timer-{timer_at}")

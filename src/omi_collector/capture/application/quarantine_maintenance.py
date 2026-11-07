@@ -94,7 +94,7 @@ def _next_cleanup_due(due_at: float, now: float) -> float:
 
 
 def _cleanup_transition(state: _CleanupState, event: _CleanupEvent, now: float) -> _CleanupState:
-    """Keep the ordered physical cleanup lifecycle within one hourly window."""
+    """Order cleanup after a publication attempt within one hourly window."""
     if not isinstance(state.phase, _CleanupPhase):
         raise ValueError("unknown cleanup phase")
     if not isinstance(event, _CleanupEvent):
@@ -341,7 +341,7 @@ class QuarantineMaintenance:
             self._defer_cleanup_window()
             return
         if self._cleanup_state.phase is _CleanupPhase.PUBLICATION:
-            if getattr(outcome, "state", None) in {"blocked", "transient"} or self._cleanup_should_defer(should_defer):
+            if getattr(outcome, "state", None) == "blocked" or self._cleanup_should_defer(should_defer):
                 self._defer_cleanup_window()
             else:
                 self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.ADVANCE, monotonic())
@@ -425,6 +425,8 @@ class QuarantineMaintenance:
             return await self._sweep_terminal_quarantine(should_defer)
         elif phase is _CleanupPhase.VACUUM:
             outcome = await self._owned_cleanup_effect(self._staging.compact_after_cleanup, should_defer)
+            if self._staging.publication_retry_schedule() is not None:
+                self._arm_publication_timer()
             if outcome is not None and outcome.reason != "compaction_done":
                 self._runtime.debug_event("hourly_compaction_deferred", reason=outcome.reason)
                 return False

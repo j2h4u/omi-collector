@@ -209,7 +209,7 @@ def _matrix_expected_actions() -> dict[tuple[PublicationMode, str], tuple[Public
             arm,
             check,
             none,
-            none,
+            compact,
             none,
             check,
             cancel,
@@ -343,6 +343,17 @@ def test_compaction_admission_settlement_retry_and_stale_completion() -> None:
     settled, command = publication_transition(started, CompactionFinished(1, 8, "rev", PublicationResult.SETTLED, 2.0))
     assert command.action is PublicationAction.NONE
     assert settled.work == Settled("rev", PublicationResult.SETTLED)
+
+
+def test_compaction_preserves_pending_publication_retry_and_deadline() -> None:
+    retry = RetryWait("old", "space shortage", 10.0, 2)
+    started, command = publication_transition(PublicationState(work=retry), CompactionDue("new", 8))
+    assert command.action is PublicationAction.COMPACT
+    during, command = publication_transition(started, TimerFired(0, 10.0, 11.0))
+    assert during == started and command.action is PublicationAction.NONE
+    finished, command = publication_transition(during, CompactionFinished(1, 8, "new", PublicationResult.SETTLED, 12.0))
+    assert finished.work == retry
+    assert command.action is PublicationAction.ARM and command.deadline == 10.0
 
 
 def test_compaction_probe_failure_uses_existing_retry_wait() -> None:

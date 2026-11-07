@@ -335,7 +335,7 @@ class StagingStore:
             )
         )
         if next_command.action is PublicationAction.ARM:
-            return self._publication_outcome(next_command)
+            return outcome if work.publication_retry is not None else self._publication_outcome(next_command)
         if next_command.action is PublicationAction.CHECK_INPUT:
             return next_command
         return outcome
@@ -894,11 +894,11 @@ class StagingStore:
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
         clock_state = self._publication_clock_state()
-        acknowledged = acknowledged_public_audio_v2(checkpoint_path)
-        acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
         if not self._retired_recovery_done:
             resume_retired_public_audio_v2(publication_root, self._state_db)
             self._retired_recovery_done = True
+        acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+        acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
         closures = ready_closures.coalesce(self._state_db)
         closure = closures[-1] if closures else None
         frontier = None if closure is None else closure.next_sequence
@@ -942,11 +942,11 @@ class StagingStore:
             return 0
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
         with self.device_lock(operation="ready_ack_retirement"):
-            acknowledged = acknowledged_public_audio_v2(checkpoint_path)
-            needs_retirement = acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
             if not self._retired_recovery_done:
                 resume_retired_public_audio_v2(publication_root, self._state_db)
                 self._retired_recovery_done = True
+            acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+            needs_retirement = acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
             if not needs_retirement or should_defer():
                 return 0
             try:

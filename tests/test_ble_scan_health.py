@@ -527,6 +527,53 @@ def test_start_callback_before_failure_cannot_resolve_existing_incident() -> Non
     asyncio.run(scenario())
 
 
+def test_failed_start_callback_during_incident_open_cannot_resolve_it() -> None:
+    async def scenario() -> None:
+        now = [10.0]
+        opening = asyncio.Event()
+        release = asyncio.Event()
+
+        class DelayedSink(FakeSink):
+            async def open(self, context: ScanIncidentContext) -> None:
+                opening.set()
+                await release.wait()
+                await super().open(context)
+
+        class RefusingOnce(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                if self.events.count("start") == 1:
+                    raise RuntimeError("start refused")
+
+        sink = DelayedSink()
+        observer = RefusingOnce()
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        scheduler = PresenceScheduler(observer, scan_health=monitor, clock=lambda: now[0])
+        scheduler._loop = asyncio.get_running_loop()
+        start = asyncio.create_task(scheduler._start_scan())
+        try:
+            async with asyncio.timeout(1.0):
+                await opening.wait()
+                now[0] = 11.0
+                assert observer.callback is not None
+                observer.callback(ScanRadioActivity(now[0]))
+                release.set()
+                assert not await start
+                assert sink.is_active and not sink.resolved
+                assert await scheduler._start_scan()
+                now[0] = 12.0
+                assert observer.callback is not None
+                observer.callback(ScanRadioActivity(now[0]))
+                await monitor.flush_recovery()
+                assert sink.resolved == [(1, "advertisements_resumed")]
+        finally:
+            release.set()
+            await asyncio.gather(start, return_exceptions=True)
+            await scheduler.close()
+
+    asyncio.run(scenario())
+
+
 def test_new_failure_supersedes_pending_recovery_and_delayed_callback() -> None:
     async def scenario() -> None:
         now = [1.0]

@@ -587,6 +587,9 @@ def service(
         try:
             with _command_state(loaded) as state_db:
                 stop_intent.check()
+                capture_cli = _capture_cli()
+                _run_device_operation(capture_cli.recover_phy(capture_cli.SUPPORTED_ADAPTER), stop_intent=stop_intent)
+                stop_intent.check()
                 _service_locked(loaded, state_db, stop_intent=stop_intent)
         except StopRequestedError as error:
             raise typer.Exit(code=stop_intent.exit_code) from error

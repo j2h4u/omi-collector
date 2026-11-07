@@ -396,6 +396,7 @@ class PresenceScheduler:
                 await self._scan_health.scan_stopped(generation)
 
     async def _record_scan_start_failure(self, generation: int, error: Exception) -> None:
+        self._active_scanner_generation = None
         if self._scan_health is not None:
             await self._scan_health.scan_start_failed(generation, error)
 

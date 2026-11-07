@@ -1,5 +1,17 @@
 # Agent Rules
 
+## Architecture and code design
+
+Apply Stratified Design throughout new development and refactoring, including
+tests and automation. Keep operations at a consistent semantic level and hide
+representation details behind small, meaningful interfaces. Separate calculations
+from effects where this creates a useful boundary; do not add forwarding wrappers
+or layers solely for structure. Preserve business invariants, effect order,
+transactions, and cancellation behavior. Test observable behavior at these
+boundaries. Use the `stratified-design` skill when available.
+
+## Verification
+
 This project uses hard gates. Do not weaken, skip, or locally suppress them to
 make a change pass.
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.10](https://github.com/j2h4u/omi-collector/compare/v1.1.9...v1.1.10) (2026-11-07)
+
+
+### Fixes
+
+* bound unchanged publication work and continue independent quarantine recovery ([f38abec](https://github.com/j2h4u/omi-collector/commit/f38abec16135063e84b5111c39cbd6bbccc369d4))
+* preserve causal clock uncertainty and physical audio publication order ([f38abec](https://github.com/j2h4u/omi-collector/commit/f38abec16135063e84b5111c39cbd6bbccc369d4))
+* preserve committed retirement cleanup and external publication recovery ([f38abec](https://github.com/j2h4u/omi-collector/commit/f38abec16135063e84b5111c39cbd6bbccc369d4))
+* reclaim authorized storage independently of publication retries ([f38abec](https://github.com/j2h4u/omi-collector/commit/f38abec16135063e84b5111c39cbd6bbccc369d4))
+* restore marked temporary PHY settings before collector service readiness ([f38abec](https://github.com/j2h4u/omi-collector/commit/f38abec16135063e84b5111c39cbd6bbccc369d4))
+* serialize scan incident persistence and reject failed scanner recovery evidence ([f38abec](https://github.com/j2h4u/omi-collector/commit/f38abec16135063e84b5111c39cbd6bbccc369d4))
+
 ## [1.1.9](https://github.com/j2h4u/omi-collector/compare/v1.1.8...v1.1.9) (2026-11-07)
 
 

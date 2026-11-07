@@ -1430,12 +1430,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "0eca9b7b2b2ac4d5db4889b306bfad1e31007d66bec32d81792b9106661793ed",
-      "count": 1,
-      "reason": "Publication completion preserves its effect outcome and uses explicit reprobe plus publication revision/generation rules; compaction completion additionally binds storage-debt generation, preserves quiescing ownership, and rechecks pending input after success. Their completion schemas, settlement values and interruption rules differ despite the small shared backoff calculation. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:312-340 ~ src/omi_collector/capture/domain/ready_machine.py:359-392."
-    },
-    {
-      "detector": "pyscn",
       "identity": "0fd52823cf6b16fea5d68b47fbe5cd3ca976ee669bcf1b1bd1f56f302022b040",
       "count": 1,
       "reason": "Failed-start cleanup invalidates the start marker even when incident persistence is cancelled; failed-stop reporting preserves the already frozen scan-duration context from scan_stopping. Both compose the existing incident/persistence/diagnostic primitives, but their lifecycle postconditions differ. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:161-170 ~ src/omi_collector/capture/application/ble_scan_health.py:179-187."
@@ -1493,12 +1487,6 @@
       "identity": "1f5a7e0825cc07f2c6208ddc1a79df390bb7c20cf12839cb955a46d9e4acf4d2",
       "count": 1,
       "reason": "HCI data-length transitions and connection parameter requests have different controller units, field meanings and wire events. Keep explicit record/serialization contracts. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:168-182 ~ src/omi_collector/capture/adapters/ble_link_observability.py:202-216."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "1fc2b3d38e021bd44ab78738b76db59059d430eb2de89c2ed55778ea961a094e",
-      "count": 1,
-      "reason": "Compaction scheduling requires available idle/settled state and creates a debt-bound effect token; failed-probe handling schedules repair/backoff without that successful debt evidence. Keep independent state transitions. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:372-379 ~ src/omi_collector/capture/domain/ready_machine.py:418-430."
     },
     {
       "detector": "pyscn",
@@ -1886,6 +1874,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "93299fa7bb0833f727e6b73a7ec7949097a21a7611d2a93f4c43433636582449",
+      "count": 1,
+      "reason": "Compaction admission has confirmed debt evidence, allocates a debt-bound effect token, and carries an existing publication RetryWait through compaction. Failed-probe handling has no debt generation or runnable effect; it accepts only idle/settled work and arms the first probe retry without replacing an existing publication retry. Their admission sets, evidence and commands differ despite similar state construction. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:350-358 ~ src/omi_collector/capture/domain/ready_machine.py:399-411."
+    },
+    {
+      "detector": "pyscn",
       "identity": "98b51391f4ac6ddc1d5bb48d681ef6c05010155f8abc6cfcd828a20b8a0e95fc",
       "count": 1,
       "reason": "Durable prefix and durable seal protocols intentionally expose overlapping custody fields, but a seal additionally establishes source identity and publication authority. Independent interfaces constrain different consumers. Reviewed pair: src/omi_collector/capture/application/ports.py:39-50 ~ src/omi_collector/capture/application/ports.py:63-79."
@@ -2165,6 +2159,12 @@
       "identity": "ee083a18f156b3ec1c1575d896949ad668f12cf47515470278dea8aaf061f061",
       "count": 1,
       "reason": "Retirement source selection and publisher candidate inventory use different lifecycle eligibility and return models. Shared StateDB read mechanics already exist. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4505-4524 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "ee1d8cbc946c2ed755cf3034e36d8e5796ad9532807000555196dda3853da233",
+      "count": 1,
+      "reason": "Publication completion preserves its effect outcome and applies explicit reprobe plus publication revision/generation rules. Compaction completion binds storage-debt generation, preserves quiescing ownership, and restores a retained publication RetryWait with its original outcome/deadline before considering compaction backoff. Their event schemas, settlement values and outstanding retry obligations differ; keep independent transitions. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:313-341 ~ src/omi_collector/capture/domain/ready_machine.py:361-396."
     },
     {
       "detector": "pyscn",

@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.11](https://github.com/j2h4u/omi-collector/compare/v1.1.10...v1.1.11) (2026-11-07)
+
+
+### Documentation
+
+* define current invariant contracts and measured verification scopes ([8bbab34](https://github.com/j2h4u/omi-collector/commit/8bbab34c5a8fe3561174d053bcb1563dfda0ef80))
+
+
+### Tests
+
+* enumerate bounded FSM safety and progress obligations ([8bbab34](https://github.com/j2h4u/omi-collector/commit/8bbab34c5a8fe3561174d053bcb1563dfda0ef80))
+* generate durable effect failure and recovery scenarios ([8bbab34](https://github.com/j2h4u/omi-collector/commit/8bbab34c5a8fe3561174d053bcb1563dfda0ef80))
+
 ## [1.1.10](https://github.com/j2h4u/omi-collector/compare/v1.1.9...v1.1.10) (2026-11-07)
 
 

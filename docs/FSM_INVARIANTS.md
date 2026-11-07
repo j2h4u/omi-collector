@@ -2,7 +2,9 @@
 
 This is the current technical contract for supported collector paths. Runtime
 code is based on `18806fc`; model and effect tests are at `1b9e9f8`. The targeted
-model/effect receipt records 21 passing tests. The obligations describe intended
+model/effect receipt records 21 passing tests. Full verification of source and
+test tree `5fb069f` records 2,925 passing tests, static checks, CRAP, dependency
+audit and Docker runtime checks. The obligations describe intended
 behavior; implementation status is scoped to available tests and source
 evidence, not a proof of all executions.
 
@@ -151,7 +153,7 @@ The named node exercises the specific scenario stated here; the full baseline
 receipt includes the suite, but passing a node does not establish its entire
 property. A slash between letters groups only the scenario being checked.
 
-- **F01(a):** `tests/test_attempt_writer.py::test_prefix_and_done_seal_are_worker_owned_and_ordered` checks writer prefix/seal ordering; `tests/test_batch_machine.py::test_legal_lifecycle_reaches_retired_only_after_close` checks transition ordering. Neither alone establishes actual durable writer receipt through ADVANCE. **F01(b):** fresh compatible INFO through transport is not established by these nodes; this obligation remains supported by the source trace rather than a named end-to-end test here.
+- **F01(a,b):** `tests/test_batch_reconciliation.py::test_fresh_info_regression_keeps_sealed_batch_without_advance` uses a real writer, private SQLite and scripted ring session to retain two records and send no ADVANCE after regressed INFO. `tests/test_batch_reconciliation.py::test_fresh_info_cursor_ahead_does_not_claim_advance_confirmation` checks that an ahead cursor does not claim ADVANCE confirmation. `tests/test_batch_reconciliation.py::test_acknowledged_advance_with_old_cursor_repeats_without_reread` checks two ADVANCE commands, one READ, confirmed cursor and joined writer. These controlled cases do not establish every durability or transport failure, real BLE, or untagged firmware correlation.
 - **F02(a):** `tests/test_attempt_writer.py::test_partial_tail_is_drained_before_interruption` checks interruption draining, not every cancellation interleaving. **F02(b):** `tests/test_public_audio_v2_integration.py::test_v2_accepted_cohort_without_stage_resumes_after_interruption` checks one cohort recovery path, not every crash cut. **F02(c):** `tests/test_staging_quarantine.py::test_ready_custody_conflict_cannot_be_salvaged_or_terminally_deleted` checks a conflict hold; nonempty terminal-delete authorization remains unresolved.
 - **F03(a,b):** `tests/test_public_audio_v2_integration.py::test_v2_waits_for_drain_and_threshold_without_reserving_order` checks waiting on drain and cohort threshold. Previously authorized recovery may finish, and the threshold is for the cohort, not each split file. **F03(c):** `tests/test_public_audio_v2_recovery.py::test_v2_materialization_process_loss_converges_to_reserved_artifact` checks recovery to a reserved artifact, not every atomicity or immutability failure mode.
 - **F04(a):** `tests/test_fsm_publication_model.py::test_generated_frontier_preserves_late_custody` checks exact replay and late unique source at the frontier, not every ordering case. **F04(b):** `tests/test_public_audio_v2_integration.py::test_v2_same_cohort_sequence_gap_splits_artifacts_and_marks_second_boundary` checks one gap boundary. **F04(c):** `tests/test_public_time_facts.py::test_completed_empty_clock_write_preserves_boundary_after_reload` checks an empty completed boundary. **F04(d):** `tests/test_public_audio_v2_recovery.py::test_legacy_unknown_stage_and_replay_survive_current_clock_upgrade` checks legacy frozen recovery; historic timestamps cannot always be reconstructed.
@@ -167,11 +169,12 @@ property. A slash between letters groups only the scenario being checked.
 The following existing tests are the checking route. Run from the project root:
 
 ```sh
-timeout --signal=TERM --kill-after=5s 600s uv run --no-sync pytest -q tests/test_fsm_scan_model.py tests/test_fsm_publication_model.py tests/test_fsm_cleanup_model.py tests/test_fsm_clock_model.py tests/test_fsm_bounded_obligations.py tests/test_fsm_effect_recovery.py --hypothesis-show-statistics
+timeout --signal=TERM --kill-after=5s 600s chrt --idle 0 nice -n 19 ionice -c 3 uv run --no-sync pytest -q tests/test_fsm_scan_model.py tests/test_fsm_publication_model.py tests/test_fsm_cleanup_model.py tests/test_fsm_clock_model.py tests/test_fsm_bounded_obligations.py tests/test_fsm_effect_recovery.py --hypothesis-show-statistics
 ```
 
 Configured example counts below are budgets, not measured state or transition
-counts. Hypothesis resets each example, generates and shrinks sequences, and
+counts. Tests reset their model and runtime per example; Hypothesis generates and shrinks
+sequences, and
 reports sampled labels; random sampling does not establish exhaustive coverage.
 Directed tests listed above exercise concrete effects. The full verification
 receipt is for the baseline identified above; model statistics from other runs
@@ -228,7 +231,7 @@ a successful fair suffix; the companion guard node checks stale tokens, stale
 timers and early versus due deadlines. The targeted receipt covers these nodes alongside the effect tests described below.
 
 - **B / F08(a,b):** `tests/test_fsm_bounded_obligations.py::test_bounded_monitor_chronology`
-  enumerated 125 length-three paths, observing two incident-open states and ten
+  enumerated 125 length-three paths, observing two incident states (closed and open) and ten
   labeled edges. It compares the isolated monitor's stop-failure chronology
   against a successful sink. It assumes the caller filters failed-start
   generations; it does not check that caller qualification, failed storage,

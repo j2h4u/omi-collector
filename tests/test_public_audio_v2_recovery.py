@@ -954,14 +954,21 @@ def test_legacy_unknown_stage_and_replay_survive_current_clock_upgrade(
     with pytest.raises(ReadyBundleError, match="after reservation"):
         finalize_public_audio_v2(store, (source,), ready, _options(legacy, 12))
     with closing(database.open_connection(read_only=True)) as connection:
-        stage = connection.execute(
-            "SELECT artifact_id,descriptor,descriptor_sha256,expected_audio_sha256,expected_manifest_sha256 "
-            "FROM ready_v2_output_stage"
-        ).fetchone()
-        proof = connection.execute(
-            "SELECT immutable_metadata,proof_content_sha256,records_sha256 FROM ready_replay_proof"
-        ).fetchone()
+        stage = cast(
+            tuple[object, ...] | None,
+            connection.execute(
+                "SELECT artifact_id,descriptor,descriptor_sha256,expected_audio_sha256,expected_manifest_sha256 "
+                "FROM ready_v2_output_stage"
+            ).fetchone(),
+        )
+        proof = cast(
+            tuple[object, ...] | None,
+            connection.execute(
+                "SELECT immutable_metadata,proof_content_sha256,records_sha256 FROM ready_replay_proof"
+            ).fetchone(),
+        )
     assert stage is not None and proof is not None
+    assert isinstance(stage[1], bytes)
     assert hashlib.sha256(stage[1]).hexdigest() == stage[2]
     frozen_projection_sha = ready_bundles._v2_descriptor_basis(stage[1])[3]
 

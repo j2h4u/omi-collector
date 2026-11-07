@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -30,15 +31,18 @@ def test_ack_retirement_releases_reserve_for_waiting_publication(
         _source(audio, "a" * 32, 10, (_record(100),))
     store.append_ready_closure(11, "drained")
     (first,) = store.recover_and_publish().published
-    manifest = json.loads((first.path / "manifest.json").read_text())
-    _checkpoint(tmp_path, [{"id": first.bundle_id, "audio_sha256": manifest["audio_sha256"]}])
+    manifest = cast(object, json.loads((first.path / "manifest.json").read_text()))
+    assert isinstance(manifest, dict)
+    digest = cast(dict[str, object], manifest).get("audio_sha256")
+    assert isinstance(digest, str)
+    _checkpoint(tmp_path, [{"id": first.bundle_id, "audio_sha256": digest}])
     with InternalAudioStore(store.state_db) as audio:
         _source(audio, "b" * 32, 11, (_record(101),))
     store.append_ready_closure(12, "drained")
     statvfs = os.statvfs
 
     def space(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> object:
-        if Path(path) == ready:
+        if Path(os.fsdecode(path)) == ready:
             return SimpleNamespace(f_frsize=4096, f_bavail=0 if first.path.exists() else 10**8)
         return statvfs(path)
 
@@ -62,5 +66,7 @@ def test_ack_retirement_releases_reserve_for_waiting_publication(
 
     asyncio.run(run())
     assert not first.path.exists()
-    assert store.state_db.get(StateKind.READY_PUBLICATION, first.bundle_id)["state"] == "retired"
+    ledger = store.state_db.get(StateKind.READY_PUBLICATION, first.bundle_id)
+    assert ledger is not None
+    assert ledger["state"] == "retired"
     assert len(list(ready.iterdir())) == 1

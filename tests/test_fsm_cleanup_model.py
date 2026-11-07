@@ -54,6 +54,7 @@ def test_bounded_cleanup_reachability_and_guards() -> None:
     visited: set[tuple[str, str, str]] = set()
     for actions in product(_CleanupEvent, repeat=6):
         state = _CleanupState(_CleanupPhase.WAITING, 10.0)
+        now = 10.0
         for index, action in enumerate(actions):
             now = 10.0 + index * CLEANUP_INTERVAL_SECONDS * 2
             before = state.phase.value

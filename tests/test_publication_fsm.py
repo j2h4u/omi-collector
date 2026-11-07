@@ -16,12 +16,13 @@ import pytest
 
 from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters import staging_store as staging_store_module
-from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, CaptureRecord, InternalAudioStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance
+from omi_collector.capture.domain.ready_machine import PublicationCommand, PublicationEvent
 from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, RetryConfig
 from staging_test_factory import StagingStore
@@ -54,9 +55,11 @@ def test_space_only_recovery_probes_without_rereading_payload(tmp_path: Path, mo
     original_read = InternalAudioStore.read_record_page
     monkeypatch.setattr(staging_store_module, "monotonic", lambda: now[0])
 
-    def tracked(*args, **kwargs):
+    def tracked(
+        audio: InternalAudioStore, source_id: str, after_ordinal: int = -1, limit: int = 128
+    ) -> tuple[CaptureRecord, ...]:
         reads[0] += 1
-        return original_read(*args, **kwargs)
+        return original_read(audio, source_id, after_ordinal, limit)
 
     def reserve(path: Path, required: int) -> None:
         if free[0] < required:
@@ -92,7 +95,7 @@ def test_partial_stage_failures_keep_backoff(tmp_path: Path, monkeypatch: pytest
     events: list[tuple[object, object]] = []
     event = store._publication_event
 
-    def bounded_event(value):
+    def bounded_event(value: PublicationEvent) -> PublicationCommand:
         result = event(value)
         events.append((value, result))
         assert len(events) < 25, events
@@ -100,7 +103,7 @@ def test_partial_stage_failures_keep_backoff(tmp_path: Path, monkeypatch: pytest
 
     monkeypatch.setattr(store, "_publication_event", bounded_event)
 
-    def fail(stage, _page_limit):
+    def fail(stage: ready_bundles._V2Stage, _page_limit: int) -> ready_bundles.ReadyBundleResult:
         stage.path.mkdir(exist_ok=True)
         (stage.path / "partial").write_text(str(now[0]))
         raise OSError("partial write")

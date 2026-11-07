@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.9](https://github.com/j2h4u/omi-collector/compare/v1.1.8...v1.1.9) (2026-11-07)
+
+
+### Documentation
+
+* establish agent architecture guidance ([#332](https://github.com/j2h4u/omi-collector/issues/332)) ([13bb89c](https://github.com/j2h4u/omi-collector/commit/13bb89cbc19b477d64e67ce240c5c94b0f19bc9b))
+
 ## [1.1.8](https://github.com/j2h4u/omi-collector/compare/v1.1.7...v1.1.8) (2026-11-06)
 
 

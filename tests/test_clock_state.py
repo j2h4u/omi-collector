@@ -204,3 +204,39 @@ def test_clock_state_payload_rejects_missing_or_extra_fields(section: str, missi
         entry["extra"] = 1
     with pytest.raises(ClockStateError):
         ClockState.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [[], ("not a clock range",), (_range(0, 3, 1.0), _range(2, 4, 1.0))],
+)
+def test_clock_state_rejects_invalid_or_overlapping_ranges(ranges: object) -> None:
+    with pytest.raises(ClockStateError, match="ranges overlap or are unordered"):
+        ClockState(ranges=cast(tuple[ClockRange, ...], ranges))
+
+
+@pytest.mark.parametrize("field", ["intent", "anchor"])
+def test_clock_state_rejects_invalid_intent_and_anchor(field: str) -> None:
+    arguments = {field: "invalid"}
+    with pytest.raises(ClockStateError, match=f"clock {field} is invalid"):
+        ClockState(
+            intent=cast(ClockIntent | None, arguments.get("intent")),
+            anchor=cast(ClockAnchor | None, arguments.get("anchor")),
+        )
+
+
+@pytest.mark.parametrize(
+    "intervals",
+    [[], ((1,),), ((1, 2, 3),), ((True, 2),), ((1, False),), ((1.0, 2),), ((-1, 2),), ((3, 2),)],
+)
+def test_clock_state_rejects_invalid_causal_uncertainty(intervals: object) -> None:
+    with pytest.raises(ClockStateError, match="clock causal uncertainty is invalid"):
+        ClockState(causal_uncertainty=cast(tuple[tuple[int, int], ...], intervals))
+
+
+@pytest.mark.parametrize("intervals", [[1], [[1]], [[1, 2, 3]], [[False, 2]], [[3, 2]]])
+def test_clock_state_payload_rejects_invalid_causal_uncertainty(intervals: object) -> None:
+    payload = ClockState().to_payload()
+    payload["causal_uncertainty"] = intervals
+    with pytest.raises(ClockStateError, match="clock state payload is invalid"):
+        ClockState.from_payload(payload)

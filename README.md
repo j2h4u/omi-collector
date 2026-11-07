@@ -87,6 +87,9 @@ ledger and replay custody, records retirement, then removes the exact ready
 directory and proof. The consumer is responsible for the truth of its ACK;
 the collector does not inspect its speech-tail state.
 
+For the technical runtime contract and bounded state-machine checks, see the
+[FSM invariants](docs/FSM_INVARIANTS.md).
+
 ## Requirements
 
 - Omi CV1 pendant running stock firmware

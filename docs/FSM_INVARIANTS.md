@@ -1,12 +1,10 @@
 # Runtime invariants and bounded FSM contracts
 
-This is the current technical contract for the supported collector paths. The
-baseline is `18806fc`; its runtime and tests are byte-identical to candidate
-`696ca55`, whose full verification receipt records 2,904 passing tests. That
-receipt does not establish exhaustive state coverage. The earlier audit snapshot
-`36becf4` remains separate. The obligations below describe intended behavior;
-implementation status is scoped to available tests and source evidence, not a
-proof of all executions.
+This is the current technical contract for supported collector paths. Runtime
+code is based on `18806fc`; model and effect tests are at `1b9e9f8`. The targeted
+model/effect receipt records 21 passing tests. The obligations describe intended
+behavior; implementation status is scoped to available tests and source
+evidence, not a proof of all executions.
 
 ## Assumptions and boundaries
 
@@ -169,7 +167,7 @@ property. A slash between letters groups only the scenario being checked.
 The following existing tests are the checking route. Run from the project root:
 
 ```sh
-timeout --signal=TERM --kill-after=5s 600s uv run --no-sync pytest -q tests/test_fsm_scan_model.py tests/test_fsm_publication_model.py tests/test_fsm_cleanup_model.py tests/test_fsm_clock_model.py --hypothesis-show-statistics
+timeout --signal=TERM --kill-after=5s 600s uv run --no-sync pytest -q tests/test_fsm_scan_model.py tests/test_fsm_publication_model.py tests/test_fsm_cleanup_model.py tests/test_fsm_clock_model.py tests/test_fsm_bounded_obligations.py tests/test_fsm_effect_recovery.py --hypothesis-show-statistics
 ```
 
 Configured example counts below are budgets, not measured state or transition
@@ -220,6 +218,64 @@ must not be substituted for its measurements.
   uses 50 sequences of 1–15 events and a successful finish suffix. Successful
   persistence and a known end are required; concurrent writes and crashes during
   writes are outside the model.
+
+### Measured finite runtime comparisons
+
+The targeted receipt for `test_fsm_bounded_obligations.py` records all four
+nodes below passing. These are counts in the named abstractions, not total
+runtime states or schedules. Each enumeration asserts required edges and supplies
+a successful fair suffix; the companion guard node checks stale tokens, stale
+timers and early versus due deadlines. The targeted receipt covers these nodes alongside the effect tests described below.
+
+- **B / F08(a,b):** `tests/test_fsm_bounded_obligations.py::test_bounded_monitor_chronology`
+  enumerated 125 length-three paths, observing two incident-open states and ten
+  labeled edges. It compares the isolated monitor's stop-failure chronology
+  against a successful sink. It assumes the caller filters failed-start
+  generations; it does not check that caller qualification, failed storage,
+  arbitrary concurrency or process crashes.
+- **C / F04(c):** `tests/test_fsm_bounded_obligations.py::test_bounded_clock_intent`
+  enumerated 64 length-three paths, observing three intent phases and twelve
+  labeled edges, including rejections. It assumes committed serialization and a
+  known boundary; it does not enumerate interrupted persistence or concurrent
+  writes.
+- **P / F03, F07 and F09:** `tests/test_fsm_bounded_obligations.py::test_bounded_publication_ownership`
+  enumerated 125 length-three paths, observing eight abstract mode/work states
+  and thirty labeled edges. `tests/test_fsm_bounded_obligations.py::test_bounded_publication_token_and_deadline_guards`
+  separately checks stale completion and timer tokens, early deadline and due
+  deadline. These check reducer ownership, guards and conditional settlement,
+  not actual publication, custody or end-to-end progress. They assume effects
+  finish, deadlines pass and capture releases; compaction, failed storage,
+  concurrent schedules and crash cuts are excluded.
+
+### Real effect and recovery checks
+
+The targeted receipt records 21 passing tests across the finite and effect
+file in 5.55 seconds. Hypothesis generated 20 passing examples for each of the
+four generated nodes below; the scan chronology run also discarded two invalid
+examples. Generated samples are observations, not exhaustive coverage.
+
+- **C / F04(c):** `tests/test_fsm_effect_recovery.py::test_generated_clock_transaction_recovery`
+  and `tests/test_fsm_effect_recovery.py::test_clock_effect_transition_witnesses`
+  use real SQLite transactions, rollback and reopen to check persisted clock
+  intent and uncertainty. They do not enumerate every crash cut or concurrency.
+- **B / F08(a–c):** `tests/test_fsm_effect_recovery.py::test_generated_scan_incident_recovery`
+  and `tests/test_fsm_effect_recovery.py::test_scan_effect_transition_witnesses`
+  exercise incident persistence and reopen; `tests/test_fsm_effect_recovery.py::test_generated_scan_transient_store_recovery`
+  exercises active-scan silence, transient open/resolve writes, retry deadlines
+  and reopen. Its 20 sampled examples included all four open/resolve failure
+  combinations, five each. `tests/test_fsm_effect_recovery.py::test_cancelled_incident_resolution_joins_committed_write`
+  checks that cancellation joins the owned resolution write. These do not
+  enumerate arbitrary callback schedules or physical scanner failures.
+- **P / F03, F05, F09:** `tests/test_fsm_effect_recovery.py::test_generated_publication_effect_recovery`
+  and `tests/test_fsm_effect_recovery.py::test_publication_effect_transition_witnesses`
+  exercise real publication fault boundaries, 0–6 additional read-only store
+  reopens and then one recovery publication. They check bad ACK preserves,
+  exact ACK retires, covered RAW is removed and compaction debt remains pending.
+  The deterministic parameterized witness covers ten boundaries: before and
+  after each of five effects; this particular random run also sampled all ten,
+  which future random runs need not do. These checks do not execute compaction
+  completion or new capture interleavings; for controlled compaction yield see
+  `tests/test_quarantine_maintenance.py::test_admitted_vacuum_ignores_window_expiry_but_yields_to_capture`.
 
 These routes check finite safety, reachable states, rejection and supplied fair
 progress witnesses. They do not prove unbounded temporal properties, all

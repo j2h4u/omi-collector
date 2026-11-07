@@ -73,6 +73,7 @@ class PublicationMode(StrEnum):
 
 class PublicationResult(StrEnum):
     SETTLED = "settled"
+    BLOCKED = "blocked"
     TRANSIENT = "transient"
 
 
@@ -314,7 +315,9 @@ def _finished(state: PublicationState, event: Finished) -> tuple[PublicationStat
         return state, PublicationCommand()
     if state.mode is not PublicationMode.AVAILABLE:
         return PublicationState(state.mode, Idle(), state.generation, state.next_token), PublicationCommand()
-    if work.generation != state.generation or event.revision != work.revision:
+    if work.generation != state.generation or (
+        event.result is PublicationResult.SETTLED and event.revision != work.revision
+    ):
         updated = PublicationState(state.mode, Idle(), state.generation, state.next_token, True)
         return updated, PublicationCommand(PublicationAction.CHECK_INPUT)
     if event.result is PublicationResult.TRANSIENT:
@@ -327,7 +330,7 @@ def _finished(state: PublicationState, event: Finished) -> tuple[PublicationStat
             state.next_token,
         )
         return updated, PublicationCommand(PublicationAction.ARM, deadline=deadline)
-    if event.result is PublicationResult.SETTLED:
+    if event.result in {PublicationResult.SETTLED, PublicationResult.BLOCKED}:
         updated = PublicationState(
             state.mode, Settled(event.revision, event.outcome), state.generation, state.next_token
         )

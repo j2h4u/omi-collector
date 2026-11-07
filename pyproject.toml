@@ -270,4 +270,5 @@ dev = [
     "vulture>=2.16",
     "tach>=0.35.0",
     "coverage>=7.14.3",
+    "hypothesis>=6,<7",
 ]

@@ -251,3 +251,131 @@ def test_prepared_projection_builds_components_once_for_many_records(monkeypatch
     for sequence in range(1000):
         assert projection.freeze(sequence=sequence, raw_timestamp=100).causal_membership == "mapped:0:1000"
     assert calls == 1
+
+
+@pytest.mark.parametrize("second_label", [99, 100, 101])
+def test_completed_clock_write_keeps_each_record_incomparable(second_label: int) -> None:
+    intent = ClockIntent("write", "prepared", 100, 200, 0.0, 10)
+    pending = ClockState().begin_intent(intent).mark_uncertain("write", write_sequence_after=12)
+    completed = pending.finish_intent("write", (ClockRange(10, 12, None, None, "unknown", "write"),))
+    restored = ClockState.from_payload(completed.to_payload())
+    first = PublicTimeProjection.from_state(restored).freeze(sequence=10, raw_timestamp=100)
+    second = PublicTimeProjection.from_state(restored).freeze(
+        sequence=11, raw_timestamp=second_label, predecessor=FrozenTimePredecessor(10, first)
+    )
+
+    assert (first.seconds, second.seconds) == (100, second_label)
+    assert second.comparable_to_previous is False
+
+
+def test_completed_empty_clock_write_preserves_boundary_after_reload() -> None:
+    intent = ClockIntent("write", "prepared", 100, 200, 0.0, 11)
+    state = ClockState((_mapped(10, 13, 0.0, "anchor"),)).begin_intent(intent)
+    completed = state.mark_uncertain("write", write_sequence_after=11).finish_intent("write", ())
+    projection = PublicTimeProjection.from_state(ClockState.from_payload(completed.to_payload()))
+    first = projection.freeze(sequence=10, raw_timestamp=100)
+    second = projection.freeze(sequence=11, raw_timestamp=100, predecessor=FrozenTimePredecessor(10, first))
+
+    assert second.comparable_to_previous is False
+
+
+def test_completed_write_boundary_carries_across_zero_record_and_artifact() -> None:
+    from omi_collector.capture.domain.public_audio_v2 import FrozenRecordProjection, project_public_timeline
+
+    intent = ClockIntent("write", "prepared", 100, 200, 0.0, 11)
+    state = ClockState((_mapped(10, 14, 0.0, "anchor"),)).begin_intent(intent)
+    completed = state.mark_uncertain("write", write_sequence_after=11).finish_intent("write", ())
+    projection = PublicTimeProjection.from_state(completed)
+    before = projection.freeze(sequence=10, raw_timestamp=100)
+    empty = projection.freeze(sequence=11, raw_timestamp=100, predecessor=FrozenTimePredecessor(10, before))
+    after = projection.freeze(sequence=12, raw_timestamp=100, predecessor=FrozenTimePredecessor(11, empty))
+    timeline = project_public_timeline((FrozenRecordProjection(0, empty), FrozenRecordProjection(1, after)))
+
+    assert [(item.at_packet, item.facts) for item in timeline.boundaries] == [(0, ("time_incomparable",))]
+
+
+def test_legacy_frozen_snapshot_keeps_original_projection_and_payload() -> None:
+    state = ClockState((ClockRange(10, 12, None, None, "unknown", "old"),))
+    payload = state.to_payload()
+    restored = ClockState.from_payload(payload)
+    projection = PublicTimeProjection.from_state(restored)
+    first = projection.freeze(sequence=10, raw_timestamp=100)
+    second = projection.freeze(sequence=11, raw_timestamp=100, predecessor=FrozenTimePredecessor(10, first))
+
+    assert restored.to_payload() == payload
+    assert second.comparable_to_previous is True
+
+
+def test_current_store_upgrades_unknown_ranges_once(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+    from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+
+    assert isinstance(tmp_path, Path)
+    db = StateDB(tmp_path / "clock.sqlite3")
+    legacy = ClockState((ClockRange(10, 12, None, None, "unknown", "old"),))
+    db.put(StateKind.CLOCK, "current", legacy.to_payload())
+    store = ClockStateStore(db)
+
+    upgraded = store.state()
+    assert upgraded.causal_uncertainty == ((10, 12),)
+    assert db.get(StateKind.CLOCK, "current") == legacy.to_payload()
+    store.prepare(ClockIntent("new", "prepared", 100, 200, 0.0, 12))
+    assert store.state().causal_uncertainty == upgraded.causal_uncertainty
+    projection = PublicTimeProjection.from_state(upgraded)
+    first = projection.freeze(sequence=10, raw_timestamp=100)
+    second = projection.freeze(sequence=11, raw_timestamp=100, predecessor=FrozenTimePredecessor(10, first))
+    assert second.comparable_to_previous is False
+
+
+def test_current_clock_read_is_read_only_before_and_after_upgrade(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+    from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+
+    assert isinstance(tmp_path, Path)
+    path = tmp_path / "clock.sqlite3"
+    database = StateDB(path)
+    legacy = ClockState((ClockRange(10, 12, None, None, "unknown", "old"),))
+    database.put(StateKind.CLOCK, "current", legacy.to_payload())
+    reader = ClockStateStore(StateDB(path, read_only=True))
+    before = path.read_bytes()
+    assert reader.state().causal_uncertainty == ((10, 12),)
+    assert path.read_bytes() == before
+    assert database.get(StateKind.CLOCK, "current") == legacy.to_payload()
+    ClockStateStore(database).prepare(ClockIntent("new", "prepared", 100, 200, 0.0, 12))
+    before = path.read_bytes()
+    assert reader.state().causal_uncertainty == ((10, 12),)
+    assert path.read_bytes() == before
+    with database.transaction():
+        assert reader.state().causal_uncertainty == ((10, 12),)
+
+
+def test_repeated_empty_clock_writes_do_not_accumulate_identical_boundaries() -> None:
+    state = ClockState()
+    for index in range(3):
+        operation = str(index)
+        intent = ClockIntent(operation, "prepared", 100, 200, 0.0, 10)
+        state = state.begin_intent(intent).mark_uncertain(operation, write_sequence_after=10)
+        state = state.finish_intent(operation, ())
+
+    assert state.causal_uncertainty == ((10, 10),)
+    assert ClockState.from_payload(state.to_payload()) == state
+
+
+def test_current_clock_upgrade_deduplicates_existing_uncertainty(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+    from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
+
+    assert isinstance(tmp_path, Path)
+    database = StateDB(tmp_path / "clock.sqlite3")
+    current = ClockState((ClockRange(10, 12, None, None, "unknown", "old"),), causal_uncertainty=((10, 12),))
+    database.put(StateKind.CLOCK, "current", current.to_payload())
+    store = ClockStateStore(database)
+    assert store.state().causal_uncertainty == ((10, 12),)
+    store.prepare(ClockIntent("new", "prepared", 100, 200, 0.0, 12))
+    assert store.state().causal_uncertainty == ((10, 12),)

@@ -189,9 +189,10 @@ The root carries the ordered page-hash index. Once validated and cached against 
 loads only touched pages and checks their indexed hashes; it neither rereads all proof BLOBs nor adds a Merkle framework.
 
 A valid proof with a mismatching candidate is a device replay conflict and follows existing conflict quarantine. A
-missing, malformed, or root/page-mismatched proof is instead a private storage-integrity failure: retain incoming data,
-enter the existing blocked/fail-closed storage path, and never fall back to rereading Ogg/READY or repeatedly rebuilding
-proofs. SQLite busy and ordinary I/O faults retain their existing bounded transient classification.
+missing, malformed, or root/page-mismatched proof encountered during replay is a private storage-integrity failure:
+retain incoming data, enter the existing blocked/fail-closed storage path, and never fall back to rereading Ogg/READY
+or repeatedly rebuilding proofs. ACK retirement authenticates the root and page index; it does not read every proof-page
+payload before deletion. SQLite busy and ordinary I/O faults retain their existing bounded transient classification.
 
 Normalization runs use an exact 32-byte big-endian record:
 
@@ -256,5 +257,5 @@ Every acknowledged entry has exactly `id` and `audio_sha256`. Duplicates, unknow
 or a present checkpoint with missing/non-list `acknowledged` fail closed. ACK irrevocably asserts durable results and
 tail state, with no open tail, retry, cache, or future computation needing the artifact. Collector may then immediately
 retire ledger/proof and public bytes. A matching retired `(id, audio_sha256)` is an idempotent no-op without files or
-active proof; the same retired ID with a stale hash is rejected. Consumer crash tests cover results, tail, checkpoint,
-and ACK.
+active proof; the same retired ID with a stale hash is rejected. The collector cannot verify consumer durability or
+tail state: the consumer must ensure results and tail state are durable before writing the ACK.

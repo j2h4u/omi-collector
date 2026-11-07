@@ -83,6 +83,10 @@ class QuarantineCustodyHoldError(QuarantinePublishError):
     """Unresolved audio custody keeps canonical SQL bytes pending review."""
 
 
+class QuarantineSourceRetryableError(StagingError):
+    """One source could not be read; its evidence remains unchanged."""
+
+
 _CUSTODY_HOLD_SQL = "(" + ",".join(f"'{reason}'" for reason in sorted(QUARANTINE_CUSTODY_HOLD_REASONS)) + ")"
 
 
@@ -380,6 +384,8 @@ def _require_authenticated_admission(
         _hold_source_authentication_mismatch(filesystem, source_id, snapshot)
         raise QuarantineCustodyHoldError("typed source record checkpoint requires custody review") from error
     except InternalAudioStoreError as error:
+        if isinstance(error.__cause__, OSError):
+            raise QuarantineSourceRetryableError("typed quarantine source read failed") from error
         raise StagingError("typed quarantine prefix authentication is unavailable") from error
     if (
         source.source_type != "quarantine"

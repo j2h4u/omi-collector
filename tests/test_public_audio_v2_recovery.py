@@ -930,3 +930,61 @@ def test_v2_waiting_preserves_covered_source_until_bounded_maintenance_after_ack
         assert not artifact.path.exists()
         with closing(database.open_connection(read_only=True)) as connection:
             assert connection.execute("SELECT count(*) FROM ready_replay_proof").fetchone()[0] == 0
+
+
+def test_legacy_unknown_stage_and_replay_survive_current_clock_upgrade(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omi_collector.capture.adapters.clock_state_store import ClockStateStore
+    from omi_collector.capture.domain.clock_state import ClockIntent
+
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "a" * 32, 10, 2)
+    legacy = ClockState((ClockRange(10, 12, None, None, "unknown", "old"),))
+    database.put(StateKind.CLOCK, "current", legacy.to_payload())
+    original = ready_bundles._materialize_v2_stage_with_failure_latch
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("interrupted after reservation")
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt)
+    with pytest.raises(ReadyBundleError, match="after reservation"):
+        finalize_public_audio_v2(store, (source,), ready, _options(legacy, 12))
+    with closing(database.open_connection(read_only=True)) as connection:
+        stage = connection.execute(
+            "SELECT artifact_id,descriptor,descriptor_sha256,expected_audio_sha256,expected_manifest_sha256 "
+            "FROM ready_v2_output_stage"
+        ).fetchone()
+        proof = connection.execute(
+            "SELECT immutable_metadata,proof_content_sha256,records_sha256 FROM ready_replay_proof"
+        ).fetchone()
+    assert stage is not None and proof is not None
+    artifact_id, descriptor, descriptor_sha, audio_sha, manifest_sha = stage
+    assert hashlib.sha256(descriptor).hexdigest() == descriptor_sha
+    frozen_projection_sha = ready_bundles._v2_descriptor_basis(descriptor)[3]
+
+    clock = ClockStateStore(database)
+    clock.prepare(ClockIntent("new", "prepared", 100, 200, 0.0, 12))
+    assert clock.state().causal_uncertainty == ((10, 12),)
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original)
+    result = finalize_public_audio_v2(store, (source,), ready, _options(clock.state(), 12))
+    artifact = result.published[0]
+    audio = (artifact.path / "audio.ogg").read_bytes()
+    manifest = (artifact.path / "manifest.json").read_bytes()
+    assert artifact.bundle_id == artifact_id
+    assert hashlib.sha256(audio).hexdigest() == audio_sha
+    assert hashlib.sha256(manifest).hexdigest() == manifest_sha
+    with closing(database.open_connection(read_only=True)) as connection:
+        active_proof = connection.execute(
+            "SELECT immutable_metadata,proof_content_sha256,records_sha256 FROM ready_replay_proof"
+        ).fetchone()
+    assert active_proof == proof
+    assert ready_bundles._v2_descriptor_basis(descriptor)[3] == frozen_projection_sha
+
+    replay = _source(store, "b" * 32, 10, 2)
+    assert finalize_public_audio_v2(store, (replay,), ready, _options(clock.state(), 12)).published == ()
+    assert (artifact.path / "audio.ogg").read_bytes() == audio
+    assert (artifact.path / "manifest.json").read_bytes() == manifest

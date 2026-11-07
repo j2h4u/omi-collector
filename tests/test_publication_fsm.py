@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from struct import pack
 from threading import Event
 from time import monotonic
+from types import SimpleNamespace
 
 import pytest
 
+from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters import staging_store as staging_store_module
-from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.staging_contract import DeviceAlreadyRunningError
@@ -39,6 +42,98 @@ def _store(tmp_path: Path, *, threshold: float = 0.02, backoff: float = 0.05) ->
 
 def _record(sequence: int) -> bytes:
     return pack(">I", sequence) + bytes((2, 8, sequence % 256)) + bytes(AUDIO_RECORD_SIZE - 7)
+
+
+def test_space_only_recovery_probes_without_rereading_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    _add_source(store, 100)
+    store.append_ready_closure(101, "drained")
+    now = [100.0]
+    free = [0]
+    reads = [0]
+    original_read = InternalAudioStore.read_record_page
+    monkeypatch.setattr(staging_store_module, "monotonic", lambda: now[0])
+
+    def tracked(*args, **kwargs):
+        reads[0] += 1
+        return original_read(*args, **kwargs)
+
+    def reserve(path: Path, required: int) -> None:
+        if free[0] < required:
+            raise ready_bundles.ReadySpaceError(path, required)
+
+    monkeypatch.setattr(InternalAudioStore, "read_record_page", tracked)
+    monkeypatch.setattr(ready_bundles, "_require_typed_filesystem_space", reserve)
+    monkeypatch.setattr(staging_store_module.os, "statvfs", lambda _path: SimpleNamespace(f_bavail=free[0], f_frsize=1))
+    assert store.recover_and_publish().state is ReadyOutcomeState.TRANSIENT
+    initial_reads = reads[0]
+    assert initial_reads > 0
+    schedule = store.publication_retry_schedule()
+    assert schedule is not None
+    now[0] = schedule[1]
+    assert store.publication_timer_fired(*schedule)
+    assert store.recover_and_publish().state is ReadyOutcomeState.TRANSIENT
+    assert reads[0] == initial_reads
+    schedule = store.publication_retry_schedule()
+    assert schedule is not None
+    free[0] = 1 << 50
+    now[0] = schedule[1]
+    assert store.publication_timer_fired(*schedule)
+    assert store.recover_and_publish().state is ReadyOutcomeState.PUBLISHED
+
+
+def test_partial_stage_failures_keep_backoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    store._config = replace(store._config, retry=RetryConfig(rapid_backoff=(1.0, 5.0)))
+    _add_source(store, 100)
+    store.append_ready_closure(101, "drained")
+    now = [100.0]
+    monkeypatch.setattr(staging_store_module, "monotonic", lambda: now[0])
+    events: list[tuple[object, object]] = []
+    event = store._publication_event
+
+    def bounded_event(value):
+        result = event(value)
+        events.append((value, result))
+        assert len(events) < 25, events
+        return result
+
+    monkeypatch.setattr(store, "_publication_event", bounded_event)
+
+    def fail(stage, _page_limit):
+        stage.path.mkdir(exist_ok=True)
+        (stage.path / "partial").write_text(str(now[0]))
+        raise OSError("partial write")
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage", fail)
+    assert store.recover_and_publish().state is ReadyOutcomeState.TRANSIENT
+    schedule = store.publication_retry_schedule()
+    assert schedule is not None and schedule[1] == 101.0
+    now[0] = schedule[1]
+    assert store.publication_timer_fired(*schedule)
+    assert store.recover_and_publish().state is ReadyOutcomeState.TRANSIENT
+    schedule = store.publication_retry_schedule()
+    assert schedule is not None and schedule[1] == 106.0
+
+
+def test_changed_input_during_space_failure_does_not_park_new_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    calls = 0
+
+    def run() -> ReadyOutcome:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            store.publication_input_changed()
+            raise ready_bundles.ReadySpaceError(tmp_path, 1 << 60)
+        return ReadyOutcome(ReadyOutcomeState.WAITING, reason="changed")
+
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", run)
+    assert store.recover_and_publish().reason == "changed"
+    assert calls == 2
+    assert store._publication_space is None
 
 
 def _add_source(store: StagingStore, start: int, count: int = 1) -> None:

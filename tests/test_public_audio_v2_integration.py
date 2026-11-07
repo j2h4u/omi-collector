@@ -29,6 +29,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     publication_contract_state,
     retire_acknowledged_public_audio_v2,
 )
+from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockRange, ClockState
 from omi_collector.capture.domain.public_audio_v2 import FrozenPublicTime
 from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeginNotification
@@ -326,6 +327,30 @@ def test_v2_staging_cohort_without_files_resumes_after_interruption(
     with closing(database.open_connection(read_only=True)) as connection:
         assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_v2_output_stage")) == (0,)
         assert ready_bundles._sql_one(connection.execute("SELECT count(*) FROM ready_output_stage")) == (0,)
+
+
+def test_v2_resumed_stage_rejects_changed_committed_frontier(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    first = _source(store, "a" * 32, 10, (_record(100),))
+    finalize_public_audio_v2(store, (first,), ready, _options(ClockState(), 11))
+    second = _source(store, "b" * 32, 12, (_record(102),))
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("interrupted")
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt)
+    with pytest.raises(ReadyBundleError, match="interrupted"):
+        finalize_public_audio_v2(store, (second,), ready, _options(ClockState(), 13))
+    frontier = database.get(StateKind.PUBLICATION_V2_FRONTIER, "current")
+    assert frontier is not None
+    frontier["sequence"] = 11
+    database.put(StateKind.PUBLICATION_V2_FRONTIER, "current", frontier)
+    with pytest.raises(FatalInternalAudioStorageError, match="frontier"):
+        finalize_public_audio_v2(store, (), ready, _options(ClockState(), 13))
+    assert publication_contract_state(database).next_public_order == 2
 
 
 def test_v2_resume_rejects_legacy_cohort_digest_before_mutation(
@@ -827,6 +852,79 @@ def test_v2_active_artifact_suppresses_exact_replay_and_rejects_conflicting_over
         finalize_public_audio_v2(store, (conflicting,), ready, _options(ClockState(), 12))
     assert artifact.path.is_dir()
     assert database.list(StateKind.READY_PUBLICATION) == before
+
+
+def test_v2_blocks_late_unique_record_after_gap_but_accepts_exact_replay(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    first = _record(100)
+    last = _record(102)
+    finalize_public_audio_v2(store, (_source(store, "a" * 32, 10, (first,)),), ready, _options(ClockState(), 11))
+    finalize_public_audio_v2(store, (_source(store, "b" * 32, 12, (last,)),), ready, _options(ClockState(), 13))
+    replay = _source(store, "c" * 32, 10, (first,))
+    assert finalize_public_audio_v2(store, (replay,), ready, _options(ClockState(), 13)).published == ()
+    late = _source(store, "d" * 32, 11, (_record(101),))
+    with pytest.raises(ReadyBundleError, match="committed v2 frontier"):
+        finalize_public_audio_v2(store, (late,), ready, _options(ClockState(), 13))
+    assert publication_contract_state(database).next_public_order == 2
+    retained = store.get_source("d" * 32)
+    assert retained is not None and retained.lifecycle == "sealed_waiting"
+
+
+def test_overlapping_subthreshold_sources_reuse_authenticated_count(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, store = audio_store
+    ready = _ready_root(tmp_path)
+    records = (_record(100), _record(101))
+    first = _source(store, "a" * 32, 10, records)
+    second = _source(store, "b" * 32, 11, (records[1],))
+    reads: list[str] = []
+    original = store.read_record_page
+
+    def tracked(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        reads.append(source_id)
+        return original(source_id, after_ordinal, limit)
+
+    monkeypatch.setattr(store, "read_record_page", tracked)
+    options = _options(ClockState(), 12, threshold=0.06)
+    assert finalize_public_audio_v2(store, (first, second), ready, options).reason == "waiting_for_threshold"
+    assert reads
+    reads.clear()
+    assert finalize_public_audio_v2(store, (first, second), ready, options).reason == "waiting_for_threshold"
+    assert reads == []
+    third = _source(store, "c" * 32, 12, (_record(102),))
+    assert finalize_public_audio_v2(
+        store, (first, second, third), ready, _options(ClockState(), 13, threshold=0.06)
+    ).published
+    assert reads
+
+
+def test_active_ready_prefix_and_unique_tail_reuse_authenticated_count(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, store = audio_store
+    ready = _ready_root(tmp_path)
+    records = (_record(100), _record(101), _record(102))
+    first = _source(store, "a" * 32, 10, records[:2])
+    finalize_public_audio_v2(store, (first,), ready, _options(ClockState(), 12))
+    overlap = _source(store, "b" * 32, 11, records[1:])
+    reads: list[str] = []
+    original = store.read_record_page
+
+    def tracked(source_id: str, after_ordinal: int = -1, limit: int = 128) -> tuple[CaptureRecord, ...]:
+        reads.append(source_id)
+        return original(source_id, after_ordinal, limit)
+
+    monkeypatch.setattr(store, "read_record_page", tracked)
+    options = _options(ClockState(), 13, threshold=0.04)
+    assert finalize_public_audio_v2(store, (overlap,), ready, options).reason == "waiting_for_threshold"
+    assert reads
+    reads.clear()
+    assert finalize_public_audio_v2(store, (overlap,), ready, options).reason == "waiting_for_threshold"
+    assert reads == []
 
 
 def test_staging_store_preserves_subthreshold_source_under_v2_contract(tmp_path: Path) -> None:

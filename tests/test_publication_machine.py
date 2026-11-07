@@ -134,7 +134,11 @@ def test_publication_event_work_and_result_inventories_are_explicit() -> None:
     assert production_work == {Idle, Running, Settled, RetryWait, Compacting, Quiescing}
     assert {type(event) for event in _matrix_events(object())} == production_events
     assert {type(work) for _name, work in _matrix_work_phases(object())} == production_work
-    assert tuple(PublicationResult) == (PublicationResult.SETTLED, PublicationResult.TRANSIENT)
+    assert tuple(PublicationResult) == (
+        PublicationResult.SETTLED,
+        PublicationResult.BLOCKED,
+        PublicationResult.TRANSIENT,
+    )
 
     with pytest.raises(ValueError, match="unsupported publication event"):
         publication_transition(PublicationState(), cast(PublicationEvent, object()))

@@ -2,7 +2,38 @@
 
 import pytest
 
-from omi_collector.capture.domain.ready_machine import recovered_closure
+from omi_collector.capture.domain.ready_machine import (
+    Finished,
+    PublicationAction,
+    PublicationResult,
+    PublicationState,
+    RetryWait,
+    Running,
+    Wake,
+    publication_transition,
+    recovered_closure,
+)
+
+
+def test_failed_stage_revision_keeps_saturating_backoff() -> None:
+    state = PublicationState(work=Running(1, "before", 0), next_token=1)
+    state, command = publication_transition(state, Finished(1, "after", None, PublicationResult.TRANSIENT, 10, (1, 5)))
+    assert isinstance(state.work, RetryWait)
+    assert command.deadline == 11
+    state, command = publication_transition(state, Wake("after", 11))
+    assert command.action is PublicationAction.RUN
+    state, command = publication_transition(
+        state, Finished(2, "after-again", None, PublicationResult.TRANSIENT, 11, (1, 5))
+    )
+    assert command.deadline == 16
+
+
+def test_blocked_effect_settles_its_own_changed_revision() -> None:
+    state = PublicationState(work=Running(1, "before", 0), next_token=1)
+    state, command = publication_transition(state, Finished(1, "after", None, PublicationResult.BLOCKED, 10))
+    assert command.action is PublicationAction.NONE
+    _, command = publication_transition(state, Wake("after", 11))
+    assert command.action is PublicationAction.NONE
 
 
 @pytest.mark.parametrize(

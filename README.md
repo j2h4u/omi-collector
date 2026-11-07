@@ -34,7 +34,7 @@ Omi Collector provides the narrow first stage:
 - drains the on-device ring as quickly as the link permits;
 - resumes after ordinary disconnects and process restarts;
 - verifies replayed overlap instead of silently skipping records;
-- corrects timestamps around recorded pendant clock changes;
+- maps device time around recorded pendant clock changes when possible;
 - atomically finalizes sealed ready bundles with per-range UTC metadata;
 - records bounded operational metrics and a current runtime snapshot in local state.
 
@@ -42,8 +42,9 @@ It deliberately does **not** transcode, run VAD, transcribe, or call the Omi
 cloud. Production downstream processing is orchestrated by Dagster, but the
 collector remains an independent producer and has no Dagster runtime
 dependency. The collector removes a ready bundle only after a downstream
-consumer durably acknowledges that exact bundle and digest. Bundles referenced
-by an open downstream speech tail remain available.
+consumer acknowledges that exact bundle and digest. The consumer must not
+acknowledge a bundle while an open speech tail still needs it; the collector
+cannot verify the consumer's durable state.
 
 ## What comes next
 
@@ -82,8 +83,9 @@ contains the consumer's completed audio and passport artifacts.
 A downstream consumer's durable checkpoint acknowledges an artifact by its ID
 and `audio_sha256` only after every packet has durable speech or no-speech
 handling. The collector validates the complete ACK batch against its private
-ledger and replay proof, records retirement, then removes the exact ready
-directory and proof. An open speech tail is never an ACK.
+ledger and replay custody, records retirement, then removes the exact ready
+directory and proof. The consumer is responsible for the truth of its ACK;
+the collector does not inspect its speech-tail state.
 
 ## Requirements
 
@@ -162,11 +164,13 @@ scripts/deploy-systemd-service.sh
 
 Replace `pendant_address` with the uppercase Bluetooth address printed by
 `bluetoothctl devices`. `bundle_min_audio_seconds` is the minimum cumulative
-captured Opus duration for publishing a ready bundle: `3600` means one hour of
-audio, not elapsed waiting time or a maximum chunk size. Publication happens
-after a complete pendant drain. Smaller drains accumulate in SQLite
+captured Opus duration for accepting a publication cohort: `3600` means one
+hour of audio, not elapsed waiting time or a maximum chunk size. Admission
+follows a complete pendant drain. Smaller drains accumulate in SQLite
 indefinitely until the minimum is reached; downstream VAD does not determine
-this duration. Automatic scanner admission defaults to 30 seconds of
+this duration. Physical discontinuities can split a qualifying cohort into
+multiple ready artifacts, each of which may be shorter than the minimum.
+Automatic scanner admission defaults to 30 seconds of
 observations with no gap of 10 seconds or more before GATT opens. To tune it,
 set both optional flat keys `presence_arrival_stability_seconds` and
 `presence_arrival_max_gap_seconds`; they are omitted from the example because
@@ -274,7 +278,9 @@ the device was read, not when the JSON was generated. `last_drain` records a
 confirmed empty ring after durable host storage; its ID survives restarts and
 republication. It remains the last completed event when later audio arrives,
 while `ring` reports the newer backlog. Deduplicate notifications by event ID
-and assess freshness using the actual observation time. Files use mode `0640`
+and assess freshness using the actual observation time. This is a latest-state
+snapshot, not an event log or delivery acknowledgment; intermediate events can
+be replaced before a consumer reads them. Files use mode `0640`
 inside a setgid `2750` directory owned by the service and operator read group.
 An unchanged snapshot is checked without rewriting it. After a restart, the
 writer removes its own abandoned staging files before publishing. A recovered
@@ -407,37 +413,28 @@ and flashing the pendant yourself.
 
 #### The pendant clock can be substantially wrong
 
-Each stored record contains a pendant-generated Unix timestamp. The CV1 clock
-has been observed ahead of trusted host time by many minutes. The corrections
-are too large to assume ordinary crystal drift, but current evidence does not
-distinguish among RTC restoration, sleep-time accounting, reset behavior, or
-another firmware defect.
+Each stored record contains a pendant-generated clock label. The CV1 clock
+has been observed ahead of trusted host time by many minutes. Current evidence
+does not distinguish among RTC restoration, sleep-time accounting, reset
+behavior, or another firmware defect.
 
-Correcting the clock can make later raw records appear earlier than records
-written immediately before the change. The collector persists its intent,
-verifies the readback, and confirms a sequence interval only after two INFO
-reads in the same BLE session. It rewrites timestamps only inside such a
-confirmed interval. It can also estimate UTC over intervals bounded by
-trusted native clock reads when no confirmed mapping covers them. Those
-timestamps are rewritten too, and their ready-manifest mapping carries
-`confidence: approximate`. Records with no usable estimate retain their device
-timestamps and have `utc: null`. A bundle boundary alone is not proof of a
-clock correction.
+The collector records clock observations and verifies clock corrections. It
+uses confirmed clock membership or a trusted RTC read to map record labels to
+calendar time when possible. In the ready manifest, timeline spans with
+`quality: known` or `quality: approximate` carry `unix_seconds` and an
+uncertainty; `quality: unknown` carries the original `source_seconds` label,
+which must not be interpreted as Unix time. Clock observations survive restart.
 
-This preserves device evidence without inventing UTC for historical backlog.
-It does not explain or fix the underlying RTC behavior. Record sequence is the
-authoritative audio order; calendar timestamps do not reorder the stream.
-Treat `sequence_loss` as confirmed unrecoverable loss, and treat UTC as known
-only where the ready manifest supplies a confirmed or explicitly approximate
-mapping. Recheck both behaviors after every firmware upgrade; a new version
-number alone is not proof that either one was fixed.
-
-Clock observations, including healthy reads, are retained in the shared
-Collector state database. A restart replays native causal observations without
-a new BLE visit. Confirmed mappings use verified clock membership; approximate
-mappings use the host midpoint at a trusted RTC read and are explicitly marked
-in the manifest. Records outside every confirmed or approximate segment remain
-unknown rather than being assigned a guessed time.
+A clock correction can make later labels appear earlier. When the collector
+cannot establish whether adjacent records belong to comparable clock segments,
+it marks the boundary `time_incomparable`, even if their labels look ordered.
+A bundle boundary alone does not establish comparability. Record sequence is
+the authoritative audio order; calendar labels do not reorder the stream. A
+`source_loss` boundary marks confirmed unrecoverable loss. These facts do not
+establish exact acoustic capture time or silence duration. See the
+[public audio contract](docs/PUBLIC_AUDIO_CONTRACT.md) for the timeline and
+boundary rules. Recheck clock and loss behavior after a firmware upgrade; a
+new version number alone does not establish that either limitation is fixed.
 
 The optional `--force-1m` weak-RF workaround changes controller-wide PHY state.
 It is disabled by default and restores the prior selection after completion,

@@ -15,6 +15,7 @@ from omi_collector.capture.adapters.internal_audio_store import InternalAudioSto
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.application.quarantine_maintenance import QuarantineMaintenance, _CleanupPhase, _CleanupState
+from omi_collector.capture.application.session_lifecycle import joined_to_thread
 from omi_collector.config import CollectorConfig, ReadyConfig
 from staging_test_factory import StagingStore, attempt_source
 from test_public_audio_v2_integration import _checkpoint, _ready_root, _record, _source
@@ -155,12 +156,12 @@ def test_transient_publication_allows_covered_reclamation_and_compaction(
             assert reclaimed and len(compacted) == 1
             assert compacted[0] is not None and compacted[0].reason == "compaction_done"
             assert first.path.exists()
-            assert attempt_source(store, "b" * 32) is not None
+            assert await joined_to_thread(attempt_source, store, "b" * 32) is not None
             schedule = store.publication_retry_schedule()
             assert schedule is not None
             assert maintenance._publication_retry_handle is not None
             monkeypatch.setattr("omi_collector.capture.adapters.staging_store.monotonic", lambda: schedule[1] + 1)
-            assert store.recover_and_publish().state == "published"
+            assert (await joined_to_thread(store.recover_and_publish)).state == "published"
         finally:
             await maintenance.close()
 

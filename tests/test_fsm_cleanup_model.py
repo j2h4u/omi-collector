@@ -132,6 +132,7 @@ def test_retry_compaction_boundary_traces(boundary: str, timer_at: float) -> Non
 def test_generated_retry_compaction_boundaries(traces: list[tuple[str, float]]) -> None:
     for boundary, timer_at in traces:
         _check_retry_compaction_trace(boundary, timer_at)
+        event(f"{boundary}:timer-{timer_at}")
 
 
 def _check_retry_compaction_trace(boundary: str, timer_at: float) -> None:
@@ -194,4 +195,3 @@ def _check_retry_compaction_trace(boundary: str, timer_at: float) -> None:
         state, command = publication_transition(state, CaptureEnd())
         assert state.mode is (PublicationMode.AVAILABLE if boundary == "capture" else PublicationMode.CLOSED)
         assert command.action is (PublicationAction.CHECK_INPUT if boundary == "capture" else PublicationAction.NONE)
-    event(f"{boundary}:timer-{timer_at}")

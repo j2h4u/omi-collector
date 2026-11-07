@@ -19,7 +19,7 @@ SNAPSHOT = ("BR1M1SLOT", "LE1MTX", "LE1MRX", "LE2MTX", "LE2MRX")
 @pytest.mark.parametrize("scenario", ["no_marker", "restore", "failure", "cancel"])
 def test_service_recovers_phy_before_readiness(scenario: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
-    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\n', encoding="utf-8")
+    config.write_text('pendant_address = "AA:BB:CC:DD:EE:FF"\nbundle_min_audio_seconds = 3600.0\n', encoding="utf-8")
     layout = load_operator_config(config).storage
     layout.collector.root.mkdir(parents=True, exist_ok=True)
     layout.collector.root.chmod(0o2750)

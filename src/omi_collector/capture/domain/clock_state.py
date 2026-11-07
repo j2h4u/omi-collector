@@ -200,7 +200,8 @@ def _valid_anchor_identity(confidence: object, source_id: object) -> bool:
 def _valid_causal_interval(item: object) -> bool:
     if not isinstance(item, tuple):
         return False
-    match item:
+    values = cast(tuple[object, ...], item)
+    match values:
         case (start, end):
             return type(start) is int and type(end) is int and 0 <= start <= end
         case _:
@@ -341,9 +342,13 @@ class ClockState:
             intent = _parse_intent(cast(dict[object, object], intent_value)) if isinstance(intent_value, dict) else None
             anchor = _parse_anchor(cast(dict[object, object], anchor_value)) if isinstance(anchor_value, dict) else None
             uncertainty = payload.get("causal_uncertainty", [])
-            if not isinstance(uncertainty, list) or any(not isinstance(item, list) for item in uncertainty):
+            if not isinstance(uncertainty, list):
                 raise ClockStateError("clock causal uncertainty is invalid")
-            intervals = cast(tuple[tuple[int, int], ...], tuple(tuple(item) for item in uncertainty))
+            items = cast(list[object], uncertainty)
+            if any(not isinstance(item, list) for item in items):
+                raise ClockStateError("clock causal uncertainty is invalid")
+            lists = cast(list[list[object]], items)
+            intervals = cast(tuple[tuple[int, int], ...], tuple(tuple(item) for item in lists))
             return cls(ranges, intent, anchor, intervals)
         except (TypeError, ValueError) as error:
             raise ClockStateError("clock state payload is invalid") from error

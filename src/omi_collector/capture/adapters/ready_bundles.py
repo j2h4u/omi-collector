@@ -118,7 +118,7 @@ class ReadySpaceError(ReadyBundleError):
         super().__init__("insufficient filesystem space for typed ready publication")
         self.path = path
         self.required = required
-        self.requirements = ((path, required),)
+        self.requirements: tuple[tuple[Path, int], ...] = ((path, required),)
 
 
 class _ReadyMaintenanceDeferredError(Exception):
@@ -2162,11 +2162,7 @@ def _cached_normalized_wait(
     if cached is None or cached.get("key") != key or type(cached.get("remaining")) is not bool:
         return None
     values = cached.get("stats")
-    if not (
-        isinstance(values, list)
-        and len(values) == len(ReadyPublicationStats.__dataclass_fields__)
-        and all(type(value) is int and value >= 0 for value in values)
-    ):
+    if not _valid_normalized_wait_stats(values):
         return None
     stats = ReadyPublicationStats(*values)
     if stats.audio_packets >= threshold or stats.threshold_packets != threshold:
@@ -2178,6 +2174,15 @@ def _cached_normalized_wait(
         remaining_at_frontier=cast(bool, cached["remaining"]),
         stats=stats,
         custody_cache=custody_cache,
+    )
+
+
+def _valid_normalized_wait_stats(values: object) -> TypeGuard[list[int]]:
+    if not isinstance(values, list):
+        return False
+    items = cast(list[object], values)
+    return len(items) == len(ReadyPublicationStats.__dataclass_fields__) and all(
+        type(value) is int and value >= 0 for value in items
     )
 
 

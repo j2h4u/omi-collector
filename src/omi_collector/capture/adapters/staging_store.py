@@ -274,12 +274,12 @@ class StagingStore:
                 outcome, revision = self._run_publication_effect(command.token, held_lease)
                 if outcome.state is ReadyOutcomeState.PUBLISHED:
                     latest_published = outcome
-                result = self._finish_publication(command, revision, outcome)
+                result = self._finish_publication(command, revision, outcome, reprobe=revision is _UNKNOWN_REVISION)
             elif command.action is PublicationAction.COMPACT:
                 result = self._run_compaction(command, held_lease, should_defer)
             else:
                 result = self._publication_outcome(command)
-        if result.state is ReadyOutcomeState.WAITING and latest_published is not None:
+        if result.state in {ReadyOutcomeState.WAITING, ReadyOutcomeState.TRANSIENT} and latest_published is not None:
             return latest_published
         return result
 
@@ -360,6 +360,7 @@ class StagingStore:
         self, running: Running, held_lease: DeviceLock | None, input_epoch: int
     ) -> tuple[ReadyOutcome, object]:
         phase = "publication_effect"
+        outcome: ReadyOutcome | None = None
         try:
             if held_lease is None:
                 with self.device_lock(operation="ready_publication"):
@@ -380,9 +381,7 @@ class StagingStore:
             _debug_publication_failure(error, phase="device_lock", path=self._filesystem.lock_path)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="publication_lock_busy"), running.revision
         except (OSError, TransientInternalAudioStorageError) as error:
-            _debug_publication_failure(error, phase=phase)
-            revision = self._failure_revision(running.revision)
-            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), revision
+            return self._publication_io_failure(error, phase, outcome, running.revision)
         except Exception as error:
             if not isinstance(error, ReadyBundleError):
                 logger = configure_debug_logging(self._state_db.path.parent)
@@ -405,6 +404,19 @@ class StagingStore:
                 )
             reason = str(error) if isinstance(error, ReadyBundleError) else type(error).__name__
             return ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=reason), revision
+
+    def _publication_io_failure(
+        self,
+        error: OSError | TransientInternalAudioStorageError,
+        phase: str,
+        outcome: ReadyOutcome | None,
+        fallback: object,
+    ) -> tuple[ReadyOutcome, object]:
+        _debug_publication_failure(error, phase=phase)
+        if phase == "post_effect_revision" and outcome is not None and outcome.state is ReadyOutcomeState.PUBLISHED:
+            return outcome, _UNKNOWN_REVISION
+        revision = self._failure_revision(fallback)
+        return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), revision
 
     def _publication_space_failed(
         self, running: Running, input_epoch: int, error: ReadySpaceError
@@ -453,14 +465,15 @@ class StagingStore:
         command: PublicationCommand,
         revision: object,
         outcome: ReadyOutcome,
+        *,
+        reprobe: bool = False,
     ) -> ReadyOutcome | PublicationCommand:
         assert command.token is not None
         result = {
             ReadyOutcomeState.TRANSIENT: PublicationResult.TRANSIENT,
-            ReadyOutcomeState.BLOCKED: PublicationResult.BLOCKED,
         }.get(outcome.state, PublicationResult.SETTLED)
         next_command = self._publication_event(
-            Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff)
+            Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff, reprobe)
         )
         if next_command.action is PublicationAction.CHECK_INPUT:
             return next_command

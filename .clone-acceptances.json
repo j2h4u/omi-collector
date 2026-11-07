@@ -1430,6 +1430,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "0eca9b7b2b2ac4d5db4889b306bfad1e31007d66bec32d81792b9106661793ed",
+      "count": 1,
+      "reason": "Publication completion preserves its effect outcome and uses explicit reprobe plus publication revision/generation rules; compaction completion additionally binds storage-debt generation, preserves quiescing ownership, and rechecks pending input after success. Their completion schemas, settlement values and interruption rules differ despite the small shared backoff calculation. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:312-340 ~ src/omi_collector/capture/domain/ready_machine.py:359-392."
+    },
+    {
+      "detector": "pyscn",
       "identity": "0fd52823cf6b16fea5d68b47fbe5cd3ca976ee669bcf1b1bd1f56f302022b040",
       "count": 1,
       "reason": "Failed-start cleanup invalidates the start marker even when incident persistence is cancelled; failed-stop reporting preserves the already frozen scan-duration context from scan_stopping. Both compose the existing incident/persistence/diagnostic primitives, but their lifecycle postconditions differ. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:161-170 ~ src/omi_collector/capture/application/ble_scan_health.py:179-187."
@@ -1505,12 +1511,6 @@
       "identity": "22362071780955d7bf6fd067d3625b053c2d2f41e004c961bb51de49e5d601ed",
       "count": 1,
       "reason": "Conflict-disposition proposal reading and post-error conflict inspection use the same source row helper already, but one builds a proposal while the other compares old/proposed source/cohort state. Their different outputs and commit roles require independent bodies. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4345-4353 ~ src/omi_collector/capture/adapters/ready_bundles.py:4431-4444."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "235b58f5d71f06d9f9a96d405230b3c308817fa939a006e63bf71426b6c15b6d",
-      "count": 1,
-      "reason": "Publication completion preserves publication outcome and settles blocked/changed-revision failures; compaction completion also binds debt generation, preserves quiescing ownership, and rechecks input after generation changes. Their completion event schemas, settlement values and interruption rules differ despite the common small backoff calculation. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:312-338 ~ src/omi_collector/capture/domain/ready_machine.py:357-390."
     },
     {
       "detector": "pyscn",

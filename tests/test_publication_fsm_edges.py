@@ -173,6 +173,42 @@ def test_changed_blocked_revisions_use_one_publication_dispatch_loop(
     assert outcome.reason == "controlled_inventory_exhausted"
 
 
+def test_repaired_checkpoint_during_blocked_effect_is_rechecked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    checkpoint = tmp_path / "work" / "omi-ready-checkpoint.json"
+    checkpoint.parent.mkdir()
+    checkpoint.write_text("invalid")
+    original = staging_store_module.acknowledged_public_audio_v2
+    calls = 0
+
+    def repair_after_failed_read(path: Path) -> tuple[tuple[str, str], ...]:
+        nonlocal calls
+        calls += 1
+        try:
+            return original(path)
+        except ReadyBundleError:
+            path.write_text(
+                dumps(
+                    {
+                        "audio_contract": "omi-audio-v2",
+                        "analysis_cursor": None,
+                        "vad_decisions": [],
+                        "open_speech_tail": None,
+                        "acknowledged": [],
+                    }
+                )
+            )
+            raise
+
+    monkeypatch.setattr(staging_store_module, "acknowledged_public_audio_v2", repair_after_failed_read)
+    outcome = store.recover_and_publish()
+    assert calls >= 2
+    assert outcome.state is ReadyOutcomeState.WAITING
+    assert not store.publication_followup_due()
+
+
 def test_published_outcome_survives_blocked_followup_ending_in_waiting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -202,6 +238,27 @@ def test_published_outcome_survives_blocked_followup_ending_in_waiting(
 
     assert revision_reads[0] == 5
     assert outcome is published
+
+
+def test_published_outcome_survives_post_effect_revision_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    published = ReadyOutcome(ReadyOutcomeState.PUBLISHED, reason="published")
+    original = store._publication_revision
+    calls = 0
+
+    def revision() -> object:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise PermissionError(errno.EACCES, "revision denied")
+        return original()
+
+    monkeypatch.setattr(store, "_publication_revision", revision)
+    monkeypatch.setattr(store, "_recover_and_publish_unlocked", lambda: published)
+    assert store.recover_and_publish() is published
+    assert store.publication_retry_schedule() is not None
 
 
 def test_repeated_retry_wakes_keep_the_absolute_deadline_and_one_effect(

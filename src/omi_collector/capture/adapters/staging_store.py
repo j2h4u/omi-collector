@@ -65,6 +65,7 @@ from .ready_bundles import (
     ReadyCustodyCache,
     ReadyOutcome,
     ReadyOutcomeState,
+    ReadySpaceError,
     SqlitePublicationSource,
     _typed_source_admissions,
     acknowledged_public_audio_v2,
@@ -170,6 +171,8 @@ class StagingStore:
         self._ready_custody_cache: ReadyCustodyCache | None = None
         self._compaction_interrupt = Event()
         self._compaction_parked: tuple[int, int] | None = None
+        self._publication_space: tuple[object, tuple[tuple[Path, int], ...], int] | None = None
+        self._publication_input_epoch = 0
         self._retired_recovery_done = False
 
     @classmethod
@@ -193,6 +196,8 @@ class StagingStore:
         store._ready_custody_cache = None
         store._compaction_interrupt = Event()
         store._compaction_parked = None
+        store._publication_space = None
+        store._publication_input_epoch = 0
         store._retired_recovery_done = False
         return store
 
@@ -269,12 +274,12 @@ class StagingStore:
                 outcome, revision = self._run_publication_effect(command.token, held_lease)
                 if outcome.state is ReadyOutcomeState.PUBLISHED:
                     latest_published = outcome
-                result = self._finish_publication(command, revision, outcome)
+                result = self._finish_publication(command, revision, outcome, reprobe=revision is _UNKNOWN_REVISION)
             elif command.action is PublicationAction.COMPACT:
                 result = self._run_compaction(command, held_lease, should_defer)
             else:
                 result = self._publication_outcome(command)
-        if result.state is ReadyOutcomeState.WAITING and latest_published is not None:
+        if result.state in {ReadyOutcomeState.WAITING, ReadyOutcomeState.TRANSIENT} and latest_published is not None:
             return latest_published
         return result
 
@@ -330,7 +335,7 @@ class StagingStore:
             )
         )
         if next_command.action is PublicationAction.ARM:
-            return self._publication_outcome(next_command)
+            return outcome if work.publication_retry is not None else self._publication_outcome(next_command)
         if next_command.action is PublicationAction.CHECK_INPUT:
             return next_command
         return outcome
@@ -338,6 +343,7 @@ class StagingStore:
     def _run_publication_effect(self, token: int, held_lease: DeviceLock | None) -> tuple[ReadyOutcome, object]:
         with self._publication_lock:
             running = self._publication_state.work
+            input_epoch = self._publication_input_epoch
             allowed = (
                 self._publication_state.mode is PublicationMode.AVAILABLE
                 and isinstance(running, Running)
@@ -345,7 +351,16 @@ class StagingStore:
             )
         if not allowed or not isinstance(running, Running):
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="capture_active"), _UNKNOWN_REVISION
+        blocked = self._probe_publication_space(running)
+        if blocked is not None:
+            return blocked, running.revision
+        return self._execute_publication_effect(running, held_lease, input_epoch)
+
+    def _execute_publication_effect(
+        self, running: Running, held_lease: DeviceLock | None, input_epoch: int
+    ) -> tuple[ReadyOutcome, object]:
         phase = "publication_effect"
+        outcome: ReadyOutcome | None = None
         try:
             if held_lease is None:
                 with self.device_lock(operation="ready_publication"):
@@ -358,14 +373,15 @@ class StagingStore:
                 phase = "post_effect_revision"
                 revision = self._publication_revision()
             return outcome, revision
+        except ReadySpaceError as error:
+            return self._publication_space_failed(running, input_epoch, error)
         except FatalInternalAudioStorageError:
             raise
         except DeviceAlreadyRunningError as error:
             _debug_publication_failure(error, phase="device_lock", path=self._filesystem.lock_path)
             return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason="publication_lock_busy"), running.revision
         except (OSError, TransientInternalAudioStorageError) as error:
-            _debug_publication_failure(error, phase=phase)
-            return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), running.revision
+            return self._publication_io_failure(error, phase, outcome, running.revision)
         except Exception as error:
             if not isinstance(error, ReadyBundleError):
                 logger = configure_debug_logging(self._state_db.path.parent)
@@ -389,18 +405,75 @@ class StagingStore:
             reason = str(error) if isinstance(error, ReadyBundleError) else type(error).__name__
             return ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=reason), revision
 
+    def _publication_io_failure(
+        self,
+        error: OSError | TransientInternalAudioStorageError,
+        phase: str,
+        outcome: ReadyOutcome | None,
+        fallback: object,
+    ) -> tuple[ReadyOutcome, object]:
+        _debug_publication_failure(error, phase=phase)
+        if phase == "post_effect_revision" and outcome is not None and outcome.state is ReadyOutcomeState.PUBLISHED:
+            return outcome, _UNKNOWN_REVISION
+        revision = self._failure_revision(fallback)
+        return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error)), revision
+
+    def _publication_space_failed(
+        self, running: Running, input_epoch: int, error: ReadySpaceError
+    ) -> tuple[ReadyOutcome, object]:
+        revision = self._failure_revision(running.revision)
+        with self._publication_lock:
+            if self._publication_input_epoch == input_epoch and self._publication_state.work == running:
+                self._publication_space = (revision, error.requirements, input_epoch)
+        return ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=str(error)), revision
+
+    def _failure_revision(self, fallback: object) -> object:
+        try:
+            return self._publication_revision()
+        except OSError, TransientInternalAudioStorageError:
+            return fallback
+
+    def _probe_publication_space(self, running: Running) -> ReadyOutcome | None:
+        with self._publication_lock:
+            requirement = self._publication_space
+            epoch = self._publication_input_epoch
+        if requirement is None:
+            return None
+        previous, requirements, input_epoch = requirement
+        outcome = None
+        if previous == running.revision and input_epoch == epoch:
+            try:
+                for path, required in requirements:
+                    stat = os.statvfs(path)
+                    if stat.f_bavail * stat.f_frsize < required:
+                        outcome = ReadyOutcome(
+                            ReadyOutcomeState.TRANSIENT,
+                            reason="insufficient filesystem space for typed ready publication",
+                        )
+                        break
+            except OSError as error:
+                outcome = ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(error))
+        with self._publication_lock:
+            if self._publication_input_epoch != epoch or self._publication_state.work != running:
+                return None
+            if outcome is None:
+                self._publication_space = None
+            return outcome
+
     def _finish_publication(
         self,
         command: PublicationCommand,
         revision: object,
         outcome: ReadyOutcome,
+        *,
+        reprobe: bool = False,
     ) -> ReadyOutcome | PublicationCommand:
         assert command.token is not None
-        result = (
-            PublicationResult.TRANSIENT if outcome.state is ReadyOutcomeState.TRANSIENT else PublicationResult.SETTLED
-        )
+        result = {
+            ReadyOutcomeState.TRANSIENT: PublicationResult.TRANSIENT,
+        }.get(outcome.state, PublicationResult.SETTLED)
         next_command = self._publication_event(
-            Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff)
+            Finished(command.token, revision, outcome, result, monotonic(), self._config.retry.rapid_backoff, reprobe)
         )
         if next_command.action is PublicationAction.CHECK_INPUT:
             return next_command
@@ -413,6 +486,8 @@ class StagingStore:
         revision: object,
         held_lease: DeviceLock | None,
         should_defer: Callable[[], bool],
+        *,
+        after_cleanup: bool = False,
     ) -> ReadyOutcome | None:
         try:
             generation = pending_compaction_generation(self._state_db)
@@ -429,7 +504,7 @@ class StagingStore:
             return None
         if self._compaction_parked is not None and self._compaction_parked[0] == generation:
             available = self._available_compaction_space()
-            required_release = max(self._state_db.path.stat().st_size, 1)
+            required_release = 1 if after_cleanup else max(self._state_db.path.stat().st_size, 1)
             if available < self._compaction_parked[1] + required_release:
                 return ReadyOutcome(ReadyOutcomeState.WAITING, reason="compaction_parked")
         compact = self._publication_event(CompactionDue(revision, generation))
@@ -448,7 +523,7 @@ class StagingStore:
         """Attempt one due compaction after the scheduled cleanup phases."""
         if self._publication_root is None or should_defer():
             return None
-        return self._compact_after_publication(self._publication_revision(), None, should_defer)
+        return self._compact_after_publication(self._publication_revision(), None, should_defer, after_cleanup=True)
 
     def _publication_revision(self) -> object:
         if self._publication_root is None:
@@ -508,7 +583,10 @@ class StagingStore:
         self._publication_event(Shutdown())
 
     def publication_input_changed(self) -> bool:
-        command = self._publication_event(InputChanged())
+        with self._publication_lock:
+            self._publication_input_epoch += 1
+            self._publication_space = None
+            self._publication_state, command = publication_transition(self._publication_state, InputChanged())
         return command.action is PublicationAction.CHECK_INPUT
 
     def recover_and_publish(self) -> ReadyOutcome:
@@ -711,7 +789,7 @@ class StagingStore:
             )
         closure = ready_closures.append(self._state_db, next_sequence, reason, on_commit=callback)
         self._public_drain.wake()
-        self._publication_event(InputChanged())
+        self.publication_input_changed()
         return closure
 
     def _complete_recovered_drain_unlocked(
@@ -816,11 +894,11 @@ class StagingStore:
             return ReadyOutcome(ReadyOutcomeState.WAITING, reason="publication_unconfigured")
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
         clock_state = self._publication_clock_state()
-        acknowledged = acknowledged_public_audio_v2(checkpoint_path)
-        acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
         if not self._retired_recovery_done:
             resume_retired_public_audio_v2(publication_root, self._state_db)
             self._retired_recovery_done = True
+        acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+        acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
         closures = ready_closures.coalesce(self._state_db)
         closure = closures[-1] if closures else None
         frontier = None if closure is None else closure.next_sequence
@@ -849,6 +927,8 @@ class StagingStore:
                 )
                 if outcome.custody_cache is not None:
                     self._ready_custody_cache = outcome.custody_cache
+        except ReadySpaceError:
+            raise
         except ReadyBundleError as error:
             outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
         if closure is not None and not outcome.remaining_at_frontier:
@@ -862,11 +942,11 @@ class StagingStore:
             return 0
         checkpoint_path = publication_root.parent / "work" / "omi-ready-checkpoint.json"
         with self.device_lock(operation="ready_ack_retirement"):
-            acknowledged = acknowledged_public_audio_v2(checkpoint_path)
-            needs_retirement = acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
             if not self._retired_recovery_done:
                 resume_retired_public_audio_v2(publication_root, self._state_db)
                 self._retired_recovery_done = True
+            acknowledged = acknowledged_public_audio_v2(checkpoint_path)
+            needs_retirement = acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
             if not needs_retirement or should_defer():
                 return 0
             try:
@@ -882,6 +962,7 @@ class StagingStore:
                 raise
             if retired:
                 self._ready_custody_cache = None
+                self.publication_input_changed()
             return len(retired)
 
     def retire_covered_raw_page(self, *, should_defer: Callable[[], bool]) -> bool:

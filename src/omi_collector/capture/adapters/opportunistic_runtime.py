@@ -21,14 +21,19 @@ from ..application.ports import (
     StagingPort,
     StagingWriterTargetPort,
 )
-from ..application.storage_fault import FatalInternalAudioStorageError
+from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from ..domain.operational_status_machine import PublicationOutcome
 from ..domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from .attempt_writer import AttemptWriter, WriterError, WriterFailedError, WriterProgress
 from .clock_state_store import ClockStateStore
 from .debug_logging import debug_event, debug_exception
 from .firmware_observations import FirmwareObservationStore, FirmwareObservationWriter
-from .quarantine import QuarantineCustodyHoldError, QuarantinePublishError, QuarantineSalvageDeferredError
+from .quarantine import (
+    QuarantineCustodyHoldError,
+    QuarantinePublishError,
+    QuarantineSalvageDeferredError,
+    QuarantineSourceRetryableError,
+)
 from .staging_contract import DeviceAlreadyRunningError, StagingError
 from .staging_store import StagingStore
 
@@ -260,9 +265,11 @@ class OpportunisticRuntime(CaptureRuntimePort):
             return "deferred"
         if isinstance(error, QuarantinePublishError):
             return "deferred"
-        if isinstance(error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError)):
+        if isinstance(
+            error, (QuarantineSalvageDeferredError, DeviceAlreadyRunningError, TransientInternalAudioStorageError)
+        ):
             return "deferred"
-        if isinstance(error, OSError):
+        if isinstance(error, (OSError, QuarantineSourceRetryableError)):
             return "retryable"
         if isinstance(error, StagingError):
             return "deferred"

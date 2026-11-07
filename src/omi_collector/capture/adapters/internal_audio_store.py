@@ -540,12 +540,13 @@ class InternalAudioStore:
             raise InternalAudioStoreError("publication reader is already active")
         try:
             self._publication_reader = self.state_db.open_connection(read_only=True)
-            yield
         except InternalAudioStoreError:
             raise
         except (OSError, sqlite3.DatabaseError, StateDBError) as error:
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("publication reader failed") from error
+        try:
+            yield
         finally:
             if self._publication_reader is not None:
                 self._publication_reader.close()

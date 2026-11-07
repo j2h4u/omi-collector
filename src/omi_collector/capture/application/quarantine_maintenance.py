@@ -10,7 +10,7 @@ from threading import Event
 from time import monotonic
 from typing import Protocol
 
-from ...config import DEFAULT_CONFIG, CollectorConfig
+from ...config import CLEANUP_INTERVAL_SECONDS, CLEANUP_WINDOW_SECONDS, DEFAULT_CONFIG, CollectorConfig
 from ..domain.quarantine_machine import (
     QuarantineAction,
     QuarantineEvent,
@@ -60,10 +60,6 @@ class PendingStartupState:
     disposition: RecoveryDisposition = "empty"
 
 
-_CLEANUP_INTERVAL_SECONDS = 3600.0
-_CLEANUP_WINDOW_SECONDS = 600.0
-
-
 class _CleanupPhase(Enum):
     WAITING = "waiting"
     PUBLICATION = "publication"
@@ -79,6 +75,12 @@ class _CleanupEvent(Enum):
     DEFER = "defer"
 
 
+class _SalvageResult(Enum):
+    CONTINUE = "continue"
+    RETRY = "retry"
+    DEFER = "defer"
+
+
 @dataclass(frozen=True, slots=True)
 class _CleanupState:
     phase: _CleanupPhase
@@ -87,12 +89,12 @@ class _CleanupState:
 
 
 def _next_cleanup_due(due_at: float, now: float) -> float:
-    elapsed_windows = max(0, int((now - due_at) // _CLEANUP_INTERVAL_SECONDS))
-    return due_at + (elapsed_windows + 1) * _CLEANUP_INTERVAL_SECONDS
+    elapsed_windows = max(0, int((now - due_at) // CLEANUP_INTERVAL_SECONDS))
+    return due_at + (elapsed_windows + 1) * CLEANUP_INTERVAL_SECONDS
 
 
 def _cleanup_transition(state: _CleanupState, event: _CleanupEvent, now: float) -> _CleanupState:
-    """Keep the ordered physical cleanup lifecycle within one hourly window."""
+    """Order cleanup after a publication attempt within one hourly window."""
     if not isinstance(state.phase, _CleanupPhase):
         raise ValueError("unknown cleanup phase")
     if not isinstance(event, _CleanupEvent):
@@ -103,11 +105,11 @@ def _cleanup_transition(state: _CleanupState, event: _CleanupEvent, now: float) 
         return _CleanupState(_CleanupPhase.WAITING, _next_cleanup_due(state.due_at, now))
     if event is _CleanupEvent.WAKE:
         if state.phase is _CleanupPhase.WAITING and now >= state.due_at:
-            return _CleanupState(_CleanupPhase.PUBLICATION, state.due_at, now + _CLEANUP_WINDOW_SECONDS)
+            return _CleanupState(_CleanupPhase.ACK, state.due_at, now + CLEANUP_WINDOW_SECONDS)
         return state
     next_phase = {
-        _CleanupPhase.PUBLICATION: _CleanupPhase.ACK,
-        _CleanupPhase.ACK: _CleanupPhase.RAW,
+        _CleanupPhase.ACK: _CleanupPhase.PUBLICATION,
+        _CleanupPhase.PUBLICATION: _CleanupPhase.RAW,
         _CleanupPhase.RAW: _CleanupPhase.EXPIRY,
         _CleanupPhase.EXPIRY: _CleanupPhase.VACUUM,
     }.get(state.phase)
@@ -136,7 +138,7 @@ class QuarantineMaintenance:
         self._startup_state: PendingStartupState | None = None
         self._startup_state_bound = False
         self._maintenance_not_before = 0.0
-        self._cleanup_state = _CleanupState(_CleanupPhase.WAITING, monotonic() + _CLEANUP_INTERVAL_SECONDS)
+        self._cleanup_state = _CleanupState(_CleanupPhase.WAITING, monotonic() + CLEANUP_INTERVAL_SECONDS)
         self._quarantine_retry_not_before = 0.0
         self._quarantine_retry_number = 0
         self._publication_retry_handle: asyncio.TimerHandle | None = None
@@ -329,9 +331,9 @@ class QuarantineMaintenance:
         """Run one cooperative terminal sweep and quarantine salvage pass."""
         if not self._maintenance_due(should_defer):
             return
-        if self._cleanup_state.phase is not _CleanupPhase.WAITING:
-            self._defer_cleanup_window()
-        self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.WAKE, monotonic())
+        await self._begin_cleanup_window(should_defer)
+        if should_defer():
+            return
         outcome = await self._recover_and_publish()
         while self._staging.publication_followup_due() and not self._cleanup_should_defer(should_defer):
             outcome = await self._recover_and_publish()
@@ -339,7 +341,7 @@ class QuarantineMaintenance:
             self._defer_cleanup_window()
             return
         if self._cleanup_state.phase is _CleanupPhase.PUBLICATION:
-            if getattr(outcome, "state", None) in {"blocked", "transient"} or self._cleanup_should_defer(should_defer):
+            if getattr(outcome, "state", None) == "blocked" or self._cleanup_should_defer(should_defer):
                 self._defer_cleanup_window()
             else:
                 self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.ADVANCE, monotonic())
@@ -352,6 +354,14 @@ class QuarantineMaintenance:
         if not self._salvage_due(should_defer):
             return
         await self._salvage_quarantine(should_defer)
+
+    async def _begin_cleanup_window(self, should_defer: Callable[[], bool]) -> None:
+        if self._cleanup_state.phase is not _CleanupPhase.WAITING:
+            self._defer_cleanup_window()
+        self._cleanup_state = _cleanup_transition(self._cleanup_state, _CleanupEvent.WAKE, monotonic())
+        self._raise_publication_fatal()
+        if self._cleanup_state.phase is _CleanupPhase.ACK:
+            await self._run_cleanup_window(should_defer)
 
     def _cleanup_should_defer(self, should_defer: Callable[[], bool]) -> bool:
         return (
@@ -376,12 +386,17 @@ class QuarantineMaintenance:
         def deferred() -> bool:
             return self._cleanup_should_defer(should_defer)
 
-        while self._cleanup_state.phase is not _CleanupPhase.WAITING:
+        while self._cleanup_state.phase not in {_CleanupPhase.WAITING, _CleanupPhase.PUBLICATION}:
             if deferred():
                 self._defer_cleanup_window()
                 return
             try:
-                completed = await self._run_cleanup_phase(deferred)
+                effect_defer = (
+                    (lambda: should_defer() or self._staging.publication_maintenance_interrupted())
+                    if self._cleanup_state.phase is _CleanupPhase.VACUUM
+                    else deferred
+                )
+                completed = await self._run_cleanup_phase(effect_defer)
             except FatalInternalAudioStorageError:
                 raise
             except Exception as error:  # noqa: BLE001 - preserve cleanup debt and retry next window
@@ -410,6 +425,8 @@ class QuarantineMaintenance:
             return await self._sweep_terminal_quarantine(should_defer)
         elif phase is _CleanupPhase.VACUUM:
             outcome = await self._owned_cleanup_effect(self._staging.compact_after_cleanup, should_defer)
+            if self._staging.publication_retry_schedule() is not None:
+                self._arm_publication_timer()
             if outcome is not None and outcome.reason != "compaction_done":
                 self._runtime.debug_event("hourly_compaction_deferred", reason=outcome.reason)
                 return False
@@ -465,9 +482,23 @@ class QuarantineMaintenance:
         except Exception as error:  # noqa: BLE001 - no unsafe inference from unreadable quarantine
             self._runtime.debug_exception("quarantine_scan_failed", error)
             return
+        failed = False
         for source in sources:
-            if should_defer() or not await self._salvage_quarantined_prefix(source, should_defer):
+            if should_defer():
                 return
+            result = await self._salvage_quarantined_prefix(source, should_defer)
+            if result is _SalvageResult.DEFER:
+                return
+            if result is _SalvageResult.RETRY and not failed:
+                failed = True
+                backoff = self._config.retry.quarantine_publish_backoff_seconds
+                self._quarantine_retry_not_before = (
+                    monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
+                )
+                self._quarantine_retry_number += 1
+        if not failed:
+            self._quarantine_retry_number = 0
+            self._quarantine_retry_not_before = 0.0
 
     async def quarantine_attempt_source(self, attempt_id: str) -> None:
         """Move a discontinuous source aside without diagnostic metadata."""
@@ -641,10 +672,10 @@ class QuarantineMaintenance:
             raise OpportunisticSyncError("typed recovery returned inconsistent durable bounds")
         return descriptor.start_sequence + recovery.valid_records
 
-    async def _salvage_quarantined_prefix(self, source: str, should_defer: Callable[[], bool]) -> bool:
+    async def _salvage_quarantined_prefix(self, source: str, should_defer: Callable[[], bool]) -> _SalvageResult:
         source_state = await joined_to_thread(self._staging.quarantine_state, source)
         if source_state in {QuarantineState.PUBLISHED, QuarantineState.UNPROCESSABLE}:
-            return True
+            return _SalvageResult.CONTINUE
         recovery_event = {
             QuarantineState.RETRYABLE: QuarantineEvent.RECOVERED_RETRYABLE,
             QuarantineState.INVALID_EVIDENCE: QuarantineEvent.RECOVERED_INVALID,
@@ -664,8 +695,6 @@ class QuarantineMaintenance:
             raise
         except Exception as error:  # noqa: BLE001 - the runtime classifies supported salvage failures
             return await self._handle_quarantine_publish_error(source, state, error)
-        self._quarantine_retry_number = 0
-        self._quarantine_retry_not_before = 0.0
         self._runtime.debug_event(
             "quarantine_prefix_admitted",
             source=source,
@@ -675,24 +704,24 @@ class QuarantineMaintenance:
         )
         await report_activity(self._activity, "prefix_admitted")
         await self._recover_and_publish()
-        return True
+        return _SalvageResult.CONTINUE
 
     async def _handle_quarantine_publish_error(
         self,
         source: str,
         state: QuarantineState,
         error: Exception,
-    ) -> bool:
+    ) -> _SalvageResult:
         kind = self._runtime.classify_quarantine_error(error)
         if kind is None:
             raise error
         if kind == "deferred":
             deferred = quarantine_transition(state, QuarantineEvent.DEFER)
-            return deferred.action is not QuarantineAction.WAIT
+            return _SalvageResult.DEFER if deferred.action is QuarantineAction.WAIT else _SalvageResult.CONTINUE
         if kind == "unprocessable":
             pending = quarantine_transition(state, QuarantineEvent.CLASSIFIED_UNPROCESSABLE)
             if pending.action is not QuarantineAction.MARK_UNPROCESSABLE:
-                return True
+                return _SalvageResult.CONTINUE
             marked = await self._mark_quarantine(
                 source,
                 self._staging.mark_quarantine_unprocessable,
@@ -703,15 +732,12 @@ class QuarantineMaintenance:
                 pending.state,
                 QuarantineEvent.MARK_COMMITTED if marked else QuarantineEvent.MARK_FAILED,
             )
-            return True
+            return _SalvageResult.CONTINUE
         retry = quarantine_transition(state, QuarantineEvent.RETRYABLE_FAILURE)
         if retry.action is not QuarantineAction.KEEP:
-            return True
+            return _SalvageResult.CONTINUE
         self._runtime.debug_exception("quarantine_prefix_publish_retryable", error, source=source)
-        backoff = self._config.retry.quarantine_publish_backoff_seconds
-        self._quarantine_retry_not_before = monotonic() + backoff[min(self._quarantine_retry_number, len(backoff) - 1)]
-        self._quarantine_retry_number += 1
-        return False
+        return _SalvageResult.RETRY
 
     async def _mark_quarantine(
         self,

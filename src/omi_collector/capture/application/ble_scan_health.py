@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Literal, Protocol
 
+from .owned_work import join_owned
 from .storage_fault import FatalInternalAudioStorageError
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,6 +96,9 @@ class ScanHealthMonitor:
         self._last_callback_at: float | None = None
         self._callback_count = 0
         self._failure_latched = False
+        self._failure_at: float | None = None
+        self._persistence_lock = asyncio.Lock()
+        self._resolving = False
 
     @property
     def next_deadline(self) -> float | None:
@@ -175,11 +180,9 @@ class ScanHealthMonitor:
         if generation != self._generation:
             return
         _LOGGER.warning("BLE scan stop failed (generation %d): %s: %s", generation, type(error).__name__, error)
-        if not self._failure_latched:
-            self._start_open(generation, "scan_stop_failed", error)
+        self._start_open(generation, "scan_stop_failed", error)
         try:
-            if self._retry_at is None or self._retry_at <= self._clock():
-                await self._attempt_persistence()
+            await self._attempt_persistence()
         finally:
             await self._close_diagnostics(generation)
 
@@ -187,9 +190,11 @@ class ScanHealthMonitor:
         if generation != self._generation:
             return False
         self._callback_count += 1
-        self._last_callback_at = at
+        self._last_callback_at = max(self._last_callback_at, at) if self._last_callback_at is not None else at
         with suppress(Exception):
             self._diagnostics.healthy(generation)
+        if self._failure_at is not None and at <= self._failure_at:
+            return False
         if self._incident_active or self._incident_state_unknown or self._open_context is not None:
             if self._resolution_pending:
                 return False
@@ -211,7 +216,7 @@ class ScanHealthMonitor:
         if self._retry_at is not None:
             if current < self._retry_at:
                 return False
-            await self._attempt_persistence()
+            await self._attempt_persistence(current)
             return True
         deadline = self.next_deadline
         generation = self._generation
@@ -227,11 +232,13 @@ class ScanHealthMonitor:
         reason: Literal["scan_silence", "scan_start_failed", "scan_stop_failed"],
         error: Exception | None,
     ) -> None:
-        if self._failure_latched:
+        now = self._clock()
+        self._failure_at = now
+        self._resolution_pending = False
+        if self._failure_latched and not self._resolving:
             return
         if reason == "scan_silence":
             _LOGGER.warning("BLE scan %s (generation %d)", reason, generation)
-        now = self._clock()
         active_seconds = max(0.0, now - self._started_at) if self._started_at is not None else self._active_seconds
         age = None if self._last_callback_at is None else max(0.0, now - self._last_callback_at)
         self._open_context = ScanIncidentContext(
@@ -246,8 +253,15 @@ class ScanHealthMonitor:
         self._incident_generation = generation
         self._failure_latched = True
 
-    async def _attempt_persistence(self) -> None:
+    async def _attempt_persistence(self, now: float | None = None) -> None:
+        async with self._persistence_lock:
+            await self._persist_pending(now)
+
+    async def _persist_pending(self, now: float | None) -> None:
         if self._storage_fatal is not None:
+            return
+        current = self._clock() if now is None else now
+        if self._retry_at is not None and current < self._retry_at:
             return
         try:
             if self._open_context is not None:
@@ -259,14 +273,8 @@ class ScanHealthMonitor:
             if self._resolution_pending and (self._incident_active or self._incident_state_unknown):
                 generation = self._incident_generation
                 if generation is not None:
-                    await self._sink.resolve(generation, "advertisements_resumed")
-                    self._incident_active = False
-                    self._incident_state_unknown = False
-                    self._incident_generation = None
-                    self._resolution_pending = False
-                    self._failure_latched = False
-                    self._retry_at = None
-                    self._retry_delay = 1.0
+                    self._resolving = True
+                    await join_owned(self._resolve_pending(generation))
         except FatalInternalAudioStorageError as error:
             self._storage_fatal = error
             raise
@@ -278,6 +286,22 @@ class ScanHealthMonitor:
                 self._retry_delay,
             )
             self._retry_delay = min(self._retry_delay * 2, 30.0)
+
+    async def _resolve_pending(self, generation: int) -> None:
+        try:
+            await self._sink.resolve(generation, "advertisements_resumed")
+        finally:
+            self._resolving = False
+        self._incident_active = False
+        self._incident_state_unknown = False
+        if self._open_context is None:
+            self._incident_generation = None
+            self._resolution_pending = False
+            self._failure_latched = False
+        self._retry_at = None
+        self._retry_delay = 1.0
+        if self._open_context is not None:
+            await self._persist_pending(None)
 
     async def _close_diagnostics(self, generation: int) -> None:
         try:

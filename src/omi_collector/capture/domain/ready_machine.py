@@ -110,6 +110,7 @@ class Compacting:
     generation: int
     debt_generation: int
     failure_count: int = 0
+    publication_retry: RetryWait | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +167,7 @@ class Finished:
     result: PublicationResult
     now: float
     backoff: tuple[float, ...] = ()
+    reprobe: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,7 +316,11 @@ def _finished(state: PublicationState, event: Finished) -> tuple[PublicationStat
         return state, PublicationCommand()
     if state.mode is not PublicationMode.AVAILABLE:
         return PublicationState(state.mode, Idle(), state.generation, state.next_token), PublicationCommand()
-    if work.generation != state.generation or event.revision != work.revision:
+    if (
+        work.generation != state.generation
+        or event.reprobe
+        or (event.result is not PublicationResult.TRANSIENT and event.revision != work.revision)
+    ):
         updated = PublicationState(state.mode, Idle(), state.generation, state.next_token, True)
         return updated, PublicationCommand(PublicationAction.CHECK_INPUT)
     if event.result is PublicationResult.TRANSIENT:
@@ -342,10 +348,11 @@ def _quiescing(work: Idle | Running | Settled | RetryWait | Compacting | Quiesci
 
 
 def _compaction_due(state: PublicationState, event: CompactionDue) -> tuple[PublicationState, PublicationCommand]:
-    if state.mode is not PublicationMode.AVAILABLE or not isinstance(state.work, (Idle, Settled)):
+    if state.mode is not PublicationMode.AVAILABLE or not isinstance(state.work, (Idle, Settled, RetryWait)):
         return state, PublicationCommand()
     token = state.next_token + 1
-    work = Compacting(token, event.revision, state.generation, event.debt_generation)
+    retry = state.work if isinstance(state.work, RetryWait) else None
+    work = Compacting(token, event.revision, state.generation, event.debt_generation, publication_retry=retry)
     return PublicationState(state.mode, work, state.generation, token, state.needs_check), PublicationCommand(
         PublicationAction.COMPACT, token=token, debt_generation=event.debt_generation
     )
@@ -363,15 +370,17 @@ def _compaction_finished(
         return PublicationState(state.mode, Idle(), state.generation, state.next_token, True), PublicationCommand(
             PublicationAction.CHECK_INPUT
         )
-    if event.result is PublicationResult.TRANSIENT:
-        delay = event.backoff[min(work.failure_count, len(event.backoff) - 1)] if event.backoff else 1.0
-        deadline = event.now + delay
+    retry = work.publication_retry if isinstance(work, Compacting) and not state.needs_check else None
+    if retry is not None or event.result is PublicationResult.TRANSIENT:
+        if retry is None:
+            delay = event.backoff[min(work.failure_count, len(event.backoff) - 1)] if event.backoff else 1.0
+            retry = RetryWait(event.revision, event.result, event.now + delay, work.failure_count + 1)
         return PublicationState(
             state.mode,
-            RetryWait(event.revision, event.result, deadline, work.failure_count + 1),
+            retry,
             state.generation,
             state.next_token,
-        ), PublicationCommand(PublicationAction.ARM, deadline=deadline)
+        ), PublicationCommand(PublicationAction.ARM, deadline=retry.deadline)
     if event.result is PublicationResult.SETTLED:
         if work.generation != state.generation or state.needs_check:
             return PublicationState(

@@ -111,6 +111,16 @@ class ReadyBundleError(RuntimeError):
     """A draft cannot be safely finalized into a ready bundle."""
 
 
+class ReadySpaceError(ReadyBundleError):
+    """The measured reserve for a publication is unavailable."""
+
+    def __init__(self, path: Path, required: int) -> None:
+        super().__init__("insufficient filesystem space for typed ready publication")
+        self.path = path
+        self.required = required
+        self.requirements: tuple[tuple[Path, int], ...] = ((path, required),)
+
+
 class _ReadyMaintenanceDeferredError(Exception):
     """Cooperative capture preemption before an ACK retirement marker."""
 
@@ -1399,8 +1409,6 @@ def _finalize_public_audio_v2(
         custody_cache = _v2_ready_custody(ready_root, audio_store.state_db, custody_cache)
         custody = custody_cache.custody
         admissions = _typed_source_admissions(audio_store, sources, options.frontier)
-        if options.drained:
-            admissions = _cover_typed_full_replays(audio_store, admissions, custody, options.page_limit)
         _require_typed_admissions_current(audio_store, admissions)
         if not options.drained:
             return ReadyOutcome(
@@ -1409,7 +1417,18 @@ def _finalize_public_audio_v2(
                 remaining_at_frontier=bool(admissions),
                 custody_cache=custody_cache,
             )
-        summary = _disjoint_packet_summary(audio_store, admissions, custody, options.page_limit, threshold)
+        frontier = _v2_frontier(audio_store.state_db)
+        cache_key = _normalized_wait_key(admissions, custody, threshold, frontier)
+        cached = _cached_normalized_wait(audio_store, admissions, cache_key, threshold, custody_cache)
+        if cached is not None:
+            return cached
+        admissions = _cover_typed_full_replays(audio_store, admissions, custody, options.page_limit)
+        _require_typed_admissions_current(audio_store, admissions)
+        summary = (
+            _disjoint_packet_summary(audio_store, admissions, custody, options.page_limit, threshold)
+            if frontier is None or all(item.snapshot.sequence_start > frontier.sequence for item in admissions)
+            else None
+        )
         if summary is not None and summary[0] < threshold:
             _persist_typed_packet_summaries(audio_store, summary[1])
             _require_typed_admissions_current(audio_store, admissions)
@@ -1430,8 +1449,26 @@ def _finalize_public_audio_v2(
             _block_typed_custody_conflict(audio_store, admission)
             raise
         _require_typed_admissions_current(audio_store, admissions)
+        _require_slices_after_v2_frontier(slices, frontier)
         stats = _typed_stats(admissions, slices, threshold)
         if not slices or stats.audio_packets < threshold:
+            _require_typed_summary_certification_current(audio_store, admissions)
+            audio_store.state_db.put(
+                StateKind.PACKET_SUMMARY,
+                "normalized_wait",
+                {
+                    "key": cache_key,
+                    "remaining": bool(admissions),
+                    "stats": [
+                        stats.source_count,
+                        stats.record_count,
+                        stats.audio_packets,
+                        stats.threshold_packets,
+                        stats.gap_count,
+                        stats.gap_records,
+                    ],
+                },
+            )
             return ReadyOutcome(
                 ReadyOutcomeState.WAITING,
                 reason="waiting_for_threshold",
@@ -2101,6 +2138,54 @@ def _typed_packet_fingerprint(admission: _TypedAdmission) -> str:
     ).hexdigest()
 
 
+def _normalized_wait_key(
+    admissions: tuple[_TypedAdmission, ...], custody: _TypedReadyCustody, threshold: int, frontier: _V2Frontier | None
+) -> str:
+    identity = (
+        [(_typed_packet_fingerprint(item), item.cursor, item.member_ordinal) for item in admissions],
+        custody.entries,
+        [(key, proof.proof_content_sha256) for key, proof in sorted(custody.proofs.items())],
+        threshold,
+        None if frontier is None else _v2_frontier_payload(frontier),
+    )
+    return sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _cached_normalized_wait(
+    audio_store: InternalAudioStore,
+    admissions: tuple[_TypedAdmission, ...],
+    key: str,
+    threshold: int,
+    custody_cache: ReadyCustodyCache,
+) -> ReadyOutcome | None:
+    cached = audio_store.state_db.get(StateKind.PACKET_SUMMARY, "normalized_wait")
+    if cached is None or cached.get("key") != key or type(cached.get("remaining")) is not bool:
+        return None
+    values = cached.get("stats")
+    if not _valid_normalized_wait_stats(values):
+        return None
+    stats = ReadyPublicationStats(*values)
+    if stats.audio_packets >= threshold or stats.threshold_packets != threshold:
+        return None
+    _require_typed_summary_certification_current(audio_store, admissions)
+    return ReadyOutcome(
+        ReadyOutcomeState.WAITING,
+        reason="waiting_for_threshold",
+        remaining_at_frontier=cast(bool, cached["remaining"]),
+        stats=stats,
+        custody_cache=custody_cache,
+    )
+
+
+def _valid_normalized_wait_stats(values: object) -> TypeGuard[list[int]]:
+    if not isinstance(values, list):
+        return False
+    items = cast(list[object], values)
+    return len(items) == len(ReadyPublicationStats.__dataclass_fields__) and all(
+        type(value) is int and value >= 0 for value in items
+    )
+
+
 def _persist_typed_packet_summaries(audio_store: InternalAudioStore, fresh_slices: tuple[_TypedSlice, ...]) -> None:
     if not fresh_slices:
         return
@@ -2248,6 +2333,11 @@ def _v2_frontier(state_db: StateDB) -> _V2Frontier | None:
     if payload is None:
         return None
     return _v2_frontier_from_payload(payload)
+
+
+def _require_slices_after_v2_frontier(slices: tuple[_TypedSlice, ...], frontier: _V2Frontier | None) -> None:
+    if frontier is not None and any(item.start_sequence <= frontier.sequence for item in slices):
+        raise ReadyBundleError("unique source records precede the committed v2 frontier")
 
 
 def _v2_frontier_from_payload(payload: Mapping[str, object] | Mapping[object, object]) -> _V2Frontier:
@@ -2565,10 +2655,21 @@ def _require_v2_stage_space(audio_store: InternalAudioStore, ready_root: Path, g
         ready_stat = ready_root.stat()
         database_stat = database.stat()
         if ready_stat.st_dev == database_stat.st_dev:
-            _require_typed_filesystem_space(ready_root, output_bytes + database_bytes + _TYPED_SPACE_HEADROOM)
+            requirements = ((ready_root, output_bytes + database_bytes + _TYPED_SPACE_HEADROOM),)
         else:
-            _require_typed_filesystem_space(ready_root, output_bytes + _TYPED_SPACE_HEADROOM)
-            _require_typed_filesystem_space(database.parent, database_bytes + _TYPED_SPACE_HEADROOM)
+            requirements = (
+                (ready_root, output_bytes + _TYPED_SPACE_HEADROOM),
+                (database.parent, database_bytes + _TYPED_SPACE_HEADROOM),
+            )
+        shortage = None
+        for path, required in requirements:
+            try:
+                _require_typed_filesystem_space(path, required)
+            except ReadySpaceError as error:
+                shortage = error
+        if shortage is not None:
+            shortage.requirements = requirements
+            raise shortage
     except ReadyBundleError:
         raise
     except (OSError, StateDBError, sqlite3.DatabaseError, TypeError, IndexError) as error:
@@ -3133,6 +3234,7 @@ def _resume_v2_cohort(
         _require_typed_admissions_current(audio_store, current.admissions)
         if current.lifecycle == "staging":
             stage = _load_v2_stage(audio_store, context.ready_root, current, context.page_limit)
+            _require_v2_stage_frontier(audio_store, stage)
             custody_cache = _v2_ready_custody(
                 context.ready_root, audio_store.state_db, custody_cache, pending=stage.artifact_id
             )
@@ -3142,6 +3244,7 @@ def _resume_v2_cohort(
                 slices = _accepted_typed_slices(
                     audio_store, current, context.page_limit, custody_cache.custody, prepared_slices
                 )
+                _require_slices_after_v2_frontier(slices, _v2_frontier(audio_store.state_db))
                 prepared_slices = None
                 groups = iter(_v2_physical_groups(slices, context.page_limit))
             custody_cache = _v2_ready_custody(context.ready_root, audio_store.state_db, custody_cache)
@@ -3174,6 +3277,12 @@ def _resume_v2_cohort(
         if current is not None and current.cohort_id != cohort.cohort_id:
             _typed_fail_stop(audio_store, "v2 publication cohort changed during resume")
     return published, _final_v2_custody(context.ready_root, audio_store.state_db, custody_cache)
+
+
+def _require_v2_stage_frontier(audio_store: InternalAudioStore, stage: _V2Stage) -> None:
+    if stage.group.initial_frontier != _v2_frontier(audio_store.state_db):
+        _typed_fail_stop(audio_store, "v2 stage frontier differs from committed frontier")
+    _require_slices_after_v2_frontier(stage.group.slices, stage.group.initial_frontier)
 
 
 def _final_v2_custody(
@@ -4345,7 +4454,7 @@ def _require_typed_filesystem_space(path: Path, required: int) -> None:
     filesystem = os.statvfs(path)
     available = filesystem.f_bavail * filesystem.f_frsize
     if available < required:
-        raise ReadyBundleError("insufficient filesystem space for typed ready publication")
+        raise ReadySpaceError(path, required)
 
 
 def _sync_regular_file(path: Path) -> None:

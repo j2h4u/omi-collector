@@ -681,6 +681,32 @@ def test_publication_record_page_preserves_sqlite_fault(
     assert raised.value.__cause__ is failure
 
 
+def test_publication_reader_preserves_effect_oserror_and_closes_reader(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    failure = OSError("stage write failed")
+    with InternalAudioStore(db) as store:
+        with pytest.raises(OSError) as raised, store.publication_reader():
+            raise failure
+        assert raised.value is failure
+        with store.publication_reader():
+            pass
+
+
+def test_publication_reader_classifies_its_open_sqlite_fault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    failure = sqlite3.DatabaseError("reader open failed")
+    failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    with InternalAudioStore(db) as store:
+
+        def fail_open(*_args: object, **_kwargs: object) -> None:
+            raise failure
+
+        monkeypatch.setattr(db, "open_connection", fail_open)
+        with pytest.raises(TransientInternalAudioStorageError) as raised, store.publication_reader():
+            pass
+        assert raised.value.__cause__ is failure
+
+
 def test_authentication_raw_oserror_is_not_a_structured_read_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

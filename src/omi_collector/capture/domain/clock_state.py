@@ -197,11 +197,23 @@ def _valid_anchor_identity(confidence: object, source_id: object) -> bool:
     )
 
 
+def _valid_causal_interval(item: object) -> bool:
+    if not isinstance(item, tuple):
+        return False
+    values = cast(tuple[object, ...], item)
+    match values:
+        case (start, end):
+            return type(start) is int and type(end) is int and 0 <= start <= end
+        case _:
+            return False
+
+
 @dataclass(frozen=True, slots=True)
 class ClockState:
     ranges: tuple[ClockRange, ...] = ()
     intent: ClockIntent | None = None
     anchor: ClockAnchor | None = None
+    causal_uncertainty: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -217,6 +229,10 @@ class ClockState:
             raise ClockStateError("clock intent is invalid")
         if self.anchor is not None and not isinstance(self.anchor, ClockAnchor):
             raise ClockStateError("clock anchor is invalid")
+        if not isinstance(self.causal_uncertainty, tuple) or any(
+            not _valid_causal_interval(item) for item in self.causal_uncertainty
+        ):
+            raise ClockStateError("clock causal uncertainty is invalid")
 
     def add_range(self, incoming: ClockRange) -> ClockState:
         """Add evidence only to uncovered sequences, keeping prior audio timing fixed."""
@@ -247,7 +263,7 @@ class ClockState:
                 merged[-1] = replace(merged[-1], next_sequence=item.next_sequence)
             else:
                 merged.append(item)
-        return ClockState(tuple(merged), self.intent, self.anchor)
+        return ClockState(tuple(merged), self.intent, self.anchor, self.causal_uncertainty)
 
     def observe(
         self,
@@ -286,16 +302,24 @@ class ClockState:
         return state
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": _SCHEMA_VERSION,
             "ranges": [asdict(item) for item in self.ranges],
             "intent": asdict(self.intent) if self.intent is not None else None,
             "anchor": asdict(self.anchor) if self.anchor is not None else None,
         }
+        if self.causal_uncertainty:
+            payload["causal_uncertainty"] = [list(item) for item in self.causal_uncertainty]
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> ClockState:
-        if not isinstance(payload, dict) or set(payload) != {"schema_version", "ranges", "intent", "anchor"}:
+        required = {"schema_version", "ranges", "intent", "anchor"}
+        if (
+            not isinstance(payload, dict)
+            or not required <= set(payload)
+            or set(payload) - required - {"causal_uncertainty"}
+        ):
             raise ClockStateError("clock state payload is invalid")
         if type(payload["schema_version"]) is not int or payload["schema_version"] != _SCHEMA_VERSION:
             raise ClockStateError("clock state schema is unsupported")
@@ -317,7 +341,15 @@ class ClockState:
                 raise ClockStateError("clock state range is invalid")
             intent = _parse_intent(cast(dict[object, object], intent_value)) if isinstance(intent_value, dict) else None
             anchor = _parse_anchor(cast(dict[object, object], anchor_value)) if isinstance(anchor_value, dict) else None
-            return cls(ranges, intent, anchor)
+            uncertainty = payload.get("causal_uncertainty", [])
+            if not isinstance(uncertainty, list):
+                raise ClockStateError("clock causal uncertainty is invalid")
+            items = cast(list[object], uncertainty)
+            if any(not isinstance(item, list) for item in items):
+                raise ClockStateError("clock causal uncertainty is invalid")
+            lists = cast(list[list[object]], items)
+            intervals = cast(tuple[tuple[int, int], ...], tuple(tuple(item) for item in lists))
+            return cls(ranges, intent, anchor, intervals)
         except (TypeError, ValueError) as error:
             raise ClockStateError("clock state payload is invalid") from error
 
@@ -368,7 +400,13 @@ class ClockState:
             completed = completed.add_range(item)
         if boundary > self.intent.write_sequence_before:
             _require_unknown_coverage(self.intent.write_sequence_before, boundary, completed.ranges)
-        return replace(completed, intent=None)
+        return replace(
+            completed,
+            intent=None,
+            causal_uncertainty=tuple(
+                sorted({*completed.causal_uncertainty, (self.intent.write_sequence_before, boundary)})
+            ),
+        )
 
 
 def _require_unknown_coverage(start: int, end: int, ranges: tuple[ClockRange, ...]) -> None:

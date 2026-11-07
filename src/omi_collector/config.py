@@ -62,6 +62,8 @@ def _require_fraction(value: float, name: str) -> None:
 
 
 _RAPID_BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+CLEANUP_INTERVAL_SECONDS = 3600.0
+CLEANUP_WINDOW_SECONDS = 600.0
 
 
 @dataclass(frozen=True, slots=True)

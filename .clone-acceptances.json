@@ -524,12 +524,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "560411519944f18108945d9013a0d6912472650c6c3c96dfe971145dcdbeaf1b",
-      "count": 1,
-      "reason": "Clock observe/prepare/uncertain/cancel/finish perform different ClockState transitions and missing-intent policies inside atomic transactions. Shared transaction/get/put mechanisms already come from StateDB; callback-based generic mutation would obscure the lifecycle effects. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:78-84 ~ src/omi_collector/capture/adapters/clock_state_store.py:98-103."
-    },
-    {
-      "detector": "jscpd",
       "identity": "565676d763886dd8bee45667d3ef0aeccd9c7c2cd4140010faebffdea7d9e627",
       "count": 1,
       "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:14-46 ~ src/omi_collector/capture/adapters/attempt_writer_machine.py:73-105."
@@ -836,6 +830,12 @@
     },
     {
       "detector": "jscpd",
+      "identity": "989a14e3aed6d23ffdb5ef9af441a0ea247ef6da5780547d4ffb049b005bded6",
+      "count": 1,
+      "reason": "Scanner start failure and stop failure have different lifecycle events and start-time cleanup: failed start clears its start marker in finally; stopping already freezes active duration before failed stop is reported. Incident construction, persistence/retry and diagnostic closure are shared primitives; keep the explicit lifecycle handlers. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:159-169 ~ src/omi_collector/capture/application/ble_scan_health.py:177-187."
+    },
+    {
+      "detector": "jscpd",
       "identity": "99f9cdbdfc17028dee356e2341e4e21913386ea045d4ae67dac9e5a89d81bd12",
       "count": 1,
       "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:71-83 ~ src/omi_collector/operator_status.py:56-66."
@@ -887,12 +887,6 @@
       "identity": "a3518ba881b4350a467c931c18d5a856effc529d5e676567237af9c862e625e8",
       "count": 1,
       "reason": "The overlapping windows enumerate one CollectorConfig's independently owned component defaults. There are not two configuration implementations. Reviewed pair: src/omi_collector/config.py:383-396 ~ src/omi_collector/config.py:384-399."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "a4daf0f6fc13a9a734827212f7eca8ef890fa99b7f9dcedb73750f9b4d45743c",
-      "count": 1,
-      "reason": "Clock observe/prepare/uncertain/cancel/finish perform different ClockState transitions and missing-intent policies inside atomic transactions. Shared transaction/get/put mechanisms already come from StateDB; callback-based generic mutation would obscure the lifecycle effects. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:67-72 ~ src/omi_collector/capture/adapters/clock_state_store.py:86-91."
     },
     {
       "detector": "jscpd",
@@ -956,15 +950,15 @@
     },
     {
       "detector": "jscpd",
-      "identity": "aeb19ea22cea82c83dfb117c109ed68975e0d0ecb604e4de661bc0abec2895ef",
+      "identity": "ae5f9549d34a39be431906303341a78f9c9e7d0ab22b7f077f4f7168028f0e68",
       "count": 1,
-      "reason": "These are explicit imports of two independent typed state machines. The names are used by writer command admission versus visit/session orchestration; replacing import lists would hide dependencies rather than remove executable work. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:30-59 ~ src/omi_collector/capture/adapters/attempt_writer.py:31-60."
+      "reason": "These spans cross distinct clock operations: prepare requires no pending intent, cancel removes only a matching prepared intent when no write occurred, uncertainty preserves possible-write evidence, and finish validates causal range coverage. _load_current already shares decoding/migration and StateDB shares atomic persistence; retain the explicit operation methods. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:52-61 ~ src/omi_collector/capture/adapters/clock_state_store.py:64-73."
     },
     {
       "detector": "jscpd",
-      "identity": "b3d5d263418ad8d4d77fca7e851f90a0617803d8bb393632ff38c58bed63bb97",
+      "identity": "aeb19ea22cea82c83dfb117c109ed68975e0d0ecb604e4de661bc0abec2895ef",
       "count": 1,
-      "reason": "Clock observe/prepare/uncertain/cancel/finish perform different ClockState transitions and missing-intent policies inside atomic transactions. Shared transaction/get/put mechanisms already come from StateDB; callback-based generic mutation would obscure the lifecycle effects. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:78-84 ~ src/omi_collector/capture/adapters/clock_state_store.py:89-94."
+      "reason": "These are explicit imports of two independent typed state machines. The names are used by writer command admission versus visit/session orchestration; replacing import lists would hide dependencies rather than remove executable work. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:30-59 ~ src/omi_collector/capture/adapters/attempt_writer.py:31-60."
     },
     {
       "detector": "jscpd",
@@ -1436,9 +1430,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "11bc7d51e49688a6ec629f605a43fd56dc13a4dfb2cf0eaa75de02db99b40ae2",
+      "identity": "0fd52823cf6b16fea5d68b47fbe5cd3ca976ee669bcf1b1bd1f56f302022b040",
       "count": 1,
-      "reason": "mark_uncertain and cancel_prepared apply different ClockState intent transitions with different operation validation. StateDB transaction mechanics are already shared; preserve explicit effects. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:78-87 ~ src/omi_collector/capture/adapters/clock_state_store.py:89-96."
+      "reason": "Failed-start cleanup invalidates the start marker even when incident persistence is cancelled; failed-stop reporting preserves the already frozen scan-duration context from scan_stopping. Both compose the existing incident/persistence/diagnostic primitives, but their lifecycle postconditions differ. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:161-170 ~ src/omi_collector/capture/application/ble_scan_health.py:179-187."
     },
     {
       "detector": "pyscn",
@@ -1493,12 +1487,6 @@
       "identity": "1f5a7e0825cc07f2c6208ddc1a79df390bb7c20cf12839cb955a46d9e4acf4d2",
       "count": 1,
       "reason": "HCI data-length transitions and connection parameter requests have different controller units, field meanings and wire events. Keep explicit record/serialization contracts. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:168-182 ~ src/omi_collector/capture/adapters/ble_link_observability.py:202-216."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "1fc2b3d38e021bd44ab78738b76db59059d430eb2de89c2ed55778ea961a094e",
-      "count": 1,
-      "reason": "Compaction scheduling requires available idle/settled state and creates a debt-bound effect token; failed-probe handling schedules repair/backoff without that successful debt evidence. Keep independent state transitions. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:372-379 ~ src/omi_collector/capture/domain/ready_machine.py:418-430."
     },
     {
       "detector": "pyscn",
@@ -1838,12 +1826,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "7d254ab63d252719aed935a3665df5a4753ca8d3add9d94d7dee98a0d2d6c440",
-      "count": 1,
-      "reason": "Uncertain-clock marking and clock intent completion persist different ClockState transitions and evidence. Shared transaction/get/put mechanics already come from StateDB. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:79-87 ~ src/omi_collector/capture/adapters/clock_state_store.py:98-105."
-    },
-    {
-      "detector": "pyscn",
       "identity": "7efccc7f57facfa7fc5565324999f6c94b8af42f3102766f72eacb5b3ede9040",
       "count": 1,
       "reason": "Salvage inventory and terminal marker writes classify different failures and effects; both deliberately rethrow fatal storage errors while retaining evidence for other errors. Common exception idiom preserves safety at separate effect boundaries. Reviewed pair: src/omi_collector/capture/application/quarantine_maintenance.py:458-467 ~ src/omi_collector/capture/application/quarantine_maintenance.py:690-703."
@@ -1892,6 +1874,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "93299fa7bb0833f727e6b73a7ec7949097a21a7611d2a93f4c43433636582449",
+      "count": 1,
+      "reason": "Compaction admission has confirmed debt evidence, allocates a debt-bound effect token, and carries an existing publication RetryWait through compaction. Failed-probe handling has no debt generation or runnable effect; it accepts only idle/settled work and arms the first probe retry without replacing an existing publication retry. Their admission sets, evidence and commands differ despite similar state construction. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:350-358 ~ src/omi_collector/capture/domain/ready_machine.py:399-411."
+    },
+    {
+      "detector": "pyscn",
       "identity": "98b51391f4ac6ddc1d5bb48d681ef6c05010155f8abc6cfcd828a20b8a0e95fc",
       "count": 1,
       "reason": "Durable prefix and durable seal protocols intentionally expose overlapping custody fields, but a seal additionally establishes source identity and publication authority. Independent interfaces constrain different consumers. Reviewed pair: src/omi_collector/capture/application/ports.py:39-50 ~ src/omi_collector/capture/application/ports.py:63-79."
@@ -1901,12 +1889,6 @@
       "identity": "992376d869a3f2e5113c803f0a788af34f54721d22a976356d710c58a5d741ef",
       "count": 1,
       "reason": "A latched durability-failure probe inspects a persistent stop marker; final-commit inspection authenticates destination files plus ledger/frontier/cohort witnesses. Shared database access does not make these equivalent checks. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:3233-3248 ~ src/omi_collector/capture/adapters/ready_bundles.py:3352-3393."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "998734bff527794f725fd13c321404ea429b0c54c25f5da986a8f35bdcbe3c41",
-      "count": 1,
-      "reason": "Publication completion reconciles input revision/outcome and publication retry state; compaction completion also binds debt generation and interruption semantics. They are distinct effect-result machines despite token/transition syntax. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:339-363 ~ src/omi_collector/capture/domain/ready_machine.py:382-415."
     },
     {
       "detector": "pyscn",
@@ -1931,12 +1913,6 @@
       "identity": "9d5083e4e0daafadc9e945499d411f68804250575402e1e91a856052ca41a30d",
       "count": 1,
       "reason": "A validated single-source lookup returns one source snapshot with source-specific errors; the proof-root inventory reads all proof rows and reports durability failure. Their shared read-only database scope already uses StateDB. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:388-395 ~ src/omi_collector/capture/adapters/ready_bundles.py:1597-1609."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "9d9d5d86d7ea6b1c22adca009c1218c6f0a0bf3477052935ae76ce9c3590559d",
-      "count": 1,
-      "reason": "Clock observation accepts a missing payload as empty state and writes only when the serialized state changes; uncertainty marking requires an existing intent and always persists its validated transition. StateDB already owns transaction, get and put; a generic callback would hide these distinct policies. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:36-48 ~ src/omi_collector/capture/adapters/clock_state_store.py:59-67."
     },
     {
       "detector": "pyscn",
@@ -2033,12 +2009,6 @@
       "identity": "c4efad03247d302e52217eabaffae5532514f3c56ec3fc4662799f531a50c9dc",
       "count": 1,
       "reason": "Pending attempt enumeration protects startup/GATT uniqueness; typed-attempt sources drive consuming resume under a lease. Their result schemas and lifecycle eligibility differ despite similar SQL wrappers. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/staging_store.py:1052-1068."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "c5b360893f47d12d76200be9863a422f7418c3361b9a903034f8182433e18c41",
-      "count": 1,
-      "reason": "Prepared-intent cancellation and clock completion have different domain transitions and range inputs. Keep atomic operation-specific mutation methods rather than callback-driven generic updates. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:89-96 ~ src/omi_collector/capture/adapters/clock_state_store.py:98-105."
     },
     {
       "detector": "pyscn",
@@ -2192,6 +2162,12 @@
     },
     {
       "detector": "pyscn",
+      "identity": "ee1d8cbc946c2ed755cf3034e36d8e5796ad9532807000555196dda3853da233",
+      "count": 1,
+      "reason": "Publication completion preserves its effect outcome and applies explicit reprobe plus publication revision/generation rules. Compaction completion binds storage-debt generation, preserves quiescing ownership, and restores a retained publication RetryWait with its original outcome/deadline before considering compaction backoff. Their event schemas, settlement values and outstanding retry obligations differ; keep independent transitions. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:313-341 ~ src/omi_collector/capture/domain/ready_machine.py:361-396."
+    },
+    {
+      "detector": "pyscn",
       "identity": "eef8eda89c4aaa9075c93780423bac7f6e771636fa0e95dd9699a466351bebb1",
       "count": 1,
       "reason": "Connection parameter requests record a bounded requested range; successful updates additionally change effective connection parameters and preserve status outcomes. Shared list/lock shape masks different HCI state effects. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:1023-1038 ~ src/omi_collector/capture/adapters/ble_link_observability.py:1051-1063."
@@ -2204,21 +2180,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "f2c03903c8a380fc3fa7e155e616d1711982017674054a931815b5dd74c60647",
-      "count": 1,
-      "reason": "Clock uncertainty marking and completed-range publication are separate intent transitions. Atomic StateDB scope is common infrastructure, not a duplicate clock operation. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:78-87 ~ src/omi_collector/capture/adapters/clock_state_store.py:98-105."
-    },
-    {
-      "detector": "pyscn",
       "identity": "f4f72c701d53f62097391d0269de0c06f8dcef2174eb956fb74b1227d075cfaf",
       "count": 1,
       "reason": "Legacy clock correction evidence and typed publication admission snapshots represent different eras, field schemas and ownership. Similar optional/default annotation shape is incidental. Reviewed pair: src/omi_collector/capture/adapters/legacy_clock_import.py:95-106 ~ src/omi_collector/capture/adapters/ready_bundles.py:1104-1113."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "f8c6a633d9b0120dc0b53fbab77679141f39eebe57f85137a815b1e1f76f9c26",
-      "count": 1,
-      "reason": "Clock observation accepts a missing payload as empty state and writes only when the serialized state changes; prepared-intent cancellation requires an existing intent and always persists its validated transition. StateDB already owns transaction, get and put; a generic callback would hide these distinct policies. Reviewed pair: src/omi_collector/capture/adapters/clock_state_store.py:26-48 ~ src/omi_collector/capture/adapters/clock_state_store.py:69-76."
     }
   ]
 }

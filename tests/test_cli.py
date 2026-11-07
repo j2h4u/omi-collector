@@ -482,13 +482,18 @@ def test_service_runs_under_one_guarded_state_scope(monkeypatch: pytest.MonkeyPa
         yield object()
         calls.append("guard-exit")
 
+    async def fake_recover_phy(adapter: str) -> None:
+        assert adapter == device_cli.SUPPORTED_ADAPTER
+        calls.append("recover")
+
     monkeypatch.setattr(cli, "_command_state", fake_command_state)
+    monkeypatch.setattr(device_cli, "recover_phy", fake_recover_phy)
     monkeypatch.setattr(cli, "_service_locked", lambda *_args, **_kwargs: calls.append("service"))
 
     result = CliRunner().invoke(app, ["service", "--config", str(config_path)])
 
     assert result.exit_code == 0
-    assert calls == ["guard-enter", "service", "guard-exit"]
+    assert calls == ["guard-enter", "recover", "service", "guard-exit"]
 
 
 def test_version_flag_reports_package_version() -> None:

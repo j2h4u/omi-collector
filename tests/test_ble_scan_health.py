@@ -284,10 +284,11 @@ def test_persisted_incident_does_not_hide_new_scan_silence(caplog: pytest.LogCap
         assert caplog.text.count("BLE scan scan_silence") == 1
         assert not monitor.radio_activity(1, now[0])
         assert sink.resolved == []
+        now[0] += 0.1
         assert monitor.radio_activity(2, now[0])
         await monitor.flush_recovery()
         assert sink.resolved == [(2, "advertisements_resumed")]
-        assert monitor.next_deadline == 360.0
+        assert monitor.next_deadline == 360.1
 
     asyncio.run(scenario())
 
@@ -501,6 +502,269 @@ def test_open_and_resolve_failures_retry_without_deadline_spin_or_losing_state()
         assert await monitor.check_deadline()
         assert sink.resolved == [(1, "advertisements_resumed")]
         assert monitor.next_deadline == 7.1
+
+    asyncio.run(scenario())
+
+
+def test_start_callback_before_failure_cannot_resolve_existing_incident() -> None:
+    async def scenario() -> None:
+        now = [1.0]
+        sink = FakeSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+
+        class PacketThenFailure(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                callback(ScanRadioActivity(now[0]))
+                raise RuntimeError("start refused")
+
+        scheduler = PresenceScheduler(PacketThenFailure(), scan_health=monitor, clock=lambda: now[0])
+        scheduler._loop = asyncio.get_running_loop()
+        await scheduler._start_scan()
+        assert sink.is_active
+        assert sink.resolved == []
+        await scheduler.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_start_callback_during_incident_open_cannot_resolve_it() -> None:
+    async def scenario() -> None:
+        now = [10.0]
+        opening = asyncio.Event()
+        release = asyncio.Event()
+
+        class DelayedSink(FakeSink):
+            async def open(self, context: ScanIncidentContext) -> None:
+                opening.set()
+                await release.wait()
+                await super().open(context)
+
+        class RefusingOnce(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                if self.events.count("start") == 1:
+                    raise RuntimeError("start refused")
+
+        sink = DelayedSink()
+        observer = RefusingOnce()
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        scheduler = PresenceScheduler(observer, scan_health=monitor, clock=lambda: now[0])
+        scheduler._loop = asyncio.get_running_loop()
+        start = asyncio.create_task(scheduler._start_scan())
+        try:
+            async with asyncio.timeout(1.0):
+                await opening.wait()
+                now[0] = 11.0
+                assert observer.callback is not None
+                observer.callback(ScanRadioActivity(now[0]))
+                release.set()
+                assert not await start
+                assert sink.is_active and not sink.resolved
+                assert await scheduler._start_scan()
+                now[0] = 12.0
+                assert observer.callback is not None
+                observer.callback(ScanRadioActivity(now[0]))
+                await monitor.flush_recovery()
+                assert sink.resolved == [(1, "advertisements_resumed")]
+        finally:
+            release.set()
+            await asyncio.gather(start, return_exceptions=True)
+            await scheduler.close()
+
+    asyncio.run(scenario())
+
+
+def test_new_failure_supersedes_pending_recovery_and_delayed_callback() -> None:
+    async def scenario() -> None:
+        now = [1.0]
+        sink = FakeSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        await monitor.prepare(1)
+        assert monitor.radio_activity(1, 1.0)
+        now[0] = 2.0
+        await monitor.scan_start_failed(1, RuntimeError("start refused"))
+        assert sink.is_active and not sink.resolved
+        assert not monitor.radio_activity(1, 1.5)
+        await monitor.flush_recovery()
+        assert sink.is_active and not sink.resolved
+        await monitor.prepare(2)
+        monitor.scan_started(2)
+        now[0] = 3.0
+        assert monitor.radio_activity(2, 3.0)
+        await monitor.flush_recovery()
+        assert sink.resolved == [(2, "advertisements_resumed")]
+
+    asyncio.run(scenario())
+
+
+def test_latched_stop_failure_supersedes_pending_recovery() -> None:
+    async def scenario() -> None:
+        now = [1.0]
+        sink = FakeSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        await monitor.prepare(1)
+        await monitor.scan_start_failed(1, RuntimeError("start"))
+        now[0] = 2.0
+        assert monitor.radio_activity(1, 2.0)
+        now[0] = 3.0
+        await monitor.scan_stop_failed(1, RuntimeError("stop"))
+        await monitor.flush_recovery()
+        assert sink.is_active and not sink.resolved
+        assert not monitor.radio_activity(1, 2.5)
+        now[0] = 4.0
+        assert monitor.radio_activity(1, 4.0)
+        await monitor.flush_recovery()
+        assert sink.resolved == [(1, "advertisements_resumed")]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+def test_close_stop_failure_reopens_incident_after_inflight_resolution(*, cancel_waiter: bool) -> None:
+    async def scenario() -> None:
+        now = [1.0]
+        resolving = asyncio.Event()
+        release = asyncio.Event()
+        stop_failed = asyncio.Event()
+
+        class DelayedResolveSink(FakeSink):
+            async def resolve(self, generation: int, reason: str) -> None:
+                resolving.set()
+                await release.wait()
+                await super().resolve(generation, reason)
+
+        class FailingStop(FakeObserver):
+            async def start(self, callback: Callable[[object], object]) -> None:
+                await super().start(callback)
+                callback(ScanRadioActivity(now[0]))
+
+            async def stop(self) -> None:
+                stop_failed.set()
+                raise RuntimeError("stop refused")
+
+        sink = DelayedResolveSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        scheduler = PresenceScheduler(FailingStop(), scan_health=monitor, clock=lambda: now[0])
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        closer: asyncio.Task[None] | None = None
+        try:
+            async with asyncio.timeout(1.0):
+                await resolving.wait()
+                now[0] = 2.0
+                closer = asyncio.create_task(scheduler.close())
+                await stop_failed.wait()
+                while monitor._open_context is None:
+                    await asyncio.sleep(0)
+                if cancel_waiter:
+                    waiter.cancel()
+                release.set()
+                await closer
+                expected = asyncio.CancelledError if cancel_waiter else RuntimeError
+                with pytest.raises(expected):
+                    await waiter
+            assert sink.is_active
+            assert sink.opened[-1].reason == "scan_stop_failed"
+            assert sink.resolved == [(0, "advertisements_resumed")]
+        finally:
+            release.set()
+            if closer is not None:
+                await asyncio.gather(closer, return_exceptions=True)
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_failure_waiter_does_not_lose_failure_during_resolution() -> None:
+    async def scenario() -> None:
+        now = [1.0]
+        resolving = asyncio.Event()
+        release = asyncio.Event()
+
+        class DelayedResolveSink(FakeSink):
+            async def resolve(self, generation: int, reason: str) -> None:
+                resolving.set()
+                await release.wait()
+                await super().resolve(generation, reason)
+
+        sink = DelayedResolveSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        await monitor.prepare(1)
+        assert monitor.radio_activity(1, 1.0)
+        recovery = asyncio.create_task(monitor.flush_recovery())
+        await resolving.wait()
+        now[0] = 2.0
+        failure = asyncio.create_task(monitor.scan_stop_failed(1, RuntimeError("stop")))
+        while monitor._open_context is None:
+            await asyncio.sleep(0)
+        failure.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await failure
+        recovery.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await recovery
+        assert sink.is_active
+        assert sink.opened[-1].reason == "scan_stop_failed"
+
+    asyncio.run(scenario())
+
+
+def test_failure_at_owned_resolution_start_remains_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        now = [1.0]
+        sink = FakeSink(active=True)
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        await monitor.prepare(1)
+        await monitor.scan_start_failed(1, RuntimeError("start"))
+        now[0] = 2.0
+        assert monitor.radio_activity(1, 2.0)
+        original = monitor._resolve_pending
+
+        async def fail_before_resolve(generation: int) -> None:
+            now[0] = 3.0
+            monitor._start_open(generation, "scan_stop_failed", RuntimeError("stop"))
+            await original(generation)
+
+        monkeypatch.setattr(monitor, "_resolve_pending", fail_before_resolve)
+        await monitor.flush_recovery()
+        assert sink.is_active
+        assert sink.opened[-1].reason == "scan_stop_failed"
+
+    asyncio.run(scenario())
+
+
+def test_retry_deadline_applies_to_flush_and_new_scan_failures() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+
+        class FlakySink(FakeSink):
+            attempts = 0
+
+            async def open(self, context: ScanIncidentContext) -> None:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise OSError("unavailable")
+                await super().open(context)
+
+        sink = FlakySink()
+        monitor = ScanHealthMonitor(sink, FakeDiagnostics(), 10.0, clock=lambda: now[0])
+        await monitor.prepare(1)
+        await monitor.scan_start_failed(1, RuntimeError("first"))
+        assert sink.attempts == 1 and monitor.next_deadline == 1.0
+        await monitor.flush_recovery()
+        await monitor.prepare(2)
+        await monitor.scan_start_failed(2, RuntimeError("second"))
+        await monitor.scan_stop_failed(2, RuntimeError("stop"))
+        await monitor.flush_recovery()
+        assert sink.attempts == 1
+        now[0] = 1.0
+        assert await monitor.check_deadline()
+        assert sink.attempts == 2 and sink.is_active
+        now[0] = 2.0
+        assert monitor.radio_activity(2, 2.0)
+        await monitor.flush_recovery()
+        assert not sink.is_active
 
     asyncio.run(scenario())
 

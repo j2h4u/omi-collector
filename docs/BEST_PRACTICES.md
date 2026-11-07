@@ -322,8 +322,10 @@ The configuration is strict and contains the flat `pendant_address` setting,
 plus optional `presence` settings and `bundle_min_audio_seconds` (3600 seconds
 by default). Only a confirmed complete
 pendant drain permits packaging, and only when the cumulative captured Opus
-audio reaches that minimum. All accumulated eligible drafts then form one
-bundle; crossing the minimum during downloading never splits the visit.
+audio reaches that minimum. A qualifying cohort may produce multiple artifacts
+where physical continuity requires a split, so an individual artifact can be
+shorter than the minimum.
+Crossing the minimum during downloading never splits the visit.
 Smaller downloads accumulate across visits and restarts indefinitely. Calendar
 gaps do not count toward audio duration; no age-based or manual flush exists.
 Interrupted closures preserve data but do not authorize packaging.
@@ -378,8 +380,12 @@ recovery; never strip dates or restore an older state database.
 A mismatched canonical record or checkpoint stays in blocked, unclassified
 quarantine custody without an expiry deadline. Ordinary salvage and terminal
 classification must leave it untouched until an explicit custody resolution;
-only terminal residual evidence may expire. Canonical records remain pinned by
-their independent publication references. READY materialization that observes
+terminal residual evidence may expire. The current runtime automatically
+classifies only empty quarantine as unprocessable. The lower-level terminal
+classification API also permits nonempty unprocessable sources; after expiry,
+unreferenced canonical records can be deleted. A reason string alone does not
+establish that deleting nonempty data is justified. Publication references and
+custody holds continue to pin records. READY materialization that observes
 `EIO` must durably latch its stage, preserve source rows, and refuse later
 publication retries. If that refusal cannot be recorded, the collector exits
 with status 78 so systemd does not restart it into another capture attempt.

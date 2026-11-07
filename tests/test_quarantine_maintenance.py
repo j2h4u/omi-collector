@@ -632,6 +632,28 @@ def test_hourly_cleanup_yields_after_one_raw_page_on_capture_intent(
     assert maintenance._cleanup_state.phase is _CleanupPhase.WAITING
 
 
+def test_admitted_vacuum_ignores_window_expiry_but_yields_to_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omi_collector.capture.application.quarantine_maintenance as module
+
+    store = _store(tmp_path)
+    maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+    now = [1.0]
+    capture = threading.Event()
+    monkeypatch.setattr(module, "monotonic", lambda: now[0])
+
+    def compact(*, should_defer: Callable[[], bool]) -> None:
+        now[0] = 601.0
+        assert not should_defer()
+        capture.set()
+        assert should_defer()
+
+    monkeypatch.setattr(store, "compact_after_cleanup", compact)
+    maintenance._cleanup_state = _CleanupState(_CleanupPhase.VACUUM, 0, 600)
+    _run(maintenance._run_cleanup_window(capture.is_set))
+
+
 @pytest.mark.parametrize("phase", tuple(_CleanupPhase))
 @pytest.mark.parametrize("event", tuple(_CleanupEvent))
 def test_hourly_cleanup_transition_covers_every_phase_event(phase: _CleanupPhase, event: _CleanupEvent) -> None:
@@ -642,13 +664,13 @@ def test_hourly_cleanup_transition_covers_every_phase_event(phase: _CleanupPhase
         return
     result = _cleanup_transition(state, event, 120.0)
     if event is _CleanupEvent.WAKE:
-        expected = _CleanupState(_CleanupPhase.PUBLICATION, 100.0, 720.0) if phase is _CleanupPhase.WAITING else state
+        expected = _CleanupState(_CleanupPhase.ACK, 100.0, 720.0) if phase is _CleanupPhase.WAITING else state
     elif event is _CleanupEvent.DEFER:
         expected = state if phase is _CleanupPhase.WAITING else _CleanupState(_CleanupPhase.WAITING, 3700.0)
     else:
         next_phase = {
-            _CleanupPhase.PUBLICATION: _CleanupPhase.ACK,
-            _CleanupPhase.ACK: _CleanupPhase.RAW,
+            _CleanupPhase.ACK: _CleanupPhase.PUBLICATION,
+            _CleanupPhase.PUBLICATION: _CleanupPhase.RAW,
             _CleanupPhase.RAW: _CleanupPhase.EXPIRY,
             _CleanupPhase.EXPIRY: _CleanupPhase.VACUUM,
         }.get(phase)
@@ -661,9 +683,7 @@ def test_hourly_cleanup_transition_covers_every_phase_event(phase: _CleanupPhase
 def test_hourly_cleanup_wakes_at_due_and_rejects_unknown_state_or_event() -> None:
     waiting = _CleanupState(_CleanupPhase.WAITING, 100.0)
     assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 99.999) == waiting
-    assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 100.0) == _CleanupState(
-        _CleanupPhase.PUBLICATION, 100.0, 700.0
-    )
+    assert _cleanup_transition(waiting, _CleanupEvent.WAKE, 100.0) == _CleanupState(_CleanupPhase.ACK, 100.0, 700.0)
     with pytest.raises(ValueError, match="unknown cleanup event"):
         _cleanup_transition(waiting, cast(_CleanupEvent, "invalid"), 100.0)
     with pytest.raises(ValueError, match="unknown cleanup phase"):
@@ -698,14 +718,12 @@ def test_unchanged_full_compaction_debt_parks_until_relevant_generation_changes(
     assert first is not None and first.reason == "compaction_parked"
     assert second is not None and second.reason == "compaction_parked"
     assert calls == [5]
-    required_release = max(store.state_db.path.stat().st_size, 1)
-    available_space[0] += required_release - 1
-    still_parked = store.compact_after_cleanup(should_defer=lambda: False)
-    assert still_parked is not None and still_parked.reason == "compaction_parked"
-    assert calls == [5]
     available_space[0] += 1
     released = store.compact_after_cleanup(should_defer=lambda: False)
     assert released is not None and released.reason == "compaction_parked"
+    assert calls == [5, 5]
+    unchanged = store.compact_after_cleanup(should_defer=lambda: False)
+    assert unchanged is not None and unchanged.reason == "compaction_parked"
     assert calls == [5, 5]
     generation[0] = 6
     changed = store.compact_after_cleanup(should_defer=lambda: False)
@@ -933,7 +951,7 @@ def test_integrity_hold_preserves_source_and_next_maintenance_pass_admits_other_
     ("failure_type", "reason"),
     [(OSError, "temporary admission failure"), (QuarantineSalvageDeferredError, "maintenance deferred")],
 )
-def test_run_once_stops_after_retryable_or_deferred_source_without_touching_the_next(
+def test_run_once_continues_only_after_source_local_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure_type: type[Exception],
@@ -960,11 +978,86 @@ def test_run_once_stops_after_retryable_or_deferred_source_without_touching_the_
         finally:
             await maintenance.close()
 
-        assert calls == [sources[0]]
+        assert calls == ([sources[0]] if failure_type is QuarantineSalvageDeferredError else list(sources))
         snapshots = [await asyncio.to_thread(_source_snapshot, store, source) for source in sources]
         terminal_states = [await asyncio.to_thread(_terminal_state, store, source) for source in sources]
-        assert all(snapshot == before[source] for source, snapshot in zip(sources, snapshots, strict=True))
-        assert all(state is None for state in terminal_states)
+        assert snapshots[0] == before[sources[0]]
+        assert terminal_states[0] is None
+        if failure_type is QuarantineSalvageDeferredError:
+            assert snapshots[1] == before[sources[1]]
+            assert terminal_states[1] is None
+        else:
+            assert terminal_states[1] == "published"
+            assert maintenance._quarantine_retry_not_before > 0
+
+    _run(scenario())
+
+
+def test_source_authentication_io_failure_does_not_starve_next_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omi_collector.capture.adapters import internal_audio_store
+
+    async def scenario() -> None:
+        store = await asyncio.to_thread(_store, tmp_path)
+        first, second = await asyncio.to_thread(_quarantine_sources, store, (1, 2))
+        before = await asyncio.to_thread(_source_snapshot, store, first)
+        scan = internal_audio_store._scan_authenticated_records
+        calls: list[str] = []
+
+        def fail_first(connection: sqlite3.Connection, source_id: str, limit: int) -> object:
+            calls.append(source_id)
+            if source_id == first:
+                raise OSError("source-specific read failure")
+            return scan(connection, source_id, limit)
+
+        monkeypatch.setattr(internal_audio_store, "_scan_authenticated_records", fail_first)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        try:
+            await maintenance.run_once(lambda: False)
+            assert calls[:2] == [first, second]
+            assert await asyncio.to_thread(_source_snapshot, store, first) == before
+            assert await asyncio.to_thread(_terminal_state, store, first) is None
+            assert await asyncio.to_thread(_terminal_state, store, second) == "published"
+            assert maintenance._quarantine_retry_number == 1
+            assert maintenance._quarantine_retry_not_before > 0
+        finally:
+            await maintenance.close()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CORRUPT])
+def test_source_authentication_shared_or_fatal_sqlite_failure_stops_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    from omi_collector.capture.adapters import internal_audio_store
+
+    async def scenario() -> None:
+        store = await asyncio.to_thread(_store, tmp_path)
+        sources = await asyncio.to_thread(_quarantine_sources, store, (1, 2))
+        before = await asyncio.to_thread(lambda: [_source_snapshot(store, source) for source in sources])
+        calls: list[str] = []
+
+        def fail_scan(_connection: sqlite3.Connection, source_id: str, _limit: int) -> object:
+            calls.append(source_id)
+            error = sqlite3.OperationalError("injected database failure")
+            error.sqlite_errorcode = code
+            raise error
+
+        monkeypatch.setattr(internal_audio_store, "_scan_authenticated_records", fail_scan)
+        maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
+        try:
+            if code == sqlite3.SQLITE_CORRUPT:
+                with pytest.raises(FatalInternalAudioStorageError):
+                    await maintenance.run_once(lambda: False)
+            else:
+                await maintenance.run_once(lambda: False)
+            assert calls == [sources[0]]
+            assert await asyncio.to_thread(lambda: [_source_snapshot(store, source) for source in sources]) == before
+            assert maintenance._quarantine_retry_number == 0
+        finally:
+            await maintenance.close()
 
     _run(scenario())
 
@@ -1905,10 +1998,16 @@ def test_quarantine_retry_backoff_stays_at_last_delay_after_repeated_failures(
             if attempt:
                 now += backoff[min(attempt - 1, len(backoff) - 1)] + 0.01
             _run(maintenance.run_once(lambda: False))
+            assert calls == list(sources) * (attempt + 1)
+            assert maintenance._quarantine_retry_number == attempt + 1
+            assert maintenance._quarantine_retry_not_before == now + backoff[min(attempt, len(backoff) - 1)]
+            now += 0.11
+            _run(maintenance.run_once(lambda: False))
+            assert calls == list(sources) * (attempt + 1)
     finally:
         _run(maintenance.close())
 
-    assert calls == [sources[0]] * total_attempts
+    assert calls == list(sources) * total_attempts
     assert all(_terminal_state(store, source) is None for source in sources)
     assert not store.capture_root.exists() or tuple(store.capture_root.iterdir()) == ()
 

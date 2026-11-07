@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -14,6 +15,7 @@ from omi_collector.capture.adapters.collector_state_db import StateKind
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime, _StagingWriterAdapter
 from omi_collector.capture.adapters.ready_bundles import ReadyOutcome, ReadyOutcomeState
 from omi_collector.capture.adapters.ready_closures import ReadyClosure
+from omi_collector.capture.adapters.staging_contract import FatalInternalAudioStorageError
 from omi_collector.capture.adapters.staging_filesystem import DeviceLock
 from omi_collector.capture.adapters.staging_writer import StagingWriter
 from omi_collector.capture.application.quarantine_maintenance import (
@@ -21,6 +23,7 @@ from omi_collector.capture.application.quarantine_maintenance import (
     _CleanupPhase,
     _CleanupState,
 )
+from omi_collector.capture.domain.ready_machine import PublicationAction, Wake
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, RetryConfig
 from staging_test_factory import StagingStore, attempt_source, closure_payload
@@ -353,6 +356,87 @@ def test_cleanup_compaction_owns_lease_and_publication_does_not_compact(
         assert seen == []
     store.compact_after_cleanup(should_defer=lambda: False)
     assert len(seen) == 1
+    with store.device_lock():
+        pass
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        (sqlite3.SQLITE_BUSY, False, ReadyOutcomeState.TRANSIENT, "compaction_deferred"),
+        (sqlite3.SQLITE_FULL, False, ReadyOutcomeState.WAITING, "compaction_parked"),
+        (sqlite3.SQLITE_INTERRUPT, True, None, None),
+    ),
+)
+def test_compaction_probe_failure_preserves_cleanup_and_capture_priority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[int, bool, ReadyOutcomeState | None, str | None],
+) -> None:
+    code, interrupted, expected_state, expected_reason = case
+    store = _store(tmp_path)
+    failure = sqlite3.OperationalError("compaction debt unavailable")
+    failure.sqlite_errorcode = code
+
+    def fail_probe(_db: object) -> int | None:
+        raise failure
+
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.pending_compaction_generation", fail_probe)
+    if interrupted:
+        store.publication_capture_intent()
+    outcome = store.compact_after_cleanup(should_defer=lambda: False)
+    if expected_state is None:
+        assert outcome is None
+    else:
+        assert outcome is not None
+        assert (outcome.state, outcome.reason) == (expected_state, expected_reason)
+    assert store.publication_retry_schedule() is None
+    with store.device_lock():
+        pass
+
+
+def test_compaction_probe_propagates_fatal_storage_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    failure = FatalInternalAudioStorageError("corrupt debt")
+
+    def fail_probe(_db: object) -> int | None:
+        raise failure
+
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.pending_compaction_generation", fail_probe)
+    with pytest.raises(FatalInternalAudioStorageError) as raised:
+        store.compact_after_cleanup(should_defer=lambda: False)
+    assert raised.value is failure
+    with store.device_lock():
+        pass
+
+
+def test_compaction_waits_when_no_debt_or_capture_interrupts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    generation: list[int | None] = [None]
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "omi_collector.capture.adapters.staging_store.pending_compaction_generation", lambda _db: generation[0]
+    )
+
+    def vacuum(_db: object, debt: int, _interrupt: Event, _defer: Callable[[], bool]) -> str:
+        calls.append(debt)
+        return "done"
+
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.vacuum_pending", vacuum)
+    assert store.compact_after_cleanup(should_defer=lambda: False) is None
+    generation[0] = 1
+    store.publication_capture_intent()
+    assert store.compact_after_cleanup(should_defer=lambda: False) is None
+    assert calls == []
+
+
+def test_compaction_does_not_preempt_running_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    monkeypatch.setattr("omi_collector.capture.adapters.staging_store.pending_compaction_generation", lambda _db: 1)
+    command = store._publication_event(Wake(store._publication_revision(), 0.0))
+    assert command.action is PublicationAction.RUN
+    assert store.compact_after_cleanup(should_defer=lambda: False) is None
+    assert not store.publication_followup_due()
     with store.device_lock():
         pass
 

@@ -77,6 +77,8 @@ def _same_causal_component(
     membership: str,
     predecessor: FrozenTimePredecessor,
 ) -> bool:
+    if any(start <= sequence <= end for start, end in projection.state.causal_uncertainty):
+        return False
     previous_membership = predecessor.time.causal_membership
     if previous_membership == membership:
         return True

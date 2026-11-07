@@ -114,3 +114,39 @@ def test_v2_reserve_ignores_unrelated_audio_pages_and_checks_each_device(
     assert outcome.state is ReadyOutcomeState.PUBLISHED
     assert set(checked) == ({ready} if not split_filesystem else {ready, database.path.parent})
     store.close()
+
+
+def test_v2_shortage_retains_requirements_for_both_filesystems(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = StateDB(tmp_path / "state.sqlite3")
+    store = InternalAudioStore(database)
+    source = _sealed_source(store)
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    real_stat = Path.stat
+    database_device = real_stat(database.path).st_dev
+
+    def fake_stat(path: Path, *, follow_symlinks: bool = True):
+        result = real_stat(path, follow_symlinks=follow_symlinks)
+        if path == database.path:
+            return type(result)([*tuple(result)[:2], database_device + 1, *tuple(result)[3:]])
+        return result
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    checked: list[tuple[Path, int]] = []
+
+    def shortage(path: Path, required: int) -> None:
+        checked.append((path, required))
+        raise ready_bundles.ReadySpaceError(path, required)
+
+    monkeypatch.setattr(ready_bundles, "_require_typed_filesystem_space", shortage)
+    with pytest.raises(ready_bundles.ReadySpaceError) as raised:
+        ready_bundles.finalize_public_audio_v2(
+            store,
+            (source,),
+            ready,
+            PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 101, True),
+        )
+    assert [path for path, _ in checked] == [ready, database.path.parent]
+    assert raised.value.requirements == tuple(checked)
+    store.close()

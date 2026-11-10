@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.12](https://github.com/j2h4u/omi-collector/compare/v1.1.11...v1.1.12) (2026-11-10)
+
+
+### Fixes
+
+* retain ownership of pending BLE scan startup ([#340](https://github.com/j2h4u/omi-collector/issues/340)) ([b2b308b](https://github.com/j2h4u/omi-collector/commit/b2b308bd47fdbec16bd1927a5ff8e2dc5639f3cb))
+
 ## [1.1.11](https://github.com/j2h4u/omi-collector/compare/v1.1.10...v1.1.11) (2026-11-07)
 
 

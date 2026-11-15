@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.14](https://github.com/j2h4u/omi-collector/compare/v1.1.13...v1.1.14) (2026-11-15)
+
+
+### Fixes
+
+* keep pendant discovery continuous between GATT attempts ([e1cb03c](https://github.com/j2h4u/omi-collector/commit/e1cb03c97d72d29327a93d182dbdf682354a1283))
+* name the BlueZ error behind scanner start and stop failures ([e1cb03c](https://github.com/j2h4u/omi-collector/commit/e1cb03c97d72d29327a93d182dbdf682354a1283))
+* report scan silence after 15 seconds instead of 180 ([e1cb03c](https://github.com/j2h4u/omi-collector/commit/e1cb03c97d72d29327a93d182dbdf682354a1283))
+
+
+### Refactoring
+
+* move exception chain summaries into a leaf module ([e1cb03c](https://github.com/j2h4u/omi-collector/commit/e1cb03c97d72d29327a93d182dbdf682354a1283))
+
 ## [1.1.13](https://github.com/j2h4u/omi-collector/compare/v1.1.12...v1.1.13) (2026-11-15)
 
 

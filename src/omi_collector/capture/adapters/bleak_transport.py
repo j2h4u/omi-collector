@@ -82,6 +82,7 @@ class BleakPresenceObserver:
         self._adapter = adapter
         self._scanner_factory = scanner_factory or BleakScanner
         self._scanner: PresenceScannerLike | None = None
+        self._start_task: asyncio.Task[object] | None = None
         self._stop_task: asyncio.Task[object] | None = None
 
     async def start(self, callback: PresenceCallback) -> None:
@@ -102,8 +103,9 @@ class BleakPresenceObserver:
             bluez={"adapter": self._adapter, "filters": {"DuplicateData": True}},
         )
         self._scanner = scanner
+        self._start_task = asyncio.create_task(scanner.start())
         try:
-            await scanner.start()
+            await asyncio.shield(self._start_task)
         except BaseException:
             with suppress(BaseException):
                 await self.stop()
@@ -115,13 +117,20 @@ class BleakPresenceObserver:
         if scanner is not None:
             task = self._stop_task
             if task is None:
-                task = asyncio.create_task(scanner.stop())
+                task = asyncio.create_task(self._finish_scan(scanner))
                 task.add_done_callback(_consume_task_exception)
                 self._stop_task = task
             await asyncio.shield(task)
             if self._stop_task is task:
                 self._scanner = None
+                self._start_task = None
                 self._stop_task = None
+
+    async def _finish_scan(self, scanner: PresenceScannerLike) -> None:
+        if self._start_task is not None:
+            with suppress(Exception):
+                await asyncio.shield(self._start_task)
+        await scanner.stop()
 
 
 def _normalize_address(address: str) -> str:

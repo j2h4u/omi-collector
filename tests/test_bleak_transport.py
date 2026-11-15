@@ -12,6 +12,7 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakCharacteristicNotFoundError, BleakDeviceNotFoundError, BleakError
 from dbus_fast import Message, MessageType, Variant
+from dbus_fast.aio import MessageBus
 
 import omi_collector.capture.adapters.bleak_transport as bleak_transport
 from omi_collector.capture.adapters.bleak_transport import (
@@ -1807,3 +1808,128 @@ async def test_cancelled_disconnect_timeout_keeps_late_callback_local() -> None:
 
     assert debug_events.count("ble_gatt_local_disconnect_intent") == 1
     assert "ble_gatt_unexpected_disconnect" not in debug_events
+
+
+def test_cancelled_presence_start_waits_for_bluez_stop_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bleak.backends.bluezdbus import manager as bluez_manager
+    from bleak.backends.bluezdbus import scanner as bluez_scanner
+
+    async def scenario() -> None:
+        manager = bluez_manager.BlueZManager()
+        path = "/org/bluez/hci0"
+        manager._properties[path] = {}
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        class Bus:
+            owned = False
+
+            async def call(self, message: Message) -> Message:
+                calls.append(message.member or "")
+                if message.member == "StartDiscovery":
+                    self.owned = True
+                    entered.set()
+                    await release.wait()
+                elif message.member == "StopDiscovery":
+                    self.owned = False
+                return Message(message_type=MessageType.METHOD_RETURN, reply_serial=1)
+
+        bus = Bus()
+        manager._bus = cast("MessageBus", bus)
+
+        async def get_manager() -> bluez_manager.BlueZManager:
+            return manager
+
+        monkeypatch.setattr(bluez_scanner, "get_global_bluez_manager", get_manager)
+        observer = bleak_transport.BleakPresenceObserver(
+            "aa:bb",
+            scanner_factory=lambda **_: bluez_scanner.BleakScannerBlueZDBus(
+                None, None, "active", bluez={"adapter": "hci0"}
+            ),
+        )
+        start = asyncio.create_task(observer.start(lambda _: None))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        start.cancel()
+        await asyncio.sleep(0)
+        assert bus.owned
+        assert not start.done()
+        with pytest.raises(RuntimeError, match="already active"):
+            await observer.start(lambda _: None)
+        start.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start
+        release.set()
+        await observer.stop()
+        assert not bus.owned
+        assert calls.count("StopDiscovery") == 1
+        assert not manager._advertisement_callbacks[path]
+        await observer.stop()
+        assert calls.count("StopDiscovery") == 1
+
+    asyncio.run(scenario())
+
+
+def test_presence_scheduler_closes_while_bluez_start_reply_is_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bleak.backends.bluezdbus import manager as bluez_manager
+    from bleak.backends.bluezdbus import scanner as bluez_scanner
+
+    from omi_collector.capture.application.presence import (
+        PresencePolicy,
+        PresenceScanTransitionError,
+        PresenceScheduler,
+    )
+
+    async def scenario() -> None:
+        manager = bluez_manager.BlueZManager()
+        path = "/org/bluez/hci0"
+        manager._properties[path] = {}
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+        scanners: list[object] = []
+
+        class Bus:
+            async def call(self, message: Message) -> Message:
+                calls.append(message.member or "")
+                if message.member == "StartDiscovery":
+                    entered.set()
+                    await release.wait()
+                return Message(message_type=MessageType.METHOD_RETURN, reply_serial=1)
+
+        manager._bus = cast("MessageBus", Bus())
+
+        async def get_manager() -> bluez_manager.BlueZManager:
+            return manager
+
+        def factory(**_kwargs: object) -> bluez_scanner.BleakScannerBlueZDBus:
+            instance = bluez_scanner.BleakScannerBlueZDBus(None, None, "active", bluez={"adapter": "hci0"})
+            scanners.append(instance)
+            return instance
+
+        monkeypatch.setattr(bluez_scanner, "get_global_bluez_manager", get_manager)
+        observer = bleak_transport.BleakPresenceObserver("aa:bb", scanner_factory=factory)
+        policy = PresencePolicy(
+            scan_transition_seconds=0.01,
+            scan_cancel_grace_min_seconds=0.002,
+            scan_cancel_grace_max_seconds=0.002,
+            scan_cancel_grace_fraction=1.0,
+        )
+        scheduler = PresenceScheduler(observer, policy=policy)
+        waiter = asyncio.create_task(scheduler.wait_for_attempt())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            with pytest.raises(PresenceScanTransitionError, match="uncertain"):
+                await asyncio.wait_for(waiter, timeout=1)
+            with pytest.raises(RuntimeError, match="closed"):
+                await scheduler.wait_for_attempt()
+            assert len(scanners) == 1
+            assert "StopDiscovery" not in calls
+        finally:
+            release.set()
+            await observer.stop()
+            await scheduler.close()
+        assert calls.count("StopDiscovery") == 1
+        assert not manager._advertisement_callbacks[path]
+
+    asyncio.run(scenario())

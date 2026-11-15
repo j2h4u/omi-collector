@@ -74,9 +74,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "02b4730ec094cdbae558d4cbcc4e8a415f4dabac9d47a51d03eb7cd5dc55d2fd",
+      "identity": "ad3ee9d0896cc1e8878b016855d6733da948042c042d0fb8a693c0a5347af820",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:224-232 ~ src/omi_collector/config.py:94-102."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:220-228 ~ src/omi_collector/config.py:90-98."
     },
     {
       "detector": "jscpd",
@@ -458,9 +458,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "484579a42dd84311129c5f2f99603e7289b491d1c422c791127dea44cbff4ab5",
+      "identity": "b7caa403c7b4efc0a03e6692a034a326ad7754971bec2e25e47d60a67e7c5f1e",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:71-85 ~ src/omi_collector/config.py:72-86."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:73-83 ~ src/omi_collector/config.py:74-84."
     },
     {
       "detector": "jscpd",
@@ -740,9 +740,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "89bb3f11164330c210f86456f9930aa0e3cc1cc3fd75b77885d2e16f507e4cf9",
+      "identity": "d1924f5ac987c34114844c745169f42429a804d9b9ae604823cd2597351a11f2",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:90-99 ~ src/omi_collector/config.py:91-100."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:88-95 ~ src/omi_collector/config.py:89-96."
     },
     {
       "detector": "jscpd",
@@ -836,9 +836,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "99f9cdbdfc17028dee356e2341e4e21913386ea045d4ae67dac9e5a89d81bd12",
+      "identity": "2b9e46ab1e94d97ee7ab1fa8c687f564969a9077427b64724b393ccc41752a10",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:71-83 ~ src/omi_collector/operator_status.py:56-66."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:73-83 ~ src/omi_collector/operator_status.py:58-68."
     },
     {
       "detector": "jscpd",
@@ -1106,9 +1106,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "d0ef7ef67ba18af3d1ac1ac71ed505c1a4feed089673fd9cb95e9d261985bc49",
+      "identity": "02d08d2e6d6f29c11d8faa11f24d15ca361bd892f09e64fa025d838415b52019",
       "count": 1,
-      "reason": "Presence scheduling and BLE observer configurations enforce separate parameter invariants."
+      "reason": "Presence scheduling and BLE observer configurations enforce separate parameter invariants. Reviewed pair: src/omi_collector/config.py:203-215 ~ src/omi_collector/config.py:79-91."
     },
     {
       "detector": "jscpd",

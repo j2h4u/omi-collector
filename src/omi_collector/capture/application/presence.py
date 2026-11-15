@@ -19,6 +19,7 @@ from typing import Literal, Protocol, cast
 from ...config import DEFAULT_CONFIG
 from . import presence_machine as machine
 from .ble_scan_health import ScanHealthMonitor, ScanRadioActivity
+from .error_chain import error_chain_message
 from .storage_fault import FatalInternalAudioStorageError
 
 # Hard safety cap after the short transition timeout; this is not a BlueZ limit.
@@ -514,14 +515,14 @@ async def _stop_observer(observer: PresenceObserver, policy: PresencePolicy, *, 
             _LOGGER.warning(
                 "presence scanner stop recovery failed after %.3fs (%s)",
                 time.monotonic() - started,
-                type(recovery_error).__name__,
+                error_chain_message(recovery_error),
             )
             raise PresenceScanStopError("presence scanner stop remained pending after recovery") from recovery_error
         except Exception as recovery_error:
             _LOGGER.warning(
                 "presence scanner stop operation failed during recovery after %.3fs (%s)",
                 time.monotonic() - started,
-                type(recovery_error).__name__,
+                error_chain_message(recovery_error),
             )
             raise PresenceScanStopError("presence scanner stop failed during recovery") from recovery_error
         _LOGGER.info("presence scanner stop recovered after %.3fs", time.monotonic() - started)

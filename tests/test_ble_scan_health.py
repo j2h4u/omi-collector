@@ -189,7 +189,7 @@ def test_fatal_incident_persistence_is_not_retried_during_close(operation: str) 
 
 
 def test_presence_config_defaults_and_validates_scan_silence_threshold() -> None:
-    assert PresenceConfig().scan_silence_seconds == 180.0
+    assert PresenceConfig().scan_silence_seconds == 15.0
 
     for value in (0.0, -1.0):
         try:

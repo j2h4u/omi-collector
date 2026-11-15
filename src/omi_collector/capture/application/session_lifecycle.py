@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
@@ -20,6 +19,7 @@ from typing import Literal, Protocol, cast
 from ...config import DEFAULT_CONFIG, CollectorConfig, RetryConfig
 from ..domain.ring_protocol import RECORD_SIZE, STATUS_STORAGE_NOT_READY, RingInfo, RingStatus, encode_stop_command
 from . import collector
+from .error_chain import error_chain_message
 from .operational_telemetry import (
     OperationalEmitter,
     TelemetryClock,
@@ -137,9 +137,6 @@ class PresenceSchedulerPort(Protocol):
     def resume_interrupted_visit(self) -> None: ...
 
     async def close(self) -> None: ...
-
-
-_BLE_ADDRESS = re.compile(r"(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:_-]){5}[0-9a-f]{2}(?![0-9a-f])")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1256,33 +1253,8 @@ def sanitize_error_message(error: BaseException) -> str:
     if isinstance(error, NotificationOverflowError):
         return "notification queue overflow"
     if isinstance(error, (RingTransportDisconnectedError, RingTransportUnavailableError)):
-        return transport_error_chain_message(error)
+        return error_chain_message(error)
     return "session operation failed"
-
-
-def transport_error_chain_message(error: BaseException) -> str:
-    summaries: list[str] = []
-    seen_exceptions: set[int] = set()
-    seen_summaries: set[str] = set()
-    cause: BaseException | None = error
-    while cause is not None and len(summaries) < DEFAULT_CONFIG.observability.max_error_chain_entries:
-        if id(cause) in seen_exceptions:
-            break
-        seen_exceptions.add(id(cause))
-        summary = bounded_error_summary(cause)
-        if summary not in seen_summaries:
-            summaries.append(summary)
-            seen_summaries.add(summary)
-        cause = cause.__cause__
-    return " <- ".join(summaries)
-
-
-def bounded_error_summary(error: BaseException) -> str:
-    max_chars = DEFAULT_CONFIG.observability.max_error_entry_chars
-    type_name = type(error).__name__[: max_chars - 2]
-    message_limit = max_chars - len(type_name) - 2
-    message = _BLE_ADDRESS.sub("[BLE address]", str(error))
-    return f"{type_name}: {message[:message_limit]}"
 
 
 def remaining_budget(deadline: float) -> float:

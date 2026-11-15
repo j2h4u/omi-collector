@@ -178,15 +178,10 @@ observations with no gap of 10 seconds or more before GATT opens. To tune it,
 set both optional flat keys `presence_arrival_stability_seconds` and
 `presence_arrival_max_gap_seconds`; they are omitted from the example because
 the defaults are suitable for most installations.
-Idle searching uses 5-second scan windows and 10-second pauses only after that
-scanner generation receives any-device radio activity and no fresh target
-candidate is present. If the first window has no callback, the same scan remains
-continuous, allowing the existing 180-second scan-fault deadline to fire. A fresh
-matching candidate keeps scanning continuous through the existing 30-second
-stability and 10-second maximum-gap admission rule. Cadence timings live in the
-frozen `PresenceConfig` dataclass. The 10-second pause leaves transition margin
-within the roughly 20-second additional-discovery budget.
-The optional flat key `scan_silence_seconds` defaults to `180` positive
+Searching keeps one continuous discovery session and stops it only before a
+GATT attempt, because every BlueZ discovery stop risks a rejected stop that
+leaves `bluetoothd` reporting discovery with nothing scanning.
+The optional flat key `scan_silence_seconds` defaults to `15` positive
 seconds and sets the all-device receive-fault threshold; pendant absence does
 not count as a scan fault.
 The setup grants only the required service start, stop, and restart operations.
@@ -267,9 +262,8 @@ deployed. The version-3 document has exactly six fields:
 stable incident ID, open/resolved status, reason, detection time, and optional
 resolution time. It omits diagnostic details. The fixed host adapter is
 expected to observe ambient Bluetooth advertisements continuously: zero
-advertisements for 180 seconds while scanning is expected indicates a scan
-fault. Pendant absence is normal; GATT work and intentional scan pauses are
-excluded. The initial behavior records bounded evidence and does not restart
+advertisements for 15 seconds while scanning is expected indicates a scan
+fault. Pendant absence is normal; GATT work is excluded. The initial behavior records bounded evidence and does not restart
 the scanner automatically. A resolved incident remains visible as the latest
 summary until another incident replaces it.
 `storage` is `null` until an explicit pendant storage-not-ready acknowledgement.

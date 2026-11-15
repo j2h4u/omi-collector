@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Literal, Protocol
 
+from .error_chain import error_chain_message
 from .owned_work import join_owned
 from .storage_fault import FatalInternalAudioStorageError
 
@@ -161,7 +162,7 @@ class ScanHealthMonitor:
     async def scan_start_failed(self, generation: int, error: Exception) -> None:
         if generation != self._generation:
             return
-        _LOGGER.warning("BLE scan start failed (generation %d): %s: %s", generation, type(error).__name__, error)
+        _LOGGER.warning("BLE scan start failed (generation %d): %s", generation, error_chain_message(error))
         self._start_open(generation, "scan_start_failed", error)
         try:
             await self._attempt_persistence()
@@ -179,7 +180,7 @@ class ScanHealthMonitor:
     async def scan_stop_failed(self, generation: int, error: Exception) -> None:
         if generation != self._generation:
             return
-        _LOGGER.warning("BLE scan stop failed (generation %d): %s: %s", generation, type(error).__name__, error)
+        _LOGGER.warning("BLE scan stop failed (generation %d): %s", generation, error_chain_message(error))
         self._start_open(generation, "scan_stop_failed", error)
         try:
             await self._attempt_persistence()

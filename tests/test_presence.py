@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Generator
 from dataclasses import FrozenInstanceError
 
@@ -1858,3 +1859,37 @@ def test_two_old_generation_callbacks_cannot_release_a_waiting_attempt() -> None
             await scheduler.close()
 
     _run(scenario())
+
+
+def test_stop_recovery_failure_logs_the_underlying_bluez_error(caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        class SlowRejectedStop:
+            def __init__(self) -> None:
+                self.task: asyncio.Future[None] | None = None
+
+            async def start(self, callback: object) -> None:
+                del callback
+
+            async def stop(self) -> None:
+                if self.task is None:
+                    self.task = asyncio.ensure_future(self._reject_later())
+                await asyncio.shield(self.task)
+
+            async def _reject_later(self) -> None:
+                await asyncio.sleep(0.05)
+                raise RuntimeError("[org.bluez.Error.InProgress] Operation already in progress")
+
+        policy = _test_policy(
+            scan_transition_seconds=0.01,
+            scan_cancel_grace_min_seconds=0.002,
+            scan_cancel_grace_max_seconds=0.002,
+            scan_cancel_grace_fraction=1.0,
+        )
+        with pytest.raises(PresenceScanStopError, match="failed during recovery"):
+            await presence_module._stop_observer(SlowRejectedStop(), policy, recover=True)
+
+    with caplog.at_level(logging.WARNING):
+        _run(scenario())
+
+    assert "stop operation failed during recovery" in caplog.text
+    assert "org.bluez.Error.InProgress" in caplog.text

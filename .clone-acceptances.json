@@ -74,9 +74,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "02b4730ec094cdbae558d4cbcc4e8a415f4dabac9d47a51d03eb7cd5dc55d2fd",
+      "identity": "ad3ee9d0896cc1e8878b016855d6733da948042c042d0fb8a693c0a5347af820",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:224-232 ~ src/omi_collector/config.py:94-102."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:220-228 ~ src/omi_collector/config.py:90-98."
     },
     {
       "detector": "jscpd",
@@ -458,9 +458,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "484579a42dd84311129c5f2f99603e7289b491d1c422c791127dea44cbff4ab5",
+      "identity": "330e7f14333367a3132a96317e5dd8f4638e4a4c6462b4693b7491644f184859",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:71-85 ~ src/omi_collector/config.py:72-86."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:73-83 ~ src/omi_collector/config.py:74-84."
     },
     {
       "detector": "jscpd",
@@ -740,9 +740,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "89bb3f11164330c210f86456f9930aa0e3cc1cc3fd75b77885d2e16f507e4cf9",
+      "identity": "d1924f5ac987c34114844c745169f42429a804d9b9ae604823cd2597351a11f2",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:90-99 ~ src/omi_collector/config.py:91-100."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:88-95 ~ src/omi_collector/config.py:89-96."
     },
     {
       "detector": "jscpd",
@@ -830,15 +830,15 @@
     },
     {
       "detector": "jscpd",
-      "identity": "989a14e3aed6d23ffdb5ef9af441a0ea247ef6da5780547d4ffb049b005bded6",
+      "identity": "cec3279ecd2449e6b1b329451add1b5447aded5347f08741623737b5b7602c36",
       "count": 1,
-      "reason": "Scanner start failure and stop failure have different lifecycle events and start-time cleanup: failed start clears its start marker in finally; stopping already freezes active duration before failed stop is reported. Incident construction, persistence/retry and diagnostic closure are shared primitives; keep the explicit lifecycle handlers. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:159-169 ~ src/omi_collector/capture/application/ble_scan_health.py:177-187."
+      "reason": "Scanner start failure and stop failure have different lifecycle events and start-time cleanup: failed start clears its start marker in finally; stopping already freezes active duration before failed stop is reported. Incident construction, persistence/retry and diagnostic closure are shared primitives; keep the explicit lifecycle handlers. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:160-170 ~ src/omi_collector/capture/application/ble_scan_health.py:178-188."
     },
     {
       "detector": "jscpd",
-      "identity": "99f9cdbdfc17028dee356e2341e4e21913386ea045d4ae67dac9e5a89d81bd12",
+      "identity": "881b89fcf9ed196aa9663b4224ac1f9174722cd664165d385d02199d0181f615",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:71-83 ~ src/omi_collector/operator_status.py:56-66."
+      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:73-83 ~ src/omi_collector/operator_status.py:58-68."
     },
     {
       "detector": "jscpd",
@@ -1106,9 +1106,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "d0ef7ef67ba18af3d1ac1ac71ed505c1a4feed089673fd9cb95e9d261985bc49",
+      "identity": "02d08d2e6d6f29c11d8faa11f24d15ca361bd892f09e64fa025d838415b52019",
       "count": 1,
-      "reason": "Presence scheduling and BLE observer configurations enforce separate parameter invariants."
+      "reason": "Presence scheduling and BLE observer configurations enforce separate parameter invariants. Reviewed pair: src/omi_collector/config.py:203-215 ~ src/omi_collector/config.py:79-91."
     },
     {
       "detector": "jscpd",
@@ -1430,9 +1430,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "0fd52823cf6b16fea5d68b47fbe5cd3ca976ee669bcf1b1bd1f56f302022b040",
+      "identity": "689b36bed1abf988c7038e710f7bd9777b386a40f43332ee267e7ecc534d4001",
       "count": 1,
-      "reason": "Failed-start cleanup invalidates the start marker even when incident persistence is cancelled; failed-stop reporting preserves the already frozen scan-duration context from scan_stopping. Both compose the existing incident/persistence/diagnostic primitives, but their lifecycle postconditions differ. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:161-170 ~ src/omi_collector/capture/application/ble_scan_health.py:179-187."
+      "reason": "Failed-start cleanup invalidates the start marker even when incident persistence is cancelled; failed-stop reporting preserves the already frozen scan-duration context from scan_stopping. Both compose the existing incident/persistence/diagnostic primitives, but their lifecycle postconditions differ. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:162-171 ~ src/omi_collector/capture/application/ble_scan_health.py:180-188."
     },
     {
       "detector": "pyscn",

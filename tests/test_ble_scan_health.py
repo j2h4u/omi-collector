@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 
 import pytest
@@ -10,7 +11,7 @@ from omi_collector.capture.application.ble_scan_health import (
     ScanIncidentContext,
     ScanRadioActivity,
 )
-from omi_collector.capture.application.presence import PresencePolicy, PresenceScheduler
+from omi_collector.capture.application.presence import PresencePolicy, PresenceScanStopError, PresenceScheduler
 from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.config import PresenceConfig
 
@@ -189,7 +190,7 @@ def test_fatal_incident_persistence_is_not_retried_during_close(operation: str) 
 
 
 def test_presence_config_defaults_and_validates_scan_silence_threshold() -> None:
-    assert PresenceConfig().scan_silence_seconds == 180.0
+    assert PresenceConfig().scan_silence_seconds == 15.0
 
     for value in (0.0, -1.0):
         try:
@@ -959,3 +960,21 @@ def test_scan_radio_activity_is_frozen_and_does_not_expose_device_details() -> N
         pass
     else:
         raise AssertionError("scan radio activity marker was mutable")
+
+
+@pytest.mark.parametrize("operation", ["start", "stop"])
+def test_scan_failure_log_names_the_underlying_bluez_error(operation: str, caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        monitor = ScanHealthMonitor(FakeSink(), FakeDiagnostics(), 10.0, clock=lambda: 1.0)
+        await monitor.prepare(1)
+        cause = RuntimeError("[org.bluez.Error.InProgress] Operation already in progress")
+        error = PresenceScanStopError("presence scanner stop failed during recovery")
+        error.__cause__ = cause
+        report = monitor.scan_start_failed if operation == "start" else monitor.scan_stop_failed
+        await report(1, error)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+
+    assert f"BLE scan {operation} failed (generation 1)" in caplog.text
+    assert "org.bluez.Error.InProgress" in caplog.text

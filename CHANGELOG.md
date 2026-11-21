@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.15](https://github.com/j2h4u/omi-collector/compare/v1.1.14...v1.1.15) (2026-11-21)
+
+
+### Fixes
+
+* run one stopped-service integrity scan for current SQLite state ([5a16eee](https://github.com/j2h4u/omi-collector/commit/5a16eeeb5fd3f0a427f0ed9aa5f58c9b77ab3ce3))
+* use host wall time for pendant clock correction ([5a16eee](https://github.com/j2h4u/omi-collector/commit/5a16eeeb5fd3f0a427f0ed9aa5f58c9b77ab3ce3))
+
 ## [1.1.14](https://github.com/j2h4u/omi-collector/compare/v1.1.13...v1.1.14) (2026-11-15)
 
 

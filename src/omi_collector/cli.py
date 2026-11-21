@@ -497,9 +497,11 @@ def initialize_collector_state_command(
 def check_collector_state(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     stopped: Annotated[bool, typer.Option("--stopped", help="Require the installed service to be stopped.")] = False,
-    prepare_current: Annotated[bool, typer.Option("--prepare-current", help="Prepare current state while stopped.")] = False,
+    prepare_current: Annotated[
+        bool, typer.Option("--prepare-current", help="Prepare current state while stopped.")
+    ] = False,
 ) -> None:
-    """Read-only check that Collector state is safe for stopped-service initialization."""
+    """Check state read-only by default, or prepare current state while stopped."""
     from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
     from omi_collector.capture.application.storage_fault import (
         FatalInternalAudioStorageError,

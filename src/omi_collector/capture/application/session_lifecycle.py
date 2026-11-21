@@ -165,7 +165,6 @@ class OpportunisticOptions:
     activity: ActivityCallback | None = None
     operational: OperationalEmitter | None = None
     host_time: Callable[[], float] = time.time
-    host_clock_synchronized: Callable[[float], bool] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], object] = asyncio.sleep
     presence: PresenceSchedulerPort | None = None
@@ -838,9 +837,7 @@ class SessionLifecycle:
                     emitter,
                     clock=TelemetryClock(
                         now=options.host_time,
-                        synchronized=options.host_clock_synchronized,
                         operation_timeout=operation_timeout,
-                        host_clock_probe_timeout=options.config.telemetry.host_clock_probe_timeout_seconds,
                         info_reader=lambda: self._info(session),
                         status_reader=session.read_status if options.operational is not None else None,
                         state_store=options.clock_state_store,

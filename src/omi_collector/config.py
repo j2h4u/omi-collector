@@ -260,12 +260,10 @@ class TelemetryConfig:
 
     clock_drift_threshold_seconds: float = 5.0
     optional_operation_timeout_seconds: float = 0.5
-    host_clock_probe_timeout_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         _require_positive_float(self.clock_drift_threshold_seconds, "clock_drift_threshold_seconds")
         _require_positive_float(self.optional_operation_timeout_seconds, "optional_operation_timeout_seconds")
-        _require_positive_float(self.host_clock_probe_timeout_seconds, "host_clock_probe_timeout_seconds")
 
 
 @dataclass(frozen=True, slots=True)

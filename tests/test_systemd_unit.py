@@ -206,6 +206,7 @@ def _fake_deployer(
         f'  if [[ "$*" == *--stopped* && {int(stopped_refusal)} == 1 ]]; then printf \'{{"detail":"refused","reason":"state_validation_failed","status":"state_refused"}}\\n\'; exit 1; fi\n'
         f'  printf \'hot=%s args=%s\\n\' "$FAKE_HOT_JOURNAL" "$*" >> {shlex.quote(str(log))}\n'
         f'  if [[ {int(hot_journal)} == 1 && ! -f {shlex.quote(str(call_count))}.recovered ]]; then printf \'{{"reason":"canonical_hot_journal","status":"recovery_required"}}\\n\'; exit 1; fi\n'
+        '  if [[ "${FAKE_PREPARED:-0}" == 1 ]]; then printf \'{"schema_version":4,"status":"state_prepared"}\\n\'; exit 0; fi\n'
         '  printf \'{"schema_version":4,"status":"state_compatible"}\\n\' ;;\n'
         f"recover-state-journal) printf 'collector recover-state-journal\\n' >> {shlex.quote(str(log))}; [[ {int(recovery_fail)} == 1 ]] && exit 1; touch {shlex.quote(str(call_count))}.recovered; printf '{{\"status\":\"recovered\"}}\\n' ;;\n"
         'init-state) [[ "${FAKE_INIT_FAIL:-0}" == 1 ]] && exit 1; printf \'{"schema_version":4}\\n\' ;;\n'
@@ -356,11 +357,25 @@ def test_deployer_builds_and_selects_candidate_then_removes_previous_release(tmp
         "source_revision": revision
     }
     commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8")
-    assert commands.index("systemctl stop") < commands.index("--stopped") if "--stopped" in commands else True
+    checks = [line for line in commands.splitlines() if line.startswith("collector check-state")]
+    assert len(checks) == 1 and "--stopped" in checks[0]
+    assert commands.index("systemctl stop") < commands.index("collector check-state")
     assert "UV_LINK_MODE=hardlink" in deployer.read_text(encoding="utf-8")
     assert commands.index("systemctl restart --no-block") < commands.index(
         "systemctl show omi-collector.service --property=ActiveState --property=MainPID"
     )
+
+
+def test_deployer_skips_init_for_prepared_current_state(tmp_path: Path) -> None:
+    deployer, env = _fake_deployer(tmp_path)
+    env["FAKE_PREPARED"] = "1"
+
+    result = _run_fake_deployer(deployer, env)
+
+    assert result.returncode == 0, result.stderr
+    commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8")
+    assert "--stopped --prepare-current" in commands
+    assert "collector init-state" not in commands
 
 
 def test_deployer_restores_compatible_previous_release_on_stopped_state_refusal(tmp_path: Path) -> None:
@@ -422,7 +437,8 @@ def test_deployer_recovers_hot_journal_only_under_stopped_guard(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     commands = Path(env["TEST_LOG"]).read_text(encoding="utf-8")
     assert commands.index("systemctl stop") < commands.index("collector recover-state-journal")
-    assert commands.count("collector check-state") == 3
+    assert commands.count("collector check-state") == 2
+    assert all("--stopped" in line for line in commands.splitlines() if line.startswith("collector check-state"))
     assert commands.index("collector recover-state-journal") < commands.index("collector init-state")
 
 

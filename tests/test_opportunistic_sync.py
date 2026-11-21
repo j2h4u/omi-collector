@@ -3388,7 +3388,6 @@ async def test_ble_optional_reads_keep_operation_bounds_without_preflight_storag
                 TransferTimeouts(info=30.0, transfer=600.0),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
                 operational=emit,
-                host_clock_synchronized=lambda _timeout: False,
                 config=config,
             ),
         )
@@ -3466,7 +3465,6 @@ async def test_status_read_can_outlast_preflight_budget_and_preserve_audio(
             replace(
                 _options(),
                 operational=observations.append,
-                host_clock_synchronized=lambda _timeout: False,
                 config=config,
             ),
         )
@@ -3544,7 +3542,6 @@ async def test_status_timeout_cancels_read_and_preserves_audio(tmp_path: Path) -
             replace(
                 _options(),
                 operational=lambda _event: None,
-                host_clock_synchronized=lambda _timeout: False,
                 config=config,
             ),
         ),
@@ -3565,72 +3562,6 @@ async def test_status_timeout_cancels_read_and_preserves_audio(tmp_path: Path) -
     assert result.next_sequence == 11
     assert isinstance(result.seal, DurableSqliteSeal)
     assert _sealed_records(store, result.seal) == _record(10)
-
-
-@_async_test
-async def test_blocking_host_trust_probe_cannot_delay_later_gatt(tmp_path: Path) -> None:
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-    config = CollectorConfig(retry=RetryConfig(presence_preflight_budget_seconds=1.0))
-
-    class BlockingTrustSession(ScriptedRingSession):
-        async def read_optional_characteristic(self, uuid: str) -> bytes | None:
-            if uuid == TIME_READ_UUID:
-                return pack("<I", 0)
-            return None
-
-    session = BlockingTrustSession(
-        _status(),
-        (
-            WriteStep(b"\x10", (_info(10, 11),)),
-            WriteStep(encode_read_command(10, 1), (_begin(10, 1), _data(_record(10)), _done(11))),
-            WriteStep(b"\x10", (_info(10, 11),)),
-            WriteStep(encode_advance_command(11), (b"\x01\x00",)),
-            WriteStep(b"\x10", (_info(11, 11),)),
-        ),
-    )
-
-    def blocking_trust_probe(timeout: float) -> bool:
-        started.set()
-        if not release.wait(timeout):
-            finished.set()
-            raise TimeoutError
-        finished.set()
-        return False
-
-    collection = asyncio.create_task(
-        run_opportunistic_collector(
-            Provider([session]),
-            _staging_store(tmp_path, _capture_root(tmp_path)),
-            OpportunisticOptions(
-                TransferTimeouts(info=30.0, transfer=600.0),
-                policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
-                operational=lambda _event: None,
-                host_clock_synchronized=blocking_trust_probe,
-                config=config,
-            ),
-        )
-    )
-    try:
-        assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=5.0)
-        # The callback honors its own supplied timeout and the joined worker
-        # finishes before collection proceeds.
-        result = await asyncio.wait_for(collection, timeout=5.0)
-        assert not release.is_set()
-        assert finished.is_set()
-    finally:
-        release.set()
-        assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=5.0)
-
-    assert isinstance(result, CollectionResult)
-    assert session.writes == [
-        b"\x10",
-        encode_read_command(10, 1),
-        b"\x10",
-        encode_advance_command(11),
-        b"\x10",
-    ]
 
 
 class _PublicationClockSession(ScriptedRingSession):
@@ -3727,7 +3658,6 @@ async def test_clock_telemetry_defers_publication_and_retry_until_after_capture_
             _options(batch_records=1),
             operational=lambda _event: None,
             host_time=lambda: 10_000.0,
-            host_clock_synchronized=lambda _timeout: True,
             activity=activity,
             config=config,
         ),
@@ -5215,7 +5145,7 @@ async def test_corrupt_clock_state_read_stops_preflight_before_audio_read(
         await run_opportunistic_collector(
             Provider([session]),
             store,
-            replace(_options(), host_time=lambda: 1000.0, host_clock_synchronized=lambda _timeout: True),
+            replace(_options(), host_time=lambda: 1000.0),
         )
     assert raised.value is fatal
     assert session.writes == [b"\x10"]

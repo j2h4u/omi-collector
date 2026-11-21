@@ -32,7 +32,7 @@ deliberately omits sequence ranges, record identities, and loss seconds: ring
 record size and Opus packing cannot establish audio duration. Both event types
 carry release and firmware context when known.
 
-`clock_correction` appears only after the collector wrote an NTP-trusted time
+`clock_correction` appears only after the collector wrote an host wall-clock time
 and read the same value back from the pendant. `boundary_sequence_min` is the
 next sequence observed before the RTC write and `boundary_sequence_max` is the
 next sequence observed after verification. A raw timestamp reset caused by the

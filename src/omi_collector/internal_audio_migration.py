@@ -99,6 +99,19 @@ def inspect_collector_state(layout: StorageLayout) -> dict[str, object]:
         return {"detail": str(error), "reason": "state_validation_failed", "status": "state_refused"}
 
 
+def prepare_current_collector_state(layout: StorageLayout) -> dict[str, object]:
+    """Inspect state and complete the current schema's durable handoff under the caller's guard."""
+    path = layout.collector.state_db
+    before = _identity(path) if path.exists() else None
+    result = inspect_collector_state(layout)
+    if result == {"schema_version": 4, "status": "state_compatible"}:
+        if _identity(path) != before:
+            raise InternalAudioMigrationError("canonical SQLite identity changed during state inspection")
+        _handoff_canonical(path)
+        return {"schema_version": 4, "status": "state_prepared"}
+    return result
+
+
 def recover_canonical_journal(layout: StorageLayout) -> dict[str, object]:
     """Let SQLite recover its verified hot rollback journal under the stable guard."""
 

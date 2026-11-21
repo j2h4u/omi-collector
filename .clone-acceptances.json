@@ -182,9 +182,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "177bd77e1347398e47e20a2798c603020911244566b99ecacddd3700316f93f9",
+      "identity": "50657f1243c0e080d4afe62890a652c88e0a7a32053275188247ba5becca8ceb",
       "count": 1,
-      "reason": "Debug and quality-log settings have independent defaults and validation contracts; debug also requires a logger name."
+      "reason": "Debug and quality-log settings have independent defaults and consumers; debug also requires a logger name. Reviewed config.py DebugLogConfig and QualityMetricsConfig validation and tests."
     },
     {
       "detector": "jscpd",
@@ -614,9 +614,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "735179f16bf8a167adf5c06498b0aff0696eacd6ca4d26c85df17c01a9dbd623",
+      "identity": "3abf22a403300c6629ab6f450e7bf00efead350596f04b494872bfb62b365ef3",
       "count": 1,
-      "reason": "Configuration models validate different domains, ranges, tuple values, paths, capacities and telemetry policies; the metric/status records are separate schemas. Existing primitive validators already centralize repeated elementary checks, so retain explicit field-specific constraints. Reviewed pair: src/omi_collector/config.py:258-272 ~ src/omi_collector/config.py:348-362."
+      "reason": "Telemetry limits and PHY deadlines govern separate operations and consumers; each validates its own fields using shared primitive validators. Reviewed TelemetryConfig and PhyConfig validation and tests."
     },
     {
       "detector": "jscpd",

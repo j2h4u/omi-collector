@@ -497,6 +497,7 @@ def initialize_collector_state_command(
 def check_collector_state(
     config_path: Annotated[Path, typer.Option("--config", help="Collector TOML configuration.")] = DEFAULT_CONFIG_PATH,
     stopped: Annotated[bool, typer.Option("--stopped", help="Require the installed service to be stopped.")] = False,
+    prepare_current: Annotated[bool, typer.Option("--prepare-current", help="Prepare current state while stopped.")] = False,
 ) -> None:
     """Read-only check that Collector state is safe for stopped-service initialization."""
     from omi_collector.capture.adapters.collector_guard import CollectorGuardError, collector_guard
@@ -504,13 +505,19 @@ def check_collector_state(
         FatalInternalAudioStorageError,
         TransientInternalAudioStorageError,
     )
-    from omi_collector.internal_audio_migration import inspect_collector_state
+    from omi_collector.internal_audio_migration import (
+        InternalAudioMigrationError,
+        inspect_collector_state,
+        prepare_current_collector_state,
+    )
     from omi_collector.state_migration import StateMigrationError
 
     loaded = _load_config(config_path)
     exit_code = 1
     try:
         _require_host_singleton(loaded)
+        if prepare_current and not stopped:
+            raise StateMigrationError("state preparation requires --stopped")
         if stopped:
             with collector_guard(loaded.storage.collector.lock):
                 service_state = _systemd_service_status()
@@ -519,7 +526,11 @@ def check_collector_state(
                     "failed",
                 }:
                     raise StateMigrationError("confirm the Collector service is stopped before state inspection")
-                result = inspect_collector_state(loaded.storage)
+                result = (
+                    prepare_current_collector_state(loaded.storage)
+                    if prepare_current
+                    else inspect_collector_state(loaded.storage)
+                )
         else:
             result = inspect_collector_state(loaded.storage)
     except (FatalInternalAudioStorageError, TransientInternalAudioStorageError) as error:
@@ -531,10 +542,10 @@ def check_collector_state(
         }
         if isinstance(error, FatalInternalAudioStorageError):
             exit_code = 78
-    except (CollectorGuardError, StateMigrationError, OSError, ValueError) as error:
+    except (CollectorGuardError, InternalAudioMigrationError, StateMigrationError, OSError, ValueError) as error:
         result = {"detail": str(error), "reason": "inspection_failed", "status": "state_refused"}
     typer.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    if result["status"] != "state_compatible":
+    if result["status"] not in {"state_compatible", "state_prepared"}:
         raise typer.Exit(code=exit_code)
 
 

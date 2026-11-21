@@ -307,6 +307,15 @@ def test_check_state_classifies_v1_as_refused_without_mutating_it(tmp_path: Path
     assert state_file.read_bytes() == before
 
 
+def test_check_state_preparation_requires_stopped_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = _layout(tmp_path)
+    monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": True, "active_state": "active"})
+    for args in (["--prepare-current"], ["--stopped", "--prepare-current"]):
+        result = CliRunner().invoke(app, ["check-state", "--config", str(config_path), *args])
+        assert result.exit_code == 1
+        assert "stopped" in result.output
+
+
 def test_recover_state_journal_recovers_real_v4_journal_only_when_stopped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

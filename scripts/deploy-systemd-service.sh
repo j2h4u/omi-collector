@@ -46,12 +46,11 @@ function candidate_is_live {
 }
 
 function state_check {
-    local -r environment="$1" stopped="$2"
-    local -a args=()
+    local -r environment="$1"
     local output status
-    [[ "$stopped" == true ]] && args+=(--stopped)
-    if output=$("$environment/bin/omi-collector" check-state --config "$config_file" "${args[@]}"); then
+    if output=$("$environment/bin/omi-collector" check-state --config "$config_file" --stopped --prepare-current); then
         case "$output" in
+            '{"schema_version":4,"status":"state_prepared"}') printf 'prepared\n'; return ;;
             '{"schema_version":null,"status":"state_compatible"}'|\
             '{"schema_version":0,"status":"state_compatible"}'|\
             '{"schema_version":2,"status":"state_compatible"}'|\
@@ -64,11 +63,6 @@ function state_check {
     fi
     if (( status == 1 )) && [[ "$output" == '{"reason":"canonical_hot_journal","status":"recovery_required"}' ]]; then
         printf 'recovery_required\n'
-        return
-    fi
-    if [[ "$stopped" == false && $status == 1 \
-        && "$output" == '{"detail":"canonical audio database is busy","fault":"transient","reason":"inspection_failed","status":"state_refused"}' ]]; then
-        printf 'online_busy\n'
         return
     fi
     [[ -z "$output" ]] || printf 'Collector state check response (exit %s): %s\n' "$status" "$output" >&2
@@ -242,10 +236,6 @@ candidate_config=$("$release_path/bin/omi-collector" config check --config "$con
     || die 'candidate rejected production configuration'
 [[ "$candidate_config" == "$(printf '{\"config\":\"%s\",\"status\":\"config_valid\"}' "$config_file")" ]] \
     || die 'candidate returned an unexpected configuration validation record'
-state_preflight=$(state_check "$release_path" false) || die 'candidate refused Collector state'
-if [[ "$state_preflight" == online_busy ]]; then
-    : # A live capture may hold SQLite; repeat under the stopped-service guard.
-fi
 initial_state=$(systemctl show omi-collector.service --property=ActiveState) || die 'could not inspect service state'
 case "$initial_state" in
     ActiveState=active) service_was_active=1 ;;
@@ -255,15 +245,18 @@ esac
 service_stopped=1
 sudo -n /usr/bin/systemctl stop omi-collector.service || die 'could not stop service before state migration'
 [[ ! -L "$state_file" ]] || die 'Collector database must not be a symlink'
-state_preflight=$(state_check "$release_path" true) || die 'stopped Collector state check failed'
+state_preflight=$(state_check "$release_path") || die 'stopped Collector state check failed'
 if [[ "$state_preflight" == recovery_required ]]; then
     "$release_path/bin/omi-collector" recover-state-journal --config "$config_file" \
         || die 'guarded SQLite journal recovery failed'
-    [[ $(state_check "$release_path" true) == compatible ]] || die 'Collector state remains incompatible after journal recovery'
+    state_preflight=$(state_check "$release_path") || die 'Collector state remains incompatible after journal recovery'
+    [[ "$state_preflight" != recovery_required ]] || die 'Collector state remains incompatible after journal recovery'
 fi
 publish_selector "releases/${release_name}"
 selector_published=1
-"${current_link}/bin/omi-collector" init-state --config "$config_file" || die 'state migration failed; service remains stopped'
+if [[ "$state_preflight" != prepared ]]; then
+    "${current_link}/bin/omi-collector" init-state --config "$config_file" || die 'state migration failed; service remains stopped'
+fi
 sudo -n /usr/bin/systemctl restart --no-block omi-collector.service || die 'could not start selected service'
 restart_requested=1
 readiness_started_at=$SECONDS

@@ -22,6 +22,7 @@ from omi_collector.internal_audio_migration import (
     InternalAudioMigrationError,
     initialize_collector_state,
     inspect_collector_state,
+    prepare_current_collector_state,
 )
 from omi_collector.storage_layout import StorageLayout, load_operator_config
 
@@ -367,6 +368,7 @@ def test_interrupted_empty_database_initializes_in_place(tmp_path: Path) -> None
         pass
     identity = path.stat().st_ino
     assert inspect_collector_state(layout) == {"schema_version": 0, "status": "state_compatible"}
+    assert prepare_current_collector_state(layout) == {"schema_version": 0, "status": "state_compatible"}
     assert initialize_collector_state(layout) == {"schema_version": 4}
     assert path.stat().st_ino == identity
 
@@ -394,7 +396,7 @@ def test_existing_database_integrity_is_checked_once(
     if version == 0:
         assert inspect_collector_state(layout)["status"] == "state_compatible"
     else:
-        assert initialize_collector_state(layout) == {"schema_version": 4}
+        assert prepare_current_collector_state(layout) == {"schema_version": 4, "status": "state_prepared"}
     assert statements.count("PRAGMA integrity_check") == 1
 
 
@@ -406,6 +408,8 @@ def test_corrupt_database_is_refused(tmp_path: Path) -> None:
         inspect_collector_state(layout)
     with pytest.raises(FatalInternalAudioStorageError):
         initialize_collector_state(layout)
+    with pytest.raises(FatalInternalAudioStorageError):
+        prepare_current_collector_state(layout)
 
 
 def test_unknown_existing_v0_database_is_refused_unchanged(tmp_path: Path) -> None:
@@ -542,6 +546,10 @@ def test_hot_journal_preflight_and_recovery_keep_v4_inode_and_rows(tmp_path: Pat
         connection.execute("PRAGMA integrity_check").fetchone()
     assert error.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
     assert inspect_collector_state(layout) == {
+        "reason": "canonical_hot_journal",
+        "status": "recovery_required",
+    }
+    assert prepare_current_collector_state(layout) == {
         "reason": "canonical_hot_journal",
         "status": "recovery_required",
     }

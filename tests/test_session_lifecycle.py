@@ -84,7 +84,7 @@ from omi_collector.capture.application.storage_fault import (
 )
 from omi_collector.capture.application.visit_machine import DrainConfirmed, RecoveryDisposition
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
-from omi_collector.config import DEFAULT_CONFIG, CollectorConfig, TelemetryConfig
+from omi_collector.config import DEFAULT_CONFIG
 
 
 def _run(coroutine: Coroutine[object, object, object]) -> object:
@@ -962,7 +962,7 @@ def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytes
     ) -> None:
         del clock
         emit({"event": "pendant_observation", "firmware": "3.0.21", "battery_percent": 68})
-        emit({"event": "pendant_clock_sync", "action": "none", "outcome": "host_unsynchronized"})
+        emit({"event": "pendant_clock_sync", "action": "none", "outcome": "evidence_persist_failed"})
 
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=_noop,
@@ -998,7 +998,7 @@ def test_successful_drain_refreshes_battery_before_disconnect(monkeypatch: pytes
     assert observations[1] == {
         "event": "pendant_clock_sync",
         "action": "none",
-        "outcome": "host_unsynchronized",
+        "outcome": "evidence_persist_failed",
     }
     assert observations[-1] == {
         "event": "pendant_observation",
@@ -1080,7 +1080,7 @@ def test_battery_refresh_failure_does_not_interrupt_successful_drain(monkeypatch
 def test_clock_state_store_and_mutation_lease_reach_telemetry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     info = RingInfo(10, 10, 100, 0, 512)
     activity: list[object] = []
-    observed: list[tuple[object, float, object, object]] = []
+    observed: list[tuple[object, object]] = []
     errors: list[BaseException] = []
     store = ClockStateStore(StateDB(tmp_path / "collector-state.sqlite3"))
 
@@ -1101,7 +1101,7 @@ def test_clock_state_store_and_mutation_lease_reach_telemetry(tmp_path: Path, mo
         return info
 
     async def telemetry(*_args: object, clock: TelemetryClock, **_kwargs: object) -> None:
-        observed.append((clock.mutation_lease, clock.host_clock_probe_timeout, clock.synchronized, clock.state_store))
+        observed.append((clock.mutation_lease, clock.state_store))
 
     async def observe_error(_activity: object, _phase: object, error: BaseException, _runtime: object) -> None:
         errors.append(error)
@@ -1120,7 +1120,6 @@ def test_clock_state_store_and_mutation_lease_reach_telemetry(tmp_path: Path, mo
         activity=activity.append,
         clock_state_store=store,
         clock_lease=lambda: _Lease(),
-        config=CollectorConfig(telemetry=TelemetryConfig(host_clock_probe_timeout_seconds=0.25)),
     )
     run = SessionLifecycleRun(
         provider=lambda _candidate: Context(),
@@ -1139,7 +1138,7 @@ def test_clock_state_store_and_mutation_lease_reach_telemetry(tmp_path: Path, mo
 
     _run(scenario())
     assert activity == [], errors
-    assert observed == [(options.clock_lease, 0.25, None, store)]
+    assert observed == [(options.clock_lease, store)]
 
 
 def test_connected_step_cancellation_identity_reaches_context_exit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1768,7 +1767,7 @@ async def _resumable_recovery() -> RecoveryDisposition:
     return "resumable"
 
 
-@pytest.mark.parametrize("clock_case", ("verified", "unsynchronized", "unavailable"))
+@pytest.mark.parametrize("clock_case", ("verified", "unavailable"))
 def test_run_session_records_only_verified_clock_corrections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock_case: str
 ) -> None:
@@ -1808,7 +1807,6 @@ def test_run_session_records_only_verified_clock_corrections(
         operational=lambda event: emitted.append(dict(event)),
         activity=activity.append,
         host_time=lambda: 1000.0,
-        host_clock_synchronized=lambda _timeout: clock_case == "verified",
         quality_metrics=metrics,  # type: ignore[arg-type]
         clock_state_store=clock_state_store,
     )
@@ -1829,7 +1827,7 @@ def test_run_session_records_only_verified_clock_corrections(
     else:
         assert metrics.corrections == []
         assert writes == []
-        assert correction_events[0]["outcome"] in {"host_unsynchronized", "device_time_malformed"}
+        assert correction_events[0]["outcome"] == "device_time_malformed"
 
 
 def test_fresh_empty_ring_cursor_reaches_visit_closure(monkeypatch: pytest.MonkeyPatch) -> None:

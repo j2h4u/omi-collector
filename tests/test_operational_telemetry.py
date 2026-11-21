@@ -2,18 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import multiprocessing
 import sqlite3
 import threading
-import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from hashlib import sha256
-from multiprocessing.connection import Connection
 from pathlib import Path
 from shutil import rmtree
 from struct import pack
-from types import SimpleNamespace
 
 import pytest
 
@@ -207,7 +203,6 @@ def _run(
     events: list[dict[str, object]],
     *,
     times: tuple[float, float] = (1000.0, 1000.0),
-    synchronized: bool = True,
     operation_timeout: float = 0.5,
 ) -> None:
     ticks = iter((*times, *(times[-1] for _ in range(5))))
@@ -219,7 +214,6 @@ def _run(
             _event_emitter(events),
             clock=TelemetryClock(
                 lambda: next(ticks),
-                lambda _timeout: synchronized,
                 operation_timeout,
                 state_store=FakeClockStateStore(),
             ),
@@ -249,7 +243,6 @@ def test_telemetry_without_emitter_still_persists_observation(tmp_path: Path) ->
             None,
             clock=TelemetryClock(
                 now=lambda: next(ticks),
-                synchronized=lambda _timeout: True,
                 state_store=store,
             ),
         )
@@ -262,14 +255,9 @@ def test_telemetry_without_emitter_still_persists_observation(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("timeout", [0, -0.1])
-@pytest.mark.parametrize("timeout_field", ["operation_timeout", "host_clock_probe_timeout"])
-def test_telemetry_rejects_nonpositive_timeouts_before_device_access(timeout: float, timeout_field: str) -> None:
+def test_telemetry_rejects_nonpositive_timeouts_before_device_access(timeout: float) -> None:
     session = FakeOperationalSession({TIME_READ_UUID: pack("<I", 1000)})
-    clock = (
-        TelemetryClock(operation_timeout=timeout)
-        if timeout_field == "operation_timeout"
-        else TelemetryClock(host_clock_probe_timeout=timeout)
-    )
+    clock = TelemetryClock(operation_timeout=timeout)
 
     with pytest.raises(ValueError, match="timeout must be positive"):
         asyncio.run(collect_operational_telemetry(session, _status(), _info(), _event_emitter([]), clock=clock))
@@ -297,7 +285,6 @@ def test_supplied_status_skips_configured_status_reader() -> None:
             _event_emitter(events),
             clock=TelemetryClock(
                 now=lambda: next(ticks),
-                synchronized=lambda _timeout: False,
                 status_reader=read_status,
             ),
         )
@@ -305,38 +292,6 @@ def test_supplied_status_skips_configured_status_reader() -> None:
 
     assert status_reads == 0
     assert _observation_event(events)["used_bytes"] == 123
-
-
-def test_synchronization_probe_error_skips_time_write_and_durable_evidence() -> None:
-    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
-    events: list[dict[str, object]] = []
-    store = FakeClockStateStore()
-    ticks = iter((1000.0,) * 8)
-
-    def fail_sync_check(_timeout: float) -> bool:
-        raise OSError("private host probe detail")
-
-    asyncio.run(
-        collect_operational_telemetry(
-            session,
-            _status(),
-            _info(),
-            _event_emitter(events),
-            clock=TelemetryClock(
-                now=lambda: next(ticks),
-                synchronized=fail_sync_check,
-                state_store=store,
-            ),
-        )
-    )
-
-    clock_event = _clock_event(events)
-    assert clock_event["outcome"] == "host_unsynchronized"
-    assert clock_event["host_ntp_synchronized"] is False
-    assert session.writes == []
-    assert store.current == ClockState()
-    assert store.calls == []
-    assert "private host probe detail" not in str(events)
 
 
 @pytest.mark.parametrize(
@@ -380,7 +335,6 @@ def test_unrepresentable_clock_target_skips_time_write(host_time: float, device_
             _event_emitter(events),
             clock=TelemetryClock(
                 now=lambda: host_time,
-                synchronized=lambda _timeout: True,
                 state_store=sink,
             ),
         )
@@ -406,7 +360,6 @@ def test_representable_clock_target_is_written_as_u32(target: int) -> None:
             _event_emitter(events),
             clock=TelemetryClock(
                 now=lambda: float(target),
-                synchronized=lambda _timeout: True,
                 state_store=FakeClockStateStore(),
             ),
         )
@@ -414,6 +367,32 @@ def test_representable_clock_target_is_written_as_u32(target: int) -> None:
 
     assert session.writes == [(TIME_WRITE_UUID, pack("<I", target))]
     assert _clock_event(events)["outcome"] == "verified"
+
+
+def test_large_drift_uses_host_clock_and_persists_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    def forbidden_probe(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("system clock probe must not run")
+
+    monkeypatch.setattr(subprocess, "run", forbidden_probe)
+    host_time = 400_000
+    session = FakeOperationalSession({TIME_READ_UUID: pack("<I", 1000)}, readback=pack("<I", host_time))
+    events: list[dict[str, object]] = []
+    store = FakeClockStateStore()
+    asyncio.run(
+        collect_operational_telemetry(
+            session,
+            _status(),
+            _info(),
+            _event_emitter(events),
+            clock=TelemetryClock(now=lambda: float(host_time), state_store=store),
+        )
+    )
+
+    assert session.writes == [(TIME_WRITE_UUID, pack("<I", host_time))]
+    assert _clock_event(events)["outcome"] == "verified"
+    assert store.calls.index("observe") < store.calls.index("prepare")
 
 
 def test_write_started_at_target_plus_two_is_allowed() -> None:
@@ -432,7 +411,6 @@ def test_write_started_at_target_plus_two_is_allowed() -> None:
             _event_emitter(events),
             clock=TelemetryClock(
                 now=lambda: next(ticks),
-                synchronized=lambda _timeout: True,
                 state_store=FakeClockStateStore(),
             ),
         )
@@ -459,7 +437,6 @@ def test_readback_allowance_includes_one_second_margin(readback: int, read_finis
             _event_emitter(events),
             clock=TelemetryClock(
                 now=lambda: next(ticks),
-                synchronized=lambda _timeout: True,
                 state_store=FakeClockStateStore(),
             ),
         )
@@ -473,28 +450,8 @@ def test_telemetry_defaults_project_from_runtime_config() -> None:
 
     assert configured.clock_drift_threshold_seconds == operational_telemetry.CLOCK_DRIFT_THRESHOLD_SECONDS
     assert configured.optional_operation_timeout_seconds == operational_telemetry.OPTIONAL_OPERATION_TIMEOUT_SECONDS
-    assert configured.host_clock_probe_timeout_seconds == operational_telemetry.HOST_CLOCK_PROBE_TIMEOUT_SECONDS
     assert operational_telemetry.METADATA_VALUE_MAX_CHARS == 128
     assert configured.optional_operation_timeout_seconds == TelemetryClock().operation_timeout
-    assert configured.host_clock_probe_timeout_seconds == TelemetryClock().host_clock_probe_timeout
-
-
-def test_system_clock_check_uses_supported_timedatectl_show_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
-
-    def fake_run(command: tuple[str, ...], **kwargs: object) -> SimpleNamespace:
-        calls.append((command, kwargs))
-        return SimpleNamespace(returncode=0, stdout="yes\n")
-
-    monkeypatch.setattr(operational_telemetry.subprocess, "run", fake_run)
-
-    assert operational_telemetry.system_host_clock_synchronized() is True
-    assert calls == [
-        (
-            ("timedatectl", "show", "--property=NTPSynchronized", "--value"),
-            {"capture_output": True, "check": False, "text": True, "timeout": 1.0},
-        )
-    ]
 
 
 @pytest.mark.parametrize(("payload", "expected"), [(b"\x00", 0), (b"\x64", 100)])
@@ -587,31 +544,6 @@ def test_battery_observation_accepts_small_positive_timeout() -> None:
     assert events[0]["optional_outcomes"] == {"battery": "ok"}
 
 
-@pytest.mark.parametrize(
-    ("result", "expected"),
-    [
-        (SimpleNamespace(returncode=1, stdout="yes\n"), False),
-        (SimpleNamespace(returncode=0, stdout="no\n"), False),
-        (SimpleNamespace(returncode=0, stdout="  YeS \n"), True),
-    ],
-)
-def test_system_clock_trust_requires_success_and_normalizes_stdout(
-    monkeypatch: pytest.MonkeyPatch, result: SimpleNamespace, expected: bool
-) -> None:
-    monkeypatch.setattr(operational_telemetry.subprocess, "run", lambda *_args, **_kwargs: result)
-
-    assert operational_telemetry.system_host_clock_synchronized() is expected
-
-
-def test_system_clock_trust_fails_closed_on_os_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fail_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
-        raise OSError("private process detail")
-
-    monkeypatch.setattr(operational_telemetry.subprocess, "run", fail_run)
-
-    assert operational_telemetry.system_host_clock_synchronized() is False
-
-
 def test_empty_firmware_is_malformed_and_nonempty_firmware_is_preserved() -> None:
     for firmware, expected_value, expected_outcome in ((b"", None, "malformed"), (b" 1.2 ", " 1.2 ", "ok")):
         events: list[dict[str, object]] = []
@@ -622,7 +554,7 @@ def test_empty_firmware_is_malformed_and_nonempty_firmware_is_preserved() -> Non
                 _status(),
                 _info(),
                 _event_emitter(events),
-                clock=TelemetryClock(now=lambda: 1000.0, synchronized=lambda _timeout: False),
+                clock=TelemetryClock(now=lambda: 1000.0),
             )
         )
         observation = _observation_event(events)
@@ -631,26 +563,6 @@ def test_empty_firmware_is_malformed_and_nonempty_firmware_is_preserved() -> Non
         assert outcomes["firmware"] == expected_outcome
         if expected_value is not None:
             assert observation["firmware"] == expected_value
-
-
-def test_timedatectl_timeout_is_reported_as_host_probe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def timeout_run(*_args: object, timeout: float, **_kwargs: object) -> SimpleNamespace:
-        raise operational_telemetry.subprocess.TimeoutExpired("timedatectl", timeout)
-
-    monkeypatch.setattr(operational_telemetry.subprocess, "run", timeout_run)
-    events: list[dict[str, object]] = []
-
-    asyncio.run(
-        collect_operational_telemetry(
-            FakeOperationalSession({TIME_READ_UUID: pack("<I", 1010)}),
-            _status(),
-            _info(),
-            _event_emitter(events),
-            clock=TelemetryClock(synchronized=operational_telemetry.system_host_clock_synchronized),
-        )
-    )
-
-    assert _clock_event(events)["outcome"] == "host_probe_timeout"
 
 
 def test_boundary_drift_does_not_write_and_observation_is_safe() -> None:
@@ -699,7 +611,6 @@ def test_repeated_healthy_no_audio_visit_does_not_add_clock_history(tmp_path: Pa
                 _event_emitter([]),
                 clock=TelemetryClock(
                     lambda: next(ticks),
-                    lambda _timeout: True,
                     0.5,
                     state_store=store,
                     session_id="empty-visit",
@@ -730,7 +641,7 @@ def test_draft_clock_mapping_survives_later_correction_across_visits(tmp_path: P
             _status(),
             RingInfo(0, 10, 100, 0, RECORD_SIZE),
             _event_emitter([]),
-            clock=TelemetryClock(lambda: next(first_ticks), lambda _timeout: True, 0.5, state_store=store),
+            clock=TelemetryClock(lambda: next(first_ticks), 0.5, state_store=store),
         )
     )
     assert store.segment_map().utc_for(5, 1005) is None
@@ -743,7 +654,7 @@ def test_draft_clock_mapping_survives_later_correction_across_visits(tmp_path: P
             _status(),
             RingInfo(10, 12, 100, 0, RECORD_SIZE),
             _event_emitter([]),
-            clock=TelemetryClock(lambda: next(later_ticks), lambda _timeout: True, 0.5, state_store=store),
+            clock=TelemetryClock(lambda: next(later_ticks), 0.5, state_store=store),
         )
     )
 
@@ -770,7 +681,6 @@ def test_draft_clock_mapping_survives_later_correction_across_visits(tmp_path: P
             _event_emitter(correction_events),
             clock=TelemetryClock(
                 lambda: next(correction_ticks),
-                lambda _timeout: True,
                 0.5,
                 info_reader=info_after_correction,
                 state_store=reopened,
@@ -784,27 +694,6 @@ def test_draft_clock_mapping_survives_later_correction_across_visits(tmp_path: P
     assert after_correction.segment_map().utc_for(15, 1003) is None
     assert _clock_event(correction_events)["outcome"] == "verified"
     assert correction_session.writes == [(TIME_WRITE_UUID, pack("<I", 1003))]
-
-
-def test_untrusted_host_does_not_write_clock_state_or_set_time() -> None:
-    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1005)})
-    events: list[dict[str, object]] = []
-    store = FakeClockStateStore()
-    ticks = iter((1000.0,) * 8)
-
-    asyncio.run(
-        collect_operational_telemetry(
-            session,
-            _status(),
-            _info(),
-            _event_emitter(events),
-            clock=TelemetryClock(lambda: next(ticks), lambda _timeout: False, 0.5, state_store=store),
-        )
-    )
-
-    assert store.calls == []
-    assert session.writes == []
-    assert _clock_event(events)["outcome"] == "host_unsynchronized"
 
 
 def test_verified_set_time_persists_intent_before_write_and_keeps_exact_boundary(tmp_path: Path) -> None:
@@ -841,7 +730,6 @@ def test_verified_set_time_persists_intent_before_write_and_keeps_exact_boundary
             _event_emitter(events),
             clock=TelemetryClock(
                 lambda: next(ticks),
-                lambda _timeout: True,
                 0.5,
                 info_reader=info_after,
                 state_store=store,
@@ -882,9 +770,7 @@ def test_verified_set_time_marks_only_unlocated_write_window_unknown(tmp_path: P
             _status(),
             RingInfo(0, 12, 100, 0, RECORD_SIZE),
             _event_emitter(events),
-            clock=TelemetryClock(
-                lambda: next(ticks), lambda _timeout: True, 0.5, info_reader=info_after, state_store=store
-            ),
+            clock=TelemetryClock(lambda: next(ticks), 0.5, info_reader=info_after, state_store=store),
         )
     )
 
@@ -919,9 +805,7 @@ def test_write_failure_retains_uncertain_intent_for_next_trusted_visit(tmp_path:
             _status(),
             RingInfo(0, 12, 100, 0, RECORD_SIZE),
             _event_emitter(failure_events),
-            clock=TelemetryClock(
-                lambda: next(failure_ticks), lambda _timeout: True, 0.5, info_reader=info_after_write, state_store=store
-            ),
+            clock=TelemetryClock(lambda: next(failure_ticks), 0.5, info_reader=info_after_write, state_store=store),
         )
     )
 
@@ -938,7 +822,7 @@ def test_write_failure_retains_uncertain_intent_for_next_trusted_visit(tmp_path:
             _status(),
             RingInfo(12, 16, 100, 0, RECORD_SIZE),
             _event_emitter(next_events),
-            clock=TelemetryClock(lambda: next(next_ticks), lambda _timeout: True, 0.5, state_store=_clock_store(path)),
+            clock=TelemetryClock(lambda: next(next_ticks), 0.5, state_store=_clock_store(path)),
         )
     )
 
@@ -961,7 +845,7 @@ def test_failed_intent_commit_prevents_ble_set_time() -> None:
             _status(),
             _info(),
             _event_emitter(events),
-            clock=TelemetryClock(lambda: next(ticks), lambda _timeout: True, 0.5, state_store=store),
+            clock=TelemetryClock(lambda: next(ticks), 0.5, state_store=store),
         )
     )
 
@@ -993,7 +877,7 @@ def test_corrupt_clock_evidence_stops_preflight_before_audio_or_time_write(faili
                 _status(),
                 _info(),
                 _event_emitter([]),
-                clock=TelemetryClock(lambda: next(ticks), lambda _timeout: True, 0.5, state_store=store),
+                clock=TelemetryClock(lambda: next(ticks), 0.5, state_store=store),
             )
         )
     assert raised.value is fatal
@@ -1043,7 +927,6 @@ def test_clock_fatal_survives_repeated_cancellation_during_owned_lease_exit(tmp_
                 _event_emitter([]),
                 clock=TelemetryClock(
                     now=lambda: 1000.0,
-                    synchronized=lambda _timeout: True,
                     state_store=CorruptClockStore(state_db),
                     mutation_lease=HeldLease,
                 ),
@@ -1115,16 +998,6 @@ def test_clock_target_becomes_stale_while_monotonic_preparation_waits() -> None:
     assert session.writes == []
 
 
-def test_rtc_valid_is_telemetry_only_and_unsynchronized_host_does_not_write() -> None:
-    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
-    events: list[dict[str, object]] = []
-    _run(session, events, synchronized=False)
-
-    assert session.writes == []
-    assert _observation_event(events)["rtc_valid"] is True
-    assert _clock_event(events)["outcome"] == "host_unsynchronized"
-
-
 def test_write_and_verification_failures_are_classified_without_retry() -> None:
     class WriteFail(FakeOperationalSession):
         async def write_optional_characteristic(self, uuid: str, value: bytes) -> None:
@@ -1167,7 +1040,6 @@ def test_verification_failure_keeps_write_window_unknown(tmp_path: Path) -> None
             _event_emitter(events),
             clock=TelemetryClock(
                 lambda: next(ticks),
-                lambda _timeout: True,
                 0.5,
                 info_reader=info_after,
                 state_store=store,
@@ -1207,7 +1079,6 @@ def test_missing_time_write_cancels_prepared_intent_without_post_write_read() ->
             _event_emitter(events),
             clock=TelemetryClock(
                 lambda: next(ticks),
-                lambda _timeout: True,
                 0.5,
                 info_reader=info_after,
                 state_store=store,
@@ -1285,114 +1156,7 @@ def test_hanging_optional_reads_are_short_bounded_and_observation_still_emits() 
     assert outcomes["device_time"] == "timeout"
 
 
-def test_hanging_host_clock_probe_uses_configured_host_timeout() -> None:
-    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
-    events: list[dict[str, object]] = []
-    observed_timeouts: list[float] = []
-
-    def timeout_aware_probe(timeout: float) -> bool:
-        observed_timeouts.append(timeout)
-        time.sleep(timeout)
-        raise TimeoutError
-
-    asyncio.run(
-        collect_operational_telemetry(
-            session,
-            _status(),
-            _info(),
-            _event_emitter(events),
-            clock=TelemetryClock(
-                synchronized=timeout_aware_probe,
-                operation_timeout=0.1,
-                host_clock_probe_timeout=0.02,
-            ),
-        )
-    )
-
-    assert observed_timeouts == [0.02]
-    assert _clock_event(events)["outcome"] == "host_probe_timeout"
-
-
-def test_cancelled_host_clock_probe_joins_its_worker() -> None:
-    async def run() -> None:
-        started = threading.Event()
-        release = threading.Event()
-        finished = threading.Event()
-
-        def bounded_probe(timeout: float) -> bool:
-            started.set()
-            if not release.wait(timeout):
-                raise TimeoutError
-            finished.set()
-            return True
-
-        task = asyncio.create_task(operational_telemetry._run_host_clock_probe(bounded_probe, 1.0))
-        assert await asyncio.to_thread(started.wait, 1.0)
-        task.cancel()
-        await asyncio.sleep(0.01)
-        assert not task.done()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert finished.is_set()
-
-    asyncio.run(run())
-
-
-def _blocked_trust_probe_child(result: Connection) -> None:
-    events: list[dict[str, object]] = []
-    session = FakeOperationalSession({BATTERY_UUID: bytes((80,)), TIME_READ_UUID: pack("<I", 1010)})
-    asyncio.run(
-        operational_telemetry.collect_operational_telemetry(
-            session,
-            _status(),
-            _info(),
-            _event_emitter(events),
-            clock=TelemetryClock(
-                now=lambda: 1000.0,
-                synchronized=lambda timeout: _raise_probe_timeout(timeout),
-                host_clock_probe_timeout=0.02,
-            ),
-        )
-    )
-    result.send(_clock_event(events)["outcome"])
-    result.close()
-
-
-def test_timed_out_trust_probe_does_not_keep_child_process_alive() -> None:
-    if "fork" not in multiprocessing.get_all_start_methods():
-        pytest.skip("trust probe process-exit check requires fork")
-    context = multiprocessing.get_context("fork")
-    receive_result, send_result = context.Pipe(duplex=False)
-    process = context.Process(target=_blocked_trust_probe_child, args=(send_result,))
-    started = False
-    try:
-        process.start()
-        started = True
-        send_result.close()
-        assert receive_result.poll(1.0), "child did not report the bounded public probe outcome"
-        assert receive_result.recv() == "host_probe_timeout"
-        process.join(timeout=2.0)
-        assert process.exitcode == 0, "timed-out trust probe kept its child process alive"
-    finally:
-        receive_result.close()
-        send_result.close()
-        if started and process.is_alive():
-            process.terminate()
-            process.join(timeout=1.0)
-        if started and process.is_alive():
-            process.kill()
-            process.join(timeout=1.0)
-        if started:
-            process.close()
-
-
-def _raise_probe_timeout(timeout: float) -> bool:
-    time.sleep(timeout)
-    raise TimeoutError
-
-
-def test_slow_host_probe_finishes_clock_stage_before_metadata() -> None:
+def test_clock_stage_finishes_before_metadata() -> None:
     trace: list[str] = []
 
     class SlowMetadata(FakeOperationalSession):
@@ -1408,10 +1172,6 @@ def test_slow_host_probe_finishes_clock_stage_before_metadata() -> None:
     )
     events: list[dict[str, object]] = []
     store = FakeClockStateStore()
-
-    def delayed_host_probe(_timeout: float) -> bool:
-        time.sleep(0.05)
-        return True
 
     async def later_info() -> RingInfo:
         await asyncio.sleep(0.01)
@@ -1430,9 +1190,7 @@ def test_slow_host_probe_finishes_clock_stage_before_metadata() -> None:
             emit,
             clock=TelemetryClock(
                 now=lambda: 1000.0,
-                synchronized=delayed_host_probe,
                 operation_timeout=0.5,
-                host_clock_probe_timeout=1.0,
                 info_reader=later_info,
                 state_store=store,
             ),
@@ -1465,7 +1223,6 @@ def test_presence_telemetry_reuses_first_info_without_duplicate_info_read(tmp_pa
                 ),
                 policy=RetryPolicy(backoff=(0.001,), stop_after_drained=True),
                 operational=_event_emitter(events),
-                host_clock_synchronized=lambda _timeout: False,
             ),
             runtime=OpportunisticRuntime(),
         )

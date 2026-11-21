@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import asyncio
-import subprocess
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -41,7 +40,6 @@ MAX_U32 = 2**32 - 1
 U32_BYTES = 4
 BATTERY_MAX_PERCENT = 100
 OPTIONAL_OPERATION_TIMEOUT_SECONDS = _TELEMETRY_CONFIG.optional_operation_timeout_seconds
-HOST_CLOCK_PROBE_TIMEOUT_SECONDS = _TELEMETRY_CONFIG.host_clock_probe_timeout_seconds
 METADATA_VALUE_MAX_CHARS = 128
 
 type OperationalEvent = Mapping[str, object]
@@ -64,12 +62,10 @@ def system_host_boot_id() -> str:
 
 @dataclass(frozen=True, slots=True)
 class TelemetryClock:
-    """Injectable wall-clock and trust source used by drift correction."""
+    """Injectable wall-clock source used by drift correction."""
 
     now: Callable[[], float] = time.time
-    synchronized: Callable[[float], bool] | None = None
     operation_timeout: float = OPTIONAL_OPERATION_TIMEOUT_SECONDS
-    host_clock_probe_timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SECONDS
     info_reader: InfoReader | None = None
     status_reader: StatusReader | None = None
     state_store: ClockStatePort | None = None
@@ -91,23 +87,6 @@ class _TimeSample:
     outcome: str
 
 
-def system_host_clock_synchronized(timeout: float = HOST_CLOCK_PROBE_TIMEOUT_SECONDS) -> bool:
-    """Read systemd's NTP trust flag without invoking a shell."""
-    try:
-        result = subprocess.run(
-            ("timedatectl", "show", "--property=NTPSynchronized", "--value"),
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise _OptionalOperationTimeoutError from error
-    except (OSError, subprocess.SubprocessError):  # fmt: skip
-        return False
-    return result.returncode == 0 and result.stdout.strip().lower() == "yes"
-
-
 async def collect_operational_telemetry(
     session: object,
     status: RingStatus | None,
@@ -127,7 +106,6 @@ async def collect_operational_telemetry(
     _validate_telemetry_clock(telemetry_clock)
     if emit is None:
         emit = _discard_event
-    synchronized = telemetry_clock.synchronized or system_host_clock_synchronized
     reader, writer = _optional_accessors(session)
     # Clock evidence is its own bounded stage.  It must not depend on status,
     # metadata, or a potentially slow operational emitter.
@@ -143,10 +121,8 @@ async def collect_operational_telemetry(
         reader,
         writer,
         sample,
-        synchronized,
         clock_events.append,
         telemetry_clock.operation_timeout,
-        telemetry_clock.host_clock_probe_timeout,
         info,
         telemetry_clock.info_reader,
         telemetry_clock.state_store,
@@ -191,8 +167,6 @@ def _validate_telemetry_clock(clock: TelemetryClock) -> None:
         clock.stop_intent.check()
     if clock.operation_timeout <= 0:
         raise ValueError("optional operation timeout must be positive")
-    if clock.host_clock_probe_timeout <= 0:
-        raise ValueError("host clock probe timeout must be positive")
 
 
 async def collect_battery_observation(  # noqa: PLR0913 - inputs preserve the optional GATT seam
@@ -279,10 +253,8 @@ class _ClockSync:
     reader: OptionalReader | None
     writer: OptionalWriter | None
     sample: _TimeSample
-    host_clock_synchronized: Callable[[float], bool]
     emit: OperationalEmitter
     operation_timeout: float
-    host_clock_probe_timeout: float
     info_before: RingInfo
     info_reader: InfoReader | None
     state_store: ClockStatePort | None
@@ -351,9 +323,7 @@ async def _sync_clock_with_mutation_lease(sync: _ClockSync, mutation_lease: Cloc
 
 async def _sync_clock(sync: _ClockSync) -> None:
     sample = sync.sample
-    host_clock_synchronized = sync.host_clock_synchronized
     emit = sync.emit
-    host_clock_probe_timeout = sync.host_clock_probe_timeout
     _check_stop_intent(sync)
     if sample.epoch is None:
         emit(
@@ -373,25 +343,10 @@ async def _sync_clock(sync: _ClockSync) -> None:
         "threshold_seconds": CLOCK_DRIFT_THRESHOLD_SECONDS,
         "boundary_sequence_min": sync.info_before.write_sequence,
     }
-    try:
-        trusted = await _run_host_clock_probe(host_clock_synchronized, host_clock_probe_timeout)
-    except _OptionalOperationTimeoutError:
-        event.update(action="none", outcome="host_probe_timeout")
-        sync.emit(event)
-        return
-    except FatalInternalAudioStorageError:
-        raise
-    except Exception:  # noqa: BLE001 - trust is best effort
-        trusted = False
-    event["host_ntp_synchronized"] = trusted
-    if not trusted:
-        event.update(action="none", outcome="host_unsynchronized")
-        sync.emit(event)
-        return
-    await _sync_trusted_state_clock(sync, event, drift)
+    await _sync_state_clock(sync, event, drift)
 
 
-async def _sync_trusted_state_clock(sync: _ClockSync, event: dict[str, object], drift: float) -> None:
+async def _sync_state_clock(sync: _ClockSync, event: dict[str, object], drift: float) -> None:
     store = sync.state_store
     if store is None:
         event.update(action="none", outcome="evidence_persist_failed")
@@ -744,18 +699,6 @@ class _OptionalOperationTimeoutError(TimeoutError):
 async def _bounded_optional[T](awaitable: Awaitable[T], timeout: float) -> T:
     try:
         return await asyncio.wait_for(awaitable, timeout)
-    except TimeoutError as error:
-        raise _OptionalOperationTimeoutError from error
-
-
-async def _run_host_clock_probe(probe: Callable[[float], bool], timeout: float) -> bool:
-    """Run a timeout-aware trust probe and join its worker before returning."""
-    if timeout <= 0:
-        raise _OptionalOperationTimeoutError
-    try:
-        return bool(await joined_to_thread(probe, timeout))
-    except _OptionalOperationTimeoutError:
-        raise
     except TimeoutError as error:
         raise _OptionalOperationTimeoutError from error
 

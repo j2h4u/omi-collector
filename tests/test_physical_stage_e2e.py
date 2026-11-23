@@ -25,10 +25,12 @@ def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _seed(store: InternalAudioStore, db: StateDB) -> tuple[dict[str, object], bytes, bytes]:
+def _seed(
+    store: InternalAudioStore, db: StateDB, *, seam_packet: bytes = bytes((8, 42))
+) -> tuple[dict[str, object], bytes, bytes]:
     first, last, repeated = _record(1, marker=10), _record(2, marker=11), _record(3, marker=12)
-    packet = bytes((8, 42))
-    seam = bytes(4) + bytes((2,)) + packet + bytes((255,)) + bytes(524)
+    packet = seam_packet
+    seam = bytes(4) + bytes((len(packet),)) + packet + bytes((255,)) + bytes(526 - len(packet))
     anchor = repeated[:356]
     original = first + seam + last + anchor
     source_id, repeat_id = "a" * 32, "b" * 32
@@ -69,7 +71,7 @@ def _seed(store: InternalAudioStore, db: StateDB) -> tuple[dict[str, object], by
                 "byte_end": 976,
                 "sha256": _sha(seam),
                 "status": "unresolved",
-                "decoded_prefix_bytes": 7,
+                "decoded_prefix_bytes": 5 + len(packet),
                 "decoded_packet_count": 1,
                 "decoded_packets_sha256": packet_hash,
             }

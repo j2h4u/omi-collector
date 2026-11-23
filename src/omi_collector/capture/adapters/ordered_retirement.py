@@ -8,6 +8,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import cast
 
+from ..domain.ring_protocol import RECORD_SIZE
 from . import ready_bundles as ready
 from .collector_state_db import StateDB, StateKind
 from .internal_audio_store import InternalAudioStore
@@ -78,6 +79,8 @@ def _candidate(
     markers: dict[str, tuple[str, dict[str, object]]],
 ) -> _PhysicalRetirement | None:
     marker_id, marker = marked
+    if "anchor" in marker:
+        return _anchored_candidate(connection, artifact, marker_id, marker, entries[artifact])
     if "ordering" not in marker or entries[artifact].get("state") != "retired":
         return None
     predecessor = ordered_physical_predecessor(connection, artifact)
@@ -97,6 +100,54 @@ def _candidate(
         predecessor.source_sha256,
         0,
     )
+    return _retirement_for_source(connection, basis)
+
+
+def _anchored_candidate(
+    connection: sqlite3.Connection,
+    artifact: str,
+    marker_id: str,
+    marker: dict[str, object],
+    entry: dict[str, object],
+) -> _PhysicalRetirement | None:
+    from .physical_continuation import completed_physical_continuation
+
+    seams = entry.get("seams")
+    if entry.get("state") != "retired" or "ordering" in marker or not isinstance(seams, list):
+        return None
+    receipt = completed_physical_continuation(connection, marker_id)
+    if receipt is None:
+        return None
+    seam_items = cast(list[object], seams)
+    if len(seam_items) != 1 or not isinstance(seam_items[0], dict):
+        return None
+    seam = cast(dict[str, object], seam_items[0])
+    unresolved = cast(int, seam["byte_end"]) - cast(int, seam["byte_start"]) - cast(int, seam["decoded_prefix_bytes"])
+    anchor = cast(dict[str, object], marker["anchor"])
+    if (
+        not 0 < unresolved < RECORD_SIZE
+        or cast(int, seam["decoded_packet_count"]) <= 0
+        or anchor["repeat_offset"] != 0
+        or cast(int, anchor["source_offset"]) + cast(int, anchor["length"]) != entry["source_bytes"]
+    ):
+        return None
+    basis = _PhysicalRetirement(
+        cast(str, entry["source_id"]),
+        marker_id,
+        artifact,
+        cast(str, receipt["last_artifact_id"]),
+        cast(int, entry["source_bytes"]) // 444,
+        cast(str, entry["source_sha256"]),
+        0,
+    )
+    consent = cast(
+        tuple[int] | None,
+        connection.execute(
+            "SELECT 1 FROM state WHERE kind=? AND id=?", (StateKind.ORDERED_RETIREMENT.value, basis.source_id)
+        ).fetchone(),
+    )
+    if consent is None:
+        return None
     return _retirement_for_source(connection, basis)
 
 

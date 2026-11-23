@@ -133,9 +133,9 @@ def _assert_other_incident_holds(
 
 
 def _publish_initial_physical(
-    db: StateDB, store: InternalAudioStore, root: Path
+    db: StateDB, store: InternalAudioStore, root: Path, *, seam_packet: bytes = bytes((8, 42))
 ) -> tuple[str, ready_bundles.ReadyBundleResult, bytes]:
-    descriptor, _, repeated = _seed(store, db)
+    descriptor, _, repeated = _seed(store, db, seam_packet=seam_packet)
     prior = _source(store, "c" * 32, 99, (_record(4),))
     ready_bundles.finalize_public_audio_v2(store, (prior,), root, _options(ClockState(), 100))
     with closing(db.open_connection(read_only=True)) as connection, db.access(connection):
@@ -155,6 +155,26 @@ def _publish_initial_physical(
     return stage.stage_id, result, repeated
 
 
+def _assert_anchor_retirement_authentication(db: StateDB, store: InternalAudioStore, source_id: str) -> None:
+    from omi_collector.capture.adapters.ordered_retirement import retire_one_ordered_physical_page
+
+    consent = db.get(StateKind.ORDERED_RETIREMENT, source_id)
+    assert consent is not None
+    db.put(StateKind.ORDERED_RETIREMENT, source_id, {**consent, "sha256": "0" * 64})
+    with pytest.raises(ValueError, match="receipt changed"):
+        retire_one_ordered_physical_page(store, 2)
+    db.put(StateKind.ORDERED_RETIREMENT, source_id, consent)
+    original = store.read_record_page(source_id, -1, 1)[0].payload
+    with db.typed_write_transaction() as connection:
+        connection.execute(
+            "UPDATE capture_record SET payload=? WHERE source_id=? AND ordinal=0", (bytes(440), source_id)
+        )
+    with pytest.raises(ValueError, match="digest"):
+        retire_one_ordered_physical_page(store, 2)
+    with db.typed_write_transaction() as connection:
+        connection.execute("UPDATE capture_record SET payload=? WHERE source_id=? AND ordinal=0", (original, source_id))
+
+
 def _assert_continuation(db: StateDB, stage_id: str) -> None:
     with closing(db.open_connection(read_only=True)) as connection, db.access(connection):
         connection.execute("BEGIN")
@@ -166,6 +186,68 @@ def _assert_continuation(db: StateDB, stage_id: str) -> None:
             continuation.repeat_end,
         ) == ("a" * 32, "b" * 32, 200, 201)
         connection.rollback()
+
+
+@pytest.mark.parametrize("short_remainder", [False, True])
+@pytest.mark.parametrize("ack_first", [False, True])
+def test_acknowledged_anchor_retires_bounded_pages_after_completed_repeat(
+    tmp_path: Path, short_remainder: bool, ack_first: bool
+) -> None:
+    from omi_collector.capture.adapters.ordered_retirement import retire_one_ordered_physical_page
+    from omi_collector.capture.adapters.physical_continuation import completed_physical_continuation
+    from omi_collector.capture.adapters.sqlite_compaction import _retirement_blocks_compaction
+    from test_historical_release_publication import _classify
+
+    db = StateDB(tmp_path / "state.sqlite3")
+    root = _ready_root(tmp_path)
+    packet = bytes((8, 42)) + bytes(98) if short_remainder else bytes((8, 42))
+    with InternalAudioStore(db) as store:
+        marker_id, physical, _ = _publish_initial_physical(db, store, root, seam_packet=packet)
+        assert not retire_one_ordered_physical_page(store, 2)
+        manifest = cast(dict[str, str], json.loads((physical.path / "manifest.json").read_bytes()))
+        checkpoint = _checkpoint(tmp_path, [{"id": physical.bundle_id, "audio_sha256": manifest["audio_sha256"]}])
+        if ack_first:
+            assert len(ready_bundles.retire_acknowledged_public_audio_v2(root, db, checkpoint)) == 1
+            assert not retire_one_ordered_physical_page(store, 2)
+        _classify(db, frozenset({"a" * 32}))
+        repeat = ready_bundles.SqlitePublicationSource(store, "b" * 32)
+        assert ready_bundles.finalize_public_audio_v2(store, (repeat,), root, _options(ClockState(), 201)).published
+        assert not retire_one_ordered_physical_page(store, 2)
+        with closing(db.open_connection(read_only=True)) as connection:
+            continuation = completed_physical_continuation(connection, marker_id)
+            before_compaction = _retirement_blocks_compaction(connection)
+        source = store.get_source("a" * 32)
+        assert continuation is not None and source is not None
+        db.put(
+            StateKind.ORDERED_RETIREMENT,
+            source.source_id,
+            {
+                "artifact_id": physical.bundle_id,
+                "successor_id": continuation["last_artifact_id"],
+                "count": source.committed_count,
+                "sha256": source.committed_sha256,
+                "cursor": 0,
+            },
+        )
+        with closing(db.open_connection(read_only=True)) as connection:
+            assert _retirement_blocks_compaction(connection) == before_compaction
+        if not ack_first:
+            assert not retire_one_ordered_physical_page(store, 2)
+            assert len(ready_bundles.retire_acknowledged_public_audio_v2(root, db, checkpoint)) == 1
+        if short_remainder:
+            _assert_anchor_retirement_authentication(db, store, source.source_id)
+        assert retire_one_ordered_physical_page(store, 2) is short_remainder
+        assert len(store.read_record_page("a" * 32, -1, 8)) == (2 if short_remainder else 4)
+    with InternalAudioStore(StateDB(db.path)) as restarted:
+        if short_remainder:
+            assert retire_one_ordered_physical_page(restarted, 2)
+            assert restarted.read_record_page("a" * 32, -1, 8) == ()
+        else:
+            assert len(restarted.read_record_page("a" * 32, -1, 8)) == 4
+        assert not retire_one_ordered_physical_page(restarted, 2)
+        assert restarted.get_source("a" * 32) is not None
+        with closing(db.open_connection(read_only=True)) as connection:
+            assert completed_physical_continuation(connection, marker_id) is not None
 
 
 @pytest.mark.parametrize("crash", [False, True])

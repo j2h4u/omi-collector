@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.16](https://github.com/j2h4u/omi-collector/compare/v1.1.15...v1.1.16) (2026-11-23)
+
+
+### Fixes
+
+* retire verified recovered audio after acknowledgement ([#355](https://github.com/j2h4u/omi-collector/issues/355)) ([c2a9e3a](https://github.com/j2h4u/omi-collector/commit/c2a9e3af829175387f4dc4b962bbbe6f7689fc3a))
+
 ## [1.1.15](https://github.com/j2h4u/omi-collector/compare/v1.1.14...v1.1.15) (2026-11-23)
 
 

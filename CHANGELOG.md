@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.15](https://github.com/j2h4u/omi-collector/compare/v1.1.14...v1.1.15) (2026-11-23)
+
+
+### Fixes
+
+* preserve audio order through interrupted pendant downloads ([#353](https://github.com/j2h4u/omi-collector/issues/353)) ([1de969c](https://github.com/j2h4u/omi-collector/commit/1de969cbd055a53401df89b0766a20063c1d2367))
+* publish complete audio with retained partial tails ([#354](https://github.com/j2h4u/omi-collector/issues/354)) ([31549d8](https://github.com/j2h4u/omi-collector/commit/31549d818513a8fb05febe0c6803214b742bc390))
+* run one stopped-service integrity scan for current SQLite state ([5a16eee](https://github.com/j2h4u/omi-collector/commit/5a16eeeb5fd3f0a427f0ed9aa5f58c9b77ab3ce3))
+* use host wall time for pendant clock correction ([5a16eee](https://github.com/j2h4u/omi-collector/commit/5a16eeeb5fd3f0a427f0ed9aa5f58c9b77ab3ce3))
+
 ## [1.1.14](https://github.com/j2h4u/omi-collector/compare/v1.1.13...v1.1.14) (2026-11-15)
 
 

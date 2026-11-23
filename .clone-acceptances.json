@@ -158,12 +158,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "13fa7c70fd00e094675510ea41da009bbc8c7d5601ec5daf27845792bec1fbdb",
-      "count": 1,
-      "reason": "The windows are export lists, logging-field allowlists, metric field schemas and status category constants. Identifier/literal normalization makes different declarative vocabularies look alike; runtime policy membership remains module-specific. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:397-423 ~ src/omi_collector/capture/adapters/internal_audio_store.py:45-70."
-    },
-    {
-      "detector": "jscpd",
       "identity": "1409ec02a31fdd76c8aaddc408d50a50923df97f607af7e1fcf181e9319b6d19",
       "count": 1,
       "reason": "Read transition entries distinguish late protocol data from failure, cancellation and barrier results."
@@ -230,9 +224,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "1eb0a6ab8b414eaa6de00ed705bb11365c1f905764ea2713811aaab73ab70f23",
+      "identity": "139744ed34fcbe84c0a2589080852c4c16cad71ad111981bea06949e745916a4",
       "count": 1,
-      "reason": "Initial prepare-leg may create an unprepared attempt; recovery requires an existing prepared attempt and persists recovery intent. Both reset the same local leg counters after different durable operations; preserve these driver lifecycle boundaries. Reviewed pair: src/omi_collector/capture/adapters/staging_writer.py:117-127 ~ src/omi_collector/capture/adapters/staging_writer.py:129-139."
+      "reason": "Initial prepare-leg may create an unprepared attempt; recovery requires an existing prepared attempt and persists recovery intent. Both reset the same local leg counters after different durable operations; preserve these driver lifecycle boundaries. Reviewed pair: src/omi_collector/capture/adapters/staging_writer.py:118-129 ~ src/omi_collector/capture/adapters/staging_writer.py:131-142."
     },
     {
       "detector": "jscpd",
@@ -314,12 +308,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "2e98d4815427d9058e854f0bc3c38666e81d5911e226bf2caf79c85939a4988e",
-      "count": 1,
-      "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/domain/internal_audio_machine.py:356-368 ~ src/omi_collector/capture/domain/internal_audio_machine.py:361-373."
-    },
-    {
-      "detector": "jscpd",
       "identity": "305ae83476b6360e052b362f7dba6aa11948c14bc1a54d01b1ab4b8f02bd7361",
       "count": 1,
       "reason": "Both windows overlap the single event-type dispatcher, which deliberately routes each HCI event to its distinct recording/finalization operation. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:963-974 ~ src/omi_collector/capture/adapters/ble_link_observability.py:965-976."
@@ -356,9 +344,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "3621a61e2dc0d241b205e448600c5bbac876eef9545620a44d3e0bf69f9d32e2",
+      "identity": "cc2712e8edb88deba84a2e7992840e6acea5d07386ac057ccd3f42910b41fe75",
       "count": 1,
-      "reason": "Prepare-leg, READ_BEGIN and interruption are distinct durable FSM mutations with different SQL predicates, state transitions and durability diagnostics. Their shared rollback/storage-fault handling already calls common helpers; do not replace them with a generic transaction effect. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:681-690 ~ src/omi_collector/capture/adapters/internal_audio_store.py:717-726."
+      "reason": "Prepare-leg, READ_BEGIN and interruption are distinct durable FSM mutations with different SQL predicates, state transitions and durability diagnostics. Their shared rollback/storage-fault handling already calls common helpers; do not replace them with a generic transaction effect. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:709-718 ~ src/omi_collector/capture/adapters/internal_audio_store.py:745-754."
     },
     {
       "detector": "jscpd",
@@ -398,12 +386,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "41aa4ac8161eb2311664ea4961e991ea99aa130d4f54ec54e4db09c11787a300",
-      "count": 1,
-      "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:31-50 ~ src/omi_collector/capture/adapters/collector_state_db.py:32-51."
-    },
-    {
-      "detector": "jscpd",
       "identity": "42b330824b8108838e3ce1f24bb2891226eaf287aac1d05306348cab1714ed41",
       "count": 1,
       "reason": "One BleLinkSessionRecord serializer projects separate PHY outcome and data-length members. The overlapping windows do not represent a second serializer implementation. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:277-283 ~ src/omi_collector/capture/adapters/ble_link_observability.py:281-285."
@@ -431,12 +413,6 @@
       "identity": "451bd3185a821430063d2afcd1bbbc70176925529e912eed6cb2002bb70fa795",
       "count": 1,
       "reason": "Quarantine restart transitions distinguish recoverable custody from terminal published evidence."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "45386b84a3159688cb9c7669b8c72112d1d6abdba4de75cdb34a97c57e96f104",
-      "count": 1,
-      "reason": "Prepare-leg, READ_BEGIN and interruption are distinct durable FSM mutations with different SQL predicates, state transitions and durability diagnostics. Their shared rollback/storage-fault handling already calls common helpers; do not replace them with a generic transaction effect. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:717-726 ~ src/omi_collector/capture/adapters/internal_audio_store.py:743-754."
     },
     {
       "detector": "jscpd",
@@ -488,9 +464,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "4caf7ffb9b990800d8a3d6484c9659c38c4fbb99f1578439dfb3132909d2dd14",
+      "identity": "e34f63c425255696308e0ebd71e1cf49ebd636300cfbd44e8e2852a11c30a144",
       "count": 1,
-      "reason": "Version-specific migration installers validate different source schema versions and install different DDL/proof upgrades without owning commit. Shared schema validators and DDL execution are already reused; retain explicit migration entry points and version refusals. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:1068-1078 ~ src/omi_collector/capture/adapters/collector_state_db.py:1081-1092."
+      "reason": "Version-specific migration installers validate different source schema versions and install different DDL/proof upgrades without owning commit. Shared schema validators and DDL execution are already reused; retain explicit migration entry points and version refusals. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:1164-1174 ~ src/omi_collector/capture/adapters/collector_state_db.py:1177-1188."
     },
     {
       "detector": "jscpd",
@@ -626,12 +602,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "73d7ae75f35d1b5eb26444f006c6bd31bfc7679aef5ac17cad66f868d66837b9",
-      "count": 1,
-      "reason": "Checkpoint, interrupt, publish and close commands carry separate worker effects and ordering."
-    },
-    {
-      "detector": "jscpd",
       "identity": "74ddd5bc29a91effff0f1e740d4edee550754e12db63cbc24b48affd3579b954",
       "count": 1,
       "reason": "Batch milestones, events, cursor actions and read phases are separate enum domains."
@@ -641,12 +611,6 @@
       "identity": "75711505c2e1272cf7cce17b869085be2979d9f7fed74a9a2dc88e17bfe5fffe",
       "count": 1,
       "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:175-191 ~ src/omi_collector/capture/domain/internal_audio_machine.py:24-40."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "7604f602a6cb822db20f280b75656b243a54e842cee52e9a810190d493315a5d",
-      "count": 1,
-      "reason": "Custody reconciliation compares durable cohort and source-coverage proposals and returns the proposed cohort or completion. Retirement reconciliation compares source identity/cursor and compaction debt, validates stalled/progressed results, and returns a progress boolean; their caught exception sets also differ. Shared two-attempt syntax is not a common operation: error classification and fail-stop already use shared helpers. Keep operation-specific recovery contracts instead of callback-driven retry machinery. Independent Astra review and public-API custody/retirement rollback and lost-response tests cover the distinction. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4123-4135 ~ src/omi_collector/capture/adapters/ready_bundles.py:4641-4653."
     },
     {
       "detector": "jscpd",
@@ -668,9 +632,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "790bef738ac18097ec157c1804381f906b9f84f9f388d1a788566cbde619e484",
+      "identity": "a1539f5a3b2ef58a25382fa37f0babe58084b0f91516bf5e8b01189fd8206e7a",
       "count": 1,
-      "reason": "The windows overlap the single writer-command dispatcher. Shared data draining is already _drain_data; checkpoint, interrupt and seal intentionally call different target effects. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:650-656 ~ src/omi_collector/capture/adapters/attempt_writer.py:653-659."
+      "reason": "The windows overlap the single writer-command dispatcher. Shared data draining is already _drain_data; checkpoint, interrupt and seal intentionally call different target effects. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:695-701 ~ src/omi_collector/capture/adapters/attempt_writer.py:698-704."
     },
     {
       "detector": "jscpd",
@@ -710,9 +674,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "82be9b67e0c157ade810dc75973bf8625eeda6fce12d0d2e7f16ef432ca566ec",
+      "identity": "a859153d4ec69e93781bc55412fbbb03be3808e2bd1f7980a12aa2513d562f08",
       "count": 1,
-      "reason": "Init-state migrates the database under a process guard while metrics reads state; their lazy imports reflect separate safety boundaries. Reviewed pair: src/omi_collector/cli.py:459-468 ~ src/omi_collector/cli.py:970-979."
+      "reason": "Init-state migrates the database under a process guard while metrics reads state; their lazy imports reflect separate safety boundaries. Reviewed pair: src/omi_collector/cli.py:459-468 ~ src/omi_collector/cli.py:986-995."
     },
     {
       "detector": "jscpd",
@@ -794,9 +758,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "90cd122923580c0c5e12b5c80d4ef64a4406d23f0d430a1d525221647ba49c99",
+      "identity": "a32d95c8914ae9adfc145a5ee722b1940bf213f96c42e7041ee06163d51d419f",
       "count": 1,
-      "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:463-483 ~ src/omi_collector/cli.py:547-567."
+      "reason": "Typer command signatures, lazy imports, confirmations and guarded contexts belong to distinct init/recovery/PHY/probe/info/metrics commands with different side effects. Matching option/exception syntax is intentional command-boundary shape, not one operation. Reviewed pair: src/omi_collector/cli.py:454-474 ~ src/omi_collector/cli.py:551-571."
     },
     {
       "detector": "jscpd",
@@ -824,12 +788,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "9498a2d2513ebcafde26174051eb5b5f979c982a5731a0f0d6dd64587e776ee9",
-      "count": 1,
-      "reason": "Prepare-leg, READ_BEGIN and interruption are distinct durable FSM mutations with different SQL predicates, state transitions and durability diagnostics. Their shared rollback/storage-fault handling already calls common helpers; do not replace them with a generic transaction effect. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:683-690 ~ src/omi_collector/capture/adapters/internal_audio_store.py:745-754."
-    },
-    {
-      "detector": "jscpd",
       "identity": "cec3279ecd2449e6b1b329451add1b5447aded5347f08741623737b5b7602c36",
       "count": 1,
       "reason": "Scanner start failure and stop failure have different lifecycle events and start-time cleanup: failed start clears its start marker in finally; stopping already freezes active duration before failed stop is reported. Incident construction, persistence/retry and diagnostic closure are shared primitives; keep the explicit lifecycle handlers. Reviewed pair: src/omi_collector/capture/application/ble_scan_health.py:160-170 ~ src/omi_collector/capture/application/ble_scan_health.py:178-188."
@@ -845,12 +803,6 @@
       "identity": "9aa2b41dc17a2dff760aa1bc2a4326fe46ccb81cb77f7ab0bd447e200f82a289",
       "count": 1,
       "reason": "Mutation terminal status projects campaign ownership and checkpoint fields, while BLE incident status projects radio diagnostics and callback ages. The dictionaries expose different operator contracts and do not share an algorithm. Reviewed pair: scripts/mutation_scope.py:376-382 ~ src/omi_collector/operator_status.py:260-266."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "9b146dbf37726838132b3ded9de25663558e32bfb7859ff9a3e84f847262f1af",
-      "count": 1,
-      "reason": "Publication-source and resumable-attempt inventories select different lifecycle sets/order and enforce different ownership decisions. The connection/access/cursor idiom is already shared through StateDB, not duplicated source-selection behavior. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:1051-1061 ~ src/omi_collector/capture/adapters/staging_store.py:784-794."
     },
     {
       "detector": "jscpd",
@@ -920,12 +872,6 @@
     },
     {
       "detector": "jscpd",
-      "identity": "ac85a975caa1cbaf9e363f53b22628dd0ca1e27a4ebc46a6dcdcf275203fea1d",
-      "count": 1,
-      "reason": "Both modules use a six-line cursor-consumption idiom accepting sqlite.Row or tuple results, while stricter StateDB/audio helpers enforce different errors. Sharing a new generic cursor module or importing unrelated staging/quarantine internals adds coupling beyond this small resource-closing idiom. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:64-78 ~ src/omi_collector/capture/adapters/staging_store.py:133-147."
-    },
-    {
-      "detector": "jscpd",
       "identity": "acd3fd83fba069760c05367c7ac602f9ead855fb5b80b84223f78622b5db502a",
       "count": 1,
       "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:14-48 ~ src/omi_collector/capture/application/visit_machine.py:19-38."
@@ -971,12 +917,6 @@
       "identity": "b747c0855f682a90ebab1c8b4cbc95b928cc1e2685a682d9e6debd69939a4c09",
       "count": 1,
       "reason": "The reported models and as_dict methods encode separate PHY outcomes, connection parameters, loss facts, lock context, quality events and status/lifetime aggregates. Explicit schema keys and units are public contracts; do not combine them because normalized field assignments look alike. Reviewed pair: src/omi_collector/capture/adapters/confirmed_loss.py:50-58 ~ src/omi_collector/operator_status.py:81-89."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "b83cb6437a838d63151f2e618fdeb8128332a0e095fb0b62d382c5051443db6a",
-      "count": 1,
-      "reason": "Explicit state/event/directive declarations and enum members represent different writer, presence, visit, batch, source-audio and quarantine automata. Type identity and enum values are the dispatch contract; shape reuse must not merge these state spaces. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:30-54 ~ src/omi_collector/capture/domain/quarantine_machine.py:20-38."
     },
     {
       "detector": "jscpd",
@@ -1274,7 +1214,7 @@
     },
     {
       "detector": "jscpd",
-      "identity": "e8c5ee167178381305b2ef4ab9aec264622814ec4da85e8a8376e64ff6548eba",
+      "identity": "dbb77e9af3260afe35e51a4f9106e26994960f0c3ae397c48238b524ed49289e",
       "count": 1,
       "reason": "These are explicit imports of different state-machine/protocol vocabularies into storage and orchestration modules. They express dependencies, not duplicated executable behavior. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:20-46 ~ src/omi_collector/capture/application/collector.py:17-44."
     },
@@ -1388,18 +1328,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "04805eec509825adb774db751cca33c790c2e9e22cac6ab1600f031ef8ae999e",
-      "count": 1,
-      "reason": "Conflict-disposition reads exact source/cohort evidence; retirement selection chooses actionable covered rows. Their read-only transaction skeleton is shared infrastructure, not the same query or custody decision. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4345-4353 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "05f0359b6345c43be484000cda0247a0b348af6045b60dff8bfa4c900a887839",
-      "count": 1,
-      "reason": "Cached draft frontier and publication source inventory return different aggregates/identities from different custody lifecycle sets. Retain their independent query semantics and error contexts. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:578-594 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
       "identity": "0677a7d79f0a0931150a6c1f8156344a97c9be43ab9f595abbe76d9beba479c0",
       "count": 1,
       "reason": "Replay coverage preflight verifies a specific source snapshot; conflict inspection reconciles old/proposed terminal disposition and cohort state. Their SQL mechanism is shared, while durable witnesses differ. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4265-4273 ~ src/omi_collector/capture/adapters/ready_bundles.py:4431-4444."
@@ -1418,9 +1346,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "0d26177795a63ca78de5236ac01686c08927e9b1a7b19d044547c86d44717ee0",
+      "identity": "30f308d778536d4eb59dcdef8e27d42e1a1b62fa7730f76c3ec1704790d54ae8",
       "count": 1,
-      "reason": "Conflict-disposition proposal and cached draft frontier aggregation return different evidence models from different source filters. They share only StateDB mechanics. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4345-4353 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
+      "reason": "Conflict-disposition proposal and cached draft frontier aggregation return different evidence models from different source filters. They share only StateDB mechanics. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4710-4718 ~ src/omi_collector/capture/adapters/staging_store.py:657-676."
     },
     {
       "detector": "pyscn",
@@ -1445,18 +1373,6 @@
       "identity": "181ccaa3948f48188e16be4fb5473811d1a94bdbd594fa4dfb36befdf5ed6255",
       "count": 1,
       "reason": "Hash and physical-write paths each count their own one-pass packet iterator while invoking different existing Ogg operations. The four-line local counter must follow each independently consumed stream; a mutable counting-wrapper abstraction would add more state than it removes. Reviewed pair: src/omi_collector/capture/adapters/v2_audio.py:32-36 ~ src/omi_collector/capture/adapters/v2_audio.py:50-54."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "19159f787ac039fa679c2ece96e41338ef9de3bd5b96489596b6c68dcc087ab5",
-      "count": 1,
-      "reason": "Compaction bootstrap initializes missing debt once from freelist state; pending_compaction_generation checks existing marker, unfinished retirement and reusable pages before allowing VACUUM. Shared SQL scope does not equate these lifecycle decisions. Reviewed pair: src/omi_collector/capture/adapters/sqlite_compaction.py:56-63 ~ src/omi_collector/capture/adapters/sqlite_compaction.py:72-88."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "192ffcd31c7d6e3957f70477c573a4ff193ea79b6d15aa9b342c2678773e7948",
-      "count": 1,
-      "reason": "V2 proof inventory and covered-source retirement have different format/schema and lifecycle predicates. Common connection handling is not a shared query algorithm. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:3703-3715 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
     },
     {
       "detector": "pyscn",
@@ -1502,15 +1418,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "24e4eaafdcf0f42e4c56aaaaf4b222f5f8355809ca69a3408676024c868123e9",
+      "identity": "85b8688372ff5021310a86cfa037ecc61477959823eaafe1686a66b837a15149",
       "count": 1,
-      "reason": "Pending capture attempts and actionable typed quarantine sources select different source types/dispositions and protect distinct scheduler duties. Their SQL wrappers are not the same inventory algorithm. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/quarantine.py:111-127."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "2570966f61fe139b023abb67f59e8f18d3bbded41ad19138553414955f307d0c",
-      "count": 1,
-      "reason": "Covered-source retirement selects deletable custody; draft frontier returns publication readiness aggregate. Different SQL filters and safety decisions require separate queries. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4505-4524 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
+      "reason": "Pending capture attempts and actionable typed quarantine sources select different source types/dispositions and protect distinct scheduler duties. Their SQL wrappers are not the same inventory algorithm. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1105-1124 ~ src/omi_collector/capture/adapters/quarantine.py:115-133."
     },
     {
       "detector": "pyscn",
@@ -1520,9 +1430,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "27b065aa611af22a4c6d6f639adb3e447fe2574b11133dab1ebc398d66229edb",
+      "identity": "f278edfacfde2b362bef04f19bc32a2520c16c1dd9eb7ffffc87d9af143c1051",
       "count": 1,
-      "reason": "Historical v3 validator and current-runtime validator have different eligible versions and publication-mode requirements. Keep explicit migration-versus-runtime admission rules. Reviewed pair: src/omi_collector/state_migration.py:257-270 ~ src/omi_collector/state_migration.py:73-93."
+      "reason": "Historical v3 validator and current-runtime validator have different eligible versions and publication-mode requirements. Keep explicit migration-versus-runtime admission rules. Reviewed pair: src/omi_collector/state_migration.py:268-281 ~ src/omi_collector/state_migration.py:74-98."
     },
     {
       "detector": "pyscn",
@@ -1580,12 +1490,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "3e2d0ba85cc46bc7b2960b069bfa77e2ce642db69a281ca5f013dbe4a7d2d557",
-      "count": 1,
-      "reason": "Replay-coverage confirmation authenticates a specific source checkpoint; publisher inventory enumerates candidates across lifecycles. Their SQL scopes are shared infrastructure, while rules differ. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4265-4273 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
       "identity": "3e429ceeb0fc2c81f6fafe6961bc801f167a891b5a38dde81bc23caec0fb1b55",
       "count": 1,
       "reason": "Frozen in-memory stage and active persisted proof row have different fields and ownership/lifetimes. Matching dataclass shapes do not justify one model. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1196-1208 ~ src/omi_collector/capture/adapters/ready_bundles.py:1232-1244."
@@ -1610,27 +1514,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "48cffaaf7404e99749a6b8ae508a6753639dfba7485632fbf3e1e3f8332009fd",
+      "identity": "311895affd8158238afbf935d224d4e53ec40a9c42503a500bae58808df6ebc0",
       "count": 1,
-      "reason": "Leg preparation and interruption update different durable source lifecycle/leg fields and perform different FSM checks. Reuse existing rollback/corruption helpers while preserving their conditional writes. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:666-687 ~ src/omi_collector/capture/adapters/internal_audio_store.py:738-749."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "4b30afc45fa4a9ad8a49e2b44582ad99d8f316c47528991080fdb85a1c9a73ce",
-      "count": 1,
-      "reason": "Conflict-disposition snapshot and typed attempt inventory inspect different exact source versus candidate sets and enforce different custody decisions. Keep their SQL predicates and error contexts. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4345-4353 ~ src/omi_collector/capture/adapters/staging_store.py:1052-1068."
+      "reason": "Conflict-disposition snapshot and typed attempt inventory inspect different exact source versus candidate sets and enforce different custody decisions. Keep their SQL predicates and error contexts. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4710-4718 ~ src/omi_collector/capture/adapters/staging_store.py:1197-1215."
     },
     {
       "detector": "pyscn",
       "identity": "4c66819c0f6780fa59f95193fd0bd00d6ae8d9fc42f30da065def10bdb28db4e",
       "count": 1,
       "reason": "Cohort decision checks and source-audio decision checks operate on different FSM types and action enums. Retain type separation and their respective required transition witnesses. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1328-1336 ~ src/omi_collector/capture/adapters/ready_bundles.py:1339-1347."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "4ce545b97472b636bff60848ab37a7c3cbb3d12bd28b0116e98835f88800e9f5",
-      "count": 1,
-      "reason": "Quarantine authentication hold repair and covered-source retirement inspect different eligibility/evidence and perform different guarded transitions. The common read-only SQL wrapper is already infrastructure. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:467-475 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
     },
     {
       "detector": "pyscn",
@@ -1646,15 +1538,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "55f986710b96cec9311de59e62a26d752517a64ad213383469ebf3e90a340409",
+      "identity": "c0e232267df9027a90426f46718d09faef51eb6c6f95053ac77a9bbc56aeeaf6",
       "count": 1,
-      "reason": "Initial leg preparation may create an attempt, whereas recovery requires existing prepared custody and persists recovery intent. Shared local counter resets follow different durable effects. Reviewed pair: src/omi_collector/capture/adapters/staging_writer.py:113-125 ~ src/omi_collector/capture/adapters/staging_writer.py:127-137."
+      "reason": "Initial leg preparation may create an attempt, whereas recovery requires existing prepared custody and persists recovery intent. Shared local counter resets follow different durable effects. Reviewed pair: src/omi_collector/capture/adapters/staging_writer.py:114-127 ~ src/omi_collector/capture/adapters/staging_writer.py:129-140."
     },
     {
       "detector": "pyscn",
-      "identity": "564f6e146538f541ed3034d28bb1050cb5edc4746de12d70898447b7b7e0ecaf",
+      "identity": "1e2a49854f76823d48318c9cdf1fae559b3f544a0bc3d31d71179356618dc9ad",
       "count": 1,
-      "reason": "Historical v2 validator admits an upgrade source; current-runtime validator rejects upgrade-required versions, validates public-mode policy and has different fatal categories. Common structural validators are already reused. Reviewed pair: src/omi_collector/state_migration.py:241-254 ~ src/omi_collector/state_migration.py:73-93."
+      "reason": "Historical v2 validator admits an upgrade source; current-runtime validator rejects upgrade-required versions, validates public-mode policy and has different fatal categories. Common structural validators are already reused. Reviewed pair: src/omi_collector/state_migration.py:252-265 ~ src/omi_collector/state_migration.py:74-98."
     },
     {
       "detector": "pyscn",
@@ -1694,15 +1586,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "5f6860cf9a8ad8aceab8e81165ac47e53f00a7bf29cfcd357bc5abb498c39a86",
+      "identity": "6b7ab40bb2893367a010a4fe4ad66e330944ab0db2621da6d5daac5ded651973",
       "count": 1,
-      "reason": "Initialization and journal recovery have different eligibility checks, effects and public error sets. CLI boilerplate does not establish one migration operation. Reviewed pair: src/omi_collector/cli.py:467-502 ~ src/omi_collector/cli.py:551-583."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "5f7d9d7b131b914615267c3d06c2eda59970412948b92c53683ffad52b0ae66c",
-      "count": 1,
-      "reason": "Actionable quarantine salvage and covered-source retirement select disjoint custody states and apply different admission versus deletion policies. Common read-only SQL syntax is incidental. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:111-127 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
+      "reason": "Initialization and journal recovery have different eligibility checks, effects and public error sets. CLI boilerplate does not establish one migration operation. Reviewed pair: src/omi_collector/cli.py:458-493 ~ src/omi_collector/cli.py:555-587."
     },
     {
       "detector": "pyscn",
@@ -1712,9 +1598,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "618f86b468df889fbdb33d310ea900bb9dcfb604170463794965b7826c9d1b78",
+      "identity": "cb8a30f6ec8abf0979161d9a535d3eb33be8a3b56bf3d31a6b0bd901e789bb41",
       "count": 1,
-      "reason": "Pending-attempt restart inventory and replay-coverage authentication return different result shapes and guard different mutations. Existing read-only access owns shared connection scope. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/ready_bundles.py:4265-4273."
+      "reason": "Pending-attempt restart inventory and replay-coverage authentication return different result shapes and guard different mutations. Existing read-only access owns shared connection scope. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1105-1124 ~ src/omi_collector/capture/adapters/ready_bundles.py:4630-4638."
     },
     {
       "detector": "pyscn",
@@ -1730,21 +1616,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "621e2128830139eadbbf8b72870a2c95dde84888867a5d0778d3108fbf84425f",
-      "count": 1,
-      "reason": "Prepare-leg and READ_BEGIN bind different staged device intents and update different source columns under conditional durable transitions. Keep their distinct state/effect boundaries. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:666-687 ~ src/omi_collector/capture/adapters/internal_audio_store.py:712-723."
-    },
-    {
-      "detector": "pyscn",
       "identity": "63c7e962281269862882785b0421006bc6575bbbcbf0a5ee09dffa063d3f07ec",
       "count": 1,
       "reason": "Replacing an advertisement retains the supplied candidate/arrival timestamp; clearing arrival must remove both while retaining each phase's timer layout. Explicit state-specific constructors preserve those different transitions. Reviewed pair: src/omi_collector/capture/application/presence_machine.py:579-592 ~ src/omi_collector/capture/application/presence_machine.py:595-608."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "66a6102a4d7d16398db0211cc6a251d6ec23caa9cf4d899955d5bf73e3d6b825",
-      "count": 1,
-      "reason": "Coverage-state inspection compares old/proposed covered checkpoint state; retirement selection finds an actionable source. Shared SQL scope is mechanism, not one state decision. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4297-4312 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
     },
     {
       "detector": "pyscn",
@@ -1808,21 +1682,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "7623a8f596e095e899acb2a676eb5ca3c8fe4c1087efbb7ab28c2115d0ca1f26",
-      "count": 1,
-      "reason": "Conflict disposition authenticates one admitted source/cohort; publication inventory selects all eligible publisher sources. Preserve their distinct identity scope and result contracts. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4345-4353 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
       "identity": "7b3cf0073113d72841babc85a9bfe868bbbdd5a51c173c4a45df512c72caa872",
       "count": 1,
       "reason": "PHY command outcome and connection-parameter update have distinct status/effective-payload schemas; similar as_dict syntax encodes different HCI event meanings. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:152-164 ~ src/omi_collector/capture/adapters/ble_link_observability.py:220-234."
     },
     {
       "detector": "pyscn",
-      "identity": "7c90503a0782965ac10907fc22447600d54fc9d1bcd5b5448a0e23d44faa7c88",
+      "identity": "27ab9b5a1046675c0e5f4bbbb60dddcf6a3be6c8d17dd00d09424ed0548f5cfc",
       "count": 1,
-      "reason": "Replay coverage authentication and typed resumable-attempt inventory have different key/lifecycle constraints and result types. Common database scope is already shared. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4265-4273 ~ src/omi_collector/capture/adapters/staging_store.py:1052-1068."
+      "reason": "Replay coverage authentication and typed resumable-attempt inventory have different key/lifecycle constraints and result types. Common database scope is already shared. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4630-4638 ~ src/omi_collector/capture/adapters/staging_store.py:1197-1215."
     },
     {
       "detector": "pyscn",
@@ -1838,15 +1706,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "8260798e63fac169cde400a4ff609480a2a6068bcb98d7fe167f9622df60d65f",
+      "identity": "da8f685c10b282aee3fb053afcdfe468157358b4f50c45f82c3a0b833f99b9a0",
       "count": 1,
-      "reason": "pending_attempts selects resumable capture descriptors that block GATT; _cached_draft_frontier computes sealed/blocked publication frontier. Their common read-only SQL scope is already StateDB functionality, while queries/results differ. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
+      "reason": "pending_attempts selects resumable capture descriptors that block GATT; _cached_draft_frontier computes sealed/blocked publication frontier. Their common read-only SQL scope is already StateDB functionality, while queries/results differ. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1105-1124 ~ src/omi_collector/capture/adapters/staging_store.py:657-676."
     },
     {
       "detector": "pyscn",
-      "identity": "8649eff51308cf295641dbd844cfca945178c6fdf0565dc6ebb158abbd621bba",
+      "identity": "759139b841fd9fa1bb293ea203e4d1aa32c2d338d738a62a91b41cb152e155b8",
       "count": 1,
-      "reason": "Quarantine salvage inventory filters terminal/opaque/held sources; replay-coverage commit preflight authenticates one source checkpoint. Their SQL reads have different safety roles and results. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:111-127 ~ src/omi_collector/capture/adapters/ready_bundles.py:4265-4273."
+      "reason": "Quarantine salvage inventory filters terminal/opaque/held sources; replay-coverage commit preflight authenticates one source checkpoint. Their SQL reads have different safety roles and results. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:115-133 ~ src/omi_collector/capture/adapters/ready_bundles.py:4630-4638."
     },
     {
       "detector": "pyscn",
@@ -1868,21 +1736,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "8d93416789538553ada9706cd259fd5de3ee39caf221b5f8ef8d30ed33c28ba6",
-      "count": 1,
-      "reason": "pending_attempts enforces restart attempt uniqueness; _typed_publication_source_ids enumerates publisher admission/resume candidates. Different lifecycle queries and scheduler authorities share only existing connection mechanics. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
       "identity": "93299fa7bb0833f727e6b73a7ec7949097a21a7611d2a93f4c43433636582449",
       "count": 1,
       "reason": "Compaction admission has confirmed debt evidence, allocates a debt-bound effect token, and carries an existing publication RetryWait through compaction. Failed-probe handling has no debt generation or runnable effect; it accepts only idle/settled work and arms the first probe retry without replacing an existing publication retry. Their admission sets, evidence and commands differ despite similar state construction. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:350-358 ~ src/omi_collector/capture/domain/ready_machine.py:399-411."
     },
     {
       "detector": "pyscn",
-      "identity": "98b51391f4ac6ddc1d5bb48d681ef6c05010155f8abc6cfcd828a20b8a0e95fc",
+      "identity": "663f50bd593545ae33c1bba679214124e2f5afe0a7a581684c4da552ec660b8f",
       "count": 1,
-      "reason": "Durable prefix and durable seal protocols intentionally expose overlapping custody fields, but a seal additionally establishes source identity and publication authority. Independent interfaces constrain different consumers. Reviewed pair: src/omi_collector/capture/application/ports.py:39-50 ~ src/omi_collector/capture/application/ports.py:63-79."
+      "reason": "DurablePrefixShape represents verified capture progress, while QuarantineAdmissionShape describes a quarantined source and its lifecycle. Their overlapping fields do not imply the same authority or consumers. Reviewed pair: src/omi_collector/capture/application/ports.py:39-56 ~ src/omi_collector/capture/application/ports.py:88-105."
     },
     {
       "detector": "pyscn",
@@ -1898,9 +1760,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "9c14ac35ee3d167e5824d208da2a8731289e12594a5670b109853df8931e3ae7",
+      "identity": "64d0d06e2dd40caf1c6a890079cbc7904ef60084ab6fb84618f7a1d269fb52f3",
       "count": 1,
-      "reason": "Replay-proof and public-audio schema upgrades validate different historical versions, install different DDL and preserve outer transaction ownership. Common validators already centralize structure. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:1068-1078 ~ src/omi_collector/capture/adapters/collector_state_db.py:1081-1092."
+      "reason": "Replay-proof and public-audio schema upgrades validate different historical versions, install different DDL and preserve outer transaction ownership. Common validators already centralize structure. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:1164-1174 ~ src/omi_collector/capture/adapters/collector_state_db.py:1177-1188."
     },
     {
       "detector": "pyscn",
@@ -1934,9 +1796,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "a0d909254430b5dd76af03bd17009fe95322c7219d1bc613102d22667989e7d0",
+      "identity": "3e10b3b3988c8dec2e536ffd4ce8ebeebeaa71836000d91f9bcb841e0f357575",
       "count": 1,
-      "reason": "Quarantine salvage candidate IDs and draft publication frontier aggregates derive from different lifecycle filters and consumers. The shared SQL scope is not repeated domain behavior. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:111-127 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
+      "reason": "Quarantine salvage candidate IDs and draft publication frontier aggregates derive from different lifecycle filters and consumers. The shared SQL scope is not repeated domain behavior. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:115-133 ~ src/omi_collector/capture/adapters/staging_store.py:657-676."
     },
     {
       "detector": "pyscn",
@@ -1946,27 +1808,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "a6c921582bfb28d1539640381ea8c0602289f818f8323c0e56a1a8db29cfab04",
+      "identity": "fd5a126307900b8f97c6f6afe93e94c71ddcdc2a3ce3acb42af533222bfff117",
       "count": 1,
-      "reason": "Typed attempt inventory returns candidate source snapshots; cached draft frontier returns a publication-boundary aggregate. Keep explicit query semantics and error contracts. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:1052-1068 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "a91dd4d2050b24231d97137288e88b84693dbdaf0c29ba8b6ff23e734c514346",
-      "count": 1,
-      "reason": "READ_BEGIN binding and interruption persist different transitions and SQL fields. Common rollback and corruption classification already use shared helpers; keep operation-specific durable assertions. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:712-723 ~ src/omi_collector/capture/adapters/internal_audio_store.py:738-749."
+      "reason": "Typed attempt inventory returns candidate source snapshots; cached draft frontier returns a publication-boundary aggregate. Keep explicit query semantics and error contracts. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:1197-1215 ~ src/omi_collector/capture/adapters/staging_store.py:657-676."
     },
     {
       "detector": "pyscn",
       "identity": "abb1c6ced85cc7ba49f830219c80aefc15bb9757cfadc9d39c1017ec1758409e",
       "count": 1,
       "reason": "Closing and finalizing writer states accept different completion events and produce different final states/rejections. Their result construction must not combine the FSM transitions. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer_machine.py:313-320 ~ src/omi_collector/capture/adapters/attempt_writer_machine.py:361-368."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "ac49298bf0125870e0d293a742fe5896af1915f4c7b366175cb9277f987e7b7b",
-      "count": 1,
-      "reason": "Durability-failure latching and actionable retirement selection inspect different durable metadata and protect opposite stop-versus-cleanup decisions. Keep query and error semantics explicit. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:3233-3248 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
     },
     {
       "detector": "pyscn",
@@ -2000,15 +1850,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "c2a328c58893da361ffb13c9e915515711e34268927a48b1e8c2845a04305227",
+      "identity": "3c4b68756f9e8ccbc451ad57565d77236009b68776ce36ca1f1bd5656e787bc5",
       "count": 1,
-      "reason": "Resumable attempt source inventory and publisher source-ID inventory have different lifecycle rules, ordering and types. Shared StateDB connection/access is already reused. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:1052-1068 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "c4efad03247d302e52217eabaffae5532514f3c56ec3fc4662799f531a50c9dc",
-      "count": 1,
-      "reason": "Pending attempt enumeration protects startup/GATT uniqueness; typed-attempt sources drive consuming resume under a lease. Their result schemas and lifecycle eligibility differ despite similar SQL wrappers. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/staging_store.py:1052-1068."
+      "reason": "Pending attempt enumeration protects startup/GATT uniqueness; typed-attempt sources drive consuming resume under a lease. Their result schemas and lifecycle eligibility differ despite similar SQL wrappers. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1105-1124 ~ src/omi_collector/capture/adapters/staging_store.py:1199-1217."
     },
     {
       "detector": "pyscn",
@@ -2030,9 +1874,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "ca35a5425c7654b33f9de820c44aec220d54a735fea9cc8b087d078f48312843",
+      "identity": "1eaad8e20b1ab2d7eaf7b8e4c538783395af7017a5d9e552a0c7c75cd63d03c8",
       "count": 1,
-      "reason": "Replay coverage confirms one admitted source checkpoint; cached draft frontier aggregates unpublished durable prefixes. Their different evidence semantics are not a shared algorithm. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4265-4273 ~ src/omi_collector/capture/adapters/staging_store.py:578-594."
+      "reason": "Replay coverage confirms one admitted source checkpoint; cached draft frontier aggregates unpublished durable prefixes. Their different evidence semantics are not a shared algorithm. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4630-4638 ~ src/omi_collector/capture/adapters/staging_store.py:657-676."
     },
     {
       "detector": "pyscn",
@@ -2054,21 +1898,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "d15dd3cf3ee24bbd7e722d53c9c2594bc47e89c10cb1c2026a9ff22fe5df33cf",
-      "count": 1,
-      "reason": "Proof-root inventory reads all proof rows for custody; retirement selects one eligible retiring source with separate exclusion predicates, fields and error handling. Their shared read-only database scope already uses StateDB. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1597-1609 ~ src/omi_collector/capture/adapters/ready_bundles.py:4692-4711."
-    },
-    {
-      "detector": "pyscn",
       "identity": "d21a9df7e19fbf6088a4c31f32703e3af77141cb3f5739de20bd20ac9d99b8a4",
       "count": 1,
       "reason": "Ambiguous create reconciliation checks absence versus newly created exact source identity and may repeat create; seal reconciliation compares old source versus proposed sealed checkpoint. They have different durable witnesses, retry effects and fail-stop states. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:1280-1315 ~ src/omi_collector/capture/adapters/internal_audio_store.py:1317-1338."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "d82e0c300f4d736be1b1ce802662c33fa796377799ab45224aee1547268a1984",
-      "count": 1,
-      "reason": "Quarantine admission snapshot is immutable source authentication state; opportunistic _Run holds runtime session/configuration dependencies. Matching dataclass fields are unrelated lifetimes and schemas. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:253-261 ~ src/omi_collector/capture/application/opportunistic_sync.py:56-64."
     },
     {
       "detector": "pyscn",
@@ -2084,21 +1916,15 @@
     },
     {
       "detector": "pyscn",
-      "identity": "dc274c89fb1a1fd4bc066ddd8fe92103d3ba00f444681009523db704e5250340",
-      "count": 1,
-      "reason": "Pending-attempt enumeration blocks unsafe GATT resume; covered-source retirement chooses deletable typed custody. Their lifecycle predicates and return schemas differ. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
-    },
-    {
-      "detector": "pyscn",
       "identity": "e0a1ef8ddef9bb28dc300176b3674b6933f8abbd95bba4bea328881c165694e0",
       "count": 1,
       "reason": "Directory ensure may create and fsync a missing path; existing-directory validation deliberately treats missing as no work and never creates it. Preserve their distinct filesystem mutation authority. Reviewed pair: src/omi_collector/capture/adapters/staging_filesystem.py:149-160 ~ src/omi_collector/capture/adapters/staging_filesystem.py:162-170."
     },
     {
       "detector": "pyscn",
-      "identity": "e44a6aa3e9f5b070775b4415c7d8e4f110aaf33b8b227ed0300b5e39038db298",
+      "identity": "85e6b9dfe20496a51ca0e71ac2d998fc4a19c5b2b13ec871c241d10ddb291def",
       "count": 1,
-      "reason": "Salvage inventory filters quarantine eligibility; conflict snapshot authenticates a specific admitted source/cohort. Preserve their disjoint result models and mutation authorities. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:111-127 ~ src/omi_collector/capture/adapters/ready_bundles.py:4345-4353."
+      "reason": "Salvage inventory filters quarantine eligibility; conflict snapshot authenticates a specific admitted source/cohort. Preserve their disjoint result models and mutation authorities. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:115-133 ~ src/omi_collector/capture/adapters/ready_bundles.py:4710-4718."
     },
     {
       "detector": "pyscn",
@@ -2114,9 +1940,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "e67045030a7d2b94784113c7b4b1bbef080c55811743afafb1fbb0cdb02b70e9",
+      "identity": "3c9498a7a67d59f71a6c334ac4e5ac7394f3dad842f1ec755ae52a6c3c5ca08d",
       "count": 1,
-      "reason": "Pending attempt descriptors and publication conflict-disposition snapshots serve different restart versus terminal-custody boundaries. Preserve their query/validation contracts. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1086-1103 ~ src/omi_collector/capture/adapters/ready_bundles.py:4345-4353."
+      "reason": "Pending attempt descriptors and publication conflict-disposition snapshots serve different restart versus terminal-custody boundaries. Preserve their query/validation contracts. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1105-1124 ~ src/omi_collector/capture/adapters/ready_bundles.py:4710-4718."
     },
     {
       "detector": "pyscn",
@@ -2150,18 +1976,6 @@
     },
     {
       "detector": "pyscn",
-      "identity": "eb6167b18814f1d2f4611d12523aa6ada6d0705488996b3a0f738bdb259c9869",
-      "count": 1,
-      "reason": "Replay-coverage source verification and covered-source retirement selection have different SQL predicates, return types and mutation eligibility. Reuse StateDB mechanics, not their domain decisions. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4265-4273 ~ src/omi_collector/capture/adapters/ready_bundles.py:4505-4524."
-    },
-    {
-      "detector": "pyscn",
-      "identity": "ee083a18f156b3ec1c1575d896949ad668f12cf47515470278dea8aaf061f061",
-      "count": 1,
-      "reason": "Retirement source selection and publisher candidate inventory use different lifecycle eligibility and return models. Shared StateDB read mechanics already exist. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4505-4524 ~ src/omi_collector/capture/adapters/staging_store.py:785-802."
-    },
-    {
-      "detector": "pyscn",
       "identity": "ee1d8cbc946c2ed755cf3034e36d8e5796ad9532807000555196dda3853da233",
       "count": 1,
       "reason": "Publication completion preserves its effect outcome and applies explicit reprobe plus publication revision/generation rules. Compaction completion binds storage-debt generation, preserves quiescing ownership, and restores a retained publication RetryWait with its original outcome/deadline before considering compaction backoff. Their event schemas, settlement values and outstanding retry obligations differ; keep independent transitions. Reviewed pair: src/omi_collector/capture/domain/ready_machine.py:313-341 ~ src/omi_collector/capture/domain/ready_machine.py:361-396."
@@ -2183,6 +1997,480 @@
       "identity": "f4f72c701d53f62097391d0269de0c06f8dcef2174eb956fb74b1227d075cfaf",
       "count": 1,
       "reason": "Legacy clock correction evidence and typed publication admission snapshots represent different eras, field schemas and ownership. Similar optional/default annotation shape is incidental. Reviewed pair: src/omi_collector/capture/adapters/legacy_clock_import.py:95-106 ~ src/omi_collector/capture/adapters/ready_bundles.py:1104-1113."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "03790efbda2576a54a206b26783ebb18b5bf63417cb45eb700f317712a830d9e",
+      "count": 1,
+      "reason": "Attempt-source inventory and publication-source inventory select different lifecycles, ordering and consumers. Both use existing StateDB connection handling but do not share source eligibility rules. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:1196-1206 ~ src/omi_collector/capture/adapters/staging_store.py:868-878."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "16328758dafa8c57a183b0415367c499229bf262a313d161fb141531efc83cc0",
+      "count": 1,
+      "reason": "InterruptCommand and FinishReadCommand both flush a frontier, but only the latter carries the actual DONE and confirms a leg. They have different effects and result contracts. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:193-209 ~ src/omi_collector/capture/adapters/attempt_writer.py:202-218."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "302779770c62c4c72d1147755019fbf74e64763d558a29c6bd14e3bbe0412b68",
+      "count": 1,
+      "reason": "checkpoint waits for a durable progress barrier, while quarantine_unconfirmed finalizes and preserves provisional custody. Shared queue admission and joining do not make these effects equivalent. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:439-447 ~ src/omi_collector/capture/adapters/attempt_writer.py:490-498."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "5185eea63a05d762dbdc76eaa1fe003a20f7e6e5e617b784d8d19925b7231a8a",
+      "count": 1,
+      "reason": "quarantine_unconfirmed moves a provisional source into custody; finish_read records actual DONE and validates byte count. Their result types and terminal effects differ. Reviewed pair: src/omi_collector/capture/adapters/staging_writer.py:220-229 ~ src/omi_collector/capture/adapters/staging_writer.py:234-243."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "5558e98696ebf64c8a0c7183848887b92af6e513a5ab91e62aab5d178ffe9837",
+      "count": 1,
+      "reason": "The collector ingest port and the application writer port expose overlapping control methods to different consumers with different return contracts. Protocol declarations are not duplicated executable behavior. Reviewed pair: src/omi_collector/capture/application/collector.py:262-268 ~ src/omi_collector/capture/application/ports.py:257-263."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "7312892d22491013d80c163f07d590128dbdd0930d4c33a7a571176294462d25",
+      "count": 1,
+      "reason": "These dataclasses describe distinct ordered writer commands: preparing or observing a leg, checkpointing, interruption, finalization, and publication. Similar command fields do not make their effects interchangeable. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:180-200 ~ src/omi_collector/capture/adapters/attempt_writer.py:214-234."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "7f9936ecb61e6c1bc46c958e4ca0e20ec3022d8ecce12939f487aacee96aa487",
+      "count": 1,
+      "reason": "DurableSealShape represents complete custody before device advance; QuarantineAdmissionShape represents a quarantined source. The shared source/range fields do not imply the same lifecycle authority. Reviewed pair: src/omi_collector/capture/application/ports.py:72-85 ~ src/omi_collector/capture/application/ports.py:89-102."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "88e87e91596c30d8ac1d67d9944a616cffe30f6c6b4069f12e0f208750a19f79",
+      "count": 1,
+      "reason": "StagedAttemptShape includes recovery while ResumeAttemptShape provides a narrower restart interface. Their shared inspection and close members are intentional capability overlap. Reviewed pair: src/omi_collector/capture/application/ports.py:156-166 ~ src/omi_collector/capture/application/ports.py:168-178."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "95655109e2ac8c8aefd3e3e455b879daa5f0fc29a55b65c0c74de99b0fb32612",
+      "count": 1,
+      "reason": "The v2 stopped-service migration validator and the current runtime validator accept different schema versions and enforce different cutover rules. Shared structural validation is already factored. Reviewed pair: src/omi_collector/state_migration.py:257-265 ~ src/omi_collector/state_migration.py:89-97."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "c19c3cfae49fc5639695e3a9e5312189f0b3e153a2e1cd5d90eb83dd52db2b8a",
+      "count": 1,
+      "reason": "DurablePrefixShape exposes current capture progress; QuarantineAdmissionShape describes an admitted quarantine source and lifecycle. Their overlapping range fields carry different authority. Reviewed pair: src/omi_collector/capture/application/ports.py:41-53 ~ src/omi_collector/capture/application/ports.py:93-105."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "c1dc31a406cba35089aa619148d257de05793600df68bea2dbe2d6cfaabd929a",
+      "count": 1,
+      "reason": "CheckpointCommand and QuarantineUnconfirmedCommand carry the same receive frontier but trigger different checkpoint versus terminal quarantine effects. The worker dispatch must preserve that distinction. Reviewed pair: src/omi_collector/capture/adapters/attempt_writer.py:185-200 ~ src/omi_collector/capture/adapters/attempt_writer.py:211-226."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "c4dc9875dd72a64ab38933e69de5e04d62cbbadce5f0ea73b6e3a78af0eab3c9",
+      "count": 1,
+      "reason": "Summary certification rechecks current source metadata during a threshold wait; historical cohort custody verifies a frozen migration snapshot before resume. Their fields and acceptance decisions differ. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1881-1895 ~ src/omi_collector/capture/adapters/ready_bundles.py:4120-4134."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "08de0df36fbaa395122970b1fdacc95781c70f7aba1360b148754f36e849bfba",
+      "count": 1,
+      "reason": "READ_BEGIN binds a prepared device range and lifecycle, whereas replay-observation appends conflicting evidence for a later comparison. The durable transaction boundaries are independent. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:740-751 ~ src/omi_collector/capture/adapters/internal_audio_store.py:960-968."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "594779a2cb9c423b081685fd00082d4191657973614e41d8acb00b091df27901",
+      "count": 1,
+      "reason": "DurableSealShape authorizes capture custody before advance; QuarantineAdmissionShape exposes a separately admitted source with a lifecycle. Shared fields do not grant the same authority. Reviewed pair: src/omi_collector/capture/application/ports.py:69-85 ~ src/omi_collector/capture/application/ports.py:88-105."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "6b0254ed4baf448570d3fb9ad2862579de73c15fa7b39945898b879f6fa07052",
+      "count": 1,
+      "reason": "Leg preparation binds and records a new source range and generation, whereas replay-observation preserves conflicting incoming bytes for an existing source. The transitions and rollback contexts differ. Reviewed pair: src/omi_collector/capture/adapters/internal_audio_store.py:684-715 ~ src/omi_collector/capture/adapters/internal_audio_store.py:960-968."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "613c6edb24f61738ebfc10836efeb47a7cef913e997475b8f4120c4d3de870b1",
+      "count": 1,
+      "reason": "Framing observations report received chunks and tail coordinates, whereas conflict inventory reports preserved source-relative conflict ranges and reasons. Their joins, columns and diagnostics are distinct. Reviewed pair: src/omi_collector/operator_status.py:431-449 ~ src/omi_collector/operator_status.py:452-467."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "b6401ab7669e2d5e32c070d4b2bb6ec820c1b066332a8f0297005ad0859f0a4b",
+      "count": 1,
+      "reason": "Unresolved observation rows and conflict rows are separate evidence inventories with different coordinate systems and schemas. The shared StateDB read scope is already factored. Reviewed pair: src/omi_collector/operator_status.py:432-449 ~ src/omi_collector/operator_status.py:453-467."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "7b97ae13f7f25186ce6c6ffaa67b53fc9e35c57a39e7c2be3d98b5c03560c07a",
+      "count": 1,
+      "reason": "Replay proof root inventory authenticates bundle custody; unresolved framing observation rows support operator diagnostics. The SQL projections and failure authorities differ. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1659-1671 ~ src/omi_collector/operator_status.py:429-446."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "1d6c16fd3d92af8256f3c232bcc6b42ce01d4a8a8e01a546303e12c2aea29619",
+      "count": 1,
+      "reason": "Replay proof roots authenticate READY bundle custody, while unresolved conflict rows describe retained input conflicts. These are separate evidence types and errors. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1659-1671 ~ src/omi_collector/operator_status.py:453-467."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "20eec4e4c39dd57e8e8347f4764a223d05526af6393f52c41b340f3445b7ff76",
+      "count": 1,
+      "reason": "Active v2 proof rows authenticate published bundle replay; framing observation rows summarize unresolved received bytes. They differ in schema, lifecycle filter and consumer. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4015-4027 ~ src/omi_collector/operator_status.py:429-446."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "b98ea71b172b2c2a7627b7ef2fb2da9fdf678e3903727eeeb9bb31ea921b80b8",
+      "count": 1,
+      "reason": "Active v2 replay proof retrieval is a publication integrity boundary; unresolved conflict retrieval is an operator evidence inventory. Common SQL connection handling does not combine their decisions. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4015-4027 ~ src/omi_collector/operator_status.py:453-467."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "1b9cbe62b0c5c74c3b3d738218415cab31442d2ed80ef85c982e35be32ecd7be",
+      "count": 1,
+      "reason": "_TypedAdmissionSnapshot records source and certification state for quarantine admission; _V2ProofContent binds published artifact hashes, packet projection and replay metadata. The immutable fields support separate custody contracts. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:254-264 ~ src/omi_collector/capture/adapters/ready_bundles.py:345-356."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "b77ce7af557d91bf5cf3403eb406f48a79e0421bd5951863391d98cf83dfb94f",
+      "count": 1,
+      "reason": "_TypedAdmissionSnapshot authenticates quarantine source state; _V2ActiveProofRow represents an active READY replay proof. Their identifiers, lifecycles and validation roles are distinct. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:254-264 ~ src/omi_collector/capture/adapters/ready_bundles.py:1264-1276."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "8b51531e21b910bd35dafbc4204fbbab07668fcb5ade38733e0f494fe913416a",
+      "count": 1,
+      "reason": "Source inventory reports canonical counts and tails, while conflict inventory reports separately stored byte conflicts; they share the incident-source CTE but select different evidence and schemas. Reviewed pair: src/omi_collector/operator_status.py:307-325 ~ src/omi_collector/operator_status.py:452-467."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "166750b831f0200e0a1c46d52529845d2df2ad746a8306753a845aa8ce16479b",
+      "count": 1,
+      "reason": "Canonical source custody and retained conflict chunks have different counts, byte coordinates and consumer projections. The common relationship CTE is already shared. Reviewed pair: src/omi_collector/operator_status.py:308-325 ~ src/omi_collector/operator_status.py:453-467."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "b2e1fa422cfb212e8d921865e70fc0d3f59cd2823056fed16f5c36806aa60e67",
+      "count": 1,
+      "reason": "Source rows represent physical custody and verified counts; observation rows represent individual READ evidence and chunks. Their joins and coordinate meanings differ. Reviewed pair: src/omi_collector/operator_status.py:307-325 ~ src/omi_collector/operator_status.py:431-449."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "ce3f8240e20035ac1c26f70c3f2cde4e78922cf359c6eaf73a2b426909340df5",
+      "count": 1,
+      "reason": "Framing source and observation inventories use distinct evidence schemas and aggregation units; source identity and READ identity cannot be collapsed into one query. Reviewed pair: src/omi_collector/operator_status.py:308-325 ~ src/omi_collector/operator_status.py:432-449."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "8a652bacda1c122509d732dbee537d84a9bc5339c1ba0767114adf8d04938e80",
+      "count": 1,
+      "reason": "Replay proof root inventory authenticates READY custody, while framing source inventory reports unresolved physical source and tail metadata. Their schemas and failure authorities differ. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1659-1671 ~ src/omi_collector/operator_status.py:308-325."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "8a5ea5b11a9991aaa5bfd4dd0c71b5fd47821d2b3bcdb06ba7b8849df35f9079",
+      "count": 1,
+      "reason": "Active v2 replay proofs authenticate a publication; framing source rows summarize unresolved physical custody. The common StateDB read scope does not imply a common decision. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4015-4027 ~ src/omi_collector/operator_status.py:308-325."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "195599edc3d1ae5775e3f83a36d008b04cf9109e5fb290d5e41d476d512b0b7a",
+      "count": 1,
+      "reason": "ClockCorrection describes legacy clock correction intervals; _FramingSourceRow describes unresolved physical audio custody. Similar immutable field declarations have unrelated domains. Reviewed pair: src/omi_collector/capture/adapters/legacy_clock_import.py:95-106 ~ src/omi_collector/operator_status.py:192-202."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "7b8db3bf77aeac6e61043d4d444c6a696924667a199e84f6ec7863b0e8bcffce",
+      "count": 1,
+      "reason": "_TypedAdmission freezes publication eligibility and digest; _FramingSourceRow projects physical custody for operator status. Their lifecycles and data contracts differ. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:1136-1145 ~ src/omi_collector/operator_status.py:192-202."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "5d7362792a4f0c426c0b1e8e09940144b7ba0e1857b7a83513418fc6349fbf2b",
+      "count": 1,
+      "reason": "Source custody and observation inventories return different row shapes and coordinate semantics; shared readonly database access is already provided by StateDB. Reviewed pair: src/omi_collector/operator_status.py:300-310 ~ src/omi_collector/operator_status.py:424-434."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "e05d798fd3283e960fd308c37e94ddd10c7b9281c6eb162125f9cddfc6b7ba65",
+      "count": 1,
+      "reason": "Canonical source inventory and conflict chunk inventory share the extracted incident-source CTE but project different evidence, grouping and diagnostic results. Reviewed pair: src/omi_collector/operator_status.py:307-340 ~ src/omi_collector/operator_status.py:452-482."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "e87f25a1151845184a0d778593e8f498c834ea8769712d4c750478cdda562c81",
+      "count": 1,
+      "reason": "Source custody decoding validates committed versus verified records and optional source tails, while observation decoding validates READ-relative byte, prefix and chunk extents. Their schemas, bounds and error meanings differ. Reviewed pair: src/omi_collector/operator_status.py:329-380 ~ src/omi_collector/operator_status.py:477-535."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "fc0adec913ed4b67bd784745525088c354efda0167208965274f1ea8d375904b",
+      "count": 1,
+      "reason": "Leg preparation persists a new generation, read bounds, and recovery candidates; interruption changes the current lifecycle and records interrupted recovery. Their SQL effects and transaction errors are distinct."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "1811bec0d3e20471b2d90cbb83cbb8fc743b08b960c447407740090a2551f3c5",
+      "count": 1,
+      "reason": "Unavailable settlement creates a settled gap when the device head passes its frontier; extension only enlarges an already settled gap after a later head advance. They select and update different incidents."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "714c0f164289bdf40d6969a383cf6518097b2cb5e1a7987d451044bb22fee507",
+      "count": 1,
+      "reason": "Writer interruption retains a resumable attempt and resets its read state; quarantine transfers unconfirmed bytes to custody and closes the writer. Their lifecycle transitions and publication effects differ."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "c6fedec8ce86ab6e98567bbb91aac1ab8212c7c9af78cebd0dd5055247f851e8",
+      "count": 1,
+      "reason": "Finishing a read records its DONE evidence and may quarantine an incomplete read; sealing validates an already verified complete source for publication. Their preconditions, return types, and transitions differ."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "e46df9c115e60e85e224497f4b54cd4c59a755d59ad5a3a12ad309b7789cddb8",
+      "count": 1,
+      "reason": "Unavailable settlement uses a fresh device head to mark a gap quarantined; recovered settlement requires a matching independent completed read and records its verified end. Their evidence and SQL updates differ."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "ff940de43d1f267e58b277980b335e02002d9c452e64399c970d8fb7f9796cb9",
+      "count": 1,
+      "reason": "Interrupted recovery records the first alert outcome for a particular unfinished candidate read; unavailable settlement selects gaps overtaken by the device head and also changes incident settlement."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "2ca55d37a11dbed8328c145252e4179c55c7d6837a1e9942cde3334b135f54e6",
+      "count": 1,
+      "reason": "Physical and numbered stages derive artifact IDs from different group identities and projection evidence; their transaction ownership differs. Reviewed pair: src/omi_collector/capture/adapters/physical_stage.py:276-281 ~ src/omi_collector/capture/adapters/ready_bundles.py:3105-3113."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "41058b12192e87de5f2780f7c5ee8632af6e1066c835cfe7732836bb70124b80",
+      "count": 1,
+      "reason": "Stage reservation and final activation each validate their own ledger snapshot before distinct transaction effects; sharing a control wrapper would blur the commit boundary. Reviewed pair: src/omi_collector/capture/adapters/physical_stage.py:283-289 ~ src/omi_collector/capture/adapters/physical_stage.py:523-529."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "654235a41b3439a1b737c3f5066f32fb3d1662cce4284bb6a35f3fd64cfdc0ed",
+      "count": 1,
+      "reason": "Metrics event-field sets and READY ledger-field sets are separate declarative schemas; token normalization masks different fields. Reviewed pair: src/omi_collector/capture/adapters/quality_metrics.py:36-65 ~ src/omi_collector/capture/adapters/ready_bundles.py:312-341."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "0005c84c92ff1f68b37cf946bc82987afd71186e818eaa59952dd89dabb89500",
+      "count": 1,
+      "reason": "Replay coverage reads one source snapshot; publication inventory discovers eligible source IDs. The lookup shape is incidental to distinct operations. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:5193-5201 ~ src/omi_collector/capture/adapters/staging_store.py:871-892."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "04a7abfc4d1177c7f2c4a9b0b6d253d5f0126fcf16a2592f4471e829c2a918f2",
+      "count": 1,
+      "reason": "Physical proof validation and numbered-stage proof validation share SQL table shape but authenticate different descriptors, projections and record lineage. Reviewed pair: src/omi_collector/capture/adapters/physical_stage.py:407-422 ~ src/omi_collector/capture/adapters/ready_bundles.py:3493-3508."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "3401a639f167e7e738848a5dc1852eef55a35f1d1e3a2c482aea1bd4777d6eef",
+      "count": 1,
+      "reason": "Seam validation checks decoded packet evidence and unresolved status; span validation checks full-record alignment and total record count. These are different descriptor invariants. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:849-879 ~ src/omi_collector/capture/adapters/ready_bundles.py:882-902."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "5b3aac97cb585129593d8ef6bed6181c11dcb8bc156a754f166360d11c8a1359",
+      "count": 1,
+      "reason": "Replay coverage reads one source snapshot; publication inventory discovers eligible source IDs. The lookup shape is incidental to distinct operations. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:5098-5106 ~ src/omi_collector/capture/adapters/staging_store.py:871-892."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "804f352985cd1654359c4f8d9a876618dd5debba227559cc0442648879ff9d34",
+      "count": 1,
+      "reason": "Pending attempt inspection blocks a new READ; publication inventory selects sources eligible for READY. The SQL predicates and error contracts are distinct. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:1128-1147 ~ src/omi_collector/capture/adapters/staging_store.py:871-892."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "aaeccff6497e33174448fd3b20fd3b630198ab0d7ce952921332f7a00ebf0c69",
+      "count": 1,
+      "reason": "Draft frontier derives the highest verified draft bound; publication inventory enumerates blocked or sealed sources for later admission. Different outputs and SQL constraints. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:659-678 ~ src/omi_collector/capture/adapters/staging_store.py:871-892."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "b302848b77a6fdd7057b61e6f475ff71010f1815627bedfad7ad1407d119f57c",
+      "count": 1,
+      "reason": "Current admission checks live source snapshots; resumed historical cohort checks the frozen migration custody. Each enforces a different trust boundary. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:2196-2215 ~ src/omi_collector/capture/adapters/ready_bundles.py:4578-4599."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "ba259da3ba9f2bed2c3237cdbd78979fe9c190ae48c9a74b64b9c4623766c0c1",
+      "count": 1,
+      "reason": "Physical continuation evidence and live transfer progress are separate immutable data records with unrelated consumers and fields. Reviewed pair: src/omi_collector/capture/adapters/physical_continuation.py:18-25 ~ src/omi_collector/capture/application/collector.py:158-165."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "c8893f80c6a3307c71b405c38a0d5ecf08b4433abf08d41c5c2a957ecc654f7e",
+      "count": 1,
+      "reason": "Attempt inventory selects active device attempts; publication inventory selects blocked and sealed sources. They guard different lifecycle transitions. Reviewed pair: src/omi_collector/capture/adapters/staging_store.py:1206-1224 ~ src/omi_collector/capture/adapters/staging_store.py:871-892."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "dc4b0c3d8d9aa0f65366ddd162560b69e1f88715076cfbf75d9622af7f7e13ff",
+      "count": 1,
+      "reason": "BLE connect telemetry and physical continuation are separate immutable domain records with unrelated fields, lifetimes, and consumers. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:300-307 ~ src/omi_collector/capture/adapters/physical_continuation.py:18-25."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "f57b42e25b3f48dfdb2b4d9bfb254154dba4e03a5b0f8e4aa8f53c93ec2eb555",
+      "count": 1,
+      "reason": "Current admission checks live source snapshots; resumed historical cohort checks the frozen migration custody. Each enforces a different trust boundary. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:2199-2215 ~ src/omi_collector/capture/adapters/ready_bundles.py:4581-4599."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "34307d7ed28fd12278b5b5251e328d9b4786dd542f2819d2c65e29a43565e0dd",
+      "count": 1,
+      "reason": "Numbered predecessor lookup scans publication ledger; physical predecessor lookup scans import markers and authenticates a descriptor. Their evidence types and checks differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:143-152 ~ src/omi_collector/capture/adapters/ordered_payloads.py:195-202."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "381d0c9ccdb077557182420b245a4d84901f906c7647df0ce4c5439fb2e88a17",
+      "count": 1,
+      "reason": "Required replay receipt lookup fails on missing evidence; optional physical continuation lookup supports several kinds and returns None. Their absence contracts differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_full_replay.py:200-206 ~ src/omi_collector/capture/adapters/physical_continuation.py:35-41."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "416ccf1b85f85a513a4b0059f172adb10afa067b4b93f0acaa560bb97918f0de",
+      "count": 1,
+      "reason": "Both modules retain the previously reviewed local cursor-consumption idiom accepting sqlite.Row or tuples. Sharing a generic cursor module would couple independent staging and quarantine boundaries; this fingerprint changed with nearby imports. Reviewed pair: src/omi_collector/capture/adapters/quarantine.py:66-77 ~ src/omi_collector/capture/adapters/staging_store.py:138-149."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "55cb606fdfbbedd179bef2dd7cc3a068749858b8cad49fbc2370693ec9d261c3",
+      "count": 1,
+      "reason": "Physical predecessor marker matching and GC candidate ledger filtering use different state kinds, identities and failure behavior. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:197-204 ~ src/omi_collector/capture/adapters/ordered_payloads.py:363-371."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "5ac753a02f6d64f4024568f7bae3af6e1412169d3b9f505cf013ec0015076947",
+      "count": 1,
+      "reason": "Ordered physical descriptor includes predecessor ordering and overlap; anchored continuation descriptor authenticates a repeat anchor. Their formats and proof contracts differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:209-219 ~ src/omi_collector/capture/adapters/physical_continuation.py:62-72."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "6aa42de8ee58d8fe639eea8eee55eeedabed39fa47d67e0d1cf6911a7ea51c42",
+      "count": 1,
+      "reason": "Retirement looks up an optional ordered-successor receipt while ledger reader validates optional public READY entries; kinds and validation differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_retirement.py:61-69 ~ src/omi_collector/capture/adapters/ready_ledger.py:16-24."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "7a6bf6af76b87af8e93ae99e418b01f1c42ebff662d44517f1b4eeca8adb81ae",
+      "count": 1,
+      "reason": "Persistent state kinds and the quarantine domain FSM declare distinct vocabularies with unrelated consumers and transitions. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:31-64 ~ src/omi_collector/capture/domain/quarantine_machine.py:20-38."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "b3dcde9d67f1c97508155f1db633a5cc1bef78ab4401a1fa2c1452b0418d7cec",
+      "count": 1,
+      "reason": "Detector matched overlapping lines of the same StateKind enumeration against itself; there are not two implementations. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:32-60 ~ src/omi_collector/capture/adapters/collector_state_db.py:33-61."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "c0a3062e71e748c0f6185e7051668bcc68e3af3b1bc1466b83c73994a3993977",
+      "count": 1,
+      "reason": "Latest predecessor selection requires valid ordered ledger and custody; GC hold detection conservatively identifies only the latest numbered source and has a different failure policy. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:141-152 ~ src/omi_collector/capture/adapters/ordered_payloads.py:359-369."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "d09ea435232681074f7eed01e6aa1def64f72f36a1d395c3360c46744e7a31f3",
+      "count": 1,
+      "reason": "Replay receipt records exact byte-offset overlap and predecessor identity; continuation receipt records completed numbered repeat and last artifact. Distinct durable evidence schemas. Reviewed pair: src/omi_collector/capture/adapters/ordered_full_replay.py:102-109 ~ src/omi_collector/capture/adapters/ready_bundles.py:4146-4153."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "e353fea24feb3ac38f619919612771501f2ae383c2e6470d16c27da4e9ad7d49",
+      "count": 1,
+      "reason": "Publication custody and bounded retirement both reconcile uncertain transactions but inspect different old/proposed states and return different outcomes. Combining retries would obscure their state machines. Reviewed pair: src/omi_collector/capture/adapters/ready_bundles.py:4986-4997 ~ src/omi_collector/capture/adapters/ready_bundles.py:5533-5544."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "ee11e679de36947e4c6c954d772aa6c85bec7275b6ac389e3eecee7f47cf7e7e",
+      "count": 1,
+      "reason": "Boundary ledger validates public entries and preserves artifact order; marker collection filters published physical evidence and rejects duplicate artifacts. Their results and validation differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_boundary.py:17-26 ~ src/omi_collector/capture/adapters/ordered_boundary.py:33-40."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "03d6611db9ee524a1d3ddca46de142da47e3f669bcb02c00014b3c3708dc3fc3",
+      "count": 1,
+      "reason": "Replay receipt lookup requires a specific kind and fails if missing; physical continuation loads multiple evidence kinds and allows absence. Their caller and validation contracts differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_full_replay.py:190-203 ~ src/omi_collector/capture/adapters/physical_continuation.py:28-38."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "1fdc8b8b61c15d7e2fa450a5cd3c60f560116d9423002c6205f19d10a37c18e8",
+      "count": 1,
+      "reason": "Physical retirement state and collector application state represent different lifecycles and effects. Reviewed pair: src/omi_collector/capture/adapters/ordered_retirement.py:22-29 ~ src/omi_collector/capture/application/collector.py:158-165."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "20712aafc973b9d35b0d9ba8cd5759c527a9db5acd0b98a2818e392d9b332b43",
+      "count": 1,
+      "reason": "Ordered source selection and physical retirement have distinct immutable records, fields and lifecycle ownership. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:25-34 ~ src/omi_collector/capture/adapters/ordered_retirement.py:22-29."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "350c4757603f670aeeb3f8f185cd9578dc367baeb9266064d2a68afc0b1d374c",
+      "count": 1,
+      "reason": "Bootstrap initializes a compaction marker only when absent; pending inspection validates existing debt and actionable retirement. Similar SQLite reads have different effects and results. Reviewed pair: src/omi_collector/capture/adapters/sqlite_compaction.py:104-114 ~ src/omi_collector/capture/adapters/sqlite_compaction.py:57-64."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "809bcbc034c03fa063d32b9b923f616b690c1287e05b8e9a0bf26d006f87e026",
+      "count": 1,
+      "reason": "Replay receipt lookup requires a receipt; READY ledger lookup returns optional validated public ledger data. They have different missing and validation semantics. Reviewed pair: src/omi_collector/capture/adapters/ordered_full_replay.py:190-203 ~ src/omi_collector/capture/adapters/ready_ledger.py:12-27."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "837baada3afd037f72f4d372531993ae9730152c1d82c962dbcfb409c8ebf576",
+      "count": 1,
+      "reason": "Physical retirement cursor and physical continuation proof are distinct immutable data records with different identities and lifecycles. Reviewed pair: src/omi_collector/capture/adapters/ordered_retirement.py:22-29 ~ src/omi_collector/capture/adapters/physical_continuation.py:18-25."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "9b67ee9672cf107bc1b1ab689d07a805642b642bcc096693b782664ffd9afd47",
+      "count": 1,
+      "reason": "Physical continuation loads optional evidence of several kinds; READY ledger lookup validates one specific ledger entry. Similar JSON decoding serves different validation contracts. Reviewed pair: src/omi_collector/capture/adapters/physical_continuation.py:28-38 ~ src/omi_collector/capture/adapters/ready_ledger.py:12-27."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "b24f4406e4f399a91d7724f27e0b0e67e7ba4e40eb767640b02938c62be8851b",
+      "count": 1,
+      "reason": "Ordered audio selection and anchored continuation represent different evidence and have distinct source and sequence semantics. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:25-34 ~ src/omi_collector/capture/adapters/physical_continuation.py:18-25."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "b92b49e15f6ba932b51d2012b25ebcf181ff825ed5ae9201c6a1aaa8d5cca620",
+      "count": 1,
+      "reason": "BLE observation and physical retirement are unrelated typed records; their matching declarations carry no shared behavior. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:300-307 ~ src/omi_collector/capture/adapters/ordered_retirement.py:22-29."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "c3b37cf55851d977c9b6dbf0eebb21823d8edfcc81b0054492f5adf758d7f027",
+      "count": 1,
+      "reason": "BLE observation and ordered audio payload are unrelated immutable data records; matching typed field declarations do not imply common behavior. Reviewed pair: src/omi_collector/capture/adapters/ble_link_observability.py:300-307 ~ src/omi_collector/capture/adapters/ordered_payloads.py:25-34."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "edc3c9b2d877fc89babf3906fccbbb399fa21680830176a59c372bba6f4aa9c9",
+      "count": 1,
+      "reason": "Ordered physical custody and collector application state are independent immutable records, not interchangeable operations. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:25-34 ~ src/omi_collector/capture/application/collector.py:158-165."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "90ccea0f0fa60ae565eabd4a675a24af532c3d58cd8ce4bdc4f17e76ce52fdf0",
+      "count": 1,
+      "reason": "Boundary validation retains v2 ledger entries for chain reconstruction; predecessor selection filters ordered entries and authenticates the latest source custody. Their eligibility rules and results differ despite the shared per-entry validation. Reviewed pair: src/omi_collector/capture/adapters/ordered_boundary.py:24-29 ~ src/omi_collector/capture/adapters/ordered_payloads.py:150-155."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "605f80ead835066ebd06058f3be26835c09654510c33df75f8fe2dcc53541299",
+      "count": 1,
+      "reason": "Historical classification decodes the confirmed loss ledger into validated loss facts; ordered replay retrieves a separately validated source receipt for boundary reconstruction. The matching JSON-row reads protect distinct state and have different validation and return contracts. Reviewed pair: src/omi_collector/capture/adapters/historical_reconciliation.py:119-129 ~ src/omi_collector/capture/adapters/ordered_full_replay.py:190-203."
     }
   ]
 }

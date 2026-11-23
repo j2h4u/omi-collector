@@ -14,7 +14,7 @@ from omi_collector.capture.adapters.attempts import SqliteStagedAttempt
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import CaptureSource
 from omi_collector.capture.adapters.staging_contract import AttemptStateError, StagingError
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from staging_test_factory import StagingStore
 
 
@@ -23,7 +23,7 @@ def _store(tmp_path: Path) -> StagingStore:
 
 
 def _record(marker: int) -> bytes:
-    return marker.to_bytes(4, "big") + bytes((marker,)) * (RECORD_SIZE - 4)
+    return marker.to_bytes(4, "big") + bytes((2, 8, marker)) + bytes(RECORD_SIZE - 7)
 
 
 def _seed_quarantine(store: StagingStore, sequence: int = 100) -> tuple[SqliteStagedAttempt, str]:
@@ -31,6 +31,7 @@ def _seed_quarantine(store: StagingStore, sequence: int = 100) -> tuple[SqliteSt
     attempt.prepare_leg(sequence, 1)
     attempt.record_read_begin(ReadBeginNotification(sequence, 1))
     attempt.accept_chunk(sequence, _record(1))
+    assert attempt.finish_read(DoneNotification(0, sequence + 1), RECORD_SIZE)
     source_id = store.quarantine_attempt_source(attempt.attempt_id)
     return attempt, source_id
 

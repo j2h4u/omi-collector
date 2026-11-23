@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from functools import wraps
 from pathlib import Path
@@ -27,6 +28,7 @@ from omi_collector.capture.application.batch_reconciliation import BatchReconcil
 from omi_collector.capture.application.collector import (
     CollectionResult,
     CollectorTimeoutError,
+    FramingRecoveryDeferredError,
     ProgressEvent,
     RingTransferError,
     TransferInterruptedError,
@@ -46,7 +48,12 @@ from omi_collector.capture.application.quality_metrics import (
     SessionQuality,
     utc_timestamp,
 )
-from omi_collector.capture.application.session_lifecycle import OpportunisticOptions, RetryPolicy, SessionPhaseState
+from omi_collector.capture.application.session_lifecycle import (
+    OpportunisticOptions,
+    RetryPolicy,
+    SessionPhaseState,
+    session_retry_outcome,
+)
 from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.ring_protocol import (
     RECORD_SIZE,
@@ -67,7 +74,8 @@ from staging_test_factory import (
 
 
 def _record(value: int) -> bytes:
-    return pack(">I", value) + bytes((value % 256,)) * (RECORD_SIZE - 4)
+    payload = bytes((2, 8, value % 251 + 1))
+    return pack(">I", value) + payload + bytes(RECORD_SIZE - 4 - len(payload))
 
 
 def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
@@ -86,6 +94,11 @@ def _seed_partial(spool: Path, capture_root: Path) -> tuple[StagingStore, Captur
             attempt.prepare_leg(100, 2)
             attempt.record_read_begin(ReadBeginNotification(100, 2))
             attempt.accept_chunk(100, _record(100))
+            attempt.interrupt()
+            attempt.prepare_leg(100, 1)
+            attempt.record_read_begin(ReadBeginNotification(100, 1))
+            attempt.accept_chunk(100, _record(100))
+            assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
             prefix = attempt.checkpoint()
         finally:
             attempt.close(durable=True)
@@ -432,6 +445,12 @@ class _WriterProxy:
             error, self.interrupt_fault = self.interrupt_fault, None
             raise error
         return await self.writer.interrupt()
+
+    async def finish_read(self, done_notice: DoneNotification) -> bool:
+        return await self.writer.finish_read(done_notice)
+
+    async def quarantine_unconfirmed(self) -> DurablePrefixShape:
+        return await self.writer.quarantine_unconfirmed()
 
     async def seal(self, done_notice: DoneNotification) -> SealResultShape | DurableSealShape:
         result = await self.writer.seal(done_notice)
@@ -800,6 +819,199 @@ def _make_reconciler(
         return None
 
     return store, BatchReconciler(store, options, runtime, quarantine)
+
+
+@_async_test
+async def test_short_done_preserves_observation_and_restarts_from_fresh_info(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options(advance=False))
+    old = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    fresh = RingInfo(101, 102, 100, 0, RECORD_SIZE)
+    partial = _record(100) + b"tail"
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            WriteStep(
+                b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big"),
+                (_wire_begin(100, 2), b"\x03" + partial, _wire_done(102)),
+            ),
+            WriteStep(
+                b"\x11" + (101).to_bytes(8, "big") + (1).to_bytes(4, "big"),
+                (_wire_begin(101, 1), _wire_record(101), _wire_done(102)),
+            ),
+        ),
+    )
+    info_calls = 0
+
+    async def info(_session: object) -> RingInfo:
+        nonlocal info_calls
+        info_calls += 1
+        return fresh
+
+    try:
+        assert await reconciler.connected_step(session, old, info, SessionPhaseState("read/reconcile")) == (None, fresh)
+        first_id = runtime.proxies[0].attempt_id
+        source = attempt_source(store, first_id)
+        assert source is not None and source.lifecycle == "blocked"
+        assert await reconciler.connected_step(session, fresh, info, SessionPhaseState("read/reconcile")) == (
+            "collected",
+            fresh,
+        )
+        assert info_calls == 1
+        with closing(sqlite3.connect(store.state_db.path)) as connection:
+            assert connection.execute(
+                "SELECT tail, done FROM capture_observation WHERE source_id=?", (first_id,)
+            ).fetchone() == (b"tail", 1)
+            assert connection.execute(
+                "SELECT prefix_record_count FROM capture_observation WHERE source_id=?", (first_id,)
+            ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT status FROM capture_framing_incident WHERE incident_id=?", (first_id,)
+            ).fetchone() == ("settled",)
+        assert attempt_records(store, first_id) == (_record(100),)
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_independent_full_read_settles_recoverable_short_read(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options(advance=False))
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    command = b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big")
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (
+            WriteStep(command, (_wire_begin(100, 2), _wire_record(100), _wire_done(102))),
+            WriteStep(command, (_wire_begin(100, 2), _wire_record(100), _wire_record(101), _wire_done(102))),
+        ),
+    )
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            None,
+            current,
+        )
+        first_id = runtime.proxies[0].attempt_id
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            "collected",
+            current,
+        )
+        with closing(sqlite3.connect(store.state_db.path)) as connection:
+            assert connection.execute(
+                "SELECT status, settlement_reason FROM capture_framing_incident WHERE incident_id=?", (first_id,)
+            ).fetchone() == ("settled", "independent_complete_read")
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_corrupt_full_read_keeps_observation_and_does_not_advance(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    damaged = bytes([255]) * RECORD_SIZE
+    command = b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big")
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (WriteStep(command, (_wire_begin(100, 2), _wire_record(100), b"\x03" + damaged, _wire_done(102))),),
+    )
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            None,
+            current,
+        )
+        first_id = runtime.proxies[0].attempt_id
+        with closing(sqlite3.connect(store.state_db.path)) as connection:
+            assert connection.execute(
+                "SELECT confirmed_damage, status FROM capture_framing_incident WHERE incident_id=?", (first_id,)
+            ).fetchone() == (1, "unresolved")
+            chunks = cast(
+                list[tuple[bytes]],
+                connection.execute(
+                    "SELECT bytes FROM capture_observation_chunk WHERE source_id=? ORDER BY byte_offset", (first_id,)
+                ).fetchall(),
+            )
+            assert b"".join(row[0] for row in chunks) == damaged
+        assert attempt_records(store, first_id) == (_record(100),)
+        assert session.writes == [command]
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_repeated_corrupt_read_defers_to_session_retry_without_spinning(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    command = b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big")
+    notifications = (_wire_begin(100, 2), b"\x03" + bytes([255]) * (2 * RECORD_SIZE), _wire_done(102))
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1), (WriteStep(command, notifications),) * 2)
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            None,
+            current,
+        )
+        with pytest.raises(FramingRecoveryDeferredError) as error:
+            await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile"))
+        assert session_retry_outcome(error.value, connected=True) == "connected_interrupted"
+        assert session.writes == [command, command]
+        for proxy in runtime.proxies:
+            source = attempt_source(store, proxy.attempt_id)
+            assert source is not None and source.lifecycle == "blocked"
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
+
+
+@_async_test
+async def test_restart_seals_only_with_persisted_successful_done(tmp_path: Path) -> None:
+    def seed() -> tuple[StagingStore, AttemptDescriptor]:
+        store = StagingStore(tmp_path / "spool", tmp_path / "captures")
+        attempt = store.prepare_streaming_attempt(100, 2)
+        try:
+            attempt.prepare_leg(100, 2)
+            attempt.record_read_begin(ReadBeginNotification(100, 2))
+            attempt.accept_chunk(100, _record(100) + _record(101))
+            assert attempt.finish_read(DoneNotification(0, 102), 2 * RECORD_SIZE)
+        finally:
+            attempt.close(durable=True)
+        return store, store.pending_attempts()[0]
+
+    store, descriptor = storage_call(seed)
+    runtime = _Runtime()
+    reconciler = BatchReconciler(store, _options(advance=False), runtime, _ignore_quarantine)
+    reconciler.set_startup_state(descriptor, 102)
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1), ())
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            "collected",
+            current,
+        )
+        assert session.writes == []
+        assert attempt_records(store, descriptor.attempt_id) == (_record(100), _record(101))
+    finally:
+        await _close_real_writers(runtime)
+        await session.close()
 
 
 @_async_test
@@ -1195,12 +1407,12 @@ async def _admit_partial_and_cancel(
         raise
 
 
-async def _disconnect_recovery_before_begin(reconciler: BatchReconciler) -> ScriptedRingSession:
+async def _disconnect_recovery_before_begin(reconciler: BatchReconciler, start: int = 100) -> ScriptedRingSession:
     current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
     session = ScriptedRingSession(
         RingStatus(0, 0, 0, 1),
         (
-            WriteStep(b"\x11" + (101).to_bytes(8, "big") + (1).to_bytes(4, "big")),
+            WriteStep(b"\x11" + start.to_bytes(8, "big") + (102 - start).to_bytes(4, "big")),
             WriteStep(b"\x13"),
         ),
     )
@@ -1208,6 +1420,11 @@ async def _disconnect_recovery_before_begin(reconciler: BatchReconciler) -> Scri
     async def info(_session: object) -> RingInfo:
         return current
 
+    if start == 100:
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            None,
+            current,
+        )
     task = asyncio.create_task(reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")))
     try:
         async with asyncio.timeout(5):
@@ -1235,7 +1452,7 @@ async def test_fresh_recovery_prefix_closes_after_prebegin_disconnect(tmp_path: 
     runtime = _Runtime()
     reconciler = BatchReconciler(store, _options(), runtime, _ignore_quarantine)
     reconciler.set_startup_state(descriptor, 101)
-    session = await _disconnect_recovery_before_begin(reconciler)
+    session = await _disconnect_recovery_before_begin(reconciler, 101)
     try:
         proxy = runtime.proxies[0]
         assert proxy.progress.submitted == 0
@@ -1269,14 +1486,84 @@ async def test_interrupted_prefix_survives_retry_disconnect_before_begin(tmp_pat
         await reconciler.close_visit("recovery_exhausted")
         assert proxy.checkpoint_calls == 0
         source = attempt_source(store, proxy.attempt_id)
-        assert source is not None and source.lifecycle == "sealed_waiting"
+        assert source is not None and source.lifecycle == "blocked"
         assert attempt_records(store, proxy.attempt_id) == (_record(100),)
-        assert closure_rows(store) == [{"next_sequence": 101, "reason": "recovery_exhausted"}]
+        assert closure_rows(store) == []
     finally:
         await _close_real_writers(runtime)
         await first.close()
         if second is not None:
             await second.close()
+
+
+@_async_test
+async def test_advanced_head_quarantines_interrupted_bytes_without_exact_loss(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options())
+    first = await _admit_partial_and_cancel(reconciler, runtime)
+    await reconciler.checkpoint_after_session()
+    source_id = runtime.proxies[0].attempt_id
+    current = RingInfo(101, 102, 100, 0, RECORD_SIZE)
+    session = ScriptedRingSession(RingStatus(0, 0, 0, 1), ())
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            None,
+            current,
+        )
+        source = attempt_source(store, source_id)
+        assert source is not None and source.lifecycle == "blocked"
+        assert session.writes == []
+        assert await asyncio.to_thread(read_confirmed_losses, store.state_db, allow_missing=True) == ()
+        with closing(sqlite3.connect(store.state_db.path)) as connection:
+            assert connection.execute(
+                "SELECT status, settlement_reason FROM capture_framing_incident WHERE incident_id=?", (source_id,)
+            ).fetchone() == ("settled", "device_head_passed_unresolved_frontier")
+        assert attempt_records(store, source_id) == (_record(100),)
+    finally:
+        await _close_real_writers(runtime)
+        await first.close()
+        await session.close()
+
+
+@_async_test
+async def test_interrupted_retry_keeps_divergent_bytes_in_separate_sources(tmp_path: Path) -> None:
+    runtime = _Runtime()
+    store, reconciler = _make_reconciler(tmp_path, runtime, _options(advance=False))
+    first = await _admit_partial_and_cancel(reconciler, runtime)
+    await reconciler.checkpoint_after_session()
+    first_id = runtime.proxies[0].attempt_id
+    current = RingInfo(100, 102, 100, 0, RECORD_SIZE)
+    command = b"\x11" + (100).to_bytes(8, "big") + (2).to_bytes(4, "big")
+    session = ScriptedRingSession(
+        RingStatus(0, 0, 0, 1),
+        (WriteStep(command, (_wire_begin(100, 2), _wire_record(110), _wire_record(111), _wire_done(102))),),
+    )
+
+    async def info(_session: object) -> RingInfo:
+        return current
+
+    try:
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            None,
+            current,
+        )
+        assert session.writes == []
+        assert await reconciler.connected_step(session, current, info, SessionPhaseState("read/reconcile")) == (
+            "collected",
+            current,
+        )
+        second_id = runtime.proxies[1].attempt_id
+        assert first_id != second_id
+        assert attempt_records(store, second_id) == (_record(110), _record(111))
+        assert attempt_records(store, first_id) == (_record(100),)
+    finally:
+        await _close_real_writers(runtime)
+        await first.close()
+        await session.close()
 
 
 @_async_test
@@ -1292,7 +1579,7 @@ async def test_finalize_uses_settled_prefix_after_prebegin_retry_disconnect(tmp_
         result = await reconciler.finalize_active()
         assert result.checkpoint_error is None
         assert result.close_error is None
-        assert result.preserved_source_id == proxy.attempt_id
+        assert result.preserved_source_id == runtime.proxies[1].attempt_id
         assert proxy.checkpoint_calls == 0
         assert not proxy.thread.is_alive()
         assert attempt_records(store, proxy.attempt_id) == (_record(100),)
@@ -1339,6 +1626,7 @@ async def test_queued_read_begin_invalidates_old_prefix_before_new_data(
         await begin
         assert writer.publish(RECORD_SIZE)
         await writer.barrier()
+        assert await writer.finish_read(DoneNotification(0, 102))
         await writer.seal(DoneNotification(0, 102))
     finally:
         release.set()
@@ -1360,7 +1648,8 @@ async def test_close_visit_after_interrupted_leg_publishes_ack_without_second_ch
     try:
         interrupted = proxy.settled_prefix
         assert interrupted is not None
-        assert interrupted.record_count == 1
+        assert interrupted.record_count == 0
+        assert interrupted.has_unconfirmed
 
         await reconciler.close_visit(reason)
 
@@ -1369,12 +1658,12 @@ async def test_close_visit_after_interrupted_leg_publishes_ack_without_second_ch
         assert reconciler._state.batch is None
         source = attempt_source(store, proxy.attempt_id)
         assert source is not None
-        assert source.lifecycle == "sealed_waiting"
+        assert source.lifecycle == "interrupted"
         assert source.committed_count == 1
         assert attempt_records(store, proxy.attempt_id) == (_record(100),)
-        assert closure_rows(store) == [{"next_sequence": 101, "reason": reason}]
+        assert closure_rows(store) == []
         await reconciler.close_visit(reason)
-        assert closure_rows(store) == [{"next_sequence": 101, "reason": reason}]
+        assert closure_rows(store) == []
     finally:
         await asyncio.gather(*(item.writer.close() for item in runtime.proxies), return_exceptions=True)
         assert all(not item.thread.is_alive() for item in runtime.proxies)
@@ -1413,14 +1702,15 @@ async def test_checkpoint_after_interrupted_leg_adopts_ack_without_second_checkp
     try:
         interrupted = proxy.settled_prefix
         assert interrupted is not None
-        assert interrupted.record_count == 1
+        assert interrupted.record_count == 0
+        assert interrupted.has_unconfirmed
         assert proxy.checkpoint_calls == 0
 
         await reconciler.checkpoint_after_session()
 
         assert proxy.checkpoint_calls == 0
         assert reconciler.pending_durable_next == interrupted.next_sequence
-        assert reconciler.durable_progress() == interrupted.next_sequence
+        assert reconciler.durable_progress() == 0
     finally:
         await _close_real_writers(runtime)
         await session.close()

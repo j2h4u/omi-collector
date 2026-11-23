@@ -21,6 +21,7 @@ from ..domain.internal_audio_machine import (
     AudioAction,
     AudioEvent,
     AudioPhase,
+    AuthenticatedConflict,
     Create,
     Data,
     Done,
@@ -31,6 +32,7 @@ from ..domain.internal_audio_machine import (
     ReadBegin,
     transition,
 )
+from ..domain.opus_duration import inspect_mono_20ms_record
 from ..domain.quarantine_disposition import classify_conflict
 from .clock_segments import ClockSegmentMap
 from .collector_state_db import (
@@ -43,6 +45,7 @@ from .collector_state_db import (
     raise_if_sqlite_corrupt,
     raise_if_sqlite_storage_fault,
 )
+from .damage_alerts import enroll_new_damage_incident, record_damage_outcome, record_interrupted_recovery
 
 __all__ = [
     "AUDIO_PAYLOAD_SIZE",
@@ -186,6 +189,14 @@ class DrainCheckpoint:
     leg_generation: int
     tail: CaptureTail | None = None
     expected_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _UnconfirmedDrain:
+    records: tuple[bytes, ...]
+    tail: CaptureTail | None
+    confirmed_damage: bool = True
+    conflict_candidate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -645,8 +656,8 @@ class InternalAudioStore:
         count = _uint32(count, "leg count")
         if count == 0 or start < source.sequence_start or start + count > source.sequence_limit:
             raise InternalAudioStoreError("leg is outside the immutable source range")
-        if start > source.sequence_start + source.committed_count:
-            raise InternalAudioStoreError("leg starts after the durable frontier")
+        if start > source.sequence_start + self.confirmed_count(source.source_id):
+            raise InternalAudioStoreError("leg starts after the confirmed frontier")
         if source.lifecycle == AudioPhase.PREPARED.value and (
             start != source.sequence_start or start + count != source.sequence_limit
         ):
@@ -679,6 +690,16 @@ class InternalAudioStore:
                     count,
                     source.source_id,
                 ),
+            )
+            connection.execute(
+                "INSERT INTO capture_read_leg(source_id,leg_generation,read_start,read_count,baseline_count) VALUES (?,?,?,?,?)",
+                (source.source_id, generation, encode_uint64(start), count, self.confirmed_count(source.source_id)),
+            )
+            connection.execute(
+                "INSERT INTO capture_recovery_candidate(incident_id,source_id,leg_generation) "
+                "SELECT incident_id,?,? FROM capture_framing_incident "
+                "WHERE status='unresolved' AND incident_id != ?",
+                (source.source_id, generation, source.source_id),
             )
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
@@ -742,6 +763,8 @@ class InternalAudioStore:
                 "UPDATE capture_source SET lifecycle=? WHERE source_id=?",
                 (decision.next_phase.value, source.source_id),
             )
+            if source.read_begin_start is not None:
+                record_interrupted_recovery(connection, source.source_id, source.current_leg_generation)
             self._commit()
         except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
             self._rollback_after_error(error)
@@ -782,6 +805,15 @@ class InternalAudioStore:
             self._check_source_snapshot(connection, source)
             if self._tail_from_connection(connection, source.source_id) is not None:
                 raise InternalAudioStoreError("complete source still has a partial tail")
+            completed = _fetchone(
+                connection.execute(
+                    "SELECT 1 FROM capture_read_leg WHERE source_id=? AND leg_generation=? "
+                    "AND verified_count=? AND done_next=?",
+                    (source.source_id, leg_generation, count, encode_uint64(source.sequence_limit)),
+                )
+            )
+            if completed is None:
+                raise InternalAudioStoreError("source has no matching verified READ completion")
             connection.execute(
                 "UPDATE capture_source SET lifecycle = ? WHERE source_id = ?",
                 (next_phase.value, source.source_id),
@@ -831,6 +863,155 @@ class InternalAudioStore:
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioStoreError("record page read failed") from error
 
+    def commit_checked_drain(
+        self, source_id: str, expected_ordinal: int, records: Iterable[bytes], checkpoint: DrainCheckpoint
+    ) -> int:
+        """Store sound before the first invalid record and preserve subsequent bytes separately."""
+        self._check_writer()
+        raw_records = _bounded_records(records, self.chunk_limit)
+        source = self._require_source(_source_id(source_id))
+        expected = _uint32(expected_ordinal, "expected ordinal")
+        _validate_receiving_leg(source, expected, len(raw_records), checkpoint.leg_generation)
+        _validate_tail(checkpoint.tail, source, expected + len(raw_records))
+        if checkpoint.tail is not None and checkpoint.tail.complete_high_water != expected + len(raw_records):
+            raise InternalAudioStoreError("tail is not at the end of the checked drain")
+        if self._observation_exists(source):
+            return self._append_observation(source, expected, raw_records, checkpoint.tail)
+        if expected < source.committed_count:
+            return self._commit_checked_replay(source, expected, raw_records, checkpoint)
+        if expected != source.committed_count:
+            raise InternalAudioStoreError("drain ordinal is not the committed frontier")
+        previous_tail = self._read_tail(source.source_id)
+        if previous_tail is not None and not raw_records[0].startswith(previous_tail.data):
+            return self._start_replay_observation(
+                source, expected, _UnconfirmedDrain(raw_records, checkpoint.tail, False)
+            )
+        for index, record in enumerate(raw_records):
+            try:
+                inspect_mono_20ms_record(record)
+            except ValueError:
+                return self._append_drain(
+                    source,
+                    expected,
+                    raw_records[:index],
+                    None,
+                    _UnconfirmedDrain(raw_records[index:], checkpoint.tail),
+                )
+        return self.commit_drain(source_id, expected, raw_records, checkpoint)
+
+    def _commit_checked_replay(
+        self, source: CaptureSource, expected: int, records: tuple[bytes, ...], checkpoint: DrainCheckpoint
+    ) -> int:
+        overlap = min(len(records), source.committed_count - expected)
+        fault = self._replay_fault(source, expected, records[:overlap])
+        if fault is not None:
+            index, malformed = fault
+            return self._start_replay_observation(
+                source,
+                expected + index,
+                _UnconfirmedDrain(
+                    records[index:],
+                    checkpoint.tail,
+                    malformed,
+                    not malformed and expected + index < self.confirmed_count(source.source_id),
+                ),
+            )
+        if overlap == len(records):
+            if self._replay_tail_conflicts(source, checkpoint.tail):
+                return self._start_replay_observation(
+                    source, expected + overlap, _UnconfirmedDrain((), checkpoint.tail, False)
+                )
+            return self.commit_drain(source.source_id, expected, records, checkpoint)
+        self.commit_drain(source.source_id, expected, records[:overlap], DrainCheckpoint(checkpoint.leg_generation))
+        return self.commit_checked_drain(source.source_id, expected + overlap, records[overlap:], checkpoint)
+
+    def _replay_tail_conflicts(self, source: CaptureSource, incoming: CaptureTail | None) -> bool:
+        if incoming is None:
+            return False
+        previous = self._read_tail(source.source_id)
+        return (
+            previous is not None
+            and previous.byte_offset == incoming.byte_offset
+            and previous.data[: len(incoming.data)] != incoming.data[: len(previous.data)]
+        )
+
+    def _replay_fault(
+        self, source: CaptureSource, expected: int, records: tuple[bytes, ...]
+    ) -> tuple[int, bool] | None:
+        original = self.read_record_page(source.source_id, expected - 1, len(records))
+        for index, (old, incoming) in enumerate(zip(original, records, strict=True)):
+            try:
+                inspect_mono_20ms_record(incoming)
+                malformed = False
+            except ValueError:
+                malformed = True
+            if malformed or old.raw_bytes != incoming:
+                return index, malformed
+        return None
+
+    def _start_replay_observation(self, source: CaptureSource, expected: int, drain: _UnconfirmedDrain) -> int:
+        """Keep divergent replay bytes without changing the original accepted rows."""
+        connection = self._require_connection()
+        try:
+            self._start_write(connection)
+            self._recheck_source(connection, source)
+            self._insert_observation(connection, source, expected, drain)
+            self._commit()
+        except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            self._rollback_after_error(error)
+            raise_if_sqlite_storage_fault(error)
+            raise InternalAudioStoreError("replay observation was not confirmed durable") from error
+        return source.committed_count
+
+    def _observation_exists(self, source: CaptureSource) -> bool:
+        connection = self._require_connection()
+        return (
+            _fetchone(
+                connection.execute(
+                    "SELECT 1 FROM capture_observation WHERE source_id=? AND leg_generation=?",
+                    (source.source_id, source.current_leg_generation),
+                )
+            )
+            is not None
+        )
+
+    def _append_observation(
+        self, source: CaptureSource, expected: int, records: tuple[bytes, ...], tail: CaptureTail | None
+    ) -> int:
+        connection = self._require_connection()
+        offset = (source.sequence_start + expected - source.current_leg_start) * AUDIO_RECORD_SIZE
+        partial = b"" if tail is None else tail.data
+        payload = b"".join(records)
+        try:
+            self._start_write(connection)
+            self._recheck_source(connection, source)
+            row = _fetchone(
+                connection.execute(
+                    "SELECT received_bytes, tail FROM capture_observation WHERE source_id=? AND leg_generation=?",
+                    (source.source_id, source.current_leg_generation),
+                )
+            )
+            if row is None or _int_value(_value(row, 0)) - len(_bytes(_value(row, 1))) != offset:
+                raise InternalAudioStoreError("observation drain is not contiguous")
+            previous_tail = _bytes(_value(row, 1))
+            if previous_tail and not (payload + partial).startswith(previous_tail):
+                raise InternalAudioStoreError("observation tail conflicts with incoming bytes")
+            if payload:
+                connection.execute(
+                    "INSERT INTO capture_observation_chunk(source_id,leg_generation,byte_offset,bytes) VALUES (?,?,?,?)",
+                    (source.source_id, source.current_leg_generation, offset, payload),
+                )
+            connection.execute(
+                "UPDATE capture_observation SET received_bytes=?, tail=? WHERE source_id=? AND leg_generation=?",
+                (offset + len(payload) + len(partial), partial, source.source_id, source.current_leg_generation),
+            )
+            self._commit()
+        except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            self._rollback_after_error(error)
+            raise_if_sqlite_storage_fault(error)
+            raise InternalAudioStoreError("observation drain was not confirmed durable") from error
+        return source.committed_count
+
     def commit_drain(
         self,
         source_id: str,
@@ -862,12 +1043,20 @@ class InternalAudioStore:
         self._check_writer()
         source = self._require_source(_source_id(source_id))
         expected = _uint32(expected_ordinal, "expected ordinal")
+        if self._observation_exists(source):
+            _validate_receiving_checkpoint(source, expected, checkpoint.leg_generation)
+            _validate_tail(checkpoint.tail, source, expected)
+            if checkpoint.tail is None or checkpoint.tail.complete_high_water != expected:
+                raise InternalAudioStoreError("observation tail checkpoint is invalid")
+            return self._append_observation(source, expected, (), checkpoint.tail)
         if expected != source.committed_count:
             raise InternalAudioStoreError("tail ordinal is not the committed frontier")
         _validate_receiving_checkpoint(source, expected, checkpoint.leg_generation)
         if checkpoint.tail is None:
             raise InternalAudioStoreError("tail checkpoint is missing")
         previous = self._read_tail(source.source_id)
+        if self._replay_tail_conflicts(source, checkpoint.tail):
+            return self._start_replay_observation(source, expected, _UnconfirmedDrain((), checkpoint.tail, False))
         desired = self._resolve_tail(source, previous, checkpoint.tail, source.committed_count, ())
         if desired == previous:
             return source.committed_count
@@ -880,8 +1069,10 @@ class InternalAudioStore:
         expected: int,
         raw_records: tuple[bytes, ...],
         expected_sha256: str | None,
-        tail: CaptureTail | None,
+        tail: CaptureTail | _UnconfirmedDrain | None,
     ) -> int:
+        unconfirmed = tail.records if isinstance(tail, _UnconfirmedDrain) else ()
+        tail = tail.tail if isinstance(tail, _UnconfirmedDrain) else tail
         new_count = expected + len(raw_records)
         if new_count > MAX_PROTOCOL_UINT32 or source.sequence_start + new_count > source.sequence_limit:
             raise InternalAudioStoreError("drain exceeds source range")
@@ -894,7 +1085,11 @@ class InternalAudioStore:
         if expected_sha256 is not None and digest != expected_sha256:
             raise InternalAudioStoreError("drain digest does not match exact source rows")
         previous_tail = self._read_tail(source.source_id)
-        desired_tail = self._resolve_tail(source, previous_tail, tail, new_count, parsed)
+        desired_tail = (
+            self._unconfirmed_tail(previous_tail, parsed, unconfirmed)
+            if unconfirmed
+            else self._resolve_tail(source, previous_tail, tail, new_count, parsed)
+        )
         connection = self._require_connection()
         try:
             self._start_write(connection)
@@ -909,6 +1104,8 @@ class InternalAudioStore:
                 (new_count, digest, source.source_id),
             )
             self._write_tail(connection, source.source_id, desired_tail, previous_tail)
+            if unconfirmed:
+                self._insert_observation(connection, source, new_count, _UnconfirmedDrain(unconfirmed, tail))
             self._commit()
             self._publish_digest(source.source_id, new_count, digest, proposed_digest)
         except InternalAudioStoreError:
@@ -919,10 +1116,309 @@ class InternalAudioStore:
             raise InternalAudioStoreError("drain violates source constraints") from error
         except sqlite3.DatabaseError as error:
             self._rollback_after_error(error)
+            if unconfirmed:
+                raise_if_sqlite_storage_fault(error)
+                raise InternalAudioStoreError("observation transaction was not confirmed durable") from error
             return self._recover_ambiguous(
                 source, expected, parsed, new_count, digest, desired_tail, previous_tail, error
             )
         return new_count
+
+    @staticmethod
+    def _unconfirmed_tail(
+        previous: CaptureTail | None, parsed: tuple[CaptureRecord, ...], records: tuple[bytes, ...]
+    ) -> None:
+        first = parsed[0].raw_bytes if parsed else records[0]
+        if previous is not None and not first.startswith(previous.data):
+            raise InternalAudioStoreError("unconfirmed bytes conflict with previous tail")
+
+    def _incident_for_leg(
+        self, connection: sqlite3.Connection, source: CaptureSource, fault_ordinal: int, drain: _UnconfirmedDrain
+    ) -> str:
+        candidate = _fetchone(
+            connection.execute(
+                "SELECT candidate.incident_id FROM capture_recovery_candidate candidate "
+                "JOIN capture_framing_incident incident ON incident.incident_id=candidate.incident_id "
+                "WHERE candidate.source_id=? AND candidate.leg_generation=? AND incident.status='unresolved' "
+                "AND incident.confirmed_frontier=? ORDER BY candidate.incident_id LIMIT 1",
+                (source.source_id, source.current_leg_generation, encode_uint64(source.current_leg_start)),
+            )
+        )
+        incident_id = source.source_id if candidate is None else str(_value(candidate, 0))
+        existing = _fetchone(
+            connection.execute("SELECT 1 FROM capture_framing_incident WHERE incident_id=?", (incident_id,))
+        )
+        connection.execute(
+            "INSERT INTO capture_framing_incident(incident_id,confirmed_frontier,status,confirmed_damage,conflict_candidate,conflict_frontier) "
+            "VALUES (?,?,'unresolved',?,?,?) ON CONFLICT(incident_id) DO UPDATE SET "
+            "confirmed_damage=MAX(confirmed_damage,excluded.confirmed_damage), "
+            "conflict_candidate=MAX(conflict_candidate,excluded.conflict_candidate), "
+            "conflict_frontier=CASE WHEN conflict_frontier IS NULL THEN excluded.conflict_frontier "
+            "WHEN excluded.conflict_frontier IS NULL THEN conflict_frontier "
+            "ELSE MIN(conflict_frontier,excluded.conflict_frontier) END",
+            (
+                incident_id,
+                encode_uint64(source.sequence_start + self.confirmed_count(source.source_id)),
+                int(drain.confirmed_damage),
+                int(drain.conflict_candidate),
+                encode_uint64(source.sequence_start + fault_ordinal) if drain.conflict_candidate else None,
+            ),
+        )
+        if existing is None:
+            enroll_new_damage_incident(connection, incident_id)
+        return incident_id
+
+    def _insert_observation(
+        self,
+        connection: sqlite3.Connection,
+        source: CaptureSource,
+        fault_ordinal: int,
+        drain: _UnconfirmedDrain,
+    ) -> None:
+        offset = (source.sequence_start + fault_ordinal - source.current_leg_start) * AUDIO_RECORD_SIZE
+        payload = b"".join(drain.records)
+        partial = b"" if drain.tail is None else drain.tail.data
+        incident_id = self._incident_for_leg(connection, source, fault_ordinal, drain)
+        connection.execute(
+            "INSERT INTO capture_observation(source_id,incident_id,leg_generation,read_start,read_count,fault_offset,conflict_frontier,prefix_record_count,received_bytes,tail) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                source.source_id,
+                incident_id,
+                source.current_leg_generation,
+                encode_uint64(source.current_leg_start),
+                source.current_leg_count,
+                offset if drain.confirmed_damage else None,
+                encode_uint64(source.sequence_start + fault_ordinal) if drain.conflict_candidate else None,
+                offset // AUDIO_RECORD_SIZE,
+                offset + len(payload) + len(partial),
+                partial,
+            ),
+        )
+        if payload:
+            connection.execute(
+                "INSERT INTO capture_observation_chunk(source_id,leg_generation,byte_offset,bytes) VALUES (?,?,?,?)",
+                (source.source_id, source.current_leg_generation, offset, payload),
+            )
+
+    def confirmed_count(self, source_id: str) -> int:
+        """Return only the prefix established by a completed independent READ."""
+        connection = self._require_connection()
+        row = _fetchone(
+            connection.execute(
+                "SELECT COALESCE(MAX(verified_count),0) FROM capture_read_leg WHERE source_id=?",
+                (_source_id(source_id),),
+            )
+        )
+        if row is None:
+            raise InternalAudioStoreError("confirmed prefix is unavailable")
+        return _int_value(_value(row, 0))
+
+    def quarantine_unconfirmed(self, source_id: str) -> int:
+        """Keep physical rows and tails in quarantine without assigning positions to them."""
+        self._check_writer()
+        source = self._require_source(_source_id(source_id))
+        decision = transition(_phase(source), AuthenticatedConflict())
+        if decision.action is not AudioAction.BLOCK or decision.next_phase is not AudioPhase.BLOCKED:
+            raise InternalAudioStoreError(decision.reason)
+        confirmed = self.confirmed_count(source.source_id)
+        connection = self._require_connection()
+        try:
+            self._start_write(connection)
+            self._check_source_snapshot(connection, source)
+            self._incident_for_leg(connection, source, confirmed, _UnconfirmedDrain((), None, False))
+            if source.read_begin_start is not None:
+                record_interrupted_recovery(connection, source.source_id, source.current_leg_generation)
+            self._move_to_framing_quarantine(connection, source, "framing_unresolved")
+            self._commit()
+        except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            self._rollback_after_error(error)
+            raise_if_sqlite_storage_fault(error)
+            raise InternalAudioStoreError("provisional evidence was not confirmed durable") from error
+        return confirmed
+
+    @staticmethod
+    def _move_to_framing_quarantine(connection: sqlite3.Connection, source: CaptureSource, reason: str) -> None:
+        connection.execute(
+            "UPDATE capture_source SET source_type='quarantine',lifecycle='blocked',block_reason=?, "
+            "quarantine_disposition='unclassified',quarantine_opaque=0 WHERE source_id=?",
+            (reason, source.source_id),
+        )
+
+    def finish_read(self, source_id: str, done_next: int, received_bytes: int) -> bool:
+        """Persist real DONE and settle whether this leg supplied complete numbered audio."""
+        self._check_writer()
+        source = self._require_source(_source_id(source_id))
+        _validate_receiving_leg(
+            source, source.current_leg_start - source.sequence_start, 1, source.current_leg_generation
+        )
+        if done_next != source.current_leg_start + source.current_leg_count:
+            raise InternalAudioStoreError("DONE does not match the active READ")
+        if type(received_bytes) is not int or not 0 <= received_bytes <= source.current_leg_count * AUDIO_RECORD_SIZE:
+            raise InternalAudioStoreError("READ byte count is invalid")
+        has_fault = self._observation_exists(source)
+        if has_fault or received_bytes != source.current_leg_count * AUDIO_RECORD_SIZE:
+            verified_conflict = has_fault and self._has_verified_replay_conflict(source, received_bytes)
+            self._retain_short_read(source, done_next, received_bytes, verified_conflict)
+            return False
+        confirmed = self.confirmed_count(source.source_id)
+        leg_offset = source.current_leg_start - source.sequence_start
+        if leg_offset > confirmed:
+            raise InternalAudioStoreError("completed READ does not join the confirmed prefix")
+        verified_count = max(confirmed, leg_offset + source.current_leg_count)
+        if verified_count > source.committed_count:
+            raise InternalAudioStoreError("completed READ exceeds retained records")
+        verified_digest = (
+            source.committed_sha256
+            if verified_count == source.committed_count
+            else self._prefix_digest(source.source_id, verified_count)
+        )
+        connection = self._require_connection()
+        try:
+            self._start_write(connection)
+            self._recheck_source(connection, source)
+            updated = connection.execute(
+                "UPDATE capture_read_leg SET received_bytes=?,done_next=?,verified_count=?,verified_sha256=? "
+                "WHERE source_id=? AND leg_generation=? AND done_next IS NULL",
+                (
+                    received_bytes,
+                    encode_uint64(done_next),
+                    verified_count,
+                    verified_digest,
+                    source.source_id,
+                    source.current_leg_generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise InternalAudioStoreError("READ completion was already recorded or has no prepared leg")
+            if has_fault:
+                connection.execute(
+                    "UPDATE capture_observation SET done=1 WHERE source_id=? AND leg_generation=?",
+                    (source.source_id, source.current_leg_generation),
+                )
+            self._commit()
+        except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            self._rollback_after_error(error)
+            raise_if_sqlite_storage_fault(error)
+            raise InternalAudioStoreError("READ completion was not confirmed durable") from error
+        return not has_fault
+
+    def _has_verified_replay_conflict(self, source: CaptureSource, received_bytes: int) -> bool:
+        if received_bytes != source.current_leg_count * AUDIO_RECORD_SIZE:
+            return False
+        connection = self._require_connection()
+        row = _fetchone(
+            connection.execute(
+                "SELECT observation.conflict_frontier, observation.received_bytes, observation.tail "
+                "FROM capture_framing_incident incident JOIN capture_observation observation "
+                "ON observation.incident_id=incident.incident_id WHERE observation.source_id=? AND observation.leg_generation=?",
+                (source.source_id, source.current_leg_generation),
+            )
+        )
+        if row is None or _value(row, 0) is None:
+            return False
+        if _int_value(_value(row, 1)) != received_bytes or _bytes(_value(row, 2)):
+            return False
+        cursor = connection.execute(
+            "SELECT byte_offset,bytes FROM capture_observation_chunk WHERE source_id=? AND leg_generation=? ORDER BY byte_offset",
+            (source.source_id, source.current_leg_generation),
+        )
+        next_offset: int | None = None
+        try:
+            for item in cast(Iterator[sqlite3.Row], cursor):
+                offset, payload = _int_value(_value(item, 0)), _bytes(_value(item, 1))
+                if (next_offset is not None and offset != next_offset) or len(payload) % AUDIO_RECORD_SIZE:
+                    return False
+                for position in range(0, len(payload), AUDIO_RECORD_SIZE):
+                    try:
+                        inspect_mono_20ms_record(payload[position : position + AUDIO_RECORD_SIZE])
+                    except ValueError:
+                        return False
+                next_offset = offset + len(payload)
+        finally:
+            cursor.close()
+        return next_offset == received_bytes
+
+    def _retain_short_read(
+        self, source: CaptureSource, done_next: int, received_bytes: int, verified_conflict: bool
+    ) -> None:
+        connection = self._require_connection()
+        row = _fetchone(
+            connection.execute(
+                "SELECT baseline_count FROM capture_read_leg WHERE source_id=? AND leg_generation=? AND done_next IS NULL",
+                (source.source_id, source.current_leg_generation),
+            )
+        )
+        if row is None:
+            raise InternalAudioStoreError("short READ has no prepared leg")
+        baseline = _int_value(_value(row, 0))
+        tail = self._read_tail(source.source_id)
+        disposition = transition(_phase(source), AuthenticatedConflict())
+        if disposition.action is not AudioAction.BLOCK or disposition.next_phase is not AudioPhase.BLOCKED:
+            raise InternalAudioStoreError(disposition.reason)
+        try:
+            self._start_write(connection)
+            self._recheck_source(connection, source)
+            self._recheck_tail(connection, source.source_id, tail)
+            incident_id = self._retain_short_observation(connection, source, baseline, received_bytes, tail)
+            if verified_conflict:
+                connection.execute(
+                    "UPDATE capture_framing_incident SET verified_conflict=1, "
+                    "confirmed_frontier=MIN(confirmed_frontier,(SELECT conflict_frontier FROM capture_observation "
+                    "WHERE source_id=? AND leg_generation=?)) WHERE incident_id=?",
+                    (source.source_id, source.current_leg_generation, incident_id),
+                )
+            if incident_id != source.source_id:
+                record_damage_outcome(connection, incident_id, "quarantined")
+            reason = "ready_overlap_conflict" if verified_conflict else "framing_unresolved"
+            self._move_to_framing_quarantine(connection, source, reason)
+            connection.execute(
+                "UPDATE capture_read_leg SET received_bytes=?,done_next=? WHERE source_id=? AND leg_generation=?",
+                (received_bytes, encode_uint64(done_next), source.source_id, source.current_leg_generation),
+            )
+            self._commit()
+        except (sqlite3.DatabaseError, InternalAudioStoreError) as error:
+            self._rollback_after_error(error)
+            raise_if_sqlite_storage_fault(error)
+            raise InternalAudioStoreError("short READ evidence was not confirmed durable") from error
+
+    def _retain_short_observation(
+        self,
+        connection: sqlite3.Connection,
+        source: CaptureSource,
+        baseline: int,
+        received_bytes: int,
+        tail: CaptureTail | None,
+    ) -> str:
+        existing = _fetchone(
+            connection.execute(
+                "SELECT incident_id FROM capture_observation WHERE source_id=? AND leg_generation=?",
+                (source.source_id, source.current_leg_generation),
+            )
+        )
+        if existing is not None:
+            connection.execute(
+                "UPDATE capture_observation SET done=1 WHERE source_id=? AND leg_generation=?",
+                (source.source_id, source.current_leg_generation),
+            )
+            return str(_value(existing, 0))
+        incident_id = self._incident_for_leg(connection, source, baseline, _UnconfirmedDrain((), None, False))
+        partial = b"" if tail is None else tail.data
+        connection.execute(
+            "INSERT INTO capture_observation(source_id,incident_id,leg_generation,read_start,read_count,fault_offset,prefix_record_count,received_bytes,tail,done) "
+            "VALUES (?,?,?,?,?,NULL,?,?,?,1)",
+            (
+                source.source_id,
+                incident_id,
+                source.current_leg_generation,
+                encode_uint64(source.current_leg_start),
+                source.current_leg_count,
+                received_bytes // AUDIO_RECORD_SIZE,
+                received_bytes,
+                partial,
+            ),
+        )
+        return incident_id
 
     def validate_source_stream(
         self, records: Iterable[bytes], *, expected_count: int | None = None, expected_sha256: str | None = None

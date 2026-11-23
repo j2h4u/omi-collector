@@ -47,6 +47,7 @@ def _add_source(store: StagingStore, start: int, count: int = 1) -> None:
     attempt.prepare_leg(start, count)
     attempt.record_read_begin(ReadBeginNotification(start, count))
     attempt.accept_chunk(start, b"".join(_record(sequence) for sequence in range(start, start + count)))
+    assert attempt.finish_read(DoneNotification(0, start + count), count * AUDIO_RECORD_SIZE)
     attempt.seal(DoneNotification(0, start + count))
     attempt.close()
 
@@ -63,6 +64,7 @@ def _insert_source(audio_store: InternalAudioStore, source_id: str, start: int, 
         (raw[offset : offset + AUDIO_RECORD_SIZE] for offset in range(0, len(raw), AUDIO_RECORD_SIZE)),
         DrainCheckpoint(1, expected_sha256=digest),
     )
+    assert audio_store.finish_read(source_id, start + count, len(raw))
     audio_store.seal_source(
         source_id,
         leg_generation=1,

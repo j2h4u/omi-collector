@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import closing
-from hashlib import sha256
 from pathlib import Path
 from struct import pack
 from typing import cast
@@ -15,7 +14,6 @@ from omi_collector.capture.adapters.collector_state_db import StateDB
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_PAYLOAD_SIZE,
     AUDIO_RECORD_SIZE,
-    DrainCheckpoint,
     InternalAudioStore,
 )
 from omi_collector.capture.adapters.ready_bundles import (
@@ -25,6 +23,7 @@ from omi_collector.capture.adapters.ready_bundles import (
 )
 from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.config import ReadyConfig
+from test_public_audio_v2_integration import _source as _verified_source
 
 _FILLER_RECORDS = 20_000
 _FREE_ABOVE_HEADROOM = 5 * 1024 * 1024
@@ -52,21 +51,8 @@ def _inflate_unrelated_audio(store: InternalAudioStore) -> None:
 
 
 def _sealed_source(store: InternalAudioStore) -> SqlitePublicationSource:
-    source_id = "a" * 32
     raw = _record(100, 1)
-    source = store.create_source(source_id, "attempt", 100, 101)
-    source = store.prepare_leg(source_id, 100, 1)
-    store.record_read_begin(source_id, 100, 1)
-    store.commit_drain(source_id, 0, (raw,), DrainCheckpoint(source.current_leg_generation))
-    committed = store.get_source(source_id)
-    assert committed is not None
-    store.seal_source(
-        source_id,
-        leg_generation=committed.current_leg_generation,
-        expected_count=1,
-        expected_sha256=sha256(raw).hexdigest(),
-    )
-    return SqlitePublicationSource(store, source_id)
+    return _verified_source(store, "a" * 32, 100, (raw,))
 
 
 @pytest.mark.parametrize("split_filesystem", [False, True], ids=["shared-device", "split-devices"])

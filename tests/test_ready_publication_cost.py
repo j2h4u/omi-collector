@@ -15,6 +15,7 @@ from typing import BinaryIO, TextIO, cast
 import pytest
 
 from omi_collector.capture.adapters import collector_state_db, ready_bundles
+from omi_collector.capture.adapters.attempts import SqliteStagedAttempt
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
 from omi_collector.capture.adapters.ready_bundles import ReadyBundleError, ReadyBundleResult, ReadyOutcomeState
@@ -66,10 +67,27 @@ def _add_source(store: StagingStore, start: int, count: int) -> tuple[str, bytes
     attempt.prepare_leg(start, count)
     attempt.record_read_begin(ReadBeginNotification(start, count))
     attempt.accept_chunk(start, raw)
+    assert attempt.finish_read(DoneNotification(0, start + count), len(raw))
     attempt.seal(DoneNotification(0, start + count))
     attempt_id = attempt.attempt_id
     attempt.close()
     return attempt_id, raw
+
+
+def _verified_prefix_with_tail(store: StagingStore, count: int) -> tuple[SqliteStagedAttempt, bytes]:
+    attempt = store.prepare_streaming_attempt(100, count + 1)
+    attempt.prepare_leg(100, count + 1)
+    attempt.interrupt()
+    attempt.prepare_leg(100, count)
+    attempt.record_read_begin(ReadBeginNotification(100, count))
+    raw = b"".join(_record(sequence) for sequence in range(100, 100 + count))
+    attempt.accept_chunk(100, raw)
+    assert attempt.finish_read(DoneNotification(0, 100 + count), len(raw))
+    attempt.interrupt()
+    attempt.prepare_leg(100 + count, 1)
+    attempt.record_read_begin(ReadBeginNotification(100 + count, 1))
+    attempt.accept_chunk(100 + count, b"", b"retained-tail")
+    return attempt, raw
 
 
 def _add_quarantine_residue(store: StagingStore, source_id: str) -> None:
@@ -130,6 +148,22 @@ def _source_canonical_custody(store: StagingStore, source_id: str) -> tuple[int,
         )
     assert row is not None
     return cast(tuple[int, int, int], tuple(row))
+
+
+def _assert_retained_prefix_tail(store: StagingStore, source_id: str, raw: bytes) -> None:
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        rows = cast(
+            list[tuple[int, bytes]],
+            connection.execute(
+                "SELECT device_timestamp,payload FROM capture_record WHERE source_id=? ORDER BY ordinal", (source_id,)
+            ).fetchall(),
+        )
+        tail = cast(
+            tuple[bytes] | None,
+            connection.execute("SELECT bytes FROM capture_tail WHERE source_id=?", (source_id,)).fetchone(),
+        )
+    assert b"".join(timestamp.to_bytes(4, "big") + payload for timestamp, payload in rows) == raw
+    assert tail is not None and tail[0] == b"retained-tail"
 
 
 def _assert_v2_artifact(result: ReadyBundleResult, *, record_count: int = 1, next_sequence: int = 101) -> None:
@@ -200,9 +234,7 @@ def test_retirement_reuses_authenticated_custody_and_keeps_immediate_progress(
     assert proof is not None and proof[0] == "active" and proof[1] == record_count
 
 
-def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_retirement_retains_unresolved_tail_after_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_000_000_000
     monkeypatch.setattr("omi_collector.capture.adapters.quarantine._wall_clock_ns", lambda: now)
     config = CollectorConfig(
@@ -219,11 +251,7 @@ def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
         publication_root=ready,
         config=config,
     )
-    attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.prepare_leg(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    raw = _record(100)
-    attempt.accept_chunk(100, raw, b"retained-tail")
+    attempt, raw = _verified_prefix_with_tail(store, 1)
     source_id = store.quarantine_attempt_source(attempt.attempt_id)
     try:
         with closing(store.state_db.open_connection()) as connection:
@@ -246,7 +274,7 @@ def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
         published = store.recover_and_publish()
 
         assert published.state is ReadyOutcomeState.PUBLISHED
-        assert store.retire_covered_raw_page(should_defer=lambda: False)
+        assert not store.retire_covered_raw_page(should_defer=lambda: False)
         generation = store.state_db.get_generation()
 
         stalled = store.recover_and_publish()
@@ -264,23 +292,21 @@ def test_retirement_waits_for_retained_residue_then_resumes_after_expiry(
                 ).fetchone(),
             )
         assert retained is not None and retained.lifecycle == "retiring"
-        assert retirement_state is not None and tuple(retirement_state) == (1, 0)
+        assert retirement_state is not None and tuple(retirement_state) == (0, 0)
 
         now += 1_000_000_000
         assert store.sweep_terminal_quarantine().removed_source_ids == ()
         assert store.state_db.get_generation() == generation
         assert attempt_source(store, source_id) is not None
-        assert _source_canonical_custody(store, source_id) == (1, 0, 0)
-        retirements = 0
-        while store.retire_covered_raw_page(should_defer=lambda: False):
-            retirements += 1
-            assert retirements <= 3
-        assert attempt_source(store, source_id) is None
+        assert _source_canonical_custody(store, source_id) == (1, 1, 0)
+        assert _source_residue(store, source_id) == (1, 0, 1)
+        assert not store.retire_covered_raw_page(should_defer=lambda: False)
+        _assert_retained_prefix_tail(store, source_id, raw)
     finally:
         attempt.close()
 
 
-def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
+def test_expired_unresolved_residue_preserves_an_accepted_cohort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -300,11 +326,7 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
         publication_root=ready,
         config=config,
     )
-    attempt = store.prepare_streaming_attempt(100, 2)
-    attempt.prepare_leg(100, 2)
-    attempt.record_read_begin(ReadBeginNotification(100, 2))
-    raw = _record(100)
-    attempt.accept_chunk(100, raw, b"retained-tail")
+    attempt, raw = _verified_prefix_with_tail(store, 1)
     source_id = store.quarantine_attempt_source(attempt.attempt_id)
     original_materialize = ready_bundles._materialize_v2_stage_with_failure_latch
 
@@ -337,7 +359,7 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
             residue = _source_residue(store, source_id)
             if residue == (0, 0, 0):
                 break
-        assert residue == (0, 0, 0)
+        assert residue == (1, 1, 1)
         assert _source_canonical_custody(store, source_id) == (1, 1, 1)
 
         monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original_materialize)
@@ -349,11 +371,10 @@ def test_expired_quarantine_residue_cleanup_preserves_an_accepted_cohort(
         assert published.state is ReadyOutcomeState.PUBLISHED
         _assert_v2_artifact(published.published[0])
         assert attempt_source(restarted, source_id) is not None
-        retirements = 0
-        while restarted.retire_covered_raw_page(should_defer=lambda: False):
-            retirements += 1
-            assert retirements <= 3
-        assert attempt_source(restarted, source_id) is None
+        assert not restarted.retire_covered_raw_page(should_defer=lambda: False)
+        assert _source_canonical_custody(restarted, source_id) == (1, 1, 0)
+        assert _source_residue(restarted, source_id) == (1, 1, 1)
+        _assert_retained_prefix_tail(restarted, source_id, raw)
     finally:
         attempt.close()
 
@@ -453,7 +474,7 @@ def _hold_ready_output_write(
     return open_output
 
 
-def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart(
+def test_verified_prefix_with_unresolved_tail_stays_in_custody_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -468,16 +489,11 @@ def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
     store = StagingStore.from_paths(bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config)
-    attempt = store.prepare_streaming_attempt(100, 3)
-    attempt.prepare_leg(100, 3)
-    attempt.record_read_begin(ReadBeginNotification(100, 3))
-    raw = _record(100) + _record(101)
+    attempt, raw = _verified_prefix_with_tail(store, 2)
     try:
-        attempt.accept_chunk(100, raw, b"retained-tail")
         source_id = attempt.attempt_id
-        attempt.interrupt()
+        attempt.quarantine_unconfirmed()
         attempt.close(durable=True)
-        store.terminalize_prefix_attempt(source_id)
         _add_quarantine_residue(store, source_id)
 
         admission = store.admit_quarantined_prefix(source_id)
@@ -485,9 +501,9 @@ def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart
         store.append_ready_closure(102, "drained")
         published = store.recover_and_publish()
         assert published.state is ReadyOutcomeState.PUBLISHED
-        assert store.retire_covered_raw_page(should_defer=lambda: False)
+        assert not store.retire_covered_raw_page(should_defer=lambda: False)
         assert attempt_source(store, source_id) is not None
-        assert _source_canonical_custody(store, source_id)[:2] == (1, 1)
+        assert _source_canonical_custody(store, source_id)[:2] == (1, 2)
         assert _source_residue(store, source_id) == (1, 1, 1)
 
         now += 1_000_000_000
@@ -498,12 +514,9 @@ def test_terminalized_prefix_tail_enters_ready_custody_and_retires_after_restart
             restarted.sweep_terminal_quarantine()
             if _source_residue(restarted, source_id) == (0, 0, 0):
                 break
-        assert _source_residue(restarted, source_id) == (0, 0, 0)
-        assert _source_canonical_custody(restarted, source_id)[:2] == (1, 1)
-        retirements = 0
-        while restarted.retire_covered_raw_page(should_defer=lambda: False):
-            retirements += 1
-            assert retirements <= 3
-        assert attempt_source(restarted, source_id) is None
+        assert _source_residue(restarted, source_id) == (1, 1, 1)
+        assert _source_canonical_custody(restarted, source_id)[:2] == (1, 2)
+        assert not restarted.retire_covered_raw_page(should_defer=lambda: False)
+        _assert_retained_prefix_tail(restarted, source_id, raw)
     finally:
         attempt.close()

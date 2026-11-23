@@ -70,6 +70,7 @@ class _Batch:
     writer: BatchWriterPort
     durable: DurablePrefixShape | None = None
     seal: SealResultShape | DurableSealShape | None = None
+    done_notice: DoneNotification | None = None
 
     @property
     def count(self) -> int:
@@ -78,6 +79,13 @@ class _Batch:
 
 class _ReconcileRestart:
     """A preserved attempt requires a fresh INFO before collection resumes."""
+
+
+class _ReadIncident:
+    """A terminal READ was preserved but cannot establish its requested range."""
+
+    def __init__(self, *, failed_read: bool) -> None:
+        self.failed_read = failed_read
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +103,7 @@ class _State:
     pending_descriptor: AttemptDescriptorShape | None = None
     pending_durable_next: int | None = None
     visit_frontier: int | None = None
+    incident_head: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +189,7 @@ class BatchReconciler:
                 raise RuntimeError("drained visit lacks its confirmed cursor")
         elif drain_cursor is not None:
             raise RuntimeError("nondrained visit carries a confirmed cursor")
+        self._state.incident_head = None
         batch = self._state.batch
         if batch is None:
             # Startup recovery may have found a published prefix marker or an
@@ -324,6 +334,8 @@ async def _run_connected_step(
         phase.value = "info"
         _check_stop_intent(context.run.options.stop_intent)
         current = await info(session)
+    if current.read_sequence <= current.write_sequence:
+        await joined_to_thread(context.run.staging.settle_unavailable_framing, current)
     phase.value = "read/reconcile"
     run = context.run
     state = context.state
@@ -338,11 +350,17 @@ async def _run_connected_step(
 
     if batch.seal is None:
         reconciled = await _read_and_seal(context, session, current, batch, phase)
-        if reconciled is None:
+        if reconciled is None or isinstance(reconciled, _ReadIncident):
             phase.value = "info"
             _check_stop_intent(run.options.stop_intent)
             fresh = await info(session)
-            return await _run_connected_step(context, session, fresh, info=info, phase=phase)
+            await joined_to_thread(run.staging.settle_unavailable_framing, fresh)
+            _check_incident_progress(state, reconciled, current, fresh)
+            return (
+                (None, fresh)
+                if isinstance(reconciled, _ReadIncident)
+                else await _run_connected_step(context, session, fresh, info=info, phase=phase)
+            )
         if not run.options.policy.advance_enabled:
             await _complete_batch(
                 state,
@@ -353,11 +371,22 @@ async def _run_connected_step(
         phase.value = "advance"
         return await _advance_batch(context, session, current, batch, info=info)
 
+    await joined_to_thread(run.staging.settle_recovered_framing, batch.writer.attempt_id)
     if not run.options.policy.advance_enabled:
         await _complete_batch(state, batch, advance_confirmed=False)
         return "collected", current
     phase.value = "advance"
     return await _advance_batch(context, session, current, batch, info=info)
+
+
+def _check_incident_progress(
+    state: _State, result: bool | _ReadIncident | None, current: RingInfo, fresh: RingInfo
+) -> None:
+    if isinstance(result, _ReadIncident) and result.failed_read:
+        previous_head = state.incident_head
+        state.incident_head = current.read_sequence
+        if previous_head == current.read_sequence == fresh.read_sequence:
+            raise collector.FramingRecoveryDeferredError("repeated READ did not resolve the framing incident")
 
 
 async def _ensure_batch(current: RingInfo, run: _Run, state: _State) -> _Batch | None:
@@ -485,20 +514,26 @@ async def _read_and_seal(
     current: RingInfo,
     batch: _Batch,
     phase: SessionPhaseState,
-) -> bool | None:
+) -> bool | _ReadIncident | None:
     run = context.run
     reconciliation = await _read_or_reconcile(session, current, batch, run, phase)
     if isinstance(reconciliation, _PrefixPublished):
         await _continue_after_prefix(context.state, batch, reconciliation, run.options)
         return None
+    if isinstance(reconciliation, _ReadIncident):
+        await batch.writer.close()
+        _continue_after_reconcile_restart(context.state)
+        return reconciliation
     if isinstance(reconciliation, _ReconcileRestart):
         _continue_after_reconcile_restart(context.state)
         return None
+    context.state.incident_head = None
     prefix = batch.durable
     if prefix is None:
         raise CursorConsistencyError("writer checkpoint did not return a durable prefix")
     if prefix.next_sequence != batch.end:
         raise CursorConsistencyError("READ did not produce the bounded batch prefix")
+    done_notice = _observed_done(batch, prefix)
     public_drain = run.options.public_drain
     if public_drain is not None and prefix.next_sequence == batch.end:
         await joined_to_thread(public_drain.arm_pending, batch.writer.attempt_id, batch.end)
@@ -506,14 +541,24 @@ async def _read_and_seal(
     batch_machine.transition(seal_precondition, batch_machine.Event.SEAL_REQUEST)
     await _report_activity(run.options.activity, "sealing")
     try:
-        sealed = await batch.writer.seal(DoneNotification(0, batch.end))
+        sealed = await batch.writer.seal(done_notice)
     except BaseException as error:
         if run.runtime.is_writer_failed(error):
             _raise_writer_cause(batch.writer, error)
         raise
     batch_machine.transition(seal_precondition, batch_machine.Event.SEAL)
     batch.seal = sealed
+    await joined_to_thread(run.staging.settle_recovered_framing, batch.writer.attempt_id)
     return current.read_sequence == batch.end
+
+
+def _observed_done(batch: _Batch, prefix: DurablePrefixShape) -> DoneNotification:
+    if batch.done_notice is not None:
+        return batch.done_notice
+    done_next = prefix.done_next
+    if done_next is None or done_next != batch.end:
+        raise CursorConsistencyError("completed batch has no observed DONE")
+    return DoneNotification(0, done_next)
 
 
 async def _advance_batch(
@@ -579,7 +624,7 @@ async def _read_or_reconcile(
     batch: _Batch,
     run: _Run,
     phase: SessionPhaseState,
-) -> _PrefixPublished | _ReconcileRestart | None:
+) -> _PrefixPublished | _ReconcileRestart | _ReadIncident | None:
     options = run.options
     prefix = batch.durable
     if prefix is None:
@@ -595,11 +640,9 @@ async def _read_or_reconcile(
     if current.write_sequence < batch.end:
         await _quarantine_discontinuous_attempt(run, batch)
         return _ReconcileRestart()
-    if cursor > prefix.next_sequence:
-        return await _publish_cursor_ahead(current, batch, run, prefix.next_sequence, phase.quality)
-    if cursor == batch.end:
-        return None
-    if prefix.next_sequence == batch.end:
+    if prefix.has_unconfirmed or cursor > prefix.next_sequence:
+        return await _reconcile_cursor_ahead(current, batch, run, prefix, phase.quality)
+    if batch.end in (cursor, prefix.next_sequence):
         return None
     # A prior process may have sealed/persisted all bytes before ADVANCE was
     # observed. Fresh INFO still governs; replaying the exact range is
@@ -607,11 +650,26 @@ async def _read_or_reconcile(
     await _report_activity(options.activity, "reading")
     read_start = max(cursor, prefix.next_sequence)
     await joined_to_thread(run.staging.require_capture_space, batch.end - read_start)
-    await _read_leg_with_progress(session, batch, read_start, options, phase.quality)
+    result = await _read_leg_with_progress(session, batch, read_start, options, phase.quality)
+    if not result.healthy:
+        return _ReadIncident(failed_read=True)
+    batch.done_notice = result.done_notice
     prefix = await _checkpoint_batch(batch)
     if current.read_sequence > prefix.next_sequence:
         raise CursorConsistencyError("device cursor passed the writer checkpoint")
     return None
+
+
+async def _reconcile_cursor_ahead(
+    current: RingInfo, batch: _Batch, run: _Run, prefix: DurablePrefixShape, quality: SessionQuality | None
+) -> _ReadIncident | _PrefixPublished:
+    if prefix.has_unconfirmed:
+        await batch.writer.quarantine_unconfirmed()
+        return _ReadIncident(failed_read=False)
+    if await joined_to_thread(run.staging.has_framing_uncertainty, prefix.next_sequence, current.read_sequence):
+        await joined_to_thread(run.staging.extend_uncertain_framing, prefix.next_sequence, current)
+        return _PrefixPublished(await batch.writer.publish_prefix())
+    return await _publish_cursor_ahead(current, batch, run, prefix.next_sequence, quality)
 
 
 async def _read_leg_with_progress(

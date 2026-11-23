@@ -14,6 +14,7 @@ from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDBError, StateKind
 from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
 from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
+from omi_collector.capture.domain.public_audio_v2 import FrozenPublicTime
 from omi_collector.capture.domain.publication_recovery import (
     CohortFact,
     CommitEvidence,
@@ -188,8 +189,9 @@ def _adapter_case(
     calls: list[str] = []
     state_db = _StateDB(calls, responses, database_failure)
     store = SimpleNamespace(state_db=state_db)
-    frontier = object()
-    initial_frontier = object()
+    time = FrozenPublicTime("unknown", 100, None, "test", False)
+    frontier = ready_bundles._V2Frontier(20, time, None)
+    initial_frontier = ready_bundles._V2Frontier(19, time, None, "physical-marker")
     group = SimpleNamespace(final_frontier=frontier, initial_frontier=initial_frontier)
     stage = SimpleNamespace(
         artifact_id="artifact",
@@ -210,7 +212,14 @@ def _adapter_case(
         all_complete=False,
     )
     monkeypatch.setattr(ready_bundles, "_require_v2_destination", lambda *_args: calls.append("destination"))
-    monkeypatch.setattr(ready_bundles, "_v2_frontier_payload", lambda item: "final" if item is frontier else "old")
+
+    def frontier_payload(item: ready_bundles._V2Frontier) -> str:
+        if item is frontier:
+            return "final"
+        assert item == replace(initial_frontier, physical_marker=None)
+        return "old"
+
+    monkeypatch.setattr(ready_bundles, "_v2_frontier_payload", frontier_payload)
 
     def inspect_source(_audio_store: object, _source_id: str) -> tuple[str]:
         calls.append("source")

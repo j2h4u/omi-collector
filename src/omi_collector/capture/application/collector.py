@@ -78,6 +78,10 @@ class RingTransferError(CollectorError):
     """The notification stream violated the bounded transfer contract."""
 
 
+class FramingRecoveryDeferredError(CollectorError):
+    """Repeated ordinary reads made no progress on an unresolved range."""
+
+
 class RingAdvanceError(CollectorError):
     """An ADVANCE command was not confirmed."""
 
@@ -227,6 +231,8 @@ class ReadLegResult:
     submitted_bytes: int = 0
     written_bytes: int = 0
     progress: ProgressEvent | None = None
+    done_notice: DoneNotification | None = None
+    healthy: bool = False
 
     @property
     def counters(self) -> TransferCounters:
@@ -259,6 +265,8 @@ class IngestWriter(Protocol):
 
     async def interrupt(self) -> object: ...
 
+    async def finish_read(self, done_notice: DoneNotification) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class _LegBaselines:
@@ -282,6 +290,7 @@ class _IngestState:
     latest_progress: ProgressEvent | None = None
     failure_message: str = "READ interrupted"
     failure_cause: BaseException | None = None
+    done_notice: DoneNotification | None = None
 
 
 async def probe(session: RingSession) -> RingStatus:
@@ -375,7 +384,7 @@ async def read_leg(
         raise RingTransferError("READ ended without terminal DONE")
     # These waits are intentionally after DONE.  READ_BEGIN remains ordered
     # ahead of the barrier in the writer's command queue.
-    await _finish_read(state, arena, writer)
+    healthy = await join_owned(_settle_terminal_read(state, arena, writer))
     counters = _leg_counters(arena, writer, baselines)
     return ReadLegResult(
         start,
@@ -385,6 +394,8 @@ async def read_leg(
         submitted_bytes=counters.submitted_bytes,
         written_bytes=counters.written_bytes,
         progress=state.latest_progress,
+        done_notice=state.done_notice,
+        healthy=healthy,
     )
 
 
@@ -533,8 +544,13 @@ def _consume_notification(
     elif event is batch_machine.ReadEvent.DATA:
         _consume_data(payload, state, arena, writer)
     elif event is batch_machine.ReadEvent.DONE:
-        _validate_done(parse_done_notification(payload), arena, state.start, state.count)
-        _publish_progress(state, arena, terminal=True)
+        done = parse_done_notification(payload)
+        _validate_done(done, state.start, state.count)
+        state.done_notice = done
+        if arena.leg_received_bytes == state.count * RECORD_SIZE:
+            _publish_progress(state, arena, terminal=True)
+        else:
+            state.progress_mailbox.finish()
     else:
         raise AssertionError("read notification event has no parser")
     state.phase = decision.next_phase
@@ -637,7 +653,7 @@ async def _handle_read_cancelled(
     if state.phase is batch_machine.ReadPhase.DONE:
         # DONE admitted the writer barrier. Settle it without issuing STOP; the
         # caller still propagates cancellation and cannot seal or ADVANCE.
-        await join_owned(_finish_read(state, arena, writer, cancelled=True))
+        await join_owned(_settle_terminal_read(state, arena, writer, cancelled=True))
         return
     _move_read(state, selected, batch_machine.ReadAction.STOP)
     interrupted = await _interrupt(session, state, arena, writer, options)
@@ -770,6 +786,14 @@ async def _finish_read(
     return result
 
 
+async def _settle_terminal_read(
+    state: _IngestState, arena: TransferArena, writer: IngestWriter, *, cancelled: bool = False
+) -> bool:
+    await _finish_read(state, arena, writer, cancelled=cancelled)
+    assert state.done_notice is not None
+    return await writer.finish_read(state.done_notice)
+
+
 async def _await_writer_barrier(writer: IngestWriter) -> object:
     return await writer.barrier()
 
@@ -792,13 +816,11 @@ async def _stop_best_effort(session: RingSession, timeout: float | None) -> None
         return
 
 
-def _validate_done(done: DoneNotification, arena: TransferArena, start: int, count: int) -> None:
+def _validate_done(done: DoneNotification, start: int, count: int) -> None:
     if not done.is_ok:
         raise RingTransferError(f"DONE reported nonzero status {done.status}")
     if done.next_sequence != start + count:
         raise RingTransferError("DONE next sequence does not match requested range")
-    if arena.leg_received_bytes != count * RECORD_SIZE or arena.leg_complete_records != count:
-        raise RingTransferError("DONE arrived before all requested records")
 
 
 def _publish_progress(state: _IngestState, arena: TransferArena, *, terminal: bool = False) -> None:

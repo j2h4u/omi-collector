@@ -14,12 +14,20 @@ import pytest
 
 import omi_collector.operator_status as status_module
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
-from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossLedger, read_confirmed_losses
+from omi_collector.capture.adapters.confirmed_loss import (
+    ConfirmedLossLedger,
+    read_confirmed_losses,
+)
 from omi_collector.capture.adapters.debug_logging import (
     write_runtime_status_event,
 )
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
-from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import (
+    AUDIO_RECORD_SIZE,
+    CaptureTail,
+    DrainCheckpoint,
+    InternalAudioStore,
+)
 from omi_collector.capture.adapters.operational_status import OperationalIdentity, OperationalStatusStore
 from omi_collector.capture.adapters.quality_metrics import (
     QualityMetricsError,
@@ -50,6 +58,170 @@ from omi_collector.operator_status import OperatorStatusError, collect_operator_
 from omi_collector.spool_metrics import FirmwareLifetimeMetrics, SpoolMetrics, SpoolWindowMetrics
 from omi_collector.state_migration import open_runtime_state
 from omi_collector.storage_layout import StorageLayout, load_operator_config
+
+
+def _sqlite_row(values: tuple[object, ...]) -> sqlite3.Row:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        row = cast(
+            sqlite3.Row | None,
+            connection.execute("SELECT " + ",".join("?" for _ in values), values).fetchone(),
+        )
+    finally:
+        connection.close()
+    assert row is not None
+    return row
+
+
+def _valid_framing_source_row() -> tuple[object, ...]:
+    return ("incident", "source", (10).to_bytes(8, "big"), 3, 1, (10).to_bytes(8, "big"), 0, None, None, None)
+
+
+def _valid_framing_observation_row() -> tuple[object, ...]:
+    return (
+        "incident",
+        "source",
+        1,
+        1,
+        (10).to_bytes(8, "big"),
+        (10).to_bytes(8, "big"),
+        2,
+        None,
+        2,
+        2 * RECORD_SIZE,
+        0,
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("index", "value"),
+    (
+        (0, 1),
+        (1, None),
+        (2, b"short"),
+        (3, -1),
+        (3, 1.0),
+        (4, -1),
+        (4, 4),
+        (4, "1"),
+        (5, b"short"),
+        (6, 2),
+        (6, 1.0),
+        (7, -1),
+        (7, 1.0),
+        (8, -1),
+        (8, 1.0),
+        (9, 0),
+        (9, RECORD_SIZE),
+        (9, 1.0),
+    ),
+    ids=(
+        "incident-type",
+        "source-type",
+        "sequence-start-encoding",
+        "negative-committed-count",
+        "noninteger-committed-count",
+        "negative-verified-count",
+        "verified-count-exceeds-committed",
+        "noninteger-verified-count",
+        "frontier-encoding",
+        "invalid-conflict-flag",
+        "noninteger-conflict-flag",
+        "negative-tail-generation",
+        "noninteger-tail-generation",
+        "negative-tail-offset",
+        "noninteger-tail-offset",
+        "empty-tail",
+        "oversized-tail",
+        "noninteger-tail-size",
+    ),
+)
+def test_framing_source_decoder_rejects_invalid_persisted_metadata(index: int, value: object) -> None:
+    values = list(_valid_framing_source_row())
+    values[index] = value
+    with pytest.raises(OperatorStatusError, match="framing source metadata is invalid"):
+        status_module._decode_framing_source(_sqlite_row(tuple(values)))
+
+
+@pytest.mark.parametrize("tail", ((1, None, None), (None, 1, None), (None, None, 1)))
+def test_framing_source_decoder_requires_a_complete_tail_reference(tail: tuple[int | None, ...]) -> None:
+    values = list(_valid_framing_source_row())
+    values[7:] = tail
+    with pytest.raises(OperatorStatusError, match="framing source metadata is invalid"):
+        status_module._decode_framing_source(_sqlite_row(tuple(values)))
+
+
+def test_framing_source_decoder_projects_complete_tail_reference() -> None:
+    values = list(_valid_framing_source_row())
+    values[7:] = (1, 20, 17)
+    decoded = status_module._decode_framing_source(_sqlite_row(tuple(values)))
+    assert (decoded.tail_generation, decoded.tail_offset, decoded.tail_size) == (1, 20, 17)
+
+
+def test_framing_source_decoder_rejects_wrong_row_width() -> None:
+    with pytest.raises(OperatorStatusError, match="framing source metadata is invalid"):
+        status_module._decode_framing_source(_sqlite_row(_valid_framing_source_row()[:-1]))
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        (((0, 1),), "framing observation metadata is invalid"),
+        (((1, None),), "framing observation metadata is invalid"),
+        (((2, 1.0),), "framing observation metadata is invalid"),
+        (((3, 2),), "framing observation metadata is invalid"),
+        (((3, 1.0),), "framing observation metadata is invalid"),
+        (((6, 0),), "framing observation metadata is invalid"),
+        (((6, 1.0),), "framing observation metadata is invalid"),
+        (((7, "0"),), "framing observation metadata is invalid"),
+        (((8, -1),), "framing observation metadata is invalid"),
+        (((8, 3),), "framing observation metadata is invalid"),
+        (((8, 1.0),), "framing observation metadata is invalid"),
+        (((9, -1),), "framing observation metadata is invalid"),
+        (((9, 1.0),), "framing observation metadata is invalid"),
+        (((10, -1),), "framing observation metadata is invalid"),
+        (((10, RECORD_SIZE),), "framing observation metadata is invalid"),
+        (((10, 1.0),), "framing observation metadata is invalid"),
+        (((4, b"short"),), "framing observation READ_BEGIN is invalid"),
+        (((5, b"short"),), "framing observation READ_BEGIN is invalid"),
+        (((9, 16), (10, 17)), "framing observation byte extent is invalid"),
+        (((7, 2 * RECORD_SIZE),), "framing observation byte extent is invalid"),
+        (((8, 1), (9, RECORD_SIZE - 1)), "framing observation prefix extent exceeds its READ"),
+        (((11, 1),), "framing observation chunk extent is invalid"),
+        (((12, 0),), "framing observation chunk extent is invalid"),
+        (((11, RECORD_SIZE - 1), (12, 1)), "framing observation chunk extent is outside the READ"),
+        (((11, RECORD_SIZE), (12, 2 * RECORD_SIZE)), "framing observation chunk extent is outside the READ"),
+        (((5, (9).to_bytes(8, "big")),), "framing observation READ_BEGIN precedes its source"),
+    ),
+)
+def test_framing_observation_decoder_rejects_invalid_persisted_metadata(
+    changes: tuple[tuple[int, object], ...], message: str
+) -> None:
+    values = list(_valid_framing_observation_row())
+    for index, value in changes:
+        values[index] = value
+    with pytest.raises(OperatorStatusError, match=message):
+        status_module._decode_framing_row(_sqlite_row(tuple(values)))
+
+
+def test_framing_observation_decoder_projects_partial_tail_and_chunk_ranges() -> None:
+    values = list(_valid_framing_observation_row())
+    values[8] = 1
+    values[9] = 2 * RECORD_SIZE + 17
+    values[10] = 17
+    values[11] = RECORD_SIZE
+    values[12] = RECORD_SIZE
+    row = status_module._decode_framing_row(_sqlite_row(tuple(values)))
+    assert row.tail_range == (2 * RECORD_SIZE, 2 * RECORD_SIZE + 17)
+    assert row.chunk_range == (RECORD_SIZE, 2 * RECORD_SIZE)
+
+
+def test_framing_observation_decoder_rejects_wrong_row_width() -> None:
+    with pytest.raises(OperatorStatusError, match="framing observation row is invalid"):
+        status_module._decode_framing_row(_sqlite_row(_valid_framing_observation_row()[:-1]))
 
 
 def test_legacy_debug_parser_accepts_records_and_rejects_malformed_payload(tmp_path: Path) -> None:
@@ -114,6 +286,7 @@ def test_operator_status_reads_ready_metadata_without_opening_audio(
     source = store.prepare_leg(source_id, 10, 1)
     source = store.record_read_begin(source_id, 10, 1)
     store.commit_drain(source_id, 0, (raw,), DrainCheckpoint(source.current_leg_generation))
+    assert store.finish_read(source_id, 11, AUDIO_RECORD_SIZE) is True
     source = store.get_source(source_id)
     assert source is not None
     store.seal_source(
@@ -218,6 +391,227 @@ def test_operator_status_marks_open_ble_scan_incident_as_attention(tmp_path: Pat
     assert incident["fault_category"] == "host_ble_receive_unavailable"
     assert cast(dict[str, object], incident["bluez"])["devices_count"] == 0
     assert "diagnostics" not in incident
+
+
+def test_operator_status_separates_confirmed_bad_observations_from_unresolved_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    layout.publication.root.mkdir(parents=True)
+    db = _state_db(layout)
+    _operational_status(layout, {})
+    damaged_id, incomplete_id, tail, incomplete_tail = _seed_status_framing_cases(db)
+    with closing(db.open_connection()) as connection, db.access(connection):
+        connection.execute(
+            "INSERT INTO capture_conflict(source_id,chunk_ordinal,leg_generation,absolute_byte_offset,reason,bytes) "
+            "VALUES (?,?,?,?,?,?)",
+            (incomplete_id, 99, 1, 0, "interrupted_provisional", b"x" * 100),
+        )
+
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
+    sql: list[str] = []
+    original_open = StateDB.open_connection
+
+    def traced_open(self: StateDB, *, read_only: bool = False) -> sqlite3.Connection:
+        connection = original_open(self, read_only=read_only)
+        connection.set_trace_callback(sql.append)
+        return connection
+
+    monkeypatch.setattr(StateDB, "open_connection", traced_open)
+    status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+    framing = cast(dict[str, object], status["audio_integrity"])
+
+    assert status["status"] == "attention"
+    _assert_operator_audio_integrity(framing, damaged_id, incomplete_id, tail, incomplete_tail)
+    assert json.dumps(status, sort_keys=True)
+    framing_query = next(statement for statement in sql if "capture_observation AS observation" in statement)
+    assert "length(observation.tail)" in framing_query.lower()
+    assert "length(chunk.bytes)" in framing_query.lower()
+    assert "select chunk.bytes" not in framing_query.lower()
+    conflict_query = next(
+        statement.lower() for statement in sql if "from capture_conflict as conflict" in statement.lower()
+    )
+    assert "length(conflict.bytes)" in conflict_query.lower()
+    assert "select conflict.bytes" not in conflict_query.lower()
+    assert "incident.incident_id=observation.incident_id" in framing_query.lower()
+    assert "where incident.status='unresolved'" in framing_query.lower()
+
+
+def _assert_operator_audio_integrity(
+    framing: dict[str, object], damaged_id: str, incomplete_id: str, tail: bytes, incomplete_tail: bytes
+) -> None:
+    assert framing["confirmed_malformed_observations"] == 1
+    assert framing["unresolved_observation_count"] == 2
+    assert framing["unresolved_conflict_count"] == 1
+    assert (
+        framing["unresolved_retained_storage_bytes"]
+        == 3 * AUDIO_RECORD_SIZE + (3 * AUDIO_RECORD_SIZE + len(tail)) + (2 * len(incomplete_tail)) + 100
+    )
+    observations = cast(list[dict[str, object]], framing["unresolved_observations"])
+    damaged, incomplete = observations
+    assert damaged["local_reference"] == {"source_id": damaged_id, "leg_generation": 1}
+    assert damaged["read_begin"] == {"start_sequence": 100, "packet_count": 5}
+    assert damaged["fault_offset_read_relative"] == AUDIO_RECORD_SIZE
+    assert damaged["prefix_record_count"] == 1
+    assert damaged["prefix_source_relative_byte_range"] == {"start": 0, "end": AUDIO_RECORD_SIZE}
+    assert damaged["retained_raw_bytes"] == 3 * AUDIO_RECORD_SIZE + len(tail)
+    assert damaged["read_relative_byte_ranges"] == [
+        {"start": AUDIO_RECORD_SIZE, "end": 4 * AUDIO_RECORD_SIZE + len(tail)}
+    ]
+    assert incomplete["local_reference"] == {"source_id": incomplete_id, "leg_generation": 1}
+    assert incomplete["fault_offset_read_relative"] is None
+    assert incomplete["prefix_record_count"] == 2
+    assert incomplete["prefix_source_relative_byte_range"] == {"start": 0, "end": 2 * AUDIO_RECORD_SIZE}
+    assert incomplete["retained_raw_bytes"] == len(incomplete_tail)
+    assert incomplete["read_relative_byte_ranges"] == [
+        {"start": 2 * AUDIO_RECORD_SIZE, "end": 2 * AUDIO_RECORD_SIZE + len(incomplete_tail)}
+    ]
+    sources = cast(list[dict[str, object]], framing["unresolved_sources"])
+    damaged_source, incomplete_source = sources
+    assert damaged_source["local_reference"] == {"source_id": damaged_id}
+    assert damaged_source["canonical_unverified_records"] == 1
+    assert damaged_source["canonical_unverified_byte_range"] == {"start": 0, "end": AUDIO_RECORD_SIZE}
+    assert incomplete_source["local_reference"] == {"source_id": incomplete_id}
+    assert incomplete_source["canonical_unverified_records"] == 2
+    assert incomplete_source["canonical_unverified_byte_range"] == {
+        "start": 0,
+        "end": 2 * AUDIO_RECORD_SIZE,
+    }
+    assert cast(dict[str, object], incomplete_source["tail"])["retained_raw_bytes"] == len(incomplete_tail)
+    conflicts = cast(list[dict[str, object]], framing["unresolved_conflicts"])
+    assert any(
+        item["local_reference"] == {"source_id": incomplete_id, "leg_generation": 1}
+        and item["source_relative_byte_ranges"] == [{"start": 0, "end": 100}]
+        for item in conflicts
+    )
+    assert "x" * 100 not in json.dumps(framing)
+    assert "missing_records" not in framing and "end_sequence" not in json.dumps(framing)
+
+
+def test_operator_status_reports_quarantine_source_without_observation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    layout.publication.root.mkdir(parents=True)
+    db = _state_db(layout)
+    _operational_status(layout, {})
+    source_id = "c" * 32
+    tail = b"tail"
+    with InternalAudioStore(db, chunk_limit=8) as store:
+        store.create_source(source_id, "attempt", 300, 303)
+        store.prepare_leg(source_id, 300, 3)
+        store.record_read_begin(source_id, 300, 3)
+        store.commit_checked_drain(
+            source_id,
+            0,
+            (bytes(AUDIO_RECORD_SIZE), bytes(AUDIO_RECORD_SIZE)),
+            DrainCheckpoint(1, CaptureTail(1, 2, 2 * AUDIO_RECORD_SIZE + len(tail), 2 * AUDIO_RECORD_SIZE, tail)),
+        )
+        store.interrupt(source_id)
+    with InternalAudioStore(db, chunk_limit=8) as store:
+        assert store.quarantine_unconfirmed(source_id) == 0
+
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
+    status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    framing = cast(dict[str, object], status["audio_integrity"])
+    assert status["status"] == "attention"
+    assert framing["unresolved_source_count"] == 1
+    assert framing["unresolved_observation_count"] == 0
+    assert framing["unresolved_retained_storage_bytes"] == 2 * AUDIO_RECORD_SIZE + len(tail)
+    source = cast(list[dict[str, object]], framing["unresolved_sources"])[0]
+    assert source["local_reference"] == {"source_id": source_id}
+    assert source["canonical_unverified_byte_range"] == {
+        "start": 0,
+        "end": 2 * AUDIO_RECORD_SIZE,
+    }
+    assert cast(dict[str, object], source["tail"])["source_relative_byte_range"] == {
+        "start": 2 * AUDIO_RECORD_SIZE,
+        "end": 2 * AUDIO_RECORD_SIZE + len(tail),
+    }
+
+
+def test_operator_status_includes_verified_conflict_frontier_in_unverified_suffix() -> None:
+    source = status_module._FramingSourceRow(
+        incident_id="incident",
+        source_id="source",
+        sequence_start=100,
+        committed_count=5,
+        verified_count=4,
+        confirmed_frontier=102,
+        verified_conflict=True,
+        tail_generation=None,
+        tail_offset=None,
+        tail_size=None,
+    )
+
+    projection = status_module._project_framing_source((source,))
+
+    assert projection["canonical_unverified_records"] == 3
+    assert projection["canonical_unverified_byte_range"] == {
+        "start": 2 * AUDIO_RECORD_SIZE,
+        "end": 5 * AUDIO_RECORD_SIZE,
+    }
+
+
+def test_operator_status_joins_retry_observations_to_their_original_incident(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    layout.publication.root.mkdir(parents=True)
+    db = _state_db(layout)
+    _operational_status(layout, {})
+    original, retry = "a1" * 16, "a2" * 16
+    malformed = bytes([255]) * AUDIO_RECORD_SIZE
+    with InternalAudioStore(db, chunk_limit=8) as store:
+        for source_id in (original, retry):
+            store.create_source(source_id, "attempt", 100, 102)
+            store.prepare_leg(source_id, 100, 2)
+            store.record_read_begin(source_id, 100, 2)
+            store.commit_checked_drain(source_id, 0, (malformed,), DrainCheckpoint(1))
+            assert not store.finish_read(source_id, 102, AUDIO_RECORD_SIZE)
+
+    monkeypatch.setattr(status_module, "collect_spool_metrics", lambda *_args, **_kwargs: _spool())
+    monkeypatch.setattr(status_module, "read_firmware_observations", lambda *_args, **_kwargs: ())
+    status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+
+    framing = cast(dict[str, object], status["audio_integrity"])
+    observations = cast(list[dict[str, object]], framing["unresolved_observations"])
+    assert framing["confirmed_malformed_observations"] == 2
+    assert framing["unresolved_observation_count"] == 2
+    assert framing["unresolved_retained_storage_bytes"] == 2 * AUDIO_RECORD_SIZE
+    assert {item["incident_id"] for item in observations} == {original}
+    assert {cast(dict[str, object], item["local_reference"])["source_id"] for item in observations} == {
+        original,
+        retry,
+    }
+
+
+def _seed_status_framing_cases(db: StateDB) -> tuple[str, str, bytes, bytes]:
+    good, bad, tail, incomplete_tail = bytes(AUDIO_RECORD_SIZE), bytes([255]) * AUDIO_RECORD_SIZE, b"partial", b"rest"
+    damaged_id, incomplete_id = "a" * 32, "b" * 32
+    with InternalAudioStore(db, chunk_limit=8) as store:
+        store.create_source(damaged_id, "attempt", 100, 105)
+        store.prepare_leg(damaged_id, 100, 5)
+        store.record_read_begin(damaged_id, 100, 5)
+        assert store.commit_checked_drain(damaged_id, 0, (good, bad, good), DrainCheckpoint(1)) == 1
+        checkpoint = DrainCheckpoint(
+            1, CaptureTail(1, 4, 4 * AUDIO_RECORD_SIZE + len(tail), 4 * AUDIO_RECORD_SIZE, tail)
+        )
+        assert store.commit_checked_drain(damaged_id, 3, (good,), checkpoint) == 1
+
+        store.create_source(incomplete_id, "attempt", 200, 203)
+        store.prepare_leg(incomplete_id, 200, 3)
+        store.record_read_begin(incomplete_id, 200, 3)
+        checkpoint = DrainCheckpoint(
+            1,
+            CaptureTail(1, 2, 2 * AUDIO_RECORD_SIZE + len(incomplete_tail), 2 * AUDIO_RECORD_SIZE, incomplete_tail),
+        )
+        store.commit_checked_drain(incomplete_id, 0, (good, good), checkpoint)
+        assert store.finish_read(incomplete_id, 203, 2 * AUDIO_RECORD_SIZE + len(incomplete_tail)) is False
+    return damaged_id, incomplete_id, tail, incomplete_tail
 
 
 def _put_quality_events(layout: StorageLayout, events: tuple[dict[str, object], ...] | list[dict[str, object]]) -> None:
@@ -560,7 +954,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "updated_age_seconds": None,
         "updated_at": None,
     }
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
     assert result["publication"] == _spool().current_window.as_dict()
     assert result["quality_window"] == {
         "advertisements": 1,
@@ -1273,7 +1667,7 @@ def test_status_keeps_first_quality_observation_at_equal_timestamps(
     result = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
 
     quality = cast(dict[str, object], result["quality_window"])
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
     assert quality["advertisements"] == 2
     assert quality["last_advertisement_rssi_dbm"] == -81
     assert quality["last_transfer_outcome"] == "first-outcome"

@@ -5,14 +5,13 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
-from struct import pack
 from typing import cast
 
 import pytest
 
 from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
-from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import InternalAudioStore
 from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
     ReadyBundleError,
@@ -21,6 +20,7 @@ from omi_collector.capture.adapters.ready_bundles import (
 )
 from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.config import ReadyConfig
+from test_public_audio_v2_integration import _record, _source
 
 
 @pytest.fixture
@@ -38,24 +38,6 @@ def _ready_root(root: Path) -> Path:
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
     return ready
-
-
-def _source(store: InternalAudioStore) -> SqlitePublicationSource:
-    source_id = "a" * 32
-    record = pack(">I", 100) + bytes((2, 8, 1)) + bytes(AUDIO_RECORD_SIZE - 7)
-    store.create_source(source_id, "attempt", 10, 11)
-    source = store.prepare_leg(source_id, 10, 1)
-    source = store.record_read_begin(source_id, 10, 1)
-    store.commit_drain(source_id, 0, (record,), DrainCheckpoint(source.current_leg_generation))
-    source = store.get_source(source_id)
-    assert source is not None
-    store.seal_source(
-        source_id,
-        leg_generation=source.current_leg_generation,
-        expected_count=source.committed_count,
-        expected_sha256=source.committed_sha256,
-    )
-    return SqlitePublicationSource(store, source_id)
 
 
 def _options() -> PublicAudioV2Options:
@@ -100,7 +82,9 @@ def test_existing_v2_artifact_permission_damage_fails_closed_before_hashing(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    artifact = finalize_public_audio_v2(store, (_source(store),), ready, _options()).published[0]
+    artifact = finalize_public_audio_v2(
+        store, (_source(store, "a" * 32, 10, (_record(100),)),), ready, _options()
+    ).published[0]
     target = artifact.path / name
     if damage == "mode":
         target.chmod(0o600)
@@ -157,7 +141,7 @@ def test_interrupted_destination_permission_damage_fails_closed_on_restart(
 ) -> None:
     database, store = audio_store
     ready = _ready_root(tmp_path)
-    source = _source(store)
+    source = _source(store, "a" * 32, 10, (_record(100),))
     original_rename = Path.rename
     fired = False
 

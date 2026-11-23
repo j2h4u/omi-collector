@@ -21,7 +21,7 @@ from omi_collector.capture.domain.ring_protocol import RingInfo
 
 _ROW_ID = "current"
 _VERSION = 1
-_PUBLIC_VERSION = 3
+_PUBLIC_VERSION = 4
 _STORAGE_INCIDENT_ID = "current"
 _STORAGE_INCIDENT_VERSION = 1
 _ROW_FIELDS = frozenset(
@@ -81,7 +81,9 @@ class PublicDrainProjection:
             row = transaction.get(StateKind.PENDANT_DRAIN, _ROW_ID)
             bluetooth_incident = read_ble_scan_incident(transaction)
             storage_incident = transaction.get(StateKind.PENDANT_STORAGE_INCIDENT, _STORAGE_INCIDENT_ID)
+            alerts = transaction.list(StateKind.AUDIO_DAMAGE_ALERT)
         public = _public_row(row, bluetooth_incident, storage_incident)
+        public["audio_damage_incidents"] = _public_damage_alerts(alerts)
         encoded = (json.dumps(public, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         if not self._needs_sync and _matches_public_file(self.path, encoded, parent_stat.st_gid):
             return
@@ -223,6 +225,16 @@ class PublicDrainProjection:
             row["pending_source_id"] = None
             row["pending_frontier"] = None
         tx.put(StateKind.PENDANT_DRAIN, _ROW_ID, row)
+
+
+def _public_damage_alerts(alerts: tuple[tuple[str, dict[str, object]], ...]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for incident_id, alert in alerts:
+        outcome = alert.get("outcome")
+        if not incident_id.strip() or set(alert) != {"outcome"} or outcome not in {"recovered", "quarantined"}:
+            raise ValueError("audio damage alert is invalid")
+        result.append({"incident_id": incident_id, "outcome": cast(str, outcome)})
+    return result
 
 
 def _public_row(

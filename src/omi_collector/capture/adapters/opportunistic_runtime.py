@@ -74,6 +74,14 @@ class _StagingWriterAdapter:
     def interrupt(self) -> DurablePrefixShape:
         return self._writer.interrupt()
 
+    def quarantine_unconfirmed(self) -> DurablePrefixShape:
+        return self._writer.quarantine_unconfirmed()
+
+    def finish_read(self, done_notice: object) -> bool:
+        if not isinstance(done_notice, DoneNotification):
+            raise TypeError("done_notice must be a DoneNotification")
+        return self._writer.finish_read(done_notice)
+
     def seal(self, done_notice: object) -> SealResultShape | DurableSealShape:
         if not isinstance(done_notice, DoneNotification):
             raise TypeError("done_notice must be a DoneNotification")
@@ -186,6 +194,15 @@ class _BatchWriter:
             return result
 
         return await join_owned(settle())
+
+    async def quarantine_unconfirmed(self) -> DurablePrefixShape:
+        result = await self._writer.quarantine_unconfirmed()
+        if not isinstance(result, DurablePrefixShape):
+            raise TypeError("writer returned an invalid durable prefix")
+        return result
+
+    async def finish_read(self, done_notice: DoneNotification) -> bool:
+        return await self._writer.finish_read(done_notice)
 
     async def seal(self, done_notice: DoneNotification) -> SealResultShape | DurableSealShape:
         result = await self._writer.seal(done_notice)

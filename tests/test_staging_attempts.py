@@ -24,7 +24,7 @@ from omi_collector.capture.domain.ring_protocol import DoneNotification, ReadBeg
 
 
 def _record(marker: int) -> bytes:
-    return marker.to_bytes(4, "big") + bytes((marker,)) * (AUDIO_RECORD_SIZE - 4)
+    return marker.to_bytes(4, "big") + bytes((2, 8, marker)) + bytes(AUDIO_RECORD_SIZE - 7)
 
 
 def _store(tmp_path: Path) -> StagingStore:
@@ -90,6 +90,7 @@ def test_typed_complete_seal_returns_durable_source_result_and_sealed_lifecycle(
     try:
         raw = _record(1)
         attempt.accept_chunk(100, raw)
+        assert attempt.finish_read(DoneNotification(0, 101), len(raw))
 
         result = attempt.seal(DoneNotification(0, 101))
 
@@ -112,6 +113,7 @@ def test_restart_inspection_and_seal_authenticate_canonical_records(tmp_path: Pa
     attempt = _attempt(store, 1)
     try:
         attempt.accept_chunk(100, _record(1))
+        assert attempt.finish_read(DoneNotification(0, 101), AUDIO_RECORD_SIZE)
         with closing(store.state_db.open_connection()) as connection:
             if damage == "payload":
                 connection.execute(
@@ -154,9 +156,10 @@ def test_typed_interruption_retains_partial_tail_and_restart_completes_exact_rec
         resumed = restarted.resume_streaming_attempt(lease)
         assert resumed is not None
         try:
-            resumed.prepare_leg(101, 1)
-            resumed.record_read_begin(ReadBeginNotification(101, 1))
-            resumed.accept_chunk(101, second)
+            resumed.prepare_leg(100, 2)
+            resumed.record_read_begin(ReadBeginNotification(100, 2))
+            resumed.accept_chunk(100, first + second)
+            assert resumed.finish_read(DoneNotification(0, 102), 2 * AUDIO_RECORD_SIZE)
 
             page = resumed.source_page(limit=2)
             assert tuple(record.raw_bytes for record in page.records) == (first, second)
@@ -187,9 +190,10 @@ def test_typed_process_death_recovers_receiving_source_and_partial_tail(tmp_path
         assert resumed is not None
         try:
             assert resumed.source.lifecycle == "interrupted"
-            resumed.prepare_leg(101, 1)
-            resumed.record_read_begin(ReadBeginNotification(101, 1))
-            resumed.accept_chunk(101, second)
+            resumed.prepare_leg(100, 2)
+            resumed.record_read_begin(ReadBeginNotification(100, 2))
+            resumed.accept_chunk(100, first + second)
+            assert resumed.finish_read(DoneNotification(0, 102), 2 * AUDIO_RECORD_SIZE)
             assert tuple(record.raw_bytes for record in resumed.source_page(limit=2).records) == (first, second)
         finally:
             resumed.close()
@@ -214,9 +218,10 @@ def test_typed_restart_leg_recovery_from_interrupted_source_replays_in_order(tmp
         resumed = restarted.resume_streaming_attempt(lease)
         assert resumed is not None
         try:
-            resumed.prepare_leg(101, 1)
-            resumed.record_read_begin(ReadBeginNotification(101, 1))
-            resumed.accept_chunk(101, second)
+            resumed.prepare_leg(100, 2)
+            resumed.record_read_begin(ReadBeginNotification(100, 2))
+            resumed.accept_chunk(100, first + second)
+            assert resumed.finish_read(DoneNotification(0, 102), 2 * AUDIO_RECORD_SIZE)
             assert resumed.durable_prefix.record_count == 2
         finally:
             resumed.close()
@@ -256,18 +261,22 @@ def test_typed_attempt_rejects_data_before_read_begin_and_sequence_regression(tm
         attempt.close()
 
 
-def test_typed_replay_mismatch_retains_blocking_evidence(tmp_path: Path) -> None:
+def test_typed_replay_mismatch_retains_both_observations(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    attempt = _attempt(store)
+    attempt = _attempt(store, 1)
     try:
         attempt.accept_chunk(100, _record(1))
+        assert attempt.finish_read(DoneNotification(0, 101), AUDIO_RECORD_SIZE)
+        attempt.interrupt()
+        attempt.prepare_leg(100, 1)
+        attempt.record_read_begin(ReadBeginNotification(100, 1))
 
-        with pytest.raises(RecordAcceptanceError, match="replay conflicts"):
-            attempt.accept_chunk(100, _record(9))
-
+        attempt.accept_chunk(100, _record(9))
+        assert not attempt.finish_read(DoneNotification(0, 101), AUDIO_RECORD_SIZE)
         assert attempt.source.lifecycle == "blocked"
+        assert tuple(record.raw_bytes for record in attempt.source_page(limit=1).records) == (_record(1),)
         with closing(store.state_db.open_connection(read_only=True)) as connection:
-            count = cast(sqlite3.Row, connection.execute("SELECT COUNT(*) FROM capture_conflict").fetchone())
-            assert count[0] == 1
+            row = cast(sqlite3.Row, connection.execute("SELECT bytes FROM capture_observation_chunk").fetchone())
+            assert row[0] == _record(9)
     finally:
         attempt.close()

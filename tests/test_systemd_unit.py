@@ -206,10 +206,10 @@ def _fake_deployer(
         f'  if [[ "$*" == *--stopped* && {int(stopped_refusal)} == 1 ]]; then printf \'{{"detail":"refused","reason":"state_validation_failed","status":"state_refused"}}\\n\'; exit 1; fi\n'
         f'  printf \'hot=%s args=%s\\n\' "$FAKE_HOT_JOURNAL" "$*" >> {shlex.quote(str(log))}\n'
         f'  if [[ {int(hot_journal)} == 1 && ! -f {shlex.quote(str(call_count))}.recovered ]]; then printf \'{{"reason":"canonical_hot_journal","status":"recovery_required"}}\\n\'; exit 1; fi\n'
-        '  if [[ "${FAKE_PREPARED:-0}" == 1 ]]; then printf \'{"schema_version":4,"status":"state_prepared"}\\n\'; exit 0; fi\n'
+        '  if [[ "${FAKE_PREPARED:-0}" == 1 ]]; then printf \'{"schema_version":5,"status":"state_prepared"}\\n\'; exit 0; fi\n'
         '  printf \'{"schema_version":4,"status":"state_compatible"}\\n\' ;;\n'
         f"recover-state-journal) printf 'collector recover-state-journal\\n' >> {shlex.quote(str(log))}; [[ {int(recovery_fail)} == 1 ]] && exit 1; touch {shlex.quote(str(call_count))}.recovered; printf '{{\"status\":\"recovered\"}}\\n' ;;\n"
-        'init-state) [[ "${FAKE_INIT_FAIL:-0}" == 1 ]] && exit 1; printf \'{"schema_version":4}\\n\' ;;\n'
+        'init-state) [[ "${FAKE_INIT_FAIL:-0}" == 1 ]] && exit 1; printf \'{"schema_version":5}\\n\' ;;\n'
         "*) exit 2 ;;\n"
         "esac\n"
         'CLI\nchmod 0755 "$UV_PROJECT_ENVIRONMENT/bin/omi-collector"\n',

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import closing
 from typing import Literal, cast
 
@@ -67,6 +67,37 @@ def _bootstrap(state_db: StateDB) -> None:
             transaction.put(StateKind.COMPACTION, _KEY, {"generation": 0, "pending": pending})
 
 
+def _retirement_blocks_compaction(connection: sqlite3.Connection) -> bool:
+    """Find actionable retirement while ignoring rows held for a physical successor."""
+    from .ordered_boundary import ordered_source_held
+
+    query = (
+        "FROM capture_source WHERE lifecycle='retiring' "
+        "AND retirement_cursor<committed_count AND NOT EXISTS "
+        "(SELECT 1 FROM publication_cohort_member WHERE publication_cohort_member.source_id=capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_framing_incident WHERE incident_id=capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_observation WHERE source_id=capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_recovery_candidate WHERE source_id=capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+        "JOIN capture_source p ON p.source_id=h.source_id WHERE h.disposition='admitted' "
+        "AND h.prior_lifecycle='blocked' AND capture_source.sequence_start<p.sequence_limit "
+        "AND capture_source.sequence_limit>p.sequence_start)"
+    )
+    if _one(connection, "SELECT 1 " + query + " LIMIT 1") is None:
+        return False
+    own_snapshot = not connection.in_transaction
+    if own_snapshot:
+        connection.execute("BEGIN")
+    try:
+        with closing(connection.execute("SELECT source_id " + query)) as rows:
+            return any(
+                not ordered_source_held(connection, str(row[0])) for row in cast(Iterable[tuple[object, ...]], rows)
+            )
+    finally:
+        if own_snapshot:
+            connection.rollback()
+
+
 def pending_compaction_generation(state_db: StateDB) -> int | None:
     """Return pending debt only after actionable covered-row retirement drains."""
     _bootstrap(state_db)
@@ -77,18 +108,12 @@ def pending_compaction_generation(state_db: StateDB) -> int | None:
         if marker_row is None:
             raise StateDBError("compaction marker disappeared")
         marker = _marker_row(marker_row)
-        retiring = _one(
-            connection,
-            "SELECT 1 FROM capture_source WHERE lifecycle='retiring' "
-            "AND retirement_cursor<committed_count AND NOT EXISTS "
-            "(SELECT 1 FROM publication_cohort_member WHERE publication_cohort_member.source_id=capture_source.source_id) "
-            "LIMIT 1",
-        )
+        retiring = _retirement_blocks_compaction(connection)
         freelist = _one(connection, "PRAGMA freelist_count")
         if freelist is None or type(freelist[0]) is not int or freelist[0] < 0:
             raise StateDBError("SQLite freelist count is invalid")
     assert marker is not None
-    return marker[0] if marker[1] and retiring is None and freelist[0] > 0 else None
+    return marker[0] if marker[1] and not retiring and freelist[0] > 0 else None
 
 
 def compaction_failure_outcome(
@@ -167,14 +192,7 @@ def _vacuum_preflight(
     marker = _marker_row(marker_row)
     if marker != (generation, True):
         return "deferred"
-    retiring = _one(
-        connection,
-        "SELECT 1 FROM capture_source WHERE lifecycle='retiring' "
-        "AND retirement_cursor<committed_count AND NOT EXISTS "
-        "(SELECT 1 FROM publication_cohort_member WHERE publication_cohort_member.source_id=capture_source.source_id) "
-        "LIMIT 1",
-    )
-    if retiring is not None:
+    if _retirement_blocks_compaction(connection):
         return "deferred"
     if should_defer():
         return "deferred"

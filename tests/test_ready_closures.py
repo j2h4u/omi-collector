@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from json import dumps
+from contextlib import closing
+from json import dumps, loads
 from pathlib import Path
 from struct import pack
+from typing import cast
 
 import pytest
 
 from omi_collector.capture.adapters.attempts import SqliteStagedAttempt
-from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind, StateTransaction
+from omi_collector.capture.adapters.collector_state_db import StateDB, StateDBError, StateKind, StateTransaction
+from omi_collector.capture.adapters.framing_incidents import settle_unavailable
+from omi_collector.capture.adapters.internal_audio_store import DrainCheckpoint, InternalAudioStore
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
 from omi_collector.capture.adapters.ready_closures import (
     ReadyClosure,
@@ -18,6 +22,7 @@ from omi_collector.capture.adapters.ready_closures import (
     append,
     begin_visit,
     coalesce,
+    drained_permit,
     legacy_closures,
     load,
     remove,
@@ -45,6 +50,27 @@ def _partial(tmp_path: Path) -> tuple[StagingStore, SqliteStagedAttempt]:
 
 def _state_db(path: Path) -> StateDB:
     return StateDB(path.with_suffix(".sqlite3"))
+
+
+def _unresolved_source(db: StateDB, start: int) -> None:
+    with InternalAudioStore(db) as store:
+        store.create_source("f" * 32, "attempt", start, start + 1)
+        store.prepare_leg("f" * 32, start, 1)
+        store.record_read_begin("f" * 32, start, 1)
+        store.commit_checked_drain("f" * 32, 0, (bytes([255]) * RECORD_SIZE,), DrainCheckpoint(1))
+
+
+def _sealed_source(store: StagingStore, sequence: int) -> str:
+    writer = store.make_staging_writer(sequence, 1)
+    writer.prepare()
+    writer.prepare_leg(sequence, 1)
+    writer.read_begin(ReadBeginNotification(sequence, 1))
+    writer.append_chunk(0, memoryview(_record(sequence)))
+    assert writer.finish_read(DoneNotification(0, sequence + 1))
+    writer.seal(DoneNotification(0, sequence + 1))
+    source_id = writer.attempt_id
+    writer.close()
+    return source_id
 
 
 def test_closures_coalesce_to_latest_watermark_and_keep_equal_drain(tmp_path: Path) -> None:
@@ -78,6 +104,40 @@ def test_equal_closure_callback_commits_in_same_transaction(tmp_path: Path) -> N
     assert db.get(StateKind.PENDANT_DRAIN, "current") == {"marker": "closure"}
 
 
+def test_visit_fence_and_old_drain_permit_commit_together(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _state_db(tmp_path / "ready-closures.json")
+    original = append(db, 10, "drained")
+    put = StateTransaction.put
+
+    def fail_permit(transaction: StateTransaction, kind: StateKind, item_id: str, payload: dict[str, object]) -> None:
+        if kind is StateKind.READY_CLOSURE and item_id == "drained_permit":
+            raise StateDBError("injected failure")
+        put(transaction, kind, item_id, payload)
+
+    monkeypatch.setattr(StateTransaction, "put", fail_permit)
+    with pytest.raises(ReadyClosureError, match="could not be written"):
+        begin_visit(db)
+    assert load(db) == (original,)
+    assert db.get(StateKind.READY_CLOSURE, "drained_permit") is None
+
+
+def test_new_drain_replaces_old_permit_only_when_callback_commits(tmp_path: Path) -> None:
+    db = _state_db(tmp_path / "ready-closures.json")
+    old = append(db, 10, "drained")
+    collecting = begin_visit(db)
+
+    def fail(_transaction: StateTransaction) -> None:
+        raise StateDBError("injected failure")
+
+    with pytest.raises(ReadyClosureError, match="could not be written"):
+        append(db, 11, "drained", on_commit=fail)
+    assert load(db) == (collecting,)
+    assert drained_permit(db) == old
+    new = append(db, 11, "drained")
+    assert load(db) == (new,)
+    assert drained_permit(db) is None
+
+
 def test_staging_emits_only_verified_armed_drain_and_keeps_repeat_identity(tmp_path: Path) -> None:
     store = StagingStore(tmp_path / "spool", tmp_path / "capture")
     store.append_ready_closure(10, "drained")
@@ -88,6 +148,7 @@ def test_staging_emits_only_verified_armed_drain_and_keeps_repeat_identity(tmp_p
     writer.prepare_leg(10, 1)
     writer.read_begin(ReadBeginNotification(10, 1))
     writer.append_chunk(0, memoryview(_record(10)))
+    assert writer.finish_read(DoneNotification(0, 11))
     writer.seal(DoneNotification(0, 11))
     source_id = writer.attempt_id
     writer.close()
@@ -115,14 +176,7 @@ def test_staging_emits_only_verified_armed_drain_and_keeps_repeat_identity(tmp_p
 def test_ahead_drain_needs_one_exact_confirmed_loss(tmp_path: Path, loss: tuple[str, int, int] | None) -> None:
     store = StagingStore(tmp_path / "spool", tmp_path / "capture")
     store.initialize_confirmed_loss_ledger()
-    writer = store.make_staging_writer(10, 1)
-    writer.prepare()
-    writer.prepare_leg(10, 1)
-    writer.read_begin(ReadBeginNotification(10, 1))
-    writer.append_chunk(0, memoryview(_record(10)))
-    writer.seal(DoneNotification(0, 11))
-    source_id = writer.attempt_id
-    writer.close()
+    source_id = _sealed_source(store, 10)
     store.public_drain.arm_pending(source_id, 11)
     if loss is not None:
         fact_source = source_id if loss[0] == "same" else "0" * 32
@@ -144,14 +198,7 @@ def test_ahead_drain_needs_one_exact_confirmed_loss(tmp_path: Path, loss: tuple[
 def test_recovered_existing_drain_closure_completes_with_exact_loss(tmp_path: Path) -> None:
     store = StagingStore(tmp_path / "spool", tmp_path / "capture")
     store.initialize_confirmed_loss_ledger()
-    writer = store.make_staging_writer(10, 1)
-    writer.prepare()
-    writer.prepare_leg(10, 1)
-    writer.read_begin(ReadBeginNotification(10, 1))
-    writer.append_chunk(0, memoryview(_record(10)))
-    writer.seal(DoneNotification(0, 11))
-    source_id = writer.attempt_id
-    writer.close()
+    source_id = _sealed_source(store, 10)
     store.public_drain.arm_pending(source_id, 11)
     store.record_confirmed_loss(source_id, 11, 13, "2026-10-17T12:00:00+00:00")
     store.append_ready_closure(11, "drained")
@@ -168,7 +215,7 @@ def test_recovered_existing_drain_closure_completes_with_exact_loss(tmp_path: Pa
     assert state["pending_event_id"] is None
 
 
-def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: Path) -> None:
+def test_new_visit_preserves_old_drain_through_publication_and_restart(tmp_path: Path) -> None:
     base = StagingStore(tmp_path / "spool", tmp_path / "draft")
     ready = tmp_path / "ready"
     ready.mkdir(mode=0o2750)
@@ -180,6 +227,7 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
     writer.prepare_leg(10, 1)
     writer.read_begin(ReadBeginNotification(10, 1))
     writer.append_chunk(0, memoryview(_record(10)))
+    assert writer.finish_read(DoneNotification(0, 11))
     writer.seal(DoneNotification(0, 11))
     attempt_id = writer.attempt_id
     writer.close()
@@ -196,20 +244,29 @@ def test_new_visit_revokes_old_drain_through_publication_and_restart(tmp_path: P
             await maintenance.close()
 
     asyncio.run(visit())
+    newer_id = _sealed_source(store, 12)
+    _unresolved_source(store.state_db, 11)
     restarted = StagingStore.from_paths(base.paths, publication_root=ready, config=config)
-    assert restarted.recover_and_publish().state == "waiting"
-    assert attempt_source(restarted, attempt_id) is not None
-    assert not tuple(ready.iterdir())
-    restarted.append_ready_closure(11, "drained")
     published = restarted.recover_and_publish()
     source = attempt_source(restarted, attempt_id)
     assert published.state == "published"
     assert source is not None and source.lifecycle == "retiring"
-    assert restarted.retire_covered_raw_page(should_defer=lambda: False)
-    assert attempt_source(restarted, attempt_id) is not None
-    while restarted.retire_covered_raw_page(should_defer=lambda: False):
-        pass
-    assert attempt_source(restarted, attempt_id) is None
+    newer_source = attempt_source(restarted, newer_id)
+    assert newer_source is not None and newer_source.lifecycle == "sealed_waiting"
+    assert len(tuple(ready.iterdir())) == 1
+    assert restarted.recover_and_publish().state == "waiting"
+    assert settle_unavailable(store.state_db, 12, 12) == ("f" * 32,)
+    restarted.append_ready_closure(13, "drained")
+    later = restarted.recover_and_publish()
+    assert later.state == "published"
+    manifest = cast(dict[str, object], loads((later.published[0].path / "manifest.json").read_text()))
+    boundaries = cast(list[dict[str, object]], manifest["boundaries"])
+    assert "source_loss" in cast(list[str], boundaries[0]["facts"])
+    with closing(store.state_db.open_connection(read_only=True)) as connection:
+        assert (
+            connection.execute("SELECT bytes FROM capture_observation_chunk").fetchone()[0]
+            == bytes([255]) * RECORD_SIZE
+        )
 
 
 def test_visit_begin_reuses_active_writer_lease_across_threads(tmp_path: Path) -> None:
@@ -221,6 +278,54 @@ def test_visit_begin_reuses_active_writer_lease_across_threads(tmp_path: Path) -
         lease.require_active()
 
     assert marker is not None and marker.reason == "collecting"
+
+
+def test_preserved_drain_waits_for_threshold_and_batches_at_next_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = StagingStore(tmp_path / "spool", tmp_path / "draft")
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    store = StagingStore.from_paths(
+        base.paths, publication_root=ready, config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.04))
+    )
+    for sequence in (10, 11):
+        _sealed_source(store, sequence)
+        if sequence == 10:
+            store.append_ready_closure(11, "drained")
+            store.begin_ready_visit()
+    restarted = StagingStore.from_paths(base.paths, publication_root=ready, config=store._config)
+    monkeypatch.setattr("omi_collector.capture.adapters.framing_incidents.active_framing_frontier", lambda _db: None)
+    assert restarted.recover_and_publish().reason == "waiting_for_drain"
+    monkeypatch.setattr("omi_collector.capture.adapters.framing_incidents.active_framing_frontier", lambda _db: 11)
+    restarted.publication_input_changed()
+    assert restarted.recover_and_publish().reason == "waiting_for_threshold"
+    assert not tuple(ready.iterdir())
+    monkeypatch.setattr("omi_collector.capture.adapters.framing_incidents.active_framing_frontier", lambda _db: None)
+    restarted.append_ready_closure(12, "drained")
+    assert len(restarted.recover_and_publish().published) == 1
+
+
+def test_unresolved_frontier_limits_new_drain_and_keeps_its_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = StagingStore(tmp_path / "spool", tmp_path / "draft")
+    ready = tmp_path / "ready"
+    ready.mkdir(mode=0o2750)
+    ready.chmod(0o2750)
+    store = StagingStore.from_paths(
+        base.paths, publication_root=ready, config=CollectorConfig(ready=ReadyConfig(target_audio_seconds=0.02))
+    )
+    for sequence in (10, 11):
+        _sealed_source(store, sequence)
+    closure = store.append_ready_closure(12, "drained")
+    monkeypatch.setattr("omi_collector.capture.adapters.framing_incidents.active_framing_frontier", lambda _db: 11)
+    assert len(store.recover_and_publish().published) == 1
+    assert load(store.state_db) == (closure,)
+    monkeypatch.setattr("omi_collector.capture.adapters.framing_incidents.active_framing_frontier", lambda _db: None)
+    store.publication_input_changed()
+    assert len(store.recover_and_publish().published) == 1
 
 
 def test_closures_reject_malformed_state(tmp_path: Path) -> None:
@@ -438,27 +543,27 @@ def test_remove_rejects_empty_or_mismatched_queue_without_changing_bytes(tmp_pat
 
 
 def test_legacy_non_drained_closure_does_not_authorize_prefix_publication(tmp_path: Path) -> None:
-    base, attempt = _partial(tmp_path)
+    base = StagingStore(tmp_path / "spool", tmp_path / "capture")
     ready = tmp_path / "ready"
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
     store = StagingStore.from_paths(base.paths, publication_root=ready)
-    store.terminalize_prefix_attempt(attempt.attempt_id)
-    source = attempt_source(store, attempt.attempt_id)
+    source_id = _sealed_source(store, 10)
+    source = attempt_source(store, source_id)
     assert source is not None and source.lifecycle == "sealed_waiting"
     store.append_ready_closure(11, "legacy_prefix_publication")
     assert store.recover_and_publish().state == "waiting"
-    assert attempt_source(store, attempt.attempt_id) is not None
+    assert attempt_source(store, source_id) is not None
     assert not tuple(ready.iterdir())
     assert closure_rows(store) == [{"next_sequence": 11, "reason": "legacy_prefix_publication"}]
 
 
-def test_interrupted_close_publishes_ordinary_pending_prefix(tmp_path: Path) -> None:
+def test_interrupted_close_keeps_unconfirmed_pending_prefix(tmp_path: Path) -> None:
     store, attempt = _partial(tmp_path)
 
     closure = store.close_pending_prefix("absence")
 
-    assert closure is not None and closure.next_sequence == 11
+    assert closure is None
     source = attempt_source(store, attempt.attempt_id)
-    assert source is not None and source.lifecycle == "sealed_waiting"
-    assert store.pending_attempts() == ()
+    assert source is not None and source.lifecycle != "sealed_waiting"
+    assert store.pending_attempts()

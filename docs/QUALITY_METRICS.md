@@ -80,7 +80,7 @@ visible published bundles, and a bounded quality window:
 uv run omi-collector device status
 ```
 
-The status document has `schema_version` 3. Its top-level `status` is `ok`
+The status document has `schema_version` 4. Its top-level `status` is `ok`
 only when the quality window contains a
 completed transfer, the service is active with operational health `clear`, and
 there is no latest terminal transfer failure. A blocked health state, inactive
@@ -100,6 +100,27 @@ bytes per second, outcome counts, termination-class counts, and confirmed-loss
 totals as `confirmed_loss_events`, `confirmed_lost_records`, and
 `confirmed_lost_raw_bytes`. A null `device` means no firmware observation has
 been recorded for that device.
+
+Version 4 adds `audio_integrity`. It reports unresolved retained observations
+and conflicts using local source and READ-leg references, source-relative byte
+ranges for source custody and READ-relative ranges for observations, plus the
+total bytes stored in unresolved source custody. `confirmed_malformed_observations`
+counts observations marked by `confirmed_damage` with a READ-relative
+`fault_offset`; it does not estimate distinct damaged device frames. The
+projection counts canonical unverified records, tails, observation chunks,
+observation-tail copies, and conflict blobs. Observation prefix ranges refer to
+canonical records and are not counted a second time. Repeated stored copies
+are counted separately, so this total is storage volume, not unique audio or
+confirmed loss. The projection reads stored byte extents and lengths without
+reading or decoding audio payloads.
+
+This CLI status schema is separate from the public
+`collector/public/pendant-drain.json` schema and notification contract. DAGS-344
+uses a receiver-first activation sequence for its notification path: deploy and
+verify the receiver before enabling its corresponding sender. Public snapshot
+v4 adds `audio_damage_incidents`, an append-only list of incident IDs and the
+first recovery outcome (`recovered` or `quarantined`); it contains no audio.
+The receiver deduplicates delivery by incident ID.
 
 Confirmed loss is kept in its own authoritative StateDB rows and committed
 before the prefix publication that exposes a gap. The quality event history is

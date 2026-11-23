@@ -71,6 +71,8 @@ class DurablePrefix:
     next_sequence: int
     record_count: int
     raw_sha256: str
+    done_next: int | None = None
+    has_unconfirmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

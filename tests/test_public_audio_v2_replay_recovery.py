@@ -11,11 +11,10 @@ import pytest
 
 from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
-from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
 from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
     ReadyBundleError,
-    SqlitePublicationSource,
     finalize_public_audio_v2,
     retire_one_covered_typed_source,
     source_lineage,
@@ -23,6 +22,7 @@ from omi_collector.capture.adapters.ready_bundles import (
 from omi_collector.capture.application.storage_fault import FatalInternalAudioStorageError
 from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.config import ReadyConfig
+from test_public_audio_v2_integration import _source
 
 
 @pytest.fixture
@@ -44,24 +44,6 @@ def _ready_root(root: Path) -> Path:
 
 def _record(timestamp: int, marker: int = 1) -> bytes:
     return pack(">I", timestamp) + bytes((2, 8, marker)) + bytes(AUDIO_RECORD_SIZE - 7)
-
-
-def _source(
-    store: InternalAudioStore, source_id: str, start: int, records: tuple[bytes, ...]
-) -> SqlitePublicationSource:
-    store.create_source(source_id, "attempt", start, start + len(records))
-    source = store.prepare_leg(source_id, start, len(records))
-    source = store.record_read_begin(source_id, start, len(records))
-    store.commit_drain(source_id, 0, records, DrainCheckpoint(source.current_leg_generation))
-    source = store.get_source(source_id)
-    assert source is not None
-    store.seal_source(
-        source_id,
-        leg_generation=source.current_leg_generation,
-        expected_count=source.committed_count,
-        expected_sha256=source.committed_sha256,
-    )
-    return SqlitePublicationSource(store, source_id)
 
 
 def _options(frontier: int, *, threshold: float = 0.02, page_limit: int = 128) -> PublicAudioV2Options:

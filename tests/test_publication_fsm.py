@@ -144,6 +144,7 @@ def _add_source(store: StagingStore, start: int, count: int = 1) -> None:
     attempt.prepare_leg(start, count)
     attempt.record_read_begin(ReadBeginNotification(start, count))
     attempt.accept_chunk(start, b"".join(_record(sequence) for sequence in range(start, start + count)))
+    assert attempt.finish_read(DoneNotification(0, start + count), count * AUDIO_RECORD_SIZE)
     attempt.seal(DoneNotification(0, start + count))
     attempt.close()
 

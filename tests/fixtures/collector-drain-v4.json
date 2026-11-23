@@ -1,0 +1,12 @@
+{
+  "version": 4,
+  "ring": {"observed_at": "2026-10-17T11:59:30Z", "unread_packets": 8},
+  "last_drain": null,
+  "battery": null,
+  "bluetooth": null,
+  "storage": null,
+  "audio_damage_incidents": [
+    {"incident_id": "first", "outcome": "quarantined"},
+    {"incident_id": "second", "outcome": "recovered"}
+  ]
+}

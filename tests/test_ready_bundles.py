@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 from struct import pack
 from typing import NoReturn, TypedDict, Unpack
@@ -74,7 +75,8 @@ def _source(
     store.create_source(source_id, "attempt", start, start + len(records))
     source = store.prepare_leg(source_id, start, len(records))
     source = store.record_read_begin(source_id, start, len(records))
-    store.commit_drain(source_id, 0, records, DrainCheckpoint(source.current_leg_generation))
+    store.commit_checked_drain(source_id, 0, records, DrainCheckpoint(source.current_leg_generation))
+    assert store.finish_read(source_id, start + len(records), sum(map(len, records)))
     source = store.get_source(source_id)
     assert source is not None
     store.seal_source(
@@ -157,6 +159,22 @@ def test_threshold_requires_both_enough_audio_and_a_completed_drain(
     assert waiting_for_audio.reason == "waiting_for_threshold"
     assert published.state is ReadyOutcomeState.PUBLISHED
     assert published.published[0].record_count == 1
+
+
+def test_unverified_sealed_source_cannot_enter_new_cohort(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    source = _source(store, "a" * 32, 10, (_record(100, 1),))
+    with closing(database.open_connection()) as connection:
+        connection.execute("UPDATE capture_read_leg SET verified_count=NULL,verified_sha256=NULL,done_next=NULL")
+        connection.commit()
+
+    outcome = _publish(store, (source,), _ready_root(tmp_path))
+
+    assert outcome.published == ()
+    retained = store.get_source("a" * 32)
+    assert retained is not None and retained.lifecycle == "sealed_waiting"
 
 
 def test_undrained_v2_publication_does_not_read_raw_pages(

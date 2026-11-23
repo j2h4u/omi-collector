@@ -14,13 +14,11 @@ from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservationStore
 from omi_collector.capture.adapters.internal_audio_store import (
     AUDIO_RECORD_SIZE,
-    DrainCheckpoint,
     InternalAudioStore,
 )
 from omi_collector.capture.adapters.quality_metrics import SQLiteQualityMetrics
 from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
-    SqlitePublicationSource,
     finalize_public_audio_v2,
 )
 from omi_collector.capture.application.quality_metrics import SequenceLossMetric
@@ -28,6 +26,7 @@ from omi_collector.capture.domain.clock_state import ClockRange, ClockState
 from omi_collector.capture.domain.ring_protocol import RingInfo
 from omi_collector.config import ReadyConfig
 from omi_collector.spool_metrics import SpoolMetricsError, collect_spool_metrics
+from test_public_audio_v2_integration import _source as _v2_source
 
 RECORD_SIZE = 444
 
@@ -54,24 +53,6 @@ def _state_db(root: Path, *, read_only: bool = False) -> StateDB:
 def _v2_record(timestamp: int, *, audio: bool = True) -> bytes:
     payload = bytes((2, 8, 1)) + bytes(AUDIO_RECORD_SIZE - 7) if audio else bytes(AUDIO_RECORD_SIZE - 4)
     return timestamp.to_bytes(4, "big") + payload
-
-
-def _v2_source(
-    store: InternalAudioStore, source_id: str, start: int, records: tuple[bytes, ...]
-) -> SqlitePublicationSource:
-    store.create_source(source_id, "attempt", start, start + len(records))
-    source = store.prepare_leg(source_id, start, len(records))
-    source = store.record_read_begin(source_id, start, len(records))
-    store.commit_drain(source_id, 0, records, DrainCheckpoint(source.current_leg_generation))
-    source = store.get_source(source_id)
-    assert source is not None
-    store.seal_source(
-        source_id,
-        leg_generation=source.current_leg_generation,
-        expected_count=source.committed_count,
-        expected_sha256=source.committed_sha256,
-    )
-    return SqlitePublicationSource(store, source_id)
 
 
 @pytest.fixture
@@ -369,3 +350,49 @@ def test_spool_metrics_rejects_a_state_database_path_replaced_by_directory_or_sy
     database.path.symlink_to(target.path)
     with pytest.raises(SpoolMetricsError, match="ready publication ledger is invalid"):
         collect_spool_metrics(tmp_path, state_db=reader)
+
+
+def test_mixed_physical_and_numbered_ready_status_does_not_invent_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from omi_collector.capture.adapters import ordered_payloads
+    from omi_collector.capture.adapters.ordered_physical_plan import publish_next_ordered_physical
+    from omi_collector.operator_status import collect_operator_status
+    from test_operator_status import _layout
+    from test_operator_status import _state_db as status_state_db
+    from test_ordered_payloads import _retain
+    from test_public_audio_v2_integration import _options, _record
+
+    layout = _layout(tmp_path)
+    layout.publication.root.mkdir(parents=True)
+    layout.publication.root.chmod(0o2750)
+    db = status_state_db(layout)
+    monkeypatch.setattr(ordered_payloads, "historical_decision", lambda *_: "unknown_held")
+    with InternalAudioStore(db) as store:
+        first = _v2_source(store, "d" * 32, 100, (_record(1),))
+        assert finalize_public_audio_v2(store, (first,), layout.publication.root, _options(ClockState(), 101)).published
+        _retain(store, db, "a" * 32, 110)
+        physical = publish_next_ordered_physical(store, layout.publication.root)
+        assert physical is not None and physical is not True
+        last = _v2_source(store, "b" * 32, 120, (_record(2),))
+        assert finalize_public_audio_v2(store, (last,), layout.publication.root, _options(ClockState(), 121)).published
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args: object, **kwargs: object) -> object:
+        if path.name == "audio.ogg":
+            pytest.fail("status must not read audio")
+        return cast(Callable[..., object], original_open)(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    metrics = collect_spool_metrics(layout.publication.root, state_db=db).current_window
+    assert metrics.bundle_count == 3
+    assert metrics.downloaded_records == 3
+    assert metrics.downloaded_raw_bytes == 3 * RECORD_SIZE
+    assert metrics.unconfirmed_gap_records == 0
+    status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+    publication = cast(dict[str, object], status["publication"])
+    assert publication["bundle_count"] == 3
+    assert publication["downloaded_records"] == 3
+    assert publication["unconfirmed_gap_records"] == 0

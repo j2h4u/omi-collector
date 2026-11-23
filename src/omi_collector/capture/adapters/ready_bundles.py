@@ -42,6 +42,7 @@ from ..domain.internal_audio_machine import (
     CompleteRetire,
     ExistingReadyCustody,
     QualifiedDrained,
+    QualifiedPhysicalContinuation,
     ReadyCustody,
     cohort_transition,
     transition,
@@ -93,7 +94,11 @@ from .collector_state_db import (
     raise_if_sqlite_corrupt,
     raise_if_sqlite_storage_fault,
 )
+from .confirmed_loss import ConfirmedLossError
+from .historical_reconciliation import historical_decision as _read_historical_decision
+from .historical_reconciliation import historical_loss_end
 from .internal_audio_store import (
+    AUDIO_RECORD_SIZE,
     CaptureRecord,
     CaptureSource,
     InternalAudioStore,
@@ -153,7 +158,7 @@ class ReadyBundleResult:
 
     bundle_id: str
     path: Path
-    next_sequence: int
+    next_sequence: int | None
     record_count: int
     records_sha256: str
 
@@ -314,6 +319,26 @@ _V2_LEDGER_FIELDS = _LEDGER_ENTRY_FIELDS | frozenset(
         "manifest_bytes",
         "packet_count",
         "sources",
+    }
+)
+_V2_BYTE_SPAN_FIELDS = frozenset(
+    {
+        "format",
+        "state",
+        "order",
+        "audio_sha256",
+        "audio_bytes",
+        "manifest_sha256",
+        "manifest_bytes",
+        "packet_count",
+        "records_sha256",
+        "lineage_kind",
+        "source_id",
+        "source_sha256",
+        "source_bytes",
+        "spans",
+        "seams",
+        "record_count",
     }
 )
 _PUBLICATION_DATE_FIELDS = frozenset({"formed_on_utc", "recorded_on_utc_min", "recorded_on_utc_max"})
@@ -543,7 +568,7 @@ def retire_acknowledged_public_audio_v2(
             ReadyBundleResult(
                 artifact_id,
                 path,
-                _entry_next_sequence(entry),
+                None if entry.get("lineage_kind") == "physical_byte_span" else _entry_next_sequence(entry),
                 _entry_count(entry),
                 cast(str, entry["records_sha256"]),
             )
@@ -658,6 +683,8 @@ def _entry_next_sequence(entry: object) -> int:
 def _entry_count(entry: object) -> int:
     if not _is_dict(entry):
         raise ReadyBundleError("ready publication ledger is invalid")
+    if entry.get("lineage_kind") == "physical_byte_span":
+        return _nonnegative_int(entry["record_count"])
     return (
         _entry_next_sequence(entry)
         - _nonnegative_int(entry["start_sequence"])
@@ -699,6 +726,31 @@ def _validate_ledger_entries(bundles: Mapping[str, object]) -> None:
     for bundle_id, entry in bundles.items():
         if not _valid_ledger_entry(bundle_id, entry):
             raise ReadyBundleError("ready publication ledger is invalid")
+    _require_unique_physical_spans(bundles)
+
+
+def _require_unique_physical_spans(bundles: Mapping[str, object]) -> None:
+    sources: dict[str, tuple[str, int, list[tuple[int, int]]]] = {}
+    for entry in bundles.values():
+        if not _is_dict(entry) or entry.get("lineage_kind") != "physical_byte_span":
+            continue
+        source = cast(str, entry["source_id"])
+        digest = cast(str, entry["source_sha256"])
+        source_bytes = cast(int, entry["source_bytes"])
+        existing_digest, existing_size, intervals = sources.setdefault(source, (digest, source_bytes, []))
+        if (existing_digest, existing_size) != (digest, source_bytes):
+            raise ReadyBundleError("physical byte-span source identity conflicts")
+        for span in cast(list[dict[str, object]], entry["spans"]):
+            intervals.append((cast(int, span["byte_start"]), cast(int, span["byte_end"])))
+        for seam in cast(list[dict[str, object]], entry["seams"]):
+            start = cast(int, seam["byte_start"])
+            prefix = cast(int, seam["decoded_prefix_bytes"])
+            if prefix:
+                intervals.append((start, start + prefix))
+    for _, _, intervals in sources.values():
+        ordered = sorted(intervals)
+        if any(right[0] < left[1] for left, right in pairwise(ordered)):
+            raise ReadyBundleError("physical byte-span publication overlaps existing custody")
 
 
 def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
@@ -733,6 +785,8 @@ def _valid_ledger_entry(bundle_id: object, entry: object) -> bool:
 def _valid_v2_ledger_entry(
     _bundle_id: str, entry: Mapping[str, object] | Mapping[object, object], start: object, end: object
 ) -> bool:
+    if entry.get("lineage_kind") == "physical_byte_span":
+        return _valid_v2_byte_span_entry(entry)
     valid = all(
         (
             set(entry) == _V2_LEDGER_FIELDS | ({"gaps"} if "gaps" in entry else set()),
@@ -764,6 +818,88 @@ def _valid_v2_ledger_entry(
         return False
     facts = _BundleFacts(start, end, end - start - sum(right - left for left, right in gaps), digest, gaps)
     return _parse_sources(entry.get("sources"), facts) is not None
+
+
+def _valid_v2_byte_span_entry(entry: Mapping[str, object] | Mapping[object, object]) -> bool:
+    source_id = entry.get("source_id")
+    return (
+        all(
+            (
+                set(entry) == _V2_BYTE_SPAN_FIELDS,
+                entry.get("state") in ("ready", "retired"),
+                all(
+                    _is_sha256(entry.get(name))
+                    for name in ("records_sha256", "audio_sha256", "manifest_sha256", "source_sha256")
+                ),
+                all(
+                    type(entry.get(name)) is int and cast(int, entry[name]) > 0
+                    for name in ("record_count", "packet_count", "audio_bytes", "manifest_bytes", "source_bytes")
+                ),
+                type(entry.get("order")) is int and 0 <= cast(int, entry["order"]) <= _UINT64_MAX,
+                isinstance(source_id, str)
+                and len(source_id) == _SHA256_HEX_LENGTH // 2
+                and all(char in "0123456789abcdef" for char in source_id),
+            )
+        )
+        and _valid_v2_byte_spans(entry)
+        and _valid_v2_byte_seams(entry)
+    )
+
+
+def _valid_v2_byte_seams(entry: Mapping[str, object] | Mapping[object, object]) -> bool:
+    seams = entry.get("seams")
+    if not _is_list(seams):
+        return False
+    total_packets = 0
+    for seam in seams:
+        if not _is_dict(seam) or set(seam) != {
+            "byte_start",
+            "byte_end",
+            "sha256",
+            "status",
+            "decoded_prefix_bytes",
+            "decoded_packet_count",
+            "decoded_packets_sha256",
+        }:
+            return False
+        start, end = seam["byte_start"], seam["byte_end"]
+        prefix, packets = seam["decoded_prefix_bytes"], seam["decoded_packet_count"]
+        if type(start) is not int or type(end) is not int or not 0 <= start < end <= cast(int, entry["source_bytes"]):
+            return False
+        if type(prefix) is not int or not 0 <= prefix <= end - start or type(packets) is not int or packets < 0:
+            return False
+        if (
+            bool(prefix) != bool(packets)
+            or seam["status"] != "unresolved"
+            or not _is_sha256(seam["sha256"])
+            or not _is_sha256(seam["decoded_packets_sha256"])
+        ):
+            return False
+        total_packets += packets
+    return total_packets <= cast(int, entry["packet_count"])
+
+
+def _valid_v2_byte_spans(entry: Mapping[str, object] | Mapping[object, object]) -> bool:
+    spans = entry.get("spans")
+    if not _is_list(spans) or not spans:
+        return False
+    cursor = 0
+    total = 0
+    for span in spans:
+        if not _is_dict(span) or set(span) != {"byte_start", "byte_end", "sha256"}:
+            return False
+        start, end = span["byte_start"], span["byte_end"]
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not cursor <= start < end <= cast(int, entry["source_bytes"])
+        ):
+            return False
+        if (end - start) % AUDIO_RECORD_SIZE or not _is_sha256(span["sha256"]):
+            return False
+        total += end - start
+        cursor = end
+    return total == cast(int, entry["record_count"]) * AUDIO_RECORD_SIZE
 
 
 def _parse_ledger_gaps(
@@ -1209,6 +1345,7 @@ class _V2Frontier:
     sequence: int
     time: FrozenPublicTime
     pending_overflow_size: int | None
+    physical_marker: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1406,11 +1543,23 @@ def _finalize_public_audio_v2(
     prepared_slices: tuple[_TypedSlice, ...] | None = None
     custody_cache = options.custody_cache
     if cohort is None:
+        permit = _physical_cohort_permit(audio_store.state_db, sources)
+        admission_frontier = historical_admission_frontier(
+            audio_store.state_db,
+            _physical_requested_frontier(audio_store.state_db, permit.repeat_end)
+            if permit is not None
+            else options.frontier,
+            frozenset(source.source.source_id for source in sources),
+        )
         custody_cache = _v2_ready_custody(ready_root, audio_store.state_db, custody_cache)
-        custody = custody_cache.custody
-        admissions = _typed_source_admissions(audio_store, sources, options.frontier)
+        admissions = _typed_source_admissions(audio_store, sources, admission_frontier)
+        if permit is not None:
+            admissions = tuple(item for item in admissions if item.snapshot.source_id == permit.repeat_id)
+            threshold = 1
+        elif options.drained:
+            admissions, threshold = _ordered_flush_admissions(audio_store.state_db, admissions, threshold)
         _require_typed_admissions_current(audio_store, admissions)
-        if not options.drained:
+        if not options.drained and permit is None:
             return ReadyOutcome(
                 ReadyOutcomeState.WAITING,
                 reason="waiting_for_drain",
@@ -1418,14 +1567,14 @@ def _finalize_public_audio_v2(
                 custody_cache=custody_cache,
             )
         frontier = _v2_frontier(audio_store.state_db)
-        cache_key = _normalized_wait_key(admissions, custody, threshold, frontier)
+        cache_key = _normalized_wait_key(admissions, custody_cache.custody, threshold, frontier)
         cached = _cached_normalized_wait(audio_store, admissions, cache_key, threshold, custody_cache)
         if cached is not None:
             return cached
-        admissions = _cover_typed_full_replays(audio_store, admissions, custody, options.page_limit)
+        admissions = _cover_typed_full_replays(audio_store, admissions, custody_cache.custody, options.page_limit)
         _require_typed_admissions_current(audio_store, admissions)
         summary = (
-            _disjoint_packet_summary(audio_store, admissions, custody, options.page_limit, threshold)
+            _disjoint_packet_summary(audio_store, admissions, custody_cache.custody, options.page_limit, threshold)
             if frontier is None or all(item.snapshot.sequence_start > frontier.sequence for item in admissions)
             else None
         )
@@ -1442,7 +1591,7 @@ def _finalize_public_audio_v2(
             )
         try:
             slices = _normalize_typed_admissions(
-                admissions, options.page_limit, custody, () if summary is None else summary[1]
+                admissions, options.page_limit, custody_cache.custody, () if summary is None else summary[1]
             )
         except _TypedAdmissionConflictError as error:
             admission = next(item for item in admissions if item.snapshot.source_id == error.source_id)
@@ -1476,7 +1625,7 @@ def _finalize_public_audio_v2(
                 stats=stats,
                 custody_cache=custody_cache,
             )
-        cohort = _create_typed_cohort(audio_store, admissions, threshold, options.frontier, _v2_config_sha256())
+        cohort = _create_typed_cohort(audio_store, admissions, threshold, admission_frontier, _v2_config_sha256())
         prepared_slices = _rebind_typed_slices(slices, cohort.admissions)
     published, custody_cache = _resume_v2_cohort(
         audio_store,
@@ -1508,6 +1657,260 @@ def _validate_typed_request(frontier: int | None, drained: bool, page_limit: int
         raise ReadyBundleError("a drained typed publication requires its durable frontier")
 
 
+def historical_admission_frontier(
+    state_db: StateDB, frontier: int | None, source_ids: frozenset[str] = frozenset()
+) -> int | None:
+    """Stop at historical unknown audio, including uncovered portions after a proven prefix."""
+    if frontier is None:
+        return None
+    try:
+        with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+            connection.execute("BEGIN")
+            return _historical_proven_frontier(connection, frontier, source_ids)
+    except (OSError, StateDBError, sqlite3.DatabaseError, ValueError, TypeError, ConfirmedLossError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyBundleError("historical publication frontier is unreadable") from error
+
+
+def _physical_requested_frontier(state_db: StateDB, repeat_end: int) -> int:
+    from .framing_incidents import active_framing_frontier
+
+    unresolved = active_framing_frontier(state_db)
+    return repeat_end if unresolved is None else min(repeat_end, unresolved)
+
+
+def _ordered_flush_admissions(
+    state_db: StateDB, admissions: tuple[_TypedAdmission, ...], threshold: int
+) -> tuple[tuple[_TypedAdmission, ...], int]:
+    """Release only through the earliest numbered predecessor of held physical audio."""
+    from .ordered_payloads import next_ordered_physical_start
+
+    with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+        connection.execute("BEGIN")
+        boundary = next_ordered_physical_start(connection)
+        if boundary is not None and any(item.snapshot.sequence_start == boundary for item in admissions):
+            from .ordered_boundary import _ledger
+
+            entries = _ledger(connection)
+            latest = max(
+                (item for item in entries.values() if type(item.get("order")) is int),
+                key=lambda item: cast(int, item["order"]),
+                default=None,
+            )
+            return admissions, 1 if latest is not None and latest.get(
+                "lineage_kind"
+            ) == "physical_byte_span" else threshold
+    if boundary is None:
+        return admissions, threshold
+    preceding = tuple(item for item in admissions if item.snapshot.sequence_start + item.admitted_count <= boundary)
+    return preceding, 1 if preceding else threshold
+
+
+def _physical_cohort_permit(
+    state_db: StateDB, sources: tuple[TypedPublicationSource, ...] | list[TypedPublicationSource]
+):
+    from .physical_continuation import find_physical_continuation
+
+    with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+        connection.execute("BEGIN")
+        return find_physical_continuation(connection, frozenset(source.source.source_id for source in sources))
+
+
+def _historical_decision(connection: sqlite3.Connection, source_id: str) -> str | None:
+    try:
+        return _read_historical_decision(connection, source_id)
+    except ConfirmedLossError as error:
+        raise ReadyBundleError("historical loss evidence is unreadable") from error
+
+
+def _completed_ordered_handoff(connection: sqlite3.Connection, frontier: _V2Frontier) -> int | None:
+    from .ordered_boundary import _ledger, _markers
+    from .ordered_payloads import ordered_physical_predecessor
+    from .ordered_retirement import _successor
+
+    entries, markers = _ledger(connection), _markers(connection)
+    starts: list[int] = []
+    for artifact, (marker_id, marker) in markers.items():
+        if artifact not in entries or not isinstance(marker.get("ordering"), dict):
+            continue
+        successor = _successor(connection, artifact, marker_id, entries, markers)
+        if successor is None or successor in markers:
+            continue
+        end = entries[successor].get("next_sequence")
+        if type(end) is int and end <= frontier.sequence + 1:
+            starts.append(ordered_physical_predecessor(connection, artifact).source_start)
+    return max(starts, default=None)
+
+
+def _ordered_live_boundary(
+    connection: sqlite3.Connection, source_ids: frozenset[str], completed: frozenset[str]
+) -> int | None:
+    """Recognize a physical-to-live handoff only after earlier custody is resolved."""
+    from .ordered_boundary import ordered_physical_boundary
+    from .ordered_payloads import _empty_custody_is_proven, _historical_rows, _latest_numbered_predecessor
+
+    rows = _sql_all(
+        connection.execute(
+            "SELECT source_id,sequence_start FROM capture_source s "
+            "WHERE NOT EXISTS (SELECT 1 FROM capture_historical_custody h WHERE h.source_id=s.source_id) "
+            "ORDER BY sequence_start,source_id"
+        )
+    )
+    rows = [row for row in rows if row[0] in source_ids]
+    if not rows:
+        return None
+    source_id, raw_start = rows[0]
+    start = decode_uint64(cast(bytes, raw_start))
+    pending = _historical_rows(connection)
+    if any(
+        str(row[0]) not in completed
+        and cast(bytes, row[16]) <= cast(bytes, raw_start)
+        and (row[5] != 0 or not _empty_custody_is_proven(connection, row))
+        for row in pending
+    ):
+        return None
+    row = _sql_one(
+        connection.execute(
+            "SELECT payload FROM state WHERE kind=? AND id='current'", (StateKind.PUBLICATION_V2_FRONTIER.value,)
+        )
+    )
+    if row is None:
+        return None
+    payload = cast(object, json.loads(cast(str, row[0])))
+    if not isinstance(payload, dict):
+        raise ReadyBundleError("v2 publication frontier is invalid")
+    frontier = _v2_frontier_from_payload(cast(dict[str, object], payload))
+    try:
+        marker = ordered_physical_boundary(connection, str(source_id), frontier.sequence)
+        if marker is None:
+            return _completed_ordered_handoff(connection, frontier)
+        predecessor = _latest_numbered_predecessor(connection)
+    except ValueError:
+        return None
+    return predecessor.source_start if predecessor.source_start < start else None
+
+
+def _ordered_historical_boundaries(
+    connection: sqlite3.Connection,
+    boundaries: list[tuple[int, int]],
+    source_ids: frozenset[str],
+    completed: frozenset[str],
+) -> list[tuple[int, int]]:
+    ordered_boundary = _ordered_live_boundary(connection, source_ids, completed) if boundaries else None
+    return (
+        boundaries
+        if ordered_boundary is None
+        else [(start, end) for start, end in boundaries if start > ordered_boundary]
+    )
+
+
+def _historical_proven_frontier(connection: sqlite3.Connection, frontier: int, source_ids: frozenset[str]) -> int:
+    rows = _sql_all(
+        connection.execute(
+            "SELECT source.source_id,source.sequence_start,source.sequence_limit,source.committed_count,"
+            "source.certified_prefix_count,custody.prior_lifecycle,custody.disposition "
+            "FROM capture_historical_custody custody JOIN capture_source source ON source.source_id=custody.source_id "
+            "WHERE custody.disposition IN ('pending','admitted') ORDER BY source.sequence_start"
+        )
+    )
+    from .ordered_full_replay import completed_ordered_replays
+    from .ordered_payloads import published_ordered_sources
+    from .physical_continuation import completed_physical_originals, find_physical_continuation
+
+    completed = (
+        completed_physical_originals(connection)
+        | published_ordered_sources(connection)
+        | completed_ordered_replays(connection)
+    )
+    permit = find_physical_continuation(connection, source_ids)
+    if permit is not None:
+        frontier = min(frontier, permit.repeat_end)
+    intervals: list[tuple[int, int]] = []
+    losses: list[tuple[int, int]] = []
+    boundaries: list[tuple[int, int]] = []
+    for source_id_value, start_value, limit_value, count_value, prefix_value, lifecycle, disposition in rows:
+        source_id = str(source_id_value)
+        start, limit = decode_uint64(cast(bytes, start_value)), decode_uint64(cast(bytes, limit_value))
+        decision = _historical_decision(connection, source_id)
+        if source_id in completed or (permit is not None and source_id == permit.original_id):
+            continue
+        if decision != "legacy_custody" or (disposition == "pending" and source_id not in source_ids):
+            if disposition == "pending":
+                frontier = min(frontier, start)
+            continue
+        count = count_value if lifecycle == "sealed_waiting" else prefix_value
+        if type(count) is not int:
+            raise ReadyBundleError("historical custody has no certified count")
+        intervals.append((start, start + count))
+        loss_end = historical_loss_end(connection, source_id)
+        if loss_end is not None:
+            losses.append((start + count, loss_end))
+            if loss_end < limit:
+                boundaries.append((loss_end, limit))
+    if boundaries:
+        boundaries = _ordered_historical_boundaries(connection, boundaries, source_ids, completed)
+        intervals.extend(_verified_audio_intervals(connection, source_ids))
+    return _bounded_historical_frontier(frontier, intervals, losses, boundaries)
+
+
+def _bounded_historical_frontier(
+    frontier: int, intervals: list[tuple[int, int]], losses: list[tuple[int, int]], boundaries: list[tuple[int, int]]
+) -> int:
+    while True:
+        covered = [interval for interval in intervals if interval[1] <= frontier]
+        covered.extend((start, min(end, frontier)) for start, end in losses if start < frontier)
+        narrowed = frontier
+        for start, limit in boundaries:
+            if start >= narrowed:
+                continue
+            reachable = _continuous_coverage_end(start, limit, covered)
+            if reachable < limit:
+                narrowed = min(narrowed, reachable)
+        if narrowed == frontier:
+            return frontier
+        frontier = narrowed
+
+
+def _verified_audio_intervals(connection: sqlite3.Connection, source_ids: frozenset[str]) -> list[tuple[int, int]]:
+    rows = _sql_all(
+        connection.execute(
+            "SELECT source.sequence_start,leg.verified_count,source.source_id,source.lifecycle FROM capture_source source "
+            "JOIN capture_read_leg leg ON leg.source_id=source.source_id "
+            "WHERE source.lifecycle IN ('sealed_waiting','covered','retiring') "
+            "AND leg.verified_count=source.committed_count "
+            "AND leg.verified_sha256=source.committed_sha256 AND leg.done_next=source.sequence_limit "
+            "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h WHERE h.source_id=source.source_id)"
+        )
+    )
+    intervals: list[tuple[int, int]] = []
+    for start_value, count, source_id, lifecycle in rows:
+        if lifecycle == "sealed_waiting" and source_id not in source_ids:
+            continue
+        start = decode_uint64(cast(bytes, start_value))
+        if type(count) is not int:
+            raise ReadyBundleError("verified custody has invalid count")
+        intervals.append((start, start + count))
+    return intervals
+
+
+def _continuous_coverage_end(start: int, limit: int, intervals: list[tuple[int, int]]) -> int:
+    """Advance only through overlapping or adjacent independently numbered evidence."""
+    position = start
+    for lower, upper in sorted(intervals):
+        if lower > position:
+            break
+        position = max(position, upper)
+        if position >= limit:
+            return limit
+    return position
+
+
+def _unpublished_sources(
+    sources: dict[str, tuple[TypedPublicationSource, CaptureSource]], completed: frozenset[str]
+) -> dict[str, tuple[TypedPublicationSource, CaptureSource]]:
+    return {key: value for key, value in sources.items() if key not in completed}
+
+
 def _typed_source_admissions(
     audio_store: InternalAudioStore,
     sources: tuple[TypedPublicationSource, ...] | list[TypedPublicationSource],
@@ -1525,7 +1928,17 @@ def _typed_source_admissions(
             closing(audio_store.state_db.open_connection(read_only=True)) as connection,
             audio_store.state_db.access(connection),
         ):
-            for source_id, (reader, supplied_snapshot) in supplied.items():
+            from .ordered_full_replay import completed_ordered_replays
+            from .ordered_payloads import published_ordered_sources
+            from .physical_continuation import completed_physical_originals
+
+            connection.execute("BEGIN")
+            completed = (
+                completed_ordered_replays(connection)
+                | published_ordered_sources(connection)
+                | completed_physical_originals(connection)
+            )
+            for source_id, (reader, supplied_snapshot) in _unpublished_sources(supplied, completed).items():
                 current = audio_store.get_source(source_id)
                 if current is None or current != supplied_snapshot:
                     raise ReadyBundleError("typed publication source snapshot changed")
@@ -1534,7 +1947,9 @@ def _typed_source_admissions(
                     _sql_one(
                         connection.execute(
                             "SELECT certified_prefix_count, coverage_digest, block_reason, "
-                            "quarantine_disposition, terminal_time, retention_deadline "
+                            "quarantine_disposition, terminal_time, retention_deadline, "
+                            "EXISTS(SELECT 1 FROM capture_historical_custody h "
+                            "WHERE h.source_id=capture_source.source_id AND h.disposition='pending') "
                             "FROM capture_source WHERE source_id=?",
                             (source_id,),
                         )
@@ -1542,27 +1957,69 @@ def _typed_source_admissions(
                 )
                 if row is None:
                     raise ReadyBundleError("typed publication source disappeared")
-                admitted = _typed_admission(reader, current, row)
+                historical = bool(row[6])
+                decision = (
+                    "legacy_custody"
+                    if historical and _historical_decision(connection, source_id) == "legacy_custody"
+                    else None
+                )
+                held = historical and decision != "legacy_custody"
+                admitted = _typed_admission(reader, current, (*row[:6], held))
                 if admitted is None:
+                    continue
+                if not _admission_has_custody(connection, admitted, decision):
                     continue
                 if frontier is not None and current.sequence_start + admitted.admitted_count > frontier:
                     continue
                 admissions.append(admitted)
-    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+    except (OSError, StateDBError, sqlite3.DatabaseError, ValueError) as error:
         raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed publication source state is unreadable") from error
     return tuple(sorted(admissions, key=lambda item: (item.snapshot.sequence_start, item.snapshot.source_id)))
 
 
+def _admission_has_custody(connection: sqlite3.Connection, admission: _TypedAdmission, decision: str | None) -> bool:
+    source_id = admission.snapshot.source_id
+    if decision == "legacy_custody":
+        custody = _sql_one(
+            connection.execute(
+                "SELECT prior_source_type,prior_lifecycle,prior_count,prior_sha256,"
+                "prior_certified_count,prior_coverage_digest,disposition "
+                "FROM capture_historical_custody WHERE source_id=?",
+                (source_id,),
+            )
+        )
+        if custody is None or not _matches_historical_custody(admission, tuple(custody), "pending"):
+            raise ReadyBundleError("historical admission differs from prior custody")
+        return True
+    return (
+        _sql_one(
+            connection.execute(
+                "SELECT 1 FROM capture_read_leg WHERE source_id=? AND verified_count=? "
+                "AND verified_sha256=? AND done_next=? LIMIT 1",
+                (
+                    source_id,
+                    admission.admitted_count,
+                    admission.admitted_sha256,
+                    encode_uint64(admission.snapshot.sequence_start + admission.admitted_count),
+                ),
+            )
+        )
+        is not None
+    )
+
+
 def _typed_admission(
     reader: TypedPublicationSource, snapshot: CaptureSource, certification: tuple[object, ...]
 ) -> _TypedAdmission | None:
+    if certification[6]:
+        return None
     if snapshot.source_type not in {"attempt", "draft", "quarantine"}:
         raise ReadyBundleError("typed publication source type is invalid")
     if snapshot.lifecycle == "sealed_waiting":
         count, digest = snapshot.committed_count, snapshot.committed_sha256
     elif snapshot.lifecycle == "blocked":
-        certified = _blocked_typed_certification(snapshot, certification)
+        certified = _blocked_typed_certification(snapshot, certification[:6])
         if certified is None:
             return None
         count, digest = certified
@@ -1760,7 +2217,7 @@ def _typed_reject_partial_retired_overlap(admission: _TypedAdmission, custody: _
     if _typed_retired_full_proof(admission, custody) is not None:
         return
     for entry in custody.entries.values():
-        if entry["state"] != "retired":
+        if entry["state"] != "retired" or entry.get("lineage_kind") == "physical_byte_span":
             continue
         if any(start < run_end and run_start < end for run_start, run_end in _physical_runs(_entry_facts(entry))):
             raise _TypedCustodyConflictError("typed source overlaps retired custody without exact full-source lineage")
@@ -2087,7 +2544,12 @@ def _disjoint_packet_summary(
         return None
     if any(left[1] > right[0] for left, right in pairwise(intervals)):
         return None
-    ready_runs = tuple(run for entry in custody.entries.values() for run in _physical_runs(_entry_facts(entry)))
+    ready_runs = tuple(
+        run
+        for entry in custody.entries.values()
+        if entry.get("lineage_kind") != "physical_byte_span"
+        for run in _physical_runs(_entry_facts(entry))
+    )
     if any(
         start < ready_end and ready_start < end for start, end in intervals for ready_start, ready_end in ready_runs
     ):
@@ -2340,8 +2802,13 @@ def _require_slices_after_v2_frontier(slices: tuple[_TypedSlice, ...], frontier:
         raise ReadyBundleError("unique source records precede the committed v2 frontier")
 
 
-def _v2_frontier_from_payload(payload: Mapping[str, object] | Mapping[object, object]) -> _V2Frontier:
-    if set(payload) != {"version", "sequence", "time", "pending_overflow_size"} or payload["version"] != 1:
+def _v2_frontier_from_payload(
+    payload: Mapping[str, object] | Mapping[object, object], *, allow_physical_marker: bool = False
+) -> _V2Frontier:
+    fields = {"version", "sequence", "time", "pending_overflow_size"}
+    if allow_physical_marker and "physical_marker" in payload:
+        fields.add("physical_marker")
+    if set(payload) != fields or payload["version"] != 1:
         raise ReadyBundleError("v2 publication frontier is invalid")
     sequence = payload["sequence"]
     time_value = payload["time"]
@@ -2368,11 +2835,14 @@ def _v2_frontier_from_payload(payload: Mapping[str, object] | Mapping[object, ob
         project_public_timeline((FrozenRecordProjection(1, time),))
     except (TypeError, ValueError) as error:
         raise ReadyBundleError("v2 publication frontier is invalid") from error
-    return _V2Frontier(sequence, time, cast(int | None, pending))
+    marker = payload.get("physical_marker")
+    if marker is not None and not _is_sha256(marker):
+        raise ReadyBundleError("v2 publication physical marker is invalid")
+    return _V2Frontier(sequence, time, cast(int | None, pending), cast(str | None, marker))
 
 
 def _v2_frontier_payload(frontier: _V2Frontier) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "version": 1,
         "sequence": frontier.sequence,
         "time": {
@@ -2384,6 +2854,9 @@ def _v2_frontier_payload(frontier: _V2Frontier) -> dict[str, object]:
         },
         "pending_overflow_size": frontier.pending_overflow_size,
     }
+    if frontier.physical_marker is not None:
+        payload["physical_marker"] = frontier.physical_marker
+    return payload
 
 
 def _v2_physical_records(slices: tuple[_TypedSlice, ...], page_limit: int) -> Iterator[tuple[int, CaptureRecord]]:
@@ -2505,7 +2978,9 @@ def _v2_projected_records(
             predecessor=predecessor,
         )
         facts: set[BoundaryFact] = set()
-        if previous is not None and not adjacent:
+        if previous is not None and previous.physical_marker is not None:
+            facts.add("time_incomparable")
+        elif previous is not None and not adjacent:
             facts.add("source_loss")
         elif (
             previous is not None
@@ -2625,6 +3100,32 @@ def _v2_proof_content_sha256(content: _V2ProofContent) -> str:
 
 
 def _require_v2_stage_space(audio_store: InternalAudioStore, ready_root: Path, group: _V2PreparedGroup) -> None:
+    _require_v2_space(
+        audio_store,
+        ready_root,
+        (group.facts.record_count, len(_v2_descriptor(group)), len(group.slices), group.audio.byte_count),
+    )
+
+
+def _v2_database_space(dimensions: tuple[int, int, int, int], page_size: int, page_count: int) -> int:
+    record_count, descriptor_bytes, slice_count, _ = dimensions
+    proof_pages = ceil(record_count / 128)
+    payload = (
+        record_count * 64 + proof_pages * 64 + descriptor_bytes + slice_count * _TYPED_METADATA_ROW_BYTES + 16 * 1024
+    )
+    mutations = slice_count + proof_pages + 12
+    dirty_pages = _TYPED_BTREE_PAGES_PER_LEVEL * max(1, page_count.bit_length()) * mutations
+    return (
+        min(page_count, dirty_pages) + dirty_pages + ceil(payload / page_size) + _TYPED_JOURNAL_MARGIN_PAGES
+    ) * page_size
+
+
+def _require_v2_space(
+    audio_store: InternalAudioStore,
+    ready_root: Path,
+    dimensions: tuple[int, int, int, int],
+) -> None:
+    _, _, _, audio_bytes = dimensions
     database = audio_store.state_db.path
     try:
         with (
@@ -2638,20 +3139,8 @@ def _require_v2_stage_space(audio_store: InternalAudioStore, ready_root: Path, g
         page_size, page_count = cast(int, page_size_row[0]), cast(int, page_count_row[0])
         if page_size <= 0 or page_count <= 0:
             raise ReadyBundleError("v2 publication SQLite page accounting is invalid")
-        proof_pages = ceil(group.facts.record_count / 128)
-        payload = (
-            group.facts.record_count * 64
-            + proof_pages * 64
-            + len(_v2_descriptor(group))
-            + len(group.slices) * _TYPED_METADATA_ROW_BYTES
-            + 16 * 1024
-        )
-        mutations = len(group.slices) + proof_pages + 12
-        dirty_pages = _TYPED_BTREE_PAGES_PER_LEVEL * max(1, page_count.bit_length()) * mutations
-        database_bytes = (
-            min(page_count, dirty_pages) + dirty_pages + ceil(payload / page_size) + _TYPED_JOURNAL_MARGIN_PAGES
-        ) * page_size
-        output_bytes = group.audio.byte_count + 64 * 1024
+        database_bytes = _v2_database_space(dimensions, page_size, page_count)
+        output_bytes = audio_bytes + 64 * 1024
         ready_stat = ready_root.stat()
         database_stat = database.stat()
         if ready_stat.st_dev == database_stat.st_dev:
@@ -2900,7 +3389,7 @@ def _v2_descriptor_basis(
         clock_state = ClockState.from_payload(cast(dict[str, object], clock_value))
     except ClockStateError as error:
         raise ReadyBundleError("v2 stage clock basis is invalid") from error
-    initial = None if initial_value is None else _v2_frontier_from_payload(initial_value)
+    initial = None if initial_value is None else _v2_frontier_from_payload(initial_value, allow_physical_marker=True)
     return clock_state, initial, _v2_frontier_from_payload(final_value), cast(str, projection_sha256)
 
 
@@ -3266,7 +3755,7 @@ def _resume_v2_cohort(
                 _rebind_typed_slices(next_group, current.admissions),
                 context.page_limit,
                 context.clock_state,
-                _v2_frontier(audio_store.state_db),
+                _physical_boundary_frontier(audio_store.state_db, _v2_frontier(audio_store.state_db), next_group),
             )
             stage = _ensure_v2_stage(audio_store, context.ready_root, current, group, context.page_limit)
         else:
@@ -3280,9 +3769,49 @@ def _resume_v2_cohort(
 
 
 def _require_v2_stage_frontier(audio_store: InternalAudioStore, stage: _V2Stage) -> None:
-    if stage.group.initial_frontier != _v2_frontier(audio_store.state_db):
+    initial = stage.group.initial_frontier
+    ordinary = None if initial is None else replace(initial, physical_marker=None)
+    if ordinary != _v2_frontier(audio_store.state_db):
         _typed_fail_stop(audio_store, "v2 stage frontier differs from committed frontier")
-    _require_slices_after_v2_frontier(stage.group.slices, stage.group.initial_frontier)
+    expected = _physical_boundary_frontier(audio_store.state_db, ordinary, stage.group.slices)
+    if initial != expected:
+        _typed_fail_stop(audio_store, "v2 physical continuation proof changed")
+    _require_slices_after_v2_frontier(stage.group.slices, initial)
+
+
+def _physical_boundary_frontier(
+    state_db: StateDB, frontier: _V2Frontier | None, slices: tuple[_TypedSlice, ...]
+) -> _V2Frontier | None:
+    if frontier is None or not slices:
+        return frontier
+    first = slices[0]
+    if first.start_sequence <= frontier.sequence:
+        return frontier
+    from .ordered_boundary import ordered_physical_boundary, ordered_replay_boundary
+    from .physical_continuation import physical_continuation
+
+    with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+        connection.execute("BEGIN")
+        ordered_marker = ordered_physical_boundary(connection, first.admission.snapshot.source_id, frontier.sequence)
+        if ordered_marker is not None:
+            return replace(frontier, physical_marker=ordered_marker)
+        replay_marker = ordered_replay_boundary(connection, first.admission.snapshot.source_id, frontier.sequence)
+        if replay_marker is not None:
+            return replace(frontier, physical_marker=replay_marker)
+        rows = _sql_all(
+            connection.execute("SELECT id,payload FROM state WHERE kind=?", (StateKind.PHYSICAL_IMPORT.value,))
+        )
+        for marker_id, payload in rows:
+            document = cast(object, json.loads(cast(str, payload)))
+            if not _is_dict(document) or document.get("state") != "published":
+                continue
+            anchor = document.get("anchor")
+            if not _is_dict(anchor) or anchor.get("repeat_source_id") != first.admission.snapshot.source_id:
+                continue
+            proof = physical_continuation(connection, cast(str, marker_id))
+            if proof.repeat_start == first.start_sequence:
+                return replace(frontier, physical_marker=proof.marker_id)
+    return frontier
 
 
 def _final_v2_custody(
@@ -3337,26 +3866,12 @@ def _ensure_v2_stage(
 
 
 def _materialize_v2_stage(stage: _V2Stage, page_limit: int) -> ReadyBundleResult:
-    destination = stage.path.parent / stage.artifact_id
-    if os.path.lexists(destination):
-        _require_v2_destination(destination, stage)
-        _remove_v2_artifact(stage.path, "v2 ready stage")
-    else:
-        if os.path.lexists(stage.path):
-            try:
-                _require_v2_destination(stage.path, stage, require_name=False)
-            except ReadyBundleError:
-                _remove_v2_artifact(stage.path, "v2 ready stage")
-        if not os.path.lexists(stage.path):
-            _write_v2_stage(stage, page_limit)
-        _require_v2_destination(stage.path, stage, require_name=False)
-        try:
-            stage.path.rename(destination)
-        except FileExistsError:
-            _require_v2_destination(destination, stage)
-            _remove_v2_artifact(stage.path, "v2 ready stage")
-        _sync_directory(destination.parent)
-    _require_v2_destination(destination, stage)
+    destination = _materialize_v2_files(
+        stage.path,
+        stage.artifact_id,
+        lambda path, require_name: _require_v2_destination(path, stage, require_name=require_name),
+        lambda: _write_v2_stage(stage, page_limit),
+    )
     return ReadyBundleResult(
         stage.artifact_id,
         destination,
@@ -3364,6 +3879,36 @@ def _materialize_v2_stage(stage: _V2Stage, page_limit: int) -> ReadyBundleResult
         stage.group.facts.record_count,
         _v2_stage_records_sha256(stage, page_limit),
     )
+
+
+def _materialize_v2_files(
+    path: Path,
+    artifact_id: str,
+    validate: Callable[[Path, bool], None],
+    write: Callable[[], None],
+) -> Path:
+    """Resume a validated stage or atomically install its READY directory."""
+    destination = path.parent / artifact_id
+    if os.path.lexists(destination):
+        validate(destination, True)
+        _remove_v2_artifact(path, "v2 ready stage")
+    else:
+        if os.path.lexists(path):
+            try:
+                validate(path, False)
+            except ReadyBundleError:
+                _remove_v2_artifact(path, "v2 ready stage")
+        if not os.path.lexists(path):
+            write()
+        validate(path, False)
+        try:
+            path.rename(destination)
+        except FileExistsError:
+            validate(destination, True)
+            _remove_v2_artifact(path, "v2 ready stage")
+        _sync_directory(destination.parent)
+    validate(destination, True)
+    return destination
 
 
 def _materialize_v2_stage_with_failure_latch(
@@ -3603,7 +4148,9 @@ def _inspect_v2_commit(audio_store: InternalAudioStore, proposal: _V2Commit, des
     expectation = CommitExpectation(
         entry=proposal.entry,
         old_frontier=(
-            None if stage.group.initial_frontier is None else _v2_frontier_payload(stage.group.initial_frontier)
+            None
+            if stage.group.initial_frontier is None
+            else _v2_frontier_payload(replace(stage.group.initial_frontier, physical_marker=None))
         ),
         proposed_frontier=_v2_frontier_payload(stage.group.final_frontier),
         old_cohort_cursor=cohort.cursor,
@@ -3623,10 +4170,84 @@ def _commit_v2_stage_once(audio_store: InternalAudioStore, proposal: _V2Commit) 
         _require_v2_commit_ownership(state, connection, proposal)
         _activate_v2_commit_proof(connection, stage)
         _publish_v2_commit_ledger(state, proposal)
+        _record_ordered_successor(state, proposal)
+        _record_ordered_replay_successors(state, connection, proposal)
+        if proposal.all_complete:
+            _record_completed_physical_continuation(state, connection, proposal)
         _advance_v2_commit_members(connection, proposal)
         _apply_typed_coverage(connection, proposal.coverage)
         _finish_v2_commit(connection, proposal)
         state.mark_publication_changed()
+
+
+def _record_ordered_successor(state: StateTransaction, proposal: _V2Commit) -> None:
+    initial = proposal.stage.group.initial_frontier
+    if initial is None or initial.physical_marker is None:
+        return
+    marker = state.get(StateKind.PHYSICAL_IMPORT, initial.physical_marker)
+    if marker is None or "ordering" not in marker:
+        return
+    predecessor = marker.get("artifact_id")
+    if not isinstance(predecessor, str):
+        raise ReadyBundleError("ordered successor predecessor is invalid")
+    receipt: dict[str, object] = {"physical_artifact": predecessor, "successor_artifact": proposal.stage.artifact_id}
+    existing = state.get(StateKind.ORDERED_SUCCESSOR, initial.physical_marker)
+    if existing is not None and existing != receipt:
+        raise ReadyBundleError("ordered successor receipt conflicts")
+    if existing is None:
+        state.put(StateKind.ORDERED_SUCCESSOR, initial.physical_marker, receipt)
+
+
+def _record_ordered_replay_successors(
+    state: StateTransaction, connection: sqlite3.Connection, proposal: _V2Commit
+) -> None:
+    from .ordered_full_replay import completed_ordered_replays
+
+    order = cast(int, proposal.entry["order"])
+    start = proposal.stage.group.slices[0].start_sequence
+    for source_id in completed_ordered_replays(connection):
+        replay = state.get(StateKind.ORDERED_FULL_REPLAY, source_id)
+        if replay is None or type(replay.get("source_start")) is not int or start <= cast(int, replay["source_start"]):
+            continue
+        predecessor = replay.get("predecessor_artifact")
+        if not isinstance(predecessor, str):
+            raise ReadyBundleError("ordered replay predecessor is invalid")
+        entry = state.get(StateKind.READY_PUBLICATION, predecessor)
+        if entry is None or entry.get("order") != order - 1:
+            continue
+        receipt: dict[str, object] = {
+            "predecessor_artifact": predecessor,
+            "successor_artifact": proposal.stage.artifact_id,
+        }
+        old = state.get(StateKind.ORDERED_REPLAY_SUCCESSOR, source_id)
+        if old is not None and old != receipt:
+            raise ReadyBundleError("ordered replay successor receipt conflicts")
+        if old is None:
+            state.put(StateKind.ORDERED_REPLAY_SUCCESSOR, source_id, receipt)
+
+
+def _record_completed_physical_continuation(
+    state: StateTransaction, connection: sqlite3.Connection, proposal: _V2Commit
+) -> None:
+    from .physical_continuation import find_physical_continuation
+
+    if len(proposal.cohort.admissions) != 1:
+        return
+    source_id = proposal.cohort.admissions[0].snapshot.source_id
+    permit = find_physical_continuation(connection, frozenset({source_id}))
+    if permit is None:
+        return
+    receipt: dict[str, object] = {
+        "marker_id": permit.marker_id,
+        "physical_artifact_id": permit.artifact_id,
+        "repeat_id": permit.repeat_id,
+        "repeat_sha256": permit.repeat_sha256,
+        "repeat_start": permit.repeat_start,
+        "repeat_end": permit.repeat_end,
+        "last_artifact_id": proposal.stage.artifact_id,
+    }
+    receipt["receipt_sha256"] = sha256(_canonical(receipt)).hexdigest()
+    state.put(StateKind.PHYSICAL_CONTINUATION, permit.marker_id, receipt)
 
 
 def _activate_v2_commit_proof(connection: sqlite3.Connection, stage: _V2Stage) -> None:
@@ -3731,6 +4352,24 @@ def _advance_v2_commit_cohort(connection: sqlite3.Connection, proposal: _V2Commi
 def _read_v2_ready_source(
     path: Path, entry: Mapping[str, object], should_defer: Callable[[], bool] | None = None
 ) -> _ReadySource:
+    _require_v2_ready_files(path, entry, should_defer)
+    facts = _entry_facts(entry)
+    return _ReadySource(
+        ReadyBundleResult(
+            path.name,
+            path,
+            facts.next_sequence,
+            facts.record_count,
+            cast(str, entry["records_sha256"]),
+        ),
+        facts,
+        (),
+    )
+
+
+def _require_v2_ready_files(
+    path: Path, entry: Mapping[str, object], should_defer: Callable[[], bool] | None = None
+) -> None:
     if (
         path.is_symlink()
         or not path.is_dir()
@@ -3760,26 +4399,18 @@ def _read_v2_ready_source(
         or manifest_value.get("packet_count") != entry["packet_count"]
     ):
         raise ReadyBundleError("v2 ready manifest conflicts with its ledger")
-    facts = _entry_facts(entry)
-    return _ReadySource(
-        ReadyBundleResult(
-            path.name,
-            path,
-            facts.next_sequence,
-            facts.record_count,
-            cast(str, entry["records_sha256"]),
-        ),
-        facts,
-        (),
+
+
+def _v2_active_proof(row: tuple[object, ...], artifact_id: str, entry: Mapping[str, object]) -> _ReplayProof:
+    proof_row = _parse_v2_active_proof_row(row, artifact_id)
+    projection_sha256 = (
+        _v2_byte_span_projection(proof_row.descriptor, entry)
+        if entry.get("lineage_kind") == "physical_byte_span"
+        else _v2_descriptor_basis(proof_row.descriptor)[3]
     )
-
-
-def _v2_active_proof(row: tuple[object, ...], source: _ReadySource, entry: Mapping[str, object]) -> _ReplayProof:
-    proof_row = _parse_v2_active_proof_row(row, source.result.bundle_id)
-    projection_sha256 = _v2_descriptor_basis(proof_row.descriptor)[3]
     expected_content = _v2_proof_content_sha256(
         _V2ProofContent(
-            source.result.bundle_id,
+            artifact_id,
             proof_row.order,
             proof_row.audio_sha256,
             proof_row.manifest_sha256,
@@ -3801,8 +4432,8 @@ def _v2_active_proof(row: tuple[object, ...], source: _ReadySource, entry: Mappi
         proof_row.packet_count,
         proof_row.content_sha256,
     ) != (
-        source.facts.record_count,
-        source.result.records_sha256,
+        _entry_count(entry),
+        entry["records_sha256"],
         entry["manifest_sha256"],
         entry["order"],
         entry["audio_sha256"],
@@ -3813,7 +4444,7 @@ def _v2_active_proof(row: tuple[object, ...], source: _ReadySource, entry: Mappi
     index = unpack_page_index(proof_row.page_index, record_count=proof_row.record_count)
     runs = unpack_normalization_runs(proof_row.packed_runs, record_count=proof_row.record_count)
     return _ReplayProof(
-        source.result.bundle_id,
+        artifact_id,
         "active",
         proof_row.stage_id,
         proof_row.owner,
@@ -3827,6 +4458,22 @@ def _v2_active_proof(row: tuple[object, ...], source: _ReadySource, entry: Mappi
         index,
         runs,
     )
+
+
+def _v2_byte_span_projection(descriptor: bytes, entry: Mapping[str, object]) -> str:
+    from ..domain.physical_publication import validate_physical_descriptor
+
+    try:
+        value = cast(object, json.loads(descriptor))
+        validated = validate_physical_descriptor(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ReadyBundleError("physical byte-span descriptor is invalid") from error
+    if _canonical(validated) != descriptor or any(
+        validated[key] != entry[key]
+        for key in ("source_id", "source_sha256", "source_bytes", "spans", "seams", "record_count")
+    ):
+        raise ReadyBundleError("physical byte-span descriptor conflicts with its ledger")
+    return cast(str, validated["record_projection_sha256"])
 
 
 def _parse_v2_active_proof_row(row: tuple[object, ...], artifact_id: str) -> _V2ActiveProofRow:
@@ -3928,7 +4575,7 @@ def _extend_v2_custody(
     if stage.artifact_id not in rows:
         raise ReadyDurabilityFatalError("v2 committed replay proof is missing")
     try:
-        proof = _v2_active_proof(rows[stage.artifact_id], source, entry)
+        proof = _v2_active_proof(rows[stage.artifact_id], stage.artifact_id, entry)
     except (ReadyBundleError, ValueError, TypeError, IndexError) as error:
         raise ReadyDurabilityFatalError("v2 committed replay proof is corrupt") from error
     _require_v2_prior_custody(ready_root, state_db, previous, stage)
@@ -3978,17 +4625,25 @@ def _v2_ready_custody(
     )
     if {path.name for path in paths} != active_ids:
         raise ReadyBundleError("v2 ready files do not match the active publication ledger")
+    for path in paths:
+        if entries[path.name].get("lineage_kind") == "physical_byte_span":
+            _require_v2_ready_files(path, entries[path.name], should_defer)
     active = tuple(
-        sorted((_read_v2_ready_source(path, entries[path.name], should_defer) for path in paths), key=_ready_start)
+        sorted(
+            (
+                _read_v2_ready_source(path, entries[path.name], should_defer)
+                for path in paths
+                if entries[path.name].get("lineage_kind") != "physical_byte_span"
+            ),
+            key=_ready_start,
+        )
     )
-    source_by_id = {source.result.bundle_id: source for source in active}
     rows = {cast(str, row[0]): row for row in _v2_replay_proof_rows(state_db)}
     if set(rows) != active_ids:
         raise ReadyDurabilityFatalError("active v2 replay proofs do not match the ledger")
     try:
         proofs = {
-            bundle_id: _v2_active_proof(rows[bundle_id], source_by_id[bundle_id], entries[bundle_id])
-            for bundle_id in active_ids
+            bundle_id: _v2_active_proof(rows[bundle_id], bundle_id, entries[bundle_id]) for bundle_id in active_ids
         }
     except (ReadyBundleError, ValueError, TypeError, IndexError) as error:
         raise ReadyDurabilityFatalError("active v2 replay proof is corrupt") from error
@@ -4092,6 +4747,7 @@ def _load_active_typed_cohort(audio_store: InternalAudioStore) -> _TypedCohort |
         _persisted_admission(audio_store, expected, member, certifications)
         for expected, member in enumerate(member_rows)
     )
+    _require_historical_cohort_custody(audio_store, frozen)
     if not frozen or _typed_cohort_id(frozen, threshold, frontier, cast(str, config_digest)) != cohort_id:
         raise ReadyBundleError("typed publication cohort identity is invalid")
     return _TypedCohort(
@@ -4102,6 +4758,46 @@ def _load_active_typed_cohort(audio_store: InternalAudioStore) -> _TypedCohort |
         cursor,
         cast(str, config_digest),
         frozen,
+    )
+
+
+def _require_historical_cohort_custody(
+    audio_store: InternalAudioStore, admissions: tuple[_TypedAdmission, ...]
+) -> None:
+    try:
+        with (
+            closing(audio_store.state_db.open_connection(read_only=True)) as connection,
+            audio_store.state_db.access(connection),
+        ):
+            for admission in admissions:
+                row = _sql_one(
+                    connection.execute(
+                        "SELECT prior_source_type,prior_lifecycle,prior_count,prior_sha256,"
+                        "prior_certified_count,prior_coverage_digest,disposition "
+                        "FROM capture_historical_custody WHERE source_id=?",
+                        (admission.snapshot.source_id,),
+                    )
+                )
+                if row is not None and not _matches_historical_custody(admission, tuple(row), "admitted"):
+                    raise ReadyBundleError("historical cohort custody differs from its admitted snapshot")
+    except (OSError, StateDBError, sqlite3.DatabaseError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise ReadyBundleError("historical cohort custody is unreadable") from error
+
+
+def _matches_historical_custody(admission: _TypedAdmission, row: tuple[object, ...], disposition: str) -> bool:
+    identity = (
+        admission.snapshot.source_type,
+        admission.admitted_lifecycle,
+        admission.snapshot.committed_count,
+        admission.snapshot.committed_sha256,
+        admission.certified_prefix_count,
+    )
+    frozen = (row[2], row[3]) if row[1] == "sealed_waiting" else (row[4], row[5])
+    return (
+        tuple(row[:5]) == identity
+        and row[6] == disposition
+        and frozen == (admission.admitted_count, admission.admitted_sha256)
     )
 
 
@@ -4207,12 +4903,12 @@ def _accept_typed_cohort_once(
     frontier = proposed.frontier
     config_digest = proposed.config_digest
     with audio_store.publication_transaction() as (state, connection):
-        _require_cohort_decision(
-            CohortPhase.UNQUALIFIED,
-            QualifiedDrained(),
-            CohortAction.ACCEPT,
-            CohortPhase.ACCEPTED,
-        )
+        from .physical_continuation import find_physical_continuation
+
+        sources = frozenset(item.snapshot.source_id for item in admissions)
+        permit = find_physical_continuation(connection, sources)
+        event: CohortEvent = QualifiedPhysicalContinuation() if permit is not None else QualifiedDrained()
+        _require_cohort_decision(CohortPhase.UNQUALIFIED, event, CohortAction.ACCEPT, CohortPhase.ACCEPTED)
         active = _sql_all(
             connection.execute(
                 "SELECT cohort_id FROM publication_cohort WHERE lifecycle IN ('accepted','staging','complete')"
@@ -4220,6 +4916,20 @@ def _accept_typed_cohort_once(
         )
         if active:
             raise ReadyBundleError("another typed publication cohort is active")
+        for item in admissions:
+            source_id = item.snapshot.source_id
+            pending = _sql_one(
+                connection.execute(
+                    "SELECT 1 FROM capture_historical_custody WHERE source_id=? AND disposition='pending'", (source_id,)
+                )
+            )
+            if pending is not None:
+                if _historical_decision(connection, source_id) != "legacy_custody":
+                    raise ReadyBundleError("historical admission decision changed before acceptance")
+                connection.execute(
+                    "UPDATE capture_historical_custody SET disposition='admitted' WHERE source_id=? AND disposition='pending'",
+                    (source_id,),
+                )
         connection.execute(
             "INSERT INTO publication_cohort(cohort_id,lifecycle,accepted_permit,drained_threshold,"
             "config_digest,closure_frontier,cursor,accepted_time) "
@@ -4585,6 +5295,21 @@ def _commit_typed_replay_coverage(
             with audio_store.publication_transaction() as (state, connection):
                 if any(state.get(StateKind.READY_PUBLICATION, bundle_id) != entry for bundle_id, entry in proofs):
                     raise ReadyBundleError("typed replay custody changed before coverage commit")
+                source_id = admission.snapshot.source_id
+                pending = _sql_one(
+                    connection.execute(
+                        "SELECT 1 FROM capture_historical_custody WHERE source_id=? AND disposition='pending'",
+                        (source_id,),
+                    )
+                )
+                if pending is not None:
+                    if _historical_decision(connection, source_id) != "legacy_custody":
+                        raise ReadyBundleError("historical replay decision changed before coverage commit")
+                    connection.execute(
+                        "UPDATE capture_historical_custody SET disposition='admitted' "
+                        "WHERE source_id=? AND disposition='pending'",
+                        (source_id,),
+                    )
                 _apply_typed_coverage(connection, (proposal,))
                 state.mark_publication_changed()
             return
@@ -4811,23 +5536,51 @@ def retire_one_covered_typed_source(
         raise ValueError("typed retirement page limit is invalid")
     if should_defer is not None and should_defer():
         return False
+    from .ordered_boundary import ordered_source_held
+
+    published = _v2_frontier(audio_store.state_db)
+    published_end = 0 if published is None else published.sequence + 1
     try:
         with (
             closing(audio_store.state_db.open_connection(read_only=True)) as connection,
             audio_store.state_db.access(connection),
         ):
-            row = _sql_one(
-                connection.execute(
-                    "SELECT source_id,committed_count,committed_sha256,coverage_digest,retirement_cursor "
-                    "FROM capture_source WHERE lifecycle='retiring' AND NOT EXISTS "
-                    "(SELECT 1 FROM publication_cohort_member WHERE publication_cohort_member.source_id=capture_source.source_id) "
-                    "AND (retirement_cursor<committed_count OR (retirement_cursor=committed_count "
-                    "AND NOT EXISTS (SELECT 1 FROM capture_tail WHERE capture_tail.source_id=capture_source.source_id) "
-                    "AND NOT EXISTS (SELECT 1 FROM capture_conflict WHERE capture_conflict.source_id=capture_source.source_id) "
-                    "AND NOT EXISTS (SELECT 1 FROM capture_evidence WHERE capture_evidence.source_id=capture_source.source_id))) "
-                    "ORDER BY retirement_cursor=committed_count,source_id LIMIT 1"
-                )
+            connection.execute("BEGIN")
+            candidates = connection.execute(
+                "SELECT source_id,committed_count,committed_sha256,coverage_digest,retirement_cursor "
+                "FROM capture_source WHERE lifecycle='retiring' AND NOT EXISTS "
+                "(SELECT 1 FROM publication_cohort_member WHERE publication_cohort_member.source_id=capture_source.source_id) "
+                "AND NOT EXISTS (SELECT 1 FROM capture_framing_incident WHERE incident_id=capture_source.source_id) "
+                "AND NOT EXISTS (SELECT 1 FROM capture_observation WHERE source_id=capture_source.source_id) "
+                "AND NOT EXISTS (SELECT 1 FROM capture_recovery_candidate WHERE source_id=capture_source.source_id) "
+                "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                "WHERE h.source_id=capture_source.source_id AND h.disposition='pending') "
+                "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                "JOIN capture_source p ON p.source_id=h.source_id "
+                "WHERE h.disposition='admitted' AND h.prior_lifecycle='blocked' AND p.sequence_limit>? "
+                "AND capture_source.sequence_start<p.sequence_limit AND capture_source.sequence_limit>p.sequence_start) "
+                "AND (retirement_cursor<committed_count OR (retirement_cursor=committed_count "
+                "AND NOT EXISTS (SELECT 1 FROM capture_tail WHERE capture_tail.source_id=capture_source.source_id) "
+                "AND NOT EXISTS (SELECT 1 FROM capture_conflict WHERE capture_conflict.source_id=capture_source.source_id) "
+                "AND NOT EXISTS (SELECT 1 FROM capture_evidence WHERE capture_evidence.source_id=capture_source.source_id))) "
+                "ORDER BY retirement_cursor=committed_count,source_id",
+                (encode_uint64(published_end),),
             )
+            try:
+                row = cast(
+                    tuple[object, ...] | None,
+                    next(
+                        (
+                            item
+                            for item in cast(Iterable[tuple[object, ...]], candidates)
+                            if not ordered_source_held(connection, str(item[0]))
+                        ),
+                        None,
+                    ),
+                )
+            finally:
+                candidates.close()
+                connection.rollback()
     except (OSError, StateDBError, sqlite3.DatabaseError) as error:
         raise_if_sqlite_storage_fault(error)
         raise ReadyBundleError("typed retirement state is unreadable") from error
@@ -4882,8 +5635,42 @@ def _advance_typed_retirement(audio_store: InternalAudioStore, step: _Retirement
 
 
 def _retire_typed_source_once(audio_store: InternalAudioStore, step: _RetirementStep) -> _RetirementResult:
+    from .ordered_boundary import ordered_source_held
+
     with audio_store.publication_transaction() as (state, connection):
         _require_typed_retirement_snapshot(connection, step)
+        if ordered_source_held(connection, step.source_id):
+            return _RetirementResult(step.old_cursor, False)
+        payload = state.get(StateKind.PUBLICATION_V2_FRONTIER, "current")
+        published_end = 0 if payload is None else _v2_frontier_from_payload(payload).sequence + 1
+        historical_hold = _sql_one(
+            connection.execute(
+                "SELECT 1 FROM capture_historical_custody h JOIN capture_source s ON s.source_id=h.source_id "
+                "WHERE h.source_id=? AND h.prior_lifecycle='blocked' AND s.sequence_limit>?",
+                (step.source_id, encode_uint64(published_end)),
+            )
+        )
+        if historical_hold is not None:
+            return _RetirementResult(step.old_cursor, False)
+        connection.execute(
+            "DELETE FROM state WHERE kind='historical_resolution' AND id=? AND EXISTS "
+            "(SELECT 1 FROM capture_historical_custody WHERE source_id=? AND disposition='admitted')",
+            (step.source_id, step.source_id),
+        )
+        connection.execute(
+            "DELETE FROM capture_historical_custody WHERE source_id=? AND disposition='admitted'",
+            (step.source_id,),
+        )
+        evidence = _sql_one(
+            connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM capture_framing_incident WHERE incident_id=?) OR "
+                "EXISTS(SELECT 1 FROM capture_observation WHERE source_id=?) OR "
+                "EXISTS(SELECT 1 FROM capture_recovery_candidate WHERE source_id=?)",
+                (step.source_id,) * 3,
+            )
+        )
+        if evidence is None or evidence[0] != 0:
+            return _RetirementResult(step.old_cursor, False)
         prefix_result = _retire_typed_record_prefix(state, connection, step)
         if prefix_result is not None:
             return prefix_result
@@ -4967,11 +5754,14 @@ def _finish_typed_retirement(connection: sqlite3.Connection, step: _RetirementSt
             "(SELECT count(*) FROM capture_tail WHERE source_id=?),"
             "(SELECT count(*) FROM capture_conflict WHERE source_id=?),"
             "(SELECT count(*) FROM capture_evidence WHERE source_id=?),"
-            "(SELECT count(*) FROM publication_cohort_member WHERE source_id=?)",
-            (step.source_id, step.source_id, step.source_id, step.source_id),
+            "(SELECT count(*) FROM publication_cohort_member WHERE source_id=?),"
+            "(SELECT count(*) FROM capture_framing_incident WHERE incident_id=?),"
+            "(SELECT count(*) FROM capture_observation WHERE source_id=?),"
+            "(SELECT count(*) FROM capture_recovery_candidate WHERE source_id=?)",
+            (step.source_id,) * 7,
         )
     )
-    if residue is None or tuple(residue) != (0, 0, 0, 0):
+    if residue is None or tuple(residue) != (0,) * 7:
         return _RetirementResult(step.old_cursor, False)
     _require_audio_decision(
         AudioPhase.RETIRING,

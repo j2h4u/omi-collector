@@ -23,6 +23,7 @@ from ..domain.ring_protocol import RECORD_SIZE
 from .ports import (
     AttemptDescriptorShape,
     CaptureRuntimePort,
+    DurablePrefixShape,
     PublicationOutcomeShape,
     RecoveryShape,
     StagingPort,
@@ -205,6 +206,7 @@ class QuarantineMaintenance:
 
     async def _recover_and_publish(self) -> PublicationOutcomeShape:
         self._raise_publication_fatal()
+        await joined_to_thread(self._staging.reconcile_sealed_framing)
         task = asyncio.create_task(joined_to_thread(self._staging.recover_and_publish))
         self._background_effect_tasks.add(task)
         try:
@@ -659,18 +661,27 @@ class QuarantineMaintenance:
         attempt = await joined_to_thread(self._staging.open_attempt, descriptor.attempt_id)
         try:
             recovery = await joined_to_thread(attempt.recover)
-            return self._durable_sql_frontier(descriptor, recovery)
+            prefix = await joined_to_thread(lambda: attempt.durable_prefix)
+            return self._durable_sql_frontier(descriptor, recovery, prefix)
         finally:
             await joined_to_thread(attempt.close)
 
     @staticmethod
-    def _durable_sql_frontier(descriptor: AttemptDescriptorShape, recovery: RecoveryShape) -> int:
+    def _durable_sql_frontier(
+        descriptor: AttemptDescriptorShape, recovery: RecoveryShape, prefix: DurablePrefixShape
+    ) -> int:
         if recovery.raw_bytes % RECORD_SIZE:
             raise OpportunisticSyncError("typed recovery returned an unaligned durable frontier")
         raw_records = recovery.raw_bytes // RECORD_SIZE
         if recovery.valid_records != raw_records or raw_records > descriptor.packet_count:
             raise OpportunisticSyncError("typed recovery returned inconsistent durable bounds")
-        return descriptor.start_sequence + recovery.valid_records
+        if (
+            prefix.start_sequence != descriptor.start_sequence
+            or prefix.record_count > recovery.valid_records
+            or prefix.next_sequence != descriptor.start_sequence + prefix.record_count
+        ):
+            raise OpportunisticSyncError("verified prefix does not match retained recovery evidence")
+        return prefix.next_sequence
 
     async def _salvage_quarantined_prefix(self, source: str, should_defer: Callable[[], bool]) -> _SalvageResult:
         source_state = await joined_to_thread(self._staging.quarantine_state, source)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
 from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
 from omi_collector.capture.adapters.ready_bundles import (
@@ -18,6 +20,7 @@ from omi_collector.capture.adapters.ready_bundles import (
     finalize_public_audio_v2,
     retire_one_covered_typed_source,
 )
+from omi_collector.capture.adapters.sqlite_compaction import pending_compaction_generation, vacuum_pending
 from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.config import ReadyConfig
 
@@ -37,17 +40,18 @@ def _record(timestamp: int) -> bytes:
 
 
 def _covered_source(
-    store: InternalAudioStore, root: Path, source_id: str = "a" * 32, count: int = 3
+    store: InternalAudioStore, root: Path, source_id: str = "a" * 32, count: int = 3, start: int = 10
 ) -> tuple[Path, str]:
-    store.create_source(source_id, "attempt", 10, 10 + count)
-    source = store.prepare_leg(source_id, 10, count)
-    source = store.record_read_begin(source_id, 10, count)
-    store.commit_drain(
+    store.create_source(source_id, "attempt", start, start + count)
+    source = store.prepare_leg(source_id, start, count)
+    source = store.record_read_begin(source_id, start, count)
+    store.commit_checked_drain(
         source_id,
         0,
         tuple(_record(100 + index) for index in range(count)),
         DrainCheckpoint(source.current_leg_generation),
     )
+    assert store.finish_read(source_id, start + count, count * AUDIO_RECORD_SIZE)
     source = store.get_source(source_id)
     assert source is not None
     store.seal_source(
@@ -57,13 +61,135 @@ def _covered_source(
         expected_sha256=source.committed_sha256,
     )
     ready = root / "ready"
-    ready.mkdir(mode=0o2750)
+    ready.mkdir(mode=0o2750, exist_ok=True)
     ready.chmod(0o2750)
-    options = PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), 10 + count, True, 128)
+    options = PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), ClockState(), start + count, True, 128)
     artifact = finalize_public_audio_v2(store, (SqlitePublicationSource(store, source_id),), ready, options).published[
         0
     ]
     return artifact.path, source_id
+
+
+def test_retirement_preserves_source_with_framing_incident(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    _, source_id = _covered_source(store, tmp_path)
+    with closing(database.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO capture_framing_incident(incident_id,confirmed_frontier,status,confirmed_damage) "
+            "VALUES (?,?,'unresolved',1)",
+            (source_id, (13).to_bytes(8, "big")),
+        )
+        connection.commit()
+
+    assert not retire_one_covered_typed_source(store, 128)
+    assert store.get_source(source_id) is not None
+    assert tuple(record.raw_bytes for record in store.read_record_page(source_id, limit=8)) == tuple(
+        _record(100 + index) for index in range(3)
+    )
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert connection.execute("SELECT count(*) FROM capture_framing_incident").fetchone()[0] == 1
+
+
+def test_retirement_preserves_recovery_candidate_reference(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    _, source_id = _covered_source(store, tmp_path)
+    incident_id = "f" * 32
+    store.create_source(incident_id, "attempt", 20, 21)
+    store.prepare_leg(incident_id, 20, 1)
+    store.record_read_begin(incident_id, 20, 1)
+    store.commit_checked_drain(incident_id, 0, (bytes([255]) * AUDIO_RECORD_SIZE,), DrainCheckpoint(1))
+    with closing(database.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO capture_recovery_candidate(incident_id,source_id,leg_generation) VALUES (?,?,1)",
+            (incident_id, source_id),
+        )
+        connection.commit()
+
+    assert not retire_one_covered_typed_source(store, 128)
+    assert store.get_source(source_id) is not None
+    assert len(store.read_record_page(source_id, limit=8)) == 3
+    with closing(database.open_connection(read_only=True)) as connection:
+        assert connection.execute("SELECT count(*) FROM capture_recovery_candidate").fetchone()[0] == 1
+    with closing(sqlite3.connect(database.path)) as connection:
+        connection.execute("CREATE TABLE compaction_fixture (payload BLOB)")
+        connection.executemany("INSERT INTO compaction_fixture VALUES (?)", [(bytes(3500),)] * 100)
+        connection.commit()
+        connection.execute("DROP TABLE compaction_fixture")
+        connection.commit()
+    database.put(StateKind.COMPACTION, "current", {"generation": 6, "pending": True})
+    assert pending_compaction_generation(database) == 6
+    assert vacuum_pending(database, 6, threading.Event()) == "done"
+    assert len(store.read_record_page(source_id, limit=8)) == 3
+
+
+def test_retirement_preserves_retry_observation_linked_to_another_incident(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    _, retry_id = _covered_source(store, tmp_path)
+    incident_id = "f" * 32
+    store.create_source(incident_id, "attempt", 20, 21)
+    store.prepare_leg(incident_id, 20, 1)
+    store.record_read_begin(incident_id, 20, 1)
+    store.commit_checked_drain(incident_id, 0, (bytes([255]) * AUDIO_RECORD_SIZE,), DrainCheckpoint(1))
+    with closing(database.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO capture_observation(source_id,incident_id,leg_generation,read_start,read_count,"
+            "prefix_record_count,received_bytes,tail,done) VALUES (?,?,1,?,3,1,?,X'',1)",
+            (retry_id, incident_id, (10).to_bytes(8, "big"), AUDIO_RECORD_SIZE),
+        )
+        connection.commit()
+
+    assert not retire_one_covered_typed_source(store, 128)
+    assert tuple(record.raw_bytes for record in store.read_record_page(retry_id, limit=8)) == tuple(
+        _record(100 + index) for index in range(3)
+    )
+
+
+def test_retirement_rechecks_framing_evidence_after_selection(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, store = audio_store
+    _, source_id = _covered_source(store, tmp_path)
+    advance = ready_bundles._advance_typed_retirement
+
+    def insert_incident(audio: InternalAudioStore, step: ready_bundles._RetirementStep) -> bool:
+        with closing(database.open_connection()) as connection:
+            connection.execute(
+                "INSERT INTO capture_framing_incident(incident_id,confirmed_frontier,status,confirmed_damage) "
+                "VALUES (?,?,'unresolved',1)",
+                (source_id, (13).to_bytes(8, "big")),
+            )
+            connection.commit()
+        return advance(audio, step)
+
+    monkeypatch.setattr(ready_bundles, "_advance_typed_retirement", insert_incident)
+    assert not retire_one_covered_typed_source(store, 128)
+    assert len(store.read_record_page(source_id, limit=8)) == 3
+
+
+def test_held_source_does_not_block_retirement_of_another_source(
+    tmp_path: Path, audio_store: tuple[StateDB, InternalAudioStore]
+) -> None:
+    database, store = audio_store
+    _, held = _covered_source(store, tmp_path)
+    _, other = _covered_source(store, tmp_path, source_id="b" * 32, start=20)
+    with closing(database.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO capture_framing_incident(incident_id,confirmed_frontier,status,confirmed_damage) "
+            "VALUES (?,?,'unresolved',1)",
+            (held, (13).to_bytes(8, "big")),
+        )
+        connection.commit()
+    assert retire_one_covered_typed_source(store, 128)
+    assert retire_one_covered_typed_source(store, 128)
+    assert not retire_one_covered_typed_source(store, 128)
+    assert store.get_source(other) is None
+    assert len(store.read_record_page(held, limit=8)) == 3
 
 
 def _database_state(database: StateDB, source_id: str) -> tuple[object, ...]:

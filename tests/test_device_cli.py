@@ -612,7 +612,7 @@ def test_sync_force_1m_enters_and_restores_phy_guard(
 
 
 def _record(value: int) -> bytes:
-    return value.to_bytes(4, "big") + bytes((value,)) * (RECORD_SIZE - 4)
+    return value.to_bytes(4, "big") + bytes((2, 8, value)) + bytes(RECORD_SIZE - 7)
 
 
 def _info_notification(read_sequence: int, write_sequence: int) -> bytes:
@@ -648,6 +648,7 @@ def test_sync_reconnects_with_overlap_and_enters_one_outer_guard(
     second = ScriptedRingSession(
         RingStatus(0, 0, 0, 1),
         (
+            WriteStep(b"\x10", (_info_notification(11, 12),)),
             WriteStep(b"\x10", (_info_notification(11, 12),)),
             WriteStep(encode_read_command(11, 1), (_read_begin(11, 1), _data(_record(11)), _done(12))),
             WriteStep(b"\x10", (_info_notification(11, 12),)),
@@ -1090,8 +1091,16 @@ def test_collect_no_data_result_is_safe_json(monkeypatch: pytest.MonkeyPatch, tm
         dict[str, object],
         json.loads((tmp_path / "collector/public/pendant-drain.json").read_text(encoding="utf-8")),
     )
-    assert set(projection) == {"version", "ring", "last_drain", "battery", "bluetooth", "storage"}
-    assert projection["version"] == 3
+    assert set(projection) == {
+        "version",
+        "ring",
+        "last_drain",
+        "battery",
+        "bluetooth",
+        "storage",
+        "audio_damage_incidents",
+    }
+    assert projection["version"] == 4
     assert projection["bluetooth"] is None
     assert projection["storage"] is None
     assert projection["last_drain"] is None

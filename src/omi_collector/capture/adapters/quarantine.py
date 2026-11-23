@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
-from contextlib import closing, contextmanager
+from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import cast
 
 from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
@@ -43,6 +44,7 @@ from .internal_audio_store import (
     DEFAULT_CHUNK_LIMIT,
     MAX_CHUNK_LIMIT,
     CaptureSourceIntegrityError,
+    InternalAudioStore,
     InternalAudioStoreError,
     authenticate_capture_source,
 )
@@ -123,6 +125,8 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
                     "WHERE source_type = 'quarantine' AND COALESCE(quarantine_opaque, 0) = 0 "
                     "AND COALESCE(quarantine_disposition, '') NOT IN ('published_prefix', 'unprocessable') "
                     "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " "
+                    "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                    "WHERE h.source_id=capture_source.source_id AND h.disposition='pending') "
                     "ORDER BY source_id"
                 )
             )
@@ -133,33 +137,18 @@ def _typed_salvage_source_ids(filesystem: StagingFilesystem) -> tuple[str, ...]:
     return tuple(str(row[0]) for row in typed_rows)
 
 
-@contextmanager
-def _typed_transaction(filesystem: StagingFilesystem) -> Iterator[sqlite3.Connection]:
-    """Run one typed quarantine mutation with explicit rollback on failure."""
-    state_db = filesystem.state_db
-    with state_db.access():
-        connection = state_db.open_connection()
-        try:
-            state_db.begin_write(connection)
-            yield connection
-            connection.commit()
-        except BaseException as error:
-            state_db._rollback_managed_write(connection, error)
-            raise
-        finally:
-            state_db._close_managed_write(connection)
-
-
 def _typed_quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tuple[str, ...]:
     try:
-        with _typed_transaction(filesystem) as connection:
+        with filesystem.state_db.typed_write_transaction() as connection:
             rows = cast(
                 list[tuple[object, object]],
                 _db_all(
                     connection.execute(
                         "SELECT source_id, lifecycle FROM capture_source "
                         "WHERE source_type = 'attempt' AND lifecycle IN "
-                        "('prepared','leg_prepared','receiving','interrupted') ORDER BY source_id"
+                        "('prepared','leg_prepared','receiving','interrupted') "
+                        "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                        "WHERE h.source_id=capture_source.source_id AND h.disposition='pending') ORDER BY source_id"
                     )
                 ),
             )
@@ -178,6 +167,11 @@ def _typed_quarantine_pending(filesystem: StagingFilesystem, reason: str) -> tup
     return source_ids
 
 
+def _require_separated_custody(committed: object, confirmed: object, has_evidence: object) -> None:
+    if committed != confirmed or has_evidence:
+        raise AttemptStateError("provisional bytes require separate quarantine custody")
+
+
 def _typed_quarantine_row(
     connection: sqlite3.Connection,
     source_id: str,
@@ -194,10 +188,14 @@ def _typed_quarantine_row(
     if decision.action is not AudioAction.BLOCK or decision.next_phase is not AudioPhase.BLOCKED:
         raise AttemptStateError(decision.reason)
     row = cast(
-        tuple[object, object] | None,
+        tuple[object, object, object, object] | None,
         _db_one(
             connection.execute(
-                "SELECT committed_count, EXISTS (SELECT 1 FROM capture_record WHERE source_id = ?) "
+                "SELECT committed_count, EXISTS (SELECT 1 FROM capture_record WHERE source_id = ?), "
+                "COALESCE((SELECT MAX(verified_count) FROM capture_read_leg WHERE source_id=capture_source.source_id),0), "
+                "EXISTS (SELECT 1 FROM capture_tail WHERE source_id=capture_source.source_id) OR "
+                "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id=capture_source.source_id) OR "
+                "EXISTS (SELECT 1 FROM capture_observation WHERE source_id=capture_source.source_id) "
                 "FROM capture_source "
                 "WHERE source_id = ? AND source_type = 'attempt' AND lifecycle = ?",
                 (source_id, source_id, lifecycle),
@@ -208,6 +206,7 @@ def _typed_quarantine_row(
         raise AttemptStateError("typed attempt changed before quarantine classification")
     if type(row[0]) is not int:
         raise AttemptStateError("typed attempt committed count is invalid")
+    _require_separated_custody(row[0], row[2], row[3])
     has_records = bool(row[1])
     conflict = classify_conflict(cast(int, row[0]), has_records, reason)
     classification = conflict.classification
@@ -261,19 +260,25 @@ class _TypedAdmissionSnapshot:
     terminal_time: object
     retention_deadline: object
     certification_consistent: bool
+    physical_count: int
+    physical_sha256: str
 
 
 def _typed_admission_snapshot(row: tuple[object, ...]) -> _TypedAdmissionSnapshot:
     if row[10] in QUARANTINE_CUSTODY_HOLD_REASONS:
         raise QuarantineCustodyHoldError("unresolved custody cannot be admitted as a quarantine prefix")
     lifecycle = str(row[0])
-    count, digest = row[2], row[3]
+    physical_count, physical_digest = row[2], row[3]
+    count = 0 if row[11] is None else row[11]
+    digest = sha256().hexdigest() if row[12] is None else row[12]
     if row[6] == 1:
         raise QuarantinePublishError("opaque typed quarantine evidence cannot be admitted")
     if lifecycle not in {"blocked", "covered", "retiring"}:
         raise QuarantinePublishError("typed quarantine source is not eligible for prefix admission")
     if type(count) is not int or count < 0 or not isinstance(digest, str):
-        raise QuarantinePublishError("typed quarantine source has no committed prefix")
+        raise QuarantinePublishError("typed quarantine source has no verified prefix")
+    if type(physical_count) is not int or count > physical_count or not isinstance(physical_digest, str):
+        raise QuarantinePublishError("typed quarantine source has no verified prefix")
     if row[7] not in {None, "unclassified", "published_prefix"}:
         raise QuarantinePublishError("typed quarantine source is already terminally unprocessable")
     return _TypedAdmissionSnapshot(
@@ -285,6 +290,8 @@ def _typed_admission_snapshot(row: tuple[object, ...]) -> _TypedAdmissionSnapsho
         row[8],
         row[9],
         row[4] in {None, count} and row[5] in {None, digest},
+        physical_count,
+        physical_digest,
     )
 
 
@@ -353,8 +360,14 @@ def _read_typed_admission_snapshot(connection: sqlite3.Connection, source_id: st
             connection.execute(
                 "SELECT lifecycle, sequence_start, committed_count, committed_sha256, "
                 "certified_prefix_count, coverage_digest, quarantine_opaque, quarantine_disposition, "
-                "terminal_time, retention_deadline, block_reason FROM capture_source "
-                "WHERE source_id = ? AND source_type = 'quarantine'",
+                "terminal_time, retention_deadline, block_reason, "
+                "(SELECT verified_count FROM capture_read_leg WHERE source_id=capture_source.source_id "
+                "AND verified_count IS NOT NULL ORDER BY verified_count DESC,done_next DESC LIMIT 1), "
+                "(SELECT verified_sha256 FROM capture_read_leg WHERE source_id=capture_source.source_id "
+                "AND verified_count IS NOT NULL ORDER BY verified_count DESC,done_next DESC LIMIT 1) FROM capture_source "
+                "WHERE source_id = ? AND source_type = 'quarantine' "
+                "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                "WHERE h.source_id=capture_source.source_id AND h.disposition='pending')",
                 (source_id,),
             )
         ),
@@ -391,10 +404,18 @@ def _require_authenticated_admission(
         source.source_type != "quarantine"
         or source.lifecycle != snapshot.lifecycle
         or source.sequence_start != snapshot.start_sequence
-        or source.committed_count != snapshot.record_count
-        or source.committed_sha256 != snapshot.raw_sha256
+        or source.committed_count != snapshot.physical_count
+        or source.committed_sha256 != snapshot.physical_sha256
     ):
         raise StagingError("typed quarantine source changed during prefix authentication")
+    try:
+        with InternalAudioStore(filesystem.state_db, chunk_limit=page_limit) as audio_store:
+            prefix_digest = audio_store._prefix_digest(source_id, snapshot.record_count)
+    except InternalAudioStoreError as error:
+        raise StagingError("typed quarantine prefix authentication is unavailable") from error
+    if prefix_digest != snapshot.raw_sha256:
+        _hold_source_authentication_mismatch(filesystem, source_id, snapshot)
+        raise QuarantineCustodyHoldError("typed verified prefix checksum requires custody review")
 
 
 _SOURCE_AUTHENTICATION_HOLD = "source_authentication_mismatch"
@@ -430,7 +451,7 @@ def _hold_source_authentication_mismatch(
     before: tuple[object, ...] | None = None
     proposed: tuple[object, ...] | None = None
     try:
-        with _typed_transaction(filesystem) as connection:
+        with filesystem.state_db.typed_write_transaction() as connection:
             current = _read_typed_admission_snapshot(connection, source_id)
             if current != inspected:
                 raise StagingError("typed quarantine source changed before integrity hold")
@@ -518,7 +539,7 @@ def admit_quarantined_prefix(
         now_ns = _wall_clock_ns()
         terminal_time = str(now_ns)
         deadline = str(now_ns + _seconds_to_nanoseconds(filesystem._terminal_retention_seconds))
-        with _typed_transaction(filesystem) as connection:
+        with filesystem.state_db.typed_write_transaction() as connection:
             snapshot = _read_typed_admission_snapshot(connection, source_id)
             if snapshot.disposition != "published_prefix" and snapshot != inspected:
                 raise AttemptStateError("typed quarantine source changed during prefix admission")
@@ -542,12 +563,15 @@ def quarantine_attempt_source(filesystem: StagingFilesystem, attempt_id: str) ->
     """Move one preserved typed attempt into quarantine custody."""
     _validate_attempt_id(attempt_id)
     try:
-        with _typed_transaction(filesystem) as connection:
+        with filesystem.state_db.typed_write_transaction() as connection:
             row = cast(
                 tuple[object, object] | None,
                 _db_one(
                     connection.execute(
-                        "SELECT source_type, lifecycle FROM capture_source WHERE source_id = ?", (attempt_id,)
+                        "SELECT source_type, lifecycle FROM capture_source WHERE source_id = ? "
+                        "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                        "WHERE h.source_id=capture_source.source_id AND h.disposition='pending')",
+                        (attempt_id,),
                     )
                 ),
             )
@@ -598,18 +622,27 @@ def _terminalize_prefix_attempt_held(filesystem: StagingFilesystem, attempt_id: 
     _typed_terminalize_prefix(filesystem, attempt_id)
 
 
+def _require_confirmed_terminal_prefix(committed: object, verified: object) -> None:
+    if committed != verified:
+        raise AttemptStateError("unconfirmed rows cannot be terminalized as a prefix")
+
+
 def _typed_terminalize_prefix(filesystem: StagingFilesystem, attempt_id: str) -> None:
     try:
-        with _typed_transaction(filesystem) as connection:
+        with filesystem.state_db.typed_write_transaction() as connection:
             row = cast(
-                tuple[object, object, object] | None,
+                tuple[object, object, object, object] | None,
                 _db_one(
                     connection.execute(
                         "SELECT lifecycle, committed_count, "
                         "EXISTS (SELECT 1 FROM capture_tail WHERE source_id = capture_source.source_id) OR "
                         "EXISTS (SELECT 1 FROM capture_conflict WHERE source_id = capture_source.source_id) OR "
-                        "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id) "
-                        "FROM capture_source WHERE source_id = ? AND source_type = 'attempt'",
+                        "EXISTS (SELECT 1 FROM capture_evidence WHERE source_id = capture_source.source_id), "
+                        "COALESCE((SELECT MAX(verified_count) FROM capture_read_leg "
+                        "WHERE source_id = capture_source.source_id),0) "
+                        "FROM capture_source WHERE source_id = ? AND source_type = 'attempt' "
+                        "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                        "WHERE h.source_id=capture_source.source_id AND h.disposition='pending')",
                         (attempt_id,),
                     )
                 ),
@@ -627,6 +660,7 @@ def _typed_terminalize_prefix(filesystem: StagingFilesystem, attempt_id: str) ->
                 raise AttemptStateError(decision.reason)
             if type(row[1]) is not int:
                 raise AttemptStateError("typed prefix committed count is invalid")
+            _require_confirmed_terminal_prefix(row[1], row[3])
             if row[1] == 0 or bool(row[2]):
                 _typed_quarantine_row(
                     connection,
@@ -671,7 +705,7 @@ def _typed_mark_unprocessable(filesystem: StagingFilesystem, source_id: str, rea
     now = str(now_ns)
     deadline = str(now_ns + _seconds_to_nanoseconds(filesystem._terminal_retention_seconds))
     try:
-        with _typed_transaction(filesystem) as connection:
+        with filesystem.state_db.typed_write_transaction() as connection:
             current = cast(
                 tuple[object, object, object, object, object] | None,
                 _db_one(
@@ -735,7 +769,7 @@ def _typed_sweep_terminal_quarantine(
     removed: list[str] = []
     progressed = False
     try:
-        with _typed_transaction(filesystem) as connection:
+        with filesystem.state_db.typed_write_transaction() as connection:
             changes_before = connection.total_changes
             _classify_standalone_typed_evidence(filesystem, connection, now)
             _classify_one_typed_opaque(filesystem, connection, now)
@@ -786,6 +820,10 @@ def _expired_typed_source_sql() -> str:
         "source_type = 'quarantine' AND lifecycle IN ('blocked','covered','retiring') "
         "AND quarantine_disposition IN ('unprocessable','published_prefix') "
         "AND COALESCE(block_reason, '') NOT IN " + _CUSTODY_HOLD_SQL + " "
+        "AND NOT EXISTS (SELECT 1 FROM capture_framing_incident i WHERE i.incident_id = capture_source.source_id) "
+        "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+        "WHERE h.source_id=capture_source.source_id "
+        "AND (h.disposition='pending' OR h.prior_lifecycle='blocked')) "
         "AND retention_deadline != '' AND retention_deadline NOT GLOB '*[^0-9]*' "
         "AND CAST(retention_deadline AS INTEGER) <= ?"
     )
@@ -1098,7 +1136,9 @@ def pending_attempts(filesystem: StagingFilesystem) -> tuple[AttemptDescriptor, 
                     connection.execute(
                         "SELECT source_id, sequence_start, sequence_limit FROM capture_source "
                         "WHERE source_type = 'attempt' AND lifecycle IN "
-                        "('prepared','leg_prepared','receiving','interrupted') ORDER BY source_id"
+                        "('prepared','leg_prepared','receiving','interrupted') "
+                        "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                        "WHERE h.source_id=capture_source.source_id AND h.disposition='pending') ORDER BY source_id"
                     )
                 ),
             )

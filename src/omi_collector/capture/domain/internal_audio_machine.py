@@ -359,6 +359,11 @@ class QualifiedDrained:
 
 
 @dataclass(frozen=True, slots=True)
+class QualifiedPhysicalContinuation:
+    """One proof-bound independent repeat may be published without a device drain."""
+
+
+@dataclass(frozen=True, slots=True)
 class Stage:
     next_group: bool = True
 
@@ -396,6 +401,7 @@ class CohortConflict:
 
 CohortEvent = (
     QualifiedDrained
+    | QualifiedPhysicalContinuation
     | Stage
     | OwnedIncompleteRetry
     | DurableDestination
@@ -418,11 +424,11 @@ def cohort_transition(phase: CohortPhase, event: CohortEvent) -> CohortDecision:
     if not isinstance(phase, CohortPhase):
         return CohortDecision(None, CohortAction.REFUSE, "unsupported cohort phase")
     decision = CohortDecision(phase, CohortAction.REFUSE, "cohort event is invalid for this phase")
-    if isinstance(event, QualifiedDrained) and phase is CohortPhase.UNQUALIFIED:
-        if event.qualified:
-            decision = CohortDecision(CohortPhase.ACCEPTED, CohortAction.ACCEPT, "cohort permit persisted")
-        else:
+    if isinstance(event, (QualifiedDrained, QualifiedPhysicalContinuation)) and phase is CohortPhase.UNQUALIFIED:
+        if isinstance(event, QualifiedDrained) and not event.qualified:
             decision = CohortDecision(CohortPhase.UNQUALIFIED, CohortAction.WAIT, "drained threshold is not qualified")
+        else:
+            decision = CohortDecision(CohortPhase.ACCEPTED, CohortAction.ACCEPT, "cohort permit persisted")
     elif isinstance(event, Stage) and phase is CohortPhase.ACCEPTED and event.next_group:
         decision = CohortDecision(CohortPhase.STAGING, CohortAction.STAGE, "accepted group staged")
     elif isinstance(event, OwnedIncompleteRetry) and phase is CohortPhase.STAGING and event.owned:

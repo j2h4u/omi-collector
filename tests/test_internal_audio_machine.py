@@ -31,6 +31,7 @@ from omi_collector.capture.domain.internal_audio_machine import (
     OwnedIncompleteRetry,
     PrepareLeg,
     QualifiedDrained,
+    QualifiedPhysicalContinuation,
     QuarantineAction,
     QuarantineDisposition,
     QuarantineEvent,
@@ -214,6 +215,7 @@ def test_cohort_acceptance_permit_survives_2000_plus_1600_split() -> None:
     assert finished.next_phase is CohortPhase.COMPLETE
     assert cohort_transition(CohortPhase.COMPLETE, CompleteRetire()).next_phase is None
     assert cohort_transition(CohortPhase.UNQUALIFIED, QualifiedDrained(False)).action is CohortAction.WAIT
+    assert cohort_transition(CohortPhase.UNQUALIFIED, QualifiedPhysicalContinuation()).action is CohortAction.ACCEPT
     assert cohort_transition(CohortPhase.COMPLETE, CompleteRetire(False)).action is CohortAction.REFUSE
     existing = cohort_transition(CohortPhase.ACCEPTED, ExistingReadyCustody())
     assert (existing.next_phase, existing.action) == (CohortPhase.ACCEPTED, CohortAction.COMMIT)
@@ -232,6 +234,7 @@ def test_cohort_acceptance_permit_survives_2000_plus_1600_split() -> None:
 def test_cohort_invalid_cells_refuse_without_mutation() -> None:
     events = (
         QualifiedDrained(),
+        QualifiedPhysicalContinuation(),
         Stage(),
         OwnedIncompleteRetry(),
         DurableDestination(),
@@ -243,7 +246,7 @@ def test_cohort_invalid_cells_refuse_without_mutation() -> None:
     for phase, event in product(CohortPhase, events):
         decision = cohort_transition(phase, event)
         if not (
-            (phase is CohortPhase.UNQUALIFIED and isinstance(event, QualifiedDrained))
+            (phase is CohortPhase.UNQUALIFIED and isinstance(event, (QualifiedDrained, QualifiedPhysicalContinuation)))
             or (phase is CohortPhase.ACCEPTED and isinstance(event, Stage))
             or (phase is CohortPhase.ACCEPTED and isinstance(event, (ExistingReadyCustody, CohortConflict)))
             or (phase is CohortPhase.STAGING and isinstance(event, (OwnedIncompleteRetry, DurableDestination)))

@@ -188,6 +188,7 @@ ignore_decorators = [
 [tool.coverage.run]
 source = ["src/omi_collector"]
 branch = true
+core = "ctrace"
 sigterm = true
 
 [tool.coverage.report]

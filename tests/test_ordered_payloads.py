@@ -85,6 +85,41 @@ def test_selector_uses_observed_read_order_without_claiming_sequence_extent(tmp_
     assert not hasattr(chosen, "next_sequence")
 
 
+@pytest.mark.parametrize("defect", ["wrong_offset", "conflict", "evidence", "framing", "prior_mismatch"])
+@pytest.mark.usefixtures("established_predecessor")
+def test_selector_holds_tail_with_invalid_frontier_or_other_evidence(tmp_path: Path, defect: str) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    with InternalAudioStore(db) as store:
+        _retain(store, db, "a" * 32, 110)
+    with db.typed_write_transaction() as connection:
+        offset = 0 if defect == "wrong_offset" else 444
+        connection.execute(
+            "INSERT INTO capture_tail VALUES (?,?,?,?,?,?)", ("a" * 32, 1, offset // 444, offset + 3, offset, b"xyz")
+        )
+        if defect == "conflict":
+            connection.execute("INSERT INTO capture_conflict VALUES (?,?,?,?,?,?)", ("a" * 32, 0, 1, 0, "x", b"x"))
+        elif defect == "evidence":
+            connection.execute(
+                "INSERT INTO capture_evidence(evidence_id,source_id,entry_kind,original_relative_path,device,inode,mode,size) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ("b" * 32, "a" * 32, "directory", "evidence", 1, 1, 0, 0),
+            )
+        elif defect == "framing":
+            connection.execute(
+                "INSERT INTO capture_framing_incident(incident_id,confirmed_frontier,status,confirmed_damage) "
+                "VALUES (?,?,?,?)",
+                ("a" * 32, (110).to_bytes(8, "big"), "unresolved", 1),
+            )
+        elif defect == "prior_mismatch":
+            connection.execute(
+                "UPDATE capture_historical_custody SET prior_sha256=? WHERE source_id=?", ("0" * 64, "a" * 32)
+            )
+    with closing(db.open_connection(read_only=True)) as connection:
+        connection.execute("BEGIN")
+        with pytest.raises(ValueError):
+            ordered_payloads.select_ordered_payload(connection)
+
+
 @pytest.mark.parametrize("defect", ["same_order", "earlier_audio", "custody_changed", "no_read_begin"])
 @pytest.mark.usefixtures("established_predecessor")
 def test_selector_holds_ambiguous_or_unverified_audio(tmp_path: Path, defect: str) -> None:

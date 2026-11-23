@@ -78,7 +78,8 @@ def _source(
     store.create_source(source_id, "attempt", start, start + len(records))
     source = store.prepare_leg(source_id, start, len(records))
     source = store.record_read_begin(source_id, start, len(records))
-    store.commit_drain(source_id, 0, records, DrainCheckpoint(source.current_leg_generation))
+    store.commit_checked_drain(source_id, 0, records, DrainCheckpoint(source.current_leg_generation))
+    assert store.finish_read(source_id, start + len(records), sum(map(len, records)))
     source = store.get_source(source_id)
     assert source is not None
     store.seal_source(
@@ -258,6 +259,87 @@ def test_v2_stage_reservation_restarts_with_same_nonce_order_and_id(
 
     assert outcome.published[0].bundle_id == reserved[2]
     assert json.loads((outcome.published[0].path / "manifest.json").read_text())["order"] == 0
+    assert publication_contract_state(database).next_public_order == 1
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_v2_resumes_historical_stage_only_with_matching_migration_custody(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+    matching: bool,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    source = _source(store, "a" * 32, 10, (_record(100),))
+    original = ready_bundles._materialize_v2_stage_with_failure_latch
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("injected restart")
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt)
+    with pytest.raises(ReadyBundleError, match="injected restart"):
+        finalize_public_audio_v2(store, (source,), ready, _options(ClockState(), 11))
+    with closing(database.open_connection()) as connection:
+        connection.execute(
+            "INSERT INTO capture_historical_custody "
+            "SELECT source_id,source_type,lifecycle,committed_count,committed_sha256,"
+            "certified_prefix_count,coverage_digest,? FROM capture_source WHERE source_id=?",
+            ("admitted" if matching else "pending", "a" * 32),
+        )
+        connection.execute("DELETE FROM capture_read_leg WHERE source_id=?", ("a" * 32,))
+        connection.commit()
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original)
+    if matching:
+        with closing(database.open_connection()) as connection:
+            connection.execute(
+                "UPDATE capture_source SET coverage_digest=committed_sha256 WHERE source_id=?", ("a" * 32,)
+            )
+            connection.commit()
+        assert ready_bundles._load_active_typed_cohort(store) is not None
+        with closing(database.open_connection()) as connection:
+            connection.execute("UPDATE capture_source SET coverage_digest=NULL WHERE source_id=?", ("a" * 32,))
+            connection.commit()
+    if matching:
+        assert (
+            finalize_public_audio_v2(store, (), ready, _options(ClockState(), 11)).state is ReadyOutcomeState.PUBLISHED
+        )
+    else:
+        with pytest.raises(ReadyBundleError, match="historical cohort custody"):
+            finalize_public_audio_v2(store, (), ready, _options(ClockState(), 11))
+
+
+def test_v2_staged_cohort_publishes_before_new_unresolved_source(
+    tmp_path: Path,
+    audio_store: tuple[StateDB, InternalAudioStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = audio_store
+    ready = _ready_root(tmp_path)
+    older = _source(store, "a" * 32, 10, (_record(100),))
+    original = ready_bundles._materialize_v2_stage_with_failure_latch
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise ReadyBundleError("injected restart")
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", interrupt)
+    with pytest.raises(ReadyBundleError, match="injected restart"):
+        finalize_public_audio_v2(store, (older,), ready, _options(ClockState(), 11))
+    store.create_source("b" * 32, "attempt", 11, 12)
+    store.prepare_leg("b" * 32, 11, 1)
+    source = store.record_read_begin("b" * 32, 11, 1)
+    malformed = bytes(4) + bytes((2, 4, 1)) + bytes(AUDIO_RECORD_SIZE - 7)
+    store.commit_drain("b" * 32, 0, (malformed,), DrainCheckpoint(source.current_leg_generation))
+    newer = SqlitePublicationSource(store, "b" * 32)
+
+    monkeypatch.setattr(ready_bundles, "_materialize_v2_stage_with_failure_latch", original)
+    outcome = finalize_public_audio_v2(store, (older, newer), ready, _options(ClockState(), 11, drained=False))
+
+    assert outcome.state is ReadyOutcomeState.PUBLISHED
+    assert len(outcome.published) == 1
+    assert publication_contract_state(database).next_public_order == 1
+    again = finalize_public_audio_v2(store, (older, newer), ready, _options(ClockState(), 11, drained=False))
+    assert again.published == ()
     assert publication_contract_state(database).next_public_order == 1
 
 
@@ -943,6 +1025,7 @@ def test_staging_store_preserves_subthreshold_source_under_v2_contract(tmp_path:
     attempt.prepare_leg(10, 1)
     attempt.record_read_begin(ReadBeginNotification(10, 1))
     attempt.accept_chunk(10, _record(100))
+    assert attempt.finish_read(DoneNotification(0, 11), AUDIO_RECORD_SIZE)
     attempt.seal(DoneNotification(0, 11))
     source_id = attempt.attempt_id
     attempt.close()
@@ -976,18 +1059,19 @@ def test_staging_store_ack_preserves_multi_page_gc_progress_with_subthreshold_so
         audio_store.create_source("a" * 32, "attempt", 10, 139)
         source = audio_store.prepare_leg("a" * 32, 10, len(records))
         source = audio_store.record_read_begin("a" * 32, 10, len(records))
-        audio_store.commit_drain(
+        audio_store.commit_checked_drain(
             "a" * 32,
             0,
             records[:128],
             DrainCheckpoint(source.current_leg_generation),
         )
-        audio_store.commit_drain(
+        audio_store.commit_checked_drain(
             "a" * 32,
             128,
             records[128:],
             DrainCheckpoint(source.current_leg_generation),
         )
+        assert audio_store.finish_read("a" * 32, 139, sum(map(len, records)))
         source = audio_store.get_source("a" * 32)
         assert source is not None
         audio_store.seal_source(

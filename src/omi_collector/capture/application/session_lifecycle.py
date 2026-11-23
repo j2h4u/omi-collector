@@ -994,7 +994,11 @@ async def recoverable_session_outcome(
     if outcome is None:
         await report_activity(options.activity, "fatal")
         raise error
-    if session is not None and phase == "read/reconcile" and not isinstance(error, collector.TransferInterruptedError):
+    if (
+        session is not None
+        and phase == "read/reconcile"
+        and not isinstance(error, collector.TransferInterruptedError | collector.FramingRecoveryDeferredError)
+    ):
         await stop_after_interruption(session, options.timeouts.info)
     return outcome
 
@@ -1092,6 +1096,7 @@ def _retryable(
         error,
         (
             collector.CollectorTimeoutError,
+            collector.FramingRecoveryDeferredError,
             collector.AdvanceUncertainError,
             StorageNotReadySessionError,
             NotificationOverflowError,

@@ -20,9 +20,14 @@ from omi_collector.capture.adapters.collector_state_db import (
     StateKind,
     raise_if_sqlite_storage_fault,
 )
-from omi_collector.capture.adapters.confirmed_loss import ConfirmedLossError, ConfirmedLossFact, read_confirmed_losses
+from omi_collector.capture.adapters.confirmed_loss import (
+    ConfirmedLossError,
+    ConfirmedLossFact,
+    read_confirmed_losses,
+)
 from omi_collector.capture.adapters.debug_logging import read_runtime_status
 from omi_collector.capture.adapters.firmware_observations import FirmwareObservation, read_firmware_observations
+from omi_collector.capture.adapters.internal_audio_store import decode_uint64
 from omi_collector.capture.adapters.operational_status import (
     OperationalIdentity,
     OperationalStatusError,
@@ -47,6 +52,12 @@ _OPERATIONAL_ATTENTION = {
     "publication": "ready_publication_blocked",
     "clock": "clock_correction_blocked",
 }
+_INCIDENT_SOURCES_CTE = (
+    "WITH incident_sources(incident_id,source_id) AS ("
+    "SELECT incident_id,incident_id FROM capture_framing_incident UNION "
+    "SELECT incident_id,source_id FROM capture_observation UNION "
+    "SELECT incident_id,source_id FROM capture_recovery_candidate) "
+)
 
 
 class OperatorStatusError(ValueError):
@@ -166,6 +177,35 @@ class _QualityEvent:
     drift_seconds: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _FramingRow:
+    incident_id: str
+    source_id: str
+    leg_generation: int
+    confirmed_damage: bool
+    source_start: int
+    read_start: int
+    read_count: int
+    fault_offset: int | None
+    prefix_record_count: int
+    tail_range: tuple[int, int] | None
+    chunk_range: tuple[int, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FramingSourceRow:
+    incident_id: str
+    source_id: str
+    sequence_start: int
+    committed_count: int
+    verified_count: int
+    confirmed_frontier: int
+    verified_conflict: bool
+    tail_generation: int | None
+    tail_offset: int | None
+    tail_size: int | None
+
+
 def collect_operator_status(
     layout: StorageLayout,
     *,
@@ -203,6 +243,7 @@ def collect_operator_status(
         operational_status = read_operational_status(db, current_identity)
         runtime = _runtime_status(db, end.astimezone(UTC), operational_status, current_identity)
         custody_holds = _custody_hold_count(db)
+        audio_integrity = _audio_integrity_summary(db)
         ble_scan_incident = _ble_scan_incident_summary(db)
     except (
         ConfirmedLossError,
@@ -219,7 +260,14 @@ def collect_operator_status(
         window_status = "attention"
     if ble_scan_incident["active"]:
         window_status = "attention"
+    if (
+        audio_integrity["unresolved_source_count"]
+        or audio_integrity["unresolved_observation_count"]
+        or audio_integrity["unresolved_conflict_count"]
+    ):
+        window_status = "attention"
     return {
+        "audio_integrity": audio_integrity,
         "device": device,
         "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
         "publication": spool.current_window.as_dict(),
@@ -227,10 +275,388 @@ def collect_operator_status(
         "custody_holds": custody_holds,
         "ble_scan_incident": ble_scan_incident,
         "runtime": runtime,
-        "schema_version": 3,
+        "schema_version": 4,
         "status": window_status,
         "window_hours": hours,
     }
+
+
+def _audio_integrity_summary(db: StateDB) -> dict[str, object]:
+    """Project only unresolved framing metadata, never its audio bytes."""
+    observations: dict[tuple[str, int], dict[str, object]] = {}
+    sources = _group_framing_sources(tuple(_decode_framing_source(row) for row in _unresolved_framing_source_rows(db)))
+    for raw_row in _unresolved_framing_rows(db):
+        _accumulate_framing_row(observations, _decode_framing_row(raw_row))
+    conflicts = _unresolved_conflict_rows(db)
+    conflict_summary = _finish_conflict_summary(conflicts)
+    observation_summary = _finish_framing_summary(observations)
+    source_summary = [_project_framing_source(source) for source in sources]
+    retained_bytes = sum(cast(int, source["retained_raw_bytes"]) for source in source_summary)
+    retained_bytes += sum(cast(int, item["retained_raw_bytes"]) for item in observation_summary)
+    retained_bytes += sum(cast(int, item["retained_raw_bytes"]) for item in conflict_summary)
+    return {
+        "confirmed_malformed_observations": sum(
+            cast(bool, item["confirmed_damage"]) and item["fault_offset_read_relative"] is not None
+            for item in observation_summary
+        ),
+        "unresolved_conflict_count": len(conflict_summary),
+        "unresolved_retained_storage_bytes": retained_bytes,
+        "unresolved_observation_count": len(observation_summary),
+        "unresolved_source_count": len(source_summary),
+        "unresolved_sources": source_summary,
+        "unresolved_observations": observation_summary,
+        "unresolved_conflicts": conflict_summary,
+    }
+
+
+def _unresolved_framing_source_rows(db: StateDB) -> list[sqlite3.Row]:
+    try:
+        with closing(db.open_connection(read_only=True)) as connection, db.access(connection):
+            return connection.execute(
+                _INCIDENT_SOURCES_CTE
+                + "SELECT incident.incident_id, source.source_id, source.sequence_start, source.committed_count, "
+                "COALESCE(legs.verified_count,0), incident.confirmed_frontier, incident.verified_conflict, "
+                "tail.leg_generation, tail.byte_offset, length(tail.bytes) "
+                "FROM capture_framing_incident AS incident "
+                "JOIN incident_sources AS related ON related.incident_id=incident.incident_id "
+                "JOIN capture_source AS source ON source.source_id=related.source_id "
+                "LEFT JOIN (SELECT source_id,MAX(verified_count) AS verified_count "
+                "FROM capture_read_leg GROUP BY source_id) AS legs ON legs.source_id=source.source_id "
+                "LEFT JOIN capture_tail AS tail ON tail.source_id=source.source_id "
+                "WHERE incident.status='unresolved' ORDER BY source.source_id, incident.incident_id"
+            ).fetchall()
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise OperatorStatusError("framing source custody is unreadable") from error
+
+
+def _decode_framing_source(row: sqlite3.Row) -> _FramingSourceRow:
+    try:
+        (
+            incident_id,
+            source_id,
+            encoded_start,
+            committed_count,
+            verified_count,
+            encoded_frontier,
+            verified_conflict,
+            tail_generation,
+            tail_offset,
+            tail_size,
+        ) = cast(tuple[object, ...], row)
+        sequence_start = decode_uint64(cast(bytes, encoded_start))
+        confirmed_frontier = decode_uint64(cast(bytes, encoded_frontier))
+    except (StateDBError, TypeError, ValueError) as error:
+        raise OperatorStatusError("framing source metadata is invalid") from error
+    if (
+        not isinstance(incident_id, str)
+        or not isinstance(source_id, str)
+        or type(committed_count) is not int
+        or committed_count < 0
+        or type(verified_count) is not int
+    ):
+        raise OperatorStatusError("framing source metadata is invalid")
+    if (
+        not 0 <= verified_count <= committed_count
+        or type(verified_conflict) is not int
+        or verified_conflict not in (0, 1)
+    ):
+        raise OperatorStatusError("framing source metadata is invalid")
+    if tail_generation is not None and (type(tail_generation) is not int or tail_generation < 0):
+        raise OperatorStatusError("framing source metadata is invalid")
+    if tail_offset is not None and (type(tail_offset) is not int or tail_offset < 0):
+        raise OperatorStatusError("framing source metadata is invalid")
+    if tail_size is not None and (type(tail_size) is not int or not 1 <= tail_size < RECORD_SIZE):
+        raise OperatorStatusError("framing source metadata is invalid")
+    if (tail_generation is None) != (tail_offset is None) or (tail_generation is None) != (tail_size is None):
+        raise OperatorStatusError("framing source metadata is invalid")
+    return _FramingSourceRow(
+        incident_id,
+        source_id,
+        sequence_start,
+        committed_count,
+        verified_count,
+        confirmed_frontier,
+        bool(verified_conflict),
+        cast(int | None, tail_generation),
+        cast(int | None, tail_offset),
+        cast(int | None, tail_size),
+    )
+
+
+def _group_framing_sources(rows: tuple[_FramingSourceRow, ...]) -> tuple[tuple[_FramingSourceRow, ...], ...]:
+    by_source: dict[str, list[_FramingSourceRow]] = {}
+    for row in rows:
+        by_source.setdefault(row.source_id, []).append(row)
+    return tuple(tuple(by_source[source_id]) for source_id in sorted(by_source))
+
+
+def _project_framing_source(rows: tuple[_FramingSourceRow, ...]) -> dict[str, object]:
+    source = rows[0]
+    if any(
+        row.sequence_start != source.sequence_start
+        or row.committed_count != source.committed_count
+        or row.verified_count != source.verified_count
+        or (row.tail_generation, row.tail_offset, row.tail_size)
+        != (source.tail_generation, source.tail_offset, source.tail_size)
+        for row in rows[1:]
+    ):
+        raise OperatorStatusError("framing source custody rows disagree")
+    canonical_starts = [source.verified_count]
+    for row in rows:
+        if row.verified_conflict:
+            conflict_start = max(source.sequence_start, row.confirmed_frontier) - source.sequence_start
+            canonical_starts.append(conflict_start)
+    canonical_start = min(canonical_starts)
+    if canonical_start > source.committed_count:
+        raise OperatorStatusError("framing canonical suffix is invalid")
+    canonical_end = source.committed_count
+    canonical_bytes = (canonical_end - canonical_start) * RECORD_SIZE
+    retained_bytes = canonical_bytes
+    canonical_range = (
+        {"start": canonical_start * RECORD_SIZE, "end": canonical_end * RECORD_SIZE}
+        if canonical_start < canonical_end
+        else None
+    )
+    tail: dict[str, object] | None = None
+    if source.tail_offset is not None and source.tail_size is not None and source.tail_generation is not None:
+        tail = {
+            "local_reference": {"source_id": source.source_id, "leg_generation": source.tail_generation},
+            "source_relative_byte_range": {
+                "start": source.tail_offset,
+                "end": source.tail_offset + source.tail_size,
+            },
+            "retained_raw_bytes": source.tail_size,
+        }
+        retained_bytes += source.tail_size
+    return {
+        "local_reference": {"source_id": source.source_id},
+        "incident_ids": sorted({row.incident_id for row in rows}),
+        "canonical_unverified_records": canonical_end - canonical_start,
+        "canonical_unverified_byte_range": canonical_range,
+        "retained_raw_bytes": retained_bytes,
+        "tail": tail,
+    }
+
+
+def _unresolved_framing_rows(db: StateDB) -> list[sqlite3.Row]:
+    try:
+        with closing(db.open_connection(read_only=True)) as connection, db.access(connection):
+            return connection.execute(
+                "SELECT incident.incident_id, observation.source_id, observation.leg_generation, "
+                "incident.confirmed_damage, source.sequence_start, observation.read_start, "
+                "observation.read_count, observation.fault_offset, observation.prefix_record_count, "
+                "observation.received_bytes, length(observation.tail), chunk.byte_offset, length(chunk.bytes) "
+                "FROM capture_observation AS observation "
+                "JOIN capture_framing_incident AS incident ON incident.incident_id=observation.incident_id "
+                "JOIN capture_source AS source ON source.source_id=observation.source_id "
+                "LEFT JOIN capture_observation_chunk AS chunk "
+                "ON chunk.source_id=observation.source_id AND chunk.leg_generation=observation.leg_generation "
+                "WHERE incident.status='unresolved' "
+                "ORDER BY observation.source_id, observation.leg_generation, chunk.byte_offset"
+            ).fetchall()
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise OperatorStatusError("framing evidence is unreadable") from error
+
+
+def _unresolved_conflict_rows(db: StateDB) -> list[sqlite3.Row]:
+    try:
+        with closing(db.open_connection(read_only=True)) as connection, db.access(connection):
+            return connection.execute(
+                _INCIDENT_SOURCES_CTE
+                + "SELECT DISTINCT conflict.source_id, conflict.chunk_ordinal, conflict.leg_generation, "
+                "conflict.absolute_byte_offset, length(conflict.bytes), conflict.reason "
+                "FROM capture_conflict AS conflict "
+                "JOIN incident_sources AS related ON related.source_id=conflict.source_id "
+                "JOIN capture_framing_incident AS incident ON incident.incident_id=related.incident_id "
+                "WHERE incident.status='unresolved' "
+                "ORDER BY conflict.source_id, conflict.absolute_byte_offset, conflict.chunk_ordinal"
+            ).fetchall()
+    except (OSError, sqlite3.DatabaseError, StateDBError) as error:
+        raise_if_sqlite_storage_fault(error)
+        raise OperatorStatusError("framing conflict inventory is unreadable") from error
+
+
+def _decode_framing_row(row: sqlite3.Row) -> _FramingRow:
+    try:
+        (
+            incident_id,
+            source_id,
+            generation,
+            confirmed_damage,
+            encoded_source_start,
+            encoded_start,
+            count,
+            fault,
+            prefix_count,
+            received,
+            tail_size,
+            chunk_start,
+            chunk_size,
+        ) = cast(tuple[object, ...], row)
+    except ValueError as error:
+        raise OperatorStatusError("framing observation row is invalid") from error
+    if (
+        not isinstance(incident_id, str)
+        or not isinstance(source_id, str)
+        or type(generation) is not int
+        or type(confirmed_damage) is not int
+        or confirmed_damage not in (0, 1)
+    ):
+        raise OperatorStatusError("framing observation metadata is invalid")
+    if type(count) is not int or count <= 0 or (type(fault) is not int and fault is not None):
+        raise OperatorStatusError("framing observation metadata is invalid")
+    if type(prefix_count) is not int or not 0 <= prefix_count <= count:
+        raise OperatorStatusError("framing observation metadata is invalid")
+    if type(received) is not int or received < 0 or type(tail_size) is not int or not 0 <= tail_size < RECORD_SIZE:
+        raise OperatorStatusError("framing observation metadata is invalid")
+    try:
+        encoded_source_start = decode_uint64(cast(bytes, encoded_source_start))
+        encoded_start = decode_uint64(cast(bytes, encoded_start))
+    except (StateDBError, TypeError, ValueError) as error:
+        raise OperatorStatusError("framing observation READ_BEGIN is invalid") from error
+    if received < tail_size or (fault is not None and not 0 <= fault < received):
+        raise OperatorStatusError("framing observation byte extent is invalid")
+    if prefix_count * RECORD_SIZE > received - tail_size:
+        raise OperatorStatusError("framing observation prefix extent exceeds its READ")
+    tail_range = (received - tail_size, received) if tail_size else None
+    chunk_range = _framing_chunk_range(chunk_start, chunk_size, prefix_count, received, tail_size)
+    if encoded_start < encoded_source_start:
+        raise OperatorStatusError("framing observation READ_BEGIN precedes its source")
+    return _FramingRow(
+        incident_id,
+        source_id,
+        generation,
+        bool(confirmed_damage),
+        encoded_source_start,
+        encoded_start,
+        count,
+        fault,
+        prefix_count,
+        tail_range,
+        chunk_range,
+    )
+
+
+def _framing_chunk_range(
+    chunk_start: object, chunk_size: object, prefix_count: int, received: int, tail_size: int
+) -> tuple[int, int] | None:
+    if chunk_start is None and chunk_size is None:
+        chunk_range = None
+    elif type(chunk_start) is int and type(chunk_size) is int and chunk_size > 0:
+        chunk_range = (chunk_start, chunk_start + chunk_size)
+        if chunk_start < prefix_count * RECORD_SIZE or chunk_range[1] > received - tail_size:
+            raise OperatorStatusError("framing observation chunk extent is outside the READ")
+    else:
+        raise OperatorStatusError("framing observation chunk extent is invalid")
+    return chunk_range
+
+
+def _accumulate_framing_row(observations: dict[tuple[str, int], dict[str, object]], row: _FramingRow) -> None:
+    key = (row.source_id, row.leg_generation)
+    observation: dict[str, object] | None = observations.get(key)
+    read_begin = {"start_sequence": row.read_start, "packet_count": row.read_count}
+    if observation is None:
+        observation = {
+            "incident_id": row.incident_id,
+            "confirmed_damage": row.confirmed_damage,
+            "local_reference": {"source_id": row.source_id, "leg_generation": row.leg_generation},
+            "read_begin": read_begin,
+            "fault_offset_read_relative": row.fault_offset,
+            "prefix_record_count": row.prefix_record_count,
+            "read_relative_byte_ranges": [],
+            "_tail_range": row.tail_range,
+            "_source_start": row.source_start,
+            "_read_start": row.read_start,
+        }
+        observations[key] = observation
+    elif (
+        observation["incident_id"] != row.incident_id
+        or observation["confirmed_damage"] is not row.confirmed_damage
+        or observation["read_begin"] != read_begin
+        or any(
+            observation[key] != value
+            for key, value in (
+                ("fault_offset_read_relative", row.fault_offset),
+                ("prefix_record_count", row.prefix_record_count),
+                ("_tail_range", row.tail_range),
+                ("_source_start", row.source_start),
+            )
+        )
+    ):
+        raise OperatorStatusError("framing observation rows disagree")
+    if row.chunk_range is not None:
+        _append_read_range(observation, *row.chunk_range)
+
+
+def _finish_framing_summary(observations: dict[tuple[str, int], dict[str, object]]) -> list[dict[str, object]]:
+    summary: list[dict[str, object]] = []
+    for observation in observations.values():
+        tail_range = cast(tuple[int, int] | None, observation.pop("_tail_range"))
+        source_start = cast(int, observation.pop("_source_start"))
+        read_start = cast(int, observation.pop("_read_start"))
+        if tail_range is not None:
+            ranges = cast(list[dict[str, int]], observation["read_relative_byte_ranges"])
+            _append_range_json(ranges, tail_range[0], tail_range[1])
+        prefix_count = cast(int, observation["prefix_record_count"])
+        prefix_start = (read_start - source_start) * RECORD_SIZE
+        observation["prefix_source_relative_byte_range"] = (
+            {"start": prefix_start, "end": prefix_start + prefix_count * RECORD_SIZE} if prefix_count else None
+        )
+        observation["retained_raw_bytes"] = sum(
+            byte_range["end"] - byte_range["start"]
+            for byte_range in cast(list[dict[str, int]], observation["read_relative_byte_ranges"])
+        )
+        summary.append(observation)
+    summary.sort(
+        key=lambda item: (
+            cast(dict[str, object], item["local_reference"])["source_id"],
+            cast(dict[str, object], item["local_reference"])["leg_generation"],
+        )
+    )
+    return summary
+
+
+def _append_read_range(observation: dict[str, object], start: int, end: int) -> None:
+    ranges = cast(list[dict[str, int]], observation["read_relative_byte_ranges"])
+    _append_range_json(ranges, start, end)
+
+
+def _append_range_json(ranges: list[dict[str, int]], start: int, end: int) -> None:
+    if ranges and start < ranges[-1]["end"]:
+        raise OperatorStatusError("framing observation byte ranges overlap")
+    if ranges and start == ranges[-1]["end"]:
+        ranges[-1]["end"] = end
+    else:
+        ranges.append({"start": start, "end": end})
+
+
+def _finish_conflict_summary(rows: list[sqlite3.Row]) -> list[dict[str, object]]:
+    summary: list[dict[str, object]] = []
+    for row in rows:
+        source_id, ordinal, generation, offset, size, reason = cast(tuple[object, ...], row)
+        if (
+            not isinstance(source_id, str)
+            or type(ordinal) is not int
+            or ordinal < 0
+            or type(generation) is not int
+            or generation < 0
+        ):
+            raise OperatorStatusError("framing conflict metadata is invalid")
+        if type(offset) is not int or offset < 0 or type(size) is not int or size <= 0 or not isinstance(reason, str):
+            raise OperatorStatusError("framing conflict metadata is invalid")
+        end = offset + size
+        summary.append(
+            {
+                "local_reference": {"source_id": source_id, "leg_generation": generation},
+                "chunk_ordinal": ordinal,
+                "source_relative_byte_ranges": [{"start": offset, "end": end}],
+                "retained_raw_bytes": size,
+                "reason": reason,
+            }
+        )
+    return summary
 
 
 def _ble_scan_incident_summary(db: StateDB) -> dict[str, object]:

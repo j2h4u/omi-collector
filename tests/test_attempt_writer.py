@@ -125,6 +125,14 @@ class FakeTarget:
         self._record("interrupt")
         return self.checkpoint_result
 
+    def finish_read(self, done_notice: object) -> bool:
+        self._record("finish_read", done_notice)
+        return True
+
+    def quarantine_unconfirmed(self) -> object:
+        self._record("quarantine_unconfirmed")
+        return self.checkpoint_result
+
     def seal(self, done_notice: object) -> object:
         self._record("seal", done_notice)
         self.seal_calls += 1
@@ -203,6 +211,13 @@ class ProcessLifetimeTarget:
 
     def interrupt(self) -> object:
         self.flags[1] = 1
+        return None
+
+    def finish_read(self, done_notice: object) -> bool:
+        del done_notice
+        return True
+
+    def quarantine_unconfirmed(self) -> object:
         return None
 
     def seal(self, done_notice: object) -> object:
@@ -1331,3 +1346,16 @@ def test_failure_lifecycle_idle_append_error_keeps_close_owned_and_failed_state_
             assert not writer.thread.is_alive()
 
     asyncio.run(exercise())
+
+
+def test_finish_read_drains_before_persisting_done() -> None:
+    async def scenario() -> None:
+        target = FakeTarget()
+        async with _started(target, bytes(RECORD_SIZE)) as writer:
+            writer.publish(RECORD_SIZE)
+            assert await writer.finish_read("actual_done")
+            names = [call[0] for call in target.calls]
+            assert names.index("append") < names.index("finish_read")
+            assert target.calls[names.index("finish_read")][2] == "actual_done"
+
+    asyncio.run(scenario())

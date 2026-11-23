@@ -173,7 +173,8 @@ def _async_test[**P, T](function: Callable[P, Awaitable[T]]) -> Callable[P, T]:
 
 
 def _record(value: int) -> bytes:
-    return pack(">I", value) + bytes((value % 256,)) * (RECORD_SIZE - 4)
+    payload = bytes((2, 8, value % 251 + 1))
+    return pack(">I", value) + payload + bytes(RECORD_SIZE - 4 - len(payload))
 
 
 def _records(start: int, count: int) -> bytes:
@@ -724,6 +725,13 @@ class _BlockingSealTarget:
     def interrupt(self) -> None:
         return None
 
+    def finish_read(self, done_notice: object) -> bool:
+        del done_notice
+        return True
+
+    def quarantine_unconfirmed(self) -> None:
+        return None
+
     def checkpoint(self) -> DurablePrefix:
         return DurablePrefix(10, 11, 1, "a" * 64)
 
@@ -826,14 +834,15 @@ async def test_real_runtime_writer_barrier_returns_persisted_durable_prefix(tmp_
         durable = await writer.barrier()
 
         assert durable.start_sequence == 100
-        assert durable.next_sequence == 101
-        assert durable.record_count == 1
+        assert durable.next_sequence == 100
+        assert durable.record_count == 0
+        assert durable.has_unconfirmed
         assert _source_records(store, writer.attempt_id) == record
         source = _attempt_source(store, writer.attempt_id)
         assert source is not None
         assert source.committed_count == 1
         assert source.committed_sha256 == sha256(record).hexdigest()
-        assert durable.raw_sha256 == source.committed_sha256
+        assert durable.raw_sha256 == sha256(b"").hexdigest()
 
 
 @_async_test
@@ -842,6 +851,7 @@ async def test_real_runtime_writer_retains_seal_bundle_result(tmp_path: Path) ->
     records = _records(100, 2)
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(len(records))
+        assert await writer.finish_read(DoneNotification(0, 102))
         sealed = cast(DurableSqliteSeal, await writer.seal(DoneNotification(0, 102)))
         retained = await writer.await_seal_result()
 
@@ -1148,7 +1158,9 @@ def _patch_observation_writer(
     monkeypatch.setattr(OpportunisticRuntime, "make_observation_writer", make_observation_writer)
 
 
-def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: int = 100) -> bytes:
+def _seed_streaming_partial(
+    root: Path, *, count: int, persisted: int, start: int = 100, confirmed: bool = True
+) -> bytes:
     def seed() -> bytes:
         store = _staging_store(root, _capture_root(root))
         attempt = store.prepare_streaming_attempt(start, count)
@@ -1157,11 +1169,44 @@ def _seed_streaming_partial(root: Path, *, count: int, persisted: int, start: in
         records = _records(start, count)
         if persisted:
             attempt.accept_chunk(start, memoryview(records[: persisted * RECORD_SIZE]))
+            if confirmed and persisted < count:
+                attempt.interrupt()
+                attempt.prepare_leg(start, persisted)
+                attempt.record_read_begin(ReadBeginNotification(start, persisted))
+                attempt.accept_chunk(start, memoryview(records[: persisted * RECORD_SIZE]))
+            if confirmed:
+                assert attempt.finish_read(DoneNotification(0, start + persisted), persisted * RECORD_SIZE)
         attempt.checkpoint()
         attempt.close(durable=True)
         return records
 
     return storage_call(seed)
+
+
+@_async_test
+async def test_restart_rereads_from_fresh_head_when_saved_bytes_lack_done(tmp_path: Path) -> None:
+    records = _seed_streaming_partial(tmp_path, count=2, persisted=1, confirmed=False)
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    original_id = store.pending_attempts()[0].attempt_id
+    session = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(100, 102),)),
+            WriteStep(b"\x10", (_info(100, 102),)),
+            WriteStep(encode_read_command(100, 2), (_begin(100, 2), _data(records), _done(102))),
+        ),
+    )
+    options = _options()
+    options = replace(options, policy=replace(options.policy, advance_enabled=False))
+
+    result = await run_opportunistic_collector(Provider([session]), store, options)
+
+    assert isinstance(result, CollectionResult)
+    assert isinstance(result.seal, DurableSqliteSeal)
+    assert _sealed_records(store, result.seal) == records
+    original = _attempt_source(store, original_id)
+    assert original is not None and original.lifecycle == "blocked"
+    assert session.writes == [b"\x10", b"\x10", encode_read_command(100, 2)]
 
 
 def test_retry_policy_requires_explicit_drain_cooldown() -> None:
@@ -1831,7 +1876,7 @@ async def test_fresh_restart_cursor_ahead_publishes_prefix_and_reads_from_curren
 
 
 @_async_test
-async def test_recovered_confirmed_loss_completes_public_drain_token(tmp_path: Path) -> None:
+async def test_interrupted_unknown_gap_does_not_complete_public_drain_token(tmp_path: Path) -> None:
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     store.preflight_storage()
     store.initialize_confirmed_loss_ledger()
@@ -1872,6 +1917,7 @@ async def test_recovered_confirmed_loss_completes_public_drain_token(tmp_path: P
             20,
         )
 
+    [pending] = store.pending_attempts()
     reopened = _staging_store(tmp_path, _capture_root(tmp_path))
     result = await run_opportunistic_collector(
         Provider([recovered]),
@@ -1879,15 +1925,14 @@ async def test_recovered_confirmed_loss_completes_public_drain_token(tmp_path: P
         replace(_options(), public_drain=reopened.public_drain),
     )
 
-    assert isinstance(result, CollectionResult)
-    assert result.next_sequence == 101
-    assert _ready_closure_rows(store) == [{"next_sequence": 101, "reason": "drained"}]
-    [loss] = storage_call(lambda: read_confirmed_losses(reopened.state_db))
-    assert (loss.start_sequence, loss.end_sequence) == (101, 103)
-    assert _source_records(reopened, loss.attempt_id) == _record(100)
+    assert isinstance(result, NoDataResult)
+    assert _ready_closure_rows(store) == []
+    assert storage_call(lambda: read_confirmed_losses(reopened.state_db)) == ()
+    source = _attempt_source(reopened, pending.attempt_id)
+    assert source is not None and source.lifecycle == "blocked"
     assert recovered.writes == [b"\x10"] * 3
     drain = storage_call(lambda: reopened.state_db.get(StateKind.PENDANT_DRAIN, "current"))
-    assert drain is not None and drain["last_drain"] is not None
+    assert drain is not None and drain["last_drain"] is None
     assert drain["pending_event_id"] is None
 
     restarted_again = _staging_store(tmp_path, _capture_root(tmp_path))
@@ -1916,6 +1961,7 @@ async def test_startup_sweep_retains_aged_sealed_source_until_publication_ack(
         attempt.prepare_leg(100, 1)
         attempt.record_read_begin(ReadBeginNotification(100, 1))
         attempt.accept_chunk(100, _record(100))
+        assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         attempt.checkpoint()
         attempt.publish_prefix()
         attempt.close(durable=True)
@@ -1965,6 +2011,7 @@ async def test_maintenance_cadence_retains_sealed_source_until_publication_ack(
         attempt.prepare_leg(100, 1)
         attempt.record_read_begin(ReadBeginNotification(100, 1))
         attempt.accept_chunk(100, _record(100))
+        assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         attempt.checkpoint()
         attempt.publish_prefix()
         attempt.close(durable=True)
@@ -2393,7 +2440,7 @@ async def test_resume_cursor_matrix(
 
 
 @_async_test
-async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
+async def test_unconfirmed_aligned_bytes_remain_in_custody_before_new_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _staging_store(tmp_path, _capture_root(tmp_path))
@@ -2430,6 +2477,7 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
         _status(),
         (
             WriteStep(b"\x10", (_info(102, 103),)),
+            WriteStep(b"\x10", (_info(102, 103),)),
             WriteStep(encode_read_command(102, 1), (_begin(102, 1), _data(_record(102)), _done(103))),
             WriteStep(b"\x10", (_info(102, 103),)),
             WriteStep(encode_advance_command(103), (b"\x01\x00",)),
@@ -2441,8 +2489,8 @@ async def test_aligned_raw_tail_is_promoted_before_resume_arena_is_bound(
 
     assert isinstance(result, CollectionResult)
     assert result.next_sequence == 103
-    assert checkpoint_counts_at_allocation == [2]
-    assert session.writes[1] == encode_read_command(102, 1)
+    assert checkpoint_counts_at_allocation == [2, 2]
+    assert session.writes[2] == encode_read_command(102, 1)
 
 
 @_async_test
@@ -2943,7 +2991,8 @@ async def test_notification_overflow_checkpoints_and_reconnects_with_fresh_info(
         _status(),
         (
             WriteStep(b"\x10", (_info(10, 12),)),
-            WriteStep(encode_read_command(11, 1), (_begin(11, 1), _data(_record(11)), _done(12))),
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_records(10, 2)), _done(12))),
             WriteStep(b"\x10", (_info(10, 12),)),
             WriteStep(encode_advance_command(12), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(12, 12),)),
@@ -2976,7 +3025,7 @@ async def test_notification_overflow_checkpoints_and_reconnects_with_fresh_info(
     assert first.writes == [b"\x10", encode_read_command(10, 2), encode_stop_command()]
     assert first.closed
     assert second.closed
-    assert second.writes == [b"\x10", encode_read_command(11, 1), b"\x10", encode_advance_command(12), b"\x10"]
+    assert second.writes == [b"\x10", b"\x10", encode_read_command(10, 2), b"\x10", encode_advance_command(12), b"\x10"]
 
 
 @_async_test
@@ -3232,7 +3281,7 @@ async def test_three_batches_share_one_presence_no_double_info_and_defer_tail(tm
 
 
 @_async_test
-async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_publishes(tmp_path: Path) -> None:
+async def test_repeated_short_visits_preserve_attempts_until_full_read(tmp_path: Path) -> None:
     first = ScriptedRingSession(
         _status(),
         (
@@ -3248,9 +3297,10 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
         _status(),
         (
             WriteStep(b"\x10", (_info(10, 16),)),
+            WriteStep(b"\x10", (_info(10, 16),)),
             WriteStep(
-                encode_read_command(12, 4),
-                (_begin(12, 4), _data(_records(12, 2)), RingTransportDisconnectedError("visit ended")),
+                encode_read_command(10, 6),
+                (_begin(10, 6), _data(_records(10, 2)), RingTransportDisconnectedError("visit ended")),
             ),
             WriteStep(encode_stop_command()),
         ),
@@ -3259,7 +3309,8 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
         _status(),
         (
             WriteStep(b"\x10", (_info(10, 16),)),
-            WriteStep(encode_read_command(14, 2), (_begin(14, 2), _data(_records(14, 2)), _done(16))),
+            WriteStep(b"\x10", (_info(10, 16),)),
+            WriteStep(encode_read_command(10, 6), (_begin(10, 6), _data(_records(10, 6)), _done(16))),
             WriteStep(b"\x10", (_info(10, 16),)),
             WriteStep(encode_advance_command(16), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(16, 16),)),
@@ -3292,7 +3343,7 @@ async def test_repeated_short_visits_accumulate_durable_prefix_until_snapshot_pu
     assert isinstance(result.seal, DurableSqliteSeal)
     assert result.next_sequence == 16
     assert provider.opened == 3
-    assert durable_after_visit == [2, 4]
+    assert durable_after_visit == [2, 2]
     assert published_after_visit == [0, 0]
     assert result.seal.start_sequence == 10
     assert result.seal.next_sequence == 16
@@ -3692,7 +3743,8 @@ async def test_disconnect_next_day_replays_overlap_and_progress_counts_unique_by
         _status(),
         (
             WriteStep(b"\x10", (_info(10, 12),)),
-            WriteStep(encode_read_command(11, 1), (_begin(11, 1), _data(_record(11)), _done(12))),
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_records(10, 2)), _done(12))),
             WriteStep(b"\x10", (_info(10, 12),)),
             WriteStep(encode_advance_command(12), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(12, 12),)),
@@ -3723,7 +3775,7 @@ async def test_disconnect_next_day_replays_overlap_and_progress_counts_unique_by
     )
 
     assert isinstance(result, CollectionResult)
-    assert complete.writes[1] == encode_read_command(11, 1)
+    assert complete.writes[2] == encode_read_command(10, 2)
     assert clock.value == 15
     assert [event.retry_seconds for event in activity if event.state == "away"] == [1, 2, 4, 8]
     assert progress[-1].records_completed == progress[-1].records_total == 2
@@ -3748,7 +3800,8 @@ async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -
         _status(),
         (
             WriteStep(b"\x10", (_info(10, 12),)),
-            WriteStep(encode_read_command(11, 1), (_begin(11, 1), _data(_record(11)), _done(12))),
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_records(10, 2)), _done(12))),
             WriteStep(b"\x10", (_info(10, 12),)),
             WriteStep(encode_advance_command(12), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(12, 12),)),
@@ -3782,24 +3835,24 @@ async def test_reconnect_quality_counts_each_physical_leg_once(tmp_path: Path) -
     )
     assert isinstance(result, CollectionResult)
     assert result.packet_count == 2
-    assert [metric["requested_record_count"] for metric in metrics] == [2, 1]
+    assert [metric["requested_record_count"] for metric in metrics] == [2, 2]
     assert [metric["outcome"] for metric in metrics] == ["connected_interrupted", "drained"]
     assert [metric["termination_class"] for metric in metrics] == ["retryable_error", "completed"]
-    assert [metric["received_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
-    assert [metric["submitted_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
-    assert [metric["written_raw_bytes"] for metric in metrics] == [RECORD_SIZE, RECORD_SIZE]
+    assert [metric["received_raw_bytes"] for metric in metrics] == [RECORD_SIZE, 2 * RECORD_SIZE]
+    assert [metric["submitted_raw_bytes"] for metric in metrics] == [RECORD_SIZE, 2 * RECORD_SIZE]
+    assert [metric["written_raw_bytes"] for metric in metrics] == [RECORD_SIZE, 2 * RECORD_SIZE]
     assert [metric["active_read_elapsed_ms"] for metric in metrics] == [1000, 1000]
-    assert sum(cast(int, metric["written_raw_bytes"]) for metric in metrics) == 2 * RECORD_SIZE
+    assert sum(cast(int, metric["written_raw_bytes"]) for metric in metrics) == 3 * RECORD_SIZE
     assert (
         sum(cast(int, metric["written_raw_bytes"]) for metric in metrics)
         * 1000
         / sum(cast(int, metric["active_read_elapsed_ms"]) for metric in metrics)
-        == RECORD_SIZE
+        == 1.5 * RECORD_SIZE
     )
 
 
 @_async_test
-async def test_same_process_recovery_disconnect_rebinds_original_read_begin_for_gap(
+async def test_retry_without_data_does_not_turn_prior_uncertainty_into_exact_loss(
     tmp_path: Path,
 ) -> None:
     first = ScriptedRingSession(
@@ -3817,7 +3870,8 @@ async def test_same_process_recovery_disconnect_rebinds_original_read_begin_for_
         _status(),
         (
             WriteStep(b"\x10", (_info(10, 13),)),
-            WriteStep(encode_read_command(12, 1), (_begin(12, 1), RingTransportDisconnectedError("gone"))),
+            WriteStep(b"\x10", (_info(10, 13),)),
+            WriteStep(encode_read_command(10, 3), (_begin(10, 3), RingTransportDisconnectedError("gone"))),
             WriteStep(encode_stop_command()),
         ),
     )
@@ -3838,11 +3892,10 @@ async def test_same_process_recovery_disconnect_rebinds_original_read_begin_for_
         _options(batch_records=3),
     )
 
-    assert isinstance(result, CollectionResult)
-    assert recovery.writes[1] == encode_read_command(12, 1)
+    assert isinstance(result, NoDataResult)
+    assert recovery.writes[2] == encode_read_command(10, 3)
     assert gapped.writes == [b"\x10", b"\x10"]
-    assert isinstance(result.seal, DurableSqliteSeal)
-    assert result.seal.source_id
+    assert storage_call(lambda: read_confirmed_losses(store.state_db)) == ()
 
 
 @_async_test
@@ -3863,7 +3916,8 @@ async def test_storage_not_ready_info_after_disconnect_retries_on_same_session(t
         (
             WriteStep(b"\x10", (b"\x01\x09",)),
             WriteStep(b"\x10", (_info(10, 12),)),
-            WriteStep(encode_read_command(11, 1), (_begin(11, 1), _data(_record(11)), _done(12))),
+            WriteStep(b"\x10", (_info(10, 12),)),
+            WriteStep(encode_read_command(10, 2), (_begin(10, 2), _data(_records(10, 2)), _done(12))),
             WriteStep(b"\x10", (_info(10, 12),)),
             WriteStep(encode_advance_command(12), (b"\x01\x00",)),
             WriteStep(b"\x10", (_info(12, 12),)),
@@ -3880,7 +3934,7 @@ async def test_storage_not_ready_info_after_disconnect_retries_on_same_session(t
 
     assert isinstance(result, CollectionResult)
     assert recovered.writes[:2] == [b"\x10", b"\x10"]
-    assert recovered.writes[2] == encode_read_command(11, 1)
+    assert recovered.writes[3] == encode_read_command(10, 2)
     assert [event.retry_seconds for event in activity if event.state == "storage_wait"] == [1]
     assert clock.value == pytest.approx(1.001)
 
@@ -4391,7 +4445,7 @@ def test_durable_progress_excludes_empty_authenticated_frontier(tmp_path: Path) 
 
 
 @_async_test
-async def test_close_visit_absence_publishes_partial_prefix_before_terminal_closure(tmp_path: Path) -> None:
+async def test_close_visit_absence_preserves_unconfirmed_prefix_without_closure(tmp_path: Path) -> None:
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(RECORD_SIZE)
@@ -4416,9 +4470,9 @@ async def test_close_visit_absence_publishes_partial_prefix_before_terminal_clos
         assert not writer.thread.is_alive()
         source = _attempt_source(store, attempt_id)
         assert source is not None
-        assert source.lifecycle == "sealed_waiting"
+        assert source.lifecycle == "receiving"
         assert source.committed_count == 1
-        assert _ready_closure_rows(store) == [{"next_sequence": 101, "reason": "absence"}]
+        assert _ready_closure_rows(store) == []
 
 
 @_async_test
@@ -4426,6 +4480,7 @@ async def test_close_visit_sealed_batch_appends_terminal_closure_after_writer_cl
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 2) as writer:
         assert writer.publish(RECORD_SIZE * 2)
+        assert await writer.finish_read(DoneNotification(0, 102))
         seal = cast(DurableSqliteSeal, await writer.seal(DoneNotification(0, 102)))
         assert seal is not None
         batch = batch_reconciliation._Batch(
@@ -4479,6 +4534,7 @@ async def test_failed_writer_close_keeps_sealed_batch_active(tmp_path: Path, mon
     store = _staging_store(tmp_path, _capture_root(tmp_path))
     async with _real_batch_writer(store, 100, 1) as writer:
         assert writer.publish(RECORD_SIZE)
+        assert await writer.finish_read(DoneNotification(0, 101))
         seal = cast(DurableSqliteSeal, await writer.seal(DoneNotification(0, 101)))
         assert seal is not None
         batch = batch_reconciliation._Batch(

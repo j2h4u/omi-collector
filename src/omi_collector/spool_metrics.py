@@ -88,6 +88,8 @@ class _BundleMeasurement:
     records: int
     raw_bytes: int
     ranges: tuple[tuple[int, int], ...]
+    order: int
+    physical: bool
 
 
 def collect_spool_metrics(
@@ -148,12 +150,16 @@ def _read_v2_artifact(path: Path, entry: dict[str, object]) -> _BundleMeasuremen
     manifest_size = _require_regular_file(path / "manifest.json", "manifest.json")
     if audio_size != entry["audio_bytes"] or manifest_size != entry["manifest_bytes"]:
         raise SpoolMetricsError(f"v2 ready artifact sizes conflict with publication ledger: {path}")
-    facts = ready_bundles._entry_facts(entry)
+    physical = entry.get("lineage_kind") == "physical_byte_span"
+    facts = None if physical else ready_bundles._entry_facts(entry)
+    records = ready_bundles._entry_count(entry) if facts is None else facts.record_count
     return _BundleMeasurement(
         ("ready", path.name),
-        facts.record_count,
-        facts.record_count * RECORD_SIZE,
-        ready_bundles._physical_runs(facts),
+        records,
+        records * RECORD_SIZE,
+        () if facts is None else ready_bundles._physical_runs(facts),
+        cast(int, entry["order"]),
+        physical,
     )
 
 
@@ -210,12 +216,22 @@ def _reject_overlapping_ranges(values: tuple[_BundleMeasurement, ...]) -> None:
 
 
 def _unproven_hole_records(values: tuple[_BundleMeasurement, ...]) -> int:
-    ranges = sorted((start, end) for value in values for start, end in value.ranges)
-    if not ranges:
+    groups: list[list[tuple[int, int]]] = [[]]
+    for value in sorted(values, key=lambda item: item.order):
+        if value.physical:
+            groups.append([])
+        else:
+            groups[-1].extend(value.ranges)
+    return sum(_range_holes(group) for group in groups)
+
+
+def _range_holes(ranges: list[tuple[int, int]]) -> int:
+    ordered = sorted(ranges)
+    if not ordered:
         return 0
-    previous_end = ranges[0][1]
+    previous_end = ordered[0][1]
     holes = 0
-    for start, end in ranges[1:]:
+    for start, end in ordered[1:]:
         holes += max(0, start - previous_end)
         previous_end = max(previous_end, end)
     return holes

@@ -83,8 +83,15 @@ class WriterTarget(Protocol):
     def interrupt(self) -> object:
         """Persist an interrupted source after its exact frontier."""
 
+    def finish_read(self, done_notice: object) -> bool:
+        """Persist the physical read completion after its bytes are drained."""
+        ...
+
     def seal(self, done_notice: object) -> object:
         """Seal and publish the target for a completed device read."""
+
+    def quarantine_unconfirmed(self) -> object:
+        """Preserve an unavailable provisional range as quarantine evidence."""
 
     def publish_prefix(self) -> object:
         """Publish the checkpoint-authenticated prefix through the target thread."""
@@ -187,11 +194,28 @@ class InterruptCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class FinishReadCommand:
+    """Flush the receive frontier and persist the real DONE."""
+
+    high_water: int
+    done_notice: object
+    tail: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
 class SealCommand:
     """Flush bytes through this high-water mark, then seal."""
 
     high_water: int
     done_notice: object
+    tail: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineUnconfirmedCommand:
+    """Flush and preserve a provisional source before retiring its writer."""
+
+    high_water: int
     tail: bytes = b""
 
 
@@ -217,8 +241,10 @@ type WriterCommand = (
     | ReadBeginCommand
     | CheckpointCommand
     | InterruptCommand
+    | FinishReadCommand
     | SealCommand
     | PublishPrefixCommand
+    | QuarantineUnconfirmedCommand
     | CloseCommand
 )
 type WriterResult = object
@@ -428,6 +454,18 @@ class AttemptWriter:
             return None
         return await join_owned(future)
 
+    async def finish_read(self, done_notice: object) -> bool:
+        """Persist the actual DONE after draining the exact received bytes."""
+        future = self._admit(
+            CheckpointRequested(), lambda high_water, tail: FinishReadCommand(high_water, done_notice, tail)
+        )
+        if future is None:
+            raise RuntimeError("writer cannot finish a read")
+        result = await join_owned(future)
+        if type(result) is not bool:
+            raise TypeError("writer returned an invalid read outcome")
+        return result
+
     async def seal(self, done_notice: object = None) -> object:
         """Flush published bytes and seal, unless the target has failed."""
         future = self._admit(
@@ -448,6 +486,13 @@ class AttemptWriter:
         if pending is None:
             return None
         return await join_owned(pending)
+
+    async def quarantine_unconfirmed(self) -> object:
+        """Preserve pending raw bytes, then quarantine the provisional source."""
+        future = self._admit(FinalizeRequested(), QuarantineUnconfirmedCommand)
+        if future is None:
+            return None
+        return await join_owned(future)
 
     async def publish_prefix(self) -> object:
         """Flush published bytes and publish the durable prefix on the writer thread."""
@@ -654,12 +699,15 @@ class AttemptWriter:
         elif isinstance(command, InterruptCommand):
             self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.interrupt()
+        elif isinstance(command, FinishReadCommand):
+            self._drain_data(command.high_water, command.tail, exact=True)
+            result = self._target.finish_read(command.done_notice)
         elif isinstance(command, SealCommand):
             self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.seal(command.done_notice)
-        elif isinstance(command, PublishPrefixCommand):
+        elif isinstance(command, QuarantineUnconfirmedCommand | PublishPrefixCommand):
             self._drain_data(command.high_water, command.tail, exact=True)
-            result = self._target.publish_prefix()
+            result = self._complete_prefix_command(command)
         else:
             with self._lock:
                 state = self._state
@@ -667,6 +715,11 @@ class AttemptWriter:
                 self._drain_data(command.high_water, command.tail, exact=True)
             result = self._target.close()
         return result
+
+    def _complete_prefix_command(self, command: QuarantineUnconfirmedCommand | PublishPrefixCommand) -> object:
+        if isinstance(command, QuarantineUnconfirmedCommand):
+            return self._target.quarantine_unconfirmed()
+        return self._target.publish_prefix()
 
     def _drain_data(self, limit: int | None, tail: bytes | None = None, *, exact: bool = False) -> bool:
         with self._lock:
@@ -706,9 +759,9 @@ class AttemptWriter:
             return LegSucceeded()
         if isinstance(command, ReadBeginCommand):
             return ReadBeginSucceeded()
-        if isinstance(command, CheckpointCommand | InterruptCommand):
+        if isinstance(command, CheckpointCommand | InterruptCommand | FinishReadCommand):
             return CheckpointSucceeded()
-        if isinstance(command, SealCommand | PublishPrefixCommand):
+        if isinstance(command, SealCommand | PublishPrefixCommand | QuarantineUnconfirmedCommand):
             return FinalizeSucceeded()
         if isinstance(command, CloseCommand):
             return CloseSucceeded()

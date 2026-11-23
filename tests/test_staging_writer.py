@@ -63,6 +63,7 @@ def test_writer_maps_arena_offsets_and_owns_streaming_mutations(tmp_path: Path) 
 
     _begin(writer)
     writer.append_chunk(0, memoryview(first + second))
+    assert writer.finish_read(DoneNotification(0, 102))
     prefix = writer.checkpoint()
     assert prefix.record_count == 2
     assert prefix.start_sequence == 100
@@ -100,10 +101,11 @@ def test_prepare_resumes_partial_and_replays_from_checkpoint(tmp_path: Path) -> 
 
     store = _store(tmp_path)
     resumed = StagingWriter(store, 100, 2)
-    prefix = resumed.prepare_leg(101, 1)
-    assert prefix.next_sequence == 101
-    resumed.read_begin(ReadBeginNotification(101, 1))
-    resumed.append_chunk(0, memoryview(second))
+    prefix = resumed.prepare_leg(100, 2)
+    assert prefix.next_sequence == 100
+    resumed.read_begin(ReadBeginNotification(100, 2))
+    resumed.append_chunk(0, memoryview(first + second))
+    assert resumed.finish_read(DoneNotification(0, 102))
     resumed.checkpoint()
     result = resumed.seal(DoneNotification(0, 102))
     source = attempt_source(store, result.source_id)
@@ -121,11 +123,11 @@ def test_read_begin_rebinds_original_range_after_recovery_read_started(tmp_path:
     writer.checkpoint()
 
     writer.interrupt()
-    writer.prepare_leg(102, 1)
-    writer.read_begin(ReadBeginNotification(102, 1))
+    writer.prepare_leg(100, 3)
+    writer.read_begin(ReadBeginNotification(100, 3))
 
     with pytest.raises(StagingWriterStateError, match="does not match the prepared leg"):
-        writer.read_begin(ReadBeginNotification(100, 3))
+        writer.read_begin(ReadBeginNotification(102, 1))
     writer.close()
 
 
@@ -133,7 +135,8 @@ def test_prefix_is_certified_by_the_same_target(tmp_path: Path) -> None:
     store = _store(tmp_path)
     writer = StagingWriter(store, 100, 2)
     _begin(writer)
-    writer.append_chunk(0, memoryview(_record(1)))
+    writer.append_chunk(0, memoryview(_record(1) + _record(2)))
+    assert writer.finish_read(DoneNotification(0, 102))
     writer.checkpoint()
 
     result = writer.publish_prefix()
@@ -142,7 +145,7 @@ def test_prefix_is_certified_by_the_same_target(tmp_path: Path) -> None:
 
     assert result is not None
     assert result.source_id == source_id
-    assert result.record_count == 1
+    assert result.record_count == 2
     source = attempt_source(store, source_id)
     assert source is not None
     assert source.lifecycle == "sealed_waiting"
@@ -193,14 +196,15 @@ def test_prepare_is_idempotent_and_data_waits_for_each_read_begin(tmp_path: Path
         writer.append_chunk(0, memoryview(_record(1) * 2))
         durable = writer.checkpoint()
         writer.interrupt()
-        recovery = writer.begin_recovery(102, 1)
+        recovery = writer.begin_recovery(100, 3)
         assert recovery == durable
         with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
             writer.append_chunk(0, memoryview(_record(3)))
         with pytest.raises(StagingWriterStateError, match="READ_BEGIN"):
             writer.checkpoint()
-        writer.read_begin(ReadBeginNotification(102, 1))
-        writer.append_chunk(0, memoryview(_record(3)))
+        writer.read_begin(ReadBeginNotification(100, 3))
+        writer.append_chunk(0, memoryview(_record(1) * 2 + _record(3)))
+        assert writer.finish_read(DoneNotification(0, 103))
         assert writer.checkpoint().next_sequence == 103
     finally:
         writer.close()
@@ -245,10 +249,12 @@ def test_terminal_publication_blocks_later_appends(tmp_path: Path, terminal: str
         if terminal == "seal":
             writer.append_chunk(0, memoryview(_record(1)))
             writer.checkpoint()
+            assert writer.finish_read(DoneNotification(0, 101))
             writer.seal(DoneNotification(0, 101))
         else:
             writer.append_chunk(0, memoryview(_record(1)))
             writer.checkpoint()
+            assert writer.finish_read(DoneNotification(0, 101))
             writer.publish_prefix()
         with pytest.raises(StagingWriterStateError, match="sealed"):
             writer.append_chunk(0, memoryview(_record(2)))
@@ -276,10 +282,11 @@ def test_close_releases_lease_after_preserving_typed_records_and_resume(tmp_path
     resumed = StagingWriter(store, 100, 2)
     try:
         resumed.prepare()
-        prefix = resumed.prepare_leg(101, 1)
-        assert (prefix.next_sequence, prefix.record_count) == (101, 1)
-        resumed.read_begin(ReadBeginNotification(101, 1))
-        resumed.append_chunk(0, memoryview(_record(2)))
+        prefix = resumed.prepare_leg(100, 2)
+        assert (prefix.next_sequence, prefix.record_count) == (100, 0)
+        resumed.read_begin(ReadBeginNotification(100, 2))
+        resumed.append_chunk(0, memoryview(_record(1) + _record(2)))
+        assert resumed.finish_read(DoneNotification(0, 102))
         resumed.checkpoint()
         assert attempt_records(store, descriptor.attempt_id) == (_record(1), _record(2))
     finally:

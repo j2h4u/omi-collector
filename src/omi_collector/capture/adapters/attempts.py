@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, replace
+from hashlib import sha256
+from typing import cast
 
 from ..domain.ring_protocol import DoneNotification, ReadBeginNotification
+from .collector_state_db import StateDB
 from .internal_audio_store import (
     AUDIO_RECORD_SIZE,
     CaptureRecord,
@@ -13,6 +17,7 @@ from .internal_audio_store import (
     DrainCheckpoint,
     InternalAudioStore,
     InternalAudioStoreError,
+    decode_uint64,
 )
 from .recovery import Recovery
 from .staging_contract import AttemptDescriptor, AttemptStateError, DurablePrefix
@@ -55,19 +60,49 @@ class DurableSqliteSeal:
     raw_sha256: str
 
 
-def _durable_prefix(source: CaptureSource) -> DurablePrefix:
+def _durable_prefix(source: CaptureSource, state_db: StateDB) -> DurablePrefix:
+    with closing(state_db.open_connection(read_only=True)) as connection, state_db.access(connection):
+        row = cast(
+            tuple[object, object, object] | None,
+            connection.execute(
+                "SELECT verified_count,verified_sha256,done_next FROM capture_read_leg "
+                "WHERE source_id=? AND verified_count IS NOT NULL ORDER BY verified_count DESC,done_next DESC,leg_generation DESC LIMIT 1",
+                (source.source_id,),
+            ).fetchone(),
+        )
+        evidence = cast(
+            tuple[object] | None,
+            connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM capture_tail WHERE source_id=?) "
+                "OR EXISTS(SELECT 1 FROM capture_observation WHERE source_id=?) "
+                "OR EXISTS(SELECT 1 FROM capture_conflict WHERE source_id=?)",
+                (source.source_id, source.source_id, source.source_id),
+            ).fetchone(),
+        )
+    count, digest = (0, sha256().hexdigest()) if row is None else (row[0], row[1])
+    if type(count) is not int or not isinstance(digest, str) or count > source.committed_count:
+        raise AttemptStateError("confirmed prefix evidence is invalid")
+    done = None if row is None else row[2]
+    if done is not None and not isinstance(done, bytes):
+        raise AttemptStateError("completed READ evidence is invalid")
+    done_next = None if done is None else decode_uint64(done)
+    if evidence is None or evidence[0] not in (0, 1):
+        raise AttemptStateError("provisional evidence state is invalid")
     return DurablePrefix(
         source.sequence_start,
-        source.sequence_start + source.committed_count,
-        source.committed_count,
-        source.committed_sha256,
+        source.sequence_start + count,
+        count,
+        digest,
+        done_next,
+        source.committed_count > count or bool(evidence[0]),
     )
 
 
 class SqliteAttemptInspection:
     """Read-only startup view that never creates a persistent SQL writer."""
 
-    def __init__(self, source: CaptureSource, descriptor: AttemptDescriptor) -> None:
+    def __init__(self, source: CaptureSource, descriptor: AttemptDescriptor, state_db: StateDB) -> None:
+        self._state_db = state_db
         self._source = source
         self.descriptor = descriptor
 
@@ -77,7 +112,7 @@ class SqliteAttemptInspection:
 
     @property
     def durable_prefix(self) -> DurablePrefix:
-        return _durable_prefix(self._source)
+        return _durable_prefix(self._source, self._state_db)
 
     def recover(self) -> Recovery:
         source = self._source
@@ -129,7 +164,7 @@ class SqliteStagedAttempt:
 
     @property
     def durable_prefix(self) -> DurablePrefix:
-        return _durable_prefix(self.source)
+        return _durable_prefix(self.source, self._audio_store.state_db)
 
     def source_page(self, after_ordinal: int = -1, limit: int = 128) -> AudioSourcePage:
         """Read one bounded, short-lived page for the publication adapter."""
@@ -213,7 +248,7 @@ class SqliteStagedAttempt:
                 if following
                 else None
             )
-            self._audio_store.commit_drain(
+            self._audio_store.commit_checked_drain(
                 self.attempt_id,
                 expected,
                 (chunk[index : index + AUDIO_RECORD_SIZE] for index in range(0, len(chunk), AUDIO_RECORD_SIZE)),
@@ -262,6 +297,23 @@ class SqliteStagedAttempt:
             raise AttemptStateError(str(error)) from error
         self._refresh_descriptor()
 
+    def quarantine_unconfirmed(self) -> DurablePrefix:
+        self._require_open()
+        try:
+            self._audio_store.quarantine_unconfirmed(self.attempt_id)
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+        return self.durable_prefix
+
+    def finish_read(self, done: DoneNotification, received_bytes: int) -> bool:
+        self._require_open()
+        if not done.is_ok:
+            raise AttemptStateError("DONE status does not permit read completion")
+        try:
+            return self._audio_store.finish_read(self.attempt_id, done.next_sequence, received_bytes)
+        except InternalAudioStoreError as error:
+            raise AttemptStateError(str(error)) from error
+
     def seal(self, done: DoneNotification) -> DurableSqliteSeal:
         """Validate a complete source before the publication adapter takes it."""
         self._require_open()
@@ -270,6 +322,9 @@ class SqliteStagedAttempt:
             raise AttemptStateError("DONE status does not permit sealing")
         if source.committed_count != self.descriptor.packet_count:
             raise AttemptStateError("typed source is incomplete")
+        prefix = self.durable_prefix
+        if prefix.record_count != source.committed_count or prefix.done_next != done.next_sequence:
+            raise AttemptStateError("typed source lacks a matching successful complete READ")
         if done.next_sequence != self.descriptor.start_sequence + self.descriptor.packet_count:
             raise AttemptStateError("DONE count does not match the typed source")
         try:
@@ -294,12 +349,13 @@ class SqliteStagedAttempt:
         """Typed sources are published from SQL rows by the publication worker."""
         self._require_open()
         source = self.source
+        prefix = self.durable_prefix
         return DurableSqliteSeal(
             source.source_id,
-            source.sequence_start,
-            source.sequence_start + source.committed_count,
-            source.committed_count,
-            source.committed_sha256,
+            prefix.start_sequence,
+            prefix.next_sequence,
+            prefix.record_count,
+            prefix.raw_sha256,
         )
 
     def close(self, *, durable: bool = False) -> None:

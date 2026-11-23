@@ -33,12 +33,12 @@ def _layout(tmp_path: Path) -> StorageLayout:
     return load_operator_config(config).storage
 
 
-def test_fresh_initialization_creates_v4_without_migration_receipt(tmp_path: Path) -> None:
+def test_fresh_initialization_creates_v5_without_migration_receipt(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     assert inspect_collector_state(layout) == {"schema_version": None, "status": "state_compatible"}
-    assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert initialize_collector_state(layout) == {"schema_version": 5}
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute("SELECT 1 FROM state WHERE id='internal_audio_cutover'").fetchone() is None
     database = layout.collector.state_db.stat()
     owner = layout.collector.root.stat()
@@ -55,7 +55,7 @@ def test_fresh_initialization_accepts_empty_public_directory(tmp_path: Path) -> 
     public_root.mkdir(parents=True)
 
     assert inspect_collector_state(layout) == {"schema_version": None, "status": "state_compatible"}
-    assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert initialize_collector_state(layout) == {"schema_version": 5}
     assert layout.collector.state_db.is_file()
 
 
@@ -83,20 +83,33 @@ def test_missing_database_with_symlinked_public_directory_refuses(tmp_path: Path
     assert not layout.collector.state_db.exists()
 
 
-def test_existing_v4_without_receipt_is_accepted_without_rewrite(tmp_path: Path) -> None:
+def test_existing_v5_without_receipt_is_accepted_without_rewrite(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "operator-fact", {"value": 7})
     before = layout.collector.state_db.read_bytes()
     assert inspect_collector_state(layout)["status"] == "state_compatible"
-    assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert initialize_collector_state(layout) == {"schema_version": 5}
     assert layout.collector.state_db.read_bytes() == before
+
+
+def _drop_v5_tables(connection: sqlite3.Connection) -> None:
+    for table in (
+        "capture_observation_chunk",
+        "capture_observation",
+        "capture_recovery_candidate",
+        "capture_framing_incident",
+        "capture_read_leg",
+        "capture_historical_custody",
+    ):
+        connection.execute(f"DROP TABLE {table}")
 
 
 def _downgrade_current_database_to_v3(path: Path, *, with_active_proof: bool = True) -> None:
     bundle_id = "a" * 64
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
+        _drop_v5_tables(connection)
         connection.execute("DROP TABLE ready_v2_stage_range")
         connection.execute("DROP TABLE ready_v2_output_stage")
         connection.execute("DROP TABLE ready_replay_proof_page")
@@ -135,6 +148,7 @@ def _downgrade_current_database_to_v3(path: Path, *, with_active_proof: bool = T
 def _downgrade_current_database_to_v2(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
+        _drop_v5_tables(connection)
         connection.execute("DROP TABLE ready_v2_stage_range")
         connection.execute("DROP TABLE ready_v2_output_stage")
         connection.execute("DROP TABLE ready_replay_proof_page")
@@ -149,7 +163,7 @@ def test_drained_v2_migration_seeds_v2_contract(tmp_path: Path) -> None:
     StateDB(layout.collector.state_db)
     _downgrade_current_database_to_v2(layout.collector.state_db)
 
-    assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert initialize_collector_state(layout) == {"schema_version": 5}
     assert StateDB(layout.collector.state_db, read_only=True).get(StateKind.PUBLICATION_CONTRACT, "current") == {
         "version": 1,
         "mode": "v2_open",
@@ -217,10 +231,10 @@ def test_drained_v3_migration_seeds_v2_contract_with_empty_proof_tables(tmp_path
     _downgrade_current_database_to_v3(layout.collector.state_db, with_active_proof=False)
 
     assert inspect_collector_state(layout) == {"schema_version": 3, "status": "state_compatible"}
-    assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert initialize_collector_state(layout) == {"schema_version": 5}
 
     with closing(sqlite3.connect(layout.collector.state_db)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute("SELECT count(*) FROM ready_replay_proof").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM ready_replay_proof_page").fetchone() == (0,)
         v2_table_rows = cast(
@@ -369,12 +383,12 @@ def test_interrupted_empty_database_initializes_in_place(tmp_path: Path) -> None
     identity = path.stat().st_ino
     assert inspect_collector_state(layout) == {"schema_version": 0, "status": "state_compatible"}
     assert prepare_current_collector_state(layout) == {"schema_version": 0, "status": "state_compatible"}
-    assert initialize_collector_state(layout) == {"schema_version": 4}
+    assert initialize_collector_state(layout) == {"schema_version": 5}
     assert path.stat().st_ino == identity
 
 
-@pytest.mark.parametrize("version", [0, 4])
-def test_existing_database_integrity_is_checked_once(
+@pytest.mark.parametrize("version", [0, 4, 5])
+def test_routine_state_checks_do_not_scan_the_entire_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: int
 ) -> None:
     layout = _layout(tmp_path)
@@ -384,6 +398,11 @@ def test_existing_database_integrity_is_checked_once(
             pass
     else:
         StateDB(layout.collector.state_db)
+        if version == 4:
+            with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+                _drop_v5_tables(connection)
+                connection.execute("PRAGMA user_version = 4")
+                connection.commit()
     statements: list[str] = []
     connect = sqlite3.connect
 
@@ -395,9 +414,14 @@ def test_existing_database_integrity_is_checked_once(
     monkeypatch.setattr(sqlite3, "connect", traced_connect)
     if version == 0:
         assert inspect_collector_state(layout)["status"] == "state_compatible"
+    elif version == 5:
+        assert prepare_current_collector_state(layout) == {"schema_version": 5, "status": "state_prepared"}
     else:
-        assert prepare_current_collector_state(layout) == {"schema_version": 4, "status": "state_prepared"}
-    assert statements.count("PRAGMA integrity_check") == 1
+        assert prepare_current_collector_state(layout) == {"schema_version": 4, "status": "state_compatible"}
+        assert initialize_collector_state(layout) == {"schema_version": 5}
+    assert not any(
+        "integrity_check" in statement.lower() or "quick_check" in statement.lower() for statement in statements
+    )
 
 
 def test_corrupt_database_is_refused(tmp_path: Path) -> None:
@@ -410,6 +434,33 @@ def test_corrupt_database_is_refused(tmp_path: Path) -> None:
         initialize_collector_state(layout)
     with pytest.raises(FatalInternalAudioStorageError):
         prepare_current_collector_state(layout)
+
+
+def test_v4_migration_rolls_back_after_schema_creation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omi_collector.internal_audio_migration as migration
+    from omi_collector.state_migration import StateMigrationError
+
+    layout = _layout(tmp_path)
+    db = StateDB(layout.collector.state_db)
+    db.put(StateKind.MIGRATION, "retained", {"value": 7})
+    with closing(sqlite3.connect(db.path)) as connection:
+        _drop_v5_tables(connection)
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+    validate = migration._validate_current
+
+    def fail_v5(connection: sqlite3.Connection, *, schema_version: int = 5) -> None:
+        if schema_version == 5:
+            raise StateMigrationError("injected validation failure")
+        validate(connection, schema_version=schema_version)
+
+    monkeypatch.setattr(migration, "_validate_current", fail_v5)
+    with pytest.raises(InternalAudioMigrationError, match="observation schema migration failed"):
+        initialize_collector_state(layout)
+    with closing(sqlite3.connect(db.path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name='capture_read_leg'").fetchone() is None
+        assert connection.execute("SELECT payload FROM state WHERE id='retained'").fetchone() == ('{"value":7}',)
 
 
 def test_unknown_existing_v0_database_is_refused_unchanged(tmp_path: Path) -> None:
@@ -511,7 +562,7 @@ def test_missing_database_with_symlinked_private_root_refuses(tmp_path: Path) ->
     assert not layout.collector.state_db.exists()
 
 
-def test_hot_journal_preflight_and_recovery_keep_v4_inode_and_rows(tmp_path: Path) -> None:
+def test_hot_journal_preflight_and_recovery_keep_v5_inode_and_rows(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     db = StateDB(layout.collector.state_db)
     db.put(StateKind.MIGRATION, "operator-fact", {"value": 7})
@@ -555,7 +606,7 @@ def test_hot_journal_preflight_and_recovery_keep_v4_inode_and_rows(tmp_path: Pat
     }
     from omi_collector.internal_audio_migration import recover_canonical_journal
 
-    assert recover_canonical_journal(layout) == {"schema_version": 4, "status": "state_compatible"}
+    assert recover_canonical_journal(layout) == {"schema_version": 5, "status": "state_compatible"}
     assert path.stat().st_ino == identity
     assert not journal.exists()
     assert StateDB(path, read_only=True).get(StateKind.MIGRATION, "operator-fact") == {"value": 7}

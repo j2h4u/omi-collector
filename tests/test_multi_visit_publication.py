@@ -65,24 +65,25 @@ def test_interrupted_visits_publish_one_complete_ordered_bundle_after_drain(tmp_
             return b"\x02" + pack(">QQIQH", read, 16, 10000, 0, RECORD_SIZE)
 
         sessions = []
-        for start, end in ((10, 12), (12, 14), (14, 16)):
-            count = 16 - start
+        for end in (12, 14, 16):
             notifications = (
-                b"\x05" + start.to_bytes(8, "big") + count.to_bytes(4, "big"),
-                b"\x03" + b"".join(records[start - 10 : end - 10]),
+                b"\x05" + (10).to_bytes(8, "big") + (6).to_bytes(4, "big"),
+                b"\x03" + b"".join(records[: end - 10]),
             )
             if end < 16:
                 notifications += (RingTransportDisconnectedError("visit ended"),)
                 steps = (
                     WriteStep(b"\x10", (info(10),)),
-                    WriteStep(encode_read_command(start, count), notifications),
+                    *((WriteStep(b"\x10", (info(10),)),) if sessions else ()),
+                    WriteStep(encode_read_command(10, 6), notifications),
                     WriteStep(encode_stop_command()),
                 )
             else:
                 notifications += (b"\x04\x00" + (16).to_bytes(8, "big"),)
                 steps = (
                     WriteStep(b"\x10", (info(10),)),
-                    WriteStep(encode_read_command(start, count), notifications),
+                    WriteStep(b"\x10", (info(10),)),
+                    WriteStep(encode_read_command(10, 6), notifications),
                     WriteStep(b"\x10", (info(10),)),
                     WriteStep(encode_advance_command(16), (b"\x01\x00",)),
                     WriteStep(b"\x10", (info(16),)),

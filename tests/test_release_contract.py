@@ -508,12 +508,16 @@ def test_release_prs_keep_the_complete_ci_gate() -> None:
     assert "  docker-build:" not in _CI_WORKFLOW
 
 
-def test_full_crap_gate_uses_parallel_coverage_collection() -> None:
+def test_full_crap_gate_uses_parallel_isolated_coverage_collection() -> None:
     crap_recipe = re.search(r"(?ms)^crap-check:\n(?P<body>.*?)(?=^\S[^\n]*:\s*$)", _JUSTFILE)
 
     assert crap_recipe is not None
-    assert "pytest -n auto --cov=src/omi_collector" in crap_recipe.group("body")
-    assert "chrt --idle 0 nice -n 19 ionice -c 3" in crap_recipe.group("body")
+    body = crap_recipe.group("body")
+    assert "mktemp -d /tmp/omi-collector-crap.XXXXXX" in body
+    assert 'COVERAGE_FILE="$coverage_data_file"' in body
+    assert "trap 'rm -rf \"$coverage_dir\"' EXIT" in body
+    assert 'pytest -n auto --cov=src/omi_collector --cov-report=json:"$coverage_file"' in body
+    assert "chrt --idle 0 nice -n 19 ionice -c 3" in body
 
 
 def test_security_document_does_not_claim_unavailable_validity_checks() -> None:

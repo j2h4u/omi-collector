@@ -16,7 +16,7 @@ import pytest
 
 from omi_collector.capture.adapters import ready_bundles
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
-from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
 from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
     ReadyBundleError,
@@ -37,6 +37,7 @@ from omi_collector.capture.adapters.ready_bundles import (
 )
 from omi_collector.capture.domain.clock_state import ClockRange, ClockState
 from omi_collector.config import ReadyConfig
+from test_public_audio_v2_integration import _source as _verified_source
 
 
 @pytest.fixture
@@ -62,19 +63,7 @@ def _record(timestamp: int) -> bytes:
 
 def _source(store: InternalAudioStore, source_id: str, start: int, count: int = 1) -> SqlitePublicationSource:
     records = tuple(_record(100 + offset) for offset in range(count))
-    store.create_source(source_id, "attempt", start, start + count)
-    source = store.prepare_leg(source_id, start, count)
-    source = store.record_read_begin(source_id, start, count)
-    store.commit_drain(source_id, 0, records, DrainCheckpoint(source.current_leg_generation))
-    source = store.get_source(source_id)
-    assert source is not None
-    store.seal_source(
-        source_id,
-        leg_generation=source.current_leg_generation,
-        expected_count=source.committed_count,
-        expected_sha256=source.committed_sha256,
-    )
-    return SqlitePublicationSource(store, source_id)
+    return _verified_source(store, source_id, start, records)
 
 
 def _checkpoint(root: Path) -> Path:
@@ -898,19 +887,7 @@ def test_v2_waiting_preserves_covered_source_until_bounded_maintenance_after_ack
         )
         zero = bytearray(AUDIO_RECORD_SIZE)
         zero[:4] = (200).to_bytes(4, "big")
-        store.create_source("b" * 32, "attempt", 20, 21)
-        snapshot = store.prepare_leg("b" * 32, 20, 1)
-        snapshot = store.record_read_begin("b" * 32, 20, 1)
-        store.commit_drain("b" * 32, 0, (bytes(zero),), DrainCheckpoint(snapshot.current_leg_generation))
-        snapshot = store.get_source("b" * 32)
-        assert snapshot is not None
-        store.seal_source(
-            "b" * 32,
-            leg_generation=snapshot.current_leg_generation,
-            expected_count=snapshot.committed_count,
-            expected_sha256=snapshot.committed_sha256,
-        )
-        zero_source = SqlitePublicationSource(store, "b" * 32)
+        zero_source = _verified_source(store, "b" * 32, 20, (bytes(zero),))
         waiting_options = PublicAudioV2Options(ReadyConfig(target_audio_seconds=0.02), clock, 21, True, 1)
 
         waiting = finalize_public_audio_v2(store, (zero_source,), ready, waiting_options)

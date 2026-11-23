@@ -67,6 +67,7 @@ class StagingWriter:
         self._closed = False
         self._active_start = start_sequence
         self._active_count = packet_count
+        self._received_bytes = 0
 
     def prepare(self) -> AttemptDescriptor:
         """Acquire the lease and prepare or resume the streaming attempt."""
@@ -122,6 +123,7 @@ class StagingWriter:
         self._active_start = start_sequence
         self._active_count = record_count
         self._read_started = False
+        self._received_bytes = 0
         return prefix
 
     def begin_recovery(self, start_sequence: int, packet_count: int) -> DurablePrefix:
@@ -134,6 +136,7 @@ class StagingWriter:
         self._active_start = start_sequence
         self._active_count = packet_count
         self._read_started = False
+        self._received_bytes = 0
         return prefix
 
     def read_begin(self, notice: ReadBeginNotification) -> None:
@@ -187,6 +190,7 @@ class StagingWriter:
         self._require_lease()
         sequence = self._active_start + offset // RECORD_SIZE
         self._attempt.accept_chunk(sequence, chunk, tail)
+        self._received_bytes = offset + byte_count + len(tail)
 
     def checkpoint(self) -> DurablePrefix:
         """Checkpoint through the existing staging API."""
@@ -203,8 +207,36 @@ class StagingWriter:
         assert self._attempt is not None
         self._require_lease()
         self._attempt.interrupt()
+        self._store.public_drain.wake()
         self._read_started = False
         return self._attempt.durable_prefix
+
+    def quarantine_unconfirmed(self) -> DurablePrefix:
+        """Close the attempt into durable custody without assigning provisional positions."""
+        self._enter("quarantine_unconfirmed")
+        self._require_ready_for_read()
+        assert self._attempt is not None
+        self._require_lease()
+        result = self._attempt.quarantine_unconfirmed()
+        self._store.public_drain.wake()
+        self._sealed = True
+        self._store.publication_input_changed()
+        return result
+
+    def finish_read(self, done_notice: DoneNotification) -> bool:
+        """Record the actual terminal notice after all received bytes are durable."""
+        self._enter("finish_read")
+        self._require_ready_for_data()
+        if not isinstance(done_notice, DoneNotification):
+            raise TypeError("done_notice must be a DoneNotification")
+        assert self._attempt is not None
+        self._require_lease()
+        complete = self._attempt.finish_read(done_notice, self._received_bytes)
+        self._store.public_drain.wake()
+        if not complete:
+            self._sealed = True
+            self._store.publication_input_changed()
+        return complete
 
     def seal(self, done_notice: DoneNotification) -> DurableSqliteSeal:
         """Validate and publish through the existing staging API."""
@@ -235,7 +267,13 @@ class StagingWriter:
         self._require_ready_for_read()
         assert self._attempt is not None
         self._require_lease()
+        prefix = self._attempt.durable_prefix
         result = self._attempt.publish_prefix()
+        if prefix.has_unconfirmed:
+            self._attempt.quarantine_unconfirmed()
+            self._sealed = True
+            self._store.publication_input_changed()
+            return result if result.record_count else None
         if result.record_count == 0:
             self._store.quarantine_attempt_source(self._attempt.attempt_id)
             self._store.mark_quarantine_unprocessable(

@@ -41,17 +41,20 @@ raw = bytes.fromhex(sys.argv[2])
 ready_fd = int(sys.argv[3])
 gate_fd = int(sys.argv[4])
 with InternalAudioStore(db) as store:
+    store.interrupt(sys.argv[5])
+    leg = store.prepare_leg(sys.argv[5], 101, 1)
+    store.record_read_begin(sys.argv[5], 101, 1)
     original_commit = store._commit
     def held_commit() -> None:
         os.write(ready_fd, b"ready")
         os.read(gate_fd, 1)
         original_commit()
     store._commit = held_commit
-    store.commit_drain(
+    store.commit_checked_drain(
         sys.argv[5],
         1,
         [raw],
-        DrainCheckpoint(1, expected_sha256=hashlib.sha256(bytes.fromhex(sys.argv[6])).hexdigest()),
+        DrainCheckpoint(leg.current_leg_generation, expected_sha256=hashlib.sha256(bytes.fromhex(sys.argv[6])).hexdigest()),
     )
 """
     first = _record(100)

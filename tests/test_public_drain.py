@@ -18,6 +18,45 @@ from omi_collector.capture.domain.ring_protocol import RingInfo
 _NOW = "2026-10-17T12:00:00+00:00"
 
 
+def test_projection_matches_receiver_contract_fixture(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    path = tmp_path / "public" / "pendant-drain.json"
+    path.parent.mkdir(mode=0o2750)
+    projection = PublicDrainProjection(db, path)
+    projection.update_observations(ring=(8, "2026-10-17T11:59:30Z"))
+    db.put(StateKind.AUDIO_DAMAGE_ALERT, "first", {"outcome": "quarantined"})
+    db.put(StateKind.AUDIO_DAMAGE_ALERT, "second", {"outcome": "recovered"})
+    projection.publish_snapshot()
+    fixture = Path(__file__).parent / "fixtures" / "collector-drain-v4.json"
+    assert json.loads(path.read_text(encoding="utf-8")) == json.loads(fixture.read_text(encoding="utf-8"))
+
+
+def test_projection_retains_multiple_damage_alerts_after_restart(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    path = tmp_path / "public" / "pendant-drain.json"
+    path.parent.mkdir(mode=0o2750)
+    db.put(StateKind.AUDIO_DAMAGE_ALERT, "incident-b", {"outcome": "quarantined"})
+    db.put(StateKind.AUDIO_DAMAGE_ALERT, "incident-a", {"outcome": "recovered"})
+
+    PublicDrainProjection(db, path).publish_snapshot()
+    first = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    PublicDrainProjection(StateDB(db.path), path).publish_snapshot()
+    assert json.loads(path.read_text(encoding="utf-8")) == first
+    assert first["audio_damage_incidents"] == [
+        {"incident_id": "incident-a", "outcome": "recovered"},
+        {"incident_id": "incident-b", "outcome": "quarantined"},
+    ]
+
+
+def test_projection_rejects_invalid_damage_alert(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    path = tmp_path / "public" / "pendant-drain.json"
+    path.parent.mkdir(mode=0o2750)
+    db.put(StateKind.AUDIO_DAMAGE_ALERT, "incident", {"outcome": "unknown"})
+    with pytest.raises(ValueError, match="audio damage alert"):
+        PublicDrainProjection(db, path).publish_snapshot()
+
+
 def test_projection_starts_unknown_and_private_pending_token_is_never_exported(tmp_path: Path) -> None:
     projection = PublicDrainProjection(StateDB(tmp_path / "state.sqlite3"), tmp_path / "public" / "pendant-drain.json")
     projection.path.parent.mkdir(mode=0o2750)
@@ -25,12 +64,13 @@ def test_projection_starts_unknown_and_private_pending_token_is_never_exported(t
 
     projection.publish_snapshot()
     assert json.loads(projection.path.read_text(encoding="utf-8")) == {
-        "version": 3,
+        "version": 4,
         "ring": None,
         "last_drain": None,
         "battery": None,
         "bluetooth": None,
         "storage": None,
+        "audio_damage_incidents": [],
     }
     projection.update_observations(ring=(3, _NOW), battery=(81, _NOW))
     projection.arm_pending("source-a", 10)
@@ -45,12 +85,13 @@ def test_projection_starts_unknown_and_private_pending_token_is_never_exported(t
     exported = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
     private = projection._state_db.get(StateKind.PENDANT_DRAIN, "current")
     assert exported == {
-        "version": 3,
+        "version": 4,
         "ring": {"unread_packets": 3, "observed_at": _NOW},
         "last_drain": None,
         "battery": {"percent": 81, "observed_at": _NOW},
         "bluetooth": None,
         "storage": None,
+        "audio_damage_incidents": [],
     }
     assert private is not None and isinstance(private["pending_event_id"], str)
     assert "pending_event_id" not in exported
@@ -75,7 +116,7 @@ def test_projection_exports_only_bounded_bluetooth_incident_summary(tmp_path: Pa
     )
     projection.publish_snapshot()
     opened = cast(dict[str, object], json.loads(projection.path.read_text(encoding="utf-8")))
-    assert opened["version"] == 3
+    assert opened["version"] == 4
     assert opened["bluetooth"] == {
         "incident_id": "incident-1",
         "status": "open",
@@ -171,7 +212,7 @@ def test_storage_incident_projection_is_small_and_strict(tmp_path: Path) -> None
         "detected_at": _NOW,
         "resolved_at": None,
     }
-    assert set(public) == {"version", "ring", "last_drain", "battery", "bluetooth", "storage"}
+    assert set(public) == {"version", "ring", "last_drain", "battery", "bluetooth", "storage", "audio_damage_incidents"}
     assert "reason" not in storage
     db.put(StateKind.PENDANT_STORAGE_INCIDENT, "current", {"version": 1, "incident_id": "bad"})
     with pytest.raises(ValueError, match="schema"):

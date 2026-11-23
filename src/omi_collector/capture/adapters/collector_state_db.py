@@ -19,7 +19,8 @@ from urllib.parse import quote
 from ..application.storage_fault import FatalInternalAudioStorageError, TransientInternalAudioStorageError
 from .sqlite_admission import admit_exclusive, admit_immediate, commit_with_busy_retry
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
+_V4_SCHEMA_VERSION = 4
 _PREVIOUS_SCHEMA_VERSION = 3
 _LEGACY_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5_000
@@ -49,6 +50,15 @@ class StateKind(StrEnum):
     PUBLICATION_V2_FRONTIER = "publication_v2_frontier"
     PACKET_SUMMARY = "packet_summary"
     PENDANT_STORAGE_INCIDENT = "pendant_storage_incident"
+    AUDIO_DAMAGE_ALERT = "audio_damage_alert"
+    AUDIO_DAMAGE_ELIGIBLE = "audio_damage_eligible"
+    HISTORICAL_RESOLUTION = "historical_resolution"
+    PHYSICAL_IMPORT = "physical_import"
+    PHYSICAL_CONTINUATION = "physical_continuation"
+    ORDERED_FULL_REPLAY = "ordered_full_replay"
+    ORDERED_SUCCESSOR = "ordered_successor"
+    ORDERED_REPLAY_SUCCESSOR = "ordered_replay_successor"
+    ORDERED_RETIREMENT = "ordered_retirement"
 
 
 class StateDBError(RuntimeError):
@@ -593,6 +603,21 @@ class StateDB(_Operations):
                 else:
                     connection.close()
 
+    @contextmanager
+    def typed_write_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Commit typed custody rows with managed rollback and corruption handling."""
+        with self.access():
+            connection = self.open_connection()
+            try:
+                self.begin_write(connection)
+                yield connection
+                connection.commit()
+            except BaseException as error:
+                self._rollback_managed_write(connection, error)
+                raise
+            finally:
+                self._close_managed_write(connection)
+
     def get(self, kind: StateKind, item_id: str) -> dict[str, object] | None:
         with self._connection_for_call() as connection:
             return _Operations(connection).get(kind, item_id)
@@ -707,6 +732,7 @@ def _is_publication_input(kind: StateKind) -> bool:
         StateKind.CLOCK,
         StateKind.PUBLICATION_CONTRACT,
         StateKind.PUBLICATION_V2_FRONTIER,
+        StateKind.ORDERED_FULL_REPLAY,
     }
 
 
@@ -821,6 +847,12 @@ _AUDIO_TABLES = (
     "ready_replay_proof_page",
     "ready_v2_output_stage",
     "ready_v2_stage_range",
+    "capture_historical_custody",
+    "capture_read_leg",
+    "capture_framing_incident",
+    "capture_recovery_candidate",
+    "capture_observation",
+    "capture_observation_chunk",
 )
 
 
@@ -1024,8 +1056,90 @@ _V3_REPLAY_PROOF_DDL = _ddl(
     "proof_content_sha256 TEXT NOT NULL CHECK (length(proof_content_sha256) = 64 AND lower(proof_content_sha256) = proof_content_sha256 AND proof_content_sha256 NOT GLOB '*[^0-9a-f]*')"
     ") WITHOUT ROWID"
 )
-_V3_AUDIO_TABLES = _AUDIO_TABLES[:-2]
-_V3_AUDIO_DDL = (*_AUDIO_DDL[:10], _V3_REPLAY_PROOF_DDL, _AUDIO_DDL[11])
+_OBSERVATION_DDL = (
+    _ddl(
+        "CREATE TABLE capture_historical_custody ("
+        "source_id TEXT PRIMARY KEY NOT NULL, prior_source_type TEXT NOT NULL, prior_lifecycle TEXT NOT NULL, "
+        "prior_count INTEGER NOT NULL, prior_sha256 TEXT NOT NULL, "
+        "prior_certified_count INTEGER, prior_coverage_digest TEXT, "
+        "disposition TEXT NOT NULL CHECK (disposition IN ('pending','admitted')), "
+        "FOREIGN KEY (source_id) REFERENCES capture_source(source_id) ON DELETE CASCADE"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_read_leg ("
+        "source_id TEXT NOT NULL, leg_generation INTEGER NOT NULL, "
+        "read_start BLOB NOT NULL CHECK (typeof(read_start) = 'blob' AND length(read_start) = 8), "
+        "read_count INTEGER NOT NULL CHECK (read_count BETWEEN 1 AND 4294967295), "
+        "baseline_count INTEGER NOT NULL CHECK (baseline_count >= 0), "
+        "verified_count INTEGER CHECK (verified_count IS NULL OR verified_count BETWEEN 0 AND 4294967295), "
+        "verified_sha256 TEXT CHECK (verified_sha256 IS NULL OR (length(verified_sha256) = 64 "
+        "AND lower(verified_sha256) = verified_sha256 AND verified_sha256 NOT GLOB '*[^0-9a-f]*')), "
+        "received_bytes INTEGER CHECK (received_bytes IS NULL OR received_bytes >= 0), "
+        "done_next BLOB CHECK (done_next IS NULL OR (typeof(done_next) = 'blob' AND length(done_next) = 8)), "
+        "CHECK ((verified_count IS NULL AND verified_sha256 IS NULL) OR "
+        "(verified_count IS NOT NULL AND verified_sha256 IS NOT NULL AND done_next IS NOT NULL AND received_bytes IS NOT NULL)), "
+        "PRIMARY KEY (source_id, leg_generation), "
+        "FOREIGN KEY (source_id) REFERENCES capture_source(source_id) ON DELETE CASCADE"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_framing_incident ("
+        "incident_id TEXT PRIMARY KEY NOT NULL, "
+        "confirmed_frontier BLOB NOT NULL CHECK (typeof(confirmed_frontier) = 'blob' AND length(confirmed_frontier) = 8), "
+        "status TEXT NOT NULL CHECK (status IN ('unresolved','settled')), "
+        "confirmed_damage INTEGER NOT NULL CHECK (confirmed_damage IN (0,1)), "
+        "conflict_candidate INTEGER NOT NULL DEFAULT 0 CHECK (conflict_candidate IN (0,1)), "
+        "conflict_frontier BLOB CHECK (conflict_frontier IS NULL OR (typeof(conflict_frontier) = 'blob' AND length(conflict_frontier) = 8)), "
+        "verified_conflict INTEGER NOT NULL DEFAULT 0 CHECK (verified_conflict IN (0,1)), "
+        "settled_head BLOB CHECK (settled_head IS NULL OR (typeof(settled_head) = 'blob' AND length(settled_head) = 8)), "
+        "settlement_reason TEXT, "
+        "CHECK ((conflict_candidate = 0 AND conflict_frontier IS NULL AND verified_conflict = 0) OR "
+        "(conflict_candidate = 1 AND conflict_frontier IS NOT NULL)), "
+        "CHECK ((status = 'unresolved' AND settled_head IS NULL AND settlement_reason IS NULL) OR "
+        "(status = 'settled' AND settled_head IS NOT NULL AND settlement_reason IS NOT NULL)), "
+        "FOREIGN KEY (incident_id) REFERENCES capture_source(source_id)"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_recovery_candidate ("
+        "incident_id TEXT NOT NULL, source_id TEXT NOT NULL, leg_generation INTEGER NOT NULL, "
+        "PRIMARY KEY (incident_id,source_id,leg_generation), "
+        "FOREIGN KEY (incident_id) REFERENCES capture_framing_incident(incident_id), "
+        "FOREIGN KEY (source_id,leg_generation) REFERENCES capture_read_leg(source_id,leg_generation) ON DELETE CASCADE"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_observation ("
+        "source_id TEXT NOT NULL, incident_id TEXT NOT NULL, leg_generation INTEGER NOT NULL, "
+        "read_start BLOB NOT NULL CHECK (typeof(read_start) = 'blob' AND length(read_start) = 8), "
+        "read_count INTEGER NOT NULL CHECK (read_count BETWEEN 1 AND 4294967295), "
+        "fault_offset INTEGER CHECK (fault_offset IS NULL OR fault_offset >= 0), "
+        "conflict_frontier BLOB CHECK (conflict_frontier IS NULL OR (typeof(conflict_frontier) = 'blob' AND length(conflict_frontier) = 8)), "
+        "prefix_record_count INTEGER NOT NULL CHECK (prefix_record_count >= 0), "
+        "received_bytes INTEGER NOT NULL CHECK (received_bytes >= 0), "
+        "tail BLOB NOT NULL CHECK (typeof(tail) = 'blob' AND length(tail) < 444), "
+        "done INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)), "
+        "PRIMARY KEY (source_id, leg_generation), "
+        "FOREIGN KEY (source_id) REFERENCES capture_source(source_id), "
+        "FOREIGN KEY (incident_id) REFERENCES capture_framing_incident(incident_id)"
+        ") WITHOUT ROWID"
+    ),
+    _ddl(
+        "CREATE TABLE capture_observation_chunk ("
+        "source_id TEXT NOT NULL, leg_generation INTEGER NOT NULL, byte_offset INTEGER NOT NULL CHECK (byte_offset >= 0), "
+        "bytes BLOB NOT NULL CHECK (typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 56832), "
+        "PRIMARY KEY (source_id, leg_generation, byte_offset), "
+        "FOREIGN KEY (source_id, leg_generation) REFERENCES capture_observation(source_id, leg_generation)"
+        ") WITHOUT ROWID"
+    ),
+)
+_V4_AUDIO_TABLES = _AUDIO_TABLES[:-6]
+_V4_AUDIO_DDL = _AUDIO_DDL
+_AUDIO_DDL = (*_AUDIO_DDL, *_OBSERVATION_DDL)
+
+_V3_AUDIO_TABLES = _V4_AUDIO_TABLES[:-2]
+_V3_AUDIO_DDL = (*_V4_AUDIO_DDL[:10], _V3_REPLAY_PROOF_DDL, _V4_AUDIO_DDL[11])
 _V2_AUDIO_TABLES = _V3_AUDIO_TABLES[:-2]
 _V2_AUDIO_DDL = _V3_AUDIO_DDL[:-2]
 
@@ -1088,7 +1202,7 @@ def install_public_audio_v2_schema_for_upgrade(connection: sqlite3.Connection) -
     _validate_schema(connection)
     _validate_audio_schema(connection, version=_PREVIOUS_SCHEMA_VERSION)
     _upgrade_replay_proof_root(connection)
-    for ddl in _AUDIO_DDL[-2:]:
+    for ddl in _V4_AUDIO_DDL[-2:]:
         connection.execute(ddl)
 
 
@@ -1126,6 +1240,7 @@ def _validate_audio_schema(connection: sqlite3.Connection, *, version: int = _SC
     schemas: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {
         _LEGACY_SCHEMA_VERSION: (_V2_AUDIO_TABLES, _V2_AUDIO_DDL),
         _PREVIOUS_SCHEMA_VERSION: (_V3_AUDIO_TABLES, _V3_AUDIO_DDL),
+        _V4_SCHEMA_VERSION: (_V4_AUDIO_TABLES, _V4_AUDIO_DDL),
         _SCHEMA_VERSION: (_AUDIO_TABLES, _AUDIO_DDL),
     }
     if version not in schemas:

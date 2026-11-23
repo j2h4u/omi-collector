@@ -14,7 +14,6 @@ import pytest
 
 from omi_collector.capture.adapters import collector_state_db
 from omi_collector.capture.adapters import quarantine as quarantine_module
-from omi_collector.capture.adapters.attempts import RecordAcceptanceError
 from omi_collector.capture.adapters.collector_state_db import StateDBError, StateKind
 from omi_collector.capture.adapters.internal_audio_store import InternalAudioStoreError
 from omi_collector.capture.adapters.opportunistic_runtime import OpportunisticRuntime
@@ -30,11 +29,11 @@ from omi_collector.capture.application.storage_fault import (
 from omi_collector.capture.domain.quarantine_machine import QuarantineState
 from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, ReadyConfig, StagingRetentionConfig, WriterConfig
-from staging_test_factory import StagingStore, attempt_source
+from staging_test_factory import StagingStore, attempt_records, attempt_source
 
 
 def _record(marker: int) -> bytes:
-    return marker.to_bytes(4, "big") + bytes((marker,)) * (RECORD_SIZE - 4)
+    return marker.to_bytes(4, "big") + bytes((2, 8, marker)) + bytes(RECORD_SIZE - 7)
 
 
 def _opus_record(timestamp: int, marker: int) -> bytes:
@@ -95,7 +94,7 @@ def test_typed_quarantine_writer_keeps_committed_rows_readable_until_commit(
     def write() -> None:
         nonlocal armed
         try:
-            with quarantine_module._typed_transaction(store._filesystem) as connection:
+            with store.state_db.typed_write_transaction() as connection:
                 connection.execute(
                     "UPDATE state SET payload = '{\"value\":\"new\"}' WHERE kind='clock' AND id='current'"
                 )
@@ -139,7 +138,7 @@ def test_typed_quarantine_changes_source_state_without_creating_private_entry(tm
     assert row is not None and row[:3] == (
         "quarantine",
         "blocked",
-        "attempt source preserved",
+        "framing_unresolved",
     )
     attempt.close()
 
@@ -151,6 +150,7 @@ def test_quarantine_pending_only_blocks_active_attempt_sources(tmp_path: Path) -
 
     sealed = _attempt(store, 200, 1)
     sealed.accept_chunk(200, _record(2))
+    assert sealed.finish_read(DoneNotification(0, 201), RECORD_SIZE)
     sealed.seal(DoneNotification(0, 201))
     sealed.close()
     covered = _attempt(store, 300, 1)
@@ -167,7 +167,7 @@ def test_quarantine_pending_only_blocks_active_attempt_sources(tmp_path: Path) -
     sealed_row = _source_row(store, sealed.attempt_id)
     covered_row = _source_row(store, covered.attempt_id)
     retiring_row = _source_row(store, retiring.attempt_id)
-    assert active_row is not None and active_row[:3] == ("quarantine", "blocked", "preserve active source")
+    assert active_row is not None and active_row[:3] == ("quarantine", "blocked", "framing_unresolved")
     assert sealed_row is not None and sealed_row[:2] == ("attempt", "sealed_waiting")
     assert covered_row is not None and covered_row[:2] == ("attempt", "covered")
     assert retiring_row is not None and retiring_row[:2] == ("attempt", "retiring")
@@ -177,13 +177,16 @@ def test_quarantine_pending_only_blocks_active_attempt_sources(tmp_path: Path) -
 
 def test_quarantine_preserves_exact_records_tail_and_conflict_evidence(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    attempt = _attempt(store)
+    attempt = _attempt(store, count=2)
     try:
         accepted = _record(1)
         tail = b"partial-audio-tail"
-        attempt.accept_chunk(100, accepted, tail)
-        with pytest.raises(RecordAcceptanceError, match="conflict"):
-            attempt.accept_chunk(100, _record(9))
+        attempt.accept_chunk(100, accepted + _record(2))
+        assert attempt.finish_read(DoneNotification(0, 102), 2 * RECORD_SIZE)
+        attempt.interrupt()
+        attempt.prepare_leg(100, 2)
+        attempt.record_read_begin(ReadBeginNotification(100, 2))
+        attempt.accept_chunk(100, _record(9), tail)
         source_id = attempt.attempt_id
 
         store.quarantine_attempt_source(source_id)
@@ -196,21 +199,19 @@ def test_quarantine_preserves_exact_records_tail_and_conflict_evidence(tmp_path:
                     (source_id,),
                 ).fetchone(),
             )
-            saved_tail = cast(
-                tuple[object] | None,
-                connection.execute("SELECT bytes FROM capture_tail WHERE source_id = ?", (source_id,)).fetchone(),
+            observation = cast(
+                tuple[bytes, bytes] | None,
+                connection.execute(
+                    "SELECT c.bytes, o.tail FROM capture_observation o JOIN capture_observation_chunk c "
+                    "USING (source_id, leg_generation) WHERE o.source_id = ?",
+                    (source_id,),
+                ).fetchone(),
             )
-            conflicts = connection.execute(
-                "SELECT bytes, reason FROM capture_conflict WHERE source_id = ?", (source_id,)
-            ).fetchall()
-        assert record is not None and saved_tail is not None
+        assert record is not None and observation is not None
         assert tuple(record) == (1, accepted[4:])
-        assert saved_tail[0] == tail
-        assert [(row[0], row[1]) for row in cast(list[tuple[object, object]], conflicts)] == [
-            (_record(9), "replay_mismatch")
-        ]
+        assert tuple(observation) == (_record(9), tail)
         source = attempt_source(store, source_id)
-        assert source is not None and source.committed_sha256 == sha256(accepted).hexdigest()
+        assert source is not None and source.committed_sha256 == sha256(accepted + _record(2)).hexdigest()
     finally:
         attempt.close()
 
@@ -224,7 +225,7 @@ def test_terminal_reason_is_distinct_from_original_quarantine_reason(tmp_path: P
     store.mark_quarantine_unprocessable(source_id, "terminal proof failed")
 
     row = _source_row(store, source_id)
-    assert row is not None and row[2] == "attempt source preserved"
+    assert row is not None and row[2] == "framing_unresolved"
     assert row is not None and row[3] == "unprocessable"
     assert row is not None and row[5] == "terminal proof failed"
     assert row is not None and row[6] is not None
@@ -265,6 +266,7 @@ def test_ready_custody_conflict_cannot_be_salvaged_or_terminally_deleted(
     try:
         raw = _record(1)
         attempt.accept_chunk(100, raw)
+        assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         source_id = store.quarantine_attempt_source(attempt.attempt_id)
         with closing(store.state_db.open_connection()) as connection:
             connection.execute(
@@ -360,11 +362,11 @@ def test_salvaged_prefix_remains_in_sql_until_below_threshold_packaging(
         tmp_path,
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=1.0)),
     )
-    attempt = _attempt(store, count=2)
+    attempt = _attempt(store, count=1)
     try:
         raw = _record(1)
-        residual_tail = b"residual-tail"
-        attempt.accept_chunk(100, raw, residual_tail)
+        attempt.accept_chunk(100, raw)
+        assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         source_id = store.quarantine_attempt_source(attempt.attempt_id)
         evidence_id = "e" * 64
         with closing(store.state_db.open_connection()) as connection:
@@ -426,7 +428,7 @@ def test_salvaged_prefix_remains_in_sql_until_below_threshold_packaging(
             str(admitted_at + 1_000_000_000),
         )
         assert record is not None and tuple(record) == (1, raw[4:])
-        assert tail is not None and tuple(tail) == (residual_tail,)
+        assert tail is None
         assert evidence is not None and tuple(evidence) == ("unclassified", None)
         assert publication_rows == ()
 
@@ -509,6 +511,7 @@ def test_corrupt_source_digest_becomes_indefinite_custody_hold(tmp_path: Path, m
     raw = _record(1)
     try:
         attempt.accept_chunk(100, raw)
+        assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         source_id = store.quarantine_attempt_source(attempt.attempt_id)
         with closing(store.state_db.open_connection()) as connection:
             connection.execute(
@@ -572,6 +575,7 @@ def test_authentication_hold_reconciles_complete_durable_row(tmp_path: Path, dur
     raw = _record(1)
     try:
         attempt.accept_chunk(100, raw)
+        assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         source_id = store.quarantine_attempt_source(attempt.attempt_id)
         with closing(store.state_db.open_connection()) as connection:
             connection.execute(
@@ -584,7 +588,6 @@ def test_authentication_hold_reconciles_complete_durable_row(tmp_path: Path, dur
             current = quarantine_module._source_row(connection, source_id)
             assert current is not None
             columns, before_row = current
-            assert type(before_row) is tuple
             before = tuple(before_row)
             changes: dict[str, object] = {
                 "source_type": "quarantine",
@@ -739,7 +742,7 @@ def test_zero_checkpoint_with_real_record_enters_hold_at_quarantine_open(tmp_pat
         attempt.close()
 
 
-def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_restart(
+def test_unconfirmed_tail_is_retained_while_sealed_source_publishes_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 1_000_000_000
@@ -753,32 +756,33 @@ def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_r
     ready.mkdir(mode=0o2750)
     ready.chmod(0o2750)
     store = StagingStore.from_paths(bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config)
-    zero = _attempt(store, start=100, count=1)
-    sealed = _attempt(store, start=101, count=1)
+    zero = _attempt(store, start=101, count=1)
+    sealed = _attempt(store, start=100, count=1)
     try:
-        zero.accept_chunk(100, b"", b"partial-tail")
+        zero.accept_chunk(101, b"", b"partial-tail")
         zero.interrupt()
         zero_id = zero.attempt_id
         zero.close(durable=True)
-        store.terminalize_prefix_attempt(zero_id)
+        store.quarantine_attempt_source(zero_id)
 
-        sealed.accept_chunk(101, _opus_record(2, 2))
-        sealed.seal(DoneNotification(0, 102))
+        sealed.accept_chunk(100, _opus_record(2, 2))
+        assert sealed.finish_read(DoneNotification(0, 101), RECORD_SIZE)
+        sealed.seal(DoneNotification(0, 101))
         sealed_id = sealed.attempt_id
         sealed.close(durable=True)
         store.terminalize_prefix_attempt(sealed_id)
-        store.append_ready_closure(102, "drained")
+        store.append_ready_closure(101, "drained")
 
         zero_row = _source_row(store, zero_id)
         assert zero_row is not None and zero_row[:4] == (
             "quarantine",
             "blocked",
-            "terminal prefix residual",
-            "unprocessable",
+            "framing_unresolved",
+            "unclassified",
         )
-        assert zero_row[6] is not None
+        assert zero_row[6] is None
         now += 1_000_000_000
-        assert store.sweep_terminal_quarantine().removed_source_ids == (zero_id,)
+        assert store.sweep_terminal_quarantine().removed_source_ids == ()
         published = store.recover_and_publish()
         assert published.state is ReadyOutcomeState.PUBLISHED
         artifact = published.published[0]
@@ -786,7 +790,7 @@ def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_r
         manifest = cast(dict[str, object], loads(artifact.path.joinpath("manifest.json").read_text(encoding="utf-8")))
         assert {item.name for item in artifact.path.iterdir()} == {"audio.ogg", "manifest.json"}
         assert artifact.record_count == 1
-        assert artifact.next_sequence == 102
+        assert artifact.next_sequence == 101
         assert manifest["id"] == artifact.bundle_id
         assert manifest["packet_count"] == 1
         assert manifest["audio_sha256"] == sha256(audio).hexdigest()
@@ -795,7 +799,7 @@ def test_terminalized_zero_tail_is_expired_while_sealed_source_publishes_after_r
             bootstrap.paths, state_db=bootstrap.state_db, publication_root=ready, config=config
         )
         assert restarted.sweep_terminal_quarantine().removed_source_ids == ()
-        assert attempt_source(restarted, zero_id) is None
+        assert attempt_source(restarted, zero_id) is not None
         assert attempt_source(restarted, sealed_id) is not None
     finally:
         zero.close()
@@ -817,6 +821,7 @@ def test_unclassified_evidence_cannot_expire_or_starve_later_terminal_source(
         unresolved.accept_chunk(100, _record(1), b"uncertain tail")
         unresolved_id = store.quarantine_attempt_source(unresolved.attempt_id)
         terminal.accept_chunk(200, _record(2))
+        assert terminal.finish_read(DoneNotification(0, 201), RECORD_SIZE)
         terminal_id = store.quarantine_attempt_source(terminal.attempt_id)
         store.mark_quarantine_unprocessable(terminal_id, "explicit terminal disposition")
         with closing(store.state_db.open_connection()) as connection:
@@ -829,15 +834,13 @@ def test_unclassified_evidence_cannot_expire_or_starve_later_terminal_source(
         now += 1_000_000_000
         assert store.sweep_terminal_quarantine().removed_source_ids == (terminal_id,)
         assert _source_row(store, unresolved_id) == before
+        assert attempt_records(store, unresolved_id) == (_record(1),)
         with closing(store.state_db.open_connection(read_only=True)) as connection:
             assert (
                 connection.execute(
-                    "SELECT COUNT(*) FROM capture_record WHERE source_id=?", (unresolved_id,)
+                    "SELECT bytes FROM capture_tail WHERE source_id=?",
+                    (unresolved_id,),
                 ).fetchone()[0]
-                == 1
-            )
-            assert (
-                connection.execute("SELECT bytes FROM capture_tail WHERE source_id=?", (unresolved_id,)).fetchone()[0]
                 == b"uncertain tail"
             )
     finally:
@@ -854,11 +857,12 @@ def test_terminal_quarantine_obeys_retention_deadline_and_keeps_unterminalized_s
         tmp_path,
         config=CollectorConfig(staging_retention=StagingRetentionConfig(terminal_retention_seconds=72.0)),
     )
-    aged = _attempt(store, 100, 2)
+    aged = _attempt(store, 100, 1)
     live = _attempt(store, 200, 1)
     try:
         residual = _record(3)
-        aged.accept_chunk(100, residual, b"retained tail")
+        aged.accept_chunk(100, residual)
+        assert aged.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         aged_id = store.quarantine_attempt_source(aged.attempt_id)
         store.mark_quarantine_unprocessable(aged_id, "cannot authenticate")
         live.accept_chunk(200, _record(4))
@@ -912,10 +916,11 @@ def test_terminal_quarantine_sweep_k1_bounds_children_and_converges(
         writer=WriterConfig(chunk_records=1),
     )
     store = _store(tmp_path, config=config)
-    attempt = _attempt(store, count=4)
+    attempt = _attempt(store, count=3)
     try:
         for ordinal in range(3):
-            attempt.accept_chunk(100 + ordinal, _record(ordinal + 1), b"tail" if ordinal == 2 else b"")
+            attempt.accept_chunk(100 + ordinal, _record(ordinal + 1))
+        assert attempt.finish_read(DoneNotification(0, 103), 3 * RECORD_SIZE)
         source_id = store.quarantine_attempt_source(attempt.attempt_id)
         store.mark_quarantine_unprocessable(source_id, "authentication failed")
         evidence_id = "e" * 64
@@ -938,7 +943,7 @@ def test_terminal_quarantine_sweep_k1_bounds_children_and_converges(
             connection.commit()
         now += 1_000_000_000
         initial = _quarantine_child_count(store, source_id)
-        assert initial == 8
+        assert initial == 7
         removed: list[str] = []
         for _ in range(initial):
             before = _quarantine_child_count(store, source_id)
@@ -966,10 +971,11 @@ def test_terminal_quarantine_sweep_preserves_referenced_canonical_record(
         writer=WriterConfig(chunk_records=1),
     )
     store = _store(tmp_path, config=config)
-    attempt = _attempt(store, count=2)
+    attempt = _attempt(store, count=1)
     try:
         raw = _record(1)
-        attempt.accept_chunk(100, raw, b"tail")
+        attempt.accept_chunk(100, raw)
+        assert attempt.finish_read(DoneNotification(0, 101), RECORD_SIZE)
         source_id = store.quarantine_attempt_source(attempt.attempt_id)
         store.mark_quarantine_unprocessable(source_id, "authentication failed")
         cohort_id = "c" * 64

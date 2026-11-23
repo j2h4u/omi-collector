@@ -43,8 +43,8 @@ from ..domain.ready_machine import (
     recovered_closure,
 )
 from ..domain.ring_protocol import RingInfo
-from . import quarantine, ready_closures
-from .attempts import SqliteAttemptInspection, SqliteStagedAttempt
+from . import framing_incidents, quarantine, ready_closures
+from .attempts import SqliteAttemptInspection, SqliteStagedAttempt, _durable_prefix
 from .collector_state_db import StateDB, StateDBError, StateKind, StateTransaction, raise_if_sqlite_storage_fault
 from .confirmed_loss import ConfirmedLossError, ConfirmedLossLedger
 from .debug_logging import configure_debug_logging, debug_event
@@ -58,6 +58,9 @@ from .internal_audio_store import (
     read_capture_source,
     refresh_utc_projection,
 )
+from .ordered_physical_plan import publish_next_ordered_physical
+from .ordered_retirement import retire_one_ordered_physical_page
+from .physical_stage import resume_physical_stage
 from .public_drain import AcceptedDrainCustody, PublicDrainProjection
 from .ready_bundles import (
     PublicAudioV2Options,
@@ -71,6 +74,7 @@ from .ready_bundles import (
     acknowledged_public_audio_v2,
     acknowledged_public_audio_v2_needs_retirement,
     finalize_public_audio_v2,
+    historical_admission_frontier,
     resume_retired_public_audio_v2,
     retire_acknowledged_public_audio_v2,
     retire_one_covered_typed_source,
@@ -143,6 +147,34 @@ def _db_all(cursor: sqlite3.Cursor) -> list[sqlite3.Row] | list[tuple[object, ..
         return cursor.fetchall()
     finally:
         cursor.close()
+
+
+def _ordered_publication_outcome(store: InternalAudioStore, root: Path, outcome: ReadyOutcome) -> ReadyOutcome:
+    try:
+        physical = publish_next_ordered_physical(store, root)
+    except ValueError as error:
+        return ReadyOutcome(
+            ReadyOutcomeState.BLOCKED,
+            published=outcome.published,
+            reason=str(error),
+            remaining_at_frontier=True,
+            custody_cache=outcome.custody_cache,
+        )
+    if physical is None:
+        return outcome
+    if physical is True:
+        return ReadyOutcome(
+            ReadyOutcomeState.PUBLISHED,
+            published=outcome.published,
+            remaining_at_frontier=True,
+            custody_cache=outcome.custody_cache,
+        )
+    return ReadyOutcome(
+        ReadyOutcomeState.PUBLISHED,
+        published=(*outcome.published, physical),
+        remaining_at_frontier=True,
+        custody_cache=outcome.custody_cache,
+    )
 
 
 class StagingStore:
@@ -601,9 +633,10 @@ class StagingStore:
             closures = ready_closures.coalesce(self._state_db)
             closed_frontier = closures[-1].next_sequence if closures else None
             recoverable_prefix = any(
-                source.lifecycle == "sealed_waiting"
-                and (closed_frontier is None or source.sequence_start + source.committed_count > closed_frontier)
+                prefix.record_count > 0 and (closed_frontier is None or prefix.next_sequence > closed_frontier)
                 for source in self._typed_attempt_sources(include_sealed=True)
+                if source.lifecycle == "sealed_waiting"
+                for prefix in (_durable_prefix(source, self._state_db),)
             )
             frontier = self._cached_draft_frontier()
             unclosed_drafts = frontier is not None and (not closures or frontier > closures[-1].next_sequence)
@@ -662,8 +695,11 @@ class StagingStore:
                     list[tuple[object, object]],
                     _db_all(
                         connection.execute(
-                            "SELECT sequence_start, committed_count FROM capture_source "
-                            "WHERE source_type = 'draft' AND committed_count > 0"
+                            "SELECT source.sequence_start, MAX(leg.verified_count) FROM capture_source source "
+                            "JOIN capture_read_leg leg ON leg.source_id=source.source_id "
+                            "WHERE source.source_type = 'draft' AND leg.verified_count > 0 "
+                            "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                            "WHERE h.source_id=source.source_id AND h.disposition='pending') GROUP BY source.source_id"
                         )
                     ),
                 )
@@ -692,14 +728,16 @@ class StagingStore:
             if not sources:
                 return None
             orphan_frontier = self._cached_draft_frontier() if reason == "drained" else None
-            frontiers = [source.sequence_start + source.committed_count for source in sources]
+            verified = [(source, _durable_prefix(source, self._state_db)) for source in sources]
+            frontiers = [prefix.next_sequence for _, prefix in verified if prefix.record_count]
             if orphan_frontier is not None:
                 frontiers.append(orphan_frontier)
             frontier = max(frontiers) if frontiers else None
-            assert frontier is not None
+            if frontier is None:
+                return None
             decision, existing = self._decide_recovered_closure_unlocked(lease, frontier, reason, drain_cursor)
-            for source in sources:
-                if source.lifecycle != "sealed_waiting":
+            for source, prefix in verified:
+                if source.lifecycle != "sealed_waiting" and prefix.record_count and not prefix.has_unconfirmed:
                     self.terminalize_prefix_attempt_held(source.source_id, lease)
             if sources:
                 self.publication_input_changed()
@@ -869,9 +907,13 @@ class StagingStore:
                     list[tuple[object]],
                     _db_all(
                         connection.execute(
-                            "SELECT source_id FROM capture_source "
-                            "WHERE lifecycle IN ('sealed_waiting','blocked') "
-                            "ORDER BY sequence_start, source_id"
+                            "SELECT source.source_id FROM capture_source source "
+                            "WHERE (source.lifecycle='blocked' OR (source.lifecycle='sealed_waiting' AND (EXISTS ("
+                            "SELECT 1 FROM capture_read_leg leg WHERE leg.source_id=source.source_id "
+                            "AND leg.verified_count=source.committed_count AND leg.done_next=source.sequence_limit) "
+                            "OR EXISTS (SELECT 1 FROM capture_historical_custody h "
+                            "WHERE h.source_id=source.source_id)))) "
+                            "ORDER BY source.sequence_start, source.source_id"
                         )
                     ),
                 )
@@ -901,17 +943,23 @@ class StagingStore:
         acknowledged_public_audio_v2_needs_retirement(self._state_db, acknowledged)
         closures = ready_closures.coalesce(self._state_db)
         closure = closures[-1] if closures else None
-        frontier = None if closure is None else closure.next_sequence
-        drained = closure is not None and closure.reason == "drained"
+        unresolved_frontier = framing_incidents.active_framing_frontier(self._state_db)
+        publication_closure, preserved_permit = ready_closures.publication_closure(
+            self._state_db, closure, unresolved_frontier
+        )
+        frontier = None if publication_closure is None else publication_closure.next_sequence
+        if frontier is not None and unresolved_frontier is not None:
+            frontier = min(frontier, unresolved_frontier)
+        source_ids = self._typed_publication_source_ids()
+        frontier = historical_admission_frontier(self._state_db, frontier, frozenset(source_ids))
+        drained = publication_closure is not None and publication_closure.reason == "drained"
         try:
             with InternalAudioStore(
                 self._state_db,
                 chunk_limit=self._config.writer.chunk_records,
             ) as audio_store:
-                sources = tuple(
-                    SqlitePublicationSource(audio_store, source_id)
-                    for source_id in self._typed_publication_source_ids()
-                )
+                resume_physical_stage(audio_store, publication_root)
+                sources = tuple(SqlitePublicationSource(audio_store, source_id) for source_id in source_ids)
                 outcome = finalize_public_audio_v2(
                     audio_store,
                     sources,
@@ -927,12 +975,20 @@ class StagingStore:
                 )
                 if outcome.custody_cache is not None:
                     self._ready_custody_cache = outcome.custody_cache
+                outcome = _ordered_publication_outcome(audio_store, publication_root, outcome)
         except ReadySpaceError:
             raise
         except ReadyBundleError as error:
             outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
-        if closure is not None and not outcome.remaining_at_frontier:
-            ready_closures.remove(self._state_db, closure)
+        if (
+            publication_closure is not None
+            and frontier == publication_closure.next_sequence
+            and not outcome.remaining_at_frontier
+        ):
+            if preserved_permit:
+                ready_closures.remove_drained_permit(self._state_db, publication_closure)
+            else:
+                ready_closures.remove(self._state_db, publication_closure)
         return outcome
 
     def retire_acknowledged_ready(self, *, should_defer: Callable[[], bool]) -> int:
@@ -976,11 +1032,11 @@ class StagingStore:
                 chunk_limit=self._config.writer.chunk_records,
             ) as audio_store,
         ):
-            return retire_one_covered_typed_source(
-                audio_store,
-                self._config.writer.chunk_records,
-                should_defer,
-            )
+            if retire_one_covered_typed_source(audio_store, self._config.writer.chunk_records, should_defer):
+                return True
+            if should_defer():
+                return False
+            return retire_one_ordered_physical_page(audio_store, self._config.writer.chunk_records)
 
     @property
     def capture_root(self) -> Path:
@@ -1046,14 +1102,62 @@ class StagingStore:
                 occurred_at,
             )
 
+    def has_framing_uncertainty(self, start: int, end: int) -> bool:
+        from .framing_incidents import has_framing_uncertainty
+
+        return has_framing_uncertainty(self._state_db, start, end)
+
+    def extend_uncertain_framing(self, start: int, info: RingInfo) -> tuple[str, ...]:
+        from .framing_incidents import extend_uncertain_framing
+
+        return extend_uncertain_framing(self._state_db, start, info.read_sequence, info.write_sequence)
+
+    def reconcile_sealed_framing(self) -> tuple[str, ...]:
+        """Finish any recovery settlement interrupted after a successful source seal."""
+        return self.settle_recovered_framing(None)
+
+    def settle_recovered_framing(self, source_id: str | None) -> tuple[str, ...]:
+        """Resolve gaps fully covered by a new independent completed READ."""
+        from .framing_incidents import settle_recovered
+
+        result = settle_recovered(self._state_db, source_id)
+        self._public_drain.wake()
+        if result:
+            self.publication_input_changed()
+        return result
+
+    def settle_unavailable_framing(self, info: RingInfo) -> tuple[str, ...]:
+        """Record gaps made unavailable by one freshly observed device range."""
+        from .framing_incidents import settle_unavailable
+
+        result = settle_unavailable(self._state_db, info.read_sequence, info.write_sequence)
+        self._public_drain.wake()
+        if result:
+            self.publication_input_changed()
+        return result
+
     def quarantine_pending(self, reason: str) -> tuple[str, ...]:
-        return quarantine.quarantine_pending(self._filesystem, reason)
+        if not isinstance(reason, str) or not reason.strip():
+            raise AttemptStateError("quarantine reason must be a non-empty string")
+        retained = tuple(
+            source.source_id for source in self._typed_attempt_sources() if self._quarantine_provisional_source(source)
+        )
+        return (*retained, *quarantine.quarantine_pending(self._filesystem, reason))
 
     def quarantine_attempt_source(self, attempt_id: str) -> str:
-        return quarantine.quarantine_attempt_source(
-            self._filesystem,
-            attempt_id,
-        )
+        for source in self._typed_attempt_sources():
+            if source.source_id == attempt_id and self._quarantine_provisional_source(source):
+                return attempt_id
+        return quarantine.quarantine_attempt_source(self._filesystem, attempt_id)
+
+    def _quarantine_provisional_source(self, source: CaptureSource) -> bool:
+        if not _durable_prefix(source, self._state_db).has_unconfirmed:
+            return False
+        with InternalAudioStore(self._state_db, chunk_limit=self._config.writer.chunk_records) as audio_store:
+            audio_store.quarantine_unconfirmed(source.source_id)
+        self._public_drain.wake()
+        self.publication_input_changed()
+        return True
 
     def terminalize_prefix_attempt(self, attempt_id: str) -> None:
         quarantine.terminalize_prefix_attempt(
@@ -1140,7 +1244,9 @@ class StagingStore:
                     _db_all(
                         connection.execute(
                             "SELECT source_id FROM capture_source "
-                            f"WHERE source_type = 'attempt' AND lifecycle IN {lifecycles} ORDER BY source_id"
+                            f"WHERE source_type = 'attempt' AND lifecycle IN {lifecycles} "
+                            "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody h "
+                            "WHERE h.source_id=capture_source.source_id AND h.disposition='pending') ORDER BY source_id"
                         )
                     ),
                 )
@@ -1208,7 +1314,7 @@ class StagingStore:
         except InternalAudioStoreError as error:
             raise AttemptStateError(str(error)) from error
         if typed is not None and typed.source_type == "attempt":
-            return SqliteAttemptInspection(typed, self._typed_descriptor(typed))
+            return SqliteAttemptInspection(typed, self._typed_descriptor(typed), self._state_db)
         raise AttemptStateError("typed audio source does not exist")
 
     def resume_streaming_attempt(self, lease: StorageLeasePort) -> SqliteStagedAttempt | None:
@@ -1239,6 +1345,7 @@ class StagingStore:
             try:
                 if source.lifecycle == "receiving":
                     source = audio_store.interrupt(source.source_id)
+                    self._public_drain.wake()
             except InternalAudioStoreError as error:
                 audio_store.close()
                 raise AttemptStateError(str(error)) from error

@@ -187,6 +187,11 @@ class FakeWriter:
         await asyncio.to_thread(self._target_write)
         return "interrupted"
 
+    async def finish_read(self, done_notice: collector_module.DoneNotification) -> bool:
+        del done_notice
+        self.calls.append("finish_read")
+        return True
+
     def _target_write(self) -> None:
         self.target_threads.append(threading.get_ident())
         self.written_high_water = self.submitted_high_water
@@ -254,6 +259,14 @@ class BlockingWriterTarget:
     def interrupt(self) -> None:
         self.calls.append("interrupt")
 
+    def quarantine_unconfirmed(self) -> None:
+        self.calls.append("quarantine_unconfirmed")
+
+    def finish_read(self, done_notice: object) -> bool:
+        del done_notice
+        self.calls.append("finish_read")
+        return True
+
     def seal(self, done_notice: object) -> object:
         del done_notice
         self.calls.append("seal")
@@ -297,7 +310,7 @@ def test_burst_reaches_arena_while_heartbeat_runs_and_disk_is_after_done() -> No
         assert heartbeat > 0
         assert progress_calls == 0
         assert writer.calls[:3] == ["start", "prepare", "read_begin"]
-        assert writer.calls[-1] == "barrier"
+        assert writer.calls[-2:] == ["barrier", "finish_read"]
         assert writer.target_threads and writer.target_threads[0] != threading.get_ident()
         assert session.writes == [encode_read_command(10, 2)]
 
@@ -344,6 +357,58 @@ def test_read_leg_accepts_keyword_start_and_count() -> None:
         assert result.next_sequence == 12
         assert result.received_bytes == 2 * RECORD_SIZE
         assert session.writes == [encode_read_command(10, 2)]
+
+    asyncio.run(scenario())
+
+
+def test_short_read_preserves_terminal_done_after_writer_barrier() -> None:
+    async def scenario() -> None:
+        data = _record(1) + b"tail"
+        session = BurstSession((_begin(10, 2), _data(data), _done(12)))
+        writer = FakeWriter()
+        arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
+
+        result = await read_leg(session, arena, writer, 10, 2, ReadLegOptions(1))
+
+        assert result.done_notice == collector_module.DoneNotification(0, 12)
+        assert result.received_bytes == len(data)
+        assert writer.calls[-2:] == ["barrier", "finish_read"]
+        assert session.writes == [encode_read_command(10, 2)]
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_waits_for_terminal_evidence() -> None:
+    async def scenario() -> None:
+        class HeldFinishWriter(FakeWriter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def finish_read(self, done_notice: collector_module.DoneNotification) -> bool:
+                self.started.set()
+                await self.release.wait()
+                return await super().finish_read(done_notice)
+
+        writer = HeldFinishWriter()
+        session = BurstSession((_begin(10, 2), _data(_record(1)), _done(12)))
+        task = asyncio.create_task(
+            read_leg(session, TransferArena(10, 2, max_bytes=2 * RECORD_SIZE), writer, 10, 2, ReadLegOptions(1))
+        )
+        try:
+            await asyncio.wait_for(writer.started.wait(), 1)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            writer.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert writer.calls[-1] == "finish_read"
+            assert session.writes == [encode_read_command(10, 2)]
+        finally:
+            writer.release.set()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -451,15 +516,14 @@ def test_read_mailbox_preserves_intermediate_and_terminal_progress_on_success_an
 
         interrupted = ProgressMailbox()
         broken = BurstSession((_begin(10, 2), _data(record), _done(12)))
-        with pytest.raises(TransferInterruptedError):
-            await read_leg(
-                broken,
-                TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
-                FakeWriter(),
-                10,
-                2,
-                ReadLegOptions(1, progress_mailbox=interrupted),
-            )
+        await read_leg(
+            broken,
+            TransferArena(10, 2, max_bytes=2 * RECORD_SIZE),
+            FakeWriter(),
+            10,
+            2,
+            ReadLegOptions(1, progress_mailbox=interrupted),
+        )
         assert interrupted.snapshot.terminal
         assert interrupted.snapshot.event is not None
         assert interrupted.snapshot.event.records_completed == 1
@@ -507,6 +571,7 @@ def test_read_ack_before_begin_data_done_completes_the_full_leg() -> None:
             f"publish:{RECORD_SIZE}",
             f"publish:{2 * RECORD_SIZE}",
             "barrier",
+            "finish_read",
         ]
 
     asyncio.run(scenario())
@@ -833,6 +898,7 @@ def test_cancel_at_done_failure_waiter_handoff_settles_without_stop(writer_fails
                 with pytest.raises(asyncio.CancelledError):
                     await task
                 assert writer.barrier_done.is_set()
+                assert writer.calls[-1] == "finish_read"
             assert session.writes == [encode_read_command(10, 2)]
         finally:
             writer.wait_release.set()
@@ -1076,7 +1142,7 @@ def test_real_attempt_writer_stall_does_not_stop_ble_ingest() -> None:
             await asyncio.gather(ticker, return_exceptions=True)
         assert not writer.thread.is_alive()
         assert target.calls[:4] == ["prepare", "prepare_leg", "read_begin", "append"]
-        assert target.calls[-2:] == ["checkpoint", "close"]
+        assert target.calls[-3:] == ["checkpoint", "finish_read", "close"]
         assert target.append_threads and target.append_threads[0] != threading.get_ident()
 
     asyncio.run(scenario())
@@ -1094,10 +1160,10 @@ def test_torn_tail_and_overflow_fail_closed_without_advance(notifications: tuple
         session = BurstSession(notifications)
         writer = FakeWriter()
         arena = TransferArena(10, 2, max_bytes=2 * RECORD_SIZE)
-        with pytest.raises(TransferInterruptedError) as caught:
-            await read_leg(session, arena, writer, 10, 2, ReadLegOptions(1))
-        assert caught.value.received_bytes == expected
-        assert encode_stop_command() in session.writes
+        result = await read_leg(session, arena, writer, 10, 2, ReadLegOptions(1))
+        assert result.received_bytes == expected
+        assert result.done_notice == collector_module.DoneNotification(0, 12)
+        assert encode_stop_command() not in session.writes
         assert not any(command.startswith(b"\x12") for command in session.writes)
 
     asyncio.run(scenario())

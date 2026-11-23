@@ -12,7 +12,7 @@ from typing import cast
 import pytest
 
 from omi_collector.capture.adapters.collector_state_db import StateDB, StateKind
-from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, DrainCheckpoint, InternalAudioStore
+from omi_collector.capture.adapters.internal_audio_store import AUDIO_RECORD_SIZE, InternalAudioStore
 from omi_collector.capture.adapters.ready_bundles import (
     PublicAudioV2Options,
     ReadyOutcomeState,
@@ -27,6 +27,7 @@ from omi_collector.capture.application.storage_fault import (
 )
 from omi_collector.capture.domain.clock_state import ClockState
 from omi_collector.config import ReadyConfig
+from test_public_audio_v2_integration import _source as _verified_source
 
 
 @pytest.fixture
@@ -54,19 +55,7 @@ def _source(
     store: InternalAudioStore, source_id: str = "a" * 32, start: int = 10, records: tuple[bytes, ...] | None = None
 ) -> SqlitePublicationSource:
     raw_records = records or (_record(100),)
-    store.create_source(source_id, "attempt", start, start + len(raw_records))
-    source = store.prepare_leg(source_id, start, len(raw_records))
-    source = store.record_read_begin(source_id, start, len(raw_records))
-    store.commit_drain(source_id, 0, raw_records, DrainCheckpoint(source.current_leg_generation))
-    source = store.get_source(source_id)
-    assert source is not None
-    store.seal_source(
-        source_id,
-        leg_generation=source.current_leg_generation,
-        expected_count=source.committed_count,
-        expected_sha256=source.committed_sha256,
-    )
-    return SqlitePublicationSource(store, source_id)
+    return _verified_source(store, source_id, start, raw_records)
 
 
 def _options(frontier: int = 11) -> PublicAudioV2Options:
@@ -172,7 +161,7 @@ def test_v2_transaction_failures_reconcile_through_publication_api(
     database, store = audio_store
     after_commit, classified_busy = failure_case
     ready = _ready_root(tmp_path)
-    source = _source(store)
+    source = _source(store, "a" * 32, 10, (_record(100),))
     original, (calls, fired) = _inject_transaction_failure(
         store,
         transaction_number=1,

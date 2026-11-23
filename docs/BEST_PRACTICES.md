@@ -357,8 +357,11 @@ The deployer checks state before stopping the service and repeats the check
 under the stable guard after stop. A verified hot rollback journal is recovered
 by SQLite under that guard, then a read-only check must accept the recovered
 state. The selected release's `omi-collector init-state --config PATH` creates
-v4 only for an empty installation, upgrades drained v2 or v3 state directly to
-`v2_open` at order zero, and validates existing v4 without rewriting it. A v3
+v5 for an empty installation, upgrades drained v2 or v3 state to
+`v2_open` at order zero, and migrates v4 state to v5. Routine inspection and
+migration validate schema, custody and SQLite errors without a full database
+`integrity_check` or `quick_check`; they cannot detect corruption in unvisited
+pages. A v3
 upgrade requires empty legacy proof root and page tables. Active legacy ledger
 entries, cohorts, stages, replay proofs, or READY files are refused; they must
 be resolved through controlled recovery before deployment. Refusal preserves

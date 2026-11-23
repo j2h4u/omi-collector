@@ -65,27 +65,32 @@ def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
         raise StateMigrationError("Collector SQLite state cannot be validated") from error
 
 
-_TYPED_SCHEMA = 4
+_TYPED_SCHEMA = 5
+_V4_TYPED_SCHEMA = 4
 _PREVIOUS_TYPED_SCHEMA = 3
 _LEGACY_TYPED_SCHEMA = 2
 
 
-def _validate_current(connection: sqlite3.Connection) -> None:
+def _validate_current(connection: sqlite3.Connection, *, schema_version: int = _TYPED_SCHEMA) -> None:
     connection.row_factory = sqlite3.Row
     version_row = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
     if version_row is None:
         raise StateMigrationError("Collector SQLite schema version is unavailable")
     if version_row[0] == 1:
         raise InternalAudioCutoverRequiredError("Collector v1 state is unsupported by this release")
-    if version_row[0] in {_LEGACY_TYPED_SCHEMA, _PREVIOUS_TYPED_SCHEMA}:
+    if version_row[0] != schema_version and version_row[0] in {
+        _LEGACY_TYPED_SCHEMA,
+        _PREVIOUS_TYPED_SCHEMA,
+        _V4_TYPED_SCHEMA,
+    }:
         raise InternalAudioCutoverRequiredError(
             f"Collector v{version_row[0]} state requires stopped-service init-state migration"
         )
-    if version_row[0] != _TYPED_SCHEMA:
+    if version_row[0] != schema_version:
         raise StateMigrationError("Collector SQLite schema version is unsupported")
     try:
         _validate_schema(connection)
-        _validate_audio_schema(connection)
+        _validate_audio_schema(connection, version=schema_version)
     except StateDBError as error:
         raise StateMigrationError("Collector SQLite typed schema is invalid") from error
     if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
@@ -366,11 +371,31 @@ def _owned_v2_ready_stage(entry: Path, match: re.Match[str], connection: sqlite3
         or match.groups() != (artifact_id, stage_id[:16])
     ):
         return False
-    if not _owned_stage_cohort(connection, parts):
+    if not _owned_stage_cohort(connection, parts) and not _owned_physical_stage(connection, stage_id, identity):
         return False
     return all(
         child.name in {"audio.ogg", "manifest.json"} and stat.S_ISREG(child.lstat().st_mode)
         for child in entry.iterdir()
+    )
+
+
+def _owned_physical_stage(connection: sqlite3.Connection, stage_id: str, identity: str) -> bool:
+    row = cast(
+        tuple[str] | None,
+        connection.execute(
+            "SELECT payload FROM state WHERE kind=? AND id=?", (StateKind.PHYSICAL_IMPORT.value, stage_id)
+        ).fetchone(),
+    )
+    if row is None:
+        return False
+    try:
+        value = cast(object, json.loads(row[0]))
+    except TypeError, ValueError:
+        return False
+    return (
+        isinstance(value, dict)
+        and cast(dict[str, object], value).get("stage_identity") == identity
+        and cast(dict[str, object], value).get("state") == "staging"
     )
 
 

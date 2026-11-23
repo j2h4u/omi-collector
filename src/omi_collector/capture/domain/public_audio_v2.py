@@ -58,20 +58,23 @@ class PublicProjection:
     boundaries: tuple[PublicBoundary, ...]
 
 
-def project_public_timeline(records: Iterable[FrozenRecordProjection]) -> PublicProjection:
-    """Project frozen record labels and explicit causal facts to packet coordinates."""
-    spans: list[TimelineSpan] = []
-    boundary_facts: dict[int, set[BoundaryFact]] = {}
-    packet = 0
-    previous_key: tuple[object, ...] | None = None
-    pending_boundary = False
-    for record in records:
+class PublicTimelineBuilder:
+    """Accumulate frozen record labels without buffering source records."""
+
+    def __init__(self) -> None:
+        self.spans: list[TimelineSpan] = []
+        self.boundary_facts: dict[int, set[BoundaryFact]] = {}
+        self.packet = 0
+        self.previous_key: tuple[object, ...] | None = None
+        self.pending_boundary = False
+
+    def add(self, record: FrozenRecordProjection) -> None:
         time, facts = _validated_record_projection(record)
         if facts:
-            boundary_facts.setdefault(packet, set()).update(facts)
-            pending_boundary = True
+            self.boundary_facts.setdefault(self.packet, set()).update(facts)
+            self.pending_boundary = True
         if record.packet_count == 0:
-            continue
+            return
         key = (
             time.quality,
             time.seconds,
@@ -79,12 +82,12 @@ def project_public_timeline(records: Iterable[FrozenRecordProjection]) -> Public
             time.causal_membership,
             time.comparable_to_previous,
         )
-        if record.packet_count > _UINT64_MAX - packet:
+        if record.packet_count > _UINT64_MAX - self.packet:
             raise ValueError("projected packet_count exceeds unsigned 64-bit range")
-        next_packet = packet + record.packet_count
-        if spans and key == previous_key and not pending_boundary:
-            prior = spans[-1]
-            spans[-1] = TimelineSpan(
+        next_packet = self.packet + record.packet_count
+        if self.spans and key == self.previous_key and not self.pending_boundary:
+            prior = self.spans[-1]
+            self.spans[-1] = TimelineSpan(
                 prior.packet_start,
                 next_packet,
                 prior.quality,
@@ -92,16 +95,29 @@ def project_public_timeline(records: Iterable[FrozenRecordProjection]) -> Public
                 prior.utc_uncertainty_seconds,
             )
         else:
-            spans.append(TimelineSpan(packet, next_packet, time.quality, time.seconds, time.utc_uncertainty_seconds))
-        packet = next_packet
-        previous_key = key
-        pending_boundary = False
-    if packet == 0:
-        raise ValueError("public projection must contain packets")
-    boundaries = tuple(
-        PublicBoundary(position, tuple(sorted(facts))) for position, facts in sorted(boundary_facts.items())
-    )
-    return PublicProjection(packet, tuple(spans), boundaries)
+            self.spans.append(
+                TimelineSpan(self.packet, next_packet, time.quality, time.seconds, time.utc_uncertainty_seconds)
+            )
+        self.packet = next_packet
+        self.previous_key = key
+        self.pending_boundary = False
+
+    def finish(self) -> PublicProjection:
+        """Freeze the completed public packet timeline."""
+        if self.packet == 0:
+            raise ValueError("public projection must contain packets")
+        boundaries = tuple(
+            PublicBoundary(position, tuple(sorted(facts))) for position, facts in sorted(self.boundary_facts.items())
+        )
+        return PublicProjection(self.packet, tuple(self.spans), boundaries)
+
+
+def project_public_timeline(records: Iterable[FrozenRecordProjection]) -> PublicProjection:
+    """Project frozen record labels and explicit causal facts to packet coordinates."""
+    builder = PublicTimelineBuilder()
+    for record in records:
+        builder.add(record)
+    return builder.finish()
 
 
 def _validated_record_projection(

@@ -181,9 +181,11 @@ crap:
 
 # Hard CRAP gate: every function must stay at or below CRAP 30.
 crap-check:
-    coverage_file="$(mktemp /tmp/omi-collector-crap-coverage.XXXXXX.json)"; \
-    trap 'rm -f "$coverage_file"' EXIT; \
-    chrt --idle 0 nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -n auto --cov=src/omi_collector --cov-report=json:"$coverage_file"; pytest_status=$?; \
+    coverage_dir="$(mktemp -d /tmp/omi-collector-crap.XXXXXX)" || exit 1; \
+    coverage_file="$coverage_dir/coverage.json"; \
+    coverage_data_file="$coverage_dir/.coverage"; \
+    trap 'rm -rf "$coverage_dir"' EXIT; \
+    COVERAGE_FILE="$coverage_data_file" chrt --idle 0 nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=5s 600s uv run pytest -n auto --cov=src/omi_collector --cov-report=json:"$coverage_file"; pytest_status=$?; \
     if (( pytest_status != 0 )); then exit "$pytest_status"; fi; \
     chrt --idle 0 nice -n 19 ionice -c 3 uv run python -m scripts.crap_gate --coverage "$coverage_file" --src src/omi_collector --threshold 30
 

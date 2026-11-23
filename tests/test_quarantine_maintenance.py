@@ -32,7 +32,7 @@ from omi_collector.capture.application.quarantine_maintenance import (
     _CleanupState,
 )
 from omi_collector.capture.application.storage_fault import TransientInternalAudioStorageError
-from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, ReadBeginNotification
+from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, DoneNotification, ReadBeginNotification
 from omi_collector.config import CollectorConfig, RetryConfig
 from staging_test_factory import StagingStore, attempt_source, closure_rows
 
@@ -56,16 +56,20 @@ def _publication_store(tmp_path: Path, *, config: CollectorConfig | None = None)
 
 
 def _record(value: int) -> bytes:
-    return pack(">I", value) + bytes((value % 256,)) * (RECORD_SIZE - 4)
+    return pack(">I", value) + bytes((2, 8, value % 256)) + bytes(RECORD_SIZE - 7)
 
 
-def _seed_streaming_partial(store: StagingStore, count: int, *, start_sequence: int = 100) -> bytes:
+def _seed_streaming_partial(
+    store: StagingStore, count: int, *, start_sequence: int = 100, verified: bool = False
+) -> bytes:
     attempt = store.prepare_streaming_attempt(start_sequence, count)
     attempt.prepare_leg(start_sequence, count)
     records = b"".join(_record(sequence) for sequence in range(start_sequence, start_sequence + count))
     attempt.record_read_begin(ReadBeginNotification(start_sequence, count))
     for index in range(count):
         attempt.accept_chunk(start_sequence + index, records[index * RECORD_SIZE : (index + 1) * RECORD_SIZE])
+    if verified:
+        assert attempt.finish_read(DoneNotification(0, start_sequence + count), len(records))
     attempt.checkpoint()
     attempt.close(durable=True)
     return records
@@ -74,7 +78,7 @@ def _seed_streaming_partial(store: StagingStore, count: int, *, start_sequence: 
 def _quarantine_sources(store: StagingStore, counts: tuple[int, ...]) -> tuple[str, ...]:
     start = 100
     for count in counts:
-        _seed_streaming_partial(store, count, start_sequence=start)
+        _seed_streaming_partial(store, count, start_sequence=start, verified=True)
         start += count + 1
     for descriptor in store.pending_attempts():
         store.quarantine_attempt_source(descriptor.attempt_id)
@@ -117,18 +121,31 @@ def _source_snapshot(store: StagingStore, source_id: str) -> dict[str, object] |
                 (source_id,),
             ).fetchall(),
         )
+        observations = cast(
+            list[tuple[bytes]],
+            connection.execute(
+                "SELECT bytes FROM capture_observation_chunk WHERE source_id = ? ORDER BY leg_generation, byte_offset",
+                (source_id,),
+            ).fetchall(),
+        )
     assert source is not None
     return {
         "source": source,
         "records": tuple(records),
         "tail": tail,
         "conflicts": tuple(conflicts),
+        "observations": tuple(observations),
     }
 
 
 def _snapshot_raw_records(snapshot: dict[str, object]) -> bytes:
     records = cast(tuple[tuple[object, object], ...], snapshot["records"])
-    return b"".join(cast(int, row[0]).to_bytes(4, "big") + cast(bytes, row[1]) for row in records)
+    canonical = b"".join(cast(int, row[0]).to_bytes(4, "big") + cast(bytes, row[1]) for row in records)
+    conflicts = cast(tuple[tuple[int, str, bytes], ...], snapshot["conflicts"])
+    provisional = b"".join(row[2] for row in conflicts if row[1] == "interrupted_provisional")
+    return (
+        canonical + provisional + b"".join(row[0] for row in cast(tuple[tuple[bytes], ...], snapshot["observations"]))
+    )
 
 
 def _terminal_state(store: StagingStore, source_id: str) -> str | None:
@@ -185,6 +202,26 @@ def test_pending_startup_result_including_no_pending_is_memoized(tmp_path: Path,
     assert first.pending is None
     assert first.durable_next is None
     assert calls == 1
+
+
+def test_startup_reconciles_sealed_recovery_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    operations: list[str] = []
+    reconcile = store.reconcile_sealed_framing
+    publish = store.recover_and_publish
+
+    def record_reconcile() -> tuple[str, ...]:
+        operations.append("reconcile")
+        return reconcile()
+
+    def record_publish() -> ReadyOutcome:
+        operations.append("publish")
+        return publish()
+
+    monkeypatch.setattr(store, "reconcile_sealed_framing", record_reconcile)
+    monkeypatch.setattr(store, "recover_and_publish", record_publish)
+    _run(QuarantineMaintenance(store, None, OpportunisticRuntime()).prepare_pending_startup())
+    assert operations[:2] == ["reconcile", "publish"]
 
 
 def test_background_publication_fatal_stops_retry_and_reaches_presence_owner(
@@ -820,7 +857,7 @@ def test_terminal_sweep_repeats_only_while_progressing_and_stops_for_capture(
 def test_deferred_quarantine_is_retried_without_changing_source(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = await asyncio.to_thread(_store, tmp_path)
-        await asyncio.to_thread(_seed_streaming_partial, store, 2)
+        await asyncio.to_thread(_seed_streaming_partial, store, 2, verified=True)
         attempt_id = (await asyncio.to_thread(store.pending_attempts))[0].attempt_id
         source = await asyncio.to_thread(store.quarantine_attempt_source, attempt_id)
         before = await asyncio.to_thread(_source_snapshot, store, source)
@@ -1091,7 +1128,7 @@ def test_presence_startup_state_binds_once_after_a_completed_attempt(tmp_path: P
                 return None
 
         store = await asyncio.to_thread(_store, tmp_path)
-        await asyncio.to_thread(_seed_streaming_partial, store, 1)
+        await asyncio.to_thread(_seed_streaming_partial, store, 1, verified=True)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         bound: list[PendingStartupState] = []
 
@@ -1781,7 +1818,8 @@ def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        started = threading.Event()
+        started = asyncio.Event()
+        loop = asyncio.get_running_loop()
         release = threading.Event()
         finished = threading.Event()
 
@@ -1808,8 +1846,8 @@ def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
 
         def sweep(*, should_defer: Callable[[], bool]) -> SweepResult:
             del should_defer
-            started.set()
-            if not release.wait(2):
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(30):
                 raise TimeoutError("maintenance mutation was not released")
             finished.set()
             return SweepResult((), False)
@@ -1821,7 +1859,7 @@ def test_presence_wait_joins_mutation_after_repeated_owner_cancellation(
         presence = Presence()
         owner = asyncio.create_task(maintenance.wait_for_presence_attempt(presence, lambda _: None))
         try:
-            assert await asyncio.to_thread(started.wait, 1)
+            await asyncio.wait_for(started.wait(), timeout=15.0)
             owner.cancel()
             await asyncio.wait_for(presence.cancellation_observed.wait(), timeout=5.0)
             await asyncio.sleep(0.01)
@@ -1937,7 +1975,7 @@ def test_invalidated_startup_state_prioritizes_sealed_prefix_over_new_pending_at
                 return None
 
         store = await asyncio.to_thread(_store, tmp_path)
-        await asyncio.to_thread(_seed_streaming_partial, store, 1)
+        await asyncio.to_thread(_seed_streaming_partial, store, 1, verified=True)
         maintenance = QuarantineMaintenance(store, None, OpportunisticRuntime())
         bound: list[PendingStartupState] = []
         await maintenance.wait_for_presence_attempt(Presence(), bound.append)
@@ -2423,7 +2461,7 @@ def test_quarantine_preserves_direct_corruption_when_rollback_fails(
     sqlite_errorcode: int,
 ) -> None:
     store = _store(tmp_path)
-    _seed_streaming_partial(store, 1)
+    _seed_streaming_partial(store, 1, verified=True)
     source_id = store.pending_attempts()[0].attempt_id
     before = _source_snapshot(store, source_id)
     failure = sqlite3.DatabaseError("direct quarantine corruption")
@@ -2460,7 +2498,7 @@ def test_quarantine_unresolved_ordinary_rollback_is_fatal_and_leaves_no_mutation
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    _seed_streaming_partial(store, 1)
+    _seed_streaming_partial(store, 1, verified=True)
     source_id = store.pending_attempts()[0].attempt_id
     before = _source_snapshot(store, source_id)
     failure = sqlite3.DatabaseError("ordinary quarantine failure")

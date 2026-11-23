@@ -112,11 +112,11 @@ def _source(store: InternalAudioStore, *, limit: int = 100, source_id: str = "a"
     return source_id
 
 
-def test_fresh_database_is_v4_and_has_typed_tables(tmp_path: Path) -> None:
+def test_fresh_database_is_v5_and_has_typed_tables(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     StateDB(path)
     connection = sqlite3.connect(path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     table_rows = cast(
         list[tuple[str]],
         cast(object, connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()),
@@ -125,6 +125,12 @@ def test_fresh_database_is_v4_and_has_typed_tables(tmp_path: Path) -> None:
     assert names == {
         "state",
         "capture_source",
+        "capture_historical_custody",
+        "capture_read_leg",
+        "capture_framing_incident",
+        "capture_recovery_candidate",
+        "capture_observation",
+        "capture_observation_chunk",
         "capture_record",
         "capture_tail",
         "capture_conflict",
@@ -186,7 +192,7 @@ def test_state_connections_refuse_symlink_swap(tmp_path: Path) -> None:
     assert path.is_symlink() and path.resolve() == target
 
 
-def test_v4_validation_rejects_unexpected_tables(tmp_path: Path) -> None:
+def test_v5_validation_rejects_unexpected_tables(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     StateDB(path)
     connection = sqlite3.connect(path)
@@ -1185,9 +1191,10 @@ def test_tail_past_read_leg_is_refused_without_mutation(tmp_path: Path) -> None:
         store.commit_drain(
             source_id,
             0,
-            [first],
-            DrainCheckpoint(1, expected_sha256=hashlib.sha256(first).hexdigest()),
+            [first, second],
+            DrainCheckpoint(1, expected_sha256=hashlib.sha256(first + second).hexdigest()),
         )
+        assert store.finish_read(source_id, 2, 2 * AUDIO_RECORD_SIZE)
         store.interrupt(source_id)
         store.prepare_leg(source_id, 1, 1)
         store.record_read_begin(source_id, 1, 1)
@@ -1203,7 +1210,7 @@ def test_tail_past_read_leg_is_refused_without_mutation(tmp_path: Path) -> None:
             )
 
         assert store.get_source(source_id) == before
-        assert tuple(record.raw_bytes for record in store.read_record_page(source_id)) == (first,)
+        assert tuple(record.raw_bytes for record in store.read_record_page(source_id)) == (first, second)
     with closing(db.open_connection(read_only=True)) as connection:
         assert (
             connection.execute("SELECT COUNT(*) FROM capture_tail WHERE source_id = ?", (source_id,)).fetchone()[0] == 0
@@ -1305,6 +1312,7 @@ def test_seal_ambiguity_reconciles_only_exact_old_or_proposed_state(
     with InternalAudioStore(db) as store:
         source_id = _source(store, limit=1)
         store.commit_drain(source_id, 0, [raw], DrainCheckpoint(1, expected_sha256=digest))
+        assert store.finish_read(source_id, 1, AUDIO_RECORD_SIZE)
         commit = store._commit
 
         def ambiguous_commit() -> None:

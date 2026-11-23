@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 from omi_collector.capture.adapters.collector_guard import collector_guard
 from omi_collector.capture.adapters.collector_state_db import (
+    _OBSERVATION_DDL,
     StateDB,
     StateDBError,
     StateKind,
@@ -35,6 +36,8 @@ class InternalAudioMigrationError(RuntimeError):
     """Stopped-service state initialization or recovery was refused."""
 
 
+_V4_SCHEMA_VERSION = 4
+_CURRENT_SCHEMA_VERSION = 5
 _PREVIOUS_SCHEMA_VERSION = 3
 _LEGACY_SCHEMA_VERSION = 2
 
@@ -60,12 +63,15 @@ def initialize_collector_state(layout: StorageLayout) -> dict[str, int]:
                 StateDB(path)
             elif inspection["schema_version"] in {_LEGACY_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION}:
                 _migrate_to_v4(layout, from_version=cast(int, inspection["schema_version"]))
+                _migrate_to_v5(layout)
+            elif inspection["schema_version"] == _V4_SCHEMA_VERSION:
+                _migrate_to_v5(layout)
             _handoff_canonical(path)
-            return {"schema_version": 4}
+            return {"schema_version": _CURRENT_SCHEMA_VERSION}
         _validate_empty_install(layout)
         StateDB(path)
         _handoff_canonical(path)
-        return {"schema_version": 4}
+        return {"schema_version": _CURRENT_SCHEMA_VERSION}
 
 
 def inspect_collector_state(layout: StorageLayout) -> dict[str, object]:
@@ -88,6 +94,8 @@ def inspect_collector_state(layout: StorageLayout) -> dict[str, object]:
                 _validate_v2(connection)
             elif version_value == _PREVIOUS_SCHEMA_VERSION:
                 _validate_v3(connection)
+            elif version_value == _V4_SCHEMA_VERSION:
+                _validate_current(connection, schema_version=_V4_SCHEMA_VERSION)
             else:
                 _validate_current(connection)
             _assert_private_audio_gone(layout, connection)
@@ -104,11 +112,11 @@ def prepare_current_collector_state(layout: StorageLayout) -> dict[str, object]:
     path = layout.collector.state_db
     before = _identity(path) if path.exists() else None
     result = inspect_collector_state(layout)
-    if result == {"schema_version": 4, "status": "state_compatible"}:
+    if result == {"schema_version": _CURRENT_SCHEMA_VERSION, "status": "state_compatible"}:
         if _identity(path) != before:
             raise InternalAudioMigrationError("canonical SQLite identity changed during state inspection")
         _handoff_canonical(path)
-        return {"schema_version": 4, "status": "state_prepared"}
+        return {"schema_version": _CURRENT_SCHEMA_VERSION, "status": "state_prepared"}
     return result
 
 
@@ -174,7 +182,7 @@ def _migrate_to_v4(layout: StorageLayout, *, from_version: int) -> None:
                 ),
             )
             connection.execute("PRAGMA user_version = 4")
-            _validate_current(connection)
+            _validate_current(connection, schema_version=_V4_SCHEMA_VERSION)
             connection.commit()
         except InternalAudioMigrationError:
             connection.rollback()
@@ -190,6 +198,34 @@ def _migrate_to_v4(layout: StorageLayout, *, from_version: int) -> None:
             connection.rollback()
             raise_if_sqlite_storage_fault(error)
             raise InternalAudioMigrationError("Collector public audio v2 schema migration failed") from error
+
+
+def _migrate_to_v5(layout: StorageLayout) -> None:
+    with closing(_connect(layout.collector.state_db)) as connection:
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            _validate_current(connection, schema_version=_V4_SCHEMA_VERSION)
+            _assert_private_audio_gone(layout, connection)
+            for ddl in _OBSERVATION_DDL:
+                connection.execute(ddl)
+            connection.execute(
+                "INSERT INTO capture_historical_custody(source_id,prior_source_type,prior_lifecycle,prior_count, "
+                "prior_sha256,prior_certified_count,prior_coverage_digest,disposition) "
+                "SELECT source.source_id,source.source_type,source.lifecycle,source.committed_count, "
+                "source.committed_sha256,source.certified_prefix_count,source.coverage_digest, "
+                "CASE WHEN EXISTS (SELECT 1 FROM publication_cohort_member member "
+                "JOIN publication_cohort cohort ON cohort.cohort_id=member.cohort_id "
+                "WHERE member.source_id=source.source_id AND cohort.lifecycle IN ('accepted','staging','complete')) "
+                "THEN 'admitted' ELSE 'pending' END FROM capture_source source "
+                "WHERE source.lifecycle IN ('prepared','leg_prepared','receiving','interrupted','sealed_waiting','blocked')"
+            )
+            connection.execute("PRAGMA user_version = 5")
+            _validate_current(connection)
+            connection.commit()
+        except (OSError, sqlite3.DatabaseError, StateDBError, StateMigrationError) as error:
+            connection.rollback()
+            raise_if_sqlite_storage_fault(error)
+            raise InternalAudioMigrationError("Collector observation schema migration failed") from error
 
 
 def _require_drained_publication(layout: StorageLayout, connection: sqlite3.Connection, *, from_version: int) -> None:
@@ -333,9 +369,8 @@ def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA foreign_keys = ON")
-        integrity = cast(tuple[str] | None, connection.execute("PRAGMA integrity_check").fetchone())
-        if integrity is None or integrity[0] != "ok":
-            raise InternalAudioMigrationError("Collector SQLite integrity check failed")
+        # Force SQLite to read the database header, including hot-journal detection.
+        connection.execute("PRAGMA user_version").fetchone()
         return connection
     except sqlite3.DatabaseError as error:
         if connection is not None:

@@ -145,7 +145,8 @@ def test_runtime_rejects_unqualified_cohort_without_stage(
         store.create_source(source_id, "attempt", 10, 11)
         current = store.prepare_leg(source_id, 10, 1)
         current = store.record_read_begin(source_id, 10, 1)
-        store.commit_drain(source_id, 0, (record,), DrainCheckpoint(current.current_leg_generation))
+        store.commit_checked_drain(source_id, 0, (record,), DrainCheckpoint(current.current_leg_generation))
+        assert store.finish_read(source_id, 11, AUDIO_RECORD_SIZE)
         current = store.get_source(source_id)
         assert current is not None
         store.seal_source(
@@ -191,7 +192,8 @@ def test_runtime_rejects_valid_accepted_cohort_with_legacy_digest_before_mutatio
     store.create_source(source_id, "attempt", 10, 11)
     current = store.prepare_leg(source_id, 10, 1)
     current = store.record_read_begin(source_id, 10, 1)
-    store.commit_drain(source_id, 0, (record,), DrainCheckpoint(current.current_leg_generation))
+    store.commit_checked_drain(source_id, 0, (record,), DrainCheckpoint(current.current_leg_generation))
+    assert store.finish_read(source_id, 11, AUDIO_RECORD_SIZE)
     current = store.get_source(source_id)
     assert current is not None
     store.seal_source(
@@ -496,7 +498,8 @@ def test_current_runtime_accepts_owned_v2_stage_inventory_and_rejects_unsafe_ent
     store.create_source(source_id, "attempt", 10, 11)
     source = store.prepare_leg(source_id, 10, 1)
     source = store.record_read_begin(source_id, 10, 1)
-    store.commit_drain(source_id, 0, (record,), DrainCheckpoint(source.current_leg_generation))
+    store.commit_checked_drain(source_id, 0, (record,), DrainCheckpoint(source.current_leg_generation))
+    assert store.finish_read(source_id, 11, AUDIO_RECORD_SIZE)
     source = store.get_source(source_id)
     assert source is not None
     store.seal_source(

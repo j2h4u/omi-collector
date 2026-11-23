@@ -56,6 +56,7 @@ def _seal_writer(store: StagingStore, start: int = 100) -> StagingWriter:
     writer.prepare_leg(start, 1)
     writer.read_begin(ReadBeginNotification(start, 1))
     writer.append_chunk(0, memoryview(_record(start)))
+    assert writer.finish_read(DoneNotification(0, start + 1))
     writer.seal(DoneNotification(0, start + 1))
     return writer
 
@@ -143,6 +144,7 @@ def test_prefix_close_retires_before_ready_publication_and_keeps_lease(
     writer.read_begin(ReadBeginNotification(100, 1))
     writer.append_chunk(0, memoryview(_record(100)))
     writer.checkpoint()
+    assert writer.finish_read(DoneNotification(0, 101))
     attempt_id = writer.attempt_id
 
     terminalized: list[bool] = []
@@ -269,6 +271,7 @@ def test_writer_seal_keeps_draft_until_closed_visit(tmp_path: Path) -> None:
     writer.prepare_leg(100, 1)
     writer.read_begin(ReadBeginNotification(100, 1))
     writer.append_chunk(0, memoryview(_record(100)))
+    assert writer.finish_read(DoneNotification(0, 101))
 
     writer.seal(DoneNotification(0, 101))
 
@@ -298,6 +301,7 @@ def test_writer_seal_does_not_report_false_recovery(tmp_path: Path, monkeypatch:
     writer.prepare_leg(100, 1)
     writer.read_begin(ReadBeginNotification(100, 1))
     writer.append_chunk(0, memoryview(_record(100)))
+    assert writer.finish_read(DoneNotification(0, 101))
     writer.seal(DoneNotification(0, 101))
     writer.close()
     assert events == []

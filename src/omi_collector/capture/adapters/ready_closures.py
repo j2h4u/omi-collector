@@ -108,6 +108,8 @@ def append(
                     closure = previous
             if closures != (closure,):
                 _put(transaction, (closure,))
+            if closure.reason == "drained":
+                transaction.delete(StateKind.READY_CLOSURE, "drained_permit")
             if on_commit is not None:
                 on_commit(transaction)
     except (OSError, ValueError, StateDBError) as error:
@@ -135,8 +137,48 @@ def begin_visit(db: StateDB) -> ReadyClosure | None:
     if previous.reason != "drained":
         return previous
     collecting = ReadyClosure(previous.next_sequence, "collecting")
-    _write(db, (collecting,))
+    try:
+        with db.transaction() as transaction:
+            _put(transaction, (collecting,))
+            transaction.put(
+                StateKind.READY_CLOSURE,
+                "drained_permit",
+                {"version": _VERSION, "closures": [{"next_sequence": previous.next_sequence, "reason": "drained"}]},
+            )
+    except (OSError, ValueError, StateDBError) as error:
+        raise ReadyClosureError("ready closure queue could not be written") from error
     return collecting
+
+
+def drained_permit(db: StateDB) -> ReadyClosure | None:
+    """Return the previously drained frontier preserved during a later visit."""
+    closures = _parse_document(db.get(StateKind.READY_CLOSURE, "drained_permit"))
+    if not closures:
+        return None
+    if len(closures) != 1 or closures[0].reason != "drained":
+        raise ReadyClosureError("ready drained permit is invalid")
+    return closures[0]
+
+
+def publication_closure(
+    db: StateDB, current: ReadyClosure | None, unresolved_frontier: int | None
+) -> tuple[ReadyClosure | None, bool]:
+    """Select a confirmed drain without extending it into the current visit."""
+    permit = (
+        drained_permit(db)
+        if unresolved_frontier is not None and (current is None or current.reason != "drained")
+        else None
+    )
+    return (permit, True) if permit is not None else (current, False)
+
+
+def remove_drained_permit(db: StateDB, closure: ReadyClosure) -> None:
+    """Remove a consumed permit only if its frontier remains unchanged."""
+    with db.transaction() as transaction:
+        closures = _parse_document(transaction.get(StateKind.READY_CLOSURE, "drained_permit"))
+        if closures != (closure,):
+            raise ReadyClosureError("ready drained permit changed")
+        transaction.delete(StateKind.READY_CLOSURE, "drained_permit")
 
 
 def remove(db: StateDB, closure: ReadyClosure) -> None:

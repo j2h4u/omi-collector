@@ -44,6 +44,64 @@ def _ack(root: Path, db: StateDB, tmp_path: Path, result: ready_bundles.ReadyBun
     assert len(ready_bundles.retire_acknowledged_public_audio_v2(root, db, checkpoint)) == 1
 
 
+@pytest.mark.parametrize("crash", [False, True])
+def test_ordered_prefix_with_tail_publishes_and_retains_tail_after_ack_and_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash: bool
+) -> None:
+    from omi_collector.capture.adapters.ordered_retirement import retire_one_ordered_physical_page
+
+    db = StateDB(tmp_path / "state.sqlite3")
+    root = _ready_root(tmp_path)
+    ConfirmedLossLedger(db).initialize(allow_create=True)
+    with InternalAudioStore(db) as store:
+        first = _source(store, "1" * 32, 100, (_record(1),))
+        assert ready_bundles.finalize_public_audio_v2(store, (first,), root, _options(ClockState(), 101)).published
+        _physical(store, db, "a" * 32, 110, (2,))
+        _physical(store, db, "b" * 32, 120, (3,))
+        with db.typed_write_transaction() as connection:
+            connection.execute("INSERT INTO capture_tail VALUES (?,?,?,?,?,?)", ("a" * 32, 1, 1, 447, 444, b"xyz"))
+        _classify(db, frozenset({"a" * 32, "b" * 32}))
+        if crash:
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    physical_stage, "_commit_physical_stage", lambda *_: (_ for _ in ()).throw(OSError("crash"))
+                )
+                with pytest.raises(OSError, match="crash"):
+                    publish_next_ordered_physical(store, root)
+            prefix = physical_stage.resume_physical_stage(store, root)
+        else:
+            prefix = publish_next_ordered_physical(store, root)
+        assert prefix is not None and prefix is not True and prefix.next_sequence is None
+        entry = db.get(StateKind.READY_PUBLICATION, prefix.bundle_id)
+        assert entry is not None and entry["record_count"] == 1 and entry["seams"] == []
+        _ack(root, db, tmp_path, prefix)
+    with InternalAudioStore(StateDB(db.path)) as restarted:
+        successor = publish_next_ordered_physical(restarted, root)
+        assert successor is not None and successor is not True and successor.next_sequence is None
+        assert publish_next_ordered_physical(restarted, root) is None
+        for _ in range(5):
+            if not retire_one_ordered_physical_page(restarted, 8):
+                break
+        with closing(db.open_connection(read_only=True)) as connection:
+            assert (
+                connection.execute("SELECT bytes FROM capture_tail WHERE source_id=?", ("a" * 32,)).fetchone()[0]
+                == b"xyz"
+            )
+            assert (
+                connection.execute("SELECT count(*) FROM capture_record WHERE source_id=?", ("a" * 32,)).fetchone()[0]
+                == 1
+            )
+        _ack(root, db, tmp_path, successor)
+        sealed = _source(restarted, "c" * 32, 130, (_record(4),))
+        _hold_historical_source(db, sealed.source_id)
+        _classify(db, frozenset({"a" * 32, "b" * 32}))
+        frontier = ready_bundles.historical_admission_frontier(db, 131, frozenset({sealed.source_id}))
+        assert frontier == 131
+        assert ready_bundles.finalize_public_audio_v2(
+            restarted, (sealed,), root, _options(ClockState(), frontier)
+        ).published
+
+
 def _publish_live_after_physical(
     store: InternalAudioStore, db: StateDB, root: Path, tmp_path: Path, physical: ready_bundles.ReadyBundleResult
 ) -> None:

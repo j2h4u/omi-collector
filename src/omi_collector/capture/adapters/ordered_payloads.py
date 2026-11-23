@@ -330,7 +330,7 @@ def _empty_custody_is_proven(connection: sqlite3.Connection, row: tuple[object, 
 
 
 def _require_payload_custody(connection: sqlite3.Connection, row: tuple[object, ...]) -> None:
-    if (row[1], row[2]) not in {("quarantine", "blocked"), ("attempt", "sealed_waiting")} or row[15]:
+    if (row[1], row[2]) not in {("quarantine", "blocked"), ("attempt", "sealed_waiting")}:
         raise ValueError("historical payload requires separate custody review")
     if (row[1], row[2], row[5], row[6], row[7], row[8]) != tuple(row[9:15]):
         raise ValueError("historical payload custody changed")
@@ -338,8 +338,33 @@ def _require_payload_custody(connection: sqlite3.Connection, row: tuple[object, 
         raise ValueError("historical payload READ evidence is invalid")
     if (row[1], row[2]) == ("quarantine", "blocked") and (row[7] != row[5] or row[8] != row[6]):
         raise ValueError("historical payload lacks a durable certified prefix")
+    if row[15] and not _has_isolated_tail(connection, row):
+        raise ValueError("historical payload requires separate custody review")
     if historical_decision(connection, cast(str, row[0])) is None:
         raise ValueError("historical payload lacks a durable custody decision")
+
+
+def _has_isolated_tail(connection: sqlite3.Connection, row: tuple[object, ...]) -> bool:
+    """Allow full certified records while retaining a separate, bounded partial tail."""
+    if (row[1], row[2]) != ("quarantine", "blocked"):
+        return False
+    source_id = row[0]
+    count = cast(int, row[5])
+    result = cast(
+        tuple[int] | None,
+        connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM capture_tail WHERE source_id=? AND complete_high_water=? "
+            "AND byte_offset=? AND typeof(bytes)='blob' AND length(bytes) BETWEEN 1 AND 443 "
+            "AND received_high_water=byte_offset+length(bytes)) "
+            "AND NOT EXISTS(SELECT 1 FROM capture_conflict WHERE source_id=?) "
+            "AND NOT EXISTS(SELECT 1 FROM capture_evidence WHERE source_id=?) "
+            "AND NOT EXISTS(SELECT 1 FROM capture_observation WHERE source_id=?) "
+            "AND NOT EXISTS(SELECT 1 FROM capture_framing_incident WHERE incident_id=?) "
+            "AND NOT EXISTS(SELECT 1 FROM capture_recovery_candidate WHERE source_id=? OR incident_id=?)",
+            (source_id, count, count * 444, source_id, source_id, source_id, source_id, source_id, source_id),
+        ).fetchone(),
+    )
+    return result is not None and result[0] == 1
 
 
 def pending_physical_successor(connection: sqlite3.Connection, source_id: str) -> bool:

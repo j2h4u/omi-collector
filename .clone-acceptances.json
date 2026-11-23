@@ -2471,6 +2471,12 @@
       "identity": "605f80ead835066ebd06058f3be26835c09654510c33df75f8fe2dcc53541299",
       "count": 1,
       "reason": "Historical classification decodes the confirmed loss ledger into validated loss facts; ordered replay retrieves a separately validated source receipt for boundary reconstruction. The matching JSON-row reads protect distinct state and have different validation and return contracts. Reviewed pair: src/omi_collector/capture/adapters/historical_reconciliation.py:119-129 ~ src/omi_collector/capture/adapters/ordered_full_replay.py:190-203."
+    },
+    {
+      "detector": "pyscn",
+      "identity": "6790b49779f14cc79902e408af6f8a354e42fd22fa12d3b55fb33cd7123e8a6a",
+      "count": 1,
+      "reason": "Empty custody proves that no audio or active references exist; isolated tail custody proves a bounded partial tail follows certified full records and excludes conflicting evidence. Their inputs and required evidence differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:309-329 ~ src/omi_collector/capture/adapters/ordered_payloads.py:347-367."
     }
   ]
 }

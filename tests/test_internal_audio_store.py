@@ -906,6 +906,52 @@ def test_advanced_frontier_replaces_old_partial_tail(tmp_path: Path) -> None:
     connection.close()
 
 
+@pytest.mark.parametrize("matches", [True, False])
+def test_replayed_tail_inside_committed_record_checks_retained_bytes(tmp_path: Path, matches: bool) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    first, second = _record(50, 50), _record(51, 51)
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        assert store.commit_drain(source_id, 0, [first, second], DrainCheckpoint(1)) == 2
+        tail_bytes = second[:32] if matches else b"z" * 32
+        checkpoint = DrainCheckpoint(1, CaptureTail(1, 1, AUDIO_RECORD_SIZE + 32, AUDIO_RECORD_SIZE, tail_bytes))
+        if matches:
+            assert store.commit_drain(source_id, 0, [first], checkpoint) == 2
+            source = store.get_source(source_id)
+            assert source is not None and source.lifecycle == "receiving"
+        else:
+            with pytest.raises(InternalAudioStoreError, match="completed record conflicts"):
+                store.commit_drain(source_id, 0, [first], checkpoint)
+            source = store.get_source(source_id)
+            assert source is not None and source.lifecycle == "blocked"
+        with closing(db.open_connection(read_only=True)) as connection:
+            assert connection.execute("SELECT count(*) FROM capture_tail").fetchone()[0] == 0
+            assert connection.execute("SELECT count(*) FROM capture_record").fetchone()[0] == 2
+            conflicts = cast(list[tuple[bytes]], connection.execute("SELECT bytes FROM capture_conflict").fetchall())
+            assert [row[0] for row in conflicts] == ([] if matches else [second])
+
+
+@pytest.mark.parametrize("matches", [True, False])
+def test_tail_inside_newly_appended_record_checks_exact_prefix(tmp_path: Path, matches: bool) -> None:
+    db = StateDB(tmp_path / "state.sqlite3")
+    record = _record(50, 50)
+    with InternalAudioStore(db) as store:
+        source_id = _source(store)
+        tail_bytes = record[:32] if matches else b"z" * 32
+        checkpoint = DrainCheckpoint(1, CaptureTail(1, 0, 32, 0, tail_bytes))
+        if matches:
+            assert store.commit_drain(source_id, 0, [record], checkpoint) == 1
+            assert store.read_record_page(source_id)[0].raw_bytes == record
+        else:
+            with pytest.raises(InternalAudioStoreError, match="completed record conflicts"):
+                store.commit_drain(source_id, 0, [record], checkpoint)
+            source = store.get_source(source_id)
+            assert source is not None and source.lifecycle == "blocked"
+        with closing(db.open_connection(read_only=True)) as connection:
+            assert connection.execute("SELECT count(*) FROM capture_tail").fetchone()[0] == 0
+            assert connection.execute("SELECT count(*) FROM capture_record").fetchone()[0] == int(matches)
+
+
 def test_same_offset_mismatched_tail_blocks_and_retains_bytes(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.sqlite3")
     raw = _record(52, 52)
